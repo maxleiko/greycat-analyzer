@@ -1,68 +1,33 @@
 use std::fmt;
 
-use lsp_types::{Position, Range};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Span<'a> {
-    /// The actual source string
-    pub image: &'a str,
-    /// The starting position in the source
-    pub start: Position,
-    /// The ending position in the source
-    pub end: Position,
-}
-
-impl<'a> Span<'a> {
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.image.len()
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.image.is_empty()
-    }
-
-    pub fn as_range(&self) -> Range {
-        Range::new(self.start, self.end)
-    }
-
-    pub fn eof() -> Span<'a> {
-        Span {
-            image: "<eof>",
-            start: Position {
-                line: 0,
-                character: 0,
-            },
-            end: Position {
-                line: u32::MAX,
-                character: 0,
-            },
-        }
-    }
-}
+use crate::span::Span;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Token<'a> {
+pub struct Token {
     pub kind: TokenKind,
-    #[serde(borrow)]
-    pub span: Span<'a>,
+    pub span: Span,
 }
 
-impl fmt::Display for Token<'_> {
+pub struct SrcToken<'src> {
+    token: Token,
+    source: &'src str,
+}
+
+impl fmt::Display for SrcToken<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
+        match &self.token.kind {
             TokenKind::EolComment => write!(f, "EolComment"),
             TokenKind::DocComment => write!(f, "DocComment"),
             TokenKind::BlockComment => write!(f, "BlockComment"),
             TokenKind::Space(n) => write!(f, "Space({n})"),
             TokenKind::NewLine(n) => write!(f, "NewLine({n})"),
-            TokenKind::Ident => write!(f, "Ident({})", self.span.image),
-            TokenKind::Int => write!(f, "Int({})", self.span.image),
-            TokenKind::Float { terminated } => write!(f, "Float({}, {terminated})", self.span.image),
-            TokenKind::Char { terminated } => write!(f, "Char({}, {terminated})", self.span.image),
-            TokenKind::Bool => write!(f, "Bool({})", self.span.image),
+            TokenKind::Ident => write!(f, "Ident({})", self.token.span.as_str(self.source)),
+            TokenKind::Int => write!(f, "Int({})", self.token.span.as_str(self.source)),
+            TokenKind::Float { terminated } => write!(f, "Float({}, {terminated})", self.token.span.as_str(self.source)),
+            TokenKind::Char { terminated } => write!(f, "Char({}, {terminated})", self.token.span.as_str(self.source)),
+            TokenKind::Bool => write!(f, "Bool({})", self.token.span.as_str(self.source)),
             TokenKind::Semi => write!(f, "Semi"),
             TokenKind::Comma => write!(f, "Comma"),
             TokenKind::Dot => write!(f, "Dot"),
@@ -106,12 +71,6 @@ impl fmt::Display for Token<'_> {
             TokenKind::Unknown => write!(f, "<UNKNOWN>"),
             TokenKind::Eof => write!(f, "<EOF>>"),
         }
-    }
-}
-
-impl<'a> From<Token<'a>> for Span<'a> {
-    fn from(value: Token<'a>) -> Self {
-        value.span
     }
 }
 

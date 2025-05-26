@@ -4,17 +4,19 @@ pub use token::*;
 
 use std::str::Chars;
 
-use lsp_types::{Diagnostic, Position};
+use lsp_types::Position;
+
+use crate::span::{Span, SpanPos};
 
 const EOF: char = '\0';
 
-pub fn tokenize(source: &str) -> Result<Vec<Token>, Diagnostic> {
+pub fn tokenize(source: &str) -> Vec<Token> {
     let mut lexer = Lexer::new(source);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next_token() {
         tokens.push(token);
     }
-    Ok(tokens)
+    tokens
 }
 
 /// `Lexer` implements `Iterator` and is cheap to clone
@@ -28,7 +30,7 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Iterator for Lexer<'a> {
-    type Item = Token<'a>;
+    type Item = Token;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -37,7 +39,7 @@ impl<'a> Iterator for Lexer<'a> {
 }
 
 trait Consume<'a> {
-    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token<'a>;
+    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token;
 }
 
 #[derive(Clone)]
@@ -67,7 +69,7 @@ impl State {
 }
 
 impl<'a> Consume<'a> for Consumer {
-    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token<'a> {
+    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token {
         match self {
             Consumer::Main(lexer) => lexer.consume(ctx),
             Consumer::Template(lexer) => lexer.consume(ctx),
@@ -80,7 +82,7 @@ impl<'a> Consume<'a> for Consumer {
 struct MainLexer;
 
 impl<'a> Consume<'a> for MainLexer {
-    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token<'a> {
+    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token {
         match ctx.next() {
             EOF => ctx.token(TokenKind::Eof),
             '%' => ctx.token(TokenKind::Percent),
@@ -341,7 +343,7 @@ impl<'a> Consume<'a> for MainLexer {
 struct TemplateLexer;
 
 impl<'a> Consume<'a> for TemplateLexer {
-    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token<'a> {
+    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token {
         match ctx.next() {
             EOF => ctx.token(TokenKind::Eof),
             '"' => {
@@ -384,7 +386,7 @@ struct InterpolationLexer {
 
 impl<'a> Consume<'a> for InterpolationLexer {
     /// Delegates consumes to MainLexer, but keeps track of OpenCurly/CloseCurly depth
-    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token<'a> {
+    fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token {
         let mut main_lexer = MainLexer;
 
         match ctx.peek(0) {
@@ -423,28 +425,30 @@ impl<'a> Lexer<'a> {
     }
 
     /// Returns a vector of tokens from the current lexer source.
-    /// 
+    ///
     /// This is equivalent to `lexer.collect::<Vec<Token<'_>>>()`.
     ///
     /// *This method takes ownership of `self` because once the source
     /// is tokenized, we are at the end of the source, therefore no more
     /// tokens can be produced.*
     #[inline(always)]
-    pub fn tokenize(self) -> Vec<Token<'a>> {
+    pub fn tokenize(self) -> Vec<Token> {
         self.collect()
     }
 
-    pub fn next_token(&mut self) -> Option<Token<'a>> {
+    pub fn next_token(&mut self) -> Option<Token> {
         if self.curr.offset as usize == self.source.len() {
             return None;
         }
 
-        // if this assertion is not valid it means something is wrong in the lexer stack
-        // which is likely due to a bug introduced by popping too much
-        assert!(self.state.current.is_some(), "internal error, no more lexer in stack");
-        // SAFETY:
-        // It is safe to unwrap here, we've asserted with `is_some` above
-        let mut current_lexer = self.state.current.take().unwrap();
+        let mut current_lexer = self
+            .state
+            .current
+            .take()
+            // SAFETY:
+            // if this is not valid it means something is wrong in the lexer stack
+            // which is likely due to a bug introduced by popping too much
+            .expect("internal error, no more lexer in stack");
         let token = current_lexer.consume(self);
         match self.state.next.take() {
             Some(transition) => {
@@ -457,7 +461,9 @@ impl<'a> Lexer<'a> {
                             // We could handle an infinite stack (as long as we have memory) here
                             // but the current GreyCat compiler won't allow more than 15, so let's
                             // stick to what the compiler knows
-                            panic!("internal error, Greycat only allows 15 nested interpolation contexts")
+                            panic!(
+                                "internal error, Greycat only allows 15 nested interpolation contexts"
+                            )
                         }
                         self.state.current = Some(next);
                         self.state.stack.push(current_lexer);
@@ -500,11 +506,10 @@ impl<'a> Lexer<'a> {
         &self.source[self.start.offset as usize..self.curr.offset as usize]
     }
 
-    fn token(&mut self, kind: TokenKind) -> Token<'a> {
+    fn token(&mut self, kind: TokenKind) -> Token {
         let token = Token {
             kind,
             span: Span {
-                image: self.image(),
                 start: self.start.into(),
                 end: self.curr.into(),
             },
@@ -565,7 +570,16 @@ impl InternalPos {
 
 impl From<InternalPos> for Position {
     fn from(value: InternalPos) -> Self {
-        Position::new(value.line, value.characters)
+        Self {
+            line: value.line,
+            character: value.characters,
+        }
+    }
+}
+
+impl From<InternalPos> for SpanPos {
+    fn from(value: InternalPos) -> Self {
+        Self::new(value.line, value.characters)
     }
 }
 
@@ -576,6 +590,8 @@ enum ScientificNotation {
 
 #[cfg(test)]
 mod test {
+    use crate::span::SpanPos;
+
     use super::*;
     use pretty_assertions::assert_eq;
 
@@ -584,32 +600,29 @@ mod test {
         let tokens = tokenize("{\n}");
         assert_eq!(
             tokens,
-            Ok(vec![
+            vec![
                 Token {
                     kind: TokenKind::OpenCurly,
                     span: Span {
-                        image: "{",
-                        start: Position::new(0, 0),
-                        end: Position::new(0, 1),
+                        start: SpanPos::new(0, 0),
+                        end: SpanPos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::NewLine(1),
                     span: Span {
-                        image: "\n",
-                        start: Position::new(0, 1),
-                        end: Position::new(1, 0),
+                        start: SpanPos::new(0, 1),
+                        end: SpanPos::new(1, 0),
                     }
                 },
                 Token {
                     kind: TokenKind::CloseCurly,
                     span: Span {
-                        image: "}",
-                        start: Position::new(1, 0),
-                        end: Position::new(1, 1),
+                        start: SpanPos::new(1, 0),
+                        end: SpanPos::new(1, 1),
                     }
                 }
-            ])
+            ]
         );
     }
 
@@ -618,32 +631,29 @@ mod test {
         let tokens = tokenize("\"hello world\"");
         assert_eq!(
             tokens,
-            Ok(vec![
+            vec![
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        image: "\"",
-                        start: Position::new(0, 0),
-                        end: Position::new(0, 1),
+                        start: SpanPos::new(0, 0),
+                        end: SpanPos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        image: "hello world",
-                        start: Position::new(0, 1),
-                        end: Position::new(0, 12),
+                        start: SpanPos::new(0, 1),
+                        end: SpanPos::new(0, 12),
                     }
                 },
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        image: "\"",
-                        start: Position::new(0, 12),
-                        end: Position::new(0, 13),
+                        start: SpanPos::new(0, 12),
+                        end: SpanPos::new(0, 13),
                     }
                 },
-            ])
+            ]
         );
     }
 
@@ -652,24 +662,22 @@ mod test {
         let tokens = tokenize("\"hello ");
         assert_eq!(
             tokens,
-            Ok(vec![
+            vec![
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        image: "\"",
-                        start: Position::new(0, 0),
-                        end: Position::new(0, 1),
+                        start: SpanPos::new(0, 0),
+                        end: SpanPos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        image: "hello ",
-                        start: Position::new(0, 1),
-                        end: Position::new(0, 7),
+                        start: SpanPos::new(0, 1),
+                        end: SpanPos::new(0, 7),
                     }
                 },
-            ])
+            ]
         );
     }
 
@@ -678,56 +686,50 @@ mod test {
         let tokens = tokenize("\"hello ${world}\"");
         assert_eq!(
             tokens,
-            Ok(vec![
+            vec![
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        image: "\"",
-                        start: Position::new(0, 0),
-                        end: Position::new(0, 1),
+                        start: SpanPos::new(0, 0),
+                        end: SpanPos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        image: "hello ",
-                        start: Position::new(0, 1),
-                        end: Position::new(0, 7),
+                        start: SpanPos::new(0, 1),
+                        end: SpanPos::new(0, 7),
                     }
                 },
                 Token {
                     kind: TokenKind::EnterInterpolation,
                     span: Span {
-                        image: "${",
-                        start: Position::new(0, 7),
-                        end: Position::new(0, 9),
+                        start: SpanPos::new(0, 7),
+                        end: SpanPos::new(0, 9),
                     }
                 },
                 Token {
                     kind: TokenKind::Ident,
                     span: Span {
-                        image: "world",
-                        start: Position::new(0, 9),
-                        end: Position::new(0, 14),
+                        start: SpanPos::new(0, 9),
+                        end: SpanPos::new(0, 14),
                     }
                 },
                 Token {
                     kind: TokenKind::ExitInterpolation,
                     span: Span {
-                        image: "}",
-                        start: Position::new(0, 14),
-                        end: Position::new(0, 15),
+                        start: SpanPos::new(0, 14),
+                        end: SpanPos::new(0, 15),
                     }
                 },
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        image: "\"",
-                        start: Position::new(0, 15),
-                        end: Position::new(0, 16),
+                        start: SpanPos::new(0, 15),
+                        end: SpanPos::new(0, 16),
                     }
                 },
-            ])
+            ]
         );
     }
 
@@ -736,48 +738,43 @@ mod test {
         let tokens = tokenize("\"hello ${world\"");
         assert_eq!(
             tokens,
-            Ok(vec![
+            vec![
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        image: "\"",
-                        start: Position::new(0, 0),
-                        end: Position::new(0, 1),
+                        start: SpanPos::new(0, 0),
+                        end: SpanPos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        image: "hello ",
-                        start: Position::new(0, 1),
-                        end: Position::new(0, 7),
+                        start: SpanPos::new(0, 1),
+                        end: SpanPos::new(0, 7),
                     }
                 },
                 Token {
                     kind: TokenKind::EnterInterpolation,
                     span: Span {
-                        image: "${",
-                        start: Position::new(0, 7),
-                        end: Position::new(0, 9),
+                        start: SpanPos::new(0, 7),
+                        end: SpanPos::new(0, 9),
                     }
                 },
                 Token {
                     kind: TokenKind::Ident,
                     span: Span {
-                        image: "world",
-                        start: Position::new(0, 9),
-                        end: Position::new(0, 14),
+                        start: SpanPos::new(0, 9),
+                        end: SpanPos::new(0, 14),
                     }
                 },
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        image: "\"",
-                        start: Position::new(0, 14),
-                        end: Position::new(0, 15),
+                        start: SpanPos::new(0, 14),
+                        end: SpanPos::new(0, 15),
                     }
                 },
-            ])
+            ]
         );
     }
 
@@ -786,14 +783,13 @@ mod test {
         let tokens = tokenize("42");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Int,
                 span: Span {
-                    image: "42",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 2),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 2),
                 }
-            }])
+            }]
         );
     }
 
@@ -802,14 +798,13 @@ mod test {
         let tokens = tokenize("3.14");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    image: "3.14",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 4),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 4),
                 }
-            }])
+            }]
         );
     }
 
@@ -818,14 +813,13 @@ mod test {
         let tokens = tokenize("3.");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Float { terminated: false },
                 span: Span {
-                    image: "3.",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 2),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 2),
                 }
-            }])
+            }]
         );
     }
 
@@ -834,32 +828,29 @@ mod test {
         let tokens = tokenize("3.1.4");
         assert_eq!(
             tokens,
-            Ok(vec![
+            vec![
                 Token {
                     kind: TokenKind::Float { terminated: true },
                     span: Span {
-                        image: "3.1",
-                        start: Position::new(0, 0),
-                        end: Position::new(0, 3),
+                        start: SpanPos::new(0, 0),
+                        end: SpanPos::new(0, 3),
                     }
                 },
                 Token {
                     kind: TokenKind::Dot,
                     span: Span {
-                        image: ".",
-                        start: Position::new(0, 3),
-                        end: Position::new(0, 4),
+                        start: SpanPos::new(0, 3),
+                        end: SpanPos::new(0, 4),
                     }
                 },
                 Token {
                     kind: TokenKind::Int,
                     span: Span {
-                        image: "4",
-                        start: Position::new(0, 4),
-                        end: Position::new(0, 5),
+                        start: SpanPos::new(0, 4),
+                        end: SpanPos::new(0, 5),
                     }
                 },
-            ])
+            ]
         );
     }
 
@@ -868,14 +859,13 @@ mod test {
         let tokens = tokenize("1_000_000");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Int,
                 span: Span {
-                    image: "1_000_000",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 9),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 9),
                 }
-            },])
+            }]
         );
     }
 
@@ -884,14 +874,13 @@ mod test {
         let tokens = tokenize("3f");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    image: "3f",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 2),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 2),
                 }
-            },])
+            }]
         );
     }
 
@@ -900,14 +889,13 @@ mod test {
         let tokens = tokenize("3_float");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    image: "3_float",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 7),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 7),
                 }
-            },])
+            }]
         );
     }
 
@@ -916,14 +904,13 @@ mod test {
         let tokens = tokenize(" \t  ");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Space(4),
                 span: Span {
-                    image: " \t  ",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 4),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 4),
                 }
-            },])
+            }]
         );
     }
 
@@ -932,14 +919,13 @@ mod test {
         let tokens = tokenize("\n\r\n\n");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::NewLine(3),
                 span: Span {
-                    image: "\n\r\n\n",
-                    start: Position::new(0, 0),
-                    end: Position::new(3, 0),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(3, 0),
                 }
-            },])
+            }]
         );
     }
 
@@ -948,14 +934,13 @@ mod test {
         let tokens = tokenize("// hello");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::EolComment,
                 span: Span {
-                    image: "// hello",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 8),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 8),
                 }
-            },])
+            }]
         );
     }
 
@@ -964,14 +949,13 @@ mod test {
         let tokens = tokenize("/* hello /*\n\n * world */");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::BlockComment,
                 span: Span {
-                    image: "/* hello /*\n\n * world */",
-                    start: Position::new(0, 0),
-                    end: Position::new(2, 11),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(2, 11),
                 }
-            },])
+            }]
         );
     }
 
@@ -980,14 +964,13 @@ mod test {
         let tokens = tokenize("/* \\* */");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::BlockComment,
                 span: Span {
-                    image: "/* \\* */",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 8),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 8),
                 }
-            },])
+            }]
         );
     }
 
@@ -996,14 +979,13 @@ mod test {
         let tokens = tokenize("1e6");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Int,
                 span: Span {
-                    image: "1e6",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 3),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 3),
                 }
-            },])
+            }]
         );
     }
 
@@ -1012,14 +994,13 @@ mod test {
         let tokens = tokenize("1e-6");
         assert_eq!(
             tokens,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    image: "1e-6",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 4),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 4),
                 }
-            },])
+            }]
         );
     }
 
@@ -1028,48 +1009,43 @@ mod test {
         let tokens = tokenize("a <= 42");
         assert_eq!(
             tokens,
-            Ok(vec![
+            vec![
                 Token {
                     kind: TokenKind::Ident,
                     span: Span {
-                        image: "a",
-                        start: Position::new(0, 0),
-                        end: Position::new(0, 1),
+                        start: SpanPos::new(0, 0),
+                        end: SpanPos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::Space(1),
                     span: Span {
-                        image: " ",
-                        start: Position::new(0, 1),
-                        end: Position::new(0, 2),
+                        start: SpanPos::new(0, 1),
+                        end: SpanPos::new(0, 2),
                     }
                 },
                 Token {
                     kind: TokenKind::LtEq,
                     span: Span {
-                        image: "<=",
-                        start: Position::new(0, 2),
-                        end: Position::new(0, 4),
+                        start: SpanPos::new(0, 2),
+                        end: SpanPos::new(0, 4),
                     }
                 },
                 Token {
                     kind: TokenKind::Space(1),
                     span: Span {
-                        image: " ",
-                        start: Position::new(0, 4),
-                        end: Position::new(0, 5),
+                        start: SpanPos::new(0, 4),
+                        end: SpanPos::new(0, 5),
                     }
                 },
                 Token {
                     kind: TokenKind::Int,
                     span: Span {
-                        image: "42",
-                        start: Position::new(0, 5),
-                        end: Position::new(0, 7),
+                        start: SpanPos::new(0, 5),
+                        end: SpanPos::new(0, 7),
                     }
                 }
-            ])
+            ]
         );
     }
 
@@ -1078,14 +1054,13 @@ mod test {
         let result = tokenize("'c'");
         assert_eq!(
             result,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Char { terminated: true },
                 span: Span {
-                    image: "'c'",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 3),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 3),
                 }
-            }])
+            }]
         );
     }
 
@@ -1094,14 +1069,13 @@ mod test {
         let result = tokenize(r#"'\\'"#);
         assert_eq!(
             result,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Char { terminated: true },
                 span: Span {
-                    image: "'\\\\'",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 4),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 4),
                 }
-            }])
+            }]
         );
     }
 
@@ -1110,14 +1084,13 @@ mod test {
         let result = tokenize(r#"'c"#);
         assert_eq!(
             result,
-            Ok(vec![Token {
+            vec![Token {
                 kind: TokenKind::Char { terminated: false },
                 span: Span {
-                    image: "'c",
-                    start: Position::new(0, 0),
-                    end: Position::new(0, 2),
+                    start: SpanPos::new(0, 0),
+                    end: SpanPos::new(0, 2),
                 }
-            }])
+            }]
         );
     }
 }

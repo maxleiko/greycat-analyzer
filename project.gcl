@@ -1,0 +1,6 @@
+fn main() {
+  println("Hello, world!");
+}
+
+
+native fn add<T>(a: T, b: T): T;
