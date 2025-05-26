@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = [ "greycat-analyzer","greycat-lang"]
+
+[profile.release]
+strip = true
+lto = true
+opt-level = 3
