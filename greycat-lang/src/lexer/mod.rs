@@ -1,22 +1,20 @@
+mod stack;
 mod token;
 
+use stack::LexerStack;
 pub use token::*;
 
 use std::str::Chars;
 
 use lsp_types::Position;
 
-use crate::span::{Span, SpanPos};
+use crate::span::{Span, Pos};
 
 const EOF: char = '\0';
 
+/// Collects all tokens of the given `source` into a `Vec` using `Lexer`
 pub fn tokenize(source: &str) -> Vec<Token> {
-    let mut lexer = Lexer::new(source);
-    let mut tokens = Vec::new();
-    while let Some(token) = lexer.next_token() {
-        tokens.push(token);
-    }
-    tokens
+    Lexer::new(source).collect()
 }
 
 /// `Lexer` implements `Iterator` and is cheap to clone
@@ -42,7 +40,7 @@ trait Consume<'a> {
     fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token;
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 enum Consumer {
     Main(MainLexer),
     Template(TemplateLexer),
@@ -58,7 +56,7 @@ enum Transition {
 #[derive(Clone)]
 struct State {
     current: Option<Consumer>,
-    stack: Vec<Consumer>,
+    stack: LexerStack<Consumer, 15>,
     next: Option<Transition>,
 }
 
@@ -78,7 +76,7 @@ impl<'a> Consume<'a> for Consumer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct MainLexer;
 
 impl<'a> Consume<'a> for MainLexer {
@@ -339,7 +337,7 @@ impl<'a> Consume<'a> for MainLexer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct TemplateLexer;
 
 impl<'a> Consume<'a> for TemplateLexer {
@@ -379,7 +377,7 @@ impl<'a> Consume<'a> for TemplateLexer {
     }
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 struct InterpolationLexer {
     curly_depth: usize,
 }
@@ -418,7 +416,7 @@ impl<'a> Lexer<'a> {
             curr: InternalPos::default(),
             state: State {
                 current: Some(Consumer::Main(MainLexer)),
-                stack: Vec::with_capacity(15),
+                stack: LexerStack::new(),
                 next: None,
             },
         }
@@ -457,16 +455,14 @@ impl<'a> Lexer<'a> {
                         self.state.current = self.state.stack.pop();
                     }
                     Transition::Push(next) => {
-                        if self.state.stack.len() == 14 {
+                        self.state.current = Some(next);
+                        self.state
+                            .stack
+                            .push(current_lexer)
                             // We could handle an infinite stack (as long as we have memory) here
                             // but the current GreyCat compiler won't allow more than 15, so let's
                             // stick to what the compiler knows
-                            panic!(
-                                "internal error, Greycat only allows 15 nested interpolation contexts"
-                            )
-                        }
-                        self.state.current = Some(next);
-                        self.state.stack.push(current_lexer);
+                            .expect("internal error, GreyCat only allows 15 nested interpolations");
                     }
                 }
             }
@@ -577,7 +573,7 @@ impl From<InternalPos> for Position {
     }
 }
 
-impl From<InternalPos> for SpanPos {
+impl From<InternalPos> for Pos {
     fn from(value: InternalPos) -> Self {
         Self::new(value.line, value.characters)
     }
@@ -590,7 +586,7 @@ enum ScientificNotation {
 
 #[cfg(test)]
 mod test {
-    use crate::span::SpanPos;
+    use crate::span::Pos;
 
     use super::*;
     use pretty_assertions::assert_eq;
@@ -604,22 +600,22 @@ mod test {
                 Token {
                     kind: TokenKind::OpenCurly,
                     span: Span {
-                        start: SpanPos::new(0, 0),
-                        end: SpanPos::new(0, 1),
+                        start: Pos::new(0, 0),
+                        end: Pos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::NewLine(1),
                     span: Span {
-                        start: SpanPos::new(0, 1),
-                        end: SpanPos::new(1, 0),
+                        start: Pos::new(0, 1),
+                        end: Pos::new(1, 0),
                     }
                 },
                 Token {
                     kind: TokenKind::CloseCurly,
                     span: Span {
-                        start: SpanPos::new(1, 0),
-                        end: SpanPos::new(1, 1),
+                        start: Pos::new(1, 0),
+                        end: Pos::new(1, 1),
                     }
                 }
             ]
@@ -635,22 +631,22 @@ mod test {
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        start: SpanPos::new(0, 0),
-                        end: SpanPos::new(0, 1),
+                        start: Pos::new(0, 0),
+                        end: Pos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        start: SpanPos::new(0, 1),
-                        end: SpanPos::new(0, 12),
+                        start: Pos::new(0, 1),
+                        end: Pos::new(0, 12),
                     }
                 },
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        start: SpanPos::new(0, 12),
-                        end: SpanPos::new(0, 13),
+                        start: Pos::new(0, 12),
+                        end: Pos::new(0, 13),
                     }
                 },
             ]
@@ -666,15 +662,15 @@ mod test {
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        start: SpanPos::new(0, 0),
-                        end: SpanPos::new(0, 1),
+                        start: Pos::new(0, 0),
+                        end: Pos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        start: SpanPos::new(0, 1),
-                        end: SpanPos::new(0, 7),
+                        start: Pos::new(0, 1),
+                        end: Pos::new(0, 7),
                     }
                 },
             ]
@@ -690,43 +686,43 @@ mod test {
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        start: SpanPos::new(0, 0),
-                        end: SpanPos::new(0, 1),
+                        start: Pos::new(0, 0),
+                        end: Pos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        start: SpanPos::new(0, 1),
-                        end: SpanPos::new(0, 7),
+                        start: Pos::new(0, 1),
+                        end: Pos::new(0, 7),
                     }
                 },
                 Token {
                     kind: TokenKind::EnterInterpolation,
                     span: Span {
-                        start: SpanPos::new(0, 7),
-                        end: SpanPos::new(0, 9),
+                        start: Pos::new(0, 7),
+                        end: Pos::new(0, 9),
                     }
                 },
                 Token {
                     kind: TokenKind::Ident,
                     span: Span {
-                        start: SpanPos::new(0, 9),
-                        end: SpanPos::new(0, 14),
+                        start: Pos::new(0, 9),
+                        end: Pos::new(0, 14),
                     }
                 },
                 Token {
                     kind: TokenKind::ExitInterpolation,
                     span: Span {
-                        start: SpanPos::new(0, 14),
-                        end: SpanPos::new(0, 15),
+                        start: Pos::new(0, 14),
+                        end: Pos::new(0, 15),
                     }
                 },
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        start: SpanPos::new(0, 15),
-                        end: SpanPos::new(0, 16),
+                        start: Pos::new(0, 15),
+                        end: Pos::new(0, 16),
                     }
                 },
             ]
@@ -742,36 +738,36 @@ mod test {
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        start: SpanPos::new(0, 0),
-                        end: SpanPos::new(0, 1),
+                        start: Pos::new(0, 0),
+                        end: Pos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::RawString,
                     span: Span {
-                        start: SpanPos::new(0, 1),
-                        end: SpanPos::new(0, 7),
+                        start: Pos::new(0, 1),
+                        end: Pos::new(0, 7),
                     }
                 },
                 Token {
                     kind: TokenKind::EnterInterpolation,
                     span: Span {
-                        start: SpanPos::new(0, 7),
-                        end: SpanPos::new(0, 9),
+                        start: Pos::new(0, 7),
+                        end: Pos::new(0, 9),
                     }
                 },
                 Token {
                     kind: TokenKind::Ident,
                     span: Span {
-                        start: SpanPos::new(0, 9),
-                        end: SpanPos::new(0, 14),
+                        start: Pos::new(0, 9),
+                        end: Pos::new(0, 14),
                     }
                 },
                 Token {
                     kind: TokenKind::Doublequote,
                     span: Span {
-                        start: SpanPos::new(0, 14),
-                        end: SpanPos::new(0, 15),
+                        start: Pos::new(0, 14),
+                        end: Pos::new(0, 15),
                     }
                 },
             ]
@@ -786,8 +782,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Int,
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 2),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 2),
                 }
             }]
         );
@@ -801,8 +797,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 4),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 4),
                 }
             }]
         );
@@ -816,8 +812,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Float { terminated: false },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 2),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 2),
                 }
             }]
         );
@@ -832,22 +828,22 @@ mod test {
                 Token {
                     kind: TokenKind::Float { terminated: true },
                     span: Span {
-                        start: SpanPos::new(0, 0),
-                        end: SpanPos::new(0, 3),
+                        start: Pos::new(0, 0),
+                        end: Pos::new(0, 3),
                     }
                 },
                 Token {
                     kind: TokenKind::Dot,
                     span: Span {
-                        start: SpanPos::new(0, 3),
-                        end: SpanPos::new(0, 4),
+                        start: Pos::new(0, 3),
+                        end: Pos::new(0, 4),
                     }
                 },
                 Token {
                     kind: TokenKind::Int,
                     span: Span {
-                        start: SpanPos::new(0, 4),
-                        end: SpanPos::new(0, 5),
+                        start: Pos::new(0, 4),
+                        end: Pos::new(0, 5),
                     }
                 },
             ]
@@ -862,8 +858,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Int,
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 9),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 9),
                 }
             }]
         );
@@ -877,8 +873,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 2),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 2),
                 }
             }]
         );
@@ -892,8 +888,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 7),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 7),
                 }
             }]
         );
@@ -907,8 +903,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Space(4),
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 4),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 4),
                 }
             }]
         );
@@ -922,8 +918,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::NewLine(3),
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(3, 0),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(3, 0),
                 }
             }]
         );
@@ -937,8 +933,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::EolComment,
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 8),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 8),
                 }
             }]
         );
@@ -952,8 +948,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::BlockComment,
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(2, 11),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(2, 11),
                 }
             }]
         );
@@ -967,8 +963,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::BlockComment,
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 8),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 8),
                 }
             }]
         );
@@ -982,8 +978,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Int,
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 3),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 3),
                 }
             }]
         );
@@ -997,8 +993,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Float { terminated: true },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 4),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 4),
                 }
             }]
         );
@@ -1013,36 +1009,36 @@ mod test {
                 Token {
                     kind: TokenKind::Ident,
                     span: Span {
-                        start: SpanPos::new(0, 0),
-                        end: SpanPos::new(0, 1),
+                        start: Pos::new(0, 0),
+                        end: Pos::new(0, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::Space(1),
                     span: Span {
-                        start: SpanPos::new(0, 1),
-                        end: SpanPos::new(0, 2),
+                        start: Pos::new(0, 1),
+                        end: Pos::new(0, 2),
                     }
                 },
                 Token {
                     kind: TokenKind::LtEq,
                     span: Span {
-                        start: SpanPos::new(0, 2),
-                        end: SpanPos::new(0, 4),
+                        start: Pos::new(0, 2),
+                        end: Pos::new(0, 4),
                     }
                 },
                 Token {
                     kind: TokenKind::Space(1),
                     span: Span {
-                        start: SpanPos::new(0, 4),
-                        end: SpanPos::new(0, 5),
+                        start: Pos::new(0, 4),
+                        end: Pos::new(0, 5),
                     }
                 },
                 Token {
                     kind: TokenKind::Int,
                     span: Span {
-                        start: SpanPos::new(0, 5),
-                        end: SpanPos::new(0, 7),
+                        start: Pos::new(0, 5),
+                        end: Pos::new(0, 7),
                     }
                 }
             ]
@@ -1057,8 +1053,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Char { terminated: true },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 3),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 3),
                 }
             }]
         );
@@ -1072,8 +1068,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Char { terminated: true },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 4),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 4),
                 }
             }]
         );
@@ -1087,8 +1083,8 @@ mod test {
             vec![Token {
                 kind: TokenKind::Char { terminated: false },
                 span: Span {
-                    start: SpanPos::new(0, 0),
-                    end: SpanPos::new(0, 2),
+                    start: Pos::new(0, 0),
+                    end: Pos::new(0, 2),
                 }
             }]
         );

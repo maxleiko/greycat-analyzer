@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::span::Span;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
@@ -25,8 +25,16 @@ impl fmt::Display for SrcToken<'_> {
             TokenKind::NewLine(n) => write!(f, "NewLine({n})"),
             TokenKind::Ident => write!(f, "Ident({})", self.token.span.as_str(self.source)),
             TokenKind::Int => write!(f, "Int({})", self.token.span.as_str(self.source)),
-            TokenKind::Float { terminated } => write!(f, "Float({}, {terminated})", self.token.span.as_str(self.source)),
-            TokenKind::Char { terminated } => write!(f, "Char({}, {terminated})", self.token.span.as_str(self.source)),
+            TokenKind::Float { terminated } => write!(
+                f,
+                "Float({}, {terminated})",
+                self.token.span.as_str(self.source)
+            ),
+            TokenKind::Char { terminated } => write!(
+                f,
+                "Char({}, {terminated})",
+                self.token.span.as_str(self.source)
+            ),
             TokenKind::Bool => write!(f, "Bool({})", self.token.span.as_str(self.source)),
             TokenKind::Semi => write!(f, "Semi"),
             TokenKind::Comma => write!(f, "Comma"),
@@ -74,7 +82,7 @@ impl fmt::Display for SrcToken<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum TokenKind {
     /// `// comment`
     EolComment,
@@ -186,4 +194,16 @@ pub enum TokenKind {
 
     /// End-of-file
     Eof,
+}
+
+impl TokenKind {
+    pub fn is_trivia(&self) -> bool {
+        matches!(
+            self,
+            TokenKind::EolComment
+                | TokenKind::Space(_)
+                | TokenKind::NewLine(_)
+                | TokenKind::BlockComment
+        )
+    }
 }

@@ -7,15 +7,17 @@ pub trait ToSpan {
     fn span(&self) -> Span;
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 pub struct Span {
-    pub start: SpanPos,
-    pub end: SpanPos,
+    pub start: Pos,
+    pub end: Pos,
 }
 
 impl Span {
     #[inline(always)]
-    pub const fn new(start: SpanPos, end: SpanPos) -> Self {
+    pub const fn new(start: Pos, end: Pos) -> Self {
         Self { start, end }
     }
 
@@ -42,13 +44,13 @@ impl Span {
     }
 }
 
-#[derive(Eq, PartialEq, Clone, Copy, Serialize, Deserialize, Default)]
-pub struct SpanPos {
+#[derive(Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct Pos {
     pub line: u32,
     pub column: u32,
 }
 
-impl SpanPos {
+impl Pos {
     #[inline(always)]
     pub const fn new(line: u32, column: u32) -> Self {
         Self { line, column }
@@ -78,31 +80,31 @@ impl From<&Span> for lsp::Range {
     }
 }
 
-impl From<(SpanPos, SpanPos)> for Span {
+impl From<(Pos, Pos)> for Span {
     #[inline(always)]
-    fn from((start, end): (SpanPos, SpanPos)) -> Self {
+    fn from((start, end): (Pos, Pos)) -> Self {
         Self::new(start, end)
     }
 }
 
-impl From<SpanPos> for lsp::Range {
+impl From<Pos> for lsp::Range {
     #[inline(always)]
-    fn from(s: SpanPos) -> Self {
+    fn from(s: Pos) -> Self {
         Self::new(s.into(), s.into())
     }
 }
 
-impl From<&SpanPos> for lsp::Range {
+impl From<&Pos> for lsp::Range {
     #[inline(always)]
-    fn from(s: &SpanPos) -> Self {
+    fn from(s: &Pos) -> Self {
         Self::new(s.into(), s.into())
     }
 }
 
-impl From<SpanPos> for lsp::Position {
+impl From<Pos> for lsp::Position {
     #[allow(clippy::cast_possible_truncation)]
     #[inline(always)]
-    fn from(p: SpanPos) -> Self {
+    fn from(p: Pos) -> Self {
         Self {
             line: p.line,
             character: p.column,
@@ -110,10 +112,10 @@ impl From<SpanPos> for lsp::Position {
     }
 }
 
-impl From<&SpanPos> for lsp::Position {
+impl From<&Pos> for lsp::Position {
     #[allow(clippy::cast_possible_truncation)]
     #[inline(always)]
-    fn from(p: &SpanPos) -> Self {
+    fn from(p: &Pos) -> Self {
         Self {
             line: p.line,
             character: p.column,
@@ -121,7 +123,7 @@ impl From<&SpanPos> for lsp::Position {
     }
 }
 
-impl From<(usize, usize)> for SpanPos {
+impl From<(usize, usize)> for Pos {
     #[inline(always)]
     fn from(p: (usize, usize)) -> Self {
         Self {
@@ -131,23 +133,23 @@ impl From<(usize, usize)> for SpanPos {
     }
 }
 
-impl From<(u32, u32)> for SpanPos {
+impl From<(u32, u32)> for Pos {
     #[inline(always)]
     fn from((line, column): (u32, u32)) -> Self {
         Self { line, column }
     }
 }
 
-impl From<SpanPos> for (usize, usize) {
+impl From<Pos> for (usize, usize) {
     #[inline(always)]
-    fn from(p: SpanPos) -> Self {
+    fn from(p: Pos) -> Self {
         (p.line as usize, p.column as usize)
     }
 }
 
-impl From<&'_ SpanPos> for (usize, usize) {
+impl From<&'_ Pos> for (usize, usize) {
     #[inline(always)]
-    fn from(p: &'_ SpanPos) -> Self {
+    fn from(p: &'_ Pos) -> Self {
         (p.line as usize, p.column as usize)
     }
 }
@@ -158,13 +160,13 @@ impl std::fmt::Display for Span {
     }
 }
 
-impl std::fmt::Debug for SpanPos {
+impl std::fmt::Debug for Pos {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:4}:{:<4}", self.line, self.column)
     }
 }
 
-impl std::fmt::Display for SpanPos {
+impl std::fmt::Display for Pos {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.line, self.column)
     }
@@ -173,8 +175,8 @@ impl std::fmt::Display for SpanPos {
 #[test]
 fn span_as_range_total() {
     let span = Span {
-        start: SpanPos { line: 0, column: 0 },
-        end: SpanPos { line: 0, column: 5 },
+        start: Pos { line: 0, column: 0 },
+        end: Pos { line: 0, column: 5 },
     };
     let source = "hello";
     assert_eq!(&source[span.as_range(source)], "hello");
@@ -183,8 +185,8 @@ fn span_as_range_total() {
 #[test]
 fn span_as_range_partial_start() {
     let span = Span {
-        start: SpanPos { line: 0, column: 0 },
-        end: SpanPos { line: 0, column: 5 },
+        start: Pos { line: 0, column: 0 },
+        end: Pos { line: 0, column: 5 },
     };
     let source = "hello world";
     assert_eq!(&source[span.as_range(source)], "hello");
@@ -193,8 +195,8 @@ fn span_as_range_partial_start() {
 #[test]
 fn span_as_range_partial_end() {
     let span = Span {
-        start: SpanPos { line: 0, column: 6 },
-        end: SpanPos {
+        start: Pos { line: 0, column: 6 },
+        end: Pos {
             line: 0,
             column: 11,
         },
@@ -206,8 +208,8 @@ fn span_as_range_partial_end() {
 #[test]
 fn span_as_range_not_first_line() {
     let span = Span {
-        start: SpanPos { line: 1, column: 0 },
-        end: SpanPos { line: 1, column: 3 },
+        start: Pos { line: 1, column: 0 },
+        end: Pos { line: 1, column: 3 },
     };
     let source = "one\ntwo\nthree";
     assert_eq!(&source[span.as_range(source)], "two");
@@ -216,8 +218,8 @@ fn span_as_range_not_first_line() {
 #[test]
 fn span_as_range_multiline() {
     let span = Span {
-        start: SpanPos { line: 3, column: 2 },
-        end: SpanPos { line: 4, column: 1 },
+        start: Pos { line: 3, column: 2 },
+        end: Pos { line: 4, column: 1 },
     };
     let source = "one\n\ntwo\nthree\nfour\n\nfive\nsix";
     assert_eq!(&source[span.as_range(source)], "ree\nf");
