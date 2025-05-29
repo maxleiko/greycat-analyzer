@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use lsp_types as lsp;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeTuple};
 
 pub trait ToSpan {
     fn span(&self) -> Span;
@@ -44,7 +44,7 @@ impl Span {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Deserialize, Default, Debug)]
 pub struct Pos {
     pub line: u32,
     pub column: u32,
@@ -63,6 +63,18 @@ impl Pos {
             .take(self.line as usize)
             .fold(0, |acc, line| acc + line.len() + 1) as u32
             + self.column
+    }
+}
+
+impl Serialize for Pos {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(&self.line)?;
+        tuple.serialize_element(&self.column)?;
+        tuple.end()
     }
 }
 
@@ -160,17 +172,12 @@ impl std::fmt::Display for Span {
     }
 }
 
-impl std::fmt::Debug for Pos {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:4}:{:<4}", self.line, self.column)
-    }
-}
-
 impl std::fmt::Display for Pos {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.line, self.column)
     }
 }
+
 
 #[test]
 fn span_as_range_total() {

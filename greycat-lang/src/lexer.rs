@@ -1,14 +1,12 @@
-mod stack;
 mod token;
 
-use stack::LexerStack;
 pub use token::*;
 
 use std::str::Chars;
 
 use lsp_types::Position;
 
-use crate::span::{Span, Pos};
+use crate::span::{Pos, Span};
 
 const EOF: char = '\0';
 
@@ -56,7 +54,7 @@ enum Transition {
 #[derive(Clone)]
 struct State {
     current: Option<Consumer>,
-    stack: LexerStack<Consumer, 15>,
+    stack: Vec<Consumer>,
     next: Option<Transition>,
 }
 
@@ -81,7 +79,7 @@ struct MainLexer;
 
 impl<'a> Consume<'a> for MainLexer {
     fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token {
-        match ctx.next() {
+        match ctx.next_char() {
             EOF => ctx.token(TokenKind::Eof),
             '%' => ctx.token(TokenKind::Percent),
             '*' => ctx.token(TokenKind::Star),
@@ -92,85 +90,85 @@ impl<'a> Consume<'a> for MainLexer {
             ']' => ctx.token(TokenKind::CloseSquare),
             '(' => ctx.token(TokenKind::OpenParen),
             ')' => ctx.token(TokenKind::CloseParen),
-            '<' if ctx.peek(0) == '=' => {
-                ctx.next(); // consume '='
+            '<' if ctx.peek_char(0) == '=' => {
+                ctx.next_char(); // consume '='
                 ctx.token(TokenKind::LtEq)
             }
             '<' => ctx.token(TokenKind::Lt),
-            '>' if ctx.peek(0) == '=' => {
-                ctx.next(); // consume '='
+            '>' if ctx.peek_char(0) == '=' => {
+                ctx.next_char(); // consume '='
                 ctx.token(TokenKind::GtEq)
             }
             '>' => ctx.token(TokenKind::Gt),
-            '!' if ctx.peek(0) == '=' => {
-                ctx.next(); // consume '='
+            '!' if ctx.peek_char(0) == '=' => {
+                ctx.next_char(); // consume '='
                 ctx.token(TokenKind::BangEq)
             }
-            '!' if ctx.peek(0) == '!' => {
-                ctx.next(); // consume '!'
+            '!' if ctx.peek_char(0) == '!' => {
+                ctx.next_char(); // consume '!'
                 ctx.token(TokenKind::BangBang)
             }
             '!' => ctx.token(TokenKind::Bang),
-            '?' if ctx.peek(0) == '?' => {
-                ctx.next(); // consume '?'
+            '?' if ctx.peek_char(0) == '?' => {
+                ctx.next_char(); // consume '?'
                 ctx.token(TokenKind::QuestionQuestion)
             }
-            '?' if ctx.peek(0) == '=' => {
-                ctx.next(); // consume '='
+            '?' if ctx.peek_char(0) == '=' => {
+                ctx.next_char(); // consume '='
                 ctx.token(TokenKind::QuestionEq)
             }
             '?' => ctx.token(TokenKind::Question),
-            ':' if ctx.peek(0) == ':' => {
-                ctx.next(); // consume ':'
+            ':' if ctx.peek_char(0) == ':' => {
+                ctx.next_char(); // consume ':'
                 ctx.token(TokenKind::ColonColon)
             }
             ':' => ctx.token(TokenKind::Colon),
-            '.' if ctx.peek(0) == '.' => {
-                ctx.next(); // consume '.'
+            '.' if ctx.peek_char(0) == '.' => {
+                ctx.next_char(); // consume '.'
                 ctx.token(TokenKind::DotDot)
             }
             '.' => ctx.token(TokenKind::Dot),
             ',' => ctx.token(TokenKind::Comma),
             ';' => ctx.token(TokenKind::Semi),
-            '+' if ctx.peek(0) == '+' => {
-                ctx.next(); // consume '+'
+            '+' if ctx.peek_char(0) == '+' => {
+                ctx.next_char(); // consume '+'
                 ctx.token(TokenKind::PlusPlus)
             }
             '+' => ctx.token(TokenKind::Plus),
-            '-' if ctx.peek(0) == '-' => {
-                ctx.next(); // consume '-'
+            '-' if ctx.peek_char(0) == '-' => {
+                ctx.next_char(); // consume '-'
                 ctx.token(TokenKind::MinusMinus)
             }
-            '-' if ctx.peek(0) == '>' => {
-                ctx.next(); // consume '>'
+            '-' if ctx.peek_char(0) == '>' => {
+                ctx.next_char(); // consume '>'
                 ctx.token(TokenKind::Arrow)
             }
             '-' => ctx.token(TokenKind::Minus),
-            '=' if ctx.peek(0) == '=' => {
-                ctx.next(); // consume '='
+            '=' if ctx.peek_char(0) == '=' => {
+                ctx.next_char(); // consume '='
                 ctx.token(TokenKind::EqEq)
             }
             '=' => ctx.token(TokenKind::Eq),
             '^' => ctx.token(TokenKind::Caret),
-            '&' if ctx.peek(0) == '&' => {
-                ctx.next(); // consume '&'
+            '&' if ctx.peek_char(0) == '&' => {
+                ctx.next_char(); // consume '&'
                 ctx.token(TokenKind::AndAnd)
             }
-            '|' if ctx.peek(0) == '|' => {
-                ctx.next(); // consume '|'
+            '|' if ctx.peek_char(0) == '|' => {
+                ctx.next_char(); // consume '|'
                 ctx.token(TokenKind::OrOr)
             }
             '\n' => {
                 let mut count: usize = 1;
                 loop {
-                    match (ctx.peek(0), ctx.peek(1)) {
+                    match (ctx.peek_char(0), ctx.peek_char(1)) {
                         ('\r', '\n') => {
-                            ctx.next(); // consume '\r'
-                            ctx.next(); // consume '\n'
+                            ctx.next_char(); // consume '\r'
+                            ctx.next_char(); // consume '\n'
                             count += 1;
                         }
                         ('\n', _) => {
-                            ctx.next(); // consume '\n'
+                            ctx.next_char(); // consume '\n'
                             count += 1;
                         }
                         _ => break,
@@ -178,45 +176,45 @@ impl<'a> Consume<'a> for MainLexer {
                 }
                 ctx.token(TokenKind::NewLine(count))
             }
-            '/' if ctx.peek(0) == '/' => {
-                if ctx.peek(1) == '/' {
-                    ctx.next(); // consume first '/'
-                    ctx.next(); // consume second '/'
+            '/' if ctx.peek_char(0) == '/' => {
+                if ctx.peek_char(1) == '/' {
+                    ctx.next_char(); // consume first '/'
+                    ctx.next_char(); // consume second '/'
                     ctx.advance_while(not_newline);
                     ctx.token(TokenKind::DocComment)
                 } else {
-                    ctx.next(); // consume '/'
+                    ctx.next_char(); // consume '/'
                     ctx.advance_while(not_newline);
                     ctx.token(TokenKind::EolComment)
                 }
             }
-            '/' if ctx.peek(0) == '*' => {
-                ctx.next(); // consume '*'
+            '/' if ctx.peek_char(0) == '*' => {
+                ctx.next_char(); // consume '*'
                 loop {
-                    let c0 = ctx.peek(0);
-                    let c1 = ctx.peek(1);
-                    let c2 = ctx.peek(2);
+                    let c0 = ctx.peek_char(0);
+                    let c1 = ctx.peek_char(1);
+                    let c2 = ctx.peek_char(2);
                     match (c0, c1, c2) {
                         (EOF, _, _) => {
                             return ctx.token(TokenKind::Eof);
                         }
                         ('\\', c, _) if c != EOF => {
-                            ctx.next();
-                            ctx.next();
+                            ctx.next_char();
+                            ctx.next_char();
                         }
                         ('*', '/', _) => {
-                            ctx.next();
-                            ctx.next();
+                            ctx.next_char();
+                            ctx.next_char();
                             break;
                         }
                         (_, '*', '/') => {
-                            ctx.next();
-                            ctx.next();
-                            ctx.next();
+                            ctx.next_char();
+                            ctx.next_char();
+                            ctx.next_char();
                             break;
                         }
                         _ => {
-                            ctx.next();
+                            ctx.next_char();
                         }
                     }
                 }
@@ -225,12 +223,12 @@ impl<'a> Consume<'a> for MainLexer {
             '/' => ctx.token(TokenKind::Slash),
             '\'' => {
                 loop {
-                    match ctx.next() {
+                    match ctx.next_char() {
                         EOF | '\n' => {
                             return ctx.token(TokenKind::Char { terminated: false });
                         }
                         '\\' => {
-                            ctx.next(); // skip escaped char
+                            ctx.next_char(); // skip escaped char
                         }
                         '\'' => {
                             break ctx.token(TokenKind::Char { terminated: true });
@@ -256,13 +254,13 @@ impl<'a> Consume<'a> for MainLexer {
 
                 loop {
                     ctx.advance_while(is_number_continue);
-                    if ctx.peek(0) == '.' {
+                    if ctx.peek_char(0) == '.' {
                         if floating {
                             // already got a '.', moving on
                             break;
                         }
                         floating = true;
-                        ctx.next(); // consume '.'
+                        ctx.next_char(); // consume '.'
                         continue;
                     }
                     break;
@@ -271,19 +269,19 @@ impl<'a> Consume<'a> for MainLexer {
                 let number_end_offset = ctx.curr.offset;
 
                 // consume potential postfix
-                if is_id_start(ctx.peek(0)) {
+                if is_id_start(ctx.peek_char(0)) {
                     let postfix_start = ctx.curr.offset as usize;
-                    ctx.next(); // consume start of identifier
+                    ctx.next_char(); // consume start of identifier
                     ctx.advance_while(|c| c.is_alphabetic());
                     match &ctx.source[postfix_start..ctx.curr.offset as usize] {
                         "f" | "float" => floating = true,
-                        "e" | "E" => match ctx.peek(0) {
+                        "e" | "E" => match ctx.peek_char(0) {
                             '-' => {
-                                ctx.next();
+                                ctx.next_char();
                                 scientific = Some(ScientificNotation::Negative);
                             }
                             '+' => {
-                                ctx.next();
+                                ctx.next_char();
                                 scientific = Some(ScientificNotation::Positive);
                             }
                             _ => {
@@ -293,8 +291,8 @@ impl<'a> Consume<'a> for MainLexer {
                         _ => (),
                     }
 
-                    if scientific.is_some() && ctx.peek(0).is_ascii_digit() {
-                        ctx.next();
+                    if scientific.is_some() && ctx.peek_char(0).is_ascii_digit() {
+                        ctx.next_char();
                         ctx.advance_while(is_number_continue);
                     }
                 }
@@ -342,7 +340,7 @@ struct TemplateLexer;
 
 impl<'a> Consume<'a> for TemplateLexer {
     fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token {
-        match ctx.next() {
+        match ctx.next_char() {
             EOF => ctx.token(TokenKind::Eof),
             '"' => {
                 ctx.state.transition(Transition::Pop);
@@ -350,20 +348,20 @@ impl<'a> Consume<'a> for TemplateLexer {
             }
             '\\' => {
                 // escape skips next char
-                ctx.next();
+                ctx.next_char();
                 self.consume(ctx)
             }
-            '$' if ctx.peek(0) == '{' => {
-                ctx.next(); // consume '{' too
+            '$' if ctx.peek_char(0) == '{' => {
+                ctx.next_char(); // consume '{' too
                 ctx.state
                     .transition(Transition::Push(Consumer::Interpolation(
                         InterpolationLexer::default(),
                     )));
                 ctx.token(TokenKind::EnterInterpolation)
             }
-            _ if ctx.peek(0) == '"'
-                || (ctx.peek(0) == '$' && ctx.peek(1) == '{')
-                || ctx.peek(0) == EOF =>
+            _ if ctx.peek_char(0) == '"'
+                || (ctx.peek_char(0) == '$' && ctx.peek_char(1) == '{')
+                || ctx.peek_char(0) == EOF =>
             {
                 // if we are about to exit the template or about to enter an interpolation
                 // push a new token with the current raw string content
@@ -387,7 +385,7 @@ impl<'a> Consume<'a> for InterpolationLexer {
     fn consume(&mut self, ctx: &mut Lexer<'a>) -> Token {
         let mut main_lexer = MainLexer;
 
-        match ctx.peek(0) {
+        match ctx.peek_char(0) {
             EOF => main_lexer.consume(ctx),
             '{' => {
                 self.curly_depth += 1;
@@ -395,7 +393,7 @@ impl<'a> Consume<'a> for InterpolationLexer {
             }
             '}' => {
                 if self.curly_depth == 0 {
-                    ctx.next(); // consume '}'
+                    ctx.next_char(); // consume '}'
                     ctx.state.transition(Transition::Pop);
                     return ctx.token(TokenKind::ExitInterpolation);
                 }
@@ -416,7 +414,7 @@ impl<'a> Lexer<'a> {
             curr: InternalPos::default(),
             state: State {
                 current: Some(Consumer::Main(MainLexer)),
-                stack: LexerStack::new(),
+                stack: Vec::with_capacity(15),
                 next: None,
             },
         }
@@ -455,14 +453,14 @@ impl<'a> Lexer<'a> {
                         self.state.current = self.state.stack.pop();
                     }
                     Transition::Push(next) => {
-                        self.state.current = Some(next);
-                        self.state
-                            .stack
-                            .push(current_lexer)
+                        if self.state.stack.len() == 15 {
                             // We could handle an infinite stack (as long as we have memory) here
                             // but the current GreyCat compiler won't allow more than 15, so let's
                             // stick to what the compiler knows
-                            .expect("internal error, GreyCat only allows 15 nested interpolations");
+                            panic!("internal error, GreyCat only allows 15 nested interpolations");
+                        }
+                        self.state.current = Some(next);
+                        self.state.stack.push(current_lexer);
                     }
                 }
             }
@@ -472,7 +470,7 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline(always)]
-    fn next(&mut self) -> char {
+    fn next_char(&mut self) -> char {
         match self.chars.next() {
             None => EOF,
             Some(c) => {
@@ -483,17 +481,17 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline(always)]
-    fn peek(&self, n: usize) -> char {
+    pub fn peek_char(&self, n: usize) -> char {
         self.chars.clone().nth(n).unwrap_or(EOF)
     }
 
     fn advance_while(&mut self, predicate: fn(char) -> bool) {
         loop {
-            let c = self.peek(0);
+            let c = self.peek_char(0);
             if c == EOF || !predicate(c) {
                 break;
             }
-            self.next();
+            self.next_char();
         }
     }
 

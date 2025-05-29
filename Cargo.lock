@@ -138,6 +138,8 @@ dependencies = [
  "anyhow",
  "clap",
  "greycat-lang",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

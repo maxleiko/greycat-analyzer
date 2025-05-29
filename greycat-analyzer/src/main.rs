@@ -1,8 +1,11 @@
-use std::path::PathBuf;
+mod utils;
+
+use std::{path::PathBuf, time::Instant};
 
 use anyhow::Result;
 use clap::Parser;
 use greycat_lang::lexer::{TokenKind, tokenize};
+use utils::for_each_valid_entry;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -13,11 +16,36 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let source = std::fs::read_to_string(args.project)?;
-    let tokens = tokenize(&source);
-    dump_tokens(&source, &tokens);
+    if args.project.is_dir() {
+        for_each_valid_entry(
+            &args.project,
+            &|entry| entry.extension().is_some_and(|ext| ext == "gcl"),
+            &|entry| {
+                let source = std::fs::read_to_string(entry)?;
+                let start = Instant::now();
+                let tokens = tokenize(&source);
+                println!(
+                    "{:>10.2?} {:6} {}",
+                    start.elapsed(),
+                    tokens.len(),
+                    entry.to_string_lossy()
+                );
+                Ok(())
+            },
+        )?;
+        return Ok(());
+    }
 
-    
+    let source = std::fs::read_to_string(args.project)?;
+    let start = Instant::now();
+    let tokens = tokenize(&source);
+    println!("{} ({:?})", tokens.len(), start.elapsed());
+    // dump_tokens(&source, &tokens);
+
+    // let mut parser = parser::Parser::new(&source);
+    // let module = parser.parse(&source)?;
+
+    // println!("{}", module.to_display_node(&source));
 
     Ok(())
 }
@@ -28,10 +56,10 @@ fn dump_tokens(source: &str, tokens: &[greycat_lang::lexer::Token]) {
         match tok.kind {
             TokenKind::NewLine(n) => {
                 for _ in 0..n {
-                    println!();
+                    eprintln!();
                 }
             }
-            _ => print!("⌈{}⌉", &source[tok.span.as_range(source)]),
+            _ => eprint!("⌈{}⌉", &source[tok.span.as_range(source)]),
         }
     }
 }
