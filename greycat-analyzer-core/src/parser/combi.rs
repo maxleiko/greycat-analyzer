@@ -22,9 +22,9 @@ impl Parser2 {
     }
 
     fn next_token(&mut self) -> Option<Token> {
-        self.tokens.get(self.curr).and_then(|tok| {
+        self.tokens.get(self.curr).map(|tok| {
             self.curr += 1;
-            Some(*tok)
+            *tok
         })
     }
 
@@ -301,14 +301,14 @@ impl<'src> Parser<'src> {
         &mut self,
         source: &'src str,
         ident: &str,
-    ) -> Result<Option<TokenExt>, ParseError> {
+    ) -> Result<TokenExt, ParseError> {
         match self.peek() {
             Some(tok)
                 if tok.kind() == TokenKind::Ident && tok_text(source, &tok.token) == ident =>
             {
-                Ok(self.next())
+                Ok(self.next().unwrap())
             }
-            Some(_) => Ok(None),
+            Some(tok) => Err(ParseError::ExpectedIdent(ident.to_string(), tok.token)),
             None => Err(ParseError::UnexpectedEof),
         }
     }
@@ -317,18 +317,24 @@ impl<'src> Parser<'src> {
         &mut self,
         source: &'src str,
         idents: &[&str],
-    ) -> Result<Option<TokenExt>, ParseError> {
+    ) -> Result<TokenExt, ParseError> {
         match self.peek() {
             Some(tok) if tok.kind() == TokenKind::Ident => {
                 let current = &source[tok.token.span.as_range(source)];
                 for ident in idents {
                     if current == *ident {
-                        return Ok(self.next());
+                        return Ok(self.next().unwrap());
                     }
                 }
-                Ok(None)
+                Err(ParseError::ExpectedIdents(
+                    idents.iter().map(|s| s.to_string()).collect(),
+                    tok.token,
+                ))
             }
-            Some(_) => Ok(None),
+            Some(tok) => Err(ParseError::ExpectedIdents(
+                idents.iter().map(|s| s.to_string()).collect(),
+                tok.token,
+            )),
             None => Err(ParseError::UnexpectedEof),
         }
     }

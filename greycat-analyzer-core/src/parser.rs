@@ -115,10 +115,7 @@ impl Parser2 {
         self.expect_ident_n(source, &["native"])
     }
 
-    fn parse_fn_generic_params<'cst>(
-        &mut self,
-        source: &str,
-    ) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_generic_params<'cst>(&mut self, source: &str) -> ParserResult<Option<Node<'cst>>> {
         if let Some(tok) = self.peek() {
             if tok.kind() != TokenKind::Lt {
                 return Ok(None);
@@ -193,10 +190,7 @@ impl Parser2 {
         })
     }
 
-    fn parse_fn_return_type<'cst>(
-        &mut self,
-        source: &str,
-    ) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_return_type<'cst>(&mut self, source: &str) -> ParserResult<Option<Node<'cst>>> {
         match self.expect_opt(TokenKind::Colon)? {
             Some(colon) => {
                 let type_ident = self.parse_type_ident(source)?;
@@ -297,17 +291,16 @@ impl<'src> Parser<'src> {
         let mut children = Vec::new();
 
         while self.has_token() {
-            let next = self.peek();
-            println!(
-                "{:?}",
-                next.map(|t| (
-                    t.kind(),
-                    &source[t.token.span.as_range(source)],
-                    t.token.span
-                ))
-            );
-            let function = self.parse_function(source)?;
-            children.push(function);
+            match self.peek() {
+                Some(peek) if peek.token.kind == TokenKind::Semi => {
+                    let semi = self.next().unwrap();
+                    semi.merge_into(&mut children);
+                }
+                _ => {
+                    let function = self.parse_function(source)?;
+                    children.push(function);
+                }
+            }
         }
 
         let span = span_from_nodes(&children);
@@ -321,9 +314,7 @@ impl<'src> Parser<'src> {
 
     fn parse_function<'cst>(&mut self, source: &'src str) -> ParserResult<Node<'cst>> {
         let modifiers = self.parse_fn_modifiers(source)?;
-        let kw = self
-            .expect_ident(source, "fn")?
-            .ok_or(ParseError::NoMatch)?;
+        let kw = self.expect_ident(source, "fn")?;
         let name = self.expect(TokenKind::Ident)?;
         let generic_params = self.parse_fn_generic_params(source)?;
         let params = self.parse_fn_params(source)?;
@@ -373,7 +364,12 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_fn_modifier(&mut self, source: &'src str) -> ParserResult<Option<TokenExt>> {
-        self.expect_ident_n(source, &["native"])
+        match self.expect_ident_n(source, &["native"]) {
+            Ok(tok) => Ok(Some(tok)),
+            Err(ParseError::ExpectedIdents(_, _)) => Ok(None),
+            Err(ParseError::UnexpectedEof) => Err(ParseError::UnexpectedEof),
+            Err(_) => unreachable!(),
+        }
     }
 
     fn parse_fn_generic_params<'cst>(

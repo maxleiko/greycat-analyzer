@@ -137,13 +137,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "greycat-lang",
+ "greycat-analyzer-core",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "greycat-lang"
+name = "greycat-analyzer-core"
 version = "0.1.0"
 dependencies = [
  "bumpalo",

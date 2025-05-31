@@ -64,13 +64,13 @@ impl<'a, 'cst, 'src> DisplayNode<'a, 'cst, 'src> {
                 writeln!(f, "{pad}(Error \"{msg}\")")
             }
             NodeKind::Token(kind) => match kind {
-                TokenKind::NewLine(_) | TokenKind::Space(_) => {
-                    writeln!(f, "{pad}({kind:?})")
-                }
-                _ => {
+                TokenKind::Ident => {
                     let lexeme =
                         &self.source[node.token.as_ref().unwrap().span.as_range(self.source)];
                     writeln!(f, "{pad}({kind:?} \"{lexeme}\")")
+                }
+                _ => {
+                    writeln!(f, "{pad}({kind:?})")
                 }
             },
         }

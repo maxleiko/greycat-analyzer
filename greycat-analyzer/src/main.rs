@@ -4,7 +4,10 @@ use std::{path::PathBuf, time::Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use greycat_lang::lexer::{TokenKind, tokenize};
+use greycat_analyzer_core::{
+    lexer::{self, TokenKind, tokenize},
+    parser,
+};
 use utils::for_each_valid_entry;
 
 #[derive(Debug, Parser)]
@@ -38,20 +41,22 @@ fn main() -> Result<()> {
 
     let source = std::fs::read_to_string(args.project)?;
     let start = Instant::now();
-    let tokens = tokenize(&source);
-    println!("{} ({:?})", tokens.len(), start.elapsed());
-    // dump_tokens(&source, &tokens);
+    let mut parser = parser::Parser::new(&source);
+    let module = parser
+        .parse(&source)
+        .map_err(|err| err.to_source_error(&source))?;
 
-    // let mut parser = parser::Parser::new(&source);
-    // let module = parser.parse(&source)?;
-
-    // println!("{}", module.to_display_node(&source));
+    println!(
+        "[{:?}]\n{}",
+        start.elapsed(),
+        module.to_display_node(&source)
+    );
 
     Ok(())
 }
 
 #[allow(dead_code)]
-fn dump_tokens(source: &str, tokens: &[greycat_lang::lexer::Token]) {
+fn dump_tokens(source: &str, tokens: &[lexer::Token]) {
     for tok in tokens {
         match tok.kind {
             TokenKind::NewLine(n) => {

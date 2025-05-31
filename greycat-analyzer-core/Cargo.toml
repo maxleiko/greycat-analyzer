@@ -1,5 +1,5 @@
 [package]
-name = "greycat-lang"
+name = "greycat-analyzer-core"
 version = "0.1.0"
 edition = "2024"
 
