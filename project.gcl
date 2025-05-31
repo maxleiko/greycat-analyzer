@@ -1,3 +1,5 @@
+@include("examples/src");
+
 fn main() {
   println("Hello, world!");
 }

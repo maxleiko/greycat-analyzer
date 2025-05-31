@@ -11,7 +11,8 @@
     "allowUnusedLabels": false,
     "noImplicitReturns": true,
     "noUnusedLocals": true,
-    "noUnusedParameters": true
+    "noUnusedParameters": true,
+    "resolveJsonModule": true
   },
   "include": ["src"],
   "exclude": ["node_modules", ".vscode-test"]

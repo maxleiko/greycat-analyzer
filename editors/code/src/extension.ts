@@ -1,4 +1,12 @@
-import { commands, ExtensionContext, OutputChannel, window } from 'vscode';
+import {
+  commands,
+  ExtensionContext,
+  MarkdownString,
+  OutputChannel,
+  StatusBarAlignment,
+  window,
+} from 'vscode';
+import { version } from '../package.json';
 
 import {
   Executable,
@@ -17,6 +25,7 @@ export function activate(ctx: ExtensionContext) {
     commands.registerCommand('greycat-analyzer.restart', restart)
   );
 
+  statusBar(ctx);
   startClient();
 }
 
@@ -60,4 +69,46 @@ function startClient() {
   );
 
   return client.start();
+}
+
+function statusBar(ctx: ExtensionContext) {
+  const statusBarItem = window.createStatusBarItem(
+    StatusBarAlignment.Left,
+    100
+  );
+  statusBarItem.text = 'greycat-analyzer';
+  statusBarItem.tooltip = new MarkdownString(
+    [
+      `Extension: ${version}`,
+      '',
+      '---',
+      '',
+      '[$(refresh) Restart](command:greycat-analyzer.restart)  ',
+      '',
+      '[Need help?](https://doc.greycat.io)',
+    ].join('\n'),
+    true
+  );
+  // Required to make links clickable
+  statusBarItem.tooltip.isTrusted = true;
+  statusBarItem.command = 'greycat-analyzer.restart';
+  // statusBarItem.show();
+
+  function updateStatusBarVisiblity() {
+    const editor = window.activeTextEditor;
+    if (!editor) {
+      return;
+    }
+    if (editor.document.languageId === 'greycat') {
+      statusBarItem.show();
+    } else {
+      statusBarItem.hide();
+    }
+  }
+
+  ctx.subscriptions.push(
+    statusBarItem,
+    window.onDidChangeActiveTextEditor(updateStatusBarVisiblity),
+    window.onDidChangeVisibleTextEditors(updateStatusBarVisiblity)
+  );
 }

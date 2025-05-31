@@ -1,3 +1,5 @@
+use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -6,13 +8,14 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::Document;
+use crate::{Document, Project};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
+    projects: Arc<DashMap<Url, Project>>,
 }
 
 impl Backend {
@@ -20,7 +23,15 @@ impl Backend {
         Self {
             client,
             documents: Default::default(),
+            projects: Default::default(),
         }
+    }
+
+    pub fn register_project(&self, project_path: PathBuf) {
+        let uri = Url::from_file_path(&project_path).expect("invalid url");
+        let project = Project::new(project_path);
+        debug!("new project {project}");
+        self.projects.insert(uri, project);
     }
 }
 
@@ -33,6 +44,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncOptions {
                         open_close: Some(true),
                         change: Some(TextDocumentSyncKind::INCREMENTAL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                         ..Default::default()
                     },
                 )),
@@ -59,12 +71,57 @@ impl LanguageServer for Backend {
                 format!("greycat-analyzer-ls v{VERSION} initialized"),
             )
             .await;
+
+        if let Ok(Some(workspaces)) = self.client.workspace_folders().await {
+            for ws in workspaces {
+                if let Ok(ws_root) = ws.uri.to_file_path() {
+                    let project_path = ws_root.join("project.gcl");
+                    if project_path.exists() {
+                        self.register_project(project_path);
+                    }
+                }
+            }
+        }
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         debug!("did_open {}", params.text_document.uri);
         let doc = params.text_document;
-        self.documents.insert(doc.uri.clone(), Document::from(doc));
+        match self.projects.get(&doc.uri) {
+            Some(_project) => {
+                // already registered, nothing to do
+            }
+            None => {
+                if let Ok(path) = doc.uri.to_file_path() {
+                    if path.file_name() == Some(OsStr::new("project.gcl")) {
+                        // the document is a project.gcl file, lets register it
+                        self.register_project(path);
+                        return;
+                    }
+                }
+                // if we reach this point it means we are dealing with a module
+                // that may or may not be a part of a project, lets try to find
+                // if we have projects that include that module
+                let orphan = self
+                    .projects
+                    .iter()
+                    .filter(|project| project.includes(&doc.uri))
+                    .count()
+                    == 0;
+                if orphan {
+                    self.client
+                        .publish_diagnostics(
+                            doc.uri,
+                            vec![Diagnostic::new_simple(
+                                Range::default(),
+                                "This module is not part of any registered project".to_string(),
+                            )],
+                            Some(doc.version),
+                        )
+                        .await;
+                }
+            }
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -73,6 +130,14 @@ impl LanguageServer for Backend {
             debug!("did_change {}", &*doc);
         } else {
             debug!("did_change unknown: {}", params.text_document.uri);
+        }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        if let Some(doc) = self.documents.get_mut(&params.text_document.uri) {
+            debug!("did_save {}", &*doc);
+        } else {
+            debug!("did_save unknown: {}", params.text_document.uri);
         }
     }
 

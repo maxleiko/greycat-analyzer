@@ -8,6 +8,14 @@ pub struct Document {
 }
 
 impl Document {
+    pub fn uri(&self) -> &Url {
+        &self.uri
+    }
+
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
     pub fn text(&self) -> &Rope {
         &self.text
     }
@@ -20,35 +28,22 @@ impl Document {
     }
 
     fn apply_change(&mut self, change: TextDocumentContentChangeEvent) {
-        let TextDocumentContentChangeEvent {
-            range,
-            range_length,
-            text,
-        } = change;
-        match (range, range_length) {
+        match (change.range, change.range_length) {
             (None, None) => {
                 // full text change
                 self.text.remove(..);
-                self.text.insert(0, &text);
+                self.text.insert(0, &change.text);
             }
             (Some(range), Some(len)) => {
-                // increment text change
+                // incremental text change
                 let start_char_idx = self.text.line_to_char(range.start.line as usize);
                 let start = start_char_idx + range.start.character as usize;
                 self.text.remove(start..start + len as usize);
-                self.text.insert(start, &text);
+                self.text.insert(start, &change.text);
             }
             (Some(_), None) | (None, Some(_)) => unreachable!(),
         }
     }
-
-    // pub fn offset_at(&self, pos: Position) -> Option<usize> {
-    //     let mut offset = 0;
-    //     let mut lines = self.text.lines();
-
-    //     let line = lines.nth(pos.line as usize)?;
-    //     for (i, c) in line.line
-    // }
 }
 
 impl From<TextDocumentItem> for Document {
