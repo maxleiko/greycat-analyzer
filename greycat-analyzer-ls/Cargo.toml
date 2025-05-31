@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dashmap = "6.1.0"
 greycat-analyzer-core = { path = "../greycat-analyzer-core" }
-tower-lsp = { version = "0.20.0" }
-
+dashmap = "6.1.0"
+log = "0.4.27"
+ropey = "1.6.1"
+tower-lsp = "0.20.0"
