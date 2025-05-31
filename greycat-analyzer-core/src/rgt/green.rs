@@ -8,7 +8,7 @@ pub struct NodeId(pub usize);
 /// Immutable syntax node
 #[derive(Debug)]
 pub struct GreenNode<'a> {
-    pub kind: NodeKind<'a>,
+    pub kind: NodeKind,
     pub children: Vec<'a, &'a GreenNode<'a>>,
     pub span: Span,
     pub id: NodeId,
@@ -16,7 +16,7 @@ pub struct GreenNode<'a> {
 
 #[derive(Debug)]
 pub(crate) struct GreenNodeBuilder<'a> {
-    pub kind: NodeKind<'a>,
+    pub kind: NodeKind,
     pub children: Vec<'a, &'a GreenNode<'a>>,
     pub span: Span,
 }

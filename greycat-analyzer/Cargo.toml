@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.98"
+anyhow = { version = "1.0.98" }
 clap = { version = "4.5.38", features = ["derive"] }
 greycat-analyzer-core = { path = "../greycat-analyzer-core" }
-serde = "*"
-serde_json = "*"
+greycat-analyzer-ls = { path = "../greycat-analyzer-ls" }
+serde = { version = "1.0.219" }
+serde_json = { version = "1.0.140" }
+tokio = { version = "1.45.1", features = ["full"] }
+tower-lsp = { version = "0.20.0" }

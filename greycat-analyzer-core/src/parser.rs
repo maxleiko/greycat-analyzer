@@ -1,13 +1,13 @@
 pub mod combi;
 pub mod error;
 
-use std::{borrow::Cow, iter::Peekable};
+use std::iter::Peekable;
 
 use combi::span_from_nodes;
 use error::ParseError;
 
 use crate::{
-    cst::{Node, NodeKind},
+    cst::{Node, NodeKind, NodeRule},
     lexer::{Lexer, Token, TokenKind, tokenize},
 };
 
@@ -32,7 +32,7 @@ impl Parser2 {
         parser
     }
 
-    pub fn parse<'cst>(&mut self, source: &str) -> ParserResult<Node<'cst>> {
+    pub fn parse(&mut self, source: &str) -> ParserResult<Node> {
         let mut children = Vec::new();
 
         while self.has_token() {
@@ -51,14 +51,14 @@ impl Parser2 {
 
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(std::borrow::Cow::Borrowed("Module")),
+            kind: NodeKind::Rule(NodeRule::Module),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_function<'cst>(&mut self, source: &str) -> ParserResult<Node<'cst>> {
+    fn parse_function(&mut self, source: &str) -> ParserResult<Node> {
         let modifiers = self.parse_fn_modifiers(source)?;
         let kw = self
             .expect_ident(source, "fn")?
@@ -87,14 +87,14 @@ impl Parser2 {
         }
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("function")),
+            kind: NodeKind::Rule(NodeRule::Function),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_fn_modifiers<'cst>(&mut self, source: &str) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_modifiers(&mut self, source: &str) -> ParserResult<Option<Node>> {
         let mut children = Vec::new();
         while let Some(modifier) = self.parse_fn_modifier(source)? {
             modifier.merge_into(&mut children);
@@ -104,7 +104,7 @@ impl Parser2 {
         }
         let span = span_from_nodes(&children);
         Ok(Some(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("fn_modifiers")),
+            kind: NodeKind::Rule(NodeRule::FnModifiers),
             children,
             token: None,
             span,
@@ -115,7 +115,7 @@ impl Parser2 {
         self.expect_ident_n(source, &["native"])
     }
 
-    fn parse_fn_generic_params<'cst>(&mut self, source: &str) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_generic_params(&mut self, source: &str) -> ParserResult<Option<Node>> {
         if let Some(tok) = self.peek() {
             if tok.kind() != TokenKind::Lt {
                 return Ok(None);
@@ -127,7 +127,7 @@ impl Parser2 {
             TokenKind::Comma,
             TokenKind::Gt,
             Parser2::parse_generic_param,
-            "generic_params",
+            NodeRule::GenericParams,
         ) {
             Ok(node) => Ok(Some(node)),
             Err(ParseError::NoMatch) => Ok(None),
@@ -135,31 +135,31 @@ impl Parser2 {
         }
     }
 
-    fn parse_generic_param<'cst>(&mut self, _source: &str) -> ParserResult<Node<'cst>> {
+    fn parse_generic_param(&mut self, _source: &str) -> ParserResult<Node> {
         let ident = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
         ident.merge_into(&mut children);
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("generic_param")),
+            kind: NodeKind::Rule(NodeRule::GenericParam),
             children,
             span,
             token: None,
         })
     }
 
-    fn parse_fn_params<'cst>(&mut self, source: &str) -> ParserResult<Node<'cst>> {
+    fn parse_fn_params(&mut self, source: &str) -> ParserResult<Node> {
         self.many_sep(
             source,
             TokenKind::OpenParen,
             TokenKind::Comma,
             TokenKind::CloseParen,
             Parser2::parse_fn_param,
-            "fn_params",
+            NodeRule::FnParams,
         )
     }
 
-    fn parse_fn_param<'cst>(&mut self, source: &str) -> ParserResult<Node<'cst>> {
+    fn parse_fn_param(&mut self, source: &str) -> ParserResult<Node> {
         let name = self.expect(TokenKind::Ident)?;
         let colon = self.expect(TokenKind::Colon)?;
         let type_ident = self.parse_type_ident(source)?;
@@ -169,28 +169,28 @@ impl Parser2 {
         children.push(type_ident);
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("fn_param")),
+            kind: NodeKind::Rule(NodeRule::FnParam),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_type_ident<'cst>(&mut self, _source: &str) -> ParserResult<Node<'cst>> {
+    fn parse_type_ident(&mut self, _source: &str) -> ParserResult<Node> {
         // TODO complete type ident grammar
         let name = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
         name.merge_into(&mut children);
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("type_ident")),
+            kind: NodeKind::Rule(NodeRule::TypeIdent),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_fn_return_type<'cst>(&mut self, source: &str) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_return_type(&mut self, source: &str) -> ParserResult<Option<Node>> {
         match self.expect_opt(TokenKind::Colon)? {
             Some(colon) => {
                 let type_ident = self.parse_type_ident(source)?;
@@ -199,7 +199,7 @@ impl Parser2 {
                 children.push(type_ident);
                 let span = span_from_nodes(&children);
                 let node = Node {
-                    kind: NodeKind::Rule(Cow::Borrowed("return_type")),
+                    kind: NodeKind::Rule(NodeRule::ReturnType),
                     children,
                     span,
                     token: None,
@@ -210,7 +210,7 @@ impl Parser2 {
         }
     }
 
-    fn parse_fn_body<'cst>(&mut self, source: &str) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_body(&mut self, source: &str) -> ParserResult<Option<Node>> {
         match self.expect_opt(TokenKind::OpenCurly)? {
             Some(ocurly) => {
                 let mut stmts = Vec::new();
@@ -224,7 +224,7 @@ impl Parser2 {
                             ccurly.merge_into(&mut children);
                             let span = span_from_nodes(&children);
                             let node = Node {
-                                kind: NodeKind::Rule(Cow::Borrowed("body")),
+                                kind: NodeKind::Rule(NodeRule::Body),
                                 children,
                                 token: None,
                                 span,
@@ -243,7 +243,7 @@ impl Parser2 {
         }
     }
 
-    fn parse_body_stmt<'cst>(&mut self, _source: &str) -> ParserResult<Node<'cst>> {
+    fn parse_body_stmt(&mut self, _source: &str) -> ParserResult<Node> {
         // TODO actual body stmt parsing, right now we just eat everything until ';'
         let mut children = Vec::new();
         while let Some(tok) = self.peek() {
@@ -253,7 +253,7 @@ impl Parser2 {
                     semi.merge_into(&mut children);
                     let span = span_from_nodes(&children);
                     return Ok(Node {
-                        kind: NodeKind::Rule(Cow::Borrowed("body_stmt")),
+                        kind: NodeKind::Rule(NodeRule::BodyStmt),
                         children,
                         token: None,
                         span,
@@ -287,7 +287,7 @@ impl<'src> Parser<'src> {
         parser
     }
 
-    pub fn parse<'cst>(&mut self, source: &'src str) -> ParserResult<Node<'cst>> {
+    pub fn parse(&mut self, source: &'src str) -> ParserResult<Node> {
         let mut children = Vec::new();
 
         while self.has_token() {
@@ -305,14 +305,14 @@ impl<'src> Parser<'src> {
 
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(std::borrow::Cow::Borrowed("Module")),
+            kind: NodeKind::Rule(NodeRule::Module),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_function<'cst>(&mut self, source: &'src str) -> ParserResult<Node<'cst>> {
+    fn parse_function(&mut self, source: &'src str) -> ParserResult<Node> {
         let modifiers = self.parse_fn_modifiers(source)?;
         let kw = self.expect_ident(source, "fn")?;
         let name = self.expect(TokenKind::Ident)?;
@@ -339,14 +339,14 @@ impl<'src> Parser<'src> {
         }
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("function")),
+            kind: NodeKind::Rule(NodeRule::Function),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_fn_modifiers<'cst>(&mut self, source: &'src str) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_modifiers(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         let mut children = Vec::new();
         while let Some(modifier) = self.parse_fn_modifier(source)? {
             modifier.merge_into(&mut children);
@@ -356,7 +356,7 @@ impl<'src> Parser<'src> {
         }
         let span = span_from_nodes(&children);
         Ok(Some(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("fn_modifiers")),
+            kind: NodeKind::Rule(NodeRule::FnModifiers),
             children,
             token: None,
             span,
@@ -372,10 +372,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_fn_generic_params<'cst>(
-        &mut self,
-        source: &'src str,
-    ) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_generic_params(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         if let Some(tok) = self.peek() {
             if tok.kind() != TokenKind::Lt {
                 return Ok(None);
@@ -387,7 +384,7 @@ impl<'src> Parser<'src> {
             TokenKind::Comma,
             TokenKind::Gt,
             Parser::parse_generic_param,
-            "generic_params",
+            NodeRule::GenericParams,
         ) {
             Ok(node) => Ok(Some(node)),
             Err(ParseError::NoMatch) => Ok(None),
@@ -395,31 +392,31 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_generic_param<'cst>(&mut self, _source: &'src str) -> ParserResult<Node<'cst>> {
+    fn parse_generic_param(&mut self, _source: &'src str) -> ParserResult<Node> {
         let ident = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
         ident.merge_into(&mut children);
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("generic_param")),
+            kind: NodeKind::Rule(NodeRule::GenericParam),
             children,
             span,
             token: None,
         })
     }
 
-    fn parse_fn_params<'cst>(&mut self, source: &'src str) -> ParserResult<Node<'cst>> {
+    fn parse_fn_params(&mut self, source: &'src str) -> ParserResult<Node> {
         self.many_sep(
             source,
             TokenKind::OpenParen,
             TokenKind::Comma,
             TokenKind::CloseParen,
             Parser::parse_fn_param,
-            "fn_params",
+            NodeRule::FnParams,
         )
     }
 
-    fn parse_fn_param<'cst>(&mut self, source: &'src str) -> ParserResult<Node<'cst>> {
+    fn parse_fn_param(&mut self, source: &'src str) -> ParserResult<Node> {
         let name = self.expect(TokenKind::Ident)?;
         let colon = self.expect(TokenKind::Colon)?;
         let type_ident = self.parse_type_ident(source)?;
@@ -429,31 +426,28 @@ impl<'src> Parser<'src> {
         children.push(type_ident);
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("fn_param")),
+            kind: NodeKind::Rule(NodeRule::FnParam),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_type_ident<'cst>(&mut self, _source: &'src str) -> ParserResult<Node<'cst>> {
+    fn parse_type_ident(&mut self, _source: &'src str) -> ParserResult<Node> {
         // TODO complete type ident grammar
         let name = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
         name.merge_into(&mut children);
         let span = span_from_nodes(&children);
         Ok(Node {
-            kind: NodeKind::Rule(Cow::Borrowed("type_ident")),
+            kind: NodeKind::Rule(NodeRule::TypeIdent),
             children,
             token: None,
             span,
         })
     }
 
-    fn parse_fn_return_type<'cst>(
-        &mut self,
-        source: &'src str,
-    ) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_return_type(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         match self.expect_opt(TokenKind::Colon)? {
             Some(colon) => {
                 let type_ident = self.parse_type_ident(source)?;
@@ -462,7 +456,7 @@ impl<'src> Parser<'src> {
                 children.push(type_ident);
                 let span = span_from_nodes(&children);
                 let node = Node {
-                    kind: NodeKind::Rule(Cow::Borrowed("return_type")),
+                    kind: NodeKind::Rule(NodeRule::ReturnType),
                     children,
                     span,
                     token: None,
@@ -473,7 +467,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_fn_body<'cst>(&mut self, source: &'src str) -> ParserResult<Option<Node<'cst>>> {
+    fn parse_fn_body(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         match self.expect_opt(TokenKind::OpenCurly)? {
             Some(ocurly) => {
                 let mut stmts = Vec::new();
@@ -487,7 +481,7 @@ impl<'src> Parser<'src> {
                             ccurly.merge_into(&mut children);
                             let span = span_from_nodes(&children);
                             let node = Node {
-                                kind: NodeKind::Rule(Cow::Borrowed("body")),
+                                kind: NodeKind::Rule(NodeRule::Body),
                                 children,
                                 token: None,
                                 span,
@@ -506,7 +500,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_body_stmt<'cst>(&mut self, _source: &'src str) -> ParserResult<Node<'cst>> {
+    fn parse_body_stmt(&mut self, _source: &'src str) -> ParserResult<Node> {
         // TODO actual body stmt parsing, right now we just eat everything until ';'
         let mut children = Vec::new();
         while let Some(tok) = self.peek() {
@@ -516,7 +510,7 @@ impl<'src> Parser<'src> {
                     semi.merge_into(&mut children);
                     let span = span_from_nodes(&children);
                     return Ok(Node {
-                        kind: NodeKind::Rule(Cow::Borrowed("body_stmt")),
+                        kind: NodeKind::Rule(NodeRule::BodyStmt),
                         children,
                         token: None,
                         span,
@@ -551,7 +545,7 @@ impl TokenExt {
         self.leading.len() + 1 + self.trailing.len()
     }
 
-    fn merge_into<'cst>(self, children: &mut Vec<Node<'cst>>) {
+    fn merge_into(self, children: &mut Vec<Node>) {
         children.reserve(self.nb_tokens());
         let TokenExt {
             leading,
@@ -563,9 +557,9 @@ impl TokenExt {
         children.extend(trailing.into_iter().map(Node::from));
     }
 
-    fn merge_into_as<'cst, F>(self, children: &mut Vec<Node<'cst>>, as_node: F)
+    fn merge_into_as<F>(self, children: &mut Vec<Node>, as_node: F)
     where
-        F: Fn(Token) -> Node<'cst>,
+        F: Fn(Token) -> Node,
     {
         children.reserve(self.nb_tokens());
         let TokenExt {

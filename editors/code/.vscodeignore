@@ -1,0 +1,10 @@
+dist
+!dist/extension.js
+node_modules
+src
+scripts
+package-lock.json
+.vscode
+.vscodeignore
+.gitignore
+tsconfig.json

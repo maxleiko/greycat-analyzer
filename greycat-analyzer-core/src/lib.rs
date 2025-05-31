@@ -5,3 +5,5 @@ pub mod rgt;
 pub mod lexer;
 pub mod parser;
 pub mod span;
+// #[cfg(feature = "wasm")]
+// mod wasm;

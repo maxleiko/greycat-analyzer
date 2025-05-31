@@ -1,7 +1,5 @@
-use std::borrow::Cow;
-
 use crate::{
-    cst::{Node, NodeKind},
+    cst::{Node, NodeError, NodeKind, NodeRule},
     lexer::{Token, TokenKind},
     span::Span,
 };
@@ -122,15 +120,15 @@ impl Parser2 {
         }
     }
 
-    pub(super) fn many_sep<'cst>(
+    pub(super) fn many_sep(
         &mut self,
         source: &str,
         open: TokenKind,
         sep: TokenKind,
         close: TokenKind,
-        item_parser: impl Fn(&mut Self, &str) -> Result<Node<'cst>, ParseError>,
-        rule_name: &'static str,
-    ) -> Result<Node<'cst>, ParseError> {
+        item_parser: impl Fn(&mut Self, &str) -> Result<Node, ParseError>,
+        rule: NodeRule,
+    ) -> Result<Node, ParseError> {
         let mut children = Vec::new();
 
         // Parse and collect the opening token
@@ -153,7 +151,7 @@ impl Parser2 {
                         close_tok.merge_into(&mut children);
                         let span = span_from_nodes(&children);
                         return Ok(Node {
-                            kind: NodeKind::Rule(Cow::Borrowed(rule_name)),
+                            kind: NodeKind::Rule(rule),
                             children,
                             token: None,
                             span,
@@ -161,7 +159,7 @@ impl Parser2 {
                     } else if tok.kind() == sep {
                         let comma = self.next().unwrap();
                         comma.merge_into_as(&mut children, |token| Node {
-                            kind: NodeKind::Error(Cow::Borrowed("unexpected separator")),
+                            kind: NodeKind::Error(NodeError::UnexpectedSeparator),
                             children: Vec::new(),
                             span: token.span,
                             token: Some(token),
@@ -179,7 +177,7 @@ impl Parser2 {
                         close_tok.merge_into(&mut children);
                         let span = span_from_nodes(&children);
                         return Ok(Node {
-                            kind: NodeKind::Rule(Cow::Borrowed(rule_name)),
+                            kind: NodeKind::Rule(rule),
                             children,
                             token: None,
                             span,
@@ -190,7 +188,7 @@ impl Parser2 {
                         state = State::AfterSep;
                     } else {
                         children.push(Node {
-                            kind: NodeKind::Error(Cow::Borrowed("missing separator")),
+                            kind: NodeKind::Error(NodeError::MissingSeparator),
                             children: Vec::new(),
                             span: tok.token.span,
                             token: Some(tok.token),
@@ -204,7 +202,7 @@ impl Parser2 {
                         close_tok.merge_into(&mut children);
                         let span = span_from_nodes(&children);
                         return Ok(Node {
-                            kind: NodeKind::Rule(Cow::Borrowed(rule_name)),
+                            kind: NodeKind::Rule(rule),
                             children,
                             token: None,
                             span,
@@ -212,7 +210,7 @@ impl Parser2 {
                     } else if tok.kind() == sep {
                         let extra = self.next().unwrap();
                         extra.merge_into_as(&mut children, |token| Node {
-                            kind: NodeKind::Error(Cow::Borrowed("unexpected separator")),
+                            kind: NodeKind::Error(NodeError::UnexpectedSeparator),
                             children: Vec::new(),
                             span: token.span,
                             token: Some(token),
@@ -345,9 +343,9 @@ impl<'src> Parser<'src> {
         open: TokenKind,
         sep: TokenKind,
         close: TokenKind,
-        item_parser: impl Fn(&mut Self, &'src str) -> Result<Node<'cst>, ParseError>,
-        rule_name: &'static str,
-    ) -> Result<Node<'cst>, ParseError> {
+        item_parser: impl Fn(&mut Self, &'src str) -> Result<Node, ParseError>,
+        rule: NodeRule,
+    ) -> Result<Node, ParseError> {
         let mut children = Vec::new();
 
         // Parse and collect the opening token
@@ -370,7 +368,7 @@ impl<'src> Parser<'src> {
                         close_tok.merge_into(&mut children);
                         let span = span_from_nodes(&children);
                         return Ok(Node {
-                            kind: NodeKind::Rule(Cow::Borrowed(rule_name)),
+                            kind: NodeKind::Rule(rule),
                             children,
                             token: None,
                             span,
@@ -378,7 +376,7 @@ impl<'src> Parser<'src> {
                     } else if tok.kind() == sep {
                         let comma = self.next().unwrap();
                         comma.merge_into_as(&mut children, |token| Node {
-                            kind: NodeKind::Error(Cow::Borrowed("unexpected separator")),
+                            kind: NodeKind::Error(NodeError::UnexpectedSeparator),
                             children: Vec::new(),
                             span: token.span,
                             token: Some(token),
@@ -396,7 +394,7 @@ impl<'src> Parser<'src> {
                         close_tok.merge_into(&mut children);
                         let span = span_from_nodes(&children);
                         return Ok(Node {
-                            kind: NodeKind::Rule(Cow::Borrowed(rule_name)),
+                            kind: NodeKind::Rule(rule),
                             children,
                             token: None,
                             span,
@@ -407,7 +405,7 @@ impl<'src> Parser<'src> {
                         state = State::AfterSep;
                     } else {
                         children.push(Node {
-                            kind: NodeKind::Error(Cow::Borrowed("missing separator")),
+                            kind: NodeKind::Error(NodeError::MissingSeparator),
                             children: Vec::new(),
                             span: tok.token.span,
                             token: Some(tok.token),
@@ -421,7 +419,7 @@ impl<'src> Parser<'src> {
                         close_tok.merge_into(&mut children);
                         let span = span_from_nodes(&children);
                         return Ok(Node {
-                            kind: NodeKind::Rule(Cow::Borrowed(rule_name)),
+                            kind: NodeKind::Rule(rule),
                             children,
                             token: None,
                             span,
@@ -429,7 +427,7 @@ impl<'src> Parser<'src> {
                     } else if tok.kind() == sep {
                         let extra = self.next().unwrap();
                         extra.merge_into_as(&mut children, |token| Node {
-                            kind: NodeKind::Error(Cow::Borrowed("unexpected separator")),
+                            kind: NodeKind::Error(NodeError::UnexpectedSeparator),
                             children: Vec::new(),
                             span: token.span,
                             token: Some(token),
@@ -456,7 +454,7 @@ fn tok_text<'src>(source: &'src str, token: &'src Token) -> &'src str {
     &source[token.span.as_range(source)]
 }
 
-pub(super) fn span_from_nodes(nodes: &[Node<'_>]) -> Span {
+pub(super) fn span_from_nodes(nodes: &[Node]) -> Span {
     match (nodes.first(), nodes.last()) {
         (None, None) => Span::default(),
         (Some(first), Some(last)) => Span {

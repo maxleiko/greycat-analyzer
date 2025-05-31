@@ -4,8 +4,6 @@ pub use token::*;
 
 use std::str::Chars;
 
-use lsp_types::Position;
-
 use crate::span::{Pos, Span};
 
 const EOF: char = '\0';
@@ -558,15 +556,6 @@ impl InternalPos {
         if c == '\n' {
             self.line += 1;
             self.characters = 0;
-        }
-    }
-}
-
-impl From<InternalPos> for Position {
-    fn from(value: InternalPos) -> Self {
-        Self {
-            line: value.line,
-            character: value.characters,
         }
     }
 }

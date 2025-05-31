@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [ "greycat-analyzer","greycat-analyzer-core"]
+members = ["greycat-analyzer", "greycat-analyzer-core", "greycat-analyzer-ls"]
 
 [profile.release]
 strip = true
