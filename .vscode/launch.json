@@ -7,11 +7,20 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "Debug analyzer",
+      "name": "Debug lint",
       "cargo": {
         "args": ["build", "--bin", "greycat-analyzer"]
       },
       "args": ["lint", "${workspaceFolder}/project.gcl"]
+    },
+        {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug cst",
+      "cargo": {
+        "args": ["build", "--bin", "greycat-analyzer"]
+      },
+      "args": ["cst", "${workspaceFolder}/project.gcl"]
     }
   ]
 }

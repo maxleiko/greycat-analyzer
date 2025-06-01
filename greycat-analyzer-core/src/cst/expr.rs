@@ -3,15 +3,19 @@ use crate::{
     lexer::TokenKind,
 };
 
-use super::{Parser, ParserResult, error::ParseError, span_from_nodes};
+use super::{
+    combi::span_from_nodes,
+    error::ParseError,
+    parser::{CstParser, ParserResult},
+};
 
-impl<'src> Parser<'src> {
-    pub fn parse_expr(&mut self, source: &'src str) -> ParserResult<Node> {
+impl<'src> CstParser<'src> {
+    pub(super) fn parse_expr(&mut self, source: &'src str) -> ParserResult<Node> {
         // TODO all other expressions
         self.parse_string(source)
     }
 
-    pub fn parse_string(&mut self, source: &'src str) -> ParserResult<Node> {
+    pub(super) fn parse_string(&mut self, source: &'src str) -> ParserResult<Node> {
         let mut children = Vec::new();
 
         let oquote = self.expect(TokenKind::DoubleQuote)?;
@@ -23,12 +27,12 @@ impl<'src> Parser<'src> {
                     let equote = self.next().unwrap();
                     equote.merge_into(&mut children);
                     let span = span_from_nodes(&children);
-                    return Ok(Node {
-                        kind: NodeKind::Rule(NodeRule::String),
+                    let node = Node::Rule {
+                        rule: NodeRule::String,
                         children,
-                        token: None,
                         span,
-                    });
+                    };
+                    return Ok(node);
                 }
                 TokenKind::RawString => {
                     let raw_string = self.next().unwrap();
@@ -40,19 +44,14 @@ impl<'src> Parser<'src> {
                 }
                 kind => {
                     let unexpected = self.next().unwrap();
-                    unexpected.merge_into_as(&mut children, |tok| Node {
-                        kind: NodeKind::Error(NodeError::UnexpectedToken),
-                        children: Vec::new(),
-                        span: tok.span,
-                        token: Some(tok),
-                    });
+                    unexpected.merge_into_as_error(&mut children, NodeError::UnexpectedToken);
                 }
             }
         }
         Err(ParseError::UnexpectedEof)
     }
 
-    pub fn parse_interpolation(&mut self, source: &'src str) -> ParserResult<Node> {
+    pub(super) fn parse_interpolation(&mut self, source: &'src str) -> ParserResult<Node> {
         todo!()
     }
 }

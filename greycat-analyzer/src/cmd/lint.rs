@@ -1,12 +1,10 @@
 use std::{path::PathBuf, time::Instant};
 
-use anyhow::Result;
-use clap::Parser;
-use greycat_analyzer_core::{lexer::tokenize, parser};
-
 use crate::utils::for_each_valid_entry;
+use anyhow::Result;
+use greycat_analyzer_core::{Token, TokenKind, parse, tokenize};
 
-#[derive(Parser)]
+#[derive(clap::Parser)]
 #[clap(about = "Lints a project")]
 pub struct Lint {
     #[clap(help = "Path to a project.gcl")]
@@ -37,17 +35,26 @@ impl Lint {
 
         let source = std::fs::read_to_string(self.project)?;
         let start = Instant::now();
-        let mut parser = parser::Parser::new(&source);
-        let module = parser
-            .parse_module(&source)
-            .map_err(|err| err.to_source_error(&source))?;
-
-        println!(
-            "[{:?}]\n{}",
-            start.elapsed(),
-            module.to_display_node(&source)
-        );
+        let mut errors = Vec::new();
+        let module =
+            parse("project", &source, &mut errors).map_err(|err| err.to_source_error(&source))?;
+        let took = start.elapsed();
+        println!("{:#?}", module);
+        println!("Parsed in {took:?}, {} errors", errors.len());
 
         Ok(())
+    }
+}
+
+fn dump_tokens(source: &str, tokens: &[Token]) {
+    for tok in tokens {
+        match tok.kind {
+            TokenKind::NewLine(n) => {
+                for _ in 0..n {
+                    eprintln!();
+                }
+            }
+            _ => eprint!("⌈{}⌉", &source[tok.span.as_range(source)]),
+        }
     }
 }

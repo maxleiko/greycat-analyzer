@@ -39,6 +39,13 @@ impl Span {
         }
     }
 
+    pub fn to_range(&self) -> lsp::Range {
+        lsp::Range {
+            start: self.start.to_position(),
+            end: self.end.to_position(),
+        }
+    }
+
     pub fn as_str<'s>(&self, source: &'s str) -> &'s str {
         &source[self.as_range(source)]
     }
@@ -63,6 +70,13 @@ impl Pos {
             .take(self.line as usize)
             .fold(0, |acc, line| acc + line.len() + 1) as u32
             + self.column
+    }
+
+    pub fn to_position(&self) -> lsp::Position {
+        lsp::Position {
+            line: self.line,
+            character: self.column,
+        }
     }
 }
 
@@ -177,7 +191,6 @@ impl std::fmt::Display for Pos {
         write!(f, "{}:{}", self.line, self.column)
     }
 }
-
 
 #[test]
 fn span_as_range_total() {

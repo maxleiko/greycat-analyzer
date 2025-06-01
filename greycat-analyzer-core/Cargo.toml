@@ -12,9 +12,13 @@ edition = "2024"
 
 [dependencies]
 bumpalo = { version = "3.17.0", features = ["collections"] }
+log = "0.4.27"
 lsp-types = { version = "0.97.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 # wasm-bindgen = { version = "0.2.100", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
+
+[build-dependencies]
+cc = "1.2.25"

@@ -1,29 +1,76 @@
+mod combi;
+pub mod error;
+mod expr;
+mod parser;
+mod stmt;
+mod token_ext;
+
+pub use parser::*;
+
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     lexer::{Token, TokenKind},
-    span::Span,
+    span::{Pos, Span},
 };
 
 /// A node in the concrete syntax tree
+// #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// pub struct Node2 {
+//     /// The kind of this node (non-terminal name or token kind wrapped as leaf)
+//     pub kind: NodeKind,
+//     /// Children nodes (only empty if this is a leaf node)
+//     #[serde(skip_serializing_if = "Vec::is_empty")]
+//     pub children: Vec<Node>,
+//     /// Optional token if this is a leaf
+//     #[serde(skip)]
+//     pub token: Option<Token>,
+//     /// Span of the node, covers the span of all children or token
+//     #[serde(skip)]
+//     pub span: Span,
+// }
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Node {
-    /// The kind of this node (non-terminal name or token kind wrapped as leaf)
-    pub kind: NodeKind,
-    /// Children nodes (only empty if this is a leaf node)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub children: Vec<Node>,
-    /// Optional token if this is a leaf
-    #[serde(skip)]
-    pub token: Option<Token>,
-    /// Span of the node, covers the span of all children or token
-    #[serde(skip)]
-    pub span: Span,
+pub enum Node {
+    Rule {
+        rule: NodeRule,
+        children: Vec<Node>,
+        span: Span,
+    },
+    Token(Token),
+    Error {
+        kind: NodeError,
+        token: Token,
+    },
 }
 
 impl Node {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Rule { span, .. } => *span,
+            Self::Token(token) => token.span,
+            Self::Error { token, .. } => token.span,
+        }
+    }
+
+    pub fn start(&self) -> Pos {
+        match self {
+            Self::Rule { span, .. } => span.start,
+            Self::Token(token) => token.span.start,
+            Self::Error { token, .. } => token.span.start,
+        }
+    }
+
+    pub fn end(&self) -> Pos {
+        match self {
+            Self::Rule { span, .. } => span.end,
+            Self::Token(token) => token.span.end,
+            Self::Error { token, .. } => token.span.end,
+        }
+    }
+
     pub fn to_display_node<'a>(&'a self, source: &'a str) -> DisplayNode<'a> {
         DisplayNode { node: self, source }
     }
@@ -46,6 +93,7 @@ pub enum NodeKind {
 pub enum NodeRule {
     Module,
     Function,
+    Name,
     FnModifiers,
     GenericParams,
     GenericParam,
@@ -68,16 +116,20 @@ pub enum NodeError {
     UnexpectedToken,
 }
 
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnexpectedSeparator => write!(f, "unexpected separator"),
+            Self::MissingSeparator => write!(f, "missing separator"),
+            Self::UnexpectedToken => write!(f, "unexpected token"),
+        }
+    }
+}
+
 impl From<Token> for Node {
     #[inline]
     fn from(value: Token) -> Self {
-        let span = value.span;
-        Self {
-            kind: NodeKind::Token(value.kind),
-            children: Vec::new(),
-            span,
-            token: Some(value),
-        }
+        Self::Token(value)
     }
 }
 
@@ -95,27 +147,29 @@ impl<'a> fmt::Display for DisplayNode<'a> {
 impl<'a> DisplayNode<'a> {
     fn fmt_node(&self, f: &mut fmt::Formatter<'_>, node: &Node, indent: usize) -> fmt::Result {
         let pad = "  ".repeat(indent);
-        match &node.kind {
-            NodeKind::Rule(name) => {
-                writeln!(f, "{pad}({name:?}")?;
-                for child in &node.children {
+        match node {
+            Node::Rule {
+                rule,
+                children,
+                span,
+            } => {
+                writeln!(f, "{pad}({rule:?}")?;
+                for child in children {
                     self.fmt_node(f, child, indent + 1)?;
                 }
                 writeln!(f, "{pad})")
             }
-            NodeKind::Error(err) => {
-                writeln!(f, "{pad}(Error \"{err:?}\")")
-            }
-            NodeKind::Token(kind) => match kind {
-                TokenKind::Ident | TokenKind::RawString => {
-                    let lexeme =
-                        &self.source[node.token.as_ref().unwrap().span.as_range(self.source)];
+            Node::Token(token) => match token.kind {
+                kind @ TokenKind::Ident | kind @ TokenKind::RawString => {
+                    let lexeme = &self.source[token.span.as_range(self.source)];
                     writeln!(f, "{pad}({kind:?} \"{lexeme}\")")
                 }
-                _ => {
+                kind  if !kind.is_trivia() => {
                     writeln!(f, "{pad}({kind:?})")
                 }
+                _ => Ok(())
             },
+            Node::Error { kind, .. } => writeln!(f, "{pad}(ERROR \"{kind:?}\")"),
         }
     }
 }

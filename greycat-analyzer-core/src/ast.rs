@@ -1,12 +1,23 @@
+mod parser;
+
+pub use parser::*;
+
+use crate::{cst, span::Span};
+
 #[derive(Debug)]
 pub struct Module {
-    stmts: Vec<Stmt>,
+    pub name: String,
+    pub pragmas: Vec<Pragma>,
+    pub functions: Vec<Function>,
+    pub span: Span,
 }
 
 #[derive(Debug)]
-pub enum Stmt {
-    Fn(Function),
+pub struct Function {
+    pub name: Span,
 }
 
 #[derive(Debug)]
-pub struct Function {}
+pub struct Pragma {
+    pub name: Span,
+}
