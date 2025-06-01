@@ -3,7 +3,7 @@ use crate::{
     lexer::{Token, TokenKind},
 };
 
-use super::NodeError;
+use super::ErrorKind;
 
 /// Used during parsing to collect leading/trailing trivia tokens around a non-trivia token
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ impl TokenExt {
         children.extend(trailing.into_iter().map(Node::from));
     }
 
-    pub fn merge_into_as_error(self, children: &mut Vec<Node>, kind: NodeError) {
+    pub fn merge_into_as_error(self, children: &mut Vec<Node>, kind: ErrorKind) {
         children.reserve(self.nb_tokens());
         let TokenExt {
             leading,
@@ -60,7 +60,7 @@ impl TokenExt {
             trailing,
         } = self;
         children.extend(leading.into_iter().map(Node::from));
-        children.push(Node::Error { kind, token });
+        children.push(Node::error(kind, token));
         children.extend(trailing.into_iter().map(Node::from));
     }
 }

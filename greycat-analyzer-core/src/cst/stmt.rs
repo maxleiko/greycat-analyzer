@@ -1,18 +1,18 @@
 use crate::{
     Token,
-    cst::{Node, NodeKind, NodeRule},
+    cst::{Node, Rule},
     lexer::TokenKind,
 };
 
 use super::{
     combi::span_from_nodes,
     error::ParseError,
-    parser::{CstParser, ParserResult},
-    token_ext::TokenExt,
+    cst_parser::{CstParser, ParserResult},
+    token_ext::TokenExt, NodeRule,
 };
 
 impl<'src> CstParser<'src> {
-    pub fn parse_module(&mut self, source: &'src str) -> ParserResult<Node> {
+    pub fn parse_module(&mut self, source: &'src str) -> ParserResult<NodeRule> {
         let mut children = Vec::new();
 
         let mut bkp = None;
@@ -50,12 +50,7 @@ impl<'src> CstParser<'src> {
             }
         }
 
-        let span = span_from_nodes(&children);
-        Ok(Node::Rule {
-            rule: NodeRule::Module,
-            children,
-            span,
-        })
+        Ok(NodeRule::new(Rule::Module, children))
     }
 
     fn parse_pragma_stmt(&mut self, source: &'src str) -> ParserResult<Node> {
@@ -67,7 +62,7 @@ impl<'src> CstParser<'src> {
             TokenKind::Comma,
             TokenKind::CloseParen,
             CstParser::parse_expr,
-            NodeRule::PragmaArgs,
+            Rule::PragmaArgs,
         )?;
         let semi = self.expect(TokenKind::Semi)?;
 
@@ -76,12 +71,7 @@ impl<'src> CstParser<'src> {
         name.merge_into_as(&mut children, as_name);
         children.push(args);
         semi.merge_into(&mut children);
-        let span = span_from_nodes(&children);
-        Ok(Node::Rule {
-            rule: NodeRule::PragmaStmt,
-            children,
-            span,
-        })
+        Ok(Node::rule(Rule::PragmaStmt, children))
     }
 
     fn parse_function(&mut self, source: &'src str) -> ParserResult<Node> {
@@ -109,12 +99,7 @@ impl<'src> CstParser<'src> {
         if let Some(body) = body {
             children.push(body);
         }
-        let span = span_from_nodes(&children);
-        Ok(Node::Rule {
-            rule: NodeRule::Function,
-            children,
-            span,
-        })
+        Ok(Node::rule(Rule::Function, children))
     }
 
     fn parse_fn_modifiers(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
@@ -125,12 +110,7 @@ impl<'src> CstParser<'src> {
         if children.is_empty() {
             return Ok(None);
         }
-        let span = span_from_nodes(&children);
-        Ok(Some(Node::Rule {
-            rule: NodeRule::FnModifiers,
-            children,
-            span,
-        }))
+        Ok(Some(Node::rule(Rule::FnModifiers, children)))
     }
 
     fn parse_fn_modifier(&mut self, source: &'src str) -> ParserResult<Option<TokenExt>> {
@@ -154,7 +134,7 @@ impl<'src> CstParser<'src> {
             TokenKind::Comma,
             TokenKind::Gt,
             CstParser::parse_generic_param,
-            NodeRule::GenericParams,
+            Rule::GenericParams,
         ) {
             Ok(node) => Ok(Some(node)),
             Err(ParseError::NoMatch) => Ok(None),
@@ -166,12 +146,7 @@ impl<'src> CstParser<'src> {
         let ident = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
         ident.merge_into(&mut children);
-        let span = span_from_nodes(&children);
-        Ok(Node::Rule {
-            rule: NodeRule::GenericParam,
-            children,
-            span,
-        })
+        Ok(Node::rule(Rule::GenericParam, children))
     }
 
     fn parse_fn_params(&mut self, source: &'src str) -> ParserResult<Node> {
@@ -181,7 +156,7 @@ impl<'src> CstParser<'src> {
             TokenKind::Comma,
             TokenKind::CloseParen,
             CstParser::parse_fn_param,
-            NodeRule::FnParams,
+            Rule::FnParams,
         )
     }
 
@@ -193,12 +168,7 @@ impl<'src> CstParser<'src> {
         name.merge_into_as(&mut children, as_name);
         colon.merge_into(&mut children);
         children.push(type_ident);
-        let span = span_from_nodes(&children);
-        Ok(Node::Rule {
-            rule: NodeRule::FnParam,
-            children,
-            span,
-        })
+        Ok(Node::rule(Rule::FnParam, children))
     }
 
     fn parse_type_ident(&mut self, _source: &'src str) -> ParserResult<Node> {
@@ -206,12 +176,7 @@ impl<'src> CstParser<'src> {
         let name = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
         name.merge_into_as(&mut children, as_name);
-        let span = span_from_nodes(&children);
-        Ok(Node::Rule {
-            rule: NodeRule::TypeIdent,
-            children,
-            span,
-        })
+        Ok(Node::rule(Rule::TypeIdent, children))
     }
 
     fn parse_fn_return_type(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
@@ -221,12 +186,7 @@ impl<'src> CstParser<'src> {
                 let mut children = Vec::new();
                 colon.merge_into(&mut children);
                 children.push(type_ident);
-                let span = span_from_nodes(&children);
-                Ok(Some(Node::Rule {
-                    rule: NodeRule::ReturnType,
-                    children,
-                    span,
-                }))
+                Ok(Some(Node::rule(Rule::ReturnType, children)))
             }
             None => Ok(None),
         }
@@ -244,13 +204,7 @@ impl<'src> CstParser<'src> {
                             ocurly.merge_into(&mut children);
                             children.extend(stmts);
                             ccurly.merge_into(&mut children);
-                            let span = span_from_nodes(&children);
-                            let node = Node::Rule {
-                                rule: NodeRule::Body,
-                                children,
-                                span,
-                            };
-                            return Ok(Some(node));
+                            return Ok(Some(Node::rule(Rule::Body, children)));
                         }
                         _ => {
                             let stmt = self.parse_body_stmt(source)?;
@@ -272,13 +226,7 @@ impl<'src> CstParser<'src> {
                 TokenKind::Semi => {
                     let semi = self.next().unwrap();
                     semi.merge_into(&mut children);
-                    let span = span_from_nodes(&children);
-                    let node = Node::Rule {
-                        rule: NodeRule::BodyStmt,
-                        children,
-                        span,
-                    };
-                    return Ok(node);
+                    return Ok(Node::rule(Rule::BodyStmt, children));
                 }
                 _ => {
                     let tok = self.next().unwrap();
@@ -291,9 +239,5 @@ impl<'src> CstParser<'src> {
 }
 
 fn as_name(token: Token) -> Node {
-    Node::Rule {
-        rule: NodeRule::Name,
-        children: vec![Node::Token(token)],
-        span: token.span,
-    }
+    Node::rule(Rule::Name, vec![Node::Token(token)])
 }

@@ -1,4 +1,7 @@
-use crate::lexer::{Token, TokenKind};
+use crate::{
+    lexer::{Token, TokenKind},
+    span::Span,
+};
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -6,6 +9,7 @@ pub enum ParseError {
     UnexpectedToken(TokenKind, Token),
     ExpectedIdent(String, Token),
     ExpectedIdents(Box<[String]>, Token),
+    Unexpected(Span),
     UnexpectedEof,
 }
 
@@ -82,6 +86,12 @@ impl std::fmt::Display for SourceParseError<'_> {
                 idents.join(", "),
                 &self.source[got.span.as_range(self.source)],
                 got.span
+            ),
+            ParseError::Unexpected(span) => writeln!(
+                f,
+                "unexpected token '{}' at {}",
+                &self.source[span.as_range(self.source)],
+                span
             ),
             ParseError::UnexpectedEof => writeln!(f, "<EOF>"),
         }

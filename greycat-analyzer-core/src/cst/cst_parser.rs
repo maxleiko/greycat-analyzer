@@ -1,7 +1,7 @@
 use std::iter::Peekable;
 
 use crate::{
-    cst::{Node, NodeKind, NodeRule},
+    cst::{Node, Rule},
     lexer::{Lexer, Token, TokenKind, tokenize},
 };
 

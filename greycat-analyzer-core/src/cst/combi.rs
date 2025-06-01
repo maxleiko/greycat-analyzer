@@ -1,10 +1,10 @@
 use crate::{
-    cst::{Node, NodeError, NodeKind, NodeRule},
+    cst::{ErrorKind, Node, Rule},
     lexer::{Token, TokenKind},
     span::Span,
 };
 
-use super::{error::ParseError, parser::CstParser, token_ext::TokenExt};
+use super::{error::ParseError, cst_parser::CstParser, token_ext::TokenExt};
 
 impl<'src> CstParser<'src> {
     pub(super) fn has_token(&self) -> bool {
@@ -118,7 +118,7 @@ impl<'src> CstParser<'src> {
         sep: TokenKind,
         close: TokenKind,
         item_parser: impl Fn(&mut Self, &'src str) -> Result<Node, ParseError>,
-        rule: NodeRule,
+        rule: Rule,
     ) -> Result<Node, ParseError> {
         let mut children = Vec::new();
 
@@ -140,18 +140,10 @@ impl<'src> CstParser<'src> {
                     if tok.kind() == close {
                         let close_tok = self.next().unwrap();
                         close_tok.merge_into(&mut children);
-                        let span = span_from_nodes(&children);
-                        return Ok(Node::Rule {
-                            rule,
-                            children,
-                            span,
-                        });
+                        return Ok(Node::rule(rule, children));
                     } else if tok.kind() == sep {
                         let comma = self.next().unwrap();
-                        comma.merge_into_as(&mut children, |token| Node::Error {
-                            kind: NodeError::UnexpectedSeparator,
-                            token,
-                        });
+                        comma.merge_into_as_error(&mut children, ErrorKind::UnexpectedSeparator);
                         state = State::AfterSep;
                     } else {
                         let item = item_parser(self, source)?;
@@ -163,12 +155,7 @@ impl<'src> CstParser<'src> {
                     if tok.kind() == close {
                         let close_tok = self.next().unwrap();
                         close_tok.merge_into(&mut children);
-                        let span = span_from_nodes(&children);
-                        return Ok(Node::Rule {
-                            rule,
-                            children,
-                            span,
-                        });
+                        return Ok(Node::rule(rule, children));
                     } else if tok.kind() == sep {
                         let sep_tok = self.next().unwrap();
                         sep_tok.merge_into(&mut children);
@@ -176,10 +163,7 @@ impl<'src> CstParser<'src> {
                     } else {
                         // TODO review the following line as it might have dropped some tokens along the way
                         //      might need to use merge_into_as (not sure)
-                        children.push(Node::Error {
-                            kind: NodeError::MissingSeparator,
-                            token: tok.token,
-                        });
+                        children.push(Node::error(ErrorKind::MissingSeparator, tok.token));
                         state = State::AfterSep;
                     }
                 }
@@ -187,18 +171,10 @@ impl<'src> CstParser<'src> {
                     if tok.kind() == close {
                         let close_tok = self.next().unwrap();
                         close_tok.merge_into(&mut children);
-                        let span = span_from_nodes(&children);
-                        return Ok(Node::Rule {
-                            rule,
-                            children,
-                            span,
-                        });
+                        return Ok(Node::rule(rule, children));
                     } else if tok.kind() == sep {
                         let extra = self.next().unwrap();
-                        extra.merge_into_as(&mut children, |token| Node::Error {
-                            kind: NodeError::UnexpectedSeparator,
-                            token,
-                        });
+                        extra.merge_into_as_error(&mut children, ErrorKind::UnexpectedSeparator);
                     } else {
                         let item = item_parser(self, source)?;
                         children.push(item);

@@ -1,18 +1,19 @@
 use crate::{
-    cst::{Node, NodeError, NodeKind, NodeRule},
+    cst::{ErrorKind, Node, Rule},
     lexer::TokenKind,
 };
 
 use super::{
     combi::span_from_nodes,
+    cst_parser::{CstParser, ParserResult},
     error::ParseError,
-    parser::{CstParser, ParserResult},
 };
 
 impl<'src> CstParser<'src> {
     pub(super) fn parse_expr(&mut self, source: &'src str) -> ParserResult<Node> {
         // TODO all other expressions
-        self.parse_string(source)
+        let s = self.parse_string(source)?;
+        Ok(Node::rule(Rule::Expr, vec![s]))
     }
 
     pub(super) fn parse_string(&mut self, source: &'src str) -> ParserResult<Node> {
@@ -26,13 +27,7 @@ impl<'src> CstParser<'src> {
                 TokenKind::DoubleQuote => {
                     let equote = self.next().unwrap();
                     equote.merge_into(&mut children);
-                    let span = span_from_nodes(&children);
-                    let node = Node::Rule {
-                        rule: NodeRule::String,
-                        children,
-                        span,
-                    };
-                    return Ok(node);
+                    return Ok(Node::rule(Rule::String, children));
                 }
                 TokenKind::RawString => {
                     let raw_string = self.next().unwrap();
@@ -44,7 +39,7 @@ impl<'src> CstParser<'src> {
                 }
                 kind => {
                     let unexpected = self.next().unwrap();
-                    unexpected.merge_into_as_error(&mut children, NodeError::UnexpectedToken);
+                    unexpected.merge_into_as_error(&mut children, ErrorKind::UnexpectedToken);
                 }
             }
         }
