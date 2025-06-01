@@ -39,7 +39,7 @@ impl Lint {
         let start = Instant::now();
         let mut parser = parser::Parser::new(&source);
         let module = parser
-            .parse(&source)
+            .parse_module(&source)
             .map_err(|err| err.to_source_error(&source))?;
 
         println!(

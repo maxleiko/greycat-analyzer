@@ -11,7 +11,7 @@
       "cargo": {
         "args": ["build", "--bin", "greycat-analyzer"]
       },
-      "args": ["${workspaceFolder}/project.gcl"]
+      "args": ["lint", "${workspaceFolder}/project.gcl"]
     }
   ]
 }

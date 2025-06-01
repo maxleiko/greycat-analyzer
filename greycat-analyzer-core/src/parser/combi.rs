@@ -443,10 +443,6 @@ impl<'src> Parser<'src> {
 
         Err(ParseError::UnexpectedEof)
     }
-
-    pub(super) fn error(&mut self, err: ParseError) {
-        self.errors.push(err)
-    }
 }
 
 /// Helper to get string slice from token's span in source text

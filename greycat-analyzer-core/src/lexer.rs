@@ -238,7 +238,7 @@ impl<'a> Consume<'a> for MainLexer {
             '"' => {
                 ctx.state
                     .transition(Transition::Push(Consumer::Template(TemplateLexer)));
-                ctx.token(TokenKind::Doublequote)
+                ctx.token(TokenKind::DoubleQuote)
             }
             c if is_whitespace(c) => {
                 ctx.advance_while(is_whitespace);
@@ -342,7 +342,7 @@ impl<'a> Consume<'a> for TemplateLexer {
             EOF => ctx.token(TokenKind::Eof),
             '"' => {
                 ctx.state.transition(Transition::Pop);
-                ctx.token(TokenKind::Doublequote)
+                ctx.token(TokenKind::DoubleQuote)
             }
             '\\' => {
                 // escape skips next char
@@ -616,7 +616,7 @@ mod test {
             tokens,
             vec![
                 Token {
-                    kind: TokenKind::Doublequote,
+                    kind: TokenKind::DoubleQuote,
                     span: Span {
                         start: Pos::new(0, 0),
                         end: Pos::new(0, 1),
@@ -630,7 +630,7 @@ mod test {
                     }
                 },
                 Token {
-                    kind: TokenKind::Doublequote,
+                    kind: TokenKind::DoubleQuote,
                     span: Span {
                         start: Pos::new(0, 12),
                         end: Pos::new(0, 13),
@@ -647,7 +647,7 @@ mod test {
             tokens,
             vec![
                 Token {
-                    kind: TokenKind::Doublequote,
+                    kind: TokenKind::DoubleQuote,
                     span: Span {
                         start: Pos::new(0, 0),
                         end: Pos::new(0, 1),
@@ -671,7 +671,7 @@ mod test {
             tokens,
             vec![
                 Token {
-                    kind: TokenKind::Doublequote,
+                    kind: TokenKind::DoubleQuote,
                     span: Span {
                         start: Pos::new(0, 0),
                         end: Pos::new(0, 1),
@@ -706,7 +706,7 @@ mod test {
                     }
                 },
                 Token {
-                    kind: TokenKind::Doublequote,
+                    kind: TokenKind::DoubleQuote,
                     span: Span {
                         start: Pos::new(0, 15),
                         end: Pos::new(0, 16),
@@ -723,7 +723,7 @@ mod test {
             tokens,
             vec![
                 Token {
-                    kind: TokenKind::Doublequote,
+                    kind: TokenKind::DoubleQuote,
                     span: Span {
                         start: Pos::new(0, 0),
                         end: Pos::new(0, 1),
@@ -751,7 +751,7 @@ mod test {
                     }
                 },
                 Token {
-                    kind: TokenKind::Doublequote,
+                    kind: TokenKind::DoubleQuote,
                     span: Span {
                         start: Pos::new(0, 14),
                         end: Pos::new(0, 15),

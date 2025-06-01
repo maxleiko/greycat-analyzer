@@ -72,7 +72,7 @@ impl fmt::Display for SrcToken<'_> {
             TokenKind::Slash => write!(f, "Slash"),
             TokenKind::Caret => write!(f, "Caret"),
             TokenKind::Percent => write!(f, "Percent"),
-            TokenKind::Doublequote => write!(f, "Doublequote"),
+            TokenKind::DoubleQuote => write!(f, "Doublequote"),
             TokenKind::EnterInterpolation => write!(f, "EnterInterpolation"),
             TokenKind::ExitInterpolation => write!(f, "ExitInterpolation"),
             TokenKind::RawString => write!(f, "RawString"),
@@ -181,7 +181,7 @@ pub enum TokenKind {
     /// `%`
     Percent,
     /// `"`
-    Doublequote,
+    DoubleQuote,
     /// `${`
     EnterInterpolation,
     /// `}`

@@ -1,56 +1,47 @@
-mod combi;
-pub mod error;
-mod expr;
-mod stmt;
-mod token_ext;
-
-use std::iter::Peekable;
-
-use combi::span_from_nodes;
-use error::ParseError;
-use token_ext::TokenExt;
-
 use crate::{
     cst::{Node, NodeKind, NodeRule},
-    lexer::{Lexer, Token, TokenKind, tokenize},
+    lexer::TokenKind,
 };
 
-type ParserResult<T> = std::result::Result<T, ParseError>;
+use super::{Parser, ParserResult, TokenExt, error::ParseError, span_from_nodes};
 
-pub struct Parser2 {
-    tokens: Vec<Token>,
-    curr: usize,
-    lookahead: Option<TokenExt>,
-    errors: Vec<ParseError>,
-}
-
-impl Parser2 {
-    pub fn new(source: &str) -> Self {
-        let mut parser = Self {
-            tokens: tokenize(source),
-            curr: 0,
-            lookahead: None,
-            errors: Vec::new(),
-        };
-        parser.lookahead = parser.bump();
-        parser
-    }
-
-    pub fn parse(&mut self, source: &str) -> ParserResult<Node> {
+impl<'src> Parser<'src> {
+    pub fn parse_module(&mut self, source: &'src str) -> ParserResult<Node> {
         let mut children = Vec::new();
 
+        let mut bkp = None;
         while self.has_token() {
-            let next = self.peek();
-            println!(
-                "{:?}",
-                next.map(|t| (
-                    t.kind(),
-                    &source[t.token.span.as_range(source)],
-                    t.token.span
-                ))
-            );
-            let function = self.parse_function(source)?;
-            children.push(function);
+            bkp.replace(self.clone());
+            match self.peek() {
+                Some(peek) if peek.token.kind == TokenKind::Semi => {
+                    let semi = self.next().unwrap();
+                    semi.merge_into(&mut children);
+                }
+                _ => {
+                    match self.parse_function(source) {
+                        Ok(function) => {
+                            children.push(function);
+                            continue;
+                        }
+                        Err(ParseError::UnexpectedEof) => return Err(ParseError::UnexpectedEof),
+                        Err(_err) => {
+                            // backtrack lexer
+                            self.restore(bkp.take().unwrap());
+                        }
+                    }
+                    match self.parse_pragma_stmt(source) {
+                        Ok(function) => {
+                            children.push(function);
+                            continue;
+                        }
+                        Err(ParseError::UnexpectedEof) => return Err(ParseError::UnexpectedEof),
+                        Err(_err) => {
+                            // backtrack lexer
+                            self.restore(bkp.take().unwrap());
+                        }
+                    }
+                }
+            }
         }
 
         let span = span_from_nodes(&children);
@@ -62,11 +53,36 @@ impl Parser2 {
         })
     }
 
-    fn parse_function(&mut self, source: &str) -> ParserResult<Node> {
+    fn parse_pragma_stmt(&mut self, source: &'src str) -> ParserResult<Node> {
+        let at = self.expect(TokenKind::At)?;
+        let name = self.expect(TokenKind::Ident)?;
+        let args = self.many_sep(
+            source,
+            TokenKind::OpenParen,
+            TokenKind::Comma,
+            TokenKind::CloseParen,
+            Parser::parse_expr,
+            NodeRule::PragmaArgs,
+        )?;
+        let semi = self.expect(TokenKind::Semi)?;
+
+        let mut children = Vec::new();
+        at.merge_into(&mut children);
+        name.merge_into(&mut children);
+        children.push(args);
+        semi.merge_into(&mut children);
+        let span = span_from_nodes(&children);
+        Ok(Node {
+            kind: NodeKind::Rule(NodeRule::PragmaStmt),
+            children,
+            span,
+            token: None,
+        })
+    }
+
+    fn parse_function(&mut self, source: &'src str) -> ParserResult<Node> {
         let modifiers = self.parse_fn_modifiers(source)?;
-        let kw = self
-            .expect_ident(source, "fn")?
-            .ok_or(ParseError::NoMatch)?;
+        let kw = self.expect_ident(source, "fn")?;
         let name = self.expect(TokenKind::Ident)?;
         let generic_params = self.parse_fn_generic_params(source)?;
         let params = self.parse_fn_params(source)?;
@@ -98,7 +114,7 @@ impl Parser2 {
         })
     }
 
-    fn parse_fn_modifiers(&mut self, source: &str) -> ParserResult<Option<Node>> {
+    fn parse_fn_modifiers(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         let mut children = Vec::new();
         while let Some(modifier) = self.parse_fn_modifier(source)? {
             modifier.merge_into(&mut children);
@@ -115,11 +131,16 @@ impl Parser2 {
         }))
     }
 
-    fn parse_fn_modifier(&mut self, source: &str) -> ParserResult<Option<TokenExt>> {
-        self.expect_ident_n(source, &["native"])
+    fn parse_fn_modifier(&mut self, source: &'src str) -> ParserResult<Option<TokenExt>> {
+        match self.expect_ident_n(source, &["native"]) {
+            Ok(tok) => Ok(Some(tok)),
+            Err(ParseError::ExpectedIdents(_, _)) => Ok(None),
+            Err(ParseError::UnexpectedEof) => Err(ParseError::UnexpectedEof),
+            Err(_) => unreachable!(),
+        }
     }
 
-    fn parse_fn_generic_params(&mut self, source: &str) -> ParserResult<Option<Node>> {
+    fn parse_fn_generic_params(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         if let Some(tok) = self.peek() {
             if tok.kind() != TokenKind::Lt {
                 return Ok(None);
@@ -130,7 +151,7 @@ impl Parser2 {
             TokenKind::Lt,
             TokenKind::Comma,
             TokenKind::Gt,
-            Parser2::parse_generic_param,
+            Parser::parse_generic_param,
             NodeRule::GenericParams,
         ) {
             Ok(node) => Ok(Some(node)),
@@ -139,7 +160,7 @@ impl Parser2 {
         }
     }
 
-    fn parse_generic_param(&mut self, _source: &str) -> ParserResult<Node> {
+    fn parse_generic_param(&mut self, _source: &'src str) -> ParserResult<Node> {
         let ident = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
         ident.merge_into(&mut children);
@@ -152,18 +173,18 @@ impl Parser2 {
         })
     }
 
-    fn parse_fn_params(&mut self, source: &str) -> ParserResult<Node> {
+    fn parse_fn_params(&mut self, source: &'src str) -> ParserResult<Node> {
         self.many_sep(
             source,
             TokenKind::OpenParen,
             TokenKind::Comma,
             TokenKind::CloseParen,
-            Parser2::parse_fn_param,
+            Parser::parse_fn_param,
             NodeRule::FnParams,
         )
     }
 
-    fn parse_fn_param(&mut self, source: &str) -> ParserResult<Node> {
+    fn parse_fn_param(&mut self, source: &'src str) -> ParserResult<Node> {
         let name = self.expect(TokenKind::Ident)?;
         let colon = self.expect(TokenKind::Colon)?;
         let type_ident = self.parse_type_ident(source)?;
@@ -180,7 +201,7 @@ impl Parser2 {
         })
     }
 
-    fn parse_type_ident(&mut self, _source: &str) -> ParserResult<Node> {
+    fn parse_type_ident(&mut self, _source: &'src str) -> ParserResult<Node> {
         // TODO complete type ident grammar
         let name = self.expect(TokenKind::Ident)?;
         let mut children = Vec::new();
@@ -194,7 +215,7 @@ impl Parser2 {
         })
     }
 
-    fn parse_fn_return_type(&mut self, source: &str) -> ParserResult<Option<Node>> {
+    fn parse_fn_return_type(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         match self.expect_opt(TokenKind::Colon)? {
             Some(colon) => {
                 let type_ident = self.parse_type_ident(source)?;
@@ -214,7 +235,7 @@ impl Parser2 {
         }
     }
 
-    fn parse_fn_body(&mut self, source: &str) -> ParserResult<Option<Node>> {
+    fn parse_fn_body(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
         match self.expect_opt(TokenKind::OpenCurly)? {
             Some(ocurly) => {
                 let mut stmts = Vec::new();
@@ -247,7 +268,7 @@ impl Parser2 {
         }
     }
 
-    fn parse_body_stmt(&mut self, _source: &str) -> ParserResult<Node> {
+    fn parse_body_stmt(&mut self, _source: &'src str) -> ParserResult<Node> {
         // TODO actual body stmt parsing, right now we just eat everything until ';'
         let mut children = Vec::new();
         while let Some(tok) = self.peek() {
@@ -270,29 +291,5 @@ impl Parser2 {
             }
         }
         Err(ParseError::UnexpectedEof)
-    }
-}
-
-#[derive(Clone)]
-pub struct Parser<'src> {
-    lexer: Peekable<Lexer<'src>>,
-    lookahead: Option<TokenExt>,
-}
-
-impl<'src> Parser<'src> {
-    pub fn new(source: &'src str) -> Self {
-        let mut parser = Self {
-            lexer: Lexer::new(source).peekable(),
-            lookahead: None,
-        };
-
-        parser.lookahead = parser.bump();
-        parser
-    }
-
-    pub(super) fn restore(&mut self, bkp: Parser<'src>) {
-        let Parser { lexer, lookahead } = bkp;
-        self.lexer = lexer;
-        self.lookahead = lookahead;
     }
 }

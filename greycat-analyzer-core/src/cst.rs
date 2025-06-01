@@ -55,6 +55,9 @@ pub enum NodeRule {
     ReturnType,
     Body,
     BodyStmt,
+    PragmaStmt,
+    PragmaArgs,
+    String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,6 +65,7 @@ pub enum NodeRule {
 pub enum NodeError {
     UnexpectedSeparator,
     MissingSeparator,
+    UnexpectedToken,
 }
 
 impl From<Token> for Node {
@@ -103,7 +107,7 @@ impl<'a> DisplayNode<'a> {
                 writeln!(f, "{pad}(Error \"{err:?}\")")
             }
             NodeKind::Token(kind) => match kind {
-                TokenKind::Ident => {
+                TokenKind::Ident | TokenKind::RawString => {
                     let lexeme =
                         &self.source[node.token.as_ref().unwrap().span.as_range(self.source)];
                     writeln!(f, "{pad}({kind:?} \"{lexeme}\")")
