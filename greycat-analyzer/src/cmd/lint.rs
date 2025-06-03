@@ -13,35 +13,14 @@ pub struct Lint {
 
 impl Lint {
     pub fn run(self) -> Result<()> {
-        if self.project.is_dir() {
-            for_each_valid_entry(
-                &self.project,
-                &|entry| entry.extension().is_some_and(|ext| ext == "gcl"),
-                &|entry| {
-                    let source = std::fs::read_to_string(entry)?;
-                    let start = Instant::now();
-                    let tokens = tokenize(&source);
-                    println!(
-                        "{:>10.2?} {:6} {}",
-                        start.elapsed(),
-                        tokens.len(),
-                        entry.to_string_lossy()
-                    );
-                    Ok(())
-                },
-            )?;
-            return Ok(());
-        }
-
         let source = std::fs::read_to_string(self.project)?;
         let start = Instant::now();
         let mut errors = Vec::new();
         let module =
             parse("project", &source, &mut errors).map_err(|err| err.to_source_error(&source))?;
         let took = start.elapsed();
-        println!("{:#?}", module);
+        println!("{:#?}", module.to_pretty(&source));
         println!("Parsed in {took:?}, {} errors", errors.len());
-
         Ok(())
     }
 }
