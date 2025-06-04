@@ -7,6 +7,12 @@ pub struct NodeCursor<'a> {
     index: usize,
 }
 
+pub enum Either {
+    Left,
+    Right,
+    None,
+}
+
 impl<'a> NodeCursor<'a> {
     pub fn new(rule: &'a NodeRule) -> Self {
         Self {
@@ -15,7 +21,7 @@ impl<'a> NodeCursor<'a> {
         }
     }
 
-    fn peek_node(&self) -> Option<&'a Node> {
+    pub fn peek_node(&self) -> Option<&'a Node> {
         self.nodes.get(self.index)
     }
 
@@ -46,6 +52,14 @@ impl<'a> NodeCursor<'a> {
             Some(Node::Rule(node)) => Ok(node),
             Some(other) => Err(ParseError::Unexpected(other.span())),
             None => Err(ParseError::UnexpectedEof),
+        }
+    }
+
+    pub fn either_token(&mut self, left: TokenKind, right: TokenKind) -> Either {
+        match self.peek_node() {
+            Some(Node::Token(tok)) if tok.kind == left => Either::Left,
+            Some(Node::Token(tok)) if tok.kind == right => Either::Right,
+            _ => Either::None,
         }
     }
 }

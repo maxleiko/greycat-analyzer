@@ -196,6 +196,65 @@ pub enum TokenKind {
     Eof,
 }
 
+impl std::fmt::Display for TokenKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EolComment => write!(f, "<eol_comment>"),
+            Self::DocComment => write!(f, "<doc_comment>"),
+            Self::BlockComment => write!(f, "<block_comment>"),
+            Self::Space(_) => write!(f, " "),
+            Self::NewLine(_) => write!(f, "\\n"),
+            Self::Ident => write!(f, "identifier"),
+            Self::Int => write!(f, "int"),
+            Self::Float { terminated } => write!(f, "float"),
+            Self::Char { terminated } => write!(f, "char"),
+            Self::Bool => write!(f, "bool"),
+            Self::Semi => write!(f, ";"),
+            Self::Comma => write!(f, ","),
+            Self::Dot => write!(f, "."),
+            Self::DotDot => write!(f, ".."),
+            Self::OpenParen => write!(f, "("),
+            Self::CloseParen => write!(f, ")"),
+            Self::OpenCurly => write!(f, "{{"),
+            Self::CloseCurly => write!(f, "}}"),
+            Self::OpenSquare => write!(f, "["),
+            Self::CloseSquare => write!(f, "]"),
+            Self::At => write!(f, "@"),
+            Self::Question => write!(f, "?"),
+            Self::QuestionEq => write!(f, "?="),
+            Self::QuestionQuestion => write!(f, "??"),
+            Self::Colon => write!(f, ":"),
+            Self::ColonColon => write!(f, "::"),
+            Self::Eq => write!(f, "="),
+            Self::EqEq => write!(f, "=="),
+            Self::Bang => write!(f, "!"),
+            Self::BangEq => write!(f, "!="),
+            Self::BangBang => write!(f, "!!"),
+            Self::Lt => write!(f, "<"),
+            Self::LtEq => write!(f, "<="),
+            Self::Gt => write!(f, ">"),
+            Self::GtEq => write!(f, ">="),
+            Self::Minus => write!(f, "-"),
+            Self::MinusMinus => write!(f, "--"),
+            Self::Arrow => write!(f, "->"),
+            Self::AndAnd => write!(f, "&&"),
+            Self::OrOr => write!(f, "||"),
+            Self::Plus => write!(f, "+"),
+            Self::PlusPlus => write!(f, "++"),
+            Self::Star => write!(f, "*"),
+            Self::Slash => write!(f, "/"),
+            Self::Caret => write!(f, "^"),
+            Self::Percent => write!(f, "%"),
+            Self::DoubleQuote => write!(f, "\""),
+            Self::EnterInterpolation => write!(f, "${{"),
+            Self::ExitInterpolation => write!(f, "}}"),
+            Self::RawString => write!(f, "<raw_string>"),
+            Self::Unknown => write!(f, "<unknown>"),
+            Self::Eof => write!(f, "<eof>"),
+        }
+    }
+}
+
 impl TokenKind {
     pub fn is_trivia(&self) -> bool {
         matches!(

@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
 use greycat_analyzer_core::CstParser;
+
+use crate::utils::AnyError;
 
 #[derive(clap::Parser)]
 #[clap(about = "Prints the Cst s-expr")]
@@ -11,7 +12,7 @@ pub struct Cst {
 }
 
 impl Cst {
-    pub fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<(), AnyError> {
         let source = std::fs::read_to_string(self.project)?;
         let mut parser = CstParser::new(&source);
         let module = parser

@@ -5,19 +5,20 @@ use crate::{
 };
 
 use super::{
+    NodeRule,
     combi::span_from_nodes,
-    error::ParseError,
     cst_parser::{CstParser, ParserResult},
-    token_ext::TokenExt, NodeRule,
+    error::ParseError,
+    token_ext::TokenExt,
 };
 
 impl<'src> CstParser<'src> {
     pub fn parse_module(&mut self, source: &'src str) -> ParserResult<NodeRule> {
         let mut children = Vec::new();
 
-        let mut bkp = None;
+        let mut bkp;
         while self.has_token() {
-            bkp.replace(self.clone());
+            bkp = self.clone();
             match self.peek() {
                 Some(peek) if peek.token.kind == TokenKind::Semi => {
                     let semi = self.next().unwrap();
@@ -32,7 +33,7 @@ impl<'src> CstParser<'src> {
                         Err(ParseError::UnexpectedEof) => return Err(ParseError::UnexpectedEof),
                         Err(_err) => {
                             // backtrack lexer
-                            self.restore(bkp.take().unwrap());
+                            self.restore(&bkp);
                         }
                     }
                     match self.parse_pragma_stmt(source) {
@@ -41,9 +42,10 @@ impl<'src> CstParser<'src> {
                             continue;
                         }
                         Err(ParseError::UnexpectedEof) => return Err(ParseError::UnexpectedEof),
-                        Err(_err) => {
+                        Err(err) => {
+                            eprintln!("{}", err.as_source_error(source));
                             // backtrack lexer
-                            self.restore(bkp.take().unwrap());
+                            self.restore(&bkp);
                         }
                     }
                 }
@@ -56,21 +58,29 @@ impl<'src> CstParser<'src> {
     fn parse_pragma_stmt(&mut self, source: &'src str) -> ParserResult<Node> {
         let at = self.expect(TokenKind::At)?;
         let name = self.expect(TokenKind::Ident)?;
-        let args = self.many_sep(
-            source,
-            TokenKind::OpenParen,
-            TokenKind::Comma,
-            TokenKind::CloseParen,
-            CstParser::parse_expr,
-            Rule::PragmaArgs,
-        )?;
-        let semi = self.expect(TokenKind::Semi)?;
+        let args = match self.peek() {
+            Some(tok) if tok.token.kind == TokenKind::OpenParen => Some(self.many_sep(
+                source,
+                TokenKind::OpenParen,
+                TokenKind::Comma,
+                TokenKind::CloseParen,
+                CstParser::parse_expr,
+                Rule::PragmaArgs,
+            )?),
+            Some(_) => None,
+            None => return Err(ParseError::UnexpectedEof),
+        };
+        let semi = self.expect_opt(TokenKind::Semi)?;
 
         let mut children = Vec::new();
         at.merge_into(&mut children);
         name.merge_into_as(&mut children, as_name);
-        children.push(args);
-        semi.merge_into(&mut children);
+        if let Some(args) = args {
+            children.push(args);
+        }
+        if let Some(semi) = semi {
+            semi.merge_into(&mut children);
+        }
         Ok(Node::rule(Rule::PragmaStmt, children))
     }
 

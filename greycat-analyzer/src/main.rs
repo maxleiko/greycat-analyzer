@@ -3,9 +3,12 @@
 mod cmd;
 mod utils;
 
-use anyhow::Result;
+use std::error::Error;
+
 use clap::{Parser, Subcommand};
 use cmd::*;
+
+use crate::utils::AnyError;
 
 #[derive(Parser)]
 struct Cli {
@@ -20,7 +23,7 @@ enum Command {
     Cst(Cst),
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<(), AnyError> {
     env_logger::init();
 
     let cli = Cli::parse();

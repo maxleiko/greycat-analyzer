@@ -52,7 +52,7 @@ function startClient() {
     args: ['lang-server'],
     transport: TransportKind.stdio,
     options: {
-      env: { ...process.env, RUST_LOG: 'debug' },
+      env: { ...process.env, RUST_LOG: 'greycat_analyzer_ls=debug,greycat_analyzer_core=debug' },
     },
   };
 

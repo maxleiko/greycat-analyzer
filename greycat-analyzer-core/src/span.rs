@@ -74,8 +74,8 @@ impl Pos {
 
     pub fn to_position(&self) -> lsp::Position {
         lsp::Position {
-            line: self.line,
-            character: self.column,
+            line: self.line + 1,
+            character: self.column + 1,
         }
     }
 }

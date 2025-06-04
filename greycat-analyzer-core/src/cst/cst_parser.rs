@@ -26,8 +26,8 @@ impl<'src> CstParser<'src> {
         parser
     }
 
-    pub(super) fn restore(&mut self, bkp: CstParser<'src>) {
-        let CstParser { lexer, lookahead } = bkp;
+    pub(super) fn restore(&mut self, bkp: &CstParser<'src>) {
+        let CstParser { lexer, lookahead } = CstParser::clone(bkp);
         self.lexer = lexer;
         self.lookahead = lookahead;
     }

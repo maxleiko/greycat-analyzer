@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use dashmap::DashMap;
-use tower_lsp::lsp_types::Url;
+use lsp_types::Uri;
 
 use crate::Document;
 
@@ -9,7 +9,7 @@ pub struct Project {
     /// Path to this project's project.gcl file
     path: PathBuf,
     /// This projects modules
-    documents: DashMap<Url, Document>,
+    documents: DashMap<Uri, Document>,
 }
 
 impl Project {
@@ -20,7 +20,15 @@ impl Project {
         }
     }
 
-    pub fn includes(&self, uri: &Url) -> bool {
+    pub fn add_module(&mut self, uri: Uri, document: Document) {
+        self.documents.insert(uri, document);
+    }
+
+    pub fn remove_module(&mut self, uri: &Uri) -> Option<(Uri, Document)> {
+        self.documents.remove(uri)
+    }
+
+    pub fn includes(&self, uri: &Uri) -> bool {
         self.documents.contains_key(uri)
     }
 }

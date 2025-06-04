@@ -2,7 +2,7 @@
 
 use lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 
-use crate::{TokenKind, ast::*, cst::*, error::ParseError};
+use crate::{TokenKind, ast::*, cst::*, cursor::Either, error::ParseError};
 
 type ParserResult<T> = std::result::Result<T, ParseError>;
 
@@ -29,7 +29,7 @@ pub fn parse(name: &str, source: &str, errors: &mut Vec<Diagnostic>) -> ParserRe
             Node::Token(token) => errors.push(Diagnostic {
                 range: token.span.to_range(),
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("unexpected token '{:?}'", token.kind),
+                message: format!("unexpected token '{}'", token.kind),
                 ..Default::default()
             }),
             Node::Error(err) => errors.push(Diagnostic::from(err)),
@@ -52,13 +52,56 @@ fn parse_pragma_stmt(
     let mut cursor = node.cursor();
     let _ = cursor.expect_token(TokenKind::At)?;
     let name = cursor.expect_rule(Rule::Name)?;
-    let args = cursor.expect_rule(Rule::PragmaArgs)?;
-    let args = parse_pragma_args(source, args, errors)?;
-    Ok(Pragma {
-        name: name.span,
-        args: Some(args),
-        span: node.span,
-    })
+    match cursor.peek_node() {
+        Some(Node::Rule(rule)) => {
+            let args = parse_pragma_args(source, rule, errors)?;
+            Ok(Pragma {
+                name: name.span,
+                args: Some(args),
+                span: node.span,
+            })
+        }
+        Some(Node::Token(token)) if token.kind == TokenKind::Semi => Ok(Pragma {
+            name: name.span,
+            args: None,
+            span: node.span,
+        }),
+        Some(Node::Token(other)) => {
+            errors.push(Diagnostic {
+                range: other.span.to_range(),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Module pragma expects '{}' got '{}'", TokenKind::Semi, other.kind),
+                ..Default::default()
+            });
+            Ok(Pragma {
+                name: name.span,
+                args: None,
+                span: node.span,
+            })
+        }
+        Some(Node::Error(err)) => {
+            // TODO this will just discard the rest of the potential errors in this node's children....
+            errors.push(err.into());
+            Ok(Pragma {
+                name: name.span,
+                args: None,
+                span: node.span,
+            })
+        }
+        None => {
+            errors.push(Diagnostic {
+                range: name.span.to_range(),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Module pragma expects a '{}' at the end", TokenKind::Semi),
+                ..Default::default()
+            });
+            Ok(Pragma {
+                name: name.span,
+                args: None,
+                span: node.span,
+            })
+        }
+    }
 }
 
 fn parse_pragma_args(

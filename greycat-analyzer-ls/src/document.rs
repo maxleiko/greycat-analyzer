@@ -1,14 +1,14 @@
+use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
 use ropey::Rope;
-use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Url};
 
 pub struct Document {
-    uri: Url,
+    uri: Uri,
     version: i32,
     text: Rope,
 }
 
 impl Document {
-    pub fn uri(&self) -> &Url {
+    pub fn uri(&self) -> &Uri {
         &self.uri
     }
 
@@ -61,7 +61,7 @@ impl std::fmt::Display for Document {
         write!(
             f,
             "uri={}, version={}, bytes={}",
-            self.uri,
+            self.uri.as_str(),
             self.version,
             self.text.len_bytes()
         )
