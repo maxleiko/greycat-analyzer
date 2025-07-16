@@ -1,33 +1,32 @@
 use crate::{
     Token,
-    cst::{Node, Rule},
+    cst::{CstNode, NodeKind},
     lexer::TokenKind,
 };
 
 use super::{
-    NodeRule,
+    Node,
     combi::span_from_nodes,
-    cst_parser::{CstParser, ParserResult},
     error::ParseError,
+    parser::{CstParser, ParserResult},
     token_ext::TokenExt,
 };
 
 impl<'src> CstParser<'src> {
-    pub fn parse_module(&mut self, source: &'src str) -> ParserResult<NodeRule> {
-        let mut children = Vec::new();
+    pub fn parse_module(&mut self, source: &'src str) -> ParserResult<Node> {
+        let mut node = Node::new(NodeKind::Module);
 
         let mut bkp;
         while self.has_token() {
             bkp = self.clone();
             match self.peek() {
                 Some(peek) if peek.token.kind == TokenKind::Semi => {
-                    let semi = self.next().unwrap();
-                    semi.merge_into(&mut children);
+                    node.add_token_ext(self.next().unwrap());
                 }
                 _ => {
                     match self.parse_function(source) {
-                        Ok(function) => {
-                            children.push(function);
+                        Ok(n) => {
+                            node.add_node(n);
                             continue;
                         }
                         Err(ParseError::UnexpectedEof) => return Err(ParseError::UnexpectedEof),
@@ -37,27 +36,28 @@ impl<'src> CstParser<'src> {
                         }
                     }
                     match self.parse_pragma_stmt(source) {
-                        Ok(function) => {
-                            children.push(function);
+                        Ok(n) => {
+                            node.add_node(n);
                             continue;
                         }
                         Err(ParseError::UnexpectedEof) => return Err(ParseError::UnexpectedEof),
                         Err(err) => {
                             eprintln!("{}", err.as_source_error(source));
-                            // backtrack lexer
-                            self.restore(&bkp);
                         }
                     }
                 }
             }
         }
 
-        Ok(NodeRule::new(Rule::Module, children))
+        Ok(node)
     }
 
-    fn parse_pragma_stmt(&mut self, source: &'src str) -> ParserResult<Node> {
+    fn parse_pragma_stmt(&mut self, source: &'src str) -> ParserResult<CstNode> {
+        let mut node = Node::new(NodeKind::PragmaStmt);
         let at = self.expect(TokenKind::At)?;
+        node.add_token_ext(at);
         let name = self.expect(TokenKind::Ident)?;
+        node.add_token_ext(name);
         let args = match self.peek() {
             Some(tok) if tok.token.kind == TokenKind::OpenParen => Some(self.many_sep(
                 source,
@@ -65,62 +65,53 @@ impl<'src> CstParser<'src> {
                 TokenKind::Comma,
                 TokenKind::CloseParen,
                 CstParser::parse_expr,
-                Rule::PragmaArgs,
+                NodeKind::PragmaArgs,
             )?),
             Some(_) => None,
             None => return Err(ParseError::UnexpectedEof),
         };
-        let semi = self.expect_opt(TokenKind::Semi)?;
-
-        let mut children = Vec::new();
-        at.merge_into(&mut children);
-        name.merge_into_as(&mut children, as_name);
         if let Some(args) = args {
-            children.push(args);
+            node.add_node(args);
         }
+        let semi = self.expect_opt(TokenKind::Semi)?;
         if let Some(semi) = semi {
-            semi.merge_into(&mut children);
+            node.add_token_ext(semi);
         }
-        Ok(Node::rule(Rule::PragmaStmt, children))
+        Ok(CstNode::Node(node))
     }
 
-    fn parse_function(&mut self, source: &'src str) -> ParserResult<Node> {
-        let modifiers = self.parse_fn_modifiers(source)?;
+    fn parse_function(&mut self, source: &'src str) -> ParserResult<CstNode> {
+        let mut node = Node::new(NodeKind::Function);
+        if let Some(modifiers) = self.parse_fn_modifiers(source)? {
+            node.add_node(CstNode::Node(modifiers));
+        }
         let kw = self.expect_ident(source, "fn")?;
+        node.add_token_ext(kw);
         let name = self.expect(TokenKind::Ident)?;
-        let generic_params = self.parse_fn_generic_params(source)?;
+        node.add_token_ext(name);
+        if let Some(generic_params) = self.parse_fn_generic_params(source)? {
+            node.add_node(generic_params);
+        }
         let params = self.parse_fn_params(source)?;
-        let return_type = self.parse_fn_return_type(source)?;
-        let body = self.parse_fn_body(source)?;
-
-        let mut children = Vec::new();
-        if let Some(modifiers) = modifiers {
-            children.push(modifiers);
+        node.add_node(params);
+        if let Some(return_type) = self.parse_fn_return_type(source)? {
+            node.add_node(return_type);
         }
-        kw.merge_into(&mut children);
-        name.merge_into_as(&mut children, as_name);
-        if let Some(generic_params) = generic_params {
-            children.push(generic_params);
+        if let Some(body) = self.parse_fn_body(source)? {
+            node.add_node(body);
         }
-        children.push(params);
-        if let Some(return_type) = return_type {
-            children.push(return_type);
-        }
-        if let Some(body) = body {
-            children.push(body);
-        }
-        Ok(Node::rule(Rule::Function, children))
+        Ok(CstNode::Node(node))
     }
 
     fn parse_fn_modifiers(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
-        let mut children = Vec::new();
+        let mut node = Node::new(NodeKind::FnModifiers);
         while let Some(modifier) = self.parse_fn_modifier(source)? {
-            modifier.merge_into(&mut children);
+            node.add_token_ext(modifier);
         }
-        if children.is_empty() {
+        if node.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Node::rule(Rule::FnModifiers, children)))
+        Ok(Some(node))
     }
 
     fn parse_fn_modifier(&mut self, source: &'src str) -> ParserResult<Option<TokenExt>> {
@@ -132,7 +123,7 @@ impl<'src> CstParser<'src> {
         }
     }
 
-    fn parse_fn_generic_params(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
+    fn parse_fn_generic_params(&mut self, source: &'src str) -> ParserResult<Option<CstNode>> {
         if let Some(tok) = self.peek() {
             if tok.kind() != TokenKind::Lt {
                 return Ok(None);
@@ -144,7 +135,7 @@ impl<'src> CstParser<'src> {
             TokenKind::Comma,
             TokenKind::Gt,
             CstParser::parse_generic_param,
-            Rule::GenericParams,
+            NodeKind::GenericParams,
         ) {
             Ok(node) => Ok(Some(node)),
             Err(ParseError::NoMatch) => Ok(None),
@@ -152,73 +143,70 @@ impl<'src> CstParser<'src> {
         }
     }
 
-    fn parse_generic_param(&mut self, _source: &'src str) -> ParserResult<Node> {
+    fn parse_generic_param(&mut self, _source: &'src str) -> ParserResult<CstNode> {
+        let mut node = Node::new(NodeKind::GenericParam);
         let ident = self.expect(TokenKind::Ident)?;
-        let mut children = Vec::new();
-        ident.merge_into(&mut children);
-        Ok(Node::rule(Rule::GenericParam, children))
+        node.add_token_ext(ident);
+        Ok(CstNode::Node(node))
     }
 
-    fn parse_fn_params(&mut self, source: &'src str) -> ParserResult<Node> {
+    fn parse_fn_params(&mut self, source: &'src str) -> ParserResult<CstNode> {
         self.many_sep(
             source,
             TokenKind::OpenParen,
             TokenKind::Comma,
             TokenKind::CloseParen,
             CstParser::parse_fn_param,
-            Rule::FnParams,
+            NodeKind::FnParams,
         )
     }
 
-    fn parse_fn_param(&mut self, source: &'src str) -> ParserResult<Node> {
+    fn parse_fn_param(&mut self, source: &'src str) -> ParserResult<CstNode> {
+        let mut node = Node::new(NodeKind::FnParam);
         let name = self.expect(TokenKind::Ident)?;
+        node.add_token_ext(name);
         let colon = self.expect(TokenKind::Colon)?;
+        node.add_token_ext(colon);
         let type_ident = self.parse_type_ident(source)?;
-        let mut children = Vec::new();
-        name.merge_into_as(&mut children, as_name);
-        colon.merge_into(&mut children);
-        children.push(type_ident);
-        Ok(Node::rule(Rule::FnParam, children))
+        node.add_node(type_ident);
+        Ok(CstNode::Node(node))
     }
 
-    fn parse_type_ident(&mut self, _source: &'src str) -> ParserResult<Node> {
+    fn parse_type_ident(&mut self, _source: &'src str) -> ParserResult<CstNode> {
         // TODO complete type ident grammar
+        let mut node = Node::new(NodeKind::TypeIdent);
         let name = self.expect(TokenKind::Ident)?;
-        let mut children = Vec::new();
-        name.merge_into_as(&mut children, as_name);
-        Ok(Node::rule(Rule::TypeIdent, children))
+        Ok(CstNode::Node(node))
     }
 
-    fn parse_fn_return_type(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
+    fn parse_fn_return_type(&mut self, source: &'src str) -> ParserResult<Option<CstNode>> {
         match self.expect_opt(TokenKind::Colon)? {
             Some(colon) => {
+                let mut node = Node::new(NodeKind::ReturnType);
                 let type_ident = self.parse_type_ident(source)?;
-                let mut children = Vec::new();
-                colon.merge_into(&mut children);
-                children.push(type_ident);
-                Ok(Some(Node::rule(Rule::ReturnType, children)))
+                node.add_token_ext(colon);
+                node.add_node(type_ident);
+                Ok(Some(CstNode::Node(node)))
             }
             None => Ok(None),
         }
     }
 
-    fn parse_fn_body(&mut self, source: &'src str) -> ParserResult<Option<Node>> {
+    fn parse_fn_body(&mut self, source: &'src str) -> ParserResult<Option<CstNode>> {
         match self.expect_opt(TokenKind::OpenCurly)? {
             Some(ocurly) => {
-                let mut stmts = Vec::new();
+                let mut node = Node::new(NodeKind::Body);
+                node.add_token_ext(ocurly);
                 while let Some(tok) = self.peek() {
                     match tok.kind() {
                         TokenKind::CloseCurly => {
                             let ccurly = self.next().unwrap();
-                            let mut children = Vec::new();
-                            ocurly.merge_into(&mut children);
-                            children.extend(stmts);
-                            ccurly.merge_into(&mut children);
-                            return Ok(Some(Node::rule(Rule::Body, children)));
+                            node.add_token_ext(ccurly);
+                            return Ok(Some(CstNode::Node(node)));
                         }
                         _ => {
                             let stmt = self.parse_body_stmt(source)?;
-                            stmts.push(stmt);
+                            node.add_node(stmt);
                         }
                     }
                 }
@@ -228,26 +216,22 @@ impl<'src> CstParser<'src> {
         }
     }
 
-    fn parse_body_stmt(&mut self, _source: &'src str) -> ParserResult<Node> {
+    fn parse_body_stmt(&mut self, _source: &'src str) -> ParserResult<CstNode> {
         // TODO actual body stmt parsing, right now we just eat everything until ';'
-        let mut children = Vec::new();
+        let mut node = Node::new(NodeKind::BodyStmt);
         while let Some(tok) = self.peek() {
             match tok.kind() {
                 TokenKind::Semi => {
                     let semi = self.next().unwrap();
-                    semi.merge_into(&mut children);
-                    return Ok(Node::rule(Rule::BodyStmt, children));
+                    node.add_token_ext(semi);
+                    return Ok(CstNode::Node(node));
                 }
                 _ => {
                     let tok = self.next().unwrap();
-                    tok.merge_into(&mut children);
+                    node.add_token_ext(tok);
                 }
             }
         }
         Err(ParseError::UnexpectedEof)
     }
-}
-
-fn as_name(token: Token) -> Node {
-    Node::rule(Rule::Name, vec![Node::Token(token)])
 }

@@ -1,9 +1,11 @@
+use serde::Serialize;
+
 use crate::{
     lexer::{Token, TokenKind},
     span::Span,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum ParseError {
     NoMatch,
     UnexpectedToken(TokenKind, Token),
@@ -38,7 +40,7 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct SourceParseErrorOwned {
     source: Box<str>,
     error: ParseError,

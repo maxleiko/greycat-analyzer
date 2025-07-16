@@ -7,3 +7,5 @@ mod project;
 pub use document::*;
 pub use lang_server::*;
 pub use project::*;
+
+pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

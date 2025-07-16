@@ -2,80 +2,33 @@ mod combi;
 pub mod cursor;
 pub mod error;
 mod expr;
-mod cst_parser;
+mod parser;
 mod stmt;
 mod token_ext;
 
 use combi::span_from_nodes;
 use cursor::NodeCursor;
-pub use cst_parser::*;
+pub use parser::*;
 
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    cst::token_ext::TokenExt,
     lexer::{Token, TokenKind},
     span::{Pos, Span},
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Node {
-    Rule(NodeRule),
+#[serde(tag = "type")]
+pub enum CstNode {
+    Node(Node),
     Token(Token),
     Error(NodeError),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NodeRule {
-    pub rule: Rule,
-    pub children: Vec<Node>,
-    pub span: Span,
-}
-
-impl NodeRule {
-    #[inline(always)]
-    pub fn new(rule: Rule, children: Vec<Node>) -> Self {
-        let span = span_from_nodes(&children);
-        Self {
-            rule,
-            children,
-            span,
-        }
-    }
-
-    pub fn cursor(&self) -> NodeCursor<'_> {
-        NodeCursor::new(self)
-    }
-
-    pub fn find_child_by_rule(&self, rule: Rule) -> Option<&Node> {
-        self.children
-            .iter()
-            .find(|node| matches!(node, Node::Rule(node) if node.rule == rule))
-    }
-
-    pub fn to_display_node<'a>(&'a self, source: &'a str) -> DisplayNodeRule<'a> {
-        // TODO configure 'with_trivia' from command-line
-        DisplayNodeRule {
-            node: self,
-            source,
-            with_trivia: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NodeError {
-    pub kind: ErrorKind,
-    pub token: Token,
-}
-
-impl Node {
-    #[inline(always)]
-    pub fn rule(rule: Rule, children: Vec<Node>) -> Self {
-        Self::Rule(NodeRule::new(rule, children))
-    }
-
+impl CstNode {
     #[inline(always)]
     pub fn token(token: Token) -> Self {
         Self::Token(token)
@@ -88,7 +41,7 @@ impl Node {
 
     pub fn span(&self) -> Span {
         match self {
-            Self::Rule(NodeRule { span, .. }) => *span,
+            Self::Node(node) => node.span(),
             Self::Token(token) => token.span,
             Self::Error(NodeError { token, .. }) => token.span,
         }
@@ -96,7 +49,7 @@ impl Node {
 
     pub fn start(&self) -> Pos {
         match self {
-            Self::Rule(NodeRule { span, .. }) => span.start,
+            Self::Node(node) => node.span().start,
             Self::Token(token) => token.span.start,
             Self::Error(NodeError { token, .. }) => token.span.start,
         }
@@ -104,20 +57,97 @@ impl Node {
 
     pub fn end(&self) -> Pos {
         match self {
-            Self::Rule(NodeRule { span, .. }) => span.end,
+            Self::Node(node) => node.span().end,
             Self::Token(token) => token.span.end,
             Self::Error(NodeError { token, .. }) => token.span.end,
         }
     }
 
-    pub fn to_display_node<'a>(&'a self, source: &'a str) -> DisplayNode<'a> {
-        // TODO configure 'with_trivia' from command-line
+    pub fn to_display_node<'a>(&'a self, source: &'a str, with_trivia: bool) -> DisplayNode<'a> {
         DisplayNode {
             node: self,
             source,
-            with_trivia: true,
+            with_trivia,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    #[serde(rename = "name")]
+    pub kind: NodeKind,
+    pub children: Vec<CstNode>,
+}
+
+impl Node {
+    #[inline(always)]
+    pub fn new(kind: NodeKind) -> Self {
+        Self {
+            kind,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    pub fn add_node(&mut self, node: CstNode) {
+        self.children.push(node);
+    }
+
+    pub fn add_token_ext(&mut self, token: TokenExt) {
+        let TokenExt { leading, token } = token;
+        self.add_tokens(leading);
+        self.add_token(token);
+    }
+
+    pub fn add_token_ext_as_error(&mut self, token: TokenExt, kind: ErrorKind) {
+        let TokenExt { leading, token } = token;
+        self.add_tokens(leading);
+        self.add_node(CstNode::Error(NodeError { kind, token }));
+    }
+
+    pub fn add_token(&mut self, token: Token) {
+        self.children.push(CstNode::Token(token))
+    }
+
+    pub fn add_tokens(&mut self, tokens: Vec<Token>) {
+        self.children
+            .extend(tokens.into_iter().map(|t| CstNode::Token(t)));
+    }
+
+    pub fn cursor(&self) -> NodeCursor<'_> {
+        NodeCursor::new(self)
+    }
+
+    pub fn find_child_by_rule(&self, rule: NodeKind) -> Option<&CstNode> {
+        self.children
+            .iter()
+            .find(|node| matches!(node, CstNode::Node(node) if node.kind == rule))
+    }
+
+    pub fn to_display_node<'a>(
+        &'a self,
+        source: &'a str,
+        with_trivia: bool,
+    ) -> DisplayNodeRule<'a> {
+        DisplayNodeRule {
+            node: self,
+            source,
+            with_trivia,
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        span_from_nodes(&self.children)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeError {
+    pub kind: ErrorKind,
+    pub token: Token,
 }
 
 impl From<&NodeError> for lsp_types::Diagnostic {
@@ -132,8 +162,7 @@ impl From<&NodeError> for lsp_types::Diagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Rule {
+pub enum NodeKind {
     Module,
     Function,
     Name,
@@ -170,7 +199,7 @@ impl std::fmt::Display for ErrorKind {
     }
 }
 
-impl From<Token> for Node {
+impl From<Token> for CstNode {
     #[inline]
     fn from(value: Token) -> Self {
         Self::Token(value)
@@ -178,7 +207,7 @@ impl From<Token> for Node {
 }
 
 pub struct DisplayNodeRule<'a> {
-    node: &'a NodeRule,
+    node: &'a Node,
     source: &'a str,
     with_trivia: bool,
 }
@@ -192,7 +221,7 @@ impl<'a> fmt::Display for DisplayNodeRule<'a> {
 impl<'a> DisplayNodeRule<'a> {
     fn fmt_node(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
         let pad = "  ".repeat(indent);
-        writeln!(f, "{pad}({:?}", self.node.rule)?;
+        writeln!(f, "{pad}({:?}", self.node.kind)?;
         for child in &self.node.children {
             let child = DisplayNode {
                 node: child,
@@ -206,7 +235,7 @@ impl<'a> DisplayNodeRule<'a> {
 }
 
 pub struct DisplayNode<'a> {
-    node: &'a Node,
+    node: &'a CstNode,
     source: &'a str,
     with_trivia: bool,
 }
@@ -221,7 +250,7 @@ impl<'a> DisplayNode<'a> {
     fn fmt_node(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
         let pad = "  ".repeat(indent);
         match self.node {
-            Node::Rule(node) => {
+            CstNode::Node(node) => {
                 let node = DisplayNodeRule {
                     node,
                     source: self.source,
@@ -229,7 +258,7 @@ impl<'a> DisplayNode<'a> {
                 };
                 node.fmt_node(f, indent)
             }
-            Node::Token(token) => match token.kind {
+            CstNode::Token(token) => match token.kind {
                 kind @ TokenKind::Ident | kind @ TokenKind::RawString => {
                     let lexeme = &self.source[token.span.as_range(self.source)];
                     writeln!(f, "{pad}({kind:?} \"{lexeme}\")")
@@ -239,7 +268,7 @@ impl<'a> DisplayNode<'a> {
                 }
                 _ => Ok(()),
             },
-            Node::Error(NodeError { kind, .. }) => writeln!(f, "{pad}(ERROR \"{kind:?}\")"),
+            CstNode::Error(NodeError { kind, .. }) => writeln!(f, "{pad}(ERROR \"{kind:?}\")"),
         }
     }
 }

@@ -13,7 +13,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
     Lexer::new(source).collect()
 }
 
-/// `Lexer` implements `Iterator` and is cheap to clone
+/// `Lexer` implements `Iterator` and is fairly cheap to clone
 #[derive(Clone)]
 pub struct Lexer<'a> {
     source: &'a str,

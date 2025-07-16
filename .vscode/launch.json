@@ -20,7 +20,7 @@
       "cargo": {
         "args": ["build", "--bin", "greycat-analyzer"]
       },
-      "args": ["cst", "${workspaceFolder}/project.gcl"]
+      "args": ["cst", "${workspaceFolder}/project.gcl", "--trivia"]
     }
   ]
 }

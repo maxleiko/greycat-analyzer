@@ -1,10 +1,10 @@
 use crate::{
-    cst::{ErrorKind, Node, Rule},
+    cst::{ErrorKind, CstNode, NodeKind},
     lexer::{Token, TokenKind},
-    span::Span,
+    span::Span, Node,
 };
 
-use super::{error::ParseError, cst_parser::CstParser, token_ext::TokenExt};
+use super::{parser::CstParser, error::ParseError, token_ext::TokenExt};
 
 impl<'src> CstParser<'src> {
     pub(super) fn has_token(&self) -> bool {
@@ -25,7 +25,7 @@ impl<'src> CstParser<'src> {
         let mut leading = Vec::new();
 
         // Collect leading trivia
-        while let Some(tok) = self.lexer.next() {
+        for tok in self.lexer.by_ref() {
             if tok.kind.is_trivia() {
                 leading.push(tok);
             } else {
@@ -33,19 +33,19 @@ impl<'src> CstParser<'src> {
                 let token = tok;
 
                 // Collect trailing trivia
-                let mut trailing = Vec::new();
-                while let Some(next) = self.lexer.peek() {
-                    if next.kind.is_trivia() {
-                        trailing.push(self.lexer.next().unwrap());
-                    } else {
-                        break;
-                    }
-                }
+                // let mut trailing = Vec::new();
+                // while let Some(next) = self.lexer.peek() {
+                //     if next.kind.is_trivia() {
+                //         trailing.push(self.lexer.next().unwrap());
+                //     } else {
+                //         break;
+                //     }
+                // }
 
                 return Some(TokenExt {
                     leading,
                     token,
-                    trailing,
+                    // trailing,
                 });
             }
         }
@@ -117,14 +117,14 @@ impl<'src> CstParser<'src> {
         open: TokenKind,
         sep: TokenKind,
         close: TokenKind,
-        item_parser: impl Fn(&mut Self, &'src str) -> Result<Node, ParseError>,
-        rule: Rule,
-    ) -> Result<Node, ParseError> {
-        let mut children = Vec::new();
+        item_parser: impl Fn(&mut Self, &'src str) -> Result<CstNode, ParseError>,
+        rule: NodeKind,
+    ) -> Result<CstNode, ParseError> {
+        let mut node = Node::new(rule);
 
         // Parse and collect the opening token
         let open_tok = self.expect(open)?;
-        open_tok.merge_into(&mut children);
+        node.add_token_ext(open_tok);
 
         enum State {
             First,
@@ -139,45 +139,46 @@ impl<'src> CstParser<'src> {
                 State::First => {
                     if tok.kind() == close {
                         let close_tok = self.next().unwrap();
-                        close_tok.merge_into(&mut children);
-                        return Ok(Node::rule(rule, children));
+                        node.add_token_ext(close_tok);
+                        return Ok(CstNode::Node(node));
                     } else if tok.kind() == sep {
                         let comma = self.next().unwrap();
-                        comma.merge_into_as_error(&mut children, ErrorKind::UnexpectedSeparator);
+                        node.add_token_ext_as_error(comma, ErrorKind::UnexpectedToken);
                         state = State::AfterSep;
                     } else {
                         let item = item_parser(self, source)?;
-                        children.push(item);
+                        node.add_node(item);
                         state = State::AfterItem;
                     }
                 }
                 State::AfterItem => {
                     if tok.kind() == close {
                         let close_tok = self.next().unwrap();
-                        close_tok.merge_into(&mut children);
-                        return Ok(Node::rule(rule, children));
+                        node.add_token_ext(close_tok);
+                        return Ok(CstNode::Node(node));
                     } else if tok.kind() == sep {
                         let sep_tok = self.next().unwrap();
-                        sep_tok.merge_into(&mut children);
+                        node.add_token_ext(sep_tok);
                         state = State::AfterSep;
                     } else {
                         // TODO review the following line as it might have dropped some tokens along the way
                         //      might need to use merge_into_as (not sure)
-                        children.push(Node::error(ErrorKind::MissingSeparator, tok.token));
+                        panic!("problems");
+                        node.add_token_ext_as_error(*tok, ErrorKind::MissingSeparator);
                         state = State::AfterSep;
                     }
                 }
                 State::AfterSep => {
                     if tok.kind() == close {
                         let close_tok = self.next().unwrap();
-                        close_tok.merge_into(&mut children);
-                        return Ok(Node::rule(rule, children));
+                        node.add_token_ext(close_tok);
+                        return Ok(CstNode::Node(node));
                     } else if tok.kind() == sep {
                         let extra = self.next().unwrap();
-                        extra.merge_into_as_error(&mut children, ErrorKind::UnexpectedSeparator);
+                        node.add_token_ext_as_error(extra, ErrorKind::UnexpectedToken);
                     } else {
                         let item = item_parser(self, source)?;
-                        children.push(item);
+                        node.add_node(item);
                         state = State::AfterItem;
                     }
                 }
@@ -193,7 +194,7 @@ fn tok_text<'src>(source: &'src str, token: &'src Token) -> &'src str {
     &source[token.span.as_range(source)]
 }
 
-pub(super) fn span_from_nodes(nodes: &[Node]) -> Span {
+pub(super) fn span_from_nodes(nodes: &[CstNode]) -> Span {
     match (nodes.first(), nodes.last()) {
         (None, None) => Span::default(),
         (Some(first), Some(last)) => Span {

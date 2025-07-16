@@ -1,9 +1,9 @@
 use crate::{Token, TokenKind};
 
-use super::{Node, NodeRule, Rule, error::ParseError};
+use super::{CstNode, Node, NodeKind, error::ParseError};
 
 pub struct NodeCursor<'a> {
-    nodes: &'a [Node],
+    nodes: &'a [CstNode],
     index: usize,
 }
 
@@ -14,21 +14,21 @@ pub enum Either {
 }
 
 impl<'a> NodeCursor<'a> {
-    pub fn new(rule: &'a NodeRule) -> Self {
+    pub fn new(rule: &'a Node) -> Self {
         Self {
             nodes: &rule.children,
             index: 0,
         }
     }
 
-    pub fn peek_node(&self) -> Option<&'a Node> {
+    pub fn peek_node(&self) -> Option<&'a CstNode> {
         self.nodes.get(self.index)
     }
 
-    fn next_node(&mut self) -> Option<&'a Node> {
+    fn next_node(&mut self) -> Option<&'a CstNode> {
         loop {
             match self.nodes.get(self.index)? {
-                Node::Token(tok) if tok.kind.is_trivia() => {
+                CstNode::Token(tok) if tok.kind.is_trivia() => {
                     self.index += 1;
                 }
                 node => {
@@ -41,15 +41,15 @@ impl<'a> NodeCursor<'a> {
 
     pub fn expect_token(&mut self, kind: TokenKind) -> Result<&'a Token, ParseError> {
         match self.next_node() {
-            Some(Node::Token(token)) => Ok(token),
+            Some(CstNode::Token(token)) => Ok(token),
             Some(other) => Err(ParseError::Unexpected(other.span())),
             None => Err(ParseError::UnexpectedEof),
         }
     }
 
-    pub fn expect_rule(&mut self, rule: Rule) -> Result<&'a NodeRule, ParseError> {
+    pub fn expect_rule(&mut self, rule: NodeKind) -> Result<&'a Node, ParseError> {
         match self.next_node() {
-            Some(Node::Rule(node)) => Ok(node),
+            Some(CstNode::Node(node)) => Ok(node),
             Some(other) => Err(ParseError::Unexpected(other.span())),
             None => Err(ParseError::UnexpectedEof),
         }
@@ -57,15 +57,15 @@ impl<'a> NodeCursor<'a> {
 
     pub fn either_token(&mut self, left: TokenKind, right: TokenKind) -> Either {
         match self.peek_node() {
-            Some(Node::Token(tok)) if tok.kind == left => Either::Left,
-            Some(Node::Token(tok)) if tok.kind == right => Either::Right,
+            Some(CstNode::Token(tok)) if tok.kind == left => Either::Left,
+            Some(CstNode::Token(tok)) if tok.kind == right => Either::Right,
             _ => Either::None,
         }
     }
 }
 
 impl<'a> Iterator for NodeCursor<'a> {
-    type Item = &'a Node;
+    type Item = &'a CstNode;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_node()

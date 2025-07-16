@@ -12,6 +12,7 @@ pub struct Lint {
 
 impl Lint {
     pub fn run(self) -> Result<(), AnyError> {
+        env_logger::init();
         let source = std::fs::read_to_string(&self.project)?;
         let start = Instant::now();
         let mut errors = Vec::new();

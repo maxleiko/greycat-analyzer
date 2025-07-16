@@ -1,5 +1,5 @@
 use crate::{
-    cst::Node,
+    cst::CstNode,
     lexer::{Token, TokenKind},
 };
 
@@ -12,8 +12,8 @@ pub(super) struct TokenExt {
     pub leading: Vec<Token>,
     /// The main token itself
     pub token: Token,
-    /// Trivia tokens that appear *after* the main token (eg. spaces, newlines, comments)
-    pub trailing: Vec<Token>,
+    // Trivia tokens that appear *after* the main token (eg. spaces, newlines, comments)
+    // pub trailing: Vec<Token>,
 }
 
 impl TokenExt {
@@ -22,45 +22,45 @@ impl TokenExt {
     }
 
     pub fn nb_tokens(&self) -> usize {
-        self.leading.len() + 1 + self.trailing.len()
+        self.leading.len() + 1 /*  + self.trailing.len() */
     }
 
-    pub fn merge_into(self, children: &mut Vec<Node>) {
+    pub fn merge_into(self, children: &mut Vec<CstNode>) {
         children.reserve(self.nb_tokens());
         let TokenExt {
             leading,
             token,
-            trailing,
+            // trailing,
         } = self;
-        children.extend(leading.into_iter().map(Node::from));
-        children.push(Node::from(token));
-        children.extend(trailing.into_iter().map(Node::from));
+        children.extend(leading.into_iter().map(CstNode::from));
+        children.push(CstNode::from(token));
+        // children.extend(trailing.into_iter().map(Node::from));
     }
 
-    pub fn merge_into_as<F>(self, children: &mut Vec<Node>, as_node: F)
+    pub fn merge_into_as<F>(self, children: &mut Vec<CstNode>, as_node: F)
     where
-        F: Fn(Token) -> Node,
+        F: Fn(Token) -> CstNode,
     {
         children.reserve(self.nb_tokens());
         let TokenExt {
             leading,
             token,
-            trailing,
+            // trailing,
         } = self;
-        children.extend(leading.into_iter().map(Node::from));
+        children.extend(leading.into_iter().map(CstNode::from));
         children.push(as_node(token));
-        children.extend(trailing.into_iter().map(Node::from));
+        // children.extend(trailing.into_iter().map(Node::from));
     }
 
-    pub fn merge_into_as_error(self, children: &mut Vec<Node>, kind: ErrorKind) {
+    pub fn merge_into_as_error(self, children: &mut Vec<CstNode>, kind: ErrorKind) {
         children.reserve(self.nb_tokens());
         let TokenExt {
             leading,
             token,
-            trailing,
+            // trailing,
         } = self;
-        children.extend(leading.into_iter().map(Node::from));
-        children.push(Node::error(kind, token));
-        children.extend(trailing.into_iter().map(Node::from));
+        children.extend(leading.into_iter().map(CstNode::from));
+        children.push(CstNode::error(kind, token));
+        // children.extend(trailing.into_iter().map(Node::from));
     }
 }

@@ -10,9 +10,18 @@ pub struct Token {
     pub span: Span,
 }
 
-pub struct SrcToken<'src> {
-    token: Token,
-    source: &'src str,
+impl Token {
+    pub fn to_source_token<'a>(&'a self, source: &'a str) -> SrcToken<'a> {
+        SrcToken {
+            token: self,
+            source,
+        }
+    }
+}
+
+pub struct SrcToken<'a> {
+    token: &'a Token,
+    source: &'a str,
 }
 
 impl fmt::Display for SrcToken<'_> {
@@ -83,6 +92,7 @@ impl fmt::Display for SrcToken<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value")]
 pub enum TokenKind {
     /// `// comment`
     EolComment,

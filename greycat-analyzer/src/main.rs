@@ -21,15 +21,15 @@ enum Command {
     Lint(Lint),
     LangServer(LangServer),
     Cst(Cst),
+    Lex(Lex),
 }
 
 fn main() -> Result<(), AnyError> {
-    env_logger::init();
-
     let cli = Cli::parse();
     match cli.command {
         Command::Lint(cmd) => cmd.run(),
         Command::LangServer(cmd) => cmd.run(),
         Command::Cst(cmd) => cmd.run(),
+        Command::Lex(cmd) => cmd.run(),
     }
 }
