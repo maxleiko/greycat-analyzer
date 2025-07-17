@@ -1,10 +1,11 @@
 use crate::{
-    cst::{ErrorKind, CstNode, NodeKind},
+    Node,
+    cst::{CstNode, ErrorKind, NodeKind},
     lexer::{Token, TokenKind},
-    span::Span, Node,
+    span::Span,
 };
 
-use super::{parser::CstParser, error::ParseError, token_ext::TokenExt};
+use super::{error::ParseError, parser::CstParser, token_ext::TokenExt};
 
 impl<'src> CstParser<'src> {
     pub(super) fn has_token(&self) -> bool {
@@ -76,7 +77,7 @@ impl<'src> CstParser<'src> {
     ) -> Result<TokenExt, ParseError> {
         match self.peek() {
             Some(tok)
-                if tok.kind() == TokenKind::Ident && tok_text(source, &tok.token) == ident =>
+                if tok.kind() == TokenKind::Ident && &source[tok.token.span.as_range()] == ident =>
             {
                 Ok(self.next().unwrap())
             }
@@ -92,7 +93,7 @@ impl<'src> CstParser<'src> {
     ) -> Result<TokenExt, ParseError> {
         match self.peek() {
             Some(tok) if tok.kind() == TokenKind::Ident => {
-                let current = &source[tok.token.span.as_range(source)];
+                let current = &source[tok.token.span.as_range()];
                 for ident in idents {
                     if current == *ident {
                         return Ok(self.next().unwrap());
@@ -187,11 +188,6 @@ impl<'src> CstParser<'src> {
 
         Err(ParseError::UnexpectedEof)
     }
-}
-
-/// Helper to get string slice from token's span in source text
-fn tok_text<'src>(source: &'src str, token: &'src Token) -> &'src str {
-    &source[token.span.as_range(source)]
 }
 
 pub(super) fn span_from_nodes(nodes: &[CstNode]) -> Span {

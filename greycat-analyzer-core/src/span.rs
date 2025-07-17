@@ -21,22 +21,8 @@ impl Span {
         Self { start, end }
     }
 
-    pub fn as_range(&self, source: &str) -> Range<usize> {
-        let start = self.start.offset_in(source);
-        let end = if self.start.line == self.end.line {
-            start + (self.end.column - self.start.column)
-        } else {
-            start
-                + source[start as usize..]
-                    .lines()
-                    .take((self.end.line - self.start.line) as usize)
-                    .fold(0, |acc, line| acc + line.len() + 1) as u32
-                + self.end.column
-        };
-        Range {
-            start: start as usize,
-            end: end as usize,
-        }
+    pub fn as_range(&self) -> Range<usize> {
+        self.start.offset as usize..self.end.offset as usize
     }
 
     pub fn to_range(&self) -> lsp::Range {
@@ -45,22 +31,23 @@ impl Span {
             end: self.end.to_position(),
         }
     }
-
-    pub fn as_str<'s>(&self, source: &'s str) -> &'s str {
-        &source[self.as_range(source)]
-    }
 }
 
 #[derive(Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Deserialize, Default, Debug)]
 pub struct Pos {
     pub line: u32,
     pub column: u32,
+    pub offset: u32,
 }
 
 impl Pos {
     #[inline(always)]
-    pub const fn new(line: u32, column: u32) -> Self {
-        Self { line, column }
+    pub const fn new(line: u32, column: u32, offset: u32) -> Self {
+        Self {
+            line,
+            column,
+            offset,
+        }
     }
 
     /// Returns the absolute offset of this position in the given source
@@ -149,20 +136,25 @@ impl From<&Pos> for lsp::Position {
     }
 }
 
-impl From<(usize, usize)> for Pos {
+impl From<(usize, usize, usize)> for Pos {
     #[inline(always)]
-    fn from(p: (usize, usize)) -> Self {
+    fn from((line, column, offset): (usize, usize, usize)) -> Self {
         Self {
-            line: p.0 as u32,
-            column: p.1 as u32,
+            line: line as u32,
+            column: column as u32,
+            offset: offset as u32,
         }
     }
 }
 
-impl From<(u32, u32)> for Pos {
+impl From<(u32, u32, u32)> for Pos {
     #[inline(always)]
-    fn from((line, column): (u32, u32)) -> Self {
-        Self { line, column }
+    fn from((line, column, offset): (u32, u32, u32)) -> Self {
+        Self {
+            line,
+            column,
+            offset,
+        }
     }
 }
 
@@ -194,53 +186,35 @@ impl std::fmt::Display for Pos {
 
 #[test]
 fn span_as_range_total() {
-    let span = Span {
-        start: Pos { line: 0, column: 0 },
-        end: Pos { line: 0, column: 5 },
-    };
+    let span = Span::new(Pos::new(0, 0, 0), Pos::new(0, 5, 5));
     let source = "hello";
-    assert_eq!(&source[span.as_range(source)], "hello");
+    assert_eq!(&source[span.as_range()], "hello");
 }
 
 #[test]
 fn span_as_range_partial_start() {
-    let span = Span {
-        start: Pos { line: 0, column: 0 },
-        end: Pos { line: 0, column: 5 },
-    };
+    let span = Span::new(Pos::new(0, 0, 0), Pos::new(0, 5, 5));
     let source = "hello world";
-    assert_eq!(&source[span.as_range(source)], "hello");
+    assert_eq!(&source[span.as_range()], "hello");
 }
 
 #[test]
 fn span_as_range_partial_end() {
-    let span = Span {
-        start: Pos { line: 0, column: 6 },
-        end: Pos {
-            line: 0,
-            column: 11,
-        },
-    };
+    let span = Span::new(Pos::new(0, 6, 6), Pos::new(0, 11, 11));
     let source = "hello world";
-    assert_eq!(&source[span.as_range(source)], "world");
+    assert_eq!(&source[span.as_range()], "world");
 }
 
 #[test]
 fn span_as_range_not_first_line() {
-    let span = Span {
-        start: Pos { line: 1, column: 0 },
-        end: Pos { line: 1, column: 3 },
-    };
+    let span = Span::new(Pos::new(1, 0, 4), Pos::new(1, 3, 7));
     let source = "one\ntwo\nthree";
-    assert_eq!(&source[span.as_range(source)], "two");
+    assert_eq!(&source[span.as_range()], "two");
 }
 
 #[test]
 fn span_as_range_multiline() {
-    let span = Span {
-        start: Pos { line: 3, column: 2 },
-        end: Pos { line: 4, column: 1 },
-    };
+    let span = Span::new(Pos::new(3, 2, 11), Pos::new(4, 1, 16));
     let source = "one\n\ntwo\nthree\nfour\n\nfive\nsix";
-    assert_eq!(&source[span.as_range(source)], "ree\nf");
+    assert_eq!(&source[span.as_range()], "ree\nf");
 }

@@ -34,7 +34,7 @@ pub struct Function {
 impl Function {
     fn to_pretty<'a>(&self, source: &'a str) -> pretty::Function<'a> {
         pretty::Function {
-            name: &source[self.name.as_range(source)],
+            name: &source[self.name.as_range()],
             params: self.params.to_pretty(source),
         }
     }
@@ -63,7 +63,7 @@ pub struct FnParam {
 impl FnParam {
     fn to_pretty<'a>(&self, source: &'a str) -> pretty::FnParam<'a> {
         pretty::FnParam {
-            name: &source[self.name.as_range(source)],
+            name: &source[self.name.as_range()],
         }
     }
 }
@@ -78,7 +78,7 @@ pub struct Pragma {
 impl Pragma {
     fn to_pretty<'a>(&self, source: &'a str) -> pretty::Pragma<'a> {
         pretty::Pragma {
-            name: &source[self.name.as_range(source)],
+            name: &source[self.name.as_range()],
             args: self
                 .args
                 .as_deref()
@@ -108,6 +108,6 @@ pub struct StringLiteral {
 
 impl StringLiteral {
     fn to_pretty<'a>(&self, source: &'a str) -> pretty::StringLiteral<'a> {
-        pretty::StringLiteral(&source[self.text.as_range(source)])
+        pretty::StringLiteral(&source[self.text.as_range()])
     }
 }

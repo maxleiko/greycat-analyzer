@@ -96,13 +96,13 @@ impl Node {
         self.children.push(node);
     }
 
-    pub fn add_token_ext(&mut self, token: TokenExt) {
+    pub(self) fn add_token_ext(&mut self, token: TokenExt) {
         let TokenExt { leading, token } = token;
         self.add_tokens(leading);
         self.add_token(token);
     }
 
-    pub fn add_token_ext_as_error(&mut self, token: TokenExt, kind: ErrorKind) {
+    pub(self) fn add_token_ext_as_error(&mut self, token: TokenExt, kind: ErrorKind) {
         let TokenExt { leading, token } = token;
         self.add_tokens(leading);
         self.add_node(CstNode::Error(NodeError { kind, token }));
@@ -114,7 +114,7 @@ impl Node {
 
     pub fn add_tokens(&mut self, tokens: Vec<Token>) {
         self.children
-            .extend(tokens.into_iter().map(|t| CstNode::Token(t)));
+            .extend(tokens.into_iter().map(CstNode::Token));
     }
 
     pub fn cursor(&self) -> NodeCursor<'_> {
@@ -260,7 +260,7 @@ impl<'a> DisplayNode<'a> {
             }
             CstNode::Token(token) => match token.kind {
                 kind @ TokenKind::Ident | kind @ TokenKind::RawString => {
-                    let lexeme = &self.source[token.span.as_range(self.source)];
+                    let lexeme = &self.source[token.span.as_range()];
                     writeln!(f, "{pad}({kind:?} \"{lexeme}\")")
                 }
                 kind if self.with_trivia || !kind.is_trivia() => {

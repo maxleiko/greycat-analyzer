@@ -562,7 +562,7 @@ impl InternalPos {
 
 impl From<InternalPos> for Pos {
     fn from(value: InternalPos) -> Self {
-        Self::new(value.line, value.characters)
+        Self::new(value.line, value.characters, value.offset)
     }
 }
 
@@ -587,22 +587,22 @@ mod test {
                 Token {
                     kind: TokenKind::OpenCurly,
                     span: Span {
-                        start: Pos::new(0, 0),
-                        end: Pos::new(0, 1),
+                        start: Pos::new(0, 0, 0),
+                        end: Pos::new(0, 1, 1),
                     }
                 },
                 Token {
                     kind: TokenKind::NewLine(1),
                     span: Span {
-                        start: Pos::new(0, 1),
-                        end: Pos::new(1, 0),
+                        start: Pos::new(0, 1, 1),
+                        end: Pos::new(1, 0, 2),
                     }
                 },
                 Token {
                     kind: TokenKind::CloseCurly,
                     span: Span {
-                        start: Pos::new(1, 0),
-                        end: Pos::new(1, 1),
+                        start: Pos::new(1, 0, 2),
+                        end: Pos::new(1, 1, 3),
                     }
                 }
             ]
@@ -613,29 +613,11 @@ mod test {
     fn string_lit() {
         let tokens = tokenize("\"hello world\"");
         assert_eq!(
-            tokens,
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
             vec![
-                Token {
-                    kind: TokenKind::DoubleQuote,
-                    span: Span {
-                        start: Pos::new(0, 0),
-                        end: Pos::new(0, 1),
-                    }
-                },
-                Token {
-                    kind: TokenKind::RawString,
-                    span: Span {
-                        start: Pos::new(0, 1),
-                        end: Pos::new(0, 12),
-                    }
-                },
-                Token {
-                    kind: TokenKind::DoubleQuote,
-                    span: Span {
-                        start: Pos::new(0, 12),
-                        end: Pos::new(0, 13),
-                    }
-                },
+                TokenKind::DoubleQuote,
+                TokenKind::RawString,
+                TokenKind::DoubleQuote,
             ]
         );
     }
@@ -644,23 +626,8 @@ mod test {
     fn string_lit_unfinished() {
         let tokens = tokenize("\"hello ");
         assert_eq!(
-            tokens,
-            vec![
-                Token {
-                    kind: TokenKind::DoubleQuote,
-                    span: Span {
-                        start: Pos::new(0, 0),
-                        end: Pos::new(0, 1),
-                    }
-                },
-                Token {
-                    kind: TokenKind::RawString,
-                    span: Span {
-                        start: Pos::new(0, 1),
-                        end: Pos::new(0, 7),
-                    }
-                },
-            ]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::DoubleQuote, TokenKind::RawString]
         );
     }
 
@@ -668,50 +635,14 @@ mod test {
     fn string_lit_with_interpolation() {
         let tokens = tokenize("\"hello ${world}\"");
         assert_eq!(
-            tokens,
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
             vec![
-                Token {
-                    kind: TokenKind::DoubleQuote,
-                    span: Span {
-                        start: Pos::new(0, 0),
-                        end: Pos::new(0, 1),
-                    }
-                },
-                Token {
-                    kind: TokenKind::RawString,
-                    span: Span {
-                        start: Pos::new(0, 1),
-                        end: Pos::new(0, 7),
-                    }
-                },
-                Token {
-                    kind: TokenKind::EnterInterpolation,
-                    span: Span {
-                        start: Pos::new(0, 7),
-                        end: Pos::new(0, 9),
-                    }
-                },
-                Token {
-                    kind: TokenKind::Ident,
-                    span: Span {
-                        start: Pos::new(0, 9),
-                        end: Pos::new(0, 14),
-                    }
-                },
-                Token {
-                    kind: TokenKind::ExitInterpolation,
-                    span: Span {
-                        start: Pos::new(0, 14),
-                        end: Pos::new(0, 15),
-                    }
-                },
-                Token {
-                    kind: TokenKind::DoubleQuote,
-                    span: Span {
-                        start: Pos::new(0, 15),
-                        end: Pos::new(0, 16),
-                    }
-                },
+                TokenKind::DoubleQuote,
+                TokenKind::RawString,
+                TokenKind::EnterInterpolation,
+                TokenKind::Ident,
+                TokenKind::ExitInterpolation,
+                TokenKind::DoubleQuote,
             ]
         );
     }
@@ -720,43 +651,13 @@ mod test {
     fn string_lit_with_unfinished_interpolation() {
         let tokens = tokenize("\"hello ${world\"");
         assert_eq!(
-            tokens,
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
             vec![
-                Token {
-                    kind: TokenKind::DoubleQuote,
-                    span: Span {
-                        start: Pos::new(0, 0),
-                        end: Pos::new(0, 1),
-                    }
-                },
-                Token {
-                    kind: TokenKind::RawString,
-                    span: Span {
-                        start: Pos::new(0, 1),
-                        end: Pos::new(0, 7),
-                    }
-                },
-                Token {
-                    kind: TokenKind::EnterInterpolation,
-                    span: Span {
-                        start: Pos::new(0, 7),
-                        end: Pos::new(0, 9),
-                    }
-                },
-                Token {
-                    kind: TokenKind::Ident,
-                    span: Span {
-                        start: Pos::new(0, 9),
-                        end: Pos::new(0, 14),
-                    }
-                },
-                Token {
-                    kind: TokenKind::DoubleQuote,
-                    span: Span {
-                        start: Pos::new(0, 14),
-                        end: Pos::new(0, 15),
-                    }
-                },
+                TokenKind::DoubleQuote,
+                TokenKind::RawString,
+                TokenKind::EnterInterpolation,
+                TokenKind::Ident,
+                TokenKind::DoubleQuote,
             ]
         );
     }
@@ -765,14 +666,8 @@ mod test {
     fn int_literal() {
         let tokens = tokenize("42");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Int,
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 2),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Int]
         );
     }
 
@@ -780,14 +675,8 @@ mod test {
     fn float_literal() {
         let tokens = tokenize("3.14");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Float { terminated: true },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 4),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Float { terminated: true }]
         );
     }
 
@@ -795,14 +684,8 @@ mod test {
     fn float_literal_unfinished() {
         let tokens = tokenize("3.");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Float { terminated: false },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 2),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Float { terminated: false }]
         );
     }
 
@@ -810,29 +693,11 @@ mod test {
     fn float_literal_too_many_dots() {
         let tokens = tokenize("3.1.4");
         assert_eq!(
-            tokens,
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
             vec![
-                Token {
-                    kind: TokenKind::Float { terminated: true },
-                    span: Span {
-                        start: Pos::new(0, 0),
-                        end: Pos::new(0, 3),
-                    }
-                },
-                Token {
-                    kind: TokenKind::Dot,
-                    span: Span {
-                        start: Pos::new(0, 3),
-                        end: Pos::new(0, 4),
-                    }
-                },
-                Token {
-                    kind: TokenKind::Int,
-                    span: Span {
-                        start: Pos::new(0, 4),
-                        end: Pos::new(0, 5),
-                    }
-                },
+                TokenKind::Float { terminated: true },
+                TokenKind::Dot,
+                TokenKind::Int,
             ]
         );
     }
@@ -841,14 +706,8 @@ mod test {
     fn int_literal_with_underscores() {
         let tokens = tokenize("1_000_000");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Int,
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 9),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Int]
         );
     }
 
@@ -856,14 +715,8 @@ mod test {
     fn explicit_float_literal() {
         let tokens = tokenize("3f");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Float { terminated: true },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 2),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Float { terminated: true }]
         );
     }
 
@@ -871,14 +724,8 @@ mod test {
     fn explicit_float_literal2() {
         let tokens = tokenize("3_float");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Float { terminated: true },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 7),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Float { terminated: true }]
         );
     }
 
@@ -886,14 +733,8 @@ mod test {
     fn whitespace() {
         let tokens = tokenize(" \t  ");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Space(4),
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 4),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Space(4)]
         );
     }
 
@@ -901,14 +742,8 @@ mod test {
     fn newline() {
         let tokens = tokenize("\n\r\n\n");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::NewLine(3),
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(3, 0),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::NewLine(3)]
         );
     }
 
@@ -916,14 +751,8 @@ mod test {
     fn eol_comment() {
         let tokens = tokenize("// hello");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::EolComment,
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 8),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::EolComment]
         );
     }
 
@@ -931,14 +760,8 @@ mod test {
     fn block_comment() {
         let tokens = tokenize("/* hello /*\n\n * world */");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::BlockComment,
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(2, 11),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::BlockComment]
         );
     }
 
@@ -946,14 +769,8 @@ mod test {
     fn block_comment_with_escape() {
         let tokens = tokenize("/* \\* */");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::BlockComment,
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 8),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::BlockComment]
         );
     }
 
@@ -961,14 +778,8 @@ mod test {
     fn scientific_notation() {
         let tokens = tokenize("1e6");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Int,
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 3),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Int]
         );
     }
 
@@ -976,14 +787,8 @@ mod test {
     fn scientific_notation_nagative() {
         let tokens = tokenize("1e-6");
         assert_eq!(
-            tokens,
-            vec![Token {
-                kind: TokenKind::Float { terminated: true },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 4),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Float { terminated: true }]
         );
     }
 
@@ -991,89 +796,41 @@ mod test {
     fn small_binop() {
         let tokens = tokenize("a <= 42");
         assert_eq!(
-            tokens,
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
             vec![
-                Token {
-                    kind: TokenKind::Ident,
-                    span: Span {
-                        start: Pos::new(0, 0),
-                        end: Pos::new(0, 1),
-                    }
-                },
-                Token {
-                    kind: TokenKind::Space(1),
-                    span: Span {
-                        start: Pos::new(0, 1),
-                        end: Pos::new(0, 2),
-                    }
-                },
-                Token {
-                    kind: TokenKind::LtEq,
-                    span: Span {
-                        start: Pos::new(0, 2),
-                        end: Pos::new(0, 4),
-                    }
-                },
-                Token {
-                    kind: TokenKind::Space(1),
-                    span: Span {
-                        start: Pos::new(0, 4),
-                        end: Pos::new(0, 5),
-                    }
-                },
-                Token {
-                    kind: TokenKind::Int,
-                    span: Span {
-                        start: Pos::new(0, 5),
-                        end: Pos::new(0, 7),
-                    }
-                }
+                TokenKind::Ident,
+                TokenKind::Space(1),
+                TokenKind::LtEq,
+                TokenKind::Space(1),
+                TokenKind::Int
             ]
         );
     }
 
     #[test]
     fn char() {
-        let result = tokenize("'c'");
+        let tokens = tokenize("'c'");
         assert_eq!(
-            result,
-            vec![Token {
-                kind: TokenKind::Char { terminated: true },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 3),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Char { terminated: true }]
         );
     }
 
     #[test]
     fn char_escape() {
-        let result = tokenize(r#"'\\'"#);
+        let tokens = tokenize(r#"'\\'"#);
         assert_eq!(
-            result,
-            vec![Token {
-                kind: TokenKind::Char { terminated: true },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 4),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Char { terminated: true }]
         );
     }
 
     #[test]
     fn char_unfinished() {
-        let result = tokenize(r#"'c"#);
+        let tokens = tokenize(r#"'c"#);
         assert_eq!(
-            result,
-            vec![Token {
-                kind: TokenKind::Char { terminated: false },
-                span: Span {
-                    start: Pos::new(0, 0),
-                    end: Pos::new(0, 2),
-                }
-            }]
+            tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
+            vec![TokenKind::Char { terminated: false }]
         );
     }
 }

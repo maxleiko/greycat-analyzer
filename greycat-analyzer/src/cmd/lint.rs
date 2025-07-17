@@ -46,7 +46,7 @@ fn dump_tokens(source: &str, tokens: &[Token]) {
                     eprintln!();
                 }
             }
-            _ => eprint!("⌈{}⌉", &source[tok.span.as_range(source)]),
+            _ => eprint!("⌈{}⌉", &source[tok.span.as_range()]),
         }
     }
 }

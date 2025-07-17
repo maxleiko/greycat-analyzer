@@ -32,19 +32,19 @@ impl fmt::Display for SrcToken<'_> {
             TokenKind::BlockComment => write!(f, "BlockComment"),
             TokenKind::Space(n) => write!(f, "Space({n})"),
             TokenKind::NewLine(n) => write!(f, "NewLine({n})"),
-            TokenKind::Ident => write!(f, "Ident({})", self.token.span.as_str(self.source)),
-            TokenKind::Int => write!(f, "Int({})", self.token.span.as_str(self.source)),
+            TokenKind::Ident => write!(f, "Ident({})", &self.source[self.token.span.as_range()]),
+            TokenKind::Int => write!(f, "Int({})", &self.source[self.token.span.as_range()]),
             TokenKind::Float { terminated } => write!(
                 f,
                 "Float({}, {terminated})",
-                self.token.span.as_str(self.source)
+                &self.source[self.token.span.as_range()]
             ),
             TokenKind::Char { terminated } => write!(
                 f,
                 "Char({}, {terminated})",
-                self.token.span.as_str(self.source)
+                &self.source[self.token.span.as_range()]
             ),
-            TokenKind::Bool => write!(f, "Bool({})", self.token.span.as_str(self.source)),
+            TokenKind::Bool => write!(f, "Bool({})", &self.source[self.token.span.as_range()]),
             TokenKind::Semi => write!(f, "Semi"),
             TokenKind::Comma => write!(f, "Comma"),
             TokenKind::Dot => write!(f, "Dot"),

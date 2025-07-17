@@ -73,26 +73,26 @@ impl std::fmt::Display for SourceParseError<'_> {
             ParseError::UnexpectedToken(expected, got) => writeln!(
                 f,
                 "expected '{expected:?}', got '{}' at {}",
-                &self.source[got.span.as_range(self.source)],
+                &self.source[got.span.as_range()],
                 got.span
             ),
             ParseError::ExpectedIdent(ident, got) => writeln!(
                 f,
                 "expected '{ident}', got '{}' at {}",
-                &self.source[got.span.as_range(self.source)],
+                &self.source[got.span.as_range()],
                 got.span
             ),
             ParseError::ExpectedIdents(idents, got) => writeln!(
                 f,
                 "expected one of {}, got '{}' at {}",
                 idents.join(", "),
-                &self.source[got.span.as_range(self.source)],
+                &self.source[got.span.as_range()],
                 got.span
             ),
             ParseError::Unexpected(span) => writeln!(
                 f,
                 "unexpected token '{}' at {}",
-                &self.source[span.as_range(self.source)],
+                &self.source[span.as_range()],
                 span
             ),
             ParseError::UnexpectedEof => writeln!(f, "<EOF>"),
