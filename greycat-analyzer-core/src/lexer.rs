@@ -431,7 +431,7 @@ impl<'a> Lexer<'a> {
     }
 
     pub fn next_token(&mut self) -> Option<Token> {
-        if self.curr.offset as usize == self.source.len() {
+        if self.curr.offset as usize > self.source.len() {
             return None;
         }
 
@@ -444,6 +444,9 @@ impl<'a> Lexer<'a> {
             // which is likely due to a bug introduced by popping too much
             .expect("internal error, no more lexer in stack");
         let token = current_lexer.consume(self);
+        if token.kind == TokenKind::Eof {
+            self.curr.offset += 1;
+        }
         match self.state.next.take() {
             Some(transition) => {
                 match transition {
@@ -604,6 +607,13 @@ mod test {
                         start: Pos::new(1, 0, 2),
                         end: Pos::new(1, 1, 3),
                     }
+                },
+                Token {
+                    kind: TokenKind::Eof,
+                    span: Span {
+                        start: Pos::new(1, 1, 3),
+                        end: Pos::new(1, 1, 3),
+                    }
                 }
             ]
         );
@@ -618,6 +628,7 @@ mod test {
                 TokenKind::DoubleQuote,
                 TokenKind::RawString,
                 TokenKind::DoubleQuote,
+                TokenKind::Eof,
             ]
         );
     }
@@ -627,7 +638,7 @@ mod test {
         let tokens = tokenize("\"hello ");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::DoubleQuote, TokenKind::RawString]
+            vec![TokenKind::DoubleQuote, TokenKind::RawString, TokenKind::Eof]
         );
     }
 
@@ -643,6 +654,7 @@ mod test {
                 TokenKind::Ident,
                 TokenKind::ExitInterpolation,
                 TokenKind::DoubleQuote,
+                TokenKind::Eof,
             ]
         );
     }
@@ -658,6 +670,7 @@ mod test {
                 TokenKind::EnterInterpolation,
                 TokenKind::Ident,
                 TokenKind::DoubleQuote,
+                TokenKind::Eof,
             ]
         );
     }
@@ -667,7 +680,7 @@ mod test {
         let tokens = tokenize("42");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Int]
+            vec![TokenKind::Int, TokenKind::Eof]
         );
     }
 
@@ -676,7 +689,7 @@ mod test {
         let tokens = tokenize("3.14");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Float { terminated: true }]
+            vec![TokenKind::Float { terminated: true }, TokenKind::Eof]
         );
     }
 
@@ -685,7 +698,7 @@ mod test {
         let tokens = tokenize("3.");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Float { terminated: false }]
+            vec![TokenKind::Float { terminated: false }, TokenKind::Eof]
         );
     }
 
@@ -698,6 +711,7 @@ mod test {
                 TokenKind::Float { terminated: true },
                 TokenKind::Dot,
                 TokenKind::Int,
+                TokenKind::Eof,
             ]
         );
     }
@@ -707,7 +721,7 @@ mod test {
         let tokens = tokenize("1_000_000");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Int]
+            vec![TokenKind::Int, TokenKind::Eof]
         );
     }
 
@@ -716,7 +730,7 @@ mod test {
         let tokens = tokenize("3f");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Float { terminated: true }]
+            vec![TokenKind::Float { terminated: true }, TokenKind::Eof]
         );
     }
 
@@ -725,7 +739,7 @@ mod test {
         let tokens = tokenize("3_float");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Float { terminated: true }]
+            vec![TokenKind::Float { terminated: true }, TokenKind::Eof]
         );
     }
 
@@ -734,7 +748,7 @@ mod test {
         let tokens = tokenize(" \t  ");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Space(4)]
+            vec![TokenKind::Space(4), TokenKind::Eof]
         );
     }
 
@@ -743,7 +757,7 @@ mod test {
         let tokens = tokenize("\n\r\n\n");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::NewLine(3)]
+            vec![TokenKind::NewLine(3), TokenKind::Eof]
         );
     }
 
@@ -752,7 +766,7 @@ mod test {
         let tokens = tokenize("// hello");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::EolComment]
+            vec![TokenKind::EolComment, TokenKind::Eof]
         );
     }
 
@@ -761,7 +775,7 @@ mod test {
         let tokens = tokenize("/* hello /*\n\n * world */");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::BlockComment]
+            vec![TokenKind::BlockComment, TokenKind::Eof]
         );
     }
 
@@ -770,7 +784,7 @@ mod test {
         let tokens = tokenize("/* \\* */");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::BlockComment]
+            vec![TokenKind::BlockComment, TokenKind::Eof]
         );
     }
 
@@ -779,7 +793,7 @@ mod test {
         let tokens = tokenize("1e6");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Int]
+            vec![TokenKind::Int, TokenKind::Eof]
         );
     }
 
@@ -788,7 +802,7 @@ mod test {
         let tokens = tokenize("1e-6");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Float { terminated: true }]
+            vec![TokenKind::Float { terminated: true }, TokenKind::Eof]
         );
     }
 
@@ -802,7 +816,8 @@ mod test {
                 TokenKind::Space(1),
                 TokenKind::LtEq,
                 TokenKind::Space(1),
-                TokenKind::Int
+                TokenKind::Int,
+                TokenKind::Eof
             ]
         );
     }
@@ -812,7 +827,7 @@ mod test {
         let tokens = tokenize("'c'");
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Char { terminated: true }]
+            vec![TokenKind::Char { terminated: true }, TokenKind::Eof]
         );
     }
 
@@ -821,7 +836,7 @@ mod test {
         let tokens = tokenize(r#"'\\'"#);
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Char { terminated: true }]
+            vec![TokenKind::Char { terminated: true }, TokenKind::Eof]
         );
     }
 
@@ -830,7 +845,7 @@ mod test {
         let tokens = tokenize(r#"'c"#);
         assert_eq!(
             tokens.into_iter().map(|t| t.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Char { terminated: false }]
+            vec![TokenKind::Char { terminated: false }, TokenKind::Eof]
         );
     }
 }
