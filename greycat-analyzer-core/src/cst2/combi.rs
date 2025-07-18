@@ -8,32 +8,44 @@ use crate::{
 
 #[derive(Debug)]
 pub enum ParseError {
+    Custom { text: &'static str, got: Token },
     Expected { kind: TokenKind, got: Token },
     OneOf { errors: Vec<ParseError>, got: Token },
 }
 
+impl ParseError {
+    pub fn is_eof(&self) -> bool {
+        let got = match self {
+            Self::Custom { got, .. } => got.kind,
+            Self::Expected { got, .. } => got.kind,
+            Self::OneOf { got, .. } => got.kind,
+        };
+        got == TokenKind::Eof
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Tokens {
-    leading: Vec<Token>,
-    token: Token,
+    pub(crate) leading: Vec<Token>,
+    pub(crate) token: Token,
 }
 
 pub type Res<'a, T, E = ParseError> = std::result::Result<(&'a [Token], T), E>;
 
-pub trait Parser<'a, T> {
-    fn parse(&self, t: &'a [Token]) -> Res<'a, T>;
+pub trait Parser<'a, T, E = ParseError> {
+    fn parse(&self, t: &'a [Token]) -> Res<'a, T, E>;
 }
 
-impl<'t, T, F> Parser<'t, T> for F
+impl<'t, T, F, E> Parser<'t, T, E> for F
 where
-    F: Fn(&'t [Token]) -> Res<'t, T>,
+    F: Fn(&'t [Token]) -> Res<'t, T, E>,
 {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, T> {
+    fn parse(&self, t: &'t [Token]) -> Res<'t, T, E> {
         self(t)
     }
 }
 
-pub fn next(mut t: &[Token]) -> Res<Option<Token>> {
+pub fn next(mut t: &[Token]) -> Res<Option<Token>, Infallible> {
     if t.is_empty() {
         return Ok((t, None));
     }
@@ -41,7 +53,7 @@ pub fn next(mut t: &[Token]) -> Res<Option<Token>> {
     Ok((&t[1..], Some(next)))
 }
 
-pub fn peek<'t>(mut t: &'t [Token]) -> Res<'t, Tokens, Infallible> {
+pub fn peek(mut t: &[Token]) -> Res<Tokens, Infallible> {
     let mut iter = t.iter();
     let leading: Vec<Token> = iter.take_while(|t| t.kind.is_trivia()).copied().collect();
     t = &t[leading.len()..];
@@ -49,18 +61,56 @@ pub fn peek<'t>(mut t: &'t [Token]) -> Res<'t, Tokens, Infallible> {
     Ok((&t[1..], Tokens { leading, token }))
 }
 
-pub fn matches<'t>(kind: TokenKind) -> impl Parser<'t, Tokens> {
-    move |t| {
+#[derive(Clone, Copy)]
+pub struct Matches {
+    kind: TokenKind,
+}
+
+impl<'t> Parser<'t, Tokens> for Matches {
+    fn parse(&self, t: &'t [Token]) -> Res<'t, Tokens, ParseError> {
         let (t, tok) = peek(t).unwrap();
-        if tok.token.kind == kind {
+        if tok.token.kind == self.kind {
             Ok((t, tok))
         } else {
             Err(ParseError::Expected {
-                kind,
+                kind: self.kind,
                 got: tok.token,
             })
         }
     }
+}
+
+#[inline(always)]
+pub const fn matches(kind: TokenKind) -> Matches {
+    Matches { kind }
+}
+
+#[derive(Clone, Copy)]
+pub struct MatchesOne<const N: usize> {
+    kinds: [TokenKind; N],
+    error_text: &'static str,
+}
+
+impl<'t, const N: usize> Parser<'t, Tokens> for MatchesOne<N> {
+    fn parse(&self, t: &'t [Token]) -> Res<'t, Tokens, ParseError> {
+        let (t, tok) = peek(t).unwrap();
+        if self.kinds.contains(&tok.token.kind) {
+            Ok((t, tok))
+        } else {
+            Err(ParseError::Custom {
+                text: self.error_text,
+                got: tok.token,
+            })
+        }
+    }
+}
+
+#[inline(always)]
+pub const fn matches_one<const N: usize>(
+    kinds: [TokenKind; N],
+    error_text: &'static str,
+) -> MatchesOne<N> {
+    MatchesOne { kinds, error_text }
 }
 
 pub fn one_of<'t, 'p, P, T>(parsers: &'p [P]) -> impl Parser<'t, T>
@@ -103,7 +153,24 @@ where
     }
 }
 
-pub fn seq<'t, 'p, P, T>(parsers: &'p [P]) -> impl Parser<'t, Vec<T>>
+pub fn alt<'t, P1, P2, T>(p1: P1, p2: P2) -> impl Parser<'t, T>
+where
+    P1: Parser<'t, T>,
+    P2: Parser<'t, T>,
+{
+    move |t| match p1.parse(t) {
+        Ok((t, res)) => Ok((t, res)),
+        Err(err1) => match p2.parse(t) {
+            Ok((t, res)) => Ok((t, res)),
+            Err(err2) => Err(ParseError::OneOf {
+                errors: vec![err1, err2],
+                got: t[0],
+            }),
+        },
+    }
+}
+
+pub fn seq<'t, P, T>(parsers: &[P]) -> impl Parser<'t, Vec<T>>
 where
     P: Parser<'t, T>,
 {
@@ -115,8 +182,72 @@ where
             items.push(res);
             tokens = t;
         }
-        Ok((t, items))
+        Ok((tokens, items))
     }
+}
+
+pub fn many<'t, P, T>(parser: P) -> impl Parser<'t, Vec<T>, Infallible>
+where
+    P: Parser<'t, T>,
+{
+    move |t| {
+        let mut items = Vec::new();
+        let mut tokens = t;
+        while let Ok((t, res)) = parser.parse(tokens) {
+            items.push(res);
+            tokens = t;
+        }
+        Ok((tokens, items))
+    }
+}
+
+pub fn many1<'t, P, T>(parser: P) -> impl Parser<'t, Vec<T>>
+where
+    P: Parser<'t, T>,
+{
+    move |t| {
+        let (t, item) = parser.parse(t)?;
+        let mut items = vec![item];
+        let mut tokens = t;
+        while let Ok((t, res)) = parser.parse(tokens) {
+            items.push(res);
+            tokens = t;
+        }
+        Ok((tokens, items))
+    }
+}
+
+pub fn map<'t, P, A, B, F>(parser: P, map: F) -> impl Parser<'t, B>
+where
+    P: Parser<'t, A>,
+    F: Fn(A) -> B,
+{
+    move |t| parser.parse(t).map(|(t, res)| (t, map(res)))
+}
+
+pub fn opt<'t, P, T>(parser: P) -> impl Parser<'t, Option<T>, Infallible>
+where
+    P: Parser<'t, T>,
+{
+    move |t| match parser.parse(t) {
+        Ok((t, res)) => Ok((t, Some(res))),
+        Err(_) => Ok((t, None)),
+    }
+}
+
+pub fn and_then<'t, P, A, B, F>(parser: P, then: F) -> impl Parser<'t, B>
+where
+    P: Parser<'t, A>,
+    F: Fn(A) -> Box<dyn Parser<'t, B>>,
+{
+    move |t| parser.parse(t).and_then(|(t, res)| then(res).parse(t))
+}
+
+pub fn value<'t, T>(value: T) -> impl Parser<'t, T>
+where
+    T: Clone,
+{
+    move |t| Ok((t, value.clone()))
 }
 
 #[cfg(test)]

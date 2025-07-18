@@ -81,7 +81,7 @@ impl<'src> CstParser<'src> {
     }
 
     fn parse_function(&mut self, source: &'src str) -> ParserResult<CstNode> {
-        let mut node = Node::new(NodeKind::Function);
+        let mut node = Node::new(NodeKind::Fn);
         if let Some(modifiers) = self.parse_fn_modifiers(source)? {
             node.add_node(CstNode::Node(modifiers));
         }

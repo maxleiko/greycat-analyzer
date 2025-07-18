@@ -18,7 +18,7 @@ pub fn parse(name: &str, source: impl AsRef<str>, errors: &mut Vec<Diagnostic>) 
     for child in &root.children {
         match child {
             CstNode::Node(node) => match node.kind {
-                NodeKind::Function => functions.push(parse_function(source, node, errors)?),
+                NodeKind::Fn => functions.push(parse_function(source, node, errors)?),
                 NodeKind::PragmaStmt => pragmas.push(parse_pragma_stmt(source, node, errors)?),
                 _ => errors.push(Diagnostic {
                     range: node.span().to_range(),

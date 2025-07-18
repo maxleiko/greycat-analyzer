@@ -1,2 +1,2 @@
-mod combi;
-mod parser;
+pub mod combi;
+pub mod parser;

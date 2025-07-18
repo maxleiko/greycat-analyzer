@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cst::token_ext::TokenExt,
+    cst2::combi::Tokens,
     lexer::{Token, TokenKind},
     span::{Pos, Span},
 };
@@ -113,8 +114,19 @@ impl Node {
     }
 
     pub fn add_tokens(&mut self, tokens: Vec<Token>) {
-        self.children
-            .extend(tokens.into_iter().map(CstNode::Token));
+        self.children.extend(tokens.into_iter().map(CstNode::Token));
+    }
+
+    pub fn add_tokens2(&mut self, tokens: Tokens) {
+        let Tokens { leading, token } = tokens;
+        self.add_tokens(leading);
+        self.add_token(token);
+    }
+
+    pub fn add_many_tokens(&mut self, items: Vec<Tokens>) {
+        for item in items {
+            self.add_tokens2(item)
+        }
     }
 
     pub fn cursor(&self) -> NodeCursor<'_> {
@@ -161,10 +173,10 @@ impl From<&NodeError> for lsp_types::Diagnostic {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
     Module,
-    Function,
+    Fn,
     Name,
     FnModifiers,
     GenericParams,
@@ -175,10 +187,14 @@ pub enum NodeKind {
     ReturnType,
     Body,
     BodyStmt,
+    Pragma,
+    Doc,
     PragmaStmt,
     PragmaArgs,
     Expr,
     String,
+    Ident,
+    TypeDecorator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
