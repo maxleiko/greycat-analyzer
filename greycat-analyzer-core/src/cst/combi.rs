@@ -1,7 +1,10 @@
 use std::convert::Infallible;
 
 use crate::{
-    span::{Pos, Span}, tokenize, Token, TokenKind, cst::Tokens
+    Token, TokenKind,
+    cst::Tokens,
+    span::{Pos, Span},
+    tokenize,
 };
 
 #[derive(Debug)]
@@ -121,26 +124,8 @@ where
     }
 }
 
-pub const fn static_one_of<P>(parsers: &'static [P]) -> OneOf<'static, P> {
+pub const fn one_of<'p, P>(parsers: &'p [P]) -> OneOf<'p, P> {
     OneOf { parsers }
-}
-
-pub fn one_of<'t, 'p, P, T>(parsers: &'p [P]) -> impl Parser<'t, T>
-where
-    P: Parser<'t, T>,
-{
-    move |t| {
-        let mut errors = Vec::new();
-        for parser in parsers {
-            match parser.parse(t) {
-                Ok(res) => return Ok(res),
-                Err(err) => {
-                    errors.push(err);
-                }
-            }
-        }
-        Err(ParseError::OneOf { errors, got: t[0] })
-    }
 }
 
 pub enum Either<L, R> {

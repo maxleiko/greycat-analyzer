@@ -234,8 +234,7 @@ static KW: MatchesOne<38> = matches_one(
     "a keyword",
 );
 
-static MODIFIER: OneOf<'static, Matches> =
-    static_one_of(&[KW_NATIVE, KW_PRIVATE, KW_STATIC, KW_ABSTRACT]);
+static MODIFIER: OneOf<'static, Matches> = one_of(&[KW_NATIVE, KW_PRIVATE, KW_STATIC, KW_ABSTRACT]);
 static IDENT_OR_KW: MatchesOne<39> = matches_one(
     [
         // Identifier
