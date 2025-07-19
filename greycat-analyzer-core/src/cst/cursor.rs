@@ -1,6 +1,6 @@
 use crate::{Token, TokenKind};
 
-use super::{CstNode, Node, NodeKind, error::ParseError};
+use super::{CstNode, Node, NodeKind};
 
 pub struct NodeCursor<'a> {
     nodes: &'a [CstNode],
@@ -36,30 +36,6 @@ impl<'a> NodeCursor<'a> {
                     return Some(node);
                 }
             }
-        }
-    }
-
-    pub fn expect_token(&mut self, kind: TokenKind) -> Result<&'a Token, ParseError> {
-        match self.next_node() {
-            Some(CstNode::Token(token)) => Ok(token),
-            Some(other) => Err(ParseError::Unexpected(other.span())),
-            None => Err(ParseError::UnexpectedEof),
-        }
-    }
-
-    pub fn expect_rule(&mut self, rule: NodeKind) -> Result<&'a Node, ParseError> {
-        match self.next_node() {
-            Some(CstNode::Node(node)) => Ok(node),
-            Some(other) => Err(ParseError::Unexpected(other.span())),
-            None => Err(ParseError::UnexpectedEof),
-        }
-    }
-
-    pub fn either_token(&mut self, left: TokenKind, right: TokenKind) -> Either {
-        match self.peek_node() {
-            Some(CstNode::Token(tok)) if tok.kind == left => Either::Left,
-            Some(CstNode::Token(tok)) if tok.kind == right => Either::Right,
-            _ => Either::None,
         }
     }
 }

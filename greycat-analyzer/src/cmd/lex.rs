@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use greycat_analyzer_core::{CstParser, Lexer};
+use greycat_analyzer_core::Lexer;
 
 use crate::utils::AnyError;
 

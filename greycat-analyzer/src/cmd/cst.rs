@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use greycat_analyzer_core::{tokenize, CstParser};
+use greycat_analyzer_core::tokenize;
 
 use crate::utils::AnyError;
 
@@ -24,7 +24,7 @@ impl Cst {
         //     .map_err(|err| err.to_source_error(&source))?;
         // println!("{}", module.to_display_node(&source, self.trivia));
         let tokens = tokenize(&source);
-        let module = greycat_analyzer_core::cst2::parse(&tokens);
+        let module = greycat_analyzer_core::cst::parse(&tokens);
         println!("{}", module.to_display_node(&source, self.trivia));
         Ok(())
     }
