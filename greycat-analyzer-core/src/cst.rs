@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cst::token_ext::TokenExt,
-    cst2::combi::Tokens,
+    cst2::Tokens,
     lexer::{Token, TokenKind},
     span::{Pos, Span},
 };
@@ -195,6 +195,7 @@ pub enum NodeKind {
     String,
     Ident,
     TypeDecorator,
+    StmtHeader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -284,7 +285,9 @@ impl<'a> DisplayNode<'a> {
                 }
                 _ => Ok(()),
             },
-            CstNode::Error(NodeError { kind, .. }) => writeln!(f, "{pad}(ERROR \"{kind:?}\")"),
+            CstNode::Error(NodeError { kind, token }) => {
+                writeln!(f, "{pad}(ERROR {kind:?}={:?})", token.kind)
+            }
         }
     }
 }

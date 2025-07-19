@@ -45,20 +45,13 @@ where
     }
 }
 
-pub fn next(mut t: &[Token]) -> Res<Option<Token>, Infallible> {
-    if t.is_empty() {
-        return Ok((t, None));
-    }
-    let next = t[0];
-    Ok((&t[1..], Some(next)))
-}
-
-pub fn peek(mut t: &[Token]) -> Res<Tokens, Infallible> {
+pub fn peek(mut t: &[Token]) -> (&[Token], Tokens) {
     let mut iter = t.iter();
     let leading: Vec<Token> = iter.take_while(|t| t.kind.is_trivia()).copied().collect();
     t = &t[leading.len()..];
     let token = t[0];
-    Ok((&t[1..], Tokens { leading, token }))
+    t = &t[1..];
+    (t, Tokens { leading, token })
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +61,7 @@ pub struct Matches {
 
 impl<'t> Parser<'t, Tokens> for Matches {
     fn parse(&self, t: &'t [Token]) -> Res<'t, Tokens, ParseError> {
-        let (t, tok) = peek(t).unwrap();
+        let (t, tok) = peek(t);
         if tok.token.kind == self.kind {
             Ok((t, tok))
         } else {
@@ -93,7 +86,7 @@ pub struct MatchesOne<const N: usize> {
 
 impl<'t, const N: usize> Parser<'t, Tokens> for MatchesOne<N> {
     fn parse(&self, t: &'t [Token]) -> Res<'t, Tokens, ParseError> {
-        let (t, tok) = peek(t).unwrap();
+        let (t, tok) = peek(t);
         if self.kinds.contains(&tok.token.kind) {
             Ok((t, tok))
         } else {
@@ -222,11 +215,9 @@ where
     P: Parser<'t, A>,
     F: Fn(A) -> B,
 {
-    move |t| {
-        match parser.parse(t) {
-            Ok((t, a)) => Ok((t, map(a))),
-            Err(err) => Err(err),
-        }
+    move |t| match parser.parse(t) {
+        Ok((t, a)) => Ok((t, map(a))),
+        Err(err) => Err(err),
     }
 }
 
@@ -263,10 +254,10 @@ mod test {
     #[test]
     fn peeking() {
         let tokens = tokenize(" fn main");
-        let (t, a) = peek(&tokens).unwrap();
-        assert_eq!(t.len(), 3);
+        let (_, tok) = peek(&tokens);
+        assert_eq!(tokens.len(), 5);
         assert_eq!(
-            a,
+            tok,
             Tokens {
                 leading: vec![Token {
                     kind: TokenKind::Space(1),
@@ -278,30 +269,15 @@ mod test {
                 }
             }
         );
-        let (t, b) = peek(t).unwrap();
-        assert_eq!(t.len(), 1);
-        assert_eq!(
-            b,
-            Tokens {
-                leading: vec![Token {
-                    kind: TokenKind::Space(1),
-                    span: Span::new(Pos::new(0, 3, 3), Pos::new(0, 4, 4))
-                }],
-                token: Token {
-                    kind: TokenKind::Ident,
-                    span: Span::new(Pos::new(0, 4, 4), Pos::new(0, 8, 8))
-                }
-            }
-        );
     }
 
     #[test]
     fn all_spaces() {
         let tokens = tokenize("  ");
-        let (t, a) = peek(&tokens).unwrap();
-        assert_eq!(t.len(), 0);
+        let (_, tok) = peek(&tokens);
+        assert_eq!(tokens.len(), 3);
         assert_eq!(
-            a,
+            tok,
             Tokens {
                 leading: vec![Token {
                     kind: TokenKind::Space(2),

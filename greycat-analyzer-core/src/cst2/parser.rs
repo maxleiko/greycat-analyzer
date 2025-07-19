@@ -2,8 +2,43 @@ use std::convert::Infallible;
 
 use crate::{CstNode, ErrorKind, Node, NodeError, NodeKind, Token, TokenKind, cst2::combi::*};
 
+pub fn parse(mut t: &[Token]) -> Node {
+    let mut node = Node::new(NodeKind::Module);
+    loop {
+        let (next, peeked) = peek(t);
+        if peeked.token.kind == TokenKind::Eof {
+            node.add_tokens(peeked.leading);
+            t = next; // 't' should be empty after that because 'Eof'
+            break;
+        } else {
+            let trivia_len = peeked.leading.len();
+            node.add_tokens(peeked.leading);
+            t = &t[trivia_len..]; // consume trivia only
+        }
+        match either(module_stmt, SEMI).parse(t) {
+            Ok((next, Either::Left(stmt))) => {
+                node.add_node(CstNode::Node(stmt));
+                t = next;
+            }
+            Ok((next, Either::Right(semi))) => {
+                node.add_tokens2(semi);
+                t = next;
+            }
+            Err(_) => {
+                node.add_node(CstNode::Error(NodeError {
+                    kind: ErrorKind::UnexpectedToken,
+                    token: t[0],
+                }));
+                t = &t[1..]; // advance
+            }
+        }
+    }
+    assert!(t.is_empty());
+    node
+}
+
 fn module_stmt(t: &[Token]) -> Res<Node> {
-    todo!()
+    one_of(&[fn_decl]).parse(t)
 }
 
 fn fn_decl(t: &[Token]) -> Res<Node> {
@@ -12,12 +47,35 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     node.add_tokens2(kw);
     let (t, name) = IDENT_OR_KW.parse(t)?;
     node.add_tokens2(name);
+    let (t, params) = fn_params(t)?;
+    node.add_node(CstNode::Node(params));
+    let (t, body_or_semi) = either(body, SEMI).parse(t)?;
+    match body_or_semi {
+        Either::Left(body) => {
+            node.add_node(CstNode::Node(body));
+        }
+        Either::Right(semi) => node.add_tokens2(semi),
+    }
     Ok((t, node))
 }
 
-fn stmt_header(t: &[Token]) -> Res<Node> {
-    // many_n(seq([doc_or_pragma, unexpected(semi)]))
-    todo!()
+fn body(t: &[Token]) -> Res<Node> {
+    let (t, open) = OPEN_CURLY.parse(t)?;
+    // TODO body stmts
+    let (t, close) = CLOSE_CURLY.parse(t)?;
+    let mut node = Node::new(NodeKind::Body);
+    node.add_tokens2(open);
+    node.add_tokens2(close);
+    Ok((t, node))
+}
+
+fn stmt_header(t: &[Token]) -> Res<Node, Infallible> {
+    let mut node = Node::new(NodeKind::StmtHeader);
+    let (t, items) = many(doc_or_pragma).parse(t).unwrap();
+    for item in items {
+        node.add_node(CstNode::Node(item));
+    }
+    Ok((t, node))
 }
 
 fn doc_or_pragma(t: &[Token]) -> Res<Node> {
@@ -41,13 +99,25 @@ fn pragma(t: &[Token]) -> Res<Node> {
     node.add_tokens2(at);
     let (t, name) = IDENT_OR_KW.parse(t)?;
     node.add_tokens2(name);
-    let (t, args) = call_args(t)?;
-    node.add_node(CstNode::Node(args));
+    // TODO add call_args on pragma
+    // let (t, args) = call_args(t)?;
+    // node.add_node(CstNode::Node(args));
     Ok((t, node))
 }
 
 fn call_args(t: &[Token]) -> Res<Node> {
     todo!()
+}
+
+fn fn_params(t: &[Token]) -> Res<Node> {
+    many_sep_bound(
+        NodeKind::FnParams,
+        OPEN_PAREN,
+        map(fn_param, CstNode::Node),
+        COMMA,
+        CLOSE_PAREN,
+    )
+    .parse(t)
 }
 
 fn fn_param(t: &[Token]) -> Res<Node> {
@@ -82,6 +152,8 @@ static COLON: Matches = matches(TokenKind::Colon);
 static KW_FN: Matches = matches(TokenKind::Fn);
 static OPEN_PAREN: Matches = matches(TokenKind::OpenParen);
 static CLOSE_PAREN: Matches = matches(TokenKind::CloseParen);
+static OPEN_CURLY: Matches = matches(TokenKind::OpenCurly);
+static CLOSE_CURLY: Matches = matches(TokenKind::CloseCurly);
 static COMMA: Matches = matches(TokenKind::Comma);
 
 static KW: MatchesOne<38> = matches_one(
@@ -176,9 +248,9 @@ static IDENT_OR_KW: MatchesOne<39> = matches_one(
 );
 
 pub fn acc_trivia<'t>(acc: &mut Vec<CstNode>, t: &'t [Token]) -> &'t [Token] {
-    let (_, token) = peek(t).unwrap();
-    let skip = token.leading.len();
-    acc.extend(token.leading.into_iter().map(CstNode::Token));
+    let (next, tok) = peek(t);
+    let skip = tok.leading.len();
+    acc.extend(tok.leading.into_iter().map(CstNode::Token));
     &t[skip..]
 }
 
