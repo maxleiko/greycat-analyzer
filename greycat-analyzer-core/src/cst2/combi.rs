@@ -222,7 +222,12 @@ where
     P: Parser<'t, A>,
     F: Fn(A) -> B,
 {
-    move |t| parser.parse(t).map(|(t, res)| (t, map(res)))
+    move |t| {
+        match parser.parse(t) {
+            Ok((t, a)) => Ok((t, map(a))),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 pub fn opt<'t, P, T>(parser: P) -> impl Parser<'t, Option<T>, Infallible>
@@ -268,7 +273,7 @@ mod test {
                     span: Span::new(Pos::new(0, 0, 0), Pos::new(0, 1, 1))
                 }],
                 token: Token {
-                    kind: TokenKind::Ident,
+                    kind: TokenKind::Fn,
                     span: Span::new(Pos::new(0, 1, 1), Pos::new(0, 3, 3))
                 }
             }
@@ -313,19 +318,19 @@ mod test {
     #[test]
     fn matching() {
         let tokens = tokenize("fn main() {}");
-        let (_, kw) = matches(TokenKind::Ident).parse(&tokens).unwrap();
-        assert_eq!(kw.token.kind, TokenKind::Ident);
+        let (_, kw) = matches(TokenKind::Fn).parse(&tokens).unwrap();
+        assert_eq!(kw.token.kind, TokenKind::Fn);
     }
 
     #[test]
     fn sequence() {
         let tokens = tokenize("fn main() {}");
-        let (_, res) = seq(&[matches(TokenKind::Ident), matches(TokenKind::Ident)])
+        let (_, res) = seq(&[matches(TokenKind::Fn), matches(TokenKind::Ident)])
             .parse(&tokens)
             .unwrap();
         assert_eq!(
             res.into_iter().map(|t| t.token.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Ident, TokenKind::Ident]
+            vec![TokenKind::Fn, TokenKind::Ident]
         );
     }
 }

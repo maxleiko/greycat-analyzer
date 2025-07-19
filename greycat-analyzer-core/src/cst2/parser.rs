@@ -51,9 +51,9 @@ fn call_args(t: &[Token]) -> Res<Node> {
 }
 
 fn fn_param(t: &[Token]) -> Res<Node> {
-    let mut node = Node::new(NodeKind::Ident);
+    let mut node = Node::new(NodeKind::FnParam);
     let (t, name) = IDENT.parse(t)?;
-    node.add_tokens2(name);
+    node.add_tokens2(name); // TODO don't we want 'ident' token to be its own 'node'?
     let (t, ty) = type_decorator(t)?;
     node.add_node(CstNode::Node(ty));
     Ok((t, node))
@@ -208,18 +208,13 @@ where
         let mut state = ManySepBoundState::First;
         let mut tokens = t;
         loop {
+            // consume any trivia "in-between"
             tokens = acc_trivia(&mut node.children, tokens);
-            match close.parse(tokens) {
-                Ok((t, c)) => {
-                    node.add_tokens2(c);
-                    return Ok((t, node));
-                }
-                Err(err) if err.is_eof() => {
-                    todo!("eof")
-                }
-                Err(err) => (),
+            // check for closing bound
+            if let Ok((t, c)) = close.parse(tokens) {
+                node.add_tokens2(c);
+                return Ok((t, node));
             }
-
             match state {
                 ManySepBoundState::First => match sep.parse(tokens) {
                     Ok((t, s)) => {
@@ -250,9 +245,9 @@ where
                         // we actually expected a separator
                         node.add_node(CstNode::Error(NodeError {
                             kind: ErrorKind::MissingSeparator,
-                            token: t[0],
+                            token: t[0], // TODO might prefer to give node.last_token() here might be more accurate
                         }));
-                        let (t, i) = item.parse(t)?;
+                        let (t, i) = item.parse(tokens)?;
                         node.add_node(i);
                         tokens = t;
                         state = ManySepBoundState::AfterItem;
@@ -269,7 +264,7 @@ where
                             kind: ErrorKind::UnexpectedToken,
                             token: t[0],
                         }));
-                        let (t, s) = sep.parse(t)?;
+                        let (t, s) = sep.parse(tokens)?;
                         tokens = t;
                         state = ManySepBoundState::AfterSep;
                     }
@@ -286,8 +281,29 @@ mod test {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    fn assert_token_kind(node: &CstNode, kind: TokenKind) {
+        match node {
+            CstNode::Token(token) => assert_eq!(token.kind, kind),
+            other => panic!("Expected CstNode::Token with kind {kind:?}, got: {other:?}"),
+        }
+    }
+
+    fn assert_node_kind(node: &CstNode, kind: NodeKind) {
+        match node {
+            CstNode::Node(node) => assert_eq!(node.kind, kind),
+            other => panic!("Expected CstNode::Node with kind {kind:?}, got: {other:?}"),
+        }
+    }
+
+    fn assert_error_kind(node: &CstNode, kind: ErrorKind) {
+        match node {
+            CstNode::Error(err) => assert_eq!(err.kind, kind),
+            other => panic!("Expected CstNode::Err with kind {kind:?}, got: {other:?}"),
+        }
+    }
+
     #[test]
-    fn many_sep_bound_test() {
+    fn many_sep_bound_missing_paren() {
         let tokens = tokenize("(a: A, b: B c: C)");
         let (t, res) = many_sep_bound(
             NodeKind::FnParams,
@@ -298,5 +314,17 @@ mod test {
         )
         .parse(&tokens)
         .unwrap();
+        assert_eq!(res.kind, NodeKind::FnParams);
+        assert_token_kind(&res.children[0], TokenKind::OpenParen);
+        assert_node_kind(&res.children[1], NodeKind::FnParam);
+        assert_token_kind(&res.children[2], TokenKind::Comma);
+        assert_token_kind(&res.children[3], TokenKind::Space(1));
+        assert_node_kind(&res.children[4], NodeKind::FnParam);
+        assert_token_kind(&res.children[5], TokenKind::Space(1));
+        assert_error_kind(&res.children[6], ErrorKind::MissingSeparator);
+        assert_node_kind(&res.children[7], NodeKind::FnParam);
+        assert_token_kind(&res.children[8], TokenKind::CloseParen);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].kind, TokenKind::Eof);
     }
 }
