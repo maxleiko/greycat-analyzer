@@ -113,14 +113,10 @@ fn doc_or_pragma(t: &[Token]) -> Res<Node> {
 }
 
 fn doc(t: &[Token]) -> Res<Node> {
-    let (t, items) = many1(doc_comment).parse(t)?;
+    let (t, items) = many1(DOC_COMMENT).parse(t)?;
     let mut node = Node::new(NodeKind::Doc);
     node.add_many_tokens(items);
     Ok((t, node))
-}
-
-fn doc_comment(t: &[Token]) -> Res<Tokens> {
-    matches(TokenKind::DocComment).parse(t)
 }
 
 fn pragma(t: &[Token]) -> Res<Node> {
@@ -153,10 +149,11 @@ fn fn_param(t: &[Token]) -> Res<Node> {
 }
 
 fn type_decorator(t: &[Token]) -> Res<Node> {
-    let mut node = Node::new(NodeKind::TypeDecorator);
     let (t, c) = COLON.parse(t)?;
-    node.add_tokens2(c);
     let (t, ty) = TYPE_IDENT.parse(t)?;
+
+    let mut node = Node::new(NodeKind::TypeDecorator);
+    node.add_tokens2(c);
     node.add_node(ty);
     Ok((t, node))
 }
@@ -199,6 +196,7 @@ static COLON_COLON: Matches = matches(TokenKind::ColonColon);
 static QMARK: Matches = matches(TokenKind::Question);
 static LT: Matches = matches(TokenKind::Lt);
 static GT: Matches = matches(TokenKind::Gt);
+static DOC_COMMENT: Matches = matches(TokenKind::DocComment);
 
 static KW_FN: Matches = matches(TokenKind::Fn);
 static KW_NATIVE: Matches = matches(TokenKind::Native);
@@ -333,7 +331,7 @@ where
         let mut state = ManySepBoundState::ExpectItem;
         let mut tokens = t;
 
-        let item_or_sep = either(&self.item, &self.sep);
+        // let item_or_sep = either(&self.item, &self.sep);
         loop {
             // consume any trivia "in-between"
             tokens = acc_trivia(&mut node.children, tokens);

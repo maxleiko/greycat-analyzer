@@ -25,10 +25,10 @@ impl ParseError {
     }
 }
 
-pub type Res<'a, T, E = ParseError> = std::result::Result<(&'a [Token], T), E>;
+pub type Res<'t, T, E = ParseError> = std::result::Result<(&'t [Token], T), E>;
 
-pub trait Parser<'a, T, E = ParseError> {
-    fn parse(&self, t: &'a [Token]) -> Res<'a, T, E>;
+pub trait Parser<'t, T, E = ParseError> {
+    fn parse(&self, t: &'t [Token]) -> Res<'t, T, E>;
 }
 
 impl<'t, T, F, E> Parser<'t, T, E> for F
@@ -150,21 +150,37 @@ where
     }
 }
 
-pub fn alt<'t, P1, P2, T>(p1: P1, p2: P2) -> impl Parser<'t, T>
+#[derive(Clone, Copy)]
+pub struct Alt<P1, P2> {
+    p1: P1,
+    p2: P2,
+}
+
+impl<'t, P1, P2, T> Parser<'t, T> for Alt<P1, P2>
 where
     P1: Parser<'t, T>,
     P2: Parser<'t, T>,
 {
-    move |t| match p1.parse(t) {
-        Ok((t, res)) => Ok((t, res)),
-        Err(err1) => match p2.parse(t) {
+    fn parse(&self, t: &'t [Token]) -> Res<'t, T, ParseError> {
+        match self.p1.parse(t) {
             Ok((t, res)) => Ok((t, res)),
-            Err(err2) => Err(ParseError::OneOf {
-                errors: vec![err1, err2],
-                got: t[0],
-            }),
-        },
+            Err(err1) => match self.p2.parse(t) {
+                Ok((t, res)) => Ok((t, res)),
+                Err(err2) => Err(ParseError::OneOf {
+                    errors: vec![err1, err2],
+                    got: t[0],
+                }),
+            },
+        }
     }
+}
+
+pub const fn alt<'t, P1, P2, T>(p1: P1, p2: P2) -> Alt<P1, P2>
+where
+    P1: Parser<'t, T>,
+    P2: Parser<'t, T>,
+{
+    Alt { p1, p2 }
 }
 
 pub fn seq<'t, P, T>(parsers: &[P]) -> impl Parser<'t, Vec<T>>
@@ -205,15 +221,20 @@ where
     }
 }
 
-pub fn many1<'t, P, T>(parser: P) -> impl Parser<'t, Vec<T>>
+#[derive(Clone, Copy)]
+pub struct Many1<P> {
+    parser: P,
+}
+
+impl<'t, P, T> Parser<'t, Vec<T>> for Many1<P>
 where
     P: Parser<'t, T>,
 {
-    move |t| {
-        let (t, item) = parser.parse(t)?;
+    fn parse(&self, t: &'t [Token]) -> Res<'t, Vec<T>, ParseError> {
+        let (t, item) = self.parser.parse(t)?;
         let mut items = vec![item];
         let mut tokens = t;
-        while let Ok((t, res)) = parser.parse(tokens) {
+        while let Ok((t, res)) = self.parser.parse(tokens) {
             items.push(res);
             tokens = t;
         }
@@ -221,6 +242,14 @@ where
     }
 }
 
+pub const fn many1<'t, P, T>(parser: P) -> Many1<P>
+where
+    P: Parser<'t, T>,
+{
+    Many1 { parser }
+}
+
+#[derive(Clone, Copy)]
 pub struct Map<P, A, B> {
     parser: P,
     map: fn(A) -> B,

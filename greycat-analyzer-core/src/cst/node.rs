@@ -11,7 +11,7 @@ use crate::{
     span::{Pos, Span},
 };
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tokens {
     pub(crate) leading: Vec<Token>,
     pub(crate) token: Token,
@@ -121,8 +121,7 @@ impl Node {
         self.children.extend(tokens.into_iter().map(CstNode::Token));
     }
 
-    pub fn add_tokens2(&mut self, tokens: Tokens) {
-        let Tokens { leading, token } = tokens;
+    pub fn add_tokens2(&mut self, Tokens { leading, token }: Tokens) {
         self.add_tokens(leading);
         self.add_token(token);
     }
@@ -139,10 +138,10 @@ impl Node {
         }
     }
 
-    pub fn find_child_by_rule(&self, rule: NodeKind) -> Option<&CstNode> {
+    pub fn find_child_by_kind(&self, kind: NodeKind) -> Option<&CstNode> {
         self.children
             .iter()
-            .find(|node| matches!(node, CstNode::Node(node) if node.kind == rule))
+            .find(|node| matches!(node, CstNode::Node(node) if node.kind == kind))
     }
 
     pub fn to_display_node<'a>(
