@@ -74,6 +74,15 @@ body {
   color: #ce9178;
 }
 
+.error {
+  color: #d63333;
+}
+
+.error-kind {
+  padding-left: 0.4em;
+  color: #ffcf31;
+}
+
 .span {
   color: #888;
   font-size: 0.9em;

@@ -41,19 +41,21 @@ function renderNode(node) {
     }`;
     li.innerHTML = `<span class="token">${text}</span>`;
   } else {
-    li.textContent = node.name || node.type || 'Unknown';
+    li.innerHTML = `<span class="error">${node.token.kind.kind}</span><span class="error-kind">(${node.kind})</span>`;
   }
 
-  if (node.span) {
-    const span = document.createElement('span');
-    span.className = 'span';
-    span.textContent = `[${node.span.start.offset}:${node.span.end.offset}]`;
-    li.appendChild(span);
-  }
+  const s = span(node);
+  const spanEl = document.createElement('span');
+  spanEl.className = 'span';
+  spanEl.textContent = `[${s.start.offset}:${s.end.offset}]`;
+  li.appendChild(spanEl);
 
   if (hasChildren) {
     const ul = document.createElement('ul');
     node.children.forEach((child) => {
+      // if (child.type === 'Token' && child.kind.kind === 'Space') {
+      //   return;
+      // }
       ul.appendChild(renderNode(child));
     });
     li.appendChild(ul);
@@ -65,7 +67,10 @@ function renderNode(node) {
 function update_tree() {
   const source = mEditor.getValue();
   localStorage.setItem('source-code', source);
+  const start = performance.now();
   const root = parse_cst(source);
+  const elapsed = performance.now() - start;
+  console.log('parse', elapsed, root);
   rootUL.replaceChildren(renderNode(root));
 }
 
@@ -75,10 +80,17 @@ function editor_update() {
 
 function span(node) {
   switch (node.type) {
+    default:
     case 'Node': {
-      const start = span(node.children[0]).start;
-      const end = span(node.children[node.children.length - 1]).end;
-      return { start, end };
+      if (node.children.length > 0) {
+        const start = span(node.children[0]).start;
+        const end = span(node.children[node.children.length - 1]).end;
+        return { start, end };
+      }
+      return {
+        start: { line: 0, column: 0, offset: 0 },
+        end: { line: 0, column: 0, offset: 0 },
+      };
     }
     case 'Token': {
       return node.span;
@@ -111,6 +123,7 @@ const mEditor = monaco.editor.create(editor, {
   value: prev_source ?? '',
   language: 'greycat',
   theme: 'vs-dark',
+  minimap: { enabled: false },
 });
 
 mEditor.onDidChangeModelContent(editor_update);

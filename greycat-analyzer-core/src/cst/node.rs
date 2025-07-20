@@ -127,6 +127,12 @@ impl Node {
         self.add_token(token);
     }
 
+    pub fn add_opt_tokens2(&mut self, tokens: Option<Tokens>) {
+        if let Some(tokens) = tokens {
+            self.add_tokens2(tokens);
+        }
+    }
+
     pub fn add_many_tokens(&mut self, items: Vec<Tokens>) {
         for item in items {
             self.add_tokens2(item)
@@ -198,10 +204,10 @@ pub enum NodeKind {
     Ident,
     TypeDecorator,
     StmtHeader,
+    TypeParams,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
 pub enum ErrorKind {
     UnexpectedSeparator,
     MissingSeparator,

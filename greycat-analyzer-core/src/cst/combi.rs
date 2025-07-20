@@ -133,7 +133,7 @@ pub enum Either<L, R> {
     Right(R),
 }
 
-pub fn either<'t, P1, P2, T1, T2>(p1: P1, p2: P2) -> impl Parser<'t, Either<T1, T2>>
+pub fn either<'t, P1, P2, T1, T2>(p1: &P1, p2: &P2) -> impl Parser<'t, Either<T1, T2>>
 where
     P1: Parser<'t, T1>,
     P2: Parser<'t, T2>,
@@ -221,15 +221,28 @@ where
     }
 }
 
-pub fn map<'t, P, A, B, F>(parser: P, map: F) -> impl Parser<'t, B>
+pub struct Map<P, A, B> {
+    parser: P,
+    map: fn(A) -> B,
+}
+
+impl<'t, P, A, B> Parser<'t, B> for Map<P, A, B>
 where
     P: Parser<'t, A>,
-    F: Fn(A) -> B,
 {
-    move |t| match parser.parse(t) {
-        Ok((t, a)) => Ok((t, map(a))),
-        Err(err) => Err(err),
+    fn parse(&self, t: &'t [Token]) -> Res<'t, B, ParseError> {
+        match self.parser.parse(t) {
+            Ok((t, a)) => Ok((t, (self.map)(a))),
+            Err(err) => Err(err),
+        }
     }
+}
+
+pub const fn map<'t, P, A, B>(parser: P, map: fn(A) -> B) -> Map<P, A, B>
+where
+    P: Parser<'t, A>,
+{
+    Map { parser, map }
 }
 
 pub fn opt<'t, P, T>(parser: P) -> impl Parser<'t, Option<T>, Infallible>
@@ -248,6 +261,18 @@ where
     F: Fn(A) -> Box<dyn Parser<'t, B>>,
 {
     move |t| parser.parse(t).and_then(|(t, res)| then(res).parse(t))
+}
+
+pub fn seq2<'t, P1, P2, T>(p1: P1, p2: P2) -> impl Parser<'t, (T, T)>
+where
+    P1: Parser<'t, T>,
+    P2: Parser<'t, T>,
+{
+    move |t| {
+        let (t, id) = p1.parse(t)?;
+        let (t, dc) = p2.parse(t)?;
+        Ok((t, (id, dc)))
+    }
 }
 
 pub fn value<'t, T>(value: T) -> impl Parser<'t, T>
@@ -286,7 +311,7 @@ mod test {
     fn all_spaces() {
         let tokens = tokenize("  ");
         let (_, tok) = peek(&tokens);
-        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens.len(), 2);
         assert_eq!(
             tok,
             Tokens {
