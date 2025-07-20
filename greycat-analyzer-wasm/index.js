@@ -40,8 +40,10 @@ function renderNode(node) {
       node.kind.value !== undefined ? `(${node.kind.value})` : ''
     }`;
     li.innerHTML = `<span class="token">${text}</span>`;
-  } else {
+  } else if (node.type === 'Error') {
     li.innerHTML = `<span class="error">${node.token.kind.kind}</span><span class="error-kind">(${node.kind})</span>`;
+  } else {
+    li.innerHTML = `<span class="toggle">${node.name}</span>`;
   }
 
   const s = span(node);

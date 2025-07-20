@@ -55,6 +55,7 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
 
     let mut node = Node::new(NodeKind::Fn);
     node.add_opt_node(header);
+    node.add_opt_node(modifiers);
     node.add_tokens2(kw);
     node.add_tokens2(name);
     node.add_node(params);
