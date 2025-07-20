@@ -434,4 +434,11 @@ mod test {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].kind, TokenKind::Eof);
     }
+
+    #[test]
+    fn unfinished() {
+        let tokens = tokenize("f");
+        let module = parse(&tokens);
+        println!("{module:#?}");
+    }
 }

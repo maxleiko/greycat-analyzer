@@ -33,7 +33,7 @@ impl Span {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Deserialize, Default, Debug)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Serialize, Deserialize, Default, Debug)]
 pub struct Pos {
     pub line: u32,
     pub column: u32,
@@ -64,18 +64,6 @@ impl Pos {
             line: self.line + 1,
             character: self.column + 1,
         }
-    }
-}
-
-impl Serialize for Pos {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut tuple = serializer.serialize_tuple(2)?;
-        tuple.serialize_element(&self.line)?;
-        tuple.serialize_element(&self.column)?;
-        tuple.end()
     }
 }
 

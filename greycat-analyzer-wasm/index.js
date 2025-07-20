@@ -1,3 +1,5 @@
+/// <reference path="./global.d.ts" />
+
 // @ts-check
 import init, { parse_cst } from './pkg/greycat_analyzer_wasm.js';
 
@@ -6,16 +8,30 @@ await init();
 function renderNode(node) {
   const li = document.createElement('li');
 
+  // Make item selectable
+  li.onclick = (e) => {
+    // Remove 'selected' from previous item
+    const prev = tree.querySelector('.selected');
+    if (prev) {
+      prev.classList.remove('selected');
+    }
+
+    // Add 'selected' to this item
+    li.classList.add('selected');
+    e.stopPropagation();
+    tree.dispatchEvent(new CustomEvent('tree-select', { detail: node }));
+  };
+
   const hasChildren = Array.isArray(node.children) && node.children.length > 0;
 
   if (hasChildren) {
     const toggle = document.createElement('span');
-    toggle.textContent = '▾ ' + (node.name || node.type);
+    toggle.textContent = '- ' + (node.name || node.type);
     toggle.className = 'toggle';
     toggle.onclick = () => {
       li.classList.toggle('collapsed');
       toggle.textContent =
-        (li.classList.contains('collapsed') ? '▸ ' : '▾ ') +
+        (li.classList.contains('collapsed') ? '+ ' : '- ') +
         (node.name || node.type);
     };
     li.appendChild(toggle);
@@ -31,9 +47,7 @@ function renderNode(node) {
   if (node.span) {
     const span = document.createElement('span');
     span.className = 'span';
-    span.textContent = `(${node.span.start.join(',')} → ${node.span.end.join(
-      ','
-    )})`;
+    span.textContent = `[${node.span.start.offset}:${node.span.end.offset}]`;
     li.appendChild(span);
   }
 
@@ -49,54 +63,56 @@ function renderNode(node) {
 }
 
 function update_tree() {
-  const source = editor.textContent;
-  if (source) {
-    localStorage.setItem('source-code', source);
-    const root = parse_cst(source);
-    rootUL.replaceChildren(renderNode(root));
+  const source = mEditor.getValue();
+  localStorage.setItem('source-code', source);
+  const root = parse_cst(source);
+  rootUL.replaceChildren(renderNode(root));
+}
+
+function editor_update() {
+  update_tree();
+}
+
+function span(node) {
+  switch (node.type) {
+    case 'Node': {
+      const start = span(node.children[0]).start;
+      const end = span(node.children[node.children.length - 1]).end;
+      return { start, end };
+    }
+    case 'Token': {
+      return node.span;
+    }
+    case 'Error': {
+      return node.token.span;
+    }
   }
 }
 
 const rootUL = document.createElement('ul');
+
 tree.appendChild(rootUL);
+tree.addEventListener('tree-select', (e) => {
+  const node = e.detail;
+  console.log('select', node);
+  const s = span(node);
+  const selection = {
+    startLineNumber: s.start.line + 1,
+    startColumn: s.start.column + 1,
+    endLineNumber: s.end.line + 1,
+    endColumn: s.end.column + 1,
+  };
+  mEditor.setSelection(selection);
+  mEditor.revealRangeInCenter(selection, monaco.editor.ScrollType.Immediate);
+});
 const prev_source = localStorage.getItem('source-code');
-if (prev_source) {
-  editor.textContent = prev_source;
-}
-function updateLineNumbers() {
-  const lines = editor.innerText.split('\n').length;
-  lineNumbers.textContent = Array.from({ length: lines }, (_, i) => i + 1).join(
-    '\n'
-  );
-}
-function editor_update() {
-  updateLineNumbers();
-  update_tree();
-}
-
-editor.addEventListener('input', editor_update);
-editor.addEventListener('paste', (e) => {
-  // Prevent the default paste behavior
-  e.preventDefault();
-
-  // Get plain text
-  const text = e.clipboardData?.getData('text/plain');
-  if (!text) return;
-
-  // Get current selection
-  const selection = window.getSelection();
-  if (!selection || !selection.rangeCount) return;
-
-  // Replace the current range with plain text
-  selection.deleteFromDocument();
-  selection.getRangeAt(0).insertNode(document.createTextNode(text));
-
-  // Move cursor to the end of the inserted text
-  selection.collapseToEnd();
-  editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+// Create editor instance
+const mEditor = monaco.editor.create(editor, {
+  value: prev_source ?? '',
+  language: 'greycat',
+  theme: 'vs-dark',
 });
-editor.addEventListener('scroll', () => {
-  lineNumbers.scrollTop = editor.scrollTop;
-});
+
+mEditor.onDidChangeModelContent(editor_update);
 
 editor_update();

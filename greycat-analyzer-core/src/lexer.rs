@@ -179,10 +179,12 @@ impl<'a> Consume<'a> for MainLexer {
                     ctx.next_char(); // consume first '/'
                     ctx.next_char(); // consume second '/'
                     ctx.advance_while(not_newline);
+                    ctx.next_char(); // consume '\n'
                     ctx.token(TokenKind::DocComment)
                 } else {
                     ctx.next_char(); // consume '/'
                     ctx.advance_while(not_newline);
+                    ctx.next_char(); // consume '\n'
                     ctx.token(TokenKind::EolComment)
                 }
             }
