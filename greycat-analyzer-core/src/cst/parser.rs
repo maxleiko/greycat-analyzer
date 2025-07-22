@@ -41,7 +41,7 @@ pub fn parse(mut t: &[Token]) -> Node {
 }
 
 fn module_stmt(t: &[Token]) -> Res<Node> {
-    one_of(&[&fn_decl, &mod_var_decl, &mod_pragma]).parse(t)
+    one_of(&[&fn_decl, &type_decl, &mod_var_decl, &mod_pragma]).parse(t)
 }
 
 fn fn_decl(t: &[Token]) -> Res<Node> {
