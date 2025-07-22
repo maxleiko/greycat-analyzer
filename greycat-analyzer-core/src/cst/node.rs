@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cst::{
+        combi::Either,
         display::{DisplayNode, DisplayNodeRule},
         utils::*,
     },
@@ -99,43 +100,8 @@ impl Node {
         self.children.is_empty()
     }
 
-    pub fn add_node(&mut self, node: Node) {
-        self.children.push(CstNode::Node(node));
-    }
-
-    pub fn add_opt_node(&mut self, node: Option<Node>) {
-        if let Some(node) = node {
-            self.add_node(node);
-        }
-    }
-
-    pub fn add_error(&mut self, error: NodeError) {
-        self.children.push(CstNode::Error(error));
-    }
-
-    pub fn add_token(&mut self, token: Token) {
-        self.children.push(CstNode::Token(token))
-    }
-
-    pub fn add_tokens(&mut self, tokens: Vec<Token>) {
-        self.children.extend(tokens.into_iter().map(CstNode::Token));
-    }
-
-    pub fn add_tokens2(&mut self, Tokens { leading, token }: Tokens) {
-        self.add_tokens(leading);
-        self.add_token(token);
-    }
-
-    pub fn add_opt_tokens2(&mut self, tokens: Option<Tokens>) {
-        if let Some(tokens) = tokens {
-            self.add_tokens2(tokens);
-        }
-    }
-
-    pub fn add_many_tokens(&mut self, items: Vec<Tokens>) {
-        for item in items {
-            self.add_tokens2(item)
-        }
+    pub fn add<T: AddToNode>(&mut self, value: T) {
+        value.append_to(self);
     }
 
     pub fn find_child_by_kind(&self, kind: NodeKind) -> Option<&CstNode> {
@@ -159,6 +125,29 @@ impl Node {
     pub fn span(&self) -> Span {
         self.children.first();
         span_from_nodes(&self.children)
+    }
+
+    pub fn replace_last_token_error(&mut self, kind: ErrorKind) {
+        if let Some(n) = self.last_token_mut() {
+            *n = match n {
+                CstNode::Token(token) => CstNode::Error(NodeError {
+                    kind,
+                    token: *token,
+                }),
+                CstNode::Error(error) => CstNode::Error(NodeError {
+                    kind,
+                    token: error.token,
+                }),
+                CstNode::Node(_) => unreachable!(),
+            }
+        }
+    }
+
+    fn last_token_mut(&mut self) -> Option<&mut CstNode> {
+        self.children.last_mut().and_then(|n| match n {
+            CstNode::Node(node) => node.last_token_mut(),
+            leaf => Some(leaf),
+        })
     }
 }
 
@@ -204,12 +193,14 @@ pub enum NodeKind {
     TypeDecorator,
     StmtHeader,
     TypeParams,
+    ModVarDecl,
+    Initializer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ErrorKind {
     UnexpectedSeparator,
-    MissingSeparator,
+    MissingToken,
     UnexpectedToken,
 }
 
@@ -217,7 +208,7 @@ impl std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnexpectedSeparator => write!(f, "unexpected separator"),
-            Self::MissingSeparator => write!(f, "missing separator"),
+            Self::MissingToken => write!(f, "missing token"),
             Self::UnexpectedToken => write!(f, "unexpected token"),
         }
     }
@@ -227,5 +218,74 @@ impl From<Token> for CstNode {
     #[inline]
     fn from(value: Token) -> Self {
         Self::Token(value)
+    }
+}
+
+pub trait AddToNode {
+    fn append_to(self, node: &mut Node);
+}
+
+impl AddToNode for Token {
+    fn append_to(self, node: &mut Node) {
+        node.children.push(CstNode::Token(self))
+    }
+}
+
+impl AddToNode for Vec<Token> {
+    fn append_to(self, node: &mut Node) {
+        node.children.extend(self.into_iter().map(CstNode::Token))
+    }
+}
+
+impl AddToNode for Vec<Tokens> {
+    fn append_to(self, node: &mut Node) {
+        for tokens in self {
+            node.add(tokens);
+        }
+    }
+}
+
+impl AddToNode for Tokens {
+    fn append_to(self, node: &mut Node) {
+        self.leading.append_to(node);
+        self.token.append_to(node);
+    }
+}
+
+impl AddToNode for NodeError {
+    fn append_to(self, node: &mut Node) {
+        node.children.push(CstNode::Error(self))
+    }
+}
+
+impl<T: AddToNode, U: AddToNode> AddToNode for Either<T, U> {
+    fn append_to(self, node: &mut Node) {
+        match self {
+            Self::Left(value) => value.append_to(node),
+            Self::Right(value) => value.append_to(node),
+        }
+    }
+}
+
+impl<T: AddToNode> AddToNode for Option<T> {
+    fn append_to(self, node: &mut Node) {
+        if let Some(value) = self {
+            value.append_to(node);
+        }
+    }
+}
+
+impl AddToNode for Node {
+    fn append_to(self, node: &mut Node) {
+        node.children.push(CstNode::Node(self));
+    }
+}
+
+impl<T: AddToNode, U: AddToNode> AddToNode for Vec<(T, U)> {
+    fn append_to(self, node: &mut Node) {
+        for (t, u) in self {
+            node.add(t);
+            node.add(u);
+        }
     }
 }

@@ -1,9 +1,8 @@
-use std::convert::Infallible;
+use std::{cell::RefCell, convert::Infallible};
 
 use crate::{
     Token, TokenKind,
-    cst::combi::*,
-    cst::{CstNode, ErrorKind, Node, NodeError, NodeKind, Tokens},
+    cst::{AddToNode, CstNode, ErrorKind, Node, NodeError, NodeKind, Tokens, combi::*},
 };
 
 pub fn parse(mut t: &[Token]) -> Node {
@@ -11,25 +10,25 @@ pub fn parse(mut t: &[Token]) -> Node {
     loop {
         let (next, peeked) = peek(t);
         if peeked.token.kind == TokenKind::Eof {
-            node.add_tokens(peeked.leading);
+            node.add(peeked.leading);
             t = next; // 't' should be empty after that because 'Eof'
             break;
         } else {
             let trivia_len = peeked.leading.len();
-            node.add_tokens(peeked.leading);
+            node.add(peeked.leading);
             t = &t[trivia_len..]; // consume trivia only
         }
         match either(&module_stmt, &SEMI).parse(t) {
             Ok((next, Either::Left(stmt))) => {
-                node.add_node(stmt);
+                node.add(stmt);
                 t = next;
             }
             Ok((next, Either::Right(semi))) => {
-                node.add_tokens2(semi);
+                node.add(semi);
                 t = next;
             }
             Err(_) => {
-                node.add_error(NodeError {
+                node.add(NodeError {
                     kind: ErrorKind::UnexpectedToken,
                     token: t[0],
                 });
@@ -42,7 +41,7 @@ pub fn parse(mut t: &[Token]) -> Node {
 }
 
 fn module_stmt(t: &[Token]) -> Res<Node> {
-    one_of(&[fn_decl]).parse(t)
+    one_of(&[&fn_decl, &mod_var_decl]).parse(t)
 }
 
 fn fn_decl(t: &[Token]) -> Res<Node> {
@@ -50,30 +49,78 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     let (t, modifiers) = modifiers(t).unwrap();
     let (t, kw) = KW_FN.parse(t)?;
     let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, generics) = opt(generic_params).parse(t).unwrap();
     let (t, params) = fn_params(t)?;
     let (t, body_or_semi) = either(&body, &SEMI).parse(t)?;
 
     let mut node = Node::new(NodeKind::Fn);
-    node.add_opt_node(header);
-    node.add_opt_node(modifiers);
-    node.add_tokens2(kw);
-    node.add_tokens2(name);
-    node.add_node(params);
-    match body_or_semi {
-        Either::Left(body) => node.add_node(body),
-        Either::Right(semi) => node.add_tokens2(semi),
-    }
+    node.add(header);
+    node.add(modifiers);
+    node.add(kw);
+    node.add(name);
+    node.add(generics);
+    node.add(params);
+    node.add(body_or_semi);
     Ok((t, node))
 }
 
-fn modifiers(t: &[Token]) -> Res<Option<Node>, Infallible> {
-    let (t, mods) = many(MODIFIER).parse(t).unwrap();
+fn mod_var_decl(t: &[Token]) -> Res<Node> {
+    let (t, header) = stmt_header(t).unwrap();
+    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, kw) = KW_VAR.parse(t)?;
+    let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, ty) = opt(type_decorator).parse(t).unwrap();
+    let (t, init) = opt(initializer).parse(t).unwrap();
+    let (t, semi) = opt(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ModVarDecl);
+    node.add(header);
+    node.add(modifiers);
+    node.add(kw);
+    node.add(name);
+    node.add(ty);
+    node.add(init);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn initializer(t: &[Token]) -> Res<Node> {
+    let (t, eq) = EQ.parse(t)?;
+    let (t, e) = expr(t)?;
+
+    let mut node = Node::new(NodeKind::Initializer);
+    node.add(eq);
+    node.add(e);
+    Ok((t, node))
+}
+
+fn expr(t: &[Token]) -> Res<Node> {
+    todo!()
+}
+
+fn name(t: &[Token]) -> Res<Node> {
+    let (t, id) = matches(TokenKind::Ident).parse(t)?;
+    let mut node = Node::new(NodeKind::Name);
+    node.add(id);
+    Ok((t, node))
+}
+
+fn generic_params(t: &[Token]) -> Res<Node> {
+    many_sep_bound(NodeKind::GenericParams, LT, name, COMMA, GT).parse(t)
+}
+
+fn type_params(t: &[Token]) -> Res<Node> {
+    many_sep_bound(NodeKind::TypeParams, LT, TYPE_IDENT, COMMA, GT).parse(t)
+}
+
+fn modifiers(t: &[Token]) -> Res<Option<Node>> {
+    let (t, mods) = many(modifier).parse(t).unwrap();
     if let Some(mods) = mods {
         let mut node = Node::new(NodeKind::FnModifiers);
         for modifier in mods {
             let Tokens { leading, token } = modifier;
-            node.add_tokens(leading);
-            node.add_node(Node {
+            node.add(leading);
+            node.add(Node {
                 kind: NodeKind::FnModifier,
                 children: vec![CstNode::Token(token)],
             });
@@ -84,17 +131,21 @@ fn modifiers(t: &[Token]) -> Res<Option<Node>, Infallible> {
     }
 }
 
+fn modifier(t: &[Token]) -> Res<Tokens> {
+    one_of(&[&KW_NATIVE, &KW_PRIVATE, &KW_STATIC, &KW_ABSTRACT]).parse(t)
+}
+
 fn body(t: &[Token]) -> Res<Node> {
     let (t, open) = OPEN_CURLY.parse(t)?;
     // TODO body stmts
     let (t, close) = CLOSE_CURLY.parse(t)?;
     let mut node = Node::new(NodeKind::Body);
-    node.add_tokens2(open);
-    node.add_tokens2(close);
+    node.add(open);
+    node.add(close);
     Ok((t, node))
 }
 
-fn stmt_header(t: &[Token]) -> Res<Option<Node>, Infallible> {
+fn stmt_header(t: &[Token]) -> Res<Option<Node>> {
     let (t, items) = many(doc_or_pragma).parse(t).unwrap();
     match items {
         Some(items) => {
@@ -115,16 +166,16 @@ fn doc_or_pragma(t: &[Token]) -> Res<Node> {
 fn doc(t: &[Token]) -> Res<Node> {
     let (t, items) = many1(DOC_COMMENT).parse(t)?;
     let mut node = Node::new(NodeKind::Doc);
-    node.add_many_tokens(items);
+    node.add(items);
     Ok((t, node))
 }
 
 fn pragma(t: &[Token]) -> Res<Node> {
     let mut node = Node::new(NodeKind::Pragma);
     let (t, at) = matches(TokenKind::AtSign).parse(t)?;
-    node.add_tokens2(at);
+    node.add(at);
     let (t, name) = IDENT_OR_KW.parse(t)?;
-    node.add_tokens2(name);
+    node.add(name);
     // TODO add call_args on pragma
     // let (t, args) = call_args(t)?;
     // node.add_node(CstNode::Node(args));
@@ -142,9 +193,9 @@ fn fn_params(t: &[Token]) -> Res<Node> {
 fn fn_param(t: &[Token]) -> Res<Node> {
     let mut node = Node::new(NodeKind::FnParam);
     let (t, name) = IDENT.parse(t)?;
-    node.add_tokens2(name); // TODO don't we want 'ident' token to be its own 'node'?
+    node.add(name); // TODO don't we want 'ident' token to be its own 'node'?
     let (t, ty) = type_decorator(t)?;
-    node.add_node(ty);
+    node.add(ty);
     Ok((t, node))
 }
 
@@ -153,8 +204,8 @@ fn type_decorator(t: &[Token]) -> Res<Node> {
     let (t, ty) = TYPE_IDENT.parse(t)?;
 
     let mut node = Node::new(NodeKind::TypeDecorator);
-    node.add_tokens2(c);
-    node.add_node(ty);
+    node.add(c);
+    node.add(ty);
     Ok((t, node))
 }
 
@@ -166,20 +217,15 @@ impl<'t> Parser<'t, Node> for TypeIdent {
         let (t, kw_typeof) = opt(KW_TYPEOF).parse(t).unwrap();
         let (t, parts) = many(seq2(IDENT_OR_KW, COLON_COLON)).parse(t).unwrap();
         let (t, name) = IDENT_OR_KW.parse(t)?;
-        let (t, params) = opt(TYPE_PARAMS).parse(t).unwrap();
+        let (t, params) = opt(type_params).parse(t).unwrap();
         let (t, qmark) = opt(QMARK).parse(t).unwrap();
 
         let mut node = Node::new(NodeKind::TypeIdent);
-        node.add_opt_tokens2(kw_typeof);
-        if let Some(parts) = parts {
-            for (id, c) in parts {
-                node.add_tokens2(id);
-                node.add_tokens2(c);
-            }
-        }
-        node.add_tokens2(name);
-        node.add_opt_node(params);
-        node.add_opt_tokens2(qmark);
+        node.add(kw_typeof);
+        node.add(parts);
+        node.add(name);
+        node.add(params);
+        node.add(qmark);
         Ok((t, node))
     }
 }
@@ -197,8 +243,12 @@ static QMARK: Matches = matches(TokenKind::Question);
 static LT: Matches = matches(TokenKind::Lt);
 static GT: Matches = matches(TokenKind::Gt);
 static DOC_COMMENT: Matches = matches(TokenKind::DocComment);
+static EQ: Matches = matches(TokenKind::Eq);
 
 static KW_FN: Matches = matches(TokenKind::Fn);
+static KW_VAR: Matches = matches(TokenKind::Var);
+static KW_TYPE: Matches = matches(TokenKind::Type);
+static KW_ENUM: Matches = matches(TokenKind::Enum);
 static KW_NATIVE: Matches = matches(TokenKind::Native);
 static KW_PRIVATE: Matches = matches(TokenKind::Private);
 static KW_STATIC: Matches = matches(TokenKind::Static);
@@ -249,7 +299,6 @@ static KW: MatchesOne<38> = matches_one(
     "a keyword",
 );
 
-static MODIFIER: OneOf<'static, Matches> = one_of(&[KW_NATIVE, KW_PRIVATE, KW_STATIC, KW_ABSTRACT]);
 static IDENT_OR_KW: MatchesOne<39> = matches_one(
     [
         // Identifier
@@ -297,8 +346,6 @@ static IDENT_OR_KW: MatchesOne<39> = matches_one(
     "an identifier",
 );
 static TYPE_IDENT: TypeIdent = TypeIdent;
-static TYPE_PARAMS: ManySepBound<Matches, TypeIdent, Matches, Matches> =
-    many_sep_bound(NodeKind::TypeParams, LT, TYPE_IDENT, COMMA, GT);
 
 pub fn acc_trivia<'t>(acc: &mut Vec<CstNode>, t: &'t [Token]) -> &'t [Token] {
     let (next, tok) = peek(t);
@@ -316,17 +363,28 @@ pub struct ManySepBound<O, I, S, C> {
     close: C,
 }
 
-impl<'t, O, I, S, C> Parser<'t, Node> for ManySepBound<O, I, S, C>
+pub enum ManySepBoundState {
+    ExpectSep,
+    ExpectItem,
+}
+pub fn many_sep_bound<'t, O, I, S, C, T>(
+    kind: NodeKind,
+    open: O,
+    item: I,
+    sep: S,
+    close: C,
+) -> impl Parser<'t, Node>
 where
     O: Parser<'t, Tokens>,
-    I: Parser<'t, Node>,
+    I: Parser<'t, T>,
     S: Parser<'t, Tokens>,
     C: Parser<'t, Tokens>,
+    T: AddToNode,
 {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, Node, ParseError> {
-        let (t, o) = self.open.parse(t)?;
-        let mut node = Node::new(self.kind);
-        node.add_tokens2(o);
+    move |t| {
+        let (t, o) = open.parse(t)?;
+        let mut node = Node::new(kind);
+        node.add(o);
 
         let mut state = ManySepBoundState::ExpectItem;
         let mut tokens = t;
@@ -337,61 +395,56 @@ where
             tokens = acc_trivia(&mut node.children, tokens);
             if tokens.len() == 1 {
                 // EOF reached
-                let err = self.close.parse(tokens).err().unwrap();
-                node.add_error(NodeError {
+                let err = close.parse(tokens).err().unwrap();
+                node.add(NodeError {
                     kind: ErrorKind::UnexpectedToken,
                     token: tokens[0],
                 });
                 return Err(err);
             }
             // check for closing bound
-            if let Ok((t, c)) = self.close.parse(tokens) {
-                node.add_tokens2(c);
+            if let Ok((t, c)) = close.parse(tokens) {
+                node.add(c);
                 return Ok((t, node));
             }
             match state {
-                ManySepBoundState::ExpectSep => match self.sep.parse(tokens) {
+                ManySepBoundState::ExpectSep => match sep.parse(tokens) {
                     Ok((t, s)) => {
-                        node.add_tokens2(s);
+                        node.add(s);
                         tokens = t;
                         state = ManySepBoundState::ExpectItem;
                     }
                     Err(_) => {
                         // we actually expected a separator, record the error
-                        node.add_error(NodeError {
-                            kind: ErrorKind::MissingSeparator,
-                            token: tokens[0], // TODO might prefer to give node.last_token() here might be more accurate
-                        });
-                        let (t, i) = self.item.parse(tokens)?;
-                        node.add_node(i);
+                        node.replace_last_token_error(ErrorKind::MissingToken);
+                        let (t, i) = item.parse(tokens)?;
+                        node.add(i);
                         tokens = t;
                         state = ManySepBoundState::ExpectSep;
                     }
                 },
                 ManySepBoundState::ExpectItem => {
-                    match self.item.parse(tokens) {
+                    match item.parse(tokens) {
                         Ok((t, i)) => {
-                            node.add_node(i);
+                            node.add(i);
                             tokens = t;
                             state = ManySepBoundState::ExpectSep;
                         }
-                        Err(_) => match either(&self.sep, &self.close).parse(tokens) {
+                        Err(_) => match either(&sep, &close).parse(tokens) {
                             Ok((t, Either::Left(s))) => {
-                                let Tokens { leading, token } = s;
-                                node.add_tokens(leading);
-                                node.add_error(NodeError {
+                                node.add(s.leading);
+                                node.add(NodeError {
                                     kind: ErrorKind::UnexpectedToken,
-                                    token,
+                                    token: s.token,
                                 });
                                 tokens = t;
                                 state = ManySepBoundState::ExpectItem;
                             }
                             Ok((t, Either::Right(c))) => {
-                                let Tokens { leading, token } = c;
-                                node.add_tokens(leading);
-                                node.add_error(NodeError {
+                                node.add(c.leading);
+                                node.add(NodeError {
                                     kind: ErrorKind::UnexpectedToken,
-                                    token,
+                                    token: c.token,
                                 });
                                 return Ok((t, node));
                             }
@@ -429,29 +482,19 @@ where
     }
 }
 
-pub enum ManySepBoundState {
-    ExpectSep,
-    ExpectItem,
-}
-pub const fn many_sep_bound<'t, O, I, S, C>(
-    kind: NodeKind,
-    open: O,
-    item: I,
-    sep: S,
-    close: C,
-) -> ManySepBound<O, I, S, C>
+fn seq_n<'t, T>(kind: NodeKind, parsers: &[&dyn Parser<'t, T>]) -> impl Parser<'t, Node>
 where
-    O: Parser<'t, Tokens>,
-    I: Parser<'t, Node>,
-    S: Parser<'t, Tokens>,
-    C: Parser<'t, Tokens>,
+    T: AddToNode,
 {
-    ManySepBound {
-        kind,
-        open,
-        item,
-        sep,
-        close,
+    move |t| {
+        let mut node = Node::new(kind);
+        let mut tokens = t;
+        for parser in parsers {
+            let (t, res) = parser.parse(tokens)?;
+            res.append_to(&mut node);
+            tokens = t;
+        }
+        Ok((tokens, node))
     }
 }
 
@@ -476,10 +519,13 @@ mod test {
         }
     }
 
-    fn assert_error_kind(node: &CstNode, kind: ErrorKind) {
+    fn assert_error_kind(node: &CstNode, token_kind: TokenKind, error_kind: ErrorKind) {
         match node {
-            CstNode::Error(err) => assert_eq!(err.kind, kind),
-            other => panic!("Expected CstNode::Err with kind {kind:?}, got: {other:?}"),
+            CstNode::Error(err) => {
+                assert_eq!(err.token.kind, token_kind);
+                assert_eq!(err.kind, error_kind);
+            }
+            other => panic!("Expected CstNode::Err with kind {error_kind:?}, got: {other:?}"),
         }
     }
 
@@ -495,10 +541,13 @@ mod test {
         assert_token_kind(&res.children[2], TokenKind::Comma);
         assert_token_kind(&res.children[3], TokenKind::Space(1));
         assert_node_kind(&res.children[4], NodeKind::FnParam);
-        assert_token_kind(&res.children[5], TokenKind::Space(1));
-        assert_error_kind(&res.children[6], ErrorKind::MissingSeparator);
-        assert_node_kind(&res.children[7], NodeKind::FnParam);
-        assert_token_kind(&res.children[8], TokenKind::CloseParen);
+        assert_error_kind(
+            &res.children[5],
+            TokenKind::Space(1),
+            ErrorKind::MissingToken,
+        );
+        assert_node_kind(&res.children[6], NodeKind::FnParam);
+        assert_token_kind(&res.children[7], TokenKind::CloseParen);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].kind, TokenKind::Eof);
     }

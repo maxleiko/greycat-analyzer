@@ -16,12 +16,15 @@ pub enum ParseError {
 
 impl ParseError {
     pub fn is_eof(&self) -> bool {
-        let got = match self {
-            Self::Custom { got, .. } => got.kind,
-            Self::Expected { got, .. } => got.kind,
-            Self::OneOf { got, .. } => got.kind,
-        };
-        got == TokenKind::Eof
+        self.token().kind == TokenKind::Eof
+    }
+
+    pub fn token(&self) -> &Token {
+        match self {
+            Self::Custom { got, .. } => got,
+            Self::Expected { got, .. } => got,
+            Self::OneOf { got, .. } => got,
+        }
     }
 }
 
@@ -102,14 +105,11 @@ pub const fn matches_one<const N: usize>(
 }
 
 #[derive(Clone, Copy)]
-pub struct OneOf<'p, P> {
-    parsers: &'p [P],
+pub struct OneOf<'p, 't, T> {
+    parsers: &'p [&'p dyn Parser<'t, T>],
 }
 
-impl<'t, P, T> Parser<'t, T> for OneOf<'static, P>
-where
-    P: Parser<'t, T>,
-{
+impl<'p, 't: 'p, T> Parser<'t, T> for OneOf<'p, 't, T> {
     fn parse(&self, t: &'t [Token]) -> Res<'t, T, ParseError> {
         let mut errors = Vec::new();
         for parser in self.parsers {
@@ -124,7 +124,7 @@ where
     }
 }
 
-pub const fn one_of<'p, P>(parsers: &'p [P]) -> OneOf<'p, P> {
+pub const fn one_of<'p, 't: 'p, T>(parsers: &'p [&dyn Parser<'t, T>]) -> OneOf<'p, 't, T> {
     OneOf { parsers }
 }
 
