@@ -1,7 +1,9 @@
-// Declare that `monaco` exists in the global scope
-const monaco: typeof import('monaco-editor');
+/// <reference path="./pkg/greycat_analyzer_wasm.d.ts" />
 
-// Any other global DOM elements
-var tree: HTMLElement;
-var editor: HTMLElement;
-var lineNumbers: HTMLElement;
+// Declare that `monaco` exists in the global scope
+declare const monaco: typeof import('monaco-editor');
+
+// Well-known elements IDs in the DOM (see index.html)
+declare const tree: HTMLElement;
+declare const editor: HTMLElement;
+declare const lineNumbers: HTMLElement;
