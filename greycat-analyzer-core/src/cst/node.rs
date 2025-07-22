@@ -195,6 +195,15 @@ pub enum NodeKind {
     TypeParams,
     ModVarDecl,
     Initializer,
+    TypeDecl,
+    TypeExtends,
+    TypeBody,
+    EnumDecl,
+    TypeAttr,
+    TypeMethod,
+    StringExpr,
+    CallArgs,
+    ModPragma,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -242,6 +251,12 @@ impl AddToNode for Vec<Tokens> {
         for tokens in self {
             node.add(tokens);
         }
+    }
+}
+
+impl AddToNode for Vec<Node> {
+    fn append_to(self, node: &mut Node) {
+        node.children.extend(self.into_iter().map(CstNode::Node));
     }
 }
 

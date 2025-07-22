@@ -41,7 +41,7 @@ pub fn parse(mut t: &[Token]) -> Node {
 }
 
 fn module_stmt(t: &[Token]) -> Res<Node> {
-    one_of(&[&fn_decl, &mod_var_decl]).parse(t)
+    one_of(&[&fn_decl, &mod_var_decl, &mod_pragma]).parse(t)
 }
 
 fn fn_decl(t: &[Token]) -> Res<Node> {
@@ -84,6 +84,106 @@ fn mod_var_decl(t: &[Token]) -> Res<Node> {
     Ok((t, node))
 }
 
+fn type_decl(t: &[Token]) -> Res<Node> {
+    let (t, header) = stmt_header(t).unwrap();
+    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, kw) = KW_TYPE.parse(t)?;
+    let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, params) = opt(generic_params).parse(t).unwrap();
+    let (t, extend) = opt(type_extends).parse(t).unwrap();
+    let (t, body) = type_body(t)?;
+    let (t, semi) = opt(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::TypeDecl);
+    node.add(header);
+    node.add(modifiers);
+    node.add(kw);
+    node.add(name);
+    node.add(params);
+    node.add(extend);
+    node.add(body);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn type_extends(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_EXTENDS.parse(t)?;
+    let (t, name) = TYPE_IDENT.parse(t)?;
+
+    let mut node = Node::new(NodeKind::TypeExtends);
+    node.add(kw);
+    node.add(name);
+    Ok((t, node))
+}
+
+fn type_body(t: &[Token]) -> Res<Node> {
+    let (t, open) = OPEN_CURLY.parse(t)?;
+    let (t, fields) = many(one_of(&[&type_attr, &type_method])).parse(t).unwrap();
+    let (t, close) = CLOSE_CURLY.parse(t)?;
+
+    let mut node = Node::new(NodeKind::TypeBody);
+    node.add(open);
+    node.add(fields);
+    node.add(close);
+    Ok((t, node))
+}
+
+fn type_attr(t: &[Token]) -> Res<Node> {
+    let (t, header) = stmt_header_allow_semi(t)?;
+    let (t, modifiers) = modifiers(t)?;
+    let (t, name) = ident_or_kw_or_strlit(t)?;
+    let (t, colon) = COLON.parse(t)?;
+    let (t, ty) = TYPE_IDENT.parse(t)?;
+    let (t, init) = opt(initializer).parse(t).unwrap();
+    let (t, semi) = opt(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::TypeAttr);
+    node.add(header);
+    node.add(modifiers);
+    node.add(name);
+    node.add(colon);
+    node.add(ty);
+    node.add(init);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn mod_pragma(t: &[Token]) -> Res<Node> {
+    let (t, doc) = opt(doc).parse(t).unwrap();
+    let (t, at) = matches(TokenKind::AtSign).parse(t)?;
+    let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, args) = opt(call_args).parse(t).unwrap();
+    let (t, semi) = SEMI.parse(t)?;
+
+    let mut node = Node::new(NodeKind::ModPragma);
+    node.add(doc);
+    node.add(at);
+    node.add(name);
+    node.add(args);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn ident_or_kw_or_strlit(t: &[Token]) -> Res<Either<Tokens, Node>> {
+    either(&IDENT_OR_KW, &str_expr).parse(t)
+}
+
+fn str_expr(t: &[Token]) -> Res<Node> {
+    let (t, enter_tpl) = DOUBLE_QUOTE.parse(t)?;
+    let (t, opt_raw_string) = opt(RAW_STRING).parse(t).unwrap();
+    let (t, exit_tpl) = DOUBLE_QUOTE.parse(t)?;
+
+    let mut node = Node::new(NodeKind::StringExpr);
+    node.add(enter_tpl);
+    node.add(opt_raw_string);
+    node.add(exit_tpl);
+    Ok((t, node))
+}
+
+fn type_method(t: &[Token]) -> Res<Node> {
+    todo!()
+}
+
 fn initializer(t: &[Token]) -> Res<Node> {
     let (t, eq) = EQ.parse(t)?;
     let (t, e) = expr(t)?;
@@ -95,7 +195,13 @@ fn initializer(t: &[Token]) -> Res<Node> {
 }
 
 fn expr(t: &[Token]) -> Res<Node> {
-    todo!()
+    // TODO
+    let (t, e) = literal(t)?;
+    Ok((t, e))
+}
+
+fn literal(t: &[Token]) -> Res<Node> {
+    one_of(&[&str_expr]).parse(t)
 }
 
 fn name(t: &[Token]) -> Res<Node> {
@@ -159,8 +265,26 @@ fn stmt_header(t: &[Token]) -> Res<Option<Node>> {
     }
 }
 
+fn stmt_header_allow_semi(t: &[Token]) -> Res<Option<Node>> {
+    let (t, items) = many(doc_or_pragma_allow_semi).parse(t).unwrap();
+    match items {
+        Some(items) => {
+            let node = Node {
+                kind: NodeKind::StmtHeader,
+                children: items.into_iter().map(CstNode::Node).collect(),
+            };
+            Ok((t, Some(node)))
+        }
+        None => Ok((t, None)),
+    }
+}
+
 fn doc_or_pragma(t: &[Token]) -> Res<Node> {
     alt(doc, pragma).parse(t)
+}
+
+fn doc_or_pragma_allow_semi(t: &[Token]) -> Res<Node> {
+    alt(doc, pragma_allow_semi).parse(t)
 }
 
 fn doc(t: &[Token]) -> Res<Node> {
@@ -171,19 +295,26 @@ fn doc(t: &[Token]) -> Res<Node> {
 }
 
 fn pragma(t: &[Token]) -> Res<Node> {
-    let mut node = Node::new(NodeKind::Pragma);
     let (t, at) = matches(TokenKind::AtSign).parse(t)?;
-    node.add(at);
     let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, args) = opt(call_args).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::Pragma);
+    node.add(at);
     node.add(name);
-    // TODO add call_args on pragma
-    // let (t, args) = call_args(t)?;
-    // node.add_node(CstNode::Node(args));
+    node.add(args);
     Ok((t, node))
 }
 
+fn pragma_allow_semi(t: &[Token]) -> Res<Node> {
+    let (t, mut pragma) = pragma(t)?;
+    let (t, semi) = opt(SEMI).parse(t).unwrap();
+    pragma.add(semi);
+    Ok((t, pragma))
+}
+
 fn call_args(t: &[Token]) -> Res<Node> {
-    todo!()
+    many_sep_bound(NodeKind::CallArgs, OPEN_PAREN, expr, COMMA, CLOSE_PAREN).parse(t)
 }
 
 fn fn_params(t: &[Token]) -> Res<Node> {
@@ -244,10 +375,13 @@ static LT: Matches = matches(TokenKind::Lt);
 static GT: Matches = matches(TokenKind::Gt);
 static DOC_COMMENT: Matches = matches(TokenKind::DocComment);
 static EQ: Matches = matches(TokenKind::Eq);
+static DOUBLE_QUOTE: Matches = matches(TokenKind::DoubleQuote);
+static RAW_STRING: Matches = matches(TokenKind::RawString);
 
 static KW_FN: Matches = matches(TokenKind::Fn);
 static KW_VAR: Matches = matches(TokenKind::Var);
 static KW_TYPE: Matches = matches(TokenKind::Type);
+static KW_EXTENDS: Matches = matches(TokenKind::Extends);
 static KW_ENUM: Matches = matches(TokenKind::Enum);
 static KW_NATIVE: Matches = matches(TokenKind::Native);
 static KW_PRIVATE: Matches = matches(TokenKind::Private);
