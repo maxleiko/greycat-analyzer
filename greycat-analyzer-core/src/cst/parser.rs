@@ -51,6 +51,7 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     let (t, name) = IDENT_OR_KW.parse(t)?;
     let (t, generics) = opt(generic_params).parse(t).unwrap();
     let (t, params) = fn_params(t)?;
+    let (t, return_type) = opt(type_decorator).parse(t).unwrap();
     let (t, body_or_semi) = either(&body, &SEMI).parse(t)?;
 
     let mut node = Node::new(NodeKind::Fn);
@@ -60,6 +61,7 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     node.add(name);
     node.add(generics);
     node.add(params);
+    node.add(return_type);
     node.add(body_or_semi);
     Ok((t, node))
 }
@@ -181,7 +183,25 @@ fn str_expr(t: &[Token]) -> Res<Node> {
 }
 
 fn type_method(t: &[Token]) -> Res<Node> {
-    todo!()
+    let (t, header) = stmt_header_allow_semi(t).unwrap();
+    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, kw) = KW_FN.parse(t)?;
+    let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, generics) = opt(generic_params).parse(t).unwrap();
+    let (t, params) = fn_params(t)?;
+    let (t, return_type) = opt(type_decorator).parse(t).unwrap();
+    let (t, body_or_semi) = either(&body, &SEMI).parse(t)?;
+
+    let mut node = Node::new(NodeKind::TypeMethod);
+    node.add(header);
+    node.add(modifiers);
+    node.add(kw);
+    node.add(name);
+    node.add(generics);
+    node.add(params);
+    node.add(return_type);
+    node.add(body_or_semi);
+    Ok((t, node))
 }
 
 fn initializer(t: &[Token]) -> Res<Node> {
