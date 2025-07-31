@@ -139,10 +139,10 @@ pub enum TokenKind {
     BlockComment,
     /// Any whitespace characters sequence.
     /// The inner value represents the number of whitespaces.
-    Space(usize),
+    Space(u32),
     /// Any newline characters sequence.
     /// The inner value represents the number of newlines.
-    NewLine(usize),
+    NewLine(u32),
     /// "ident" or "continue", ...
     /// At this step keywords are also considered identifiers.
     Ident,

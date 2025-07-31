@@ -151,23 +151,6 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NodeError {
-    pub kind: ErrorKind,
-    pub token: Token,
-}
-
-impl From<&NodeError> for lsp_types::Diagnostic {
-    fn from(value: &NodeError) -> Self {
-        Self {
-            range: value.token.span.to_range(),
-            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
-            message: value.kind.to_string(),
-            ..Default::default()
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
     Module,
@@ -218,6 +201,24 @@ pub enum NodeKind {
     CharExpr,
     NaNExpr,
     InfExpr,
+    VarDecl,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeError {
+    pub kind: ErrorKind,
+    pub token: Token,
+}
+
+impl From<&NodeError> for lsp_types::Diagnostic {
+    fn from(value: &NodeError) -> Self {
+        Self {
+            range: value.token.span.to_range(),
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: value.kind.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -254,26 +255,6 @@ impl AddToNode for Token {
     }
 }
 
-impl AddToNode for Vec<Token> {
-    fn append_to(self, node: &mut Node) {
-        node.children.extend(self.into_iter().map(CstNode::Token))
-    }
-}
-
-impl AddToNode for Vec<Tokens> {
-    fn append_to(self, node: &mut Node) {
-        for tokens in self {
-            node.add(tokens);
-        }
-    }
-}
-
-impl AddToNode for Vec<Node> {
-    fn append_to(self, node: &mut Node) {
-        node.children.extend(self.into_iter().map(CstNode::Node));
-    }
-}
-
 impl AddToNode for Tokens {
     fn append_to(self, node: &mut Node) {
         self.leading.append_to(node);
@@ -284,6 +265,12 @@ impl AddToNode for Tokens {
 impl AddToNode for NodeError {
     fn append_to(self, node: &mut Node) {
         node.children.push(CstNode::Error(self))
+    }
+}
+
+impl<T: AddToNode> AddToNode for Vec<T> {
+    fn append_to(self, node: &mut Node) {
+        self.into_iter().for_each(|item| item.append_to(node));
     }
 }
 

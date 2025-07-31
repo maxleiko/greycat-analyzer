@@ -9,22 +9,117 @@ use crate::{
 
 #[derive(Debug)]
 pub enum ParseError {
-    Custom { text: &'static str, got: Token },
-    Expected { kind: TokenKind, got: Token },
-    OneOf { errors: Vec<ParseError>, got: Token },
+    Custom(CustomParseError),
+    Expected(ExpectedParseError),
+    OneOf(OneOfParseError),
+}
+
+impl From<CustomParseError> for ParseError {
+    #[inline(always)]
+    fn from(value: CustomParseError) -> Self {
+        Self::Custom(value)
+    }
+}
+
+impl From<ExpectedParseError> for ParseError {
+    #[inline(always)]
+    fn from(value: ExpectedParseError) -> Self {
+        Self::Expected(value)
+    }
+}
+
+impl From<OneOfParseError> for ParseError {
+    #[inline(always)]
+    fn from(value: OneOfParseError) -> Self {
+        Self::OneOf(value)
+    }
+}
+
+#[derive(Debug)]
+pub struct CustomParseError {
+    text: &'static str,
+    got: Token,
+}
+
+#[derive(Debug)]
+pub struct ExpectedParseError {
+    kind: TokenKind,
+    got: Token,
+}
+
+#[derive(Debug)]
+pub struct OneOfParseError {
+    kinds: Vec<Either<TokenKind, &'static str>>,
+    got: Token,
+}
+
+impl From<CustomParseError> for OneOfParseError {
+    fn from(value: CustomParseError) -> Self {
+        Self {
+            kinds: vec![Either::Right(value.text)],
+            got: value.got,
+        }
+    }
+}
+
+impl From<ExpectedParseError> for OneOfParseError {
+    fn from(value: ExpectedParseError) -> Self {
+        Self {
+            kinds: vec![Either::Left(value.kind)],
+            got: value.got,
+        }
+    }
+}
+
+impl From<ParseError> for OneOfParseError {
+    fn from(value: ParseError) -> Self {
+        match value {
+            ParseError::Custom(err) => OneOfParseError::from(err),
+            ParseError::Expected(err) => OneOfParseError::from(err),
+            ParseError::OneOf(err) => err,
+        }
+    }
 }
 
 impl ParseError {
     pub fn is_eof(&self) -> bool {
-        self.token().kind == TokenKind::Eof
+        self.got().kind == TokenKind::Eof
     }
 
-    pub fn token(&self) -> &Token {
+    pub fn got(&self) -> &Token {
         match self {
-            Self::Custom { got, .. } => got,
-            Self::Expected { got, .. } => got,
-            Self::OneOf { got, .. } => got,
+            Self::Custom(CustomParseError { got, .. }) => got,
+            Self::Expected(ExpectedParseError { got, .. }) => got,
+            Self::OneOf(OneOfParseError { got, .. }) => got,
         }
+    }
+
+    pub fn and(self, other: Self) -> Self {
+        let mut acc = OneOfParseError::from(self);
+        let got = match other {
+            ParseError::Custom(CustomParseError { text, got }) => {
+                acc.kinds.push(Either::Right(text));
+                got
+            }
+            ParseError::Expected(ExpectedParseError { kind, got }) => {
+                acc.kinds.push(Either::Left(kind));
+                got
+            }
+            ParseError::OneOf(OneOfParseError { kinds, got }) => {
+                acc.kinds.extend(kinds);
+                got
+            }
+        };
+        if got.span.start.offset < acc.got.span.start.offset {
+            acc.got = got;
+        }
+        Self::OneOf(acc)
+    }
+}
+
+impl std::iter::Sum for ParseError {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.reduce(|a, b| a.and(b)).unwrap()
     }
 }
 
@@ -63,10 +158,11 @@ impl<'t> Parser<'t, Tokens> for Matches {
         if tok.token.kind == self.kind {
             Ok((t, tok))
         } else {
-            Err(ParseError::Expected {
+            Err(ExpectedParseError {
                 kind: self.kind,
                 got: tok.token,
-            })
+            }
+            .into())
         }
     }
 }
@@ -88,10 +184,11 @@ impl<'t, const N: usize> Parser<'t, Tokens> for MatchesOne<N> {
         if self.kinds.contains(&tok.token.kind) {
             Ok((t, tok))
         } else {
-            Err(ParseError::Custom {
+            Err(CustomParseError {
                 text: self.error_text,
                 got: tok.token,
-            })
+            }
+            .into())
         }
     }
 }
@@ -111,16 +208,16 @@ pub struct OneOf<'p, 't, T> {
 
 impl<'p, 't: 'p, T> Parser<'t, T> for OneOf<'p, 't, T> {
     fn parse(&self, t: &'t [Token]) -> Res<'t, T, ParseError> {
-        let mut errors = Vec::new();
+        let mut acc = Vec::new();
         for parser in self.parsers {
             match parser.parse(t) {
                 Ok(res) => return Ok(res),
                 Err(err) => {
-                    errors.push(err);
+                    acc.push(err);
                 }
             }
         }
-        Err(ParseError::OneOf { errors, got: t[0] })
+        Err(acc.into_iter().sum())
     }
 }
 
@@ -128,6 +225,7 @@ pub const fn one_of<'p, 't: 'p, T>(parsers: &'p [&dyn Parser<'t, T>]) -> OneOf<'
     OneOf { parsers }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Either<L, R> {
     Left(L),
     Right(R),
@@ -142,10 +240,7 @@ where
         Ok((t, res)) => Ok((t, Either::Left(res))),
         Err(err1) => match p2.parse(t) {
             Ok((t, res)) => Ok((t, Either::Right(res))),
-            Err(err2) => Err(ParseError::OneOf {
-                errors: vec![err1, err2],
-                got: t[0],
-            }),
+            Err(err2) => Err(err1.and(err2)),
         },
     }
 }
@@ -166,10 +261,7 @@ where
             Ok((t, res)) => Ok((t, res)),
             Err(err1) => match self.p2.parse(t) {
                 Ok((t, res)) => Ok((t, res)),
-                Err(err2) => Err(ParseError::OneOf {
-                    errors: vec![err1, err2],
-                    got: t[0],
-                }),
+                Err(err2) => Err(err1.and(err2)),
             },
         }
     }
@@ -302,13 +394,6 @@ where
         let (t, dc) = p2.parse(t)?;
         Ok((t, (id, dc)))
     }
-}
-
-pub fn value<'t, T>(value: T) -> impl Parser<'t, T>
-where
-    T: Clone,
-{
-    move |t| Ok((t, value.clone()))
 }
 
 #[cfg(test)]

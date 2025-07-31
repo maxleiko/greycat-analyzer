@@ -13,7 +13,7 @@
       },
       "args": ["lint", "${workspaceFolder}/project.gcl"]
     },
-        {
+    {
       "type": "lldb",
       "request": "launch",
       "name": "Debug cst",
@@ -21,6 +21,6 @@
         "args": ["build", "--bin", "greycat-analyzer"]
       },
       "args": ["cst", "${workspaceFolder}/project.gcl", "--trivia"]
-    }
+    },
   ]
 }

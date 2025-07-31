@@ -3,6 +3,7 @@ use std::{cell::RefCell, convert::Infallible};
 use crate::{
     Token, TokenKind,
     cst::{AddToNode, CstNode, ErrorKind, Node, NodeError, NodeKind, Tokens, combi::*},
+    tokenize,
 };
 
 pub fn parse(mut t: &[Token]) -> Node {
@@ -105,25 +106,20 @@ fn enum_decl(t: &[Token]) -> Res<Node> {
 }
 
 fn enum_body(t: &[Token]) -> Res<Node> {
-    many_sep_bound(
-        NodeKind::EnumBody,
-        OPEN_CURLY,
-        enum_field,
-        alt(SEMI, COMMA),
-        CLOSE_CURLY,
-    )
-    .parse(t)
+    many_sep_bound(NodeKind::EnumBody, OPEN_CURLY, enum_field, alt(SEMI, COMMA), CLOSE_CURLY).parse(t)
 }
 
 fn enum_field(t: &[Token]) -> Res<Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, name) = ident_or_kw_or_strlit(t)?;
     let (t, args) = opt(paren_expr).parse(t).unwrap();
+    // let (t, sep) = expect(alt(SEMI, COMMA)).parse(t).unwrap();
 
     let mut node = Node::new(NodeKind::EnumField);
     node.add(header);
     node.add(name);
     node.add(args);
+    // node.add(sep);
     Ok((t, node))
 }
 
@@ -151,7 +147,7 @@ fn type_decl(t: &[Token]) -> Res<Node> {
 
 fn type_extends(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_EXTENDS.parse(t)?;
-    let (t, name) = TYPE_IDENT.parse(t)?;
+    let (t, name) = type_ident(t)?;
 
     let mut node = Node::new(NodeKind::TypeExtends);
     node.add(kw);
@@ -160,23 +156,13 @@ fn type_extends(t: &[Token]) -> Res<Node> {
 }
 
 fn type_body(t: &[Token]) -> Res<Node> {
-    many_sep_bound(
+    many_bound(
         NodeKind::TypeBody,
         OPEN_CURLY,
-        alt(type_attr, type_method),
-        alt(SEMI, COMMA),
+        either(&alt(type_attr, type_method), &SEMI),
         CLOSE_CURLY,
     )
     .parse(t)
-    // let (t, open) = OPEN_CURLY.parse(t)?;
-    // let (t, fields) = many(one_of(&[&type_attr, &type_method])).parse(t).unwrap();
-    // let (t, close) = CLOSE_CURLY.parse(t)?;
-
-    // let mut node = Node::new(NodeKind::TypeBody);
-    // node.add(open);
-    // node.add(fields);
-    // node.add(close);
-    // Ok((t, node))
 }
 
 fn type_attr(t: &[Token]) -> Res<Node> {
@@ -184,8 +170,9 @@ fn type_attr(t: &[Token]) -> Res<Node> {
     let (t, modifiers) = modifiers(t)?;
     let (t, name) = ident_or_kw_or_strlit(t)?;
     let (t, colon) = COLON.parse(t)?;
-    let (t, ty) = TYPE_IDENT.parse(t)?;
+    let (t, ty) = type_ident(t)?;
     let (t, init) = opt(initializer).parse(t).unwrap();
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
 
     let mut node = Node::new(NodeKind::TypeAttr);
     node.add(header);
@@ -194,6 +181,7 @@ fn type_attr(t: &[Token]) -> Res<Node> {
     node.add(colon);
     node.add(ty);
     node.add(init);
+    node.add(semi);
     Ok((t, node))
 }
 
@@ -288,7 +276,7 @@ fn initializer(t: &[Token]) -> Res<Node> {
 fn expr(t: &[Token]) -> Res<Node> {
     // parse initial operand
     let (mut t, mut lhs) = postfix_expr(t)?;
-
+    // TODO:
     // loop {
     //     // try parsing a binary operator
     //     let Ok((next, op_tok)) = binary_op(t) else {
@@ -412,7 +400,7 @@ fn prefix_op(t: &[Token]) -> Res<Tokens> {
 
 fn call_expr(t: &[Token]) -> Res<Node> {
     let (mut t, mut recv) = primary_expr(t)?;
-
+    // TODO:
     // loop {
     //     let Ok((next_t, spec)) = call_expr_spec(t) else {
     //         // no follow-up spec, stop parsing
@@ -554,7 +542,7 @@ fn generic_params(t: &[Token]) -> Res<Node> {
 }
 
 fn type_params(t: &[Token]) -> Res<Node> {
-    many_sep_bound(NodeKind::TypeParams, LT, TYPE_IDENT, COMMA, GT).parse(t)
+    many_sep_bound(NodeKind::TypeParams, LT, type_ident, COMMA, GT).parse(t)
 }
 
 fn modifiers(t: &[Token]) -> Res<Option<Node>> {
@@ -580,18 +568,29 @@ fn modifier(t: &[Token]) -> Res<Tokens> {
 }
 
 fn fn_body(t: &[Token]) -> Res<Node> {
-    many_sep_bound(NodeKind::FnBody, OPEN_CURLY, body_stmt, SEMI, CLOSE_CURLY).parse(t)
-    // let (t, open) = OPEN_CURLY.parse(t)?;
-    // // TODO body stmts
-    // let (t, close) = CLOSE_CURLY.parse(t)?;
-    // let mut node = Node::new(NodeKind::FnBody);
-    // node.add(open);
-    // node.add(close);
-    // Ok((t, node))
+    many_bound(NodeKind::FnBody, OPEN_CURLY, body_stmt, CLOSE_CURLY).parse(t)
 }
 
-fn body_stmt(t: &[Token]) -> Res<Node> {
-    todo!()
+fn body_stmt(t: &[Token]) -> Res<Either<Node, Tokens>> {
+    either(&one_of(&[&var_decl]), &SEMI).parse(t)
+}
+
+fn var_decl(t: &[Token]) -> Res<Node> {
+    let (t, header) = stmt_header(t)?;
+    let (t, kw) = KW_VAR.parse(t)?;
+    let (t, name) = IDENT.parse(t)?;
+    let (t, ty) = opt(type_decorator).parse(t).unwrap();
+    let (t, init) = opt(initializer).parse(t).unwrap();
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::VarDecl);
+    node.add(header);
+    node.add(kw);
+    node.add(name);
+    node.add(ty);
+    node.add(init);
+    node.add(semi);
+    Ok((t, node))
 }
 
 fn stmt_header(t: &[Token]) -> Res<Option<Node>> {
@@ -665,17 +664,18 @@ fn fn_params(t: &[Token]) -> Res<Node> {
 }
 
 fn fn_param(t: &[Token]) -> Res<Node> {
-    let mut node = Node::new(NodeKind::FnParam);
     let (t, name) = IDENT.parse(t)?;
-    node.add(name); // TODO don't we want 'ident' token to be its own 'node'?
     let (t, ty) = type_decorator(t)?;
+
+    let mut node = Node::new(NodeKind::FnParam);
+    node.add(name);
     node.add(ty);
     Ok((t, node))
 }
 
 fn type_decorator(t: &[Token]) -> Res<Node> {
     let (t, c) = COLON.parse(t)?;
-    let (t, ty) = TYPE_IDENT.parse(t)?;
+    let (t, ty) = expect(type_ident).parse(t).unwrap();
 
     let mut node = Node::new(NodeKind::TypeDecorator);
     node.add(c);
@@ -683,24 +683,181 @@ fn type_decorator(t: &[Token]) -> Res<Node> {
     Ok((t, node))
 }
 
-#[derive(Clone, Copy)]
-struct TypeIdent;
+fn type_ident(t: &[Token]) -> Res<Node> {
+    let (t, kw_typeof) = opt(KW_TYPEOF).parse(t).unwrap();
+    let (t, parts) = many(seq2(IDENT_OR_KW, COLON_COLON)).parse(t).unwrap();
+    let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, params) = opt(type_params).parse(t).unwrap();
+    let (t, qmark) = opt(QMARK).parse(t).unwrap();
 
-impl<'t> Parser<'t, Node> for TypeIdent {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, Node, ParseError> {
-        let (t, kw_typeof) = opt(KW_TYPEOF).parse(t).unwrap();
-        let (t, parts) = many(seq2(IDENT_OR_KW, COLON_COLON)).parse(t).unwrap();
-        let (t, name) = IDENT_OR_KW.parse(t)?;
-        let (t, params) = opt(type_params).parse(t).unwrap();
-        let (t, qmark) = opt(QMARK).parse(t).unwrap();
+    let mut node = Node::new(NodeKind::TypeIdent);
+    node.add(kw_typeof);
+    node.add(parts);
+    node.add(name);
+    node.add(params);
+    node.add(qmark);
+    Ok((t, node))
+}
 
-        let mut node = Node::new(NodeKind::TypeIdent);
-        node.add(kw_typeof);
-        node.add(parts);
-        node.add(name);
-        node.add(params);
-        node.add(qmark);
-        Ok((t, node))
+pub fn expect<'t, P, T>(parser: P) -> impl Parser<'t, Either<T, NodeError>, Infallible>
+where
+    P: Parser<'t, T>,
+{
+    move |t| match parser.parse(t) {
+        Ok((t, res)) => Ok((t, Either::Left(res))),
+        Err(_) => Ok((
+            t,
+            Either::Right(NodeError {
+                kind: ErrorKind::MissingToken,
+                token: t[0],
+            }),
+        )),
+    }
+}
+
+pub fn acc_trivia<'t>(acc: &mut Vec<CstNode>, t: &'t [Token]) -> &'t [Token] {
+    let (next, tok) = peek(t);
+    let skip = tok.leading.len();
+    acc.extend(tok.leading.into_iter().map(CstNode::Token));
+    &t[skip..]
+}
+
+pub fn many_bound<'t, O, I, C, T>(
+    kind: NodeKind,
+    open: O,
+    item: I,
+    close: C,
+) -> impl Parser<'t, Node>
+where
+    O: Parser<'t, Tokens>,
+    I: Parser<'t, T>,
+    C: Parser<'t, Tokens>,
+    T: AddToNode,
+{
+    move |t| {
+        let (t, o) = open.parse(t)?;
+        let mut node = Node::new(kind);
+        node.add(o);
+
+        let mut tokens = t;
+
+        loop {
+            // consume any trivia "in-between"
+            tokens = acc_trivia(&mut node.children, tokens);
+            if tokens.len() == 1 {
+                // EOF reached
+                let err = close.parse(tokens).err().unwrap();
+                node.add(NodeError {
+                    kind: ErrorKind::UnexpectedToken,
+                    token: tokens[0],
+                });
+                return Err(err);
+            }
+            // check for closing bound
+            if let Ok((t, c)) = close.parse(tokens) {
+                node.add(c);
+                return Ok((t, node));
+            }
+            match item.parse(tokens) {
+                Ok((t, i)) => {
+                    node.add(i);
+                    tokens = t;
+                }
+                Err(_) => return Ok((t, node)),
+            }
+        }
+    }
+}
+
+pub enum ManySepBoundState {
+    ExpectSep,
+    ExpectItem,
+}
+
+pub fn many_sep_bound<'t, O, I, S, C, T>(
+    kind: NodeKind,
+    open: O,
+    item: I,
+    sep: S,
+    close: C,
+) -> impl Parser<'t, Node>
+where
+    O: Parser<'t, Tokens>,
+    I: Parser<'t, T>,
+    S: Parser<'t, Tokens>,
+    C: Parser<'t, Tokens>,
+    T: AddToNode,
+{
+    move |t| {
+        let (t, o) = open.parse(t)?;
+        let mut node = Node::new(kind);
+        node.add(o);
+
+        let mut state = ManySepBoundState::ExpectItem;
+        let mut tokens = t;
+
+        loop {
+            // consume any trivia "in-between"
+            tokens = acc_trivia(&mut node.children, tokens);
+            if tokens.len() == 1 {
+                // EOF reached
+                let err = close.parse(tokens).err().unwrap();
+                node.add(NodeError {
+                    kind: ErrorKind::UnexpectedToken,
+                    token: tokens[0],
+                });
+                return Err(err);
+            }
+            // check for closing bound
+            if let Ok((t, c)) = close.parse(tokens) {
+                node.add(c);
+                return Ok((t, node));
+            }
+            match state {
+                ManySepBoundState::ExpectSep => match sep.parse(tokens) {
+                    Ok((t, s)) => {
+                        node.add(s);
+                        tokens = t;
+                        state = ManySepBoundState::ExpectItem;
+                    }
+                    Err(_) => {
+                        // we actually expected a separator, record the error
+                        node.replace_last_token_error(ErrorKind::MissingToken);
+                        let (t, i) = item.parse(tokens)?;
+                        node.add(i);
+                        tokens = t;
+                        state = ManySepBoundState::ExpectSep;
+                    }
+                },
+                ManySepBoundState::ExpectItem => match item.parse(tokens) {
+                    Ok((t, i)) => {
+                        node.add(i);
+                        tokens = t;
+                        state = ManySepBoundState::ExpectSep;
+                    }
+                    Err(_) => match either(&sep, &close).parse(tokens) {
+                        Ok((t, Either::Left(s))) => {
+                            node.add(s.leading);
+                            node.add(NodeError {
+                                kind: ErrorKind::UnexpectedToken,
+                                token: s.token,
+                            });
+                            tokens = t;
+                            state = ManySepBoundState::ExpectItem;
+                        }
+                        Ok((t, Either::Right(c))) => {
+                            node.add(c.leading);
+                            node.add(NodeError {
+                                kind: ErrorKind::UnexpectedToken,
+                                token: c.token,
+                            });
+                            return Ok((t, node));
+                        }
+                        Err(err) => return Err(err),
+                    },
+                },
+            }
+        }
     }
 }
 
@@ -850,109 +1007,13 @@ static IDENT_OR_KW: MatchesOne<39> = matches_one(
     ],
     "an identifier",
 );
-static TYPE_IDENT: TypeIdent = TypeIdent;
-
-pub fn acc_trivia<'t>(acc: &mut Vec<CstNode>, t: &'t [Token]) -> &'t [Token] {
-    let (next, tok) = peek(t);
-    let skip = tok.leading.len();
-    acc.extend(tok.leading.into_iter().map(CstNode::Token));
-    &t[skip..]
-}
-
-pub enum ManySepBoundState {
-    ExpectSep,
-    ExpectItem,
-}
-pub fn many_sep_bound<'t, O, I, S, C, T>(
-    kind: NodeKind,
-    open: O,
-    item: I,
-    sep: S,
-    close: C,
-) -> impl Parser<'t, Node>
-where
-    O: Parser<'t, Tokens>,
-    I: Parser<'t, T>,
-    S: Parser<'t, Tokens>,
-    C: Parser<'t, Tokens>,
-    T: AddToNode,
-{
-    move |t| {
-        let (t, o) = open.parse(t)?;
-        let mut node = Node::new(kind);
-        node.add(o);
-
-        let mut state = ManySepBoundState::ExpectItem;
-        let mut tokens = t;
-
-        loop {
-            // consume any trivia "in-between"
-            tokens = acc_trivia(&mut node.children, tokens);
-            if tokens.len() == 1 {
-                // EOF reached
-                let err = close.parse(tokens).err().unwrap();
-                node.add(NodeError {
-                    kind: ErrorKind::UnexpectedToken,
-                    token: tokens[0],
-                });
-                return Err(err);
-            }
-            // check for closing bound
-            if let Ok((t, c)) = close.parse(tokens) {
-                node.add(c);
-                return Ok((t, node));
-            }
-            match state {
-                ManySepBoundState::ExpectSep => match sep.parse(tokens) {
-                    Ok((t, s)) => {
-                        node.add(s);
-                        tokens = t;
-                        state = ManySepBoundState::ExpectItem;
-                    }
-                    Err(_) => {
-                        // we actually expected a separator, record the error
-                        node.replace_last_token_error(ErrorKind::MissingToken);
-                        let (t, i) = item.parse(tokens)?;
-                        node.add(i);
-                        tokens = t;
-                        state = ManySepBoundState::ExpectSep;
-                    }
-                },
-                ManySepBoundState::ExpectItem => match item.parse(tokens) {
-                    Ok((t, i)) => {
-                        node.add(i);
-                        tokens = t;
-                        state = ManySepBoundState::ExpectSep;
-                    }
-                    Err(_) => match either(&sep, &close).parse(tokens) {
-                        Ok((t, Either::Left(s))) => {
-                            node.add(s.leading);
-                            node.add(NodeError {
-                                kind: ErrorKind::UnexpectedToken,
-                                token: s.token,
-                            });
-                            tokens = t;
-                            state = ManySepBoundState::ExpectItem;
-                        }
-                        Ok((t, Either::Right(c))) => {
-                            node.add(c.leading);
-                            node.add(NodeError {
-                                kind: ErrorKind::UnexpectedToken,
-                                token: c.token,
-                            });
-                            return Ok((t, node));
-                        }
-                        Err(err) => return Err(err),
-                    },
-                },
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod test {
-    use crate::tokenize;
+    use crate::{
+        span::{Pos, Span},
+        tokenize,
+    };
 
     use super::*;
     use pretty_assertions::assert_eq;
@@ -1019,5 +1080,13 @@ mod test {
             "{}",
             CstNode::Node(param).to_display_node("a: Array<", true)
         );
+    }
+
+    #[test]
+    fn fn_decl_test() {
+        let source = "fn main() {}";
+        let tokens = tokenize(source);
+        let res = fn_decl(&tokens);
+        assert!(res.is_ok());
     }
 }

@@ -172,7 +172,7 @@ impl<'a> Consume<'a> for MainLexer {
                         _ => break,
                     }
                 }
-                ctx.token(TokenKind::NewLine(count))
+                ctx.token(TokenKind::NewLine(count as u32))
             }
             '/' if ctx.peek_char(0) == '/' => {
                 if ctx.peek_char(1) == '/' {
@@ -244,9 +244,7 @@ impl<'a> Consume<'a> for MainLexer {
             }
             c if is_whitespace(c) => {
                 ctx.advance_while(is_whitespace);
-                ctx.token(TokenKind::Space(
-                    ctx.curr.offset as usize - ctx.start.offset as usize,
-                ))
+                ctx.token(TokenKind::Space(ctx.curr.offset - ctx.start.offset))
             }
             _c @ '0'..='9' => {
                 let mut floating = false;
