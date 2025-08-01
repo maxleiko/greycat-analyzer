@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::{Token, TokenKind};
 
 use super::{CstNode, Node, NodeKind};

@@ -1,4 +1,5 @@
 use core::fmt;
+use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
@@ -6,7 +7,6 @@ use crate::{
     cst::{
         combi::Either,
         display::{DisplayNode, DisplayNodeRule},
-        utils::*,
     },
     lexer::{Token, TokenKind},
     span::{Pos, Span},
@@ -92,7 +92,7 @@ impl Node {
     pub fn new(kind: NodeKind) -> Self {
         Self {
             kind,
-            children: Vec::new(),
+            children: Default::default(),
         }
     }
 
@@ -123,8 +123,14 @@ impl Node {
     }
 
     pub fn span(&self) -> Span {
-        self.children.first();
-        span_from_nodes(&self.children)
+        match (self.children.first(), self.children.last()) {
+            (None, None) => Span::default(),
+            (Some(front), Some(back)) => Span {
+                start: front.start(),
+                end: back.end(),
+            },
+            _ => unreachable!(),
+        }
     }
 
     pub fn replace_last_token_error(&mut self, kind: ErrorKind) {
@@ -202,6 +208,18 @@ pub enum NodeKind {
     NaNExpr,
     InfExpr,
     VarDecl,
+    StaticMemberExpr,
+    MemberExpr,
+    OffsetExpr,
+    NonNullExpr,
+    OptionalExpr,
+    AsSpec,
+    IsSpec,
+    ExprStmt,
+    LambdaExpr,
+    ObjectExpr,
+    ObjectFields,
+    ObjectField,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,11 +315,9 @@ impl AddToNode for Node {
     }
 }
 
-impl<T: AddToNode, U: AddToNode> AddToNode for Vec<(T, U)> {
+impl<T: AddToNode, U: AddToNode> AddToNode for (T, U) {
     fn append_to(self, node: &mut Node) {
-        for (t, u) in self {
-            node.add(t);
-            node.add(u);
-        }
+        node.add(self.0);
+        node.add(self.1);
     }
 }
