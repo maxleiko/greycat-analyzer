@@ -231,7 +231,7 @@ pub enum Either<L, R> {
     Right(R),
 }
 
-pub fn either<'t, P1, P2, T1, T2>(p1: &P1, p2: &P2) -> impl Parser<'t, Either<T1, T2>>
+pub fn either<'t, P1, P2, T1, T2>(p1: P1, p2: P2) -> impl Parser<'t, Either<T1, T2>>
 where
     P1: Parser<'t, T1>,
     P2: Parser<'t, T2>,

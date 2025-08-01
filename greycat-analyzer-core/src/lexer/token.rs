@@ -285,6 +285,23 @@ pub enum TokenKind {
     Eof,
 }
 
+impl TokenKind {
+    pub fn precedence(&self) -> u8 {
+        match self {
+            Self::Caret => 13,
+            Self::Slash | Self::Star | Self::Percent => 12,
+            Self::Plus | Self::Minus => 11,
+            Self::Gt | Self::GtEq | Self::Lt | Self::LtEq => 9,
+            Self::EqEq | Self::BangEq => 8,
+            Self::As | Self::Is => 5,
+            Self::AndAnd => 4,
+            Self::OrOr => 3,
+            Self::Eq | Self::QuestionEq => 2,
+            _ => 15,
+        }
+    }
+}
+
 impl std::fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

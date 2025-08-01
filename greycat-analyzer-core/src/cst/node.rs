@@ -1,7 +1,7 @@
 use core::fmt;
-use std::collections::VecDeque;
+use std::{borrow::Cow, collections::VecDeque};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
     cst::{
@@ -28,7 +28,7 @@ impl IntoIterator for Tokens {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum CstNode {
     Node(Node),
@@ -37,21 +37,11 @@ pub enum CstNode {
 }
 
 impl CstNode {
-    #[inline(always)]
-    pub fn token(token: Token) -> Self {
-        Self::Token(token)
-    }
-
-    #[inline(always)]
-    pub fn error(kind: ErrorKind, token: Token) -> Self {
-        Self::Error(NodeError { kind, token })
-    }
-
-    pub fn span(&self) -> Span {
+    pub fn span(&self) -> Cow<'_, Span> {
         match self {
-            Self::Node(node) => node.span(),
-            Self::Token(token) => token.span,
-            Self::Error(NodeError { token, .. }) => token.span,
+            Self::Node(node) => Cow::Owned(node.span()),
+            Self::Token(token) => Cow::Borrowed(&token.span),
+            Self::Error(NodeError { span, .. }) => Cow::Borrowed(span),
         }
     }
 
@@ -59,7 +49,7 @@ impl CstNode {
         match self {
             Self::Node(node) => node.span().start,
             Self::Token(token) => token.span.start,
-            Self::Error(NodeError { token, .. }) => token.span.start,
+            Self::Error(NodeError { span, .. }) => span.start,
         }
     }
 
@@ -67,7 +57,7 @@ impl CstNode {
         match self {
             Self::Node(node) => node.span().end,
             Self::Token(token) => token.span.end,
-            Self::Error(NodeError { token, .. }) => token.span.end,
+            Self::Error(NodeError { span, .. }) => span.end,
         }
     }
 
@@ -80,11 +70,12 @@ impl CstNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Node {
     #[serde(rename = "name")]
     pub kind: NodeKind,
     pub children: Vec<CstNode>,
+    pub field_name: Option<&'static str>,
 }
 
 impl Node {
@@ -93,7 +84,12 @@ impl Node {
         Self {
             kind,
             children: Default::default(),
+            field_name: None,
         }
+    }
+
+    pub fn field(&mut self, name: &'static str) {
+        let _ = self.field_name.replace(name);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -133,23 +129,7 @@ impl Node {
         }
     }
 
-    pub fn replace_last_token_error(&mut self, kind: ErrorKind) {
-        if let Some(n) = self.last_token_mut() {
-            *n = match n {
-                CstNode::Token(token) => CstNode::Error(NodeError {
-                    kind,
-                    token: *token,
-                }),
-                CstNode::Error(error) => CstNode::Error(NodeError {
-                    kind,
-                    token: error.token,
-                }),
-                CstNode::Node(_) => unreachable!(),
-            }
-        }
-    }
-
-    fn last_token_mut(&mut self) -> Option<&mut CstNode> {
+    pub fn last_token_mut(&mut self) -> Option<&mut CstNode> {
         self.children.last_mut().and_then(|n| match n {
             CstNode::Node(node) => node.last_token_mut(),
             leaf => Some(leaf),
@@ -157,7 +137,7 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum NodeKind {
     Module,
     Fn,
@@ -219,19 +199,34 @@ pub enum NodeKind {
     LambdaExpr,
     ObjectExpr,
     ObjectFields,
-    ObjectField,
+    ObjectFieldEntry,
+    ObjectFieldExpr,
+    ArrayInlineExpr,
+    TemplateExpr,
+    Interpolation,
+    BinaryExpr,
+    BinaryOperator,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NodeError {
     pub kind: ErrorKind,
-    pub token: Token,
+    pub span: Span,
+}
+
+impl NodeError {
+    pub fn got(&self) -> TokenKind {
+        match self.kind {
+            ErrorKind::ExpectedToken { got, .. } => got,
+            ErrorKind::Expected { got, .. } => got,
+        }
+    }
 }
 
 impl From<&NodeError> for lsp_types::Diagnostic {
     fn from(value: &NodeError) -> Self {
         Self {
-            range: value.token.span.to_range(),
+            range: value.span.to_range(),
             severity: Some(lsp_types::DiagnosticSeverity::ERROR),
             message: value.kind.to_string(),
             ..Default::default()
@@ -239,19 +234,26 @@ impl From<&NodeError> for lsp_types::Diagnostic {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "reason")]
 pub enum ErrorKind {
-    UnexpectedSeparator,
-    MissingToken,
-    UnexpectedToken,
+    ExpectedToken {
+        expected: TokenKind,
+        got: TokenKind,
+    },
+    Expected {
+        expected: &'static str,
+        got: TokenKind,
+    },
 }
 
 impl std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnexpectedSeparator => write!(f, "unexpected separator"),
-            Self::MissingToken => write!(f, "missing token"),
-            Self::UnexpectedToken => write!(f, "unexpected token"),
+            Self::ExpectedToken { expected, got } => {
+                write!(f, "expected token '{expected}' got '{got}'")
+            }
+            Self::Expected { expected, got } => write!(f, "expected '{expected}' got '{got}'"),
         }
     }
 }

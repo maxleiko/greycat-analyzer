@@ -67,8 +67,8 @@ impl<'a> DisplayNode<'a> {
                 }
                 _ => Ok(()),
             },
-            CstNode::Error(NodeError { kind, token }) => {
-                writeln!(f, "{pad}(ERROR {kind:?}={:?})", token.kind)
+            CstNode::Error(NodeError { kind, span }) => {
+                writeln!(f, "{pad}(ERROR {kind} [{span}])")
             }
         }
     }

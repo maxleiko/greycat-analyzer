@@ -41,7 +41,8 @@ function renderNode(node) {
     }`;
     li.innerHTML = `<span class="token">${text}</span>`;
   } else if (node.type === 'Error') {
-    li.innerHTML = `<span class="error">${node.token.kind.kind}</span><span class="error-kind">(${node.kind})</span>`;
+    console.log(node);
+    li.innerHTML = `<span class="error">${node.kind.expected}</span><span class="error-kind">(${node.kind.got.kind})</span>`;
   } else {
     li.innerHTML = `<span class="toggle">${node.name}</span>`;
   }
@@ -98,7 +99,7 @@ function span(node) {
       return node.span;
     }
     case 'Error': {
-      return node.token.span;
+      return node.span;
     }
   }
 }

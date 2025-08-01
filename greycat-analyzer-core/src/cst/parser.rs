@@ -19,7 +19,7 @@ pub fn parse(mut t: &[Token]) -> Node {
             node.add(peeked.leading);
             t = &t[trivia_len..]; // consume trivia only
         }
-        match either(&module_stmt, &SEMI).parse(t) {
+        match either(module_stmt, SEMI).parse(t) {
             Ok((next, Either::Left(stmt))) => {
                 node.add(stmt);
                 t = next;
@@ -30,8 +30,11 @@ pub fn parse(mut t: &[Token]) -> Node {
             }
             Err(_) => {
                 node.add(NodeError {
-                    kind: ErrorKind::UnexpectedToken,
-                    token: t[0],
+                    kind: ErrorKind::Expected {
+                        expected: "a module statement",
+                        got: t[0].kind,
+                    },
+                    span: t[0].span,
                 });
                 t = &t[1..]; // advance
             }
@@ -53,7 +56,7 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     let (t, generics) = opt(generic_params).parse(t).unwrap();
     let (t, params) = fn_params(t)?;
     let (t, return_type) = opt(type_decorator).parse(t).unwrap();
-    let (t, body_or_semi) = either(&fn_body, &SEMI).parse(t)?;
+    let (t, body_or_semi) = either(fn_body, SEMI).parse(t)?;
 
     let mut node = Node::new(NodeKind::Fn);
     node.add(header);
@@ -164,7 +167,7 @@ fn type_body(t: &[Token]) -> Res<Node> {
     many_bound(
         NodeKind::TypeBody,
         OPEN_CURLY,
-        either(&alt(type_attr, type_method), &SEMI),
+        either(alt(type_attr, type_method), SEMI),
         CLOSE_CURLY,
     )
     .parse(t)
@@ -224,7 +227,7 @@ fn ident_or_kw_or_strlit(t: &[Token]) -> Res<Node> {
 
 fn paren_expr(t: &[Token]) -> Res<Node> {
     let (t, open) = OPEN_PAREN.parse(t)?;
-    let (t, expr) = expr(t)?;
+    let (t, expr) = expect(expr).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
     let mut node = Node::new(NodeKind::ParenExpr);
@@ -279,94 +282,45 @@ fn initializer(t: &[Token]) -> Res<Node> {
 }
 
 fn expr(t: &[Token]) -> Res<Node> {
-    // parse initial operand
-    let (mut t, mut lhs) = postfix_expr(t)?;
-    // TODO:
-    // loop {
-    //     // try parsing a binary operator
-    //     let Ok((next, op_tok)) = binary_op(t) else {
-    //         break;
-    //     };
+    let (mut t, mut curr) = postfix_expr(t)?;
 
-    //     // determine operator precedence
-    //     let new_prec = precedence(&op_tok.token);
+    loop {
+        let Ok((next_t, op_tok)) = binary_op(t) else {
+            break;
+        };
+        t = next_t; // advance
 
-    //     // advance past operator
-    //     t = next;
+        let new_prec = op_tok.token.kind.precedence();
 
-    //     // try parsing right-hand side operand
-    //     let rhs_res = postfix_expr(t);
+        let (next_t, rhs) = postfix_expr(t)?;
+        t = next_t; // advance
 
-    //     match rhs_res {
-    //         Ok((next_t, mut rhs)) => {
-    //             t = next_t;
+        let op = Node {
+            kind: NodeKind::BinaryOperator,
+            field_name: Some("op"),
+            children: op_tok
+                .leading
+                .into_iter()
+                .map(CstNode::Token)
+                .chain(std::iter::once(CstNode::Token(op_tok.token)))
+                .collect(),
+        };
 
-    //             if lhs.kind == NodeKind::BinExpr {
-    //                 // re-associate if current binary expr has higher precedence
-    //                 let curr_op = lhs
-    //                     .get_field("op")
-    //                     .expect("BinaryExpr must have an operator");
-    //                 let curr_prec = precedence(curr_op.token().unwrap());
+        match curr.kind {
+            NodeKind::BinaryExpr => {
+                todo!()
+            }
+            _ => {
+                let mut node = Node::new(NodeKind::BinaryExpr);
+                curr.field("lhs");
+                node.add(curr);
+                node.add(op);
+                curr = node;
+            }
+        }
+    }
 
-    //                 if new_prec <= curr_prec {
-    //                     let mut node = Node::new(NodeKind::BinExpr);
-    //                     lhs.set_field("lhs");
-    //                     node.add(lhs);
-    //                     node.add(op_tok.to_node(NodeKind::BinOp, "op"));
-    //                     rhs.set_field("rhs");
-    //                     node.add(rhs);
-    //                     lhs = node;
-    //                     continue;
-    //                 }
-
-    //                 // restructure to insert inside rhs
-    //                 let curr_lhs = lhs.get_field("lhs").unwrap();
-    //                 let curr_op = lhs.get_field("op").unwrap();
-    //                 let curr_rhs = lhs.get_field("rhs").unwrap();
-
-    //                 let mut rhs_expr = Node::new(NodeKind::BinExpr);
-    //                 curr_rhs.clone().set_field("lhs");
-    //                 rhs_expr.add(curr_rhs);
-    //                 rhs_expr.add(op_tok.to_node(NodeKind::BinOp, "op"));
-    //                 rhs.set_field("rhs");
-    //                 rhs_expr.add(rhs);
-
-    //                 let mut node = Node::new(NodeKind::BinExpr);
-    //                 curr_lhs.clone().set_field("lhs");
-    //                 node.add(curr_lhs);
-    //                 node.add(curr_op);
-    //                 rhs_expr.set_field("rhs");
-    //                 node.add(rhs_expr);
-
-    //                 lhs = node;
-    //             } else {
-    //                 // normal case
-    //                 let mut node = Node::new(NodeKind::BinExpr);
-    //                 lhs.set_field("lhs");
-    //                 node.add(lhs);
-    //                 node.add(op_tok.to_node(NodeKind::BinOp, "op"));
-    //                 rhs.set_field("rhs");
-    //                 node.add(rhs);
-    //                 lhs = node;
-    //             }
-    //         }
-    //         Err(_) => {
-    //             // rhs failed to parse, still construct a binary expr node with an error
-    //             let mut node = Node::new(NodeKind::BinExpr);
-    //             lhs.set_field("lhs");
-    //             node.add(lhs);
-    //             node.add(op_tok.to_node(NodeKind::BinOp, "op"));
-    //             node.add(NodeError {
-    //                 kind: ErrorKind::Expected,
-    //                 token: t[0],
-    //             });
-    //             lhs = node;
-    //             break;
-    //         }
-    //     }
-    // }
-
-    Ok((t, lhs))
+    Ok((t, curr))
 }
 
 fn postfix_expr(t: &[Token]) -> Res<Node> {
@@ -406,39 +360,29 @@ fn prefix_op(t: &[Token]) -> Res<Tokens> {
 fn call_expr(t: &[Token]) -> Res<Node> {
     let (mut t, mut recv) = primary_expr(t)?;
 
-    // loop {
-    //     let Ok((next_t, mut spec)) = call_expr_spec(t) else {
-    //         // no follow-up spec, stop parsing
-    //         break;
-    //     };
+    loop {
+        match either(&call_args, &call_expr_spec).parse(t) {
+            Ok((next_t, Either::Left(args))) => {
+                t = next_t; // advance
 
-    //     t = next_t;
+                let mut node = Node::new(NodeKind::CallExpr);
+                node.add(recv);
+                node.add(args);
+                recv = node;
+            }
+            Ok((next_t, Either::Right(spec))) => {
+                t = next_t; // advance
 
-    //     if spec.kind == NodeKind::CallArgs {
-    //         // construct CallExpr node
-    //         let mut expr = Node::new(NodeKind::CallExpr);
-    //         // TODO: field_name?
-    //         // recv.set_field("recv");
-    //         expr.add(recv);
-
-    //         let mut args = spec;
-    //         // TODO: field_name?
-    //         // args.set_field("args");
-    //         expr.add(args);
-
-    //         recv = expr;
-    //     } else {
-    //         spec.prepend(recv);
-    //         recv = spec;
-    //     }
-    // }
+                let mut node = Node::new(spec.kind);
+                node.add(recv);
+                node.children.extend(spec.children);
+                recv = node;
+            }
+            Err(_) => break,
+        }
+    }
 
     Ok((t, recv))
-}
-
-enum CallExprSpec {
-    Wrap(Node),
-    Append(Node),
 }
 
 fn call_expr_spec(t: &[Token]) -> Res<Node> {
@@ -466,7 +410,7 @@ fn static_member_expr(t: &[Token]) -> Res<Node> {
 }
 
 fn member_expr(t: &[Token]) -> Res<Node> {
-    let (t, sep) = either(&DOT, &ARROW).parse(t)?;
+    let (t, sep) = either(DOT, ARROW).parse(t)?;
     let (t, prop) = ident_or_kw_or_strlit(t)?;
 
     let mut node = Node::new(NodeKind::MemberExpr);
@@ -576,11 +520,38 @@ fn object_expr(t: &[Token]) -> Res<Node> {
 }
 
 fn template_expr(t: &[Token]) -> Res<Node> {
-    todo!()
+    let (t, enter) = DOUBLE_QUOTE.parse(t)?;
+    let (t, children) = many(either(RAW_STRING, interpolation)).parse(t).unwrap();
+    let (t, exit) = DOUBLE_QUOTE.parse(t)?;
+
+    let mut node = Node::new(NodeKind::TemplateExpr);
+    node.add(enter);
+    node.add(children);
+    node.add(exit);
+    Ok((t, node))
+}
+
+fn interpolation(t: &[Token]) -> Res<Node> {
+    let (t, enter) = ENTER_INTERPOLATION.parse(t)?;
+    let (t, expr) = expr(t)?;
+    let (t, exit) = EXIT_INTERPOLATION.parse(t)?;
+
+    let mut node = Node::new(NodeKind::Interpolation);
+    node.add(enter);
+    node.add(expr);
+    node.add(exit);
+    Ok((t, node))
 }
 
 fn array_inline_expr(t: &[Token]) -> Res<Node> {
-    todo!()
+    many_sep_bound(
+        NodeKind::ArrayInlineExpr,
+        OPEN_SQUARE,
+        expr,
+        COMMA,
+        CLOSE_SQUARE,
+    )
+    .parse(t)
 }
 
 fn literal(t: &[Token]) -> Res<Node> {
@@ -640,7 +611,34 @@ fn this_expr(t: &[Token]) -> Res<Node> {
 }
 
 fn object_fields(t: &[Token]) -> Res<Node> {
-    todo!()
+    many_sep_bound(
+        NodeKind::ObjectFields,
+        OPEN_CURLY,
+        alt(object_field_entry, object_field_expr),
+        COMMA,
+        CLOSE_CURLY,
+    )
+    .parse(t)
+}
+
+fn object_field_entry(t: &[Token]) -> Res<Node> {
+    let (t, name) = ident_or_kw_or_strlit(t)?;
+    let (t, sep) = COLON.parse(t)?;
+    let (t, expr) = expr(t)?;
+
+    let mut node = Node::new(NodeKind::ObjectFieldEntry);
+    node.add(name);
+    node.add(sep);
+    node.add(expr);
+    Ok((t, node))
+}
+
+fn object_field_expr(t: &[Token]) -> Res<Node> {
+    let (t, expr) = expr(t)?;
+
+    let mut node = Node::new(NodeKind::ObjectFieldExpr);
+    node.add(expr);
+    Ok((t, node))
 }
 
 fn name(t: &[Token]) -> Res<Node> {
@@ -668,6 +666,7 @@ fn modifiers(t: &[Token]) -> Res<Option<Node>> {
             node.add(Node {
                 kind: NodeKind::FnModifier,
                 children: vec![CstNode::Token(token)],
+                field_name: None,
             });
         }
         Ok((t, Some(node)))
@@ -685,7 +684,7 @@ fn fn_body(t: &[Token]) -> Res<Node> {
 }
 
 fn body_stmt(t: &[Token]) -> Res<Either<Node, Tokens>> {
-    either(&one_of(&[&var_decl, &expr_stmt]), &SEMI).parse(t)
+    either(one_of(&[&var_decl, &expr_stmt]), SEMI).parse(t)
 }
 
 fn var_decl(t: &[Token]) -> Res<Node> {
@@ -723,6 +722,7 @@ fn stmt_header(t: &[Token]) -> Res<Option<Node>> {
             let node = Node {
                 kind: NodeKind::StmtHeader,
                 children: items.into_iter().map(CstNode::Node).collect(),
+                field_name: None,
             };
             Ok((t, Some(node)))
         }
@@ -737,6 +737,7 @@ fn stmt_header_allow_semi(t: &[Token]) -> Res<Option<Node>> {
             let node = Node {
                 kind: NodeKind::StmtHeader,
                 children: items.into_iter().map(CstNode::Node).collect(),
+                field_name: None,
             };
             Ok((t, Some(node)))
         }
@@ -822,6 +823,55 @@ fn type_ident(t: &[Token]) -> Res<Node> {
     Ok((t, node))
 }
 
+fn binary_op(t: &[Token]) -> Res<Tokens> {
+    one_of(&[&or_op, &and_op, &eq_op, &rel_op, &add_op, &mul_op, &pow_op]).parse(t)
+}
+
+fn or_op(t: &[Token]) -> Res<Tokens> {
+    matches_one([TokenKind::OrOr, TokenKind::QuestionQuestion], "or op").parse(t)
+}
+
+fn and_op(t: &[Token]) -> Res<Tokens> {
+    AND_AND.parse(t)
+}
+
+fn eq_op(t: &[Token]) -> Res<Tokens> {
+    matches_one([TokenKind::EqEq, TokenKind::BangEq], "eq op").parse(t)
+}
+
+fn rel_op(t: &[Token]) -> Res<Tokens> {
+    matches_one(
+        [
+            TokenKind::Lt,
+            TokenKind::Gt,
+            TokenKind::LtEq,
+            TokenKind::GtEq,
+        ],
+        "rel op",
+    )
+    .parse(t)
+}
+
+fn add_op(t: &[Token]) -> Res<Tokens> {
+    matches_one([TokenKind::Plus, TokenKind::Minus], "add op").parse(t)
+}
+
+fn mul_op(t: &[Token]) -> Res<Tokens> {
+    matches_one(
+        [TokenKind::Star, TokenKind::Slash, TokenKind::Percent],
+        "mul op",
+    )
+    .parse(t)
+}
+
+fn pow_op(t: &[Token]) -> Res<Tokens> {
+    CARET.parse(t)
+}
+
+fn assign_op(t: &[Token]) -> Res<Tokens> {
+    matches_one([TokenKind::Eq, TokenKind::QuestionEq], "assign op").parse(t)
+}
+
 pub fn expect<'t, P, T>(parser: P) -> impl Parser<'t, Either<T, NodeError>, Infallible>
 where
     P: Parser<'t, T>,
@@ -831,8 +881,14 @@ where
         Err(_) => Ok((
             t,
             Either::Right(NodeError {
-                kind: ErrorKind::MissingToken,
-                token: t[0],
+                kind: ErrorKind::Expected {
+                    expected: std::any::type_name_of_val(&parser)
+                        .rsplit("::")
+                        .next()
+                        .unwrap(),
+                    got: t[0].kind,
+                },
+                span: t[0].span,
             }),
         )),
     }
@@ -871,8 +927,11 @@ where
                 // EOF reached
                 let err = close.parse(tokens).err().unwrap();
                 node.add(NodeError {
-                    kind: ErrorKind::UnexpectedToken,
-                    token: tokens[0],
+                    kind: ErrorKind::Expected {
+                        expected: "a closing token",
+                        got: tokens[0].kind,
+                    },
+                    span: tokens[0].span,
                 });
                 return Err(err);
             }
@@ -905,10 +964,10 @@ pub fn many_sep_bound<'t, O, I, S, C, T>(
     close: C,
 ) -> impl Parser<'t, Node>
 where
-    O: Parser<'t, Tokens>,
-    I: Parser<'t, T>,
-    S: Parser<'t, Tokens>,
-    C: Parser<'t, Tokens>,
+    O: Parser<'t, Tokens> + Copy,
+    I: Parser<'t, T> + Copy,
+    S: Parser<'t, Tokens> + Copy,
+    C: Parser<'t, Tokens> + Copy,
     T: AddToNode,
 {
     move |t| {
@@ -926,8 +985,11 @@ where
                 // EOF reached
                 let err = close.parse(tokens).err().unwrap();
                 node.add(NodeError {
-                    kind: ErrorKind::UnexpectedToken,
-                    token: tokens[0],
+                    kind: ErrorKind::Expected {
+                        expected: "a closing token",
+                        got: tokens[0].kind,
+                    },
+                    span: tokens[0].span,
                 });
                 return Err(err);
             }
@@ -945,7 +1007,17 @@ where
                     }
                     Err(_) => {
                         // we actually expected a separator, record the error
-                        node.replace_last_token_error(ErrorKind::MissingToken);
+                        if let Some(last) = node.last_token_mut() {
+                            if let CstNode::Token(tok) = last {
+                                *last = CstNode::Error(NodeError {
+                                    kind: ErrorKind::Expected {
+                                        expected: "a separator",
+                                        got: tok.kind,
+                                    },
+                                    span: tok.span,
+                                });
+                            }
+                        }
                         let (t, i) = item.parse(tokens)?;
                         node.add(i);
                         tokens = t;
@@ -958,12 +1030,15 @@ where
                         tokens = t;
                         state = ManySepBoundState::ExpectSep;
                     }
-                    Err(_) => match either(&sep, &close).parse(tokens) {
+                    Err(_) => match either(sep, close).parse(tokens) {
                         Ok((t, Either::Left(s))) => {
                             node.add(s.leading);
                             node.add(NodeError {
-                                kind: ErrorKind::UnexpectedToken,
-                                token: s.token,
+                                kind: ErrorKind::Expected {
+                                    expected: "a separator",
+                                    got: s.token.kind,
+                                },
+                                span: s.token.span,
                             });
                             tokens = t;
                             state = ManySepBoundState::ExpectItem;
@@ -971,8 +1046,11 @@ where
                         Ok((t, Either::Right(c))) => {
                             node.add(c.leading);
                             node.add(NodeError {
-                                kind: ErrorKind::UnexpectedToken,
-                                token: c.token,
+                                kind: ErrorKind::Expected {
+                                    expected: "a separator",
+                                    got: c.token.kind,
+                                },
+                                span: c.token.span,
                             });
                             return Ok((t, node));
                         }
@@ -981,6 +1059,17 @@ where
                 },
             }
         }
+    }
+}
+
+fn field<'t, P, E>(name: &'static str, parser: P) -> impl Parser<'t, Node, E>
+where
+    P: Parser<'t, Node, E>,
+{
+    move |t| {
+        let (t, mut node) = parser.parse(t)?;
+        let _ = node.field_name.replace(name);
+        Ok((t, node))
     }
 }
 
@@ -1004,6 +1093,8 @@ static DOUBLE_QUOTE: Matches = matches(TokenKind::DoubleQuote);
 static RAW_STRING: Matches = matches(TokenKind::RawString);
 static DOT: Matches = matches(TokenKind::Dot);
 static ARROW: Matches = matches(TokenKind::Arrow);
+static ENTER_INTERPOLATION: Matches = matches(TokenKind::EnterInterpolation);
+static EXIT_INTERPOLATION: Matches = matches(TokenKind::ExitInterpolation);
 
 static BANG_BANG: Matches = matches(TokenKind::BangBang);
 static BANG: Matches = matches(TokenKind::Bang);
@@ -1165,7 +1256,7 @@ mod test {
     fn assert_error_kind(node: &CstNode, token_kind: TokenKind, error_kind: ErrorKind) {
         match node {
             CstNode::Error(err) => {
-                assert_eq!(err.token.kind, token_kind);
+                assert_eq!(err.got(), token_kind);
                 assert_eq!(err.kind, error_kind);
             }
             other => panic!("Expected CstNode::Err with kind {error_kind:?}, got: {other:?}"),
@@ -1187,7 +1278,10 @@ mod test {
         assert_error_kind(
             &res.children[5],
             TokenKind::Space(1),
-            ErrorKind::MissingToken,
+            ErrorKind::Expected {
+                expected: "a separator",
+                got: TokenKind::Space(1),
+            },
         );
         assert_node_kind(&res.children[6], NodeKind::FnParam);
         assert_token_kind(&res.children[7], TokenKind::CloseParen);
@@ -1225,6 +1319,16 @@ mod test {
         let source = "{ a; }";
         let tokens = tokenize(source);
         let res = fn_body(&tokens);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn expected_expr_in_paren() {
+        let source = r#"fn main() {
+    var x = ();
+}"#;
+        let tokens = tokenize(source);
+        let res = fn_decl(&tokens);
         assert!(res.is_ok());
     }
 }
