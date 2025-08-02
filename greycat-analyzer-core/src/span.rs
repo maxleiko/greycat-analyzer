@@ -31,6 +31,21 @@ impl Span {
             end: self.end.to_position(),
         }
     }
+
+    pub fn to_span_str<'src>(&self, source: &'src str) -> SpanStr<'src> {
+        SpanStr {
+            span: *self,
+            image: &source[*self],
+        }
+    }
+}
+
+#[derive(
+    Debug, Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+pub struct SpanStr<'src> {
+    pub span: Span,
+    pub image: &'src str,
 }
 
 #[derive(

@@ -1,7 +1,11 @@
 use std::{path::PathBuf, time::Instant};
 
 use crate::utils::{AnyError, for_each_valid_entry};
-use greycat_analyzer_core::{cst::{ModuleInfo, Node, SourceModule}, parse, tokenize, Token, TokenKind};
+use greycat_analyzer_core::{
+    Token, TokenKind,
+    cst::{ModuleInfo, Node, SourceModule},
+    parse, tokenize,
+};
 
 #[derive(clap::Parser)]
 #[clap(about = "Lints a project")]
@@ -17,7 +21,19 @@ impl Lint {
         let project = greycat_analyzer_core::cst::parse_file(&self.project)?;
         let took = start.elapsed();
         let info = ModuleInfo::from(&project);
-        println!("{}: {info:#?}", self.project.display());
+        println!("Module: {}", self.project.display());
+        println!("Libraries:");
+        for lib in &info.libraries {
+            println!(
+                "  name={} version={:?}",
+                lib.name.image,
+                lib.version.map(|s| s.image)
+            );
+        }
+        println!("Includes:");
+        for include in &info.includes {
+            println!("  dir={}", include.image);
+        }
         Ok(())
     }
 }
