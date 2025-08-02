@@ -562,9 +562,9 @@ fn literal(t: &[Token]) -> Res<Node> {
 }
 
 fn num_expr(t: &[Token]) -> Res<Node> {
-    let (t, tokens) = one_of(&[&INT, &FLOAT_T, &FLOAT_U]).parse(t)?;
+    let (t, num) = NUMBER.parse(t)?;
     let mut node = Node::new(NodeKind::NumExpr);
-    node.add(tokens);
+    node.add(num);
     Ok((t, node))
 }
 
@@ -1114,9 +1114,7 @@ static SLASH: Matches = matches(TokenKind::Slash);
 static PERCENT: Matches = matches(TokenKind::Percent);
 static CARET: Matches = matches(TokenKind::Caret);
 
-static INT: Matches = matches(TokenKind::Int);
-static FLOAT_T: Matches = matches(TokenKind::Float { terminated: true });
-static FLOAT_U: Matches = matches(TokenKind::Float { terminated: false });
+static NUMBER: Matches = matches(TokenKind::Number);
 static CHAR_T: Matches = matches(TokenKind::Char { terminated: true });
 static CHAR_U: Matches = matches(TokenKind::Char { terminated: false });
 

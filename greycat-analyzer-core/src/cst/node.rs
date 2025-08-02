@@ -75,6 +75,7 @@ pub struct Node {
     #[serde(rename = "name")]
     pub kind: NodeKind,
     pub children: Vec<CstNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub field_name: Option<&'static str>,
 }
 

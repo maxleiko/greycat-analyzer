@@ -71,12 +71,7 @@ impl fmt::Display for SrcToken<'_> {
             TokenKind::While => write!(f, "Keyword(while)"),
             TokenKind::Without => write!(f, "Keyword(without)"),
             TokenKind::Ident => write!(f, "Ident({})", &self.source[self.token.span.as_range()]),
-            TokenKind::Int => write!(f, "Int({})", &self.source[self.token.span.as_range()]),
-            TokenKind::Float { terminated } => write!(
-                f,
-                "Float({}, {terminated})",
-                &self.source[self.token.span.as_range()]
-            ),
+            TokenKind::Number => write!(f, "Number({})", &self.source[self.token.span.as_range()]),
             TokenKind::Char { terminated } => write!(
                 f,
                 "Char({}, {terminated})",
@@ -129,6 +124,13 @@ impl fmt::Display for SrcToken<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ScientificNotation {
+    Positive(u8),
+    Negative(u8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value")]
 pub enum TokenKind {
     /// `// comment`
@@ -146,12 +148,8 @@ pub enum TokenKind {
     /// "ident" or "continue", ...
     /// At this step keywords are also considered identifiers.
     Ident,
-    /// `12_u8`
-    Int,
-    /// `3.14`
-    Float {
-        terminated: bool,
-    },
+    /// `12_u8`, `3.14`, `1.7976931348623157e+308_f
+    Number,
     /// `'c'`, `'😺'`
     Char {
         terminated: bool,
@@ -349,8 +347,7 @@ impl std::fmt::Display for TokenKind {
             Self::Var => write!(f, "Var"),
             Self::While => write!(f, "While"),
             Self::Without => write!(f, "Without"),
-            Self::Int => write!(f, "int"),
-            Self::Float { terminated } => write!(f, "float"),
+            Self::Number => write!(f, "number"),
             Self::Char { terminated } => write!(f, "char"),
             Self::Semi => write!(f, ";"),
             Self::Comma => write!(f, ","),

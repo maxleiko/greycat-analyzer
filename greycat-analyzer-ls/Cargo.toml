@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 greycat-analyzer-core = { path = "../greycat-analyzer-core" }
+
 dashmap = "6.1.0"
 log = "0.4.27"
 # ropey = "1.6.1"

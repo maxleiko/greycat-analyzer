@@ -42,7 +42,7 @@ function renderNode(node) {
     li.innerHTML = `<span class="token">${text}</span>`;
   } else if (node.type === 'Error') {
     console.log(node);
-    li.innerHTML = `<span class="error">${node.kind.expected}</span><span class="error-kind">(${node.kind.got.kind})</span>`;
+    li.innerHTML = `<span class="error">${node.kind.reason} ${node.kind.expected}</span><span class="error-kind">(${node.kind.got.kind})</span>`;
   } else {
     li.innerHTML = `<span class="toggle">${node.name}</span>`;
   }

@@ -37,20 +37,20 @@ impl From<OneOfParseError> for ParseError {
 
 #[derive(Debug)]
 pub struct CustomParseError {
-    text: &'static str,
-    got: Token,
+    pub text: &'static str,
+    pub got: Token,
 }
 
 #[derive(Debug)]
 pub struct ExpectedParseError {
-    kind: TokenKind,
-    got: Token,
+    pub kind: TokenKind,
+    pub got: Token,
 }
 
 #[derive(Debug)]
 pub struct OneOfParseError {
-    kinds: Vec<Either<TokenKind, &'static str>>,
-    got: Token,
+    pub kinds: Vec<Either<TokenKind, &'static str>>,
+    pub got: Token,
 }
 
 impl From<CustomParseError> for OneOfParseError {
