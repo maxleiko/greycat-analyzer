@@ -26,6 +26,7 @@ impl Cst {
         let tokens = tokenize(&source);
         let module = greycat_analyzer_core::cst::parse(&tokens);
         println!("{}", module.to_display_node(&source, self.trivia));
+
         Ok(())
     }
 }

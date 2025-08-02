@@ -101,12 +101,6 @@ impl Node {
         value.append_to(self);
     }
 
-    pub fn find_child_by_kind(&self, kind: NodeKind) -> Option<&CstNode> {
-        self.children
-            .iter()
-            .find(|node| matches!(node, CstNode::Node(node) if node.kind == kind))
-    }
-
     pub fn to_display_node<'a>(
         &'a self,
         source: &'a str,

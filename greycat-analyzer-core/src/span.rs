@@ -33,7 +33,9 @@ impl Span {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Serialize, Deserialize, Default, Debug)]
+#[derive(
+    Eq, Hash, PartialEq, Clone, Copy, PartialOrd, Ord, Serialize, Deserialize, Default, Debug,
+)]
 pub struct Pos {
     pub line: u32,
     pub column: u32,
@@ -64,6 +66,22 @@ impl Pos {
             line: self.line + 1,
             character: self.column + 1,
         }
+    }
+}
+
+impl std::ops::Index<Span> for str {
+    type Output = str;
+
+    fn index(&self, index: Span) -> &Self::Output {
+        &self[index.as_range()]
+    }
+}
+
+impl std::ops::Index<Span> for String {
+    type Output = str;
+
+    fn index(&self, index: Span) -> &Self::Output {
+        &self[index.as_range()]
     }
 }
 
