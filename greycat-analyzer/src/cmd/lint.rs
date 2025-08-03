@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::utils::AnyError;
-use greycat_analyzer_core::cst::{ModuleInfo, SourceModule};
+use greycat_analyzer_core::{cst::{ModuleInfo, SourceModule}, tokenize};
 
 #[derive(clap::Parser)]
 #[clap(about = "Lints a project")]

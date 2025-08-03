@@ -59,7 +59,7 @@ impl<'a> DisplayNode<'a> {
             }
             CstNode::Token(token) => match token.kind {
                 kind @ TokenKind::Ident | kind @ TokenKind::RawString => {
-                    let lexeme = &self.source[token.span.as_range()];
+                    let lexeme = &self.source[token.span];
                     writeln!(f, "{pad}({kind:?} \"{lexeme}\")")
                 }
                 kind if self.with_trivia || !kind.is_trivia() => {

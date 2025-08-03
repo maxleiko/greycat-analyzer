@@ -5,7 +5,6 @@ use crate::{
     cst::{AddToNode, CstNode, ErrorKind, Node, NodeError, NodeKind, Tokens, combi::*},
 };
 
-// Macro to create a new node and add children in one go
 macro_rules! new_node {
     ($kind:expr, [$($child:expr),* $(,)?]) => {
         {
@@ -76,9 +75,9 @@ fn module_stmt(t: &[Token]) -> Res<Node> {
 
 fn fn_decl(t: &[Token]) -> Res<Node> {
     let (t, header) = stmt_header(t).unwrap();
-    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_FN.parse(t)?;
-    let (t, name) = IDENT_OR_KW.parse(t)?;
+    let (t, name) = ident_or_kw(t)?;
     let (t, generics) = opt(generic_params).parse(t).unwrap();
     let (t, params) = fn_params(t)?;
     let (t, return_type) = opt(type_decorator).parse(t).unwrap();
@@ -104,7 +103,7 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
 
 fn mod_var_decl(t: &[Token]) -> Res<Node> {
     let (t, header) = stmt_header(t).unwrap();
-    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_VAR.parse(t)?;
     let (t, name) = IDENT_OR_KW.parse(t)?;
     let (t, ty) = opt(type_decorator).parse(t).unwrap();
@@ -122,7 +121,7 @@ fn mod_var_decl(t: &[Token]) -> Res<Node> {
 
 fn enum_decl(t: &[Token]) -> Res<Node> {
     let (t, header) = stmt_header(t).unwrap();
-    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_ENUM.parse(t)?;
     let (t, name) = IDENT_OR_KW.parse(t)?;
     let (t, body) = enum_body(t)?;
@@ -158,7 +157,7 @@ fn enum_field(t: &[Token]) -> Res<Node> {
 
 fn type_decl(t: &[Token]) -> Res<Node> {
     let (t, header) = stmt_header(t).unwrap();
-    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_TYPE.parse(t)?;
     let (t, name) = IDENT_OR_KW.parse(t)?;
     let (t, params) = opt(generic_params).parse(t).unwrap();
@@ -194,7 +193,7 @@ fn type_body(t: &[Token]) -> Res<Node> {
 
 fn type_attr(t: &[Token]) -> Res<Node> {
     let (t, header) = stmt_header_allow_semi(t)?;
-    let (t, modifiers) = modifiers(t)?;
+    let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, name) = ident_or_kw_or_strlit(t)?;
     let (t, colon) = COLON.parse(t)?;
     let (t, ty) = type_ident(t)?;
@@ -221,6 +220,16 @@ fn mod_pragma(t: &[Token]) -> Res<Node> {
         t,
         new_node!(NodeKind::ModPragma, [doc, at, name, args, semi]),
     ))
+}
+
+fn ident(t: &[Token]) -> Res<Node> {
+    let (t, id) = matches(TokenKind::Ident).parse(t)?;
+    Ok((t, new_node!(NodeKind::Ident, [id])))
+}
+
+fn ident_or_kw(t: &[Token]) -> Res<Node> {
+    let (t, id) = IDENT_OR_KW.parse(t)?;
+    Ok((t, new_node!(NodeKind::Ident, [id])))
 }
 
 fn ident_or_kw_or_strlit(t: &[Token]) -> Res<Node> {
@@ -252,7 +261,7 @@ fn str_expr(t: &[Token]) -> Res<Node> {
 
 fn type_method(t: &[Token]) -> Res<Node> {
     let (t, header) = stmt_header_allow_semi(t).unwrap();
-    let (t, modifiers) = modifiers(t).unwrap();
+    let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_FN.parse(t)?;
     let (t, name) = IDENT_OR_KW.parse(t)?;
     let (t, generics) = opt(generic_params).parse(t).unwrap();
@@ -637,39 +646,31 @@ fn object_field_expr(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::ObjectFieldExpr, [expr])))
 }
 
-// TODO: review this bit
-fn name(t: &[Token]) -> Res<Node> {
-    let (t, id) = matches(TokenKind::Ident).parse(t)?;
-
-    Ok((t, new_node!(NodeKind::Name, [id])))
-}
-
 fn generic_params(t: &[Token]) -> Res<Node> {
-    many_sep_bound(NodeKind::GenericParams, LT, name, COMMA, GT).parse(t)
+    many_sep_bound(NodeKind::GenericParams, LT, ident, COMMA, GT).parse(t)
 }
 
 fn type_params(t: &[Token]) -> Res<Node> {
     many_sep_bound(NodeKind::TypeParams, LT, type_ident, COMMA, GT).parse(t)
 }
 
-fn modifiers(t: &[Token]) -> Res<Option<Node>> {
-    let (t, mods) = many(modifier).parse(t).unwrap();
-    if let Some(mods) = mods {
-        let capacity = mods.iter().map(|modifier| modifier.leading.len() + 1).sum();
-        let mut node = Node::with_capacity(NodeKind::FnModifiers, capacity);
-        for modifier in mods {
-            let Tokens { leading, token } = modifier;
-            node.add(leading);
-            node.add(Node {
-                kind: NodeKind::FnModifier,
-                children: vec![CstNode::Token(token)],
-                field_name: None,
-            });
-        }
-        Ok((t, Some(node)))
-    } else {
-        Ok((t, None))
+fn modifiers(t: &[Token]) -> Res<Node> {
+    let (t, mods) = many_1(modifier).parse(t)?;
+    let mut node = Node {
+        kind: NodeKind::FnModifiers,
+        children: Vec::with_capacity(mods.iter().map(|modifier| modifier.leading.len() + 1).sum()),
+        field_name: Some("modifiers"),
+    };
+    for modifier in mods {
+        let Tokens { leading, token } = modifier;
+        node.add(leading);
+        node.add(Node {
+            kind: NodeKind::FnModifier,
+            children: vec![token.into()],
+            field_name: Some("modifier"),
+        });
     }
+    Ok((t, node))
 }
 
 fn modifier(t: &[Token]) -> Res<Tokens> {
@@ -822,8 +823,8 @@ fn for_in_condition(t: &[Token]) -> Res<Node> {
     let (t, key) = for_in_param(t)?;
     let (t, comma) = COMMA.parse(t)?;
     let (t, value) = for_in_param(t)?;
-    let (t, kw_in) = KW_IN.parse(t)?;
-    let (t, iter) = expr(t)?;
+    let (t, kw_in) = expect(KW_IN).parse(t).unwrap();
+    let (t, iter) = expect(expr).parse(t).unwrap();
     let (t, range) = opt(range).parse(t).unwrap();
     let (t, filters) = many(for_in_filter).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
@@ -1297,13 +1298,14 @@ where
     }
 }
 
+#[allow(unused)]
 fn field<'t, P, E>(name: &'static str, parser: P) -> impl Parser<'t, Node, E>
 where
     P: Parser<'t, Node, E>,
 {
     move |t| {
         let (t, mut node) = parser.parse(t)?;
-        let _ = node.field_name.replace(name);
+        node.field(name);
         Ok((t, node))
     }
 }

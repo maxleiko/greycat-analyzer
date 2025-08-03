@@ -2,7 +2,6 @@ mod ast;
 pub mod cst;
 mod lexer;
 pub mod span;
-// mod fmt;
 // #[cfg(feature = "wasm")]
 // mod wasm;
 

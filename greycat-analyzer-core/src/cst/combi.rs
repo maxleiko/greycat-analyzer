@@ -295,6 +295,31 @@ where
     }
 }
 
+pub fn many_1<'t, P, T>(parser: P) -> impl Parser<'t, Vec<T>>
+where
+    P: Parser<'t, T>,
+{
+    move |t| {
+        let mut items = Vec::new();
+        let mut tokens = t;
+        loop {
+            match parser.parse(tokens) {
+                Ok((t, item)) => {
+                    items.push(item);
+                    tokens = t;
+                }
+                Err(err) => {
+                    if items.is_empty() {
+                        return Err(err);
+                    } else {
+                        return Ok((tokens, items));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Many1<P> {
     parser: P,

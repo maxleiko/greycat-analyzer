@@ -100,6 +100,22 @@ impl std::ops::Index<Span> for String {
     }
 }
 
+impl std::ops::Index<&Span> for str {
+    type Output = str;
+
+    fn index(&self, index: &Span) -> &Self::Output {
+        &self[index.as_range()]
+    }
+}
+
+impl std::ops::Index<&Span> for String {
+    type Output = str;
+
+    fn index(&self, index: &Span) -> &Self::Output {
+        &self[index.as_range()]
+    }
+}
+
 impl From<Span> for lsp::Range {
     #[inline(always)]
     fn from(s: Span) -> Self {

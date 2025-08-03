@@ -5,6 +5,7 @@ mod info;
 mod node;
 mod node_query;
 mod parser;
+mod visitor;
 
 use std::path::Path;
 
@@ -12,11 +13,12 @@ pub use cursor::*;
 pub use info::*;
 pub use node::*;
 pub use parser::*;
+pub use visitor::*;
 
 #[derive(Debug)]
 pub struct SourceModule {
-    source: String,
-    module: Node,
+    pub source: String,
+    pub module: Node,
 }
 
 pub fn parse_file(filepath: impl AsRef<Path>) -> Result<SourceModule, std::io::Error> {
