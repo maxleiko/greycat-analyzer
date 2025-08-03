@@ -2,8 +2,6 @@ mod ast;
 pub mod cst;
 mod lexer;
 pub mod span;
-// #[cfg(feature = "wasm")]
-// mod wasm;
 
 pub use lexer::*;
 use lsp_types::Diagnostic;
