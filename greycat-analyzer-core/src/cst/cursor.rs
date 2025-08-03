@@ -1,8 +1,4 @@
-use std::collections::VecDeque;
-
-use crate::{Token, TokenKind};
-
-use super::{CstNode, Node, NodeKind};
+use super::{CstNode, Node};
 
 pub struct NodeCursor<'a> {
     nodes: &'a [CstNode],

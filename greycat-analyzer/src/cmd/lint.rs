@@ -1,15 +1,11 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use crate::utils::{AnyError, for_each_valid_entry};
-use greycat_analyzer_core::{
-    Token, TokenKind,
-    cst::{ModuleInfo, Node, SourceModule},
-    parse, tokenize,
-};
+use crate::utils::AnyError;
+use greycat_analyzer_core::cst::{ModuleInfo, SourceModule};
 
 #[derive(clap::Parser)]
 #[clap(about = "Lints a project")]
@@ -27,8 +23,13 @@ impl Lint {
             .parent()
             .expect("unable to resolve project's parent directory");
 
+        let start = Instant::now();
         let mut mgr = SourceManager::new();
         parse_module(project_dir, &self.project, &mut mgr)?;
+        let took = start.elapsed();
+
+        mgr.display_timings();
+        println!("Total: {took:?}");
 
         Ok(())
     }
@@ -36,12 +37,27 @@ impl Lint {
 
 struct SourceManager {
     sources: HashMap<PathBuf, SourceModule>,
+    timings: HashMap<PathBuf, Duration>,
 }
 
 impl SourceManager {
     pub fn new() -> Self {
         Self {
             sources: Default::default(),
+            timings: Default::default(),
+        }
+    }
+
+    pub fn display_timings(&self) {
+        // Collect all paths and their timings
+        let mut timing_pairs: Vec<(&PathBuf, &Duration)> = self.timings.iter().collect();
+
+        // Sort by duration (ascending - smallest first, largest last)
+        timing_pairs.sort_by_key(|(_, duration)| *duration);
+
+        // Display each file with its timing
+        for (path, duration) in timing_pairs {
+            println!("{:>8.2?} {}", duration, path.display());
         }
     }
 }
@@ -55,25 +71,27 @@ fn parse_module(
     let module = greycat_analyzer_core::cst::parse_file(filepath)?;
     let took = start.elapsed();
     let info = ModuleInfo::from(&module);
-    println!("{took:>8.2?} {}", filepath.display());
+    // println!("{took:>8.2?} {}", filepath.display());
     for lib in &info.libraries {
-        println!(
-            "@library(\"{}\", {:?})",
-            lib.name.image,
-            lib.version.map(|s| s.image)
-        );
-        resolve_library(lib.name.image, project_dir, mgr);
+        // println!(
+        //     "@library(\"{}\", {:?})",
+        //     lib.name.image,
+        //     lib.version.map(|s| s.image)
+        // );
+        resolve_library(lib.name.image, project_dir, mgr)?;
     }
     let mut files = Vec::new();
     for include in &info.includes {
         let include_dir = project_dir.join(include.image).canonicalize().unwrap();
-        println!("@include(\"{}\")", include_dir.display());
+        // println!("@include(\"{}\")", include_dir.display());
         files.clear();
         find_gcl_files(&include_dir, &mut files);
         for file in &files {
             parse_module(project_dir, file, mgr)?;
         }
     }
+    mgr.sources.insert(filepath.to_owned(), module);
+    mgr.timings.insert(filepath.to_owned(), took);
     Ok(())
 }
 

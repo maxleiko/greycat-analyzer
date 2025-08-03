@@ -1,6 +1,6 @@
 use crate::{
     TokenKind,
-    cst::{CstNode, Node, NodeKind, SourceModule},
+    cst::{Node, NodeKind, SourceModule},
     span::SpanStr,
 };
 

@@ -348,7 +348,7 @@ impl std::fmt::Display for TokenKind {
             Self::While => write!(f, "While"),
             Self::Without => write!(f, "Without"),
             Self::Number => write!(f, "number"),
-            Self::Char { terminated } => write!(f, "char"),
+            Self::Char { .. } => write!(f, "char"),
             Self::Semi => write!(f, ";"),
             Self::Comma => write!(f, ","),
             Self::Dot => write!(f, "."),

@@ -1,9 +1,8 @@
-use std::{cell::RefCell, collections::VecDeque, convert::Infallible};
+use std::convert::Infallible;
 
 use crate::{
     Token, TokenKind,
     cst::{AddToNode, CstNode, ErrorKind, Node, NodeError, NodeKind, Tokens, combi::*},
-    tokenize,
 };
 
 pub fn parse(mut t: &[Token]) -> Node {
@@ -56,9 +55,9 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     let (t, generics) = opt(generic_params).parse(t).unwrap();
     let (t, params) = fn_params(t)?;
     let (t, return_type) = opt(type_decorator).parse(t).unwrap();
-    let (t, body_or_semi) = either(fn_body, SEMI).parse(t)?;
+    let (t, body_or_semi) = either(body, SEMI).parse(t)?;
 
-    let mut node = Node::new(NodeKind::Fn);
+    let mut node = Node::new(NodeKind::FnDecl);
     node.add(header);
     node.add(modifiers);
     node.add(kw);
@@ -257,7 +256,7 @@ fn type_method(t: &[Token]) -> Res<Node> {
     let (t, generics) = opt(generic_params).parse(t).unwrap();
     let (t, params) = fn_params(t)?;
     let (t, return_type) = opt(type_decorator).parse(t).unwrap();
-    let (t, body) = opt(fn_body).parse(t).unwrap();
+    let (t, body) = opt(body).parse(t).unwrap();
 
     let mut node = Node::new(NodeKind::TypeMethod);
     node.add(header);
@@ -313,16 +312,12 @@ fn expr(t: &[Token]) -> Res<Node> {
                     .get_node_by_field("op")
                     .expect(
                         "BinaryExpr is always composed of 3 named fields: 'lhs', 'op' and 'rhs'",
-                    );
-                        assert_eq!(acc_op.field_name, Some("op"));
-                        println!("acc_op={acc_op:#?}");
-                        let acc_op_token = acc_op
-                    .first_non_trivia_token()
+                    ).first_non_trivia_token()
                     .expect(
                         "BinaryOperator is always composed of a non-trivia binary operator token",
                     );
                         let mut node = Node::new(NodeKind::BinaryExpr);
-                        if new_prec <= acc_op_token.kind.precedence() {
+                        if new_prec <= acc_op.kind.precedence() {
                             acc.field("lhs");
                             node.add(acc);
                             node.add(op);
@@ -330,10 +325,8 @@ fn expr(t: &[Token]) -> Res<Node> {
                             node.add(rhs);
                         } else {
                             let mut acc_nodes = acc.into_nodes().into_iter();
-                            let mut acc_lhs =
-                                acc_nodes.next().expect("BinaryExpr always have a 'lhs'");
-                            let mut acc_op =
-                                acc_nodes.next().expect("BinaryExpr always have a 'op'");
+                            let acc_lhs = acc_nodes.next().expect("BinaryExpr always have a 'lhs'");
+                            let acc_op = acc_nodes.next().expect("BinaryExpr always have a 'op'");
                             let mut acc_rhs =
                                 acc_nodes.next().expect("BinaryExpr always have a 'rhs'");
                             // we create a new rhs composed of: (acc.rhs, op, rhs)
@@ -383,13 +376,13 @@ fn expr(t: &[Token]) -> Res<Node> {
     Ok((t, acc))
 }
 
-fn dump_node(node: &Node) {
-    let mut children = Vec::new();
-    for child in &node.children {
-        children.push(child.to_string());
-    }
-    println!("{:?}={children:?}", node.kind);
-}
+// fn dump_node(node: &Node) {
+//     let mut children = Vec::new();
+//     for child in &node.children {
+//         children.push(child.to_string());
+//     }
+//     println!("{:?}={children:?}", node.kind);
+// }
 
 fn postfix_expr(t: &[Token]) -> Res<Node> {
     let (t, expr) = prefix_expr(t)?;
@@ -552,7 +545,7 @@ fn primary_expr(t: &[Token]) -> Res<Node> {
 fn lambda_expr(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_FN.parse(t)?;
     let (t, params) = fn_params(t)?;
-    let (t, body) = fn_body(t)?;
+    let (t, body) = body(t)?;
 
     let mut node = Node::new(NodeKind::LambdaExpr);
     node.add(kw);
@@ -568,7 +561,7 @@ fn tuple_expr(t: &[Token]) -> Res<Node> {
     let (t, b) = expr(t)?;
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
-    let mut node = Node::new(NodeKind::LambdaExpr);
+    let mut node = Node::new(NodeKind::TupleExpr);
     node.add(open);
     node.add(a);
     node.add(sep);
@@ -748,12 +741,32 @@ fn modifier(t: &[Token]) -> Res<Tokens> {
     one_of(&[&KW_NATIVE, &KW_PRIVATE, &KW_STATIC, &KW_ABSTRACT]).parse(t)
 }
 
-fn fn_body(t: &[Token]) -> Res<Node> {
-    many_bound(NodeKind::FnBody, OPEN_CURLY, body_stmt, CLOSE_CURLY).parse(t)
+fn body(t: &[Token]) -> Res<Node> {
+    many_bound(NodeKind::Body, OPEN_CURLY, body_stmt, CLOSE_CURLY).parse(t)
 }
 
 fn body_stmt(t: &[Token]) -> Res<Either<Node, Tokens>> {
-    either(one_of(&[&var_decl, &expr_stmt]), SEMI).parse(t)
+    either(
+        one_of(&[
+            &var_decl,
+            &try_stmt,
+            &if_stmt,
+            &while_stmt,
+            &do_while_stmt,
+            &for_in_stmt,
+            &for_stmt,
+            &at_stmt,
+            &throw_stmt,
+            &assign_stmt,
+            &breakpoint_stmt,
+            &break_stmt,
+            &continue_stmt,
+            &return_stmt,
+            &expr_stmt,
+        ]),
+        SEMI,
+    )
+    .parse(t)
 }
 
 fn var_decl(t: &[Token]) -> Res<Node> {
@@ -770,6 +783,318 @@ fn var_decl(t: &[Token]) -> Res<Node> {
     node.add(name);
     node.add(ty);
     node.add(init);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn try_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_TRY.parse(t)?;
+    let (t, body) = body(t)?;
+    let (t, catch) = opt(catch_branch).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::TryStmt);
+    node.add(kw);
+    node.add(body);
+    node.add(catch);
+    Ok((t, node))
+}
+
+fn catch_branch(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_CATCH.parse(t)?;
+    let (t, param) = opt(catch_param).parse(t).unwrap();
+    let (t, body) = body(t)?;
+
+    let mut node = Node::new(NodeKind::CatchBranch);
+    node.add(kw);
+    node.add(param);
+    node.add(body);
+    Ok((t, node))
+}
+
+fn catch_param(t: &[Token]) -> Res<Node> {
+    let (t, open) = OPEN_PAREN.parse(t)?;
+    let (t, name) = expect(IDENT).parse(t).unwrap();
+    let (t, close) = CLOSE_PAREN.parse(t)?;
+
+    let mut node = Node::new(NodeKind::CatchParam);
+    node.add(open);
+    node.add(name);
+    node.add(close);
+    Ok((t, node))
+}
+
+fn if_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_IF.parse(t)?;
+    let (t, condition) = condition(t)?;
+    let (t, then_branch) = body(t)?;
+    let (t, else_if_branches) = many(else_if_branch).parse(t).unwrap();
+    let (t, else_branch) = opt(else_branch).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::IfStmt);
+    node.add(kw);
+    node.add(condition);
+    node.add(then_branch);
+    node.add(else_if_branches);
+    node.add(else_branch);
+    Ok((t, node))
+}
+
+fn condition(t: &[Token]) -> Res<Node> {
+    let (t, open) = OPEN_PAREN.parse(t)?;
+    let (t, name) = expect(expr).parse(t).unwrap();
+    let (t, close) = CLOSE_PAREN.parse(t)?;
+
+    let mut node = Node::new(NodeKind::Condition);
+    node.add(open);
+    node.add(name);
+    node.add(close);
+    Ok((t, node))
+}
+
+fn else_if_branch(t: &[Token]) -> Res<Node> {
+    let (t, kw_else) = KW_ELSE.parse(t)?;
+    let (t, kw_if) = KW_IF.parse(t)?;
+    let (t, condition) = condition(t)?;
+    let (t, branch) = body(t)?;
+
+    let mut node = Node::new(NodeKind::ElseIfBranch);
+    node.add(kw_else);
+    node.add(kw_if);
+    node.add(condition);
+    node.add(branch);
+    Ok((t, node))
+}
+
+fn else_branch(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_ELSE.parse(t)?;
+    let (t, branch) = body(t)?;
+
+    let mut node = Node::new(NodeKind::ElseBranch);
+    node.add(kw);
+    node.add(branch);
+    Ok((t, node))
+}
+
+fn while_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_WHILE.parse(t)?;
+    let (t, condition) = expect(condition).parse(t).unwrap();
+    let (t, body) = expect(body).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::WhileStmt);
+    node.add(kw);
+    node.add(condition);
+    node.add(body);
+    Ok((t, node))
+}
+
+fn do_while_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw_do) = KW_DO.parse(t)?;
+    let (t, body) = expect(body).parse(t).unwrap();
+    let (t, kw_while) = expect(KW_WHILE).parse(t).unwrap();
+    let (t, condition) = expect(condition).parse(t).unwrap();
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::DoWhileStmt);
+    node.add(kw_do);
+    node.add(body);
+    node.add(kw_while);
+    node.add(condition);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn for_in_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_FOR.parse(t)?;
+    let (t, condition) = for_in_condition(t)?;
+    let (t, body) = expect(body).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ForInStmt);
+    node.add(kw);
+    node.add(condition);
+    node.add(body);
+    Ok((t, node))
+}
+
+fn for_in_condition(t: &[Token]) -> Res<Node> {
+    let (t, open) = OPEN_PAREN.parse(t)?;
+    let (t, key) = for_in_param(t)?;
+    let (t, comma) = COMMA.parse(t)?;
+    let (t, value) = for_in_param(t)?;
+    let (t, kw_in) = KW_IN.parse(t)?;
+    let (t, iter) = expr(t)?;
+    let (t, range) = opt(range).parse(t).unwrap();
+    let (t, filters) = many(for_in_filter).parse(t).unwrap();
+    let (t, close) = CLOSE_PAREN.parse(t)?;
+
+    let mut node = Node::new(NodeKind::ForInCondition);
+    node.add(open);
+    node.add(key);
+    node.add(comma);
+    node.add(value);
+    node.add(kw_in);
+    node.add(iter);
+    node.add(range);
+    node.add(filters);
+    node.add(close);
+    Ok((t, node))
+}
+
+fn for_in_param(t: &[Token]) -> Res<Node> {
+    let (t, name) = IDENT.parse(t)?;
+    let (t, ty) = opt(type_decorator).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ForInParam);
+    node.add(name);
+    node.add(ty);
+    Ok((t, node))
+}
+
+fn range(t: &[Token]) -> Res<Node> {
+    let (t, open) = RANGE_BOUND.parse(t)?;
+    let (t, lower) = opt(expr).parse(t).unwrap();
+    let (t, dot_dot) = DOT_DOT.parse(t)?;
+    let (t, upper) = opt(expr).parse(t).unwrap();
+    let (t, close) = RANGE_BOUND.parse(t)?;
+
+    let mut node = Node::new(NodeKind::Range);
+    node.add(open);
+    node.add(lower);
+    node.add(dot_dot);
+    node.add(upper);
+    node.add(close);
+    Ok((t, node))
+}
+
+fn for_in_filter(t: &[Token]) -> Res<Node> {
+    let (t, kw) = FOR_IN_FILTER.parse(t)?;
+    let (t, expr) = expect(expr).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ForInFilter);
+    node.add(kw);
+    node.add(expr);
+    Ok((t, node))
+}
+
+fn for_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_FOR.parse(t)?;
+    let (t, condition) = for_condition(t)?;
+    let (t, body) = expect(body).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ForStmt);
+    node.add(kw);
+    node.add(condition);
+    node.add(body);
+    Ok((t, node))
+}
+
+fn for_condition(t: &[Token]) -> Res<Node> {
+    let (t, open) = OPEN_PAREN.parse(t)?;
+    let (t, init) = expect(var_decl).parse(t).unwrap();
+    let (t, condition) = expect(expr_stmt).parse(t).unwrap();
+    let (t, update) = expect(for_expr).parse(t).unwrap();
+    let (t, close) = CLOSE_PAREN.parse(t)?;
+
+    let mut node = Node::new(NodeKind::ForCondition);
+    node.add(open);
+    node.add(init);
+    node.add(condition);
+    node.add(update);
+    node.add(close);
+    Ok((t, node))
+}
+
+fn for_expr(t: &[Token]) -> Res<Node> {
+    let (t, expr) = alt(assign_expr, expr).parse(t)?;
+
+    let mut node = Node::new(NodeKind::ForExpr);
+    node.add(expr);
+    Ok((t, node))
+}
+
+fn at_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_AT.parse(t)?;
+    let (t, expr) = paren_expr(t)?;
+    let (t, body) = expect(body).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::AtStmt);
+    node.add(kw);
+    node.add(expr);
+    node.add(body);
+    Ok((t, node))
+}
+
+fn throw_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_THROW.parse(t)?;
+    let (t, expr) = expect(expr).parse(t).unwrap();
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ThrowStmt);
+    node.add(kw);
+    node.add(expr);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn assign_stmt(t: &[Token]) -> Res<Node> {
+    let (t, expr) = assign_expr(t)?;
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::AssignStmt);
+    node.add(expr);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn assign_expr(t: &[Token]) -> Res<Node> {
+    let (t, lhs) = expr(t)?;
+    let (t, op) = ASSIGN_OP.parse(t)?;
+    let (t, rhs) = expr(t)?;
+
+    let mut node = Node::new(NodeKind::AssignExpr);
+    node.add(lhs);
+    node.add(op);
+    node.add(rhs);
+    Ok((t, node))
+}
+
+fn breakpoint_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_BREAKPOINT.parse(t)?;
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::BreakpointStmt);
+    node.add(kw);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn break_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_BREAK.parse(t)?;
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::BreakStmt);
+    node.add(kw);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn continue_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_CONTINUE.parse(t)?;
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ContinueStmt);
+    node.add(kw);
+    node.add(semi);
+    Ok((t, node))
+}
+
+fn return_stmt(t: &[Token]) -> Res<Node> {
+    let (t, kw) = KW_RETURN.parse(t)?;
+    let (t, expr) = opt(expr).parse(t).unwrap();
+    let (t, semi) = expect(SEMI).parse(t).unwrap();
+
+    let mut node = Node::new(NodeKind::ReturnStmt);
+    node.add(kw);
+    node.add(expr);
     node.add(semi);
     Ok((t, node))
 }
@@ -892,53 +1217,56 @@ fn type_ident(t: &[Token]) -> Res<Node> {
     Ok((t, node))
 }
 
+// fn binary_op(t: &[Token]) -> Res<Tokens> {
+//     one_of(&[&OR_OP, &AND_OP, &EQ_OP, &REL_OP, &ADD_OP, &MUL_OP, &POW_OP]).parse(t)
+// }
+
+/// Try operators in precedence order (highest to lowest)
+///
+/// This way we fail fast on the most common cases
 fn binary_op(t: &[Token]) -> Res<Tokens> {
-    one_of(&[&or_op, &and_op, &eq_op, &rel_op, &add_op, &mul_op, &pow_op]).parse(t)
-}
+    // Precedence 13: Exponentiation
+    if let Ok(result) = POW_OP.parse(t) {
+        return Ok(result);
+    }
 
-fn or_op(t: &[Token]) -> Res<Tokens> {
-    matches_one([TokenKind::OrOr, TokenKind::QuestionQuestion], "or op").parse(t)
-}
+    // Precedence 12: Multiplication, Division, Modulo
+    if let Ok(result) = MUL_OP.parse(t) {
+        return Ok(result);
+    }
 
-fn and_op(t: &[Token]) -> Res<Tokens> {
-    AND_AND.parse(t)
-}
+    // Precedence 11: Addition, Subtraction
+    if let Ok(result) = ADD_OP.parse(t) {
+        return Ok(result);
+    }
 
-fn eq_op(t: &[Token]) -> Res<Tokens> {
-    matches_one([TokenKind::EqEq, TokenKind::BangEq], "eq op").parse(t)
-}
+    // Precedence 9: Relational operators
+    if let Ok(result) = REL_OP.parse(t) {
+        return Ok(result);
+    }
 
-fn rel_op(t: &[Token]) -> Res<Tokens> {
-    matches_one(
-        [
-            TokenKind::Lt,
-            TokenKind::Gt,
-            TokenKind::LtEq,
-            TokenKind::GtEq,
-        ],
-        "rel op",
-    )
-    .parse(t)
-}
+    // Precedence 8: Equality operators
+    if let Ok(result) = EQ_OP.parse(t) {
+        return Ok(result);
+    }
 
-fn add_op(t: &[Token]) -> Res<Tokens> {
-    matches_one([TokenKind::Plus, TokenKind::Minus], "add op").parse(t)
-}
+    // Precedence 4: Logical AND
+    if let Ok(result) = AND_OP.parse(t) {
+        return Ok(result);
+    }
 
-fn mul_op(t: &[Token]) -> Res<Tokens> {
-    matches_one(
-        [TokenKind::Star, TokenKind::Slash, TokenKind::Percent],
-        "mul op",
-    )
-    .parse(t)
-}
+    // Precedence 3: Logical OR
+    if let Ok(result) = OR_OP.parse(t) {
+        return Ok(result);
+    }
 
-fn pow_op(t: &[Token]) -> Res<Tokens> {
-    CARET.parse(t)
-}
-
-fn assign_op(t: &[Token]) -> Res<Tokens> {
-    matches_one([TokenKind::Eq, TokenKind::QuestionEq], "assign op").parse(t)
+    // If none match, construct a comprehensive error
+    let (_, tok) = peek(t);
+    Err(CustomParseError {
+        text: "binary operator",
+        got: tok.token,
+    }
+    .into())
 }
 
 pub fn expect<'t, P, T>(parser: P) -> impl Parser<'t, Either<T, NodeError>, Infallible>
@@ -964,7 +1292,7 @@ where
 }
 
 pub fn acc_trivia<'t>(acc: &mut Vec<CstNode>, t: &'t [Token]) -> &'t [Token] {
-    let (next, tok) = peek(t);
+    let (_next, tok) = peek(t);
     let skip = tok.leading.len();
     acc.extend(tok.leading.into_iter().map(CstNode::Token));
     &t[skip..]
@@ -1161,27 +1489,47 @@ static EQ: Matches = matches(TokenKind::Eq);
 static DOUBLE_QUOTE: Matches = matches(TokenKind::DoubleQuote);
 static RAW_STRING: Matches = matches(TokenKind::RawString);
 static DOT: Matches = matches(TokenKind::Dot);
+static DOT_DOT: Matches = matches(TokenKind::DotDot);
 static ARROW: Matches = matches(TokenKind::Arrow);
 static ENTER_INTERPOLATION: Matches = matches(TokenKind::EnterInterpolation);
 static EXIT_INTERPOLATION: Matches = matches(TokenKind::ExitInterpolation);
+
+static RANGE_BOUND: MatchesOne<2> = matches_one(
+    [TokenKind::OpenSquare, TokenKind::CloseSquare],
+    "'[' or ']'",
+);
+static FOR_IN_FILTER: MatchesOne<3> = matches_one(
+    [TokenKind::Sampling, TokenKind::Limit, TokenKind::Skip],
+    "'sampling', 'skip' or 'limit'",
+);
 
 static BANG_BANG: Matches = matches(TokenKind::BangBang);
 static BANG: Matches = matches(TokenKind::Bang);
 static PLUS_PLUS: Matches = matches(TokenKind::PlusPlus);
 static MINUS_MINUS: Matches = matches(TokenKind::MinusMinus);
-static OR_OR: Matches = matches(TokenKind::OrOr);
-static QMARK_QMARK: Matches = matches(TokenKind::QuestionQuestion);
-static AND_AND: Matches = matches(TokenKind::AndAnd);
-static EQ_EQ: Matches = matches(TokenKind::EqEq);
-static BANG_EQ: Matches = matches(TokenKind::BangEq);
-static LT_EQ: Matches = matches(TokenKind::LtEq);
-static GT_EQ: Matches = matches(TokenKind::GtEq);
 static PLUS: Matches = matches(TokenKind::Plus);
 static MINUS: Matches = matches(TokenKind::Minus);
 static STAR: Matches = matches(TokenKind::Star);
-static SLASH: Matches = matches(TokenKind::Slash);
-static PERCENT: Matches = matches(TokenKind::Percent);
-static CARET: Matches = matches(TokenKind::Caret);
+
+static OR_OP: MatchesOne<2> = matches_one([TokenKind::OrOr, TokenKind::QuestionQuestion], "or op");
+static AND_OP: Matches = matches(TokenKind::AndAnd);
+static EQ_OP: MatchesOne<2> = matches_one([TokenKind::EqEq, TokenKind::BangEq], "eq op");
+static REL_OP: MatchesOne<4> = matches_one(
+    [
+        TokenKind::Lt,
+        TokenKind::Gt,
+        TokenKind::LtEq,
+        TokenKind::GtEq,
+    ],
+    "rel op",
+);
+static ADD_OP: MatchesOne<2> = matches_one([TokenKind::Plus, TokenKind::Minus], "add op");
+static MUL_OP: MatchesOne<3> = matches_one(
+    [TokenKind::Star, TokenKind::Slash, TokenKind::Percent],
+    "mul op",
+);
+static POW_OP: Matches = matches(TokenKind::Caret);
+static ASSIGN_OP: MatchesOne<2> = matches_one([TokenKind::Eq, TokenKind::QuestionEq], "assign op");
 
 static NUMBER: Matches = matches(TokenKind::Number);
 static CHAR_T: Matches = matches(TokenKind::Char { terminated: true });
@@ -1205,50 +1553,21 @@ static KW_TRUE: Matches = matches(TokenKind::True);
 static KW_FALSE: Matches = matches(TokenKind::False);
 static KW_AS: Matches = matches(TokenKind::As);
 static KW_IS: Matches = matches(TokenKind::Is);
+static KW_TRY: Matches = matches(TokenKind::Try);
+static KW_CATCH: Matches = matches(TokenKind::Catch);
+static KW_IF: Matches = matches(TokenKind::If);
+static KW_ELSE: Matches = matches(TokenKind::Else);
+static KW_WHILE: Matches = matches(TokenKind::While);
+static KW_DO: Matches = matches(TokenKind::Do);
+static KW_FOR: Matches = matches(TokenKind::For);
+static KW_IN: Matches = matches(TokenKind::In);
+static KW_AT: Matches = matches(TokenKind::At);
+static KW_THROW: Matches = matches(TokenKind::Throw);
+static KW_BREAKPOINT: Matches = matches(TokenKind::Breakpoint);
+static KW_BREAK: Matches = matches(TokenKind::Break);
+static KW_CONTINUE: Matches = matches(TokenKind::Continue);
+static KW_RETURN: Matches = matches(TokenKind::Return);
 
-static KW: MatchesOne<38> = matches_one(
-    [
-        TokenKind::Abstract,
-        TokenKind::As,
-        TokenKind::At,
-        TokenKind::Break,
-        TokenKind::Breakpoint,
-        TokenKind::Catch,
-        TokenKind::Continue,
-        TokenKind::Do,
-        TokenKind::Else,
-        TokenKind::Enum,
-        TokenKind::Extends,
-        TokenKind::False,
-        TokenKind::For,
-        TokenKind::Fn,
-        TokenKind::If,
-        TokenKind::In,
-        TokenKind::Is,
-        TokenKind::Limit,
-        TokenKind::Native,
-        TokenKind::Null,
-        TokenKind::NaN,
-        TokenKind::Infinity,
-        TokenKind::Private,
-        TokenKind::Return,
-        TokenKind::Sampling,
-        TokenKind::Skip,
-        TokenKind::Static,
-        TokenKind::Task,
-        TokenKind::This,
-        TokenKind::Throw,
-        TokenKind::Try,
-        TokenKind::Type,
-        TokenKind::True,
-        TokenKind::TypeOf,
-        TokenKind::Use,
-        TokenKind::Var,
-        TokenKind::While,
-        TokenKind::Without,
-    ],
-    "a keyword",
-);
 static IDENT_OR_KW: MatchesOne<39> = matches_one(
     [
         // Identifier
@@ -1298,10 +1617,7 @@ static IDENT_OR_KW: MatchesOne<39> = matches_one(
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        span::{Pos, Span},
-        tokenize,
-    };
+    use crate::tokenize;
 
     use super::*;
     use pretty_assertions::assert_eq;
@@ -1385,7 +1701,7 @@ mod test {
     fn fn_body_expr_stmt() {
         let source = "{ a; }";
         let tokens = tokenize(source);
-        let res = fn_body(&tokens);
+        let res = body(&tokens);
         assert!(res.is_ok());
     }
 

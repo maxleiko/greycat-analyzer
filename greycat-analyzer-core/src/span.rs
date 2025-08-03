@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use lsp_types as lsp;
-use serde::{Deserialize, Serialize, ser::SerializeTuple};
+use serde::{Deserialize, Serialize};
 
 pub trait ToSpan {
     fn span(&self) -> Span;

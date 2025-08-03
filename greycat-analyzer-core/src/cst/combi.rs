@@ -1,11 +1,6 @@
 use std::convert::Infallible;
 
-use crate::{
-    Token, TokenKind,
-    cst::Tokens,
-    span::{Pos, Span},
-    tokenize,
-};
+use crate::{Token, TokenKind, cst::Tokens};
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -139,8 +134,11 @@ where
 }
 
 pub fn peek(mut t: &[Token]) -> (&[Token], Tokens) {
-    let mut iter = t.iter();
-    let leading: Vec<Token> = iter.take_while(|t| t.kind.is_trivia()).copied().collect();
+    let leading: Vec<Token> = t
+        .iter()
+        .take_while(|t| t.kind.is_trivia())
+        .copied()
+        .collect();
     t = &t[leading.len()..];
     let token = t[0];
     t = &t[1..];
@@ -275,22 +273,6 @@ where
     Alt { p1, p2 }
 }
 
-pub fn seq<'t, P, T>(parsers: &[P]) -> impl Parser<'t, Vec<T>>
-where
-    P: Parser<'t, T>,
-{
-    move |t| {
-        let mut items = Vec::new();
-        let mut tokens = t;
-        for parser in parsers {
-            let (t, res) = parser.parse(tokens)?;
-            items.push(res);
-            tokens = t;
-        }
-        Ok((tokens, items))
-    }
-}
-
 pub fn many<'t, P, T>(parser: P) -> impl Parser<'t, Option<Vec<T>>, Infallible>
 where
     P: Parser<'t, T>,
@@ -376,14 +358,6 @@ where
     }
 }
 
-pub fn and_then<'t, P, A, B, F>(parser: P, then: F) -> impl Parser<'t, B>
-where
-    P: Parser<'t, A>,
-    F: Fn(A) -> Box<dyn Parser<'t, B>>,
-{
-    move |t| parser.parse(t).and_then(|(t, res)| then(res).parse(t))
-}
-
 pub fn seq2<'t, P1, P2, T>(p1: P1, p2: P2) -> impl Parser<'t, (T, T)>
 where
     P1: Parser<'t, T>,
@@ -399,6 +373,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::{span::Pos, span::Span, tokenize};
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -446,17 +421,5 @@ mod test {
         let tokens = tokenize("fn main() {}");
         let (_, kw) = matches(TokenKind::Fn).parse(&tokens).unwrap();
         assert_eq!(kw.token.kind, TokenKind::Fn);
-    }
-
-    #[test]
-    fn sequence() {
-        let tokens = tokenize("fn main() {}");
-        let (_, res) = seq(&[matches(TokenKind::Fn), matches(TokenKind::Ident)])
-            .parse(&tokens)
-            .unwrap();
-        assert_eq!(
-            res.into_iter().map(|t| t.token.kind).collect::<Vec<_>>(),
-            vec![TokenKind::Fn, TokenKind::Ident]
-        );
     }
 }

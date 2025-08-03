@@ -1,9 +1,5 @@
-#![allow(unused)] // TODO remove when stable
-
 mod cmd;
 mod utils;
-
-use std::error::Error;
 
 use clap::{Parser, Subcommand};
 use cmd::*;

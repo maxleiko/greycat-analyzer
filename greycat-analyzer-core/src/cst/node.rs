@@ -1,5 +1,4 @@
-use core::fmt;
-use std::{borrow::Cow, collections::VecDeque};
+use std::borrow::Cow;
 
 use serde::Serialize;
 
@@ -162,7 +161,7 @@ impl Node {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum NodeKind {
     Module,
-    Fn,
+    FnDecl,
     Name,
     FnModifiers,
     FnModifier,
@@ -172,7 +171,7 @@ pub enum NodeKind {
     FnParam,
     TypeIdent,
     ReturnType,
-    FnBody,
+    Body,
     BodyStmt,
     Pragma,
     Doc,
@@ -219,6 +218,7 @@ pub enum NodeKind {
     IsSpec,
     ExprStmt,
     LambdaExpr,
+    TupleExpr,
     ObjectExpr,
     ObjectFields,
     ObjectFieldEntry,
@@ -228,6 +228,31 @@ pub enum NodeKind {
     Interpolation,
     BinaryExpr,
     BinaryOperator,
+    TryStmt,
+    CatchBranch,
+    CatchParam,
+    IfStmt,
+    ElseIfBranch,
+    ElseBranch,
+    WhileStmt,
+    DoWhileStmt,
+    ForInStmt,
+    ForInCondition,
+    ForInParam,
+    ForInFilter,
+    Range,
+    ForStmt,
+    ForExpr,
+    AtStmt,
+    ThrowStmt,
+    AssignStmt,
+    AssignExpr,
+    BreakpointStmt,
+    BreakStmt,
+    ContinueStmt,
+    ReturnStmt,
+    Condition,
+    ForCondition,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -310,6 +335,7 @@ impl AddToNode for Token {
 
 impl AddToNode for Tokens {
     fn append_to(self, node: &mut Node) {
+        node.children.reserve(self.leading.len() + 1);
         self.leading.append_to(node);
         self.token.append_to(node);
     }
@@ -323,6 +349,7 @@ impl AddToNode for NodeError {
 
 impl<T: AddToNode> AddToNode for Vec<T> {
     fn append_to(self, node: &mut Node) {
+        node.children.reserve(self.len());
         self.into_iter().for_each(|item| item.append_to(node));
     }
 }

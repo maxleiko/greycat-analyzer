@@ -15,7 +15,7 @@ impl Lex {
     pub fn run(self) -> Result<(), AnyError> {
         env_logger::init();
         let source = std::fs::read_to_string(self.module)?;
-        let mut lexer = Lexer::new(&source);
+        let lexer = Lexer::new(&source);
         for token in lexer {
             println!("{}", token.to_source_token(&source));
         }

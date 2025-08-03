@@ -1,17 +1,17 @@
 mod combi;
 mod cursor;
 mod display;
-mod node;
-mod parser;
 mod info;
+mod node;
 mod node_query;
+mod parser;
 
 use std::path::Path;
 
 pub use cursor::*;
+pub use info::*;
 pub use node::*;
 pub use parser::*;
-pub use info::*;
 
 #[derive(Debug)]
 pub struct SourceModule {
@@ -20,7 +20,12 @@ pub struct SourceModule {
 }
 
 pub fn parse_file(filepath: impl AsRef<Path>) -> Result<SourceModule, std::io::Error> {
+    // let start = Instant::now();
     let source = std::fs::read_to_string(filepath.as_ref())?;
+    // let read_file = start.elapsed();
+    // let start = Instant::now();
     let module = parse(&crate::lexer::tokenize(&source));
+    // let parse = start.elapsed();
+    // println!("read_file={read_file:?}, parse={parse:?}");
     Ok(SourceModule { source, module })
 }
