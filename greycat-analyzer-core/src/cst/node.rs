@@ -93,7 +93,16 @@ impl Node {
     pub fn new(kind: NodeKind) -> Self {
         Self {
             kind,
-            children: Default::default(),
+            children: Vec::with_capacity(4),
+            field_name: None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn with_capacity(kind: NodeKind, capacity: usize) -> Self {
+        Self {
+            kind,
+            children: Vec::with_capacity(capacity),
             field_name: None,
         }
     }

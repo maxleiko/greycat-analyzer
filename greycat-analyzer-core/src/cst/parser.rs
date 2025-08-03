@@ -5,8 +5,35 @@ use crate::{
     cst::{AddToNode, CstNode, ErrorKind, Node, NodeError, NodeKind, Tokens, combi::*},
 };
 
+// Macro to create a new node and add children in one go
+macro_rules! new_node {
+    ($kind:expr, [$($child:expr),* $(,)?]) => {
+        {
+            // Create the new node
+            let mut node = Node::with_capacity($kind, count!($($child),*));
+            // Add each child to the node
+            $(
+                node.add($child);
+            )*
+            node
+        }
+    };
+}
+
+// Helper macro to count items at compile time
+// Macro that counts the number of arguments by expanding each to 1usize
+macro_rules! count {
+    // Match any number of expressions separated by commas
+    ($($args:expr),*) => {
+        {
+            // Replace each argument with 1usize and sum them with +
+            0usize $(+ { let _ = $args; 1usize })*
+        }
+    };
+}
+
 pub fn parse(mut t: &[Token]) -> Node {
-    let mut node = Node::new(NodeKind::Module);
+    let mut node = Node::with_capacity(NodeKind::Module, 128);
     loop {
         let (next, peeked) = peek(t);
         if peeked.token.kind == TokenKind::Eof {
@@ -57,16 +84,22 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     let (t, return_type) = opt(type_decorator).parse(t).unwrap();
     let (t, body_or_semi) = either(body, SEMI).parse(t)?;
 
-    let mut node = Node::new(NodeKind::FnDecl);
-    node.add(header);
-    node.add(modifiers);
-    node.add(kw);
-    node.add(name);
-    node.add(generics);
-    node.add(params);
-    node.add(return_type);
-    node.add(body_or_semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::FnDecl,
+            [
+                header,
+                modifiers,
+                kw,
+                name,
+                generics,
+                params,
+                return_type,
+                body_or_semi,
+            ]
+        ),
+    ))
 }
 
 fn mod_var_decl(t: &[Token]) -> Res<Node> {
@@ -78,15 +111,13 @@ fn mod_var_decl(t: &[Token]) -> Res<Node> {
     let (t, init) = opt(initializer).parse(t).unwrap();
     let (t, semi) = opt(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ModVarDecl);
-    node.add(header);
-    node.add(modifiers);
-    node.add(kw);
-    node.add(name);
-    node.add(ty);
-    node.add(init);
-    node.add(semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::ModVarDecl,
+            [header, modifiers, kw, name, ty, init, semi,]
+        ),
+    ))
 }
 
 fn enum_decl(t: &[Token]) -> Res<Node> {
@@ -97,14 +128,13 @@ fn enum_decl(t: &[Token]) -> Res<Node> {
     let (t, body) = enum_body(t)?;
     let (t, semi) = opt(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::EnumDecl);
-    node.add(header);
-    node.add(modifiers);
-    node.add(kw);
-    node.add(name);
-    node.add(body);
-    node.add(semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::EnumDecl,
+            [header, modifiers, kw, name, body, semi,]
+        ),
+    ))
 }
 
 fn enum_body(t: &[Token]) -> Res<Node> {
@@ -123,11 +153,7 @@ fn enum_field(t: &[Token]) -> Res<Node> {
     let (t, name) = ident_or_kw_or_strlit(t)?;
     let (t, args) = opt(paren_expr).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::EnumField);
-    node.add(header);
-    node.add(name);
-    node.add(args);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::EnumField, [header, name, args])))
 }
 
 fn type_decl(t: &[Token]) -> Res<Node> {
@@ -140,26 +166,20 @@ fn type_decl(t: &[Token]) -> Res<Node> {
     let (t, body) = type_body(t)?;
     let (t, semi) = opt(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::TypeDecl);
-    node.add(header);
-    node.add(modifiers);
-    node.add(kw);
-    node.add(name);
-    node.add(params);
-    node.add(extend);
-    node.add(body);
-    node.add(semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::TypeDecl,
+            [header, modifiers, kw, name, params, extend, body, semi]
+        ),
+    ))
 }
 
 fn type_extends(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_EXTENDS.parse(t)?;
     let (t, name) = type_ident(t)?;
 
-    let mut node = Node::new(NodeKind::TypeExtends);
-    node.add(kw);
-    node.add(name);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::TypeExtends, [kw, name])))
 }
 
 fn type_body(t: &[Token]) -> Res<Node> {
@@ -181,15 +201,13 @@ fn type_attr(t: &[Token]) -> Res<Node> {
     let (t, init) = opt(initializer).parse(t).unwrap();
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::TypeAttr);
-    node.add(header);
-    node.add(modifiers);
-    node.add(name);
-    node.add(colon);
-    node.add(ty);
-    node.add(init);
-    node.add(semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::TypeAttr,
+            [header, modifiers, name, colon, ty, init, semi]
+        ),
+    ))
 }
 
 fn mod_pragma(t: &[Token]) -> Res<Node> {
@@ -199,27 +217,16 @@ fn mod_pragma(t: &[Token]) -> Res<Node> {
     let (t, args) = opt(call_args).parse(t).unwrap();
     let (t, semi) = SEMI.parse(t)?;
 
-    let mut node = Node::new(NodeKind::ModPragma);
-    node.add(doc);
-    node.add(at);
-    node.add(name);
-    node.add(args);
-    node.add(semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(NodeKind::ModPragma, [doc, at, name, args, semi]),
+    ))
 }
 
 fn ident_or_kw_or_strlit(t: &[Token]) -> Res<Node> {
     alt(
-        map(IDENT_OR_KW, |tokens| {
-            let mut node = Node::new(NodeKind::Ident);
-            node.add(tokens);
-            node
-        }),
-        map(str_expr, |n| {
-            let mut node = Node::new(NodeKind::Ident);
-            node.add(n);
-            node
-        }),
+        map(IDENT_OR_KW, |tokens| new_node!(NodeKind::Ident, [tokens])),
+        map(str_expr, |n| new_node!(NodeKind::Ident, [n])),
     )
     .parse(t)
 }
@@ -229,11 +236,7 @@ fn paren_expr(t: &[Token]) -> Res<Node> {
     let (t, expr) = expect(expr).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
-    let mut node = Node::new(NodeKind::ParenExpr);
-    node.add(open);
-    node.add(expr);
-    node.add(close);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ParenExpr, [open, expr, close])))
 }
 
 fn str_expr(t: &[Token]) -> Res<Node> {
@@ -241,11 +244,10 @@ fn str_expr(t: &[Token]) -> Res<Node> {
     let (t, opt_raw_string) = opt(RAW_STRING).parse(t).unwrap();
     let (t, exit_tpl) = DOUBLE_QUOTE.parse(t)?;
 
-    let mut node = Node::new(NodeKind::StringExpr);
-    node.add(enter_tpl);
-    node.add(opt_raw_string);
-    node.add(exit_tpl);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(NodeKind::StringExpr, [enter_tpl, opt_raw_string, exit_tpl]),
+    ))
 }
 
 fn type_method(t: &[Token]) -> Res<Node> {
@@ -258,26 +260,29 @@ fn type_method(t: &[Token]) -> Res<Node> {
     let (t, return_type) = opt(type_decorator).parse(t).unwrap();
     let (t, body) = opt(body).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::TypeMethod);
-    node.add(header);
-    node.add(modifiers);
-    node.add(kw);
-    node.add(name);
-    node.add(generics);
-    node.add(params);
-    node.add(return_type);
-    node.add(body);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::TypeMethod,
+            [
+                header,
+                modifiers,
+                kw,
+                name,
+                generics,
+                params,
+                return_type,
+                body
+            ]
+        ),
+    ))
 }
 
 fn initializer(t: &[Token]) -> Res<Node> {
     let (t, eq) = EQ.parse(t)?;
-    let (t, e) = expr(t)?;
+    let (t, expr) = expr(t)?;
 
-    let mut node = Node::new(NodeKind::Initializer);
-    node.add(eq);
-    node.add(e);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::Initializer, [eq, expr])))
 }
 
 fn expr(t: &[Token]) -> Res<Node> {
@@ -316,7 +321,7 @@ fn expr(t: &[Token]) -> Res<Node> {
                     .expect(
                         "BinaryOperator is always composed of a non-trivia binary operator token",
                     );
-                        let mut node = Node::new(NodeKind::BinaryExpr);
+                        let mut node = Node::with_capacity(NodeKind::BinaryExpr, 3);
                         if new_prec <= acc_op.kind.precedence() {
                             acc.field("lhs");
                             node.add(acc);
@@ -330,7 +335,7 @@ fn expr(t: &[Token]) -> Res<Node> {
                             let mut acc_rhs =
                                 acc_nodes.next().expect("BinaryExpr always have a 'rhs'");
                             // we create a new rhs composed of: (acc.rhs, op, rhs)
-                            let mut new_rhs = Node::new(NodeKind::BinaryExpr);
+                            let mut new_rhs = Node::with_capacity(NodeKind::BinaryExpr, 3);
                             acc_rhs.field("lhs");
                             new_rhs.add(acc_rhs);
                             new_rhs.add(op);
@@ -345,7 +350,7 @@ fn expr(t: &[Token]) -> Res<Node> {
                         acc = node;
                     }
                     _ => {
-                        let mut node = Node::new(NodeKind::BinaryExpr);
+                        let mut node = Node::with_capacity(NodeKind::BinaryExpr, 3);
                         acc.field("lhs");
                         node.add(acc);
                         node.add(op);
@@ -357,7 +362,7 @@ fn expr(t: &[Token]) -> Res<Node> {
             }
             Err(_) => {
                 // unable to parse rhs: recover
-                let mut node = Node::new(NodeKind::BinaryExpr);
+                let mut node = Node::with_capacity(NodeKind::BinaryExpr, 3);
                 acc.field("lhs");
                 node.add(acc);
                 node.add(op);
@@ -387,12 +392,7 @@ fn expr(t: &[Token]) -> Res<Node> {
 fn postfix_expr(t: &[Token]) -> Res<Node> {
     let (t, expr) = prefix_expr(t)?;
     match postfix_op(t) {
-        Ok((t, op)) => {
-            let mut node = Node::new(NodeKind::PostfixExpr);
-            node.add(expr);
-            node.add(op);
-            Ok((t, node))
-        }
+        Ok((t, op)) => Ok((t, new_node!(NodeKind::PostfixExpr, [expr, op]))),
         Err(_) => Ok((t, expr)),
     }
 }
@@ -405,10 +405,7 @@ fn prefix_expr(t: &[Token]) -> Res<Node> {
     match prefix_op(t) {
         Ok((t, op)) => {
             let (t, expr) = call_expr(t)?;
-            let mut node = Node::new(NodeKind::PrefixExpr);
-            node.add(op);
-            node.add(expr);
-            Ok((t, node))
+            Ok((t, new_node!(NodeKind::PrefixExpr, [op, expr])))
         }
         Err(_) => call_expr(t),
     }
@@ -425,16 +422,12 @@ fn call_expr(t: &[Token]) -> Res<Node> {
         match either(&call_args, &call_expr_spec).parse(t) {
             Ok((next_t, Either::Left(args))) => {
                 t = next_t; // advance
-
-                let mut node = Node::new(NodeKind::CallExpr);
-                node.add(recv);
-                node.add(args);
-                recv = node;
+                recv = new_node!(NodeKind::CallExpr, [recv, args]);
             }
             Ok((next_t, Either::Right(spec))) => {
                 t = next_t; // advance
 
-                let mut node = Node::new(spec.kind);
+                let mut node = Node::with_capacity(spec.kind, spec.children.len() + 1);
                 node.add(recv);
                 node.children.extend(spec.children);
                 recv = node;
@@ -464,20 +457,14 @@ fn static_member_expr(t: &[Token]) -> Res<Node> {
     let (t, sep) = COLON_COLON.parse(t)?;
     let (t, prop) = ident_or_kw_or_strlit(t)?;
 
-    let mut node = Node::new(NodeKind::StaticMemberExpr);
-    node.add(sep);
-    node.add(prop);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::StaticMemberExpr, [sep, prop])))
 }
 
 fn member_expr(t: &[Token]) -> Res<Node> {
     let (t, sep) = either(DOT, ARROW).parse(t)?;
     let (t, prop) = ident_or_kw_or_strlit(t)?;
 
-    let mut node = Node::new(NodeKind::MemberExpr);
-    node.add(sep);
-    node.add(prop);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::MemberExpr, [sep, prop])))
 }
 
 fn offset_expr(t: &[Token]) -> Res<Node> {
@@ -485,47 +472,33 @@ fn offset_expr(t: &[Token]) -> Res<Node> {
     let (t, expr) = expr(t)?;
     let (t, close) = CLOSE_SQUARE.parse(t)?;
 
-    let mut node = Node::new(NodeKind::OffsetExpr);
-    node.add(open);
-    node.add(expr);
-    node.add(close);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::OffsetExpr, [open, expr, close])))
 }
 
 fn as_spec(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_AS.parse(t)?;
     let (t, ty) = type_ident(t)?;
 
-    let mut node = Node::new(NodeKind::AsSpec);
-    node.add(kw);
-    node.add(ty);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::AsSpec, [kw, ty])))
 }
 
 fn is_spec(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_IS.parse(t)?;
     let (t, ty) = type_ident(t)?;
 
-    let mut node = Node::new(NodeKind::IsSpec);
-    node.add(kw);
-    node.add(ty);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::IsSpec, [kw, ty])))
 }
 
 fn nonnull_expr(t: &[Token]) -> Res<Node> {
     let (t, op) = BANG_BANG.parse(t)?;
 
-    let mut node = Node::new(NodeKind::NonNullExpr);
-    node.add(op);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::NonNullExpr, [op])))
 }
 
 fn optional_expr(t: &[Token]) -> Res<Node> {
     let (t, op) = QMARK.parse(t)?;
 
-    let mut node = Node::new(NodeKind::OptionalExpr);
-    node.add(op);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::OptionalExpr, [op])))
 }
 
 fn primary_expr(t: &[Token]) -> Res<Node> {
@@ -547,11 +520,7 @@ fn lambda_expr(t: &[Token]) -> Res<Node> {
     let (t, params) = fn_params(t)?;
     let (t, body) = body(t)?;
 
-    let mut node = Node::new(NodeKind::LambdaExpr);
-    node.add(kw);
-    node.add(params);
-    node.add(body);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::LambdaExpr, [kw, params, body])))
 }
 
 fn tuple_expr(t: &[Token]) -> Res<Node> {
@@ -561,23 +530,14 @@ fn tuple_expr(t: &[Token]) -> Res<Node> {
     let (t, b) = expr(t)?;
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
-    let mut node = Node::new(NodeKind::TupleExpr);
-    node.add(open);
-    node.add(a);
-    node.add(sep);
-    node.add(b);
-    node.add(close);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::TupleExpr, [open, a, sep, b, close])))
 }
 
 fn object_expr(t: &[Token]) -> Res<Node> {
     let (t, ty) = expect(type_ident).parse(t).unwrap();
     let (t, fields) = object_fields(t)?;
 
-    let mut node = Node::new(NodeKind::ObjectExpr);
-    node.add(ty);
-    node.add(fields);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ObjectExpr, [ty, fields])))
 }
 
 fn template_expr(t: &[Token]) -> Res<Node> {
@@ -585,11 +545,10 @@ fn template_expr(t: &[Token]) -> Res<Node> {
     let (t, children) = many(either(RAW_STRING, interpolation)).parse(t).unwrap();
     let (t, exit) = DOUBLE_QUOTE.parse(t)?;
 
-    let mut node = Node::new(NodeKind::TemplateExpr);
-    node.add(enter);
-    node.add(children);
-    node.add(exit);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(NodeKind::TemplateExpr, [enter, children, exit]),
+    ))
 }
 
 fn interpolation(t: &[Token]) -> Res<Node> {
@@ -597,11 +556,7 @@ fn interpolation(t: &[Token]) -> Res<Node> {
     let (t, expr) = expr(t)?;
     let (t, exit) = EXIT_INTERPOLATION.parse(t)?;
 
-    let mut node = Node::new(NodeKind::Interpolation);
-    node.add(enter);
-    node.add(expr);
-    node.add(exit);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::Interpolation, [enter, expr, exit])))
 }
 
 fn array_inline_expr(t: &[Token]) -> Res<Node> {
@@ -624,51 +579,37 @@ fn literal(t: &[Token]) -> Res<Node> {
 
 fn num_expr(t: &[Token]) -> Res<Node> {
     let (t, num) = NUMBER.parse(t)?;
-    let mut node = Node::new(NodeKind::NumExpr);
-    node.add(num);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::NumExpr, [num])))
 }
 
 fn bool_expr(t: &[Token]) -> Res<Node> {
     let (t, tokens) = alt(KW_TRUE, KW_FALSE).parse(t)?;
-    let mut node = Node::new(NodeKind::BoolExpr);
-    node.add(tokens);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::BoolExpr, [tokens])))
 }
 
 fn char_expr(t: &[Token]) -> Res<Node> {
     let (t, tokens) = alt(CHAR_T, CHAR_U).parse(t)?;
-    let mut node = Node::new(NodeKind::CharExpr);
-    node.add(tokens);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::CharExpr, [tokens])))
 }
 
 fn nan_expr(t: &[Token]) -> Res<Node> {
     let (t, tokens) = KW_NAN.parse(t)?;
-    let mut node = Node::new(NodeKind::NaNExpr);
-    node.add(tokens);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::NaNExpr, [tokens])))
 }
 
 fn inf_expr(t: &[Token]) -> Res<Node> {
     let (t, tokens) = KW_INFINITY.parse(t)?;
-    let mut node = Node::new(NodeKind::InfExpr);
-    node.add(tokens);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::InfExpr, [tokens])))
 }
 
 fn null_expr(t: &[Token]) -> Res<Node> {
     let (t, tokens) = KW_NULL.parse(t)?;
-    let mut node = Node::new(NodeKind::NullExpr);
-    node.add(tokens);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::NullExpr, [tokens])))
 }
 
 fn this_expr(t: &[Token]) -> Res<Node> {
     let (t, tokens) = KW_THIS.parse(t)?;
-    let mut node = Node::new(NodeKind::ThisExpr);
-    node.add(tokens);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ThisExpr, [tokens])))
 }
 
 fn object_fields(t: &[Token]) -> Res<Node> {
@@ -687,27 +628,20 @@ fn object_field_entry(t: &[Token]) -> Res<Node> {
     let (t, sep) = COLON.parse(t)?;
     let (t, expr) = expr(t)?;
 
-    let mut node = Node::new(NodeKind::ObjectFieldEntry);
-    node.add(name);
-    node.add(sep);
-    node.add(expr);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ObjectFieldEntry, [name, sep, expr])))
 }
 
 fn object_field_expr(t: &[Token]) -> Res<Node> {
     let (t, expr) = expr(t)?;
 
-    let mut node = Node::new(NodeKind::ObjectFieldExpr);
-    node.add(expr);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ObjectFieldExpr, [expr])))
 }
 
 // TODO: review this bit
 fn name(t: &[Token]) -> Res<Node> {
     let (t, id) = matches(TokenKind::Ident).parse(t)?;
-    let mut node = Node::new(NodeKind::Name);
-    node.add(id);
-    Ok((t, node))
+
+    Ok((t, new_node!(NodeKind::Name, [id])))
 }
 
 fn generic_params(t: &[Token]) -> Res<Node> {
@@ -721,7 +655,8 @@ fn type_params(t: &[Token]) -> Res<Node> {
 fn modifiers(t: &[Token]) -> Res<Option<Node>> {
     let (t, mods) = many(modifier).parse(t).unwrap();
     if let Some(mods) = mods {
-        let mut node = Node::new(NodeKind::FnModifiers);
+        let capacity = mods.iter().map(|modifier| modifier.leading.len() + 1).sum();
+        let mut node = Node::with_capacity(NodeKind::FnModifiers, capacity);
         for modifier in mods {
             let Tokens { leading, token } = modifier;
             node.add(leading);
@@ -777,14 +712,10 @@ fn var_decl(t: &[Token]) -> Res<Node> {
     let (t, init) = opt(initializer).parse(t).unwrap();
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::VarDecl);
-    node.add(header);
-    node.add(kw);
-    node.add(name);
-    node.add(ty);
-    node.add(init);
-    node.add(semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(NodeKind::VarDecl, [header, kw, name, ty, init, semi]),
+    ))
 }
 
 fn try_stmt(t: &[Token]) -> Res<Node> {
@@ -792,11 +723,7 @@ fn try_stmt(t: &[Token]) -> Res<Node> {
     let (t, body) = body(t)?;
     let (t, catch) = opt(catch_branch).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::TryStmt);
-    node.add(kw);
-    node.add(body);
-    node.add(catch);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::TryStmt, [kw, body, catch])))
 }
 
 fn catch_branch(t: &[Token]) -> Res<Node> {
@@ -804,11 +731,7 @@ fn catch_branch(t: &[Token]) -> Res<Node> {
     let (t, param) = opt(catch_param).parse(t).unwrap();
     let (t, body) = body(t)?;
 
-    let mut node = Node::new(NodeKind::CatchBranch);
-    node.add(kw);
-    node.add(param);
-    node.add(body);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::CatchBranch, [kw, param, body])))
 }
 
 fn catch_param(t: &[Token]) -> Res<Node> {
@@ -816,11 +739,7 @@ fn catch_param(t: &[Token]) -> Res<Node> {
     let (t, name) = expect(IDENT).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
-    let mut node = Node::new(NodeKind::CatchParam);
-    node.add(open);
-    node.add(name);
-    node.add(close);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::CatchParam, [open, name, close])))
 }
 
 fn if_stmt(t: &[Token]) -> Res<Node> {
@@ -830,13 +749,13 @@ fn if_stmt(t: &[Token]) -> Res<Node> {
     let (t, else_if_branches) = many(else_if_branch).parse(t).unwrap();
     let (t, else_branch) = opt(else_branch).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::IfStmt);
-    node.add(kw);
-    node.add(condition);
-    node.add(then_branch);
-    node.add(else_if_branches);
-    node.add(else_branch);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::IfStmt,
+            [kw, condition, then_branch, else_if_branches, else_branch]
+        ),
+    ))
 }
 
 fn condition(t: &[Token]) -> Res<Node> {
@@ -844,11 +763,7 @@ fn condition(t: &[Token]) -> Res<Node> {
     let (t, name) = expect(expr).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
-    let mut node = Node::new(NodeKind::Condition);
-    node.add(open);
-    node.add(name);
-    node.add(close);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::Condition, [open, name, close])))
 }
 
 fn else_if_branch(t: &[Token]) -> Res<Node> {
@@ -857,22 +772,17 @@ fn else_if_branch(t: &[Token]) -> Res<Node> {
     let (t, condition) = condition(t)?;
     let (t, branch) = body(t)?;
 
-    let mut node = Node::new(NodeKind::ElseIfBranch);
-    node.add(kw_else);
-    node.add(kw_if);
-    node.add(condition);
-    node.add(branch);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(NodeKind::ElseIfBranch, [kw_else, kw_if, condition, branch]),
+    ))
 }
 
 fn else_branch(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_ELSE.parse(t)?;
     let (t, branch) = body(t)?;
 
-    let mut node = Node::new(NodeKind::ElseBranch);
-    node.add(kw);
-    node.add(branch);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ElseBranch, [kw, branch])))
 }
 
 fn while_stmt(t: &[Token]) -> Res<Node> {
@@ -880,11 +790,7 @@ fn while_stmt(t: &[Token]) -> Res<Node> {
     let (t, condition) = expect(condition).parse(t).unwrap();
     let (t, body) = expect(body).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::WhileStmt);
-    node.add(kw);
-    node.add(condition);
-    node.add(body);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::WhileStmt, [kw, condition, body])))
 }
 
 fn do_while_stmt(t: &[Token]) -> Res<Node> {
@@ -894,13 +800,13 @@ fn do_while_stmt(t: &[Token]) -> Res<Node> {
     let (t, condition) = expect(condition).parse(t).unwrap();
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::DoWhileStmt);
-    node.add(kw_do);
-    node.add(body);
-    node.add(kw_while);
-    node.add(condition);
-    node.add(semi);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::DoWhileStmt,
+            [kw_do, body, kw_while, condition, semi]
+        ),
+    ))
 }
 
 fn for_in_stmt(t: &[Token]) -> Res<Node> {
@@ -908,11 +814,7 @@ fn for_in_stmt(t: &[Token]) -> Res<Node> {
     let (t, condition) = for_in_condition(t)?;
     let (t, body) = expect(body).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ForInStmt);
-    node.add(kw);
-    node.add(condition);
-    node.add(body);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ForInStmt, [kw, condition, body])))
 }
 
 fn for_in_condition(t: &[Token]) -> Res<Node> {
@@ -926,27 +828,20 @@ fn for_in_condition(t: &[Token]) -> Res<Node> {
     let (t, filters) = many(for_in_filter).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
-    let mut node = Node::new(NodeKind::ForInCondition);
-    node.add(open);
-    node.add(key);
-    node.add(comma);
-    node.add(value);
-    node.add(kw_in);
-    node.add(iter);
-    node.add(range);
-    node.add(filters);
-    node.add(close);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::ForInCondition,
+            [open, key, comma, value, kw_in, iter, range, filters, close]
+        ),
+    ))
 }
 
 fn for_in_param(t: &[Token]) -> Res<Node> {
     let (t, name) = IDENT.parse(t)?;
     let (t, ty) = opt(type_decorator).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ForInParam);
-    node.add(name);
-    node.add(ty);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ForInParam, [name, ty])))
 }
 
 fn range(t: &[Token]) -> Res<Node> {
@@ -956,23 +851,17 @@ fn range(t: &[Token]) -> Res<Node> {
     let (t, upper) = opt(expr).parse(t).unwrap();
     let (t, close) = RANGE_BOUND.parse(t)?;
 
-    let mut node = Node::new(NodeKind::Range);
-    node.add(open);
-    node.add(lower);
-    node.add(dot_dot);
-    node.add(upper);
-    node.add(close);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(NodeKind::Range, [open, lower, dot_dot, upper, close]),
+    ))
 }
 
 fn for_in_filter(t: &[Token]) -> Res<Node> {
     let (t, kw) = FOR_IN_FILTER.parse(t)?;
     let (t, expr) = expect(expr).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ForInFilter);
-    node.add(kw);
-    node.add(expr);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ForInFilter, [kw, expr])))
 }
 
 fn for_stmt(t: &[Token]) -> Res<Node> {
@@ -980,11 +869,7 @@ fn for_stmt(t: &[Token]) -> Res<Node> {
     let (t, condition) = for_condition(t)?;
     let (t, body) = expect(body).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ForStmt);
-    node.add(kw);
-    node.add(condition);
-    node.add(body);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ForStmt, [kw, condition, body])))
 }
 
 fn for_condition(t: &[Token]) -> Res<Node> {
@@ -994,21 +879,19 @@ fn for_condition(t: &[Token]) -> Res<Node> {
     let (t, update) = expect(for_expr).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
 
-    let mut node = Node::new(NodeKind::ForCondition);
-    node.add(open);
-    node.add(init);
-    node.add(condition);
-    node.add(update);
-    node.add(close);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(
+            NodeKind::ForCondition,
+            [open, init, condition, update, close]
+        ),
+    ))
 }
 
 fn for_expr(t: &[Token]) -> Res<Node> {
     let (t, expr) = alt(assign_expr, expr).parse(t)?;
 
-    let mut node = Node::new(NodeKind::ForExpr);
-    node.add(expr);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ForExpr, [expr])))
 }
 
 fn at_stmt(t: &[Token]) -> Res<Node> {
@@ -1016,11 +899,7 @@ fn at_stmt(t: &[Token]) -> Res<Node> {
     let (t, expr) = paren_expr(t)?;
     let (t, body) = expect(body).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::AtStmt);
-    node.add(kw);
-    node.add(expr);
-    node.add(body);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::AtStmt, [kw, expr, body])))
 }
 
 fn throw_stmt(t: &[Token]) -> Res<Node> {
@@ -1028,21 +907,14 @@ fn throw_stmt(t: &[Token]) -> Res<Node> {
     let (t, expr) = expect(expr).parse(t).unwrap();
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ThrowStmt);
-    node.add(kw);
-    node.add(expr);
-    node.add(semi);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ThrowStmt, [kw, expr, semi])))
 }
 
 fn assign_stmt(t: &[Token]) -> Res<Node> {
     let (t, expr) = assign_expr(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::AssignStmt);
-    node.add(expr);
-    node.add(semi);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::AssignStmt, [expr, semi])))
 }
 
 fn assign_expr(t: &[Token]) -> Res<Node> {
@@ -1050,41 +922,28 @@ fn assign_expr(t: &[Token]) -> Res<Node> {
     let (t, op) = ASSIGN_OP.parse(t)?;
     let (t, rhs) = expr(t)?;
 
-    let mut node = Node::new(NodeKind::AssignExpr);
-    node.add(lhs);
-    node.add(op);
-    node.add(rhs);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::AssignExpr, [lhs, op, rhs])))
 }
 
 fn breakpoint_stmt(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_BREAKPOINT.parse(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::BreakpointStmt);
-    node.add(kw);
-    node.add(semi);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::BreakpointStmt, [kw, semi])))
 }
 
 fn break_stmt(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_BREAK.parse(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::BreakStmt);
-    node.add(kw);
-    node.add(semi);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::BreakStmt, [kw, semi])))
 }
 
 fn continue_stmt(t: &[Token]) -> Res<Node> {
     let (t, kw) = KW_CONTINUE.parse(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ContinueStmt);
-    node.add(kw);
-    node.add(semi);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ContinueStmt, [kw, semi])))
 }
 
 fn return_stmt(t: &[Token]) -> Res<Node> {
@@ -1092,21 +951,14 @@ fn return_stmt(t: &[Token]) -> Res<Node> {
     let (t, expr) = opt(expr).parse(t).unwrap();
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ReturnStmt);
-    node.add(kw);
-    node.add(expr);
-    node.add(semi);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ReturnStmt, [kw, expr, semi])))
 }
 
 fn expr_stmt(t: &[Token]) -> Res<Node> {
     let (t, expr) = expr(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::ExprStmt);
-    node.add(expr);
-    node.add(semi);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::ExprStmt, [expr, semi])))
 }
 
 fn stmt_header(t: &[Token]) -> Res<Option<Node>> {
@@ -1149,9 +1001,8 @@ fn doc_or_pragma_allow_semi(t: &[Token]) -> Res<Node> {
 
 fn doc(t: &[Token]) -> Res<Node> {
     let (t, items) = many1(DOC_COMMENT).parse(t)?;
-    let mut node = Node::new(NodeKind::Doc);
-    node.add(items);
-    Ok((t, node))
+
+    Ok((t, new_node!(NodeKind::Doc, [items])))
 }
 
 fn pragma(t: &[Token]) -> Res<Node> {
@@ -1159,11 +1010,7 @@ fn pragma(t: &[Token]) -> Res<Node> {
     let (t, name) = IDENT_OR_KW.parse(t)?;
     let (t, args) = opt(call_args).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::Pragma);
-    node.add(at);
-    node.add(name);
-    node.add(args);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::Pragma, [at, name, args])))
 }
 
 fn pragma_allow_semi(t: &[Token]) -> Res<Node> {
@@ -1185,20 +1032,14 @@ fn fn_param(t: &[Token]) -> Res<Node> {
     let (t, name) = IDENT.parse(t)?;
     let (t, ty) = type_decorator(t)?;
 
-    let mut node = Node::new(NodeKind::FnParam);
-    node.add(name);
-    node.add(ty);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::FnParam, [name, ty])))
 }
 
 fn type_decorator(t: &[Token]) -> Res<Node> {
     let (t, c) = COLON.parse(t)?;
     let (t, ty) = expect(type_ident).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::TypeDecorator);
-    node.add(c);
-    node.add(ty);
-    Ok((t, node))
+    Ok((t, new_node!(NodeKind::TypeDecorator, [c, ty])))
 }
 
 fn type_ident(t: &[Token]) -> Res<Node> {
@@ -1208,13 +1049,10 @@ fn type_ident(t: &[Token]) -> Res<Node> {
     let (t, params) = opt(type_params).parse(t).unwrap();
     let (t, qmark) = opt(QMARK).parse(t).unwrap();
 
-    let mut node = Node::new(NodeKind::TypeIdent);
-    node.add(kw_typeof);
-    node.add(parts);
-    node.add(name);
-    node.add(params);
-    node.add(qmark);
-    Ok((t, node))
+    Ok((
+        t,
+        new_node!(NodeKind::TypeIdent, [kw_typeof, parts, name, params, qmark]),
+    ))
 }
 
 // fn binary_op(t: &[Token]) -> Res<Tokens> {
@@ -1312,7 +1150,7 @@ where
 {
     move |t| {
         let (t, o) = open.parse(t)?;
-        let mut node = Node::new(kind);
+        let mut node = Node::with_capacity(kind, 4);
         node.add(o);
 
         let mut tokens = t;
@@ -1369,7 +1207,7 @@ where
 {
     move |t| {
         let (t, o) = open.parse(t)?;
-        let mut node = Node::new(kind);
+        let mut node = Node::with_capacity(kind, 4);
         node.add(o);
 
         let mut state = ManySepBoundState::ExpectItem;
