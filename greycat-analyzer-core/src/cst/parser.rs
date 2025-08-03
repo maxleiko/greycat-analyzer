@@ -282,7 +282,7 @@ fn initializer(t: &[Token]) -> Res<Node> {
 }
 
 fn expr(t: &[Token]) -> Res<Node> {
-    let (mut t, mut curr) = postfix_expr(t)?;
+    let (mut t, mut acc) = postfix_expr(t)?;
 
     loop {
         let Ok((next_t, op_tok)) = binary_op(t) else {
@@ -291,9 +291,6 @@ fn expr(t: &[Token]) -> Res<Node> {
         t = next_t; // advance
 
         let new_prec = op_tok.token.kind.precedence();
-
-        let (next_t, rhs) = postfix_expr(t)?;
-        t = next_t; // advance
 
         let op = Node {
             kind: NodeKind::BinaryOperator,
@@ -306,21 +303,92 @@ fn expr(t: &[Token]) -> Res<Node> {
                 .collect(),
         };
 
-        match curr.kind {
-            NodeKind::BinaryExpr => {
-                todo!()
+        match postfix_expr(t) {
+            Ok((next_t, mut rhs)) => {
+                t = next_t; // advance
+
+                match acc.kind {
+                    NodeKind::BinaryExpr => {
+                        let acc_op = acc
+                    .get_node_by_field("op")
+                    .expect(
+                        "BinaryExpr is always composed of 3 named fields: 'lhs', 'op' and 'rhs'",
+                    );
+                        assert_eq!(acc_op.field_name, Some("op"));
+                        println!("acc_op={acc_op:#?}");
+                        let acc_op_token = acc_op
+                    .first_non_trivia_token()
+                    .expect(
+                        "BinaryOperator is always composed of a non-trivia binary operator token",
+                    );
+                        let mut node = Node::new(NodeKind::BinaryExpr);
+                        if new_prec <= acc_op_token.kind.precedence() {
+                            acc.field("lhs");
+                            node.add(acc);
+                            node.add(op);
+                            rhs.field("rhs");
+                            node.add(rhs);
+                        } else {
+                            let mut acc_nodes = acc.into_nodes().into_iter();
+                            let mut acc_lhs =
+                                acc_nodes.next().expect("BinaryExpr always have a 'lhs'");
+                            let mut acc_op =
+                                acc_nodes.next().expect("BinaryExpr always have a 'op'");
+                            let mut acc_rhs =
+                                acc_nodes.next().expect("BinaryExpr always have a 'rhs'");
+                            // we create a new rhs composed of: (acc.rhs, op, rhs)
+                            let mut new_rhs = Node::new(NodeKind::BinaryExpr);
+                            acc_rhs.field("lhs");
+                            new_rhs.add(acc_rhs);
+                            new_rhs.add(op);
+                            rhs.field("rhs");
+                            new_rhs.add(rhs);
+                            // and we create the new acc value with: (acc.lhs, acc.op, new_rhs)
+                            node.add(acc_lhs);
+                            node.add(acc_op);
+                            new_rhs.field("rhs");
+                            node.add(new_rhs);
+                        }
+                        acc = node;
+                    }
+                    _ => {
+                        let mut node = Node::new(NodeKind::BinaryExpr);
+                        acc.field("lhs");
+                        node.add(acc);
+                        node.add(op);
+                        rhs.field("rhs");
+                        node.add(rhs);
+                        acc = node;
+                    }
+                }
             }
-            _ => {
+            Err(_) => {
+                // unable to parse rhs: recover
                 let mut node = Node::new(NodeKind::BinaryExpr);
-                curr.field("lhs");
-                node.add(curr);
+                acc.field("lhs");
+                node.add(acc);
                 node.add(op);
-                curr = node;
+                node.add(NodeError {
+                    kind: ErrorKind::Expected {
+                        expected: "an expression",
+                        got: t[0].kind,
+                    },
+                    span: t[0].span,
+                });
+                acc = node;
             }
         }
     }
 
-    Ok((t, curr))
+    Ok((t, acc))
+}
+
+fn dump_node(node: &Node) {
+    let mut children = Vec::new();
+    for child in &node.children {
+        children.push(child.to_string());
+    }
+    println!("{:?}={children:?}", node.kind);
 }
 
 fn postfix_expr(t: &[Token]) -> Res<Node> {
@@ -641,6 +709,7 @@ fn object_field_expr(t: &[Token]) -> Res<Node> {
     Ok((t, node))
 }
 
+// TODO: review this bit
 fn name(t: &[Token]) -> Res<Node> {
     let (t, id) = matches(TokenKind::Ident).parse(t)?;
     let mut node = Node::new(NodeKind::Name);
@@ -1328,5 +1397,72 @@ mod test {
         let tokens = tokenize(source);
         let res = fn_decl(&tokens);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn bin_expr_precedence() {
+        let source = "3 + 4 * 2 / (1 - 5) ^ 2 ^ 3";
+        let tokens = tokenize(source);
+        let (_, node) = expr(&tokens).unwrap();
+        let sexpr = node.to_display_node(source, false).to_string();
+        assert_eq!(
+            sexpr,
+            r#"(BinaryExpr
+  (NumExpr
+    (Number)
+  )
+  (BinaryOperator
+    (Plus)
+  )
+  (BinaryExpr
+    (BinaryExpr
+      (BinaryExpr
+        (BinaryExpr
+          (NumExpr
+            (Number)
+          )
+          (BinaryOperator
+            (Star)
+          )
+          (NumExpr
+            (Number)
+          )
+        )
+        (BinaryOperator
+          (Slash)
+        )
+        (ParenExpr
+          (OpenParen)
+          (BinaryExpr
+            (NumExpr
+              (Number)
+            )
+            (BinaryOperator
+              (Minus)
+            )
+            (NumExpr
+              (Number)
+            )
+          )
+          (CloseParen)
+        )
+      )
+      (BinaryOperator
+        (Caret)
+      )
+      (NumExpr
+        (Number)
+      )
+    )
+    (BinaryOperator
+      (Caret)
+    )
+    (NumExpr
+      (Number)
+    )
+  )
+)
+"#
+        );
     }
 }

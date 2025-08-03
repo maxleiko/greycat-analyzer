@@ -64,6 +64,7 @@ body {
   user-select: none;
   font-weight: bold;
   color: #9cdcfe;
+  padding-right: 0.5em;
 }
 
 .collapsed > ul {

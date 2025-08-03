@@ -70,6 +70,16 @@ impl CstNode {
     }
 }
 
+impl std::fmt::Display for CstNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Node(node) => write!(f, "{:?}", node.kind),
+            Self::Token(token) => write!(f, "{}", token.kind),
+            Self::Error(err) => write!(f, "{err}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Node {
     #[serde(rename = "name")]
@@ -129,6 +139,23 @@ impl Node {
             CstNode::Node(node) => node.last_token_mut(),
             leaf => Some(leaf),
         })
+    }
+
+    pub fn into_children(self) -> Vec<CstNode> {
+        self.children
+    }
+
+    /// Consumes `self` and returns a `Vec<Node>` of the children.
+    ///
+    /// Panics if one of the child is not a `Node`
+    pub fn into_nodes(self) -> Vec<Node> {
+        self.children
+            .into_iter()
+            .map(|child| match child {
+                CstNode::Node(node) => node,
+                _ => panic!("expecting only Node, found NodeError or Token"),
+            })
+            .collect()
     }
 }
 
@@ -214,6 +241,17 @@ impl NodeError {
         match self.kind {
             ErrorKind::ExpectedToken { got, .. } => got,
             ErrorKind::Expected { got, .. } => got,
+        }
+    }
+}
+
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            ErrorKind::ExpectedToken { expected, got } => {
+                write!(f, "expected {expected} got {got}")
+            }
+            ErrorKind::Expected { expected, got } => write!(f, "expected {expected} got {got}"),
         }
     }
 }

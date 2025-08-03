@@ -25,6 +25,20 @@ impl Node {
         })
     }
 
+    /// Returns the first node that matches the given `kind`
+    pub fn get_node_by_field(&self, name: &str) -> Option<&Node> {
+        for child in &self.children {
+            if let CstNode::Node(node) = child {
+                if let Some(field_name) = node.field_name {
+                    if field_name == name {
+                        return Some(node);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Returns all immediate child nodes with the specified `kind`.
     ///
     /// This method only considers direct children and does not recurse into nested nodes.
@@ -44,6 +58,14 @@ impl Node {
     pub fn get_token_by_kind(&self, kind: TokenKind) -> Option<&Token> {
         self.children.iter().find_map(|child| match child {
             CstNode::Token(token) if token.kind == kind => Some(token),
+            _ => None,
+        })
+    }
+
+    /// Returns the first non-trivia token if any
+    pub fn first_non_trivia_token(&self) -> Option<&Token> {
+        self.children.iter().find_map(|child| match child {
+            CstNode::Token(token) if !token.kind.is_trivia() => Some(token),
             _ => None,
         })
     }

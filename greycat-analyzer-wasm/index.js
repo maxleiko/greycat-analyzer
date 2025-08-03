@@ -26,13 +26,15 @@ function renderNode(node) {
 
   if (hasChildren) {
     const toggle = document.createElement('span');
-    toggle.textContent = '- ' + (node.name || node.type);
+    toggle.textContent = '-';
     toggle.className = 'toggle';
     toggle.onclick = () => {
       li.classList.toggle('collapsed');
-      toggle.textContent =
-        (li.classList.contains('collapsed') ? '+ ' : '- ') +
-        (node.name || node.type);
+      if (li.classList.contains('collapsed')) {
+        toggle.textContent = '+';
+      } else {
+        toggle.textContent = '-';
+      }
     };
     li.appendChild(toggle);
   } else if (node.type === 'Token') {
@@ -46,6 +48,15 @@ function renderNode(node) {
   } else {
     li.innerHTML = `<span class="toggle">${node.name}</span>`;
   }
+
+  const nameEl = document.createElement('name');
+  nameEl.classList.add('name');
+  if (node.field_name) {
+    nameEl.textContent = `${node.field_name}: ${node.name}`;
+  } else {
+    nameEl.textContent = node.name;
+  }
+  li.appendChild(nameEl);
 
   const s = span(node);
   const spanEl = document.createElement('span');
