@@ -121,12 +121,11 @@ fn find_gcl_files(dir: &Path, out: &mut Vec<PathBuf>) {
             }
 
             // if it's a file ending with .gcl, collect it
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "gcl" {
-                        out.push(path.canonicalize().unwrap());
-                    }
-                }
+            if path.is_file()
+                && let Some(ext) = path.extension()
+                && ext == "gcl"
+            {
+                out.push(path.canonicalize().unwrap());
             }
         }
     }

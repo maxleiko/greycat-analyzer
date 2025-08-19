@@ -2,7 +2,11 @@ mod ast;
 pub mod cst;
 mod lexer;
 pub mod span;
+mod doc;
+mod manager;
 
+pub use manager::*;
+pub use doc::*;
 pub use lexer::*;
 use lsp_types::Diagnostic;
 

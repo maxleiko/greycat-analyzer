@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{
     cell::OnceCell,
     path::{Path, PathBuf},
@@ -6,25 +7,39 @@ use std::{
 use line_index::{LineCol, LineIndex};
 use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
 
+use crate::{
+    cst::{self, CstStats},
+    tokenize,
+};
+
+#[derive(Debug)]
 pub struct Document {
     pub uri: Uri,
     pub version: i32,
     pub text: String,
-    pub dirty: bool,
+    pub node: cst::Node,
     filepath: OnceCell<PathBuf>,
 }
 
 impl Document {
+    /// The absolute path
     pub fn filepath(&self) -> &Path {
         self.filepath
             .get_or_init(|| PathBuf::from(self.uri.path().as_str()))
     }
 
+    /// The filename with the extension
     pub fn filename(&self) -> &str {
         self.filepath().file_name().unwrap().to_str().unwrap()
     }
 
-    pub fn apply_changes(
+    /// The module name
+    pub fn name(&self) -> &str {
+        let filename = self.filename();
+        &filename[..filename.len() - 4]
+    }
+
+    pub(crate) fn apply_changes(
         &mut self,
         mut changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
@@ -33,7 +48,6 @@ impl Document {
             return;
         }
         self.version = version;
-        self.dirty = true;
         // if at least one of the changes is a full document change, use the last
         // of them as the starting point and ignore all previous changes
         // see: https://github.com/rust-lang/rust-analyzer/blob/master/crates/rust-analyzer/src/lsp/utils.rs#L175
@@ -51,7 +65,7 @@ impl Document {
 
         let index = LineIndex::new(&self.text);
         for change in changes {
-            // the None case can't happen as we handled it above already
+            // we only deal with the Some variant, because None has been handled previously
             if let Some(range) = change.range {
                 let start = index.offset(LineCol {
                     line: range.start.line,
@@ -71,29 +85,38 @@ impl Document {
                 // self.text.insert(start, &change.text);
             }
         }
+
+        // update CST
+        let tokens = tokenize(&self.text);
+        self.node = cst::parse(&tokens);
     }
 }
 
 impl From<TextDocumentItem> for Document {
     fn from(value: TextDocumentItem) -> Self {
+        let tokens = tokenize(&value.text);
+        let node = cst::parse(&tokens);
+
         Self {
             uri: value.uri,
             version: value.version,
             text: value.text,
+            node,
             filepath: OnceCell::new(),
-            dirty: true,
         }
     }
 }
 
-impl std::fmt::Display for Document {
+impl fmt::Display for Document {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stats = CstStats::from(&self.node);
+
         write!(
             f,
-            "uri={}, version={}, len={}",
+            "{} [{}]{:x} [{stats}]",
             self.uri.as_str(),
             self.version,
-            self.text.len()
+            md5::compute(self.text.as_bytes()),
         )
     }
 }

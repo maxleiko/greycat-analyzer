@@ -1,6 +1,12 @@
+mod cst_stats;
+mod fn_finder;
+
+pub use cst_stats::*;
+pub use fn_finder::*;
+
 use crate::{
     Token,
-    cst::{CstNode, Node, NodeError, NodeKind},
+    cst::{CstNode, Node, NodeError},
 };
 
 pub trait CstVisitor {
@@ -107,6 +113,16 @@ fn visit_node<V: CstVisitor>(visitor: &mut V, node: &Node) -> VisitResult {
     }
 }
 
+pub trait CstWalk {
+    fn walk(&mut self, node: &Node);
+}
+
+impl<V: CstVisitor> CstWalk for V {
+    fn walk(&mut self, node: &Node) {
+        let _ = visit_node(self, node);
+    }
+}
+
 /// Convenience function to walk a CST tree
 pub fn walk_cst<V: CstVisitor>(root: &Node, visitor: &mut V) {
     let _ = visit_node(visitor, root);
@@ -149,75 +165,17 @@ fn visit_node_mut<V: CstVisitorMut>(visitor: &mut V, node: &mut Node) -> VisitRe
     }
 }
 
+pub trait CstWalkMut {
+    fn walk(&mut self, node: &mut Node);
+}
+
+impl<V: CstVisitorMut> CstWalkMut for V {
+    fn walk(&mut self, node: &mut Node) {
+        let _ = visit_node_mut(self, node);
+    }
+}
+
 /// Convenience function to walk a CST tree
 pub fn walk_cst_mut<V: CstVisitorMut>(root: &mut Node, visitor: &mut V) {
     let _ = visit_node_mut(visitor, root);
-}
-
-// Example visitor that handles specific node kinds
-#[derive(Default)]
-pub struct FunctionFinder {
-    pub function_names: Vec<String>,
-    pub function_count: usize,
-}
-
-impl CstVisitor for FunctionFinder {
-    fn visit_node_enter(&mut self, node: &Node) -> VisitResult {
-        match node.kind {
-            NodeKind::FnDecl => {
-                self.function_count += 1;
-                // Look for identifier in children to get function name
-                for child in &node.children {
-                    if let CstNode::Node(child_node) = child {
-                        if matches!(child_node.kind, NodeKind::Ident) {
-                            // In a real implementation, you'd extract the actual name
-                            self.function_names
-                                .push(format!("function_{}", self.function_count));
-                            break;
-                        }
-                    }
-                }
-                VisitResult::Continue
-            }
-            // Skip visiting inside expressions for performance
-            NodeKind::Expr => VisitResult::SkipChildren,
-            _ => VisitResult::Continue,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_function_finder() {
-        // Create a test tree with function nodes
-        let root = Node {
-            kind: NodeKind::Module,
-            field_name: None,
-            children: vec![
-                CstNode::Node(Node {
-                    kind: NodeKind::FnDecl,
-                    field_name: None,
-                    children: vec![CstNode::Node(Node {
-                        kind: NodeKind::Ident,
-                        field_name: Some("name"),
-                        children: vec![],
-                    })],
-                }),
-                CstNode::Node(Node {
-                    kind: NodeKind::FnDecl,
-                    field_name: None,
-                    children: vec![],
-                }),
-            ],
-        };
-
-        let mut finder = FunctionFinder::default();
-        walk_cst(&root, &mut finder);
-
-        assert_eq!(finder.function_count, 2);
-        assert_eq!(finder.function_names.len(), 1); // Only one had an identifier child
-    }
 }

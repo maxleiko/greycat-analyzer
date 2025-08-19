@@ -1,6 +1,5 @@
 use crate::{
-    Token, TokenKind,
-    cst::{CstNode, Node, NodeKind},
+    cst::{CstNode, Node, NodeKind}, Token, TokenKind
 };
 
 impl Node {
@@ -8,10 +7,10 @@ impl Node {
     pub fn children_with_kind(&self, kind: NodeKind) -> impl Iterator<Item = &Self> {
         self.children.iter().filter_map(move |child| {
             // match only CstNode::Node with the right kind
-            if let CstNode::Node(node) = child {
-                if node.kind == kind {
-                    return Some(node);
-                }
+            if let CstNode::Node(node) = child
+                && node.kind == kind
+            {
+                return Some(node);
             }
             None
         })
@@ -28,12 +27,11 @@ impl Node {
     /// Returns the first node that matches the given `kind`
     pub fn get_node_by_field(&self, name: &str) -> Option<&Node> {
         for child in &self.children {
-            if let CstNode::Node(node) = child {
-                if let Some(field_name) = node.field_name {
-                    if field_name == name {
-                        return Some(node);
-                    }
-                }
+            if let CstNode::Node(node) = child
+                && let Some(field_name) = node.field_name
+                && field_name == name
+            {
+                return Some(node);
             }
         }
         None
@@ -45,11 +43,10 @@ impl Node {
     pub fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<&Node> {
         let mut nodes = Vec::new();
         for child in &self.children {
-            if let CstNode::Node(node) = child {
-                if node.kind == kind {
+            if let CstNode::Node(node) = child
+                && node.kind == kind {
                     nodes.push(node);
                 }
-            }
         }
         nodes
     }

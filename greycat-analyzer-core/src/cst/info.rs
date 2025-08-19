@@ -71,11 +71,10 @@ fn parse_library<'src>(pragma: &Node, libraries: &mut Libraries<'src>, source: &
 }
 
 fn parse_include<'src>(pragma: &Node, includes: &mut Includes<'src>, source: &'src str) {
-    if let Some(args) = pragma.get_node_by_kind(NodeKind::CallArgs) {
-        if let Some(arg0) = args.get_node_by_kind(NodeKind::StringExpr) {
-            if let Some(value) = arg0.get_token_by_kind(TokenKind::RawString) {
-                includes.push(value.span.to_span_str(source));
-            }
-        }
+    if let Some(args) = pragma.get_node_by_kind(NodeKind::CallArgs)
+        && let Some(arg0) = args.get_node_by_kind(NodeKind::StringExpr)
+        && let Some(value) = arg0.get_token_by_kind(TokenKind::RawString)
+    {
+        includes.push(value.span.to_span_str(source));
     }
 }

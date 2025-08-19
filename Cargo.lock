@@ -245,8 +245,10 @@ dependencies = [
 name = "greycat-analyzer-core"
 version = "0.1.0"
 dependencies = [
+ "line-index",
  "log",
  "lsp-types",
+ "md5",
  "pretty_assertions",
  "serde",
 ]
@@ -259,7 +261,6 @@ dependencies = [
  "ctrlc",
  "dashmap",
  "greycat-analyzer-core",
- "line-index",
  "log",
  "lsp-server",
  "lsp-types",
@@ -392,6 +393,12 @@ dependencies = [
  "serde_json",
  "serde_repr",
 ]
+
+[[package]]
+name = "md5"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae960838283323069879657ca3de837e9f7bbb4c7bf6ea7f1b290d5e9476d2e0"
 
 [[package]]
 name = "memchr"

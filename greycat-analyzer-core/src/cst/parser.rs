@@ -69,11 +69,11 @@ pub fn parse(mut t: &[Token]) -> Node {
     node
 }
 
-fn module_stmt(t: &[Token]) -> Res<Node> {
+fn module_stmt(t: &[Token]) -> Res<'_, Node> {
     one_of(&[&fn_decl, &type_decl, &enum_decl, &mod_var_decl, &mod_pragma]).parse(t)
 }
 
-fn fn_decl(t: &[Token]) -> Res<Node> {
+fn fn_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_FN.parse(t)?;
@@ -101,7 +101,7 @@ fn fn_decl(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn mod_var_decl(t: &[Token]) -> Res<Node> {
+fn mod_var_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_VAR.parse(t)?;
@@ -119,7 +119,7 @@ fn mod_var_decl(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn enum_decl(t: &[Token]) -> Res<Node> {
+fn enum_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_ENUM.parse(t)?;
@@ -136,7 +136,7 @@ fn enum_decl(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn enum_body(t: &[Token]) -> Res<Node> {
+fn enum_body(t: &[Token]) -> Res<'_, Node> {
     many_sep_bound(
         NodeKind::EnumBody,
         OPEN_CURLY,
@@ -147,7 +147,7 @@ fn enum_body(t: &[Token]) -> Res<Node> {
     .parse(t)
 }
 
-fn enum_field(t: &[Token]) -> Res<Node> {
+fn enum_field(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, name) = ident_or_kw_or_strlit(t)?;
     let (t, args) = opt(paren_expr).parse(t).unwrap();
@@ -155,7 +155,7 @@ fn enum_field(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::EnumField, [header, name, args])))
 }
 
-fn type_decl(t: &[Token]) -> Res<Node> {
+fn type_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_TYPE.parse(t)?;
@@ -174,14 +174,14 @@ fn type_decl(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn type_extends(t: &[Token]) -> Res<Node> {
+fn type_extends(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_EXTENDS.parse(t)?;
     let (t, name) = type_ident(t)?;
 
     Ok((t, new_node!(NodeKind::TypeExtends, [kw, name])))
 }
 
-fn type_body(t: &[Token]) -> Res<Node> {
+fn type_body(t: &[Token]) -> Res<'_, Node> {
     many_bound(
         NodeKind::TypeBody,
         OPEN_CURLY,
@@ -191,7 +191,7 @@ fn type_body(t: &[Token]) -> Res<Node> {
     .parse(t)
 }
 
-fn type_attr(t: &[Token]) -> Res<Node> {
+fn type_attr(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header_allow_semi(t)?;
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, name) = ident_or_kw_or_strlit(t)?;
@@ -209,7 +209,7 @@ fn type_attr(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn mod_pragma(t: &[Token]) -> Res<Node> {
+fn mod_pragma(t: &[Token]) -> Res<'_, Node> {
     let (t, doc) = opt(doc).parse(t).unwrap();
     let (t, at) = matches(TokenKind::AtSign).parse(t)?;
     let (t, name) = IDENT_OR_KW.parse(t)?;
@@ -222,17 +222,17 @@ fn mod_pragma(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn ident(t: &[Token]) -> Res<Node> {
+fn ident(t: &[Token]) -> Res<'_, Node> {
     let (t, id) = matches(TokenKind::Ident).parse(t)?;
     Ok((t, new_node!(NodeKind::Ident, [id])))
 }
 
-fn ident_or_kw(t: &[Token]) -> Res<Node> {
+fn ident_or_kw(t: &[Token]) -> Res<'_, Node> {
     let (t, id) = IDENT_OR_KW.parse(t)?;
     Ok((t, new_node!(NodeKind::Ident, [id])))
 }
 
-fn ident_or_kw_or_strlit(t: &[Token]) -> Res<Node> {
+fn ident_or_kw_or_strlit(t: &[Token]) -> Res<'_, Node> {
     alt(
         map(IDENT_OR_KW, |tokens| new_node!(NodeKind::Ident, [tokens])),
         map(str_expr, |n| new_node!(NodeKind::Ident, [n])),
@@ -240,7 +240,7 @@ fn ident_or_kw_or_strlit(t: &[Token]) -> Res<Node> {
     .parse(t)
 }
 
-fn paren_expr(t: &[Token]) -> Res<Node> {
+fn paren_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = OPEN_PAREN.parse(t)?;
     let (t, expr) = expect(expr).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
@@ -248,7 +248,7 @@ fn paren_expr(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::ParenExpr, [open, expr, close])))
 }
 
-fn str_expr(t: &[Token]) -> Res<Node> {
+fn str_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, enter_tpl) = DOUBLE_QUOTE.parse(t)?;
     let (t, opt_raw_string) = opt(RAW_STRING).parse(t).unwrap();
     let (t, exit_tpl) = DOUBLE_QUOTE.parse(t)?;
@@ -259,7 +259,7 @@ fn str_expr(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn type_method(t: &[Token]) -> Res<Node> {
+fn type_method(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header_allow_semi(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_FN.parse(t)?;
@@ -287,14 +287,14 @@ fn type_method(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn initializer(t: &[Token]) -> Res<Node> {
+fn initializer(t: &[Token]) -> Res<'_, Node> {
     let (t, eq) = EQ.parse(t)?;
     let (t, expr) = expr(t)?;
 
     Ok((t, new_node!(NodeKind::Initializer, [eq, expr])))
 }
 
-fn expr(t: &[Token]) -> Res<Node> {
+fn expr(t: &[Token]) -> Res<'_, Node> {
     let (mut t, mut acc) = postfix_expr(t)?;
 
     loop {
@@ -398,7 +398,7 @@ fn expr(t: &[Token]) -> Res<Node> {
 //     println!("{:?}={children:?}", node.kind);
 // }
 
-fn postfix_expr(t: &[Token]) -> Res<Node> {
+fn postfix_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, expr) = prefix_expr(t)?;
     match postfix_op(t) {
         Ok((t, op)) => Ok((t, new_node!(NodeKind::PostfixExpr, [expr, op]))),
@@ -406,11 +406,11 @@ fn postfix_expr(t: &[Token]) -> Res<Node> {
     }
 }
 
-fn postfix_op(t: &[Token]) -> Res<Tokens> {
+fn postfix_op(t: &[Token]) -> Res<'_, Tokens> {
     alt(PLUS_PLUS, MINUS_MINUS).parse(t)
 }
 
-fn prefix_expr(t: &[Token]) -> Res<Node> {
+fn prefix_expr(t: &[Token]) -> Res<'_, Node> {
     match prefix_op(t) {
         Ok((t, op)) => {
             let (t, expr) = call_expr(t)?;
@@ -420,11 +420,11 @@ fn prefix_expr(t: &[Token]) -> Res<Node> {
     }
 }
 
-fn prefix_op(t: &[Token]) -> Res<Tokens> {
+fn prefix_op(t: &[Token]) -> Res<'_, Tokens> {
     one_of(&[&BANG, &PLUS, &MINUS, &STAR, &PLUS_PLUS, &MINUS_MINUS]).parse(t)
 }
 
-fn call_expr(t: &[Token]) -> Res<Node> {
+fn call_expr(t: &[Token]) -> Res<'_, Node> {
     let (mut t, mut recv) = primary_expr(t)?;
 
     loop {
@@ -448,7 +448,7 @@ fn call_expr(t: &[Token]) -> Res<Node> {
     Ok((t, recv))
 }
 
-fn call_expr_spec(t: &[Token]) -> Res<Node> {
+fn call_expr_spec(t: &[Token]) -> Res<'_, Node> {
     one_of(&[
         &call_args,
         &static_member_expr,
@@ -462,21 +462,21 @@ fn call_expr_spec(t: &[Token]) -> Res<Node> {
     .parse(t)
 }
 
-fn static_member_expr(t: &[Token]) -> Res<Node> {
+fn static_member_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, sep) = COLON_COLON.parse(t)?;
     let (t, prop) = ident_or_kw_or_strlit(t)?;
 
     Ok((t, new_node!(NodeKind::StaticMemberExpr, [sep, prop])))
 }
 
-fn member_expr(t: &[Token]) -> Res<Node> {
+fn member_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, sep) = either(DOT, ARROW).parse(t)?;
     let (t, prop) = ident_or_kw_or_strlit(t)?;
 
     Ok((t, new_node!(NodeKind::MemberExpr, [sep, prop])))
 }
 
-fn offset_expr(t: &[Token]) -> Res<Node> {
+fn offset_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = OPEN_SQUARE.parse(t)?;
     let (t, expr) = expr(t)?;
     let (t, close) = CLOSE_SQUARE.parse(t)?;
@@ -484,33 +484,33 @@ fn offset_expr(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::OffsetExpr, [open, expr, close])))
 }
 
-fn as_spec(t: &[Token]) -> Res<Node> {
+fn as_spec(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_AS.parse(t)?;
     let (t, ty) = type_ident(t)?;
 
     Ok((t, new_node!(NodeKind::AsSpec, [kw, ty])))
 }
 
-fn is_spec(t: &[Token]) -> Res<Node> {
+fn is_spec(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_IS.parse(t)?;
     let (t, ty) = type_ident(t)?;
 
     Ok((t, new_node!(NodeKind::IsSpec, [kw, ty])))
 }
 
-fn nonnull_expr(t: &[Token]) -> Res<Node> {
+fn nonnull_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, op) = BANG_BANG.parse(t)?;
 
     Ok((t, new_node!(NodeKind::NonNullExpr, [op])))
 }
 
-fn optional_expr(t: &[Token]) -> Res<Node> {
+fn optional_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, op) = QMARK.parse(t)?;
 
     Ok((t, new_node!(NodeKind::OptionalExpr, [op])))
 }
 
-fn primary_expr(t: &[Token]) -> Res<Node> {
+fn primary_expr(t: &[Token]) -> Res<'_, Node> {
     one_of(&[
         &literal,
         &lambda_expr,
@@ -524,7 +524,7 @@ fn primary_expr(t: &[Token]) -> Res<Node> {
     .parse(t)
 }
 
-fn lambda_expr(t: &[Token]) -> Res<Node> {
+fn lambda_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_FN.parse(t)?;
     let (t, params) = fn_params(t)?;
     let (t, body) = body(t)?;
@@ -532,7 +532,7 @@ fn lambda_expr(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::LambdaExpr, [kw, params, body])))
 }
 
-fn tuple_expr(t: &[Token]) -> Res<Node> {
+fn tuple_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = OPEN_PAREN.parse(t)?;
     let (t, a) = expr(t)?;
     let (t, sep) = COMMA.parse(t)?;
@@ -542,14 +542,14 @@ fn tuple_expr(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::TupleExpr, [open, a, sep, b, close])))
 }
 
-fn object_expr(t: &[Token]) -> Res<Node> {
+fn object_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, ty) = expect(type_ident).parse(t).unwrap();
     let (t, fields) = object_fields(t)?;
 
     Ok((t, new_node!(NodeKind::ObjectExpr, [ty, fields])))
 }
 
-fn template_expr(t: &[Token]) -> Res<Node> {
+fn template_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, enter) = DOUBLE_QUOTE.parse(t)?;
     let (t, children) = many(either(RAW_STRING, interpolation)).parse(t).unwrap();
     let (t, exit) = DOUBLE_QUOTE.parse(t)?;
@@ -560,7 +560,7 @@ fn template_expr(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn interpolation(t: &[Token]) -> Res<Node> {
+fn interpolation(t: &[Token]) -> Res<'_, Node> {
     let (t, enter) = ENTER_INTERPOLATION.parse(t)?;
     let (t, expr) = expr(t)?;
     let (t, exit) = EXIT_INTERPOLATION.parse(t)?;
@@ -568,7 +568,7 @@ fn interpolation(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::Interpolation, [enter, expr, exit])))
 }
 
-fn array_inline_expr(t: &[Token]) -> Res<Node> {
+fn array_inline_expr(t: &[Token]) -> Res<'_, Node> {
     many_sep_bound(
         NodeKind::ArrayInlineExpr,
         OPEN_SQUARE,
@@ -579,49 +579,49 @@ fn array_inline_expr(t: &[Token]) -> Res<Node> {
     .parse(t)
 }
 
-fn literal(t: &[Token]) -> Res<Node> {
+fn literal(t: &[Token]) -> Res<'_, Node> {
     one_of(&[
         &num_expr, &bool_expr, &char_expr, &str_expr, &nan_expr, &inf_expr, &null_expr, &this_expr,
     ])
     .parse(t)
 }
 
-fn num_expr(t: &[Token]) -> Res<Node> {
+fn num_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, num) = NUMBER.parse(t)?;
     Ok((t, new_node!(NodeKind::NumExpr, [num])))
 }
 
-fn bool_expr(t: &[Token]) -> Res<Node> {
+fn bool_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, tokens) = alt(KW_TRUE, KW_FALSE).parse(t)?;
     Ok((t, new_node!(NodeKind::BoolExpr, [tokens])))
 }
 
-fn char_expr(t: &[Token]) -> Res<Node> {
+fn char_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, tokens) = alt(CHAR_T, CHAR_U).parse(t)?;
     Ok((t, new_node!(NodeKind::CharExpr, [tokens])))
 }
 
-fn nan_expr(t: &[Token]) -> Res<Node> {
+fn nan_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, tokens) = KW_NAN.parse(t)?;
     Ok((t, new_node!(NodeKind::NaNExpr, [tokens])))
 }
 
-fn inf_expr(t: &[Token]) -> Res<Node> {
+fn inf_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, tokens) = KW_INFINITY.parse(t)?;
     Ok((t, new_node!(NodeKind::InfExpr, [tokens])))
 }
 
-fn null_expr(t: &[Token]) -> Res<Node> {
+fn null_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, tokens) = KW_NULL.parse(t)?;
     Ok((t, new_node!(NodeKind::NullExpr, [tokens])))
 }
 
-fn this_expr(t: &[Token]) -> Res<Node> {
+fn this_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, tokens) = KW_THIS.parse(t)?;
     Ok((t, new_node!(NodeKind::ThisExpr, [tokens])))
 }
 
-fn object_fields(t: &[Token]) -> Res<Node> {
+fn object_fields(t: &[Token]) -> Res<'_, Node> {
     many_sep_bound(
         NodeKind::ObjectFields,
         OPEN_CURLY,
@@ -632,7 +632,7 @@ fn object_fields(t: &[Token]) -> Res<Node> {
     .parse(t)
 }
 
-fn object_field_entry(t: &[Token]) -> Res<Node> {
+fn object_field_entry(t: &[Token]) -> Res<'_, Node> {
     let (t, name) = ident_or_kw_or_strlit(t)?;
     let (t, sep) = COLON.parse(t)?;
     let (t, expr) = expr(t)?;
@@ -640,21 +640,21 @@ fn object_field_entry(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::ObjectFieldEntry, [name, sep, expr])))
 }
 
-fn object_field_expr(t: &[Token]) -> Res<Node> {
+fn object_field_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, expr) = expr(t)?;
 
     Ok((t, new_node!(NodeKind::ObjectFieldExpr, [expr])))
 }
 
-fn generic_params(t: &[Token]) -> Res<Node> {
+fn generic_params(t: &[Token]) -> Res<'_, Node> {
     many_sep_bound(NodeKind::GenericParams, LT, ident, COMMA, GT).parse(t)
 }
 
-fn type_params(t: &[Token]) -> Res<Node> {
+fn type_params(t: &[Token]) -> Res<'_, Node> {
     many_sep_bound(NodeKind::TypeParams, LT, type_ident, COMMA, GT).parse(t)
 }
 
-fn modifiers(t: &[Token]) -> Res<Node> {
+fn modifiers(t: &[Token]) -> Res<'_, Node> {
     let (t, mods) = many_1(modifier).parse(t)?;
     let mut node = Node {
         kind: NodeKind::FnModifiers,
@@ -673,15 +673,15 @@ fn modifiers(t: &[Token]) -> Res<Node> {
     Ok((t, node))
 }
 
-fn modifier(t: &[Token]) -> Res<Tokens> {
+fn modifier(t: &[Token]) -> Res<'_, Tokens> {
     one_of(&[&KW_NATIVE, &KW_PRIVATE, &KW_STATIC, &KW_ABSTRACT]).parse(t)
 }
 
-fn body(t: &[Token]) -> Res<Node> {
+fn body(t: &[Token]) -> Res<'_, Node> {
     many_bound(NodeKind::Body, OPEN_CURLY, body_stmt, CLOSE_CURLY).parse(t)
 }
 
-fn body_stmt(t: &[Token]) -> Res<Either<Node, Tokens>> {
+fn body_stmt(t: &[Token]) -> Res<'_, Either<Node, Tokens>> {
     either(
         one_of(&[
             &var_decl,
@@ -705,7 +705,7 @@ fn body_stmt(t: &[Token]) -> Res<Either<Node, Tokens>> {
     .parse(t)
 }
 
-fn var_decl(t: &[Token]) -> Res<Node> {
+fn var_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t)?;
     let (t, kw) = KW_VAR.parse(t)?;
     let (t, name) = IDENT.parse(t)?;
@@ -719,7 +719,7 @@ fn var_decl(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn try_stmt(t: &[Token]) -> Res<Node> {
+fn try_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_TRY.parse(t)?;
     let (t, body) = body(t)?;
     let (t, catch) = opt(catch_branch).parse(t).unwrap();
@@ -727,7 +727,7 @@ fn try_stmt(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::TryStmt, [kw, body, catch])))
 }
 
-fn catch_branch(t: &[Token]) -> Res<Node> {
+fn catch_branch(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_CATCH.parse(t)?;
     let (t, param) = opt(catch_param).parse(t).unwrap();
     let (t, body) = body(t)?;
@@ -735,7 +735,7 @@ fn catch_branch(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::CatchBranch, [kw, param, body])))
 }
 
-fn catch_param(t: &[Token]) -> Res<Node> {
+fn catch_param(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = OPEN_PAREN.parse(t)?;
     let (t, name) = expect(IDENT).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
@@ -743,7 +743,7 @@ fn catch_param(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::CatchParam, [open, name, close])))
 }
 
-fn if_stmt(t: &[Token]) -> Res<Node> {
+fn if_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_IF.parse(t)?;
     let (t, condition) = condition(t)?;
     let (t, then_branch) = body(t)?;
@@ -759,7 +759,7 @@ fn if_stmt(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn condition(t: &[Token]) -> Res<Node> {
+fn condition(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = OPEN_PAREN.parse(t)?;
     let (t, name) = expect(expr).parse(t).unwrap();
     let (t, close) = CLOSE_PAREN.parse(t)?;
@@ -767,7 +767,7 @@ fn condition(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::Condition, [open, name, close])))
 }
 
-fn else_if_branch(t: &[Token]) -> Res<Node> {
+fn else_if_branch(t: &[Token]) -> Res<'_, Node> {
     let (t, kw_else) = KW_ELSE.parse(t)?;
     let (t, kw_if) = KW_IF.parse(t)?;
     let (t, condition) = condition(t)?;
@@ -779,14 +779,14 @@ fn else_if_branch(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn else_branch(t: &[Token]) -> Res<Node> {
+fn else_branch(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_ELSE.parse(t)?;
     let (t, branch) = body(t)?;
 
     Ok((t, new_node!(NodeKind::ElseBranch, [kw, branch])))
 }
 
-fn while_stmt(t: &[Token]) -> Res<Node> {
+fn while_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_WHILE.parse(t)?;
     let (t, condition) = expect(condition).parse(t).unwrap();
     let (t, body) = expect(body).parse(t).unwrap();
@@ -794,7 +794,7 @@ fn while_stmt(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::WhileStmt, [kw, condition, body])))
 }
 
-fn do_while_stmt(t: &[Token]) -> Res<Node> {
+fn do_while_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw_do) = KW_DO.parse(t)?;
     let (t, body) = expect(body).parse(t).unwrap();
     let (t, kw_while) = expect(KW_WHILE).parse(t).unwrap();
@@ -810,7 +810,7 @@ fn do_while_stmt(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn for_in_stmt(t: &[Token]) -> Res<Node> {
+fn for_in_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_FOR.parse(t)?;
     let (t, condition) = for_in_condition(t)?;
     let (t, body) = expect(body).parse(t).unwrap();
@@ -818,7 +818,7 @@ fn for_in_stmt(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::ForInStmt, [kw, condition, body])))
 }
 
-fn for_in_condition(t: &[Token]) -> Res<Node> {
+fn for_in_condition(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = OPEN_PAREN.parse(t)?;
     let (t, key) = for_in_param(t)?;
     let (t, comma) = COMMA.parse(t)?;
@@ -838,14 +838,14 @@ fn for_in_condition(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn for_in_param(t: &[Token]) -> Res<Node> {
+fn for_in_param(t: &[Token]) -> Res<'_, Node> {
     let (t, name) = IDENT.parse(t)?;
     let (t, ty) = opt(type_decorator).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::ForInParam, [name, ty])))
 }
 
-fn range(t: &[Token]) -> Res<Node> {
+fn range(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = RANGE_BOUND.parse(t)?;
     let (t, lower) = opt(expr).parse(t).unwrap();
     let (t, dot_dot) = DOT_DOT.parse(t)?;
@@ -858,14 +858,14 @@ fn range(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn for_in_filter(t: &[Token]) -> Res<Node> {
+fn for_in_filter(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = FOR_IN_FILTER.parse(t)?;
     let (t, expr) = expect(expr).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::ForInFilter, [kw, expr])))
 }
 
-fn for_stmt(t: &[Token]) -> Res<Node> {
+fn for_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_FOR.parse(t)?;
     let (t, condition) = for_condition(t)?;
     let (t, body) = expect(body).parse(t).unwrap();
@@ -873,7 +873,7 @@ fn for_stmt(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::ForStmt, [kw, condition, body])))
 }
 
-fn for_condition(t: &[Token]) -> Res<Node> {
+fn for_condition(t: &[Token]) -> Res<'_, Node> {
     let (t, open) = OPEN_PAREN.parse(t)?;
     let (t, init) = expect(var_decl).parse(t).unwrap();
     let (t, condition) = expect(expr_stmt).parse(t).unwrap();
@@ -889,13 +889,13 @@ fn for_condition(t: &[Token]) -> Res<Node> {
     ))
 }
 
-fn for_expr(t: &[Token]) -> Res<Node> {
+fn for_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, expr) = alt(assign_expr, expr).parse(t)?;
 
     Ok((t, new_node!(NodeKind::ForExpr, [expr])))
 }
 
-fn at_stmt(t: &[Token]) -> Res<Node> {
+fn at_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_AT.parse(t)?;
     let (t, expr) = paren_expr(t)?;
     let (t, body) = expect(body).parse(t).unwrap();
@@ -903,7 +903,7 @@ fn at_stmt(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::AtStmt, [kw, expr, body])))
 }
 
-fn throw_stmt(t: &[Token]) -> Res<Node> {
+fn throw_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_THROW.parse(t)?;
     let (t, expr) = expect(expr).parse(t).unwrap();
     let (t, semi) = expect(SEMI).parse(t).unwrap();
@@ -911,14 +911,14 @@ fn throw_stmt(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::ThrowStmt, [kw, expr, semi])))
 }
 
-fn assign_stmt(t: &[Token]) -> Res<Node> {
+fn assign_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, expr) = assign_expr(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::AssignStmt, [expr, semi])))
 }
 
-fn assign_expr(t: &[Token]) -> Res<Node> {
+fn assign_expr(t: &[Token]) -> Res<'_, Node> {
     let (t, lhs) = expr(t)?;
     let (t, op) = ASSIGN_OP.parse(t)?;
     let (t, rhs) = expr(t)?;
@@ -926,28 +926,28 @@ fn assign_expr(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::AssignExpr, [lhs, op, rhs])))
 }
 
-fn breakpoint_stmt(t: &[Token]) -> Res<Node> {
+fn breakpoint_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_BREAKPOINT.parse(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::BreakpointStmt, [kw, semi])))
 }
 
-fn break_stmt(t: &[Token]) -> Res<Node> {
+fn break_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_BREAK.parse(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::BreakStmt, [kw, semi])))
 }
 
-fn continue_stmt(t: &[Token]) -> Res<Node> {
+fn continue_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_CONTINUE.parse(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::ContinueStmt, [kw, semi])))
 }
 
-fn return_stmt(t: &[Token]) -> Res<Node> {
+fn return_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, kw) = KW_RETURN.parse(t)?;
     let (t, expr) = opt(expr).parse(t).unwrap();
     let (t, semi) = expect(SEMI).parse(t).unwrap();
@@ -955,14 +955,14 @@ fn return_stmt(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::ReturnStmt, [kw, expr, semi])))
 }
 
-fn expr_stmt(t: &[Token]) -> Res<Node> {
+fn expr_stmt(t: &[Token]) -> Res<'_, Node> {
     let (t, expr) = expr(t)?;
     let (t, semi) = expect(SEMI).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::ExprStmt, [expr, semi])))
 }
 
-fn stmt_header(t: &[Token]) -> Res<Option<Node>> {
+fn stmt_header(t: &[Token]) -> Res<'_, Option<Node>> {
     let (t, items) = many(doc_or_pragma).parse(t).unwrap();
     match items {
         Some(items) => {
@@ -977,7 +977,7 @@ fn stmt_header(t: &[Token]) -> Res<Option<Node>> {
     }
 }
 
-fn stmt_header_allow_semi(t: &[Token]) -> Res<Option<Node>> {
+fn stmt_header_allow_semi(t: &[Token]) -> Res<'_, Option<Node>> {
     let (t, items) = many(doc_or_pragma_allow_semi).parse(t).unwrap();
     match items {
         Some(items) => {
@@ -992,21 +992,21 @@ fn stmt_header_allow_semi(t: &[Token]) -> Res<Option<Node>> {
     }
 }
 
-fn doc_or_pragma(t: &[Token]) -> Res<Node> {
+fn doc_or_pragma(t: &[Token]) -> Res<'_, Node> {
     alt(doc, pragma).parse(t)
 }
 
-fn doc_or_pragma_allow_semi(t: &[Token]) -> Res<Node> {
+fn doc_or_pragma_allow_semi(t: &[Token]) -> Res<'_, Node> {
     alt(doc, pragma_allow_semi).parse(t)
 }
 
-fn doc(t: &[Token]) -> Res<Node> {
+fn doc(t: &[Token]) -> Res<'_, Node> {
     let (t, items) = many1(DOC_COMMENT).parse(t)?;
 
     Ok((t, new_node!(NodeKind::Doc, [items])))
 }
 
-fn pragma(t: &[Token]) -> Res<Node> {
+fn pragma(t: &[Token]) -> Res<'_, Node> {
     let (t, at) = matches(TokenKind::AtSign).parse(t)?;
     let (t, name) = IDENT_OR_KW.parse(t)?;
     let (t, args) = opt(call_args).parse(t).unwrap();
@@ -1014,36 +1014,36 @@ fn pragma(t: &[Token]) -> Res<Node> {
     Ok((t, new_node!(NodeKind::Pragma, [at, name, args])))
 }
 
-fn pragma_allow_semi(t: &[Token]) -> Res<Node> {
+fn pragma_allow_semi(t: &[Token]) -> Res<'_, Node> {
     let (t, mut pragma) = pragma(t)?;
     let (t, semi) = opt(SEMI).parse(t).unwrap();
     pragma.add(semi);
     Ok((t, pragma))
 }
 
-fn call_args(t: &[Token]) -> Res<Node> {
+fn call_args(t: &[Token]) -> Res<'_, Node> {
     many_sep_bound(NodeKind::CallArgs, OPEN_PAREN, expr, COMMA, CLOSE_PAREN).parse(t)
 }
 
-fn fn_params(t: &[Token]) -> Res<Node> {
+fn fn_params(t: &[Token]) -> Res<'_, Node> {
     many_sep_bound(NodeKind::FnParams, OPEN_PAREN, fn_param, COMMA, CLOSE_PAREN).parse(t)
 }
 
-fn fn_param(t: &[Token]) -> Res<Node> {
+fn fn_param(t: &[Token]) -> Res<'_, Node> {
     let (t, name) = IDENT.parse(t)?;
     let (t, ty) = type_decorator(t)?;
 
     Ok((t, new_node!(NodeKind::FnParam, [name, ty])))
 }
 
-fn type_decorator(t: &[Token]) -> Res<Node> {
+fn type_decorator(t: &[Token]) -> Res<'_, Node> {
     let (t, c) = COLON.parse(t)?;
     let (t, ty) = expect(type_ident).parse(t).unwrap();
 
     Ok((t, new_node!(NodeKind::TypeDecorator, [c, ty])))
 }
 
-fn type_ident(t: &[Token]) -> Res<Node> {
+fn type_ident(t: &[Token]) -> Res<'_, Node> {
     let (t, kw_typeof) = opt(KW_TYPEOF).parse(t).unwrap();
     let (t, parts) = many(seq2(IDENT_OR_KW, COLON_COLON)).parse(t).unwrap();
     let (t, name) = IDENT_OR_KW.parse(t)?;
@@ -1063,7 +1063,7 @@ fn type_ident(t: &[Token]) -> Res<Node> {
 /// Try operators in precedence order (highest to lowest)
 ///
 /// This way we fail fast on the most common cases
-fn binary_op(t: &[Token]) -> Res<Tokens> {
+fn binary_op(t: &[Token]) -> Res<'_, Tokens> {
     // Precedence 13: Exponentiation
     if let Ok(result) = POW_OP.parse(t) {
         return Ok(result);
@@ -1243,16 +1243,16 @@ where
                     }
                     Err(_) => {
                         // we actually expected a separator, record the error
-                        if let Some(last) = node.last_token_mut() {
-                            if let CstNode::Token(tok) = last {
-                                *last = CstNode::Error(NodeError {
-                                    kind: ErrorKind::Expected {
-                                        expected: "a separator",
-                                        got: tok.kind,
-                                    },
-                                    span: tok.span,
-                                });
-                            }
+                        if let Some(last) = node.last_token_mut()
+                            && let CstNode::Token(tok) = last
+                        {
+                            *last = CstNode::Error(NodeError {
+                                kind: ErrorKind::Expected {
+                                    expected: "a separator",
+                                    got: tok.kind,
+                                },
+                                span: tok.span,
+                            });
                         }
                         let (t, i) = item.parse(tokens)?;
                         node.add(i);
