@@ -292,13 +292,10 @@ fn type_extends(t: &[Token]) -> Res<'_, Node> {
 }
 
 fn type_body(t: &[Token]) -> Res<'_, Node> {
-    many_bound(
-        NodeKind::TypeBody,
-        OPEN_CURLY,
-        either(alt(type_attr, type_method), SEMI),
-        CLOSE_CURLY,
-    )
-    .parse(t)
+    let item = either(alt(type_attr, type_method), SEMI);
+    // let named_item = named_expect("a type field or method", item);
+    // TODO need to find a way to put any token in error as long as the closing token is found
+    many_bound(NodeKind::TypeBody, OPEN_CURLY, item, CLOSE_CURLY).parse(t)
 }
 
 fn type_attr(t: &[Token]) -> Res<'_, Node> {
@@ -1268,7 +1265,7 @@ pub fn acc_trivia<'t>(acc: &mut Vec<CstNode>, t: &'t [Token]) -> &'t [Token] {
     &t[skip..]
 }
 
-pub fn many_bound<'t, O, I, C, T>(
+pub fn many_bound<'t, O, I, C, T, E>(
     kind: NodeKind,
     open: O,
     item: I,
@@ -1276,7 +1273,7 @@ pub fn many_bound<'t, O, I, C, T>(
 ) -> impl Parser<'t, Node>
 where
     O: Parser<'t, Tokens>,
-    I: Parser<'t, T>,
+    I: Parser<'t, T, E>,
     C: Parser<'t, Tokens>,
     T: AddToNode,
 {
