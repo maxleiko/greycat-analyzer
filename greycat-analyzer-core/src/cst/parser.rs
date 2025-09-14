@@ -66,13 +66,7 @@ pub fn parse(mut t: &[Token]) -> Node {
                 t = next;
             }
             Err(_) => {
-                node.add(NodeError {
-                    kind: ErrorKind::Expected {
-                        expected: "a module statement",
-                        got: t[0].kind,
-                    },
-                    span: t[0].span,
-                });
+                node.add(expected!("a module statement", t[0]));
                 t = &t[1..]; // advance
             }
         }
@@ -501,13 +495,7 @@ fn expr(t: &[Token]) -> Res<'_, Node> {
                 acc.field("lhs");
                 node.add(acc);
                 node.add(op);
-                node.add(NodeError {
-                    kind: ErrorKind::Expected {
-                        expected: "an expression",
-                        got: t[0].kind,
-                    },
-                    span: t[0].span,
-                });
+                node.add(expected!("an expression", t[0]));
                 acc = node;
             }
         }
@@ -1255,16 +1243,7 @@ where
 {
     move |t| match parser.parse(t) {
         Ok((t, res)) => Ok((t, Either::Left(res))),
-        Err(_) => Ok((
-            t,
-            Either::Right(NodeError {
-                kind: ErrorKind::Expected {
-                    expected: parser.name(),
-                    got: t[0].kind,
-                },
-                span: t[0].span,
-            }),
-        )),
+        Err(_) => Ok((t, Either::Right(expected!(parser.name(), t[0])))),
     }
 }
 
@@ -1314,13 +1293,7 @@ where
             if tokens.len() == 1 {
                 // EOF reached
                 let err = close.parse(tokens).err().unwrap();
-                node.add(NodeError {
-                    kind: ErrorKind::Expected {
-                        expected: "a closing token",
-                        got: tokens[0].kind,
-                    },
-                    span: tokens[0].span,
-                });
+                node.add(expected!("a closing token", tokens[0]));
                 return Err(err);
             }
             // check for closing bound
@@ -1372,13 +1345,7 @@ where
             if tokens.len() == 1 {
                 // EOF reached
                 let err = close.parse(tokens).err().unwrap();
-                node.add(NodeError {
-                    kind: ErrorKind::Expected {
-                        expected: "a closing token",
-                        got: tokens[0].kind,
-                    },
-                    span: tokens[0].span,
-                });
+                node.add(expected!("a closing token", tokens[0]));
                 return Err(err);
             }
             // check for closing bound
@@ -1398,13 +1365,7 @@ where
                         if let Some(last) = node.last_token_mut()
                             && let CstNode::Token(tok) = last
                         {
-                            *last = CstNode::Error(NodeError {
-                                kind: ErrorKind::Expected {
-                                    expected: "a separator",
-                                    got: tok.kind,
-                                },
-                                span: tok.span,
-                            });
+                            *last = CstNode::Error(expected!("a separator", tok));
                         }
                         let (t, i) = item.parse(tokens)?;
                         node.add(i);
@@ -1421,25 +1382,13 @@ where
                     Err(_) => match either(sep, close).parse(tokens) {
                         Ok((t, Either::Left(s))) => {
                             node.add(s.leading);
-                            node.add(NodeError {
-                                kind: ErrorKind::Expected {
-                                    expected: "a separator",
-                                    got: s.token.kind,
-                                },
-                                span: s.token.span,
-                            });
+                            node.add(expected!("a separator", s.token));
                             tokens = t;
                             state = ManySepBoundState::ExpectItem;
                         }
                         Ok((t, Either::Right(c))) => {
                             node.add(c.leading);
-                            node.add(NodeError {
-                                kind: ErrorKind::Expected {
-                                    expected: "a separator",
-                                    got: c.token.kind,
-                                },
-                                span: c.token.span,
-                            });
+                            node.add(expected!("a separator", c.token));
                             return Ok((t, node));
                         }
                         Err(err) => return Err(err),
