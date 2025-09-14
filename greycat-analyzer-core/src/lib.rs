@@ -8,14 +8,16 @@ mod manager;
 pub use manager::*;
 pub use doc::*;
 pub use lexer::*;
-use lsp_types::Diagnostic;
+
+/// Re-export `lsp_types`
+pub use lsp_types;
 
 // TODO move this to HIR
 #[allow(clippy::ptr_arg)]
 pub fn parse(
     _filename: &str,
     _source: &str,
-    _diagnostics: &mut Vec<Diagnostic>,
+    _diagnostics: &mut Vec<lsp_types::Diagnostic>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     todo!()
 }

@@ -11,7 +11,7 @@
       "cargo": {
         "args": ["build", "--bin", "greycat-analyzer"]
       },
-      "args": ["lint", "${workspaceFolder}/project.gcl"]
+      "args": ["lint", "${workspaceFolder}/examples/project.gcl"]
     },
     {
       "type": "lldb",
@@ -20,7 +20,7 @@
       "cargo": {
         "args": ["build", "--bin", "greycat-analyzer"]
       },
-      "args": ["cst", "${workspaceFolder}/project.gcl", "--trivia"]
+      "args": ["cst", "${workspaceFolder}/examples/project.gcl", "--trivia"]
     },
   ]
 }

@@ -121,6 +121,12 @@ impl std::iter::Sum for ParseError {
 pub type Res<'t, T, E = ParseError> = std::result::Result<(&'t [Token], T), E>;
 
 pub trait Parser<'t, T, E = ParseError> {
+    fn name(&self) -> &'static str {
+        std::any::type_name_of_val(self)
+            .rsplit("::")
+            .next()
+            .unwrap()
+    }
     fn parse(&self, t: &'t [Token]) -> Res<'t, T, E>;
 }
 
@@ -151,6 +157,99 @@ pub struct Matches {
 }
 
 impl<'t> Parser<'t, Tokens> for Matches {
+    fn name(&self) -> &'static str {
+        match self.kind {
+            TokenKind::EolComment => "eol comment",
+            TokenKind::DocComment => "doc",
+            TokenKind::BlockComment => "block comment",
+            TokenKind::Space(_) => "space",
+            TokenKind::NewLine(_) => "newline",
+            TokenKind::Ident => "identifier",
+            TokenKind::Number => "number",
+            TokenKind::Char { .. } => "char",
+            TokenKind::Semi => "';'",
+            TokenKind::Comma => "','",
+            TokenKind::Dot => "'.'",
+            TokenKind::DotDot => "'..'",
+            TokenKind::OpenParen => "'('",
+            TokenKind::CloseParen => "')'",
+            TokenKind::OpenCurly => "'{'",
+            TokenKind::CloseCurly => "'}'",
+            TokenKind::OpenSquare => "'['",
+            TokenKind::CloseSquare => "']'",
+            TokenKind::AtSign => "'@'",
+            TokenKind::Question => "'?'",
+            TokenKind::QuestionEq => "'?='",
+            TokenKind::QuestionQuestion => "'??'",
+            TokenKind::Colon => "':'",
+            TokenKind::ColonColon => "'::'",
+            TokenKind::Eq => "'='",
+            TokenKind::EqEq => "'=='",
+            TokenKind::Bang => "'!'",
+            TokenKind::BangEq => "'!='",
+            TokenKind::BangBang => "'!!'",
+            TokenKind::Lt => "'<'",
+            TokenKind::LtEq => "'<='",
+            TokenKind::Gt => "'>'",
+            TokenKind::GtEq => "'>='",
+            TokenKind::Minus => "'-'",
+            TokenKind::MinusMinus => "'--'",
+            TokenKind::Arrow => "'->'",
+            TokenKind::AndAnd => "'&&'",
+            TokenKind::OrOr => "'||'",
+            TokenKind::Plus => "'+'",
+            TokenKind::PlusPlus => "'++'",
+            TokenKind::Star => "'*'",
+            TokenKind::Slash => "'/'",
+            TokenKind::Caret => "'^'",
+            TokenKind::Percent => "'%'",
+            TokenKind::DoubleQuote => "'\"'",
+            TokenKind::EnterInterpolation => "'${'",
+            TokenKind::ExitInterpolation => "'}'",
+            TokenKind::RawString => "raw string",
+            TokenKind::Abstract => "'abstract'",
+            TokenKind::As => "'as'",
+            TokenKind::At => "'at'",
+            TokenKind::Break => "'break'",
+            TokenKind::Breakpoint => "'breakpoint'",
+            TokenKind::Catch => "'catch'",
+            TokenKind::Continue => "'continue'",
+            TokenKind::Do => "'do'",
+            TokenKind::Else => "'else'",
+            TokenKind::Enum => "'enum'",
+            TokenKind::Extends => "'extends'",
+            TokenKind::False => "'false'",
+            TokenKind::For => "'for'",
+            TokenKind::Fn => "'fn'",
+            TokenKind::If => "'if'",
+            TokenKind::In => "'in'",
+            TokenKind::Is => "'is'",
+            TokenKind::Limit => "'limit'",
+            TokenKind::Native => "'native'",
+            TokenKind::Null => "'null'",
+            TokenKind::NaN => "'NaN'",
+            TokenKind::Infinity => "'infinity'",
+            TokenKind::Private => "'private'",
+            TokenKind::Return => "'return'",
+            TokenKind::Sampling => "'sampling'",
+            TokenKind::Skip => "'skip'",
+            TokenKind::Static => "'static'",
+            TokenKind::Task => "'task'",
+            TokenKind::This => "'this'",
+            TokenKind::Throw => "'throw'",
+            TokenKind::Try => "'try'",
+            TokenKind::Type => "'type'",
+            TokenKind::True => "'true'",
+            TokenKind::TypeOf => "'typeof'",
+            TokenKind::Use => "'use'",
+            TokenKind::Var => "'var'",
+            TokenKind::While => "'while'",
+            TokenKind::Without => "'without'",
+            TokenKind::Unknown => "unknown",
+            TokenKind::Eof => "EOF",
+        }
+    }
+
     fn parse(&self, t: &'t [Token]) -> Res<'t, Tokens, ParseError> {
         let (t, tok) = peek(t);
         if tok.token.kind == self.kind {

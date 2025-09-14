@@ -31,6 +31,18 @@ macro_rules! count {
     };
 }
 
+macro_rules! expected {
+    ($expected:expr, $token:expr) => {
+        NodeError {
+            kind: ErrorKind::Expected {
+                expected: $expected,
+                got: $token.kind,
+            },
+            span: $token.span,
+        }
+    };
+}
+
 pub fn parse(mut t: &[Token]) -> Node {
     let mut node = Node::with_capacity(NodeKind::Module, 128);
     loop {
@@ -77,63 +89,139 @@ fn fn_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_FN.parse(t)?;
-    let (t, name) = ident_or_kw(t)?;
-    let (t, generics) = opt(generic_params).parse(t).unwrap();
-    let (t, params) = fn_params(t)?;
-    let (t, return_type) = opt(type_decorator).parse(t).unwrap();
-    let (t, body_or_semi) = either(body, SEMI).parse(t)?;
-
-    Ok((
-        t,
-        new_node!(
-            NodeKind::FnDecl,
-            [
-                header,
-                modifiers,
-                kw,
-                name,
-                generics,
-                params,
-                return_type,
-                body_or_semi,
-            ]
-        ),
-    ))
+    match ident_or_kw(t) {
+        Ok((t, name)) => {
+            let (t, generics) = opt(generic_params).parse(t).unwrap();
+            match fn_params(t) {
+                Ok((t, params)) => {
+                    let (t, return_type) = opt(type_decorator).parse(t).unwrap();
+                    match either(body, SEMI).parse(t) {
+                        Ok((t, body_or_semi)) => Ok((
+                            t,
+                            new_node!(
+                                NodeKind::FnDecl,
+                                [
+                                    header,
+                                    modifiers,
+                                    kw,
+                                    name,
+                                    generics,
+                                    params,
+                                    return_type,
+                                    body_or_semi,
+                                ]
+                            ),
+                        )),
+                        Err(_) => Ok((
+                            t,
+                            new_node!(
+                                NodeKind::FnDecl,
+                                [
+                                    header,
+                                    modifiers,
+                                    kw,
+                                    name,
+                                    generics,
+                                    params,
+                                    return_type,
+                                    expected!("function body or semi", t[0])
+                                ]
+                            ),
+                        )),
+                    }
+                }
+                Err(_) => Ok((
+                    t,
+                    new_node!(
+                        NodeKind::FnDecl,
+                        [
+                            header,
+                            modifiers,
+                            kw,
+                            name,
+                            generics,
+                            expected!("function params", t[0])
+                        ]
+                    ),
+                )),
+            }
+        }
+        Err(_) => Ok((
+            t,
+            new_node!(
+                NodeKind::FnDecl,
+                [
+                    header,
+                    modifiers,
+                    kw,
+                    expected!("function identifier", t[0])
+                ]
+            ),
+        )),
+    }
 }
 
 fn mod_var_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_VAR.parse(t)?;
-    let (t, name) = IDENT_OR_KW.parse(t)?;
-    let (t, ty) = opt(type_decorator).parse(t).unwrap();
-    let (t, init) = opt(initializer).parse(t).unwrap();
-    let (t, semi) = opt(SEMI).parse(t).unwrap();
+    match ident_or_kw(t) {
+        Ok((t, name)) => {
+            let (t, ty) = opt(type_decorator).parse(t).unwrap();
+            let (t, init) = opt(initializer).parse(t).unwrap();
+            let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    Ok((
-        t,
-        new_node!(
-            NodeKind::ModVarDecl,
-            [header, modifiers, kw, name, ty, init, semi,]
-        ),
-    ))
+            Ok((
+                t,
+                new_node!(
+                    NodeKind::ModVarDecl,
+                    [header, modifiers, kw, name, ty, init, semi]
+                ),
+            ))
+        }
+        Err(_) => Ok((
+            t,
+            new_node!(
+                NodeKind::ModVarDecl,
+                [header, modifiers, kw, expected!("identifier", t[0])]
+            ),
+        )),
+    }
 }
 
 fn enum_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_ENUM.parse(t)?;
-    let (t, name) = IDENT_OR_KW.parse(t)?;
-    let (t, body) = enum_body(t)?;
-    let (t, semi) = opt(SEMI).parse(t).unwrap();
+    match ident_or_kw(t) {
+        Ok((t, name)) => match enum_body(t) {
+            Ok((t, body)) => {
+                let (t, semi) = opt(SEMI).parse(t).unwrap();
 
-    Ok((
-        t,
-        new_node!(
-            NodeKind::EnumDecl,
-            [header, modifiers, kw, name, body, semi,]
-        ),
-    ))
+                Ok((
+                    t,
+                    new_node!(
+                        NodeKind::EnumDecl,
+                        [header, modifiers, kw, name, body, semi,]
+                    ),
+                ))
+            }
+            Err(_) => Ok((
+                t,
+                new_node!(
+                    NodeKind::EnumDecl,
+                    [header, modifiers, kw, name, expected!("enum body", t[0])]
+                ),
+            )),
+        },
+        Err(_) => Ok((
+            t,
+            new_node!(
+                NodeKind::EnumDecl,
+                [header, modifiers, kw, expected!("enum identifier", t[0])]
+            ),
+        )),
+    }
 }
 
 fn enum_body(t: &[Token]) -> Res<'_, Node> {
@@ -159,19 +247,47 @@ fn type_decl(t: &[Token]) -> Res<'_, Node> {
     let (t, header) = stmt_header(t).unwrap();
     let (t, modifiers) = opt(modifiers).parse(t).unwrap();
     let (t, kw) = KW_TYPE.parse(t)?;
-    let (t, name) = IDENT_OR_KW.parse(t)?;
-    let (t, params) = opt(generic_params).parse(t).unwrap();
-    let (t, extend) = opt(type_extends).parse(t).unwrap();
-    let (t, body) = type_body(t)?;
-    let (t, semi) = opt(SEMI).parse(t).unwrap();
 
-    Ok((
-        t,
-        new_node!(
-            NodeKind::TypeDecl,
-            [header, modifiers, kw, name, params, extend, body, semi]
-        ),
-    ))
+    match ident_or_kw(t) {
+        Ok((t, name)) => {
+            let (t, params) = opt(generic_params).parse(t).unwrap();
+            let (t, extend) = opt(type_extends).parse(t).unwrap();
+            match type_body(t) {
+                Ok((t, body)) => {
+                    let (t, semi) = opt(SEMI).parse(t).unwrap();
+                    Ok((
+                        t,
+                        new_node!(
+                            NodeKind::TypeDecl,
+                            [header, modifiers, kw, name, params, extend, body, semi]
+                        ),
+                    ))
+                }
+                Err(_) => Ok((
+                    t,
+                    new_node!(
+                        NodeKind::TypeDecl,
+                        [
+                            header,
+                            modifiers,
+                            kw,
+                            name,
+                            params,
+                            extend,
+                            expected!("type body", t[0]),
+                        ]
+                    ),
+                )),
+            }
+        }
+        Err(_) => Ok((
+            t,
+            new_node!(
+                NodeKind::TypeDecl,
+                [header, modifiers, kw, expected!("type identifier", t[0])]
+            ),
+        )),
+    }
 }
 
 fn type_extends(t: &[Token]) -> Res<'_, Node> {
@@ -212,14 +328,24 @@ fn type_attr(t: &[Token]) -> Res<'_, Node> {
 fn mod_pragma(t: &[Token]) -> Res<'_, Node> {
     let (t, doc) = opt(doc).parse(t).unwrap();
     let (t, at) = matches(TokenKind::AtSign).parse(t)?;
-    let (t, name) = IDENT_OR_KW.parse(t)?;
-    let (t, args) = opt(call_args).parse(t).unwrap();
-    let (t, semi) = SEMI.parse(t)?;
+    match ident_or_kw(t) {
+        Ok((t, name)) => {
+            let (t, args) = opt(call_args).parse(t).unwrap();
+            let (t, semi) = expect(SEMI).parse(t).unwrap();
 
-    Ok((
-        t,
-        new_node!(NodeKind::ModPragma, [doc, at, name, args, semi]),
-    ))
+            Ok((
+                t,
+                new_node!(NodeKind::ModPragma, [doc, at, name, args, semi]),
+            ))
+        }
+        Err(_) => Ok((
+            t,
+            new_node!(
+                NodeKind::ModPragma,
+                [doc, at, expected!("pragma identifier", t[0])]
+            ),
+        )),
+    }
 }
 
 fn ident(t: &[Token]) -> Res<'_, Node> {
@@ -1108,6 +1234,21 @@ fn binary_op(t: &[Token]) -> Res<'_, Tokens> {
     .into())
 }
 
+struct NamedParser<P> {
+    name: &'static str,
+    parser: P,
+}
+
+impl<'t, T, P: Parser<'t, T>> Parser<'t, T> for NamedParser<P> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn parse(&self, t: &'t [Token]) -> Res<'t, T, ParseError> {
+        self.parser.parse(t)
+    }
+}
+
 pub fn expect<'t, P, T>(parser: P) -> impl Parser<'t, Either<T, NodeError>, Infallible>
 where
     P: Parser<'t, T>,
@@ -1118,16 +1259,27 @@ where
             t,
             Either::Right(NodeError {
                 kind: ErrorKind::Expected {
-                    expected: std::any::type_name_of_val(&parser)
-                        .rsplit("::")
-                        .next()
-                        .unwrap(),
+                    expected: parser.name(),
                     got: t[0].kind,
                 },
                 span: t[0].span,
             }),
         )),
     }
+}
+
+#[inline(always)]
+pub fn named_expect<'t, P, T>(
+    expected: &'static str,
+    parser: P,
+) -> impl Parser<'t, Either<T, NodeError>, Infallible>
+where
+    P: Parser<'t, T>,
+{
+    expect(NamedParser {
+        name: expected,
+        parser,
+    })
 }
 
 pub fn acc_trivia<'t>(acc: &mut Vec<CstNode>, t: &'t [Token]) -> &'t [Token] {

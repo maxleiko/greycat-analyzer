@@ -5,7 +5,10 @@ use std::{
 };
 
 use crate::utils::AnyError;
-use greycat_analyzer_core::cst::{ModuleInfo, SourceModule};
+use greycat_analyzer_core::{
+    cst::{ModuleInfo, SourceModule},
+    lsp_types::Diagnostic,
+};
 
 #[derive(clap::Parser)]
 #[clap(about = "Lints a project")]
@@ -18,14 +21,14 @@ impl Lint {
     pub fn run(self) -> Result<(), AnyError> {
         env_logger::init();
 
-        let project_dir = self
-            .project
+        let project_filepath = self.project.canonicalize()?;
+        let project_dir = project_filepath
             .parent()
             .expect("unable to resolve project's parent directory");
 
         let start = Instant::now();
         let mut mgr = SourceManager::new();
-        parse_module(project_dir, &self.project, &mut mgr)?;
+        parse_module(project_dir, &project_filepath, &mut mgr)?;
         let took = start.elapsed();
 
         mgr.display_timings();
@@ -35,17 +38,16 @@ impl Lint {
     }
 }
 
+#[derive(Default, Debug)]
 struct SourceManager {
     sources: HashMap<PathBuf, SourceModule>,
     timings: HashMap<PathBuf, Duration>,
+    errors: HashMap<PathBuf, Vec<Diagnostic>>,
 }
 
 impl SourceManager {
     pub fn new() -> Self {
-        Self {
-            sources: Default::default(),
-            timings: Default::default(),
-        }
+        Self::default()
     }
 
     pub fn display_timings(&self) {
@@ -68,10 +70,10 @@ fn parse_module(
     mgr: &mut SourceManager,
 ) -> Result<(), AnyError> {
     let start = Instant::now();
+
     let module = greycat_analyzer_core::cst::parse_file(filepath)?;
     let took = start.elapsed();
     let info = ModuleInfo::from(&module);
-    // println!("{took:>8.2?} {}", filepath.display());
     for lib in &info.libraries {
         // println!(
         //     "@library(\"{}\", {:?})",
@@ -82,7 +84,26 @@ fn parse_module(
     }
     let mut files = Vec::new();
     for include in &info.includes {
-        let include_dir = project_dir.join(include.image).canonicalize().unwrap();
+        let include_dir = match project_dir.join(include.image).canonicalize() {
+            Ok(path) => path,
+            Err(err) => {
+                mgr.errors
+                    .entry(filepath.to_path_buf())
+                    .and_modify(|entry| {
+                        entry.push(Diagnostic::new_simple(
+                            include.span.to_range(),
+                            err.to_string(),
+                        ));
+                    })
+                    .or_insert_with(|| {
+                        vec![Diagnostic::new_simple(
+                            include.span.to_range(),
+                            err.to_string(),
+                        )]
+                    });
+                continue;
+            }
+        };
         // println!("@include(\"{}\")", include_dir.display());
         files.clear();
         find_gcl_files(&include_dir, &mut files);

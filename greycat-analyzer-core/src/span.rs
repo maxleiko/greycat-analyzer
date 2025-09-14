@@ -1,3 +1,4 @@
+use core::fmt;
 use std::ops::Range;
 
 use lsp_types as lsp;
@@ -46,6 +47,12 @@ impl Span {
 pub struct SpanStr<'src> {
     pub span: Span,
     pub image: &'src str,
+}
+
+impl fmt::Display for SpanStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.image.fmt(f)
+    }
 }
 
 #[derive(
