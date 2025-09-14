@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use greycat_analyzer_core::tokenize;
+use greycat_analyzer_core::{bumpalo::Bump, cst::ParserCtx, tokenize};
 
 use crate::utils::AnyError;
 
@@ -23,8 +23,12 @@ impl Cst {
         //     .parse_module(&source)
         //     .map_err(|err| err.to_source_error(&source))?;
         // println!("{}", module.to_display_node(&source, self.trivia));
-        let tokens = tokenize(&source);
-        let module = greycat_analyzer_core::cst::parse(&tokens);
+        let arena = Bump::new();
+        let ctx = ParserCtx {
+            arena: &arena,
+            tokens: &tokenize(&source),
+        };
+        let module = greycat_analyzer_core::cst::parse(ctx);
         println!("{}", module.to_display_node(&source, self.trivia));
 
         Ok(())

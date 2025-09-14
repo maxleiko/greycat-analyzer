@@ -32,7 +32,7 @@ impl CstVisitor for FunctionFinder {
     }
 }
 
-impl From<&Node> for FunctionFinder {
+impl From<&Node<'_>> for FunctionFinder {
     fn from(value: &Node) -> Self {
         let mut stats = Self::default();
         stats.walk(value);
@@ -42,24 +42,25 @@ impl From<&Node> for FunctionFinder {
 
 #[test]
 fn test_function_finder() {
+    let arena = Bump::new();
     // Create a test tree with function nodes
     let root = Node {
         kind: NodeKind::Module,
         field_name: None,
-        children: vec![
+        children: bumpalo::vec![in &arena;
             CstNode::Node(Node {
                 kind: NodeKind::FnDecl,
                 field_name: None,
-                children: vec![CstNode::Node(Node {
+                children: bumpalo::vec![in &arena; CstNode::Node(Node {
                     kind: NodeKind::Ident,
                     field_name: Some("name"),
-                    children: vec![],
+                    children: bumpalo::vec![in &arena],
                 })],
             }),
             CstNode::Node(Node {
                 kind: NodeKind::FnDecl,
                 field_name: None,
-                children: vec![],
+                children: bumpalo::vec![in &arena],
             }),
         ],
     };

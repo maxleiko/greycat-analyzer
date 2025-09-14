@@ -1,7 +1,7 @@
 use super::{CstNode, Node};
 
 pub struct NodeCursor<'a> {
-    nodes: &'a [CstNode],
+    nodes: &'a [CstNode<'a>],
     index: usize,
 }
 
@@ -19,11 +19,11 @@ impl<'a> NodeCursor<'a> {
         }
     }
 
-    pub fn peek_node(&self) -> Option<&'a CstNode> {
+    pub fn peek_node(&self) -> Option<&'a CstNode<'_>> {
         self.nodes.get(self.index)
     }
 
-    fn next_node(&mut self) -> Option<&'a CstNode> {
+    fn next_node(&mut self) -> Option<&'a CstNode<'_>> {
         loop {
             match self.nodes.get(self.index)? {
                 CstNode::Token(tok) if tok.kind.is_trivia() => {
@@ -39,7 +39,7 @@ impl<'a> NodeCursor<'a> {
 }
 
 impl<'a> Iterator for NodeCursor<'a> {
-    type Item = &'a CstNode;
+    type Item = &'a CstNode<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_node()

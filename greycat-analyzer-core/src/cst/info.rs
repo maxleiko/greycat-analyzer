@@ -19,14 +19,16 @@ pub struct ModuleInfo<'src> {
     pub includes: Includes<'src>,
 }
 
-impl<'src> From<&'src SourceModule> for ModuleInfo<'src> {
+impl<'src> From<&'src SourceModule<'_>> for ModuleInfo<'src> {
     fn from(value: &'src SourceModule) -> Self {
         let source = &value.source[..];
         let mut libraries = Default::default();
         let mut includes = Default::default();
 
         for pragma in value.module.children_with_kind(NodeKind::ModPragma) {
-            if let Some(id) = pragma.get_token_by_kind(TokenKind::Ident) {
+            if let Some(ident) = pragma.get_node_by_kind(NodeKind::Ident)
+                && let Some(id) = ident.get_token_by_kind(TokenKind::Ident)
+            {
                 match &source[id.span] {
                     "library" => parse_library(pragma, &mut libraries, source),
                     "include" => parse_include(pragma, &mut includes, source),

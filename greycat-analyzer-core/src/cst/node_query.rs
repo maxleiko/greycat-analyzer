@@ -2,7 +2,7 @@ use crate::{
     cst::{CstNode, Node, NodeKind}, Token, TokenKind
 };
 
-impl Node {
+impl Node<'_> {
     /// Returns an iterator over child nodes with the given `kind`
     pub fn children_with_kind(&self, kind: NodeKind) -> impl Iterator<Item = &Self> {
         self.children.iter().filter_map(move |child| {
@@ -17,7 +17,7 @@ impl Node {
     }
 
     /// Returns the first node that matches the given `kind`
-    pub fn get_node_by_kind(&self, kind: NodeKind) -> Option<&Node> {
+    pub fn get_node_by_kind(&self, kind: NodeKind) -> Option<&Node<'_>> {
         self.children.iter().find_map(|child| match child {
             CstNode::Node(node) if node.kind == kind => Some(node),
             _ => None,
@@ -25,7 +25,7 @@ impl Node {
     }
 
     /// Returns the first node that matches the given `kind`
-    pub fn get_node_by_field(&self, name: &str) -> Option<&Node> {
+    pub fn get_node_by_field(&self, name: &str) -> Option<&Node<'_>> {
         for child in &self.children {
             if let CstNode::Node(node) = child
                 && let Some(field_name) = node.field_name
@@ -40,7 +40,7 @@ impl Node {
     /// Returns all immediate child nodes with the specified `kind`.
     ///
     /// This method only considers direct children and does not recurse into nested nodes.
-    pub fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<&Node> {
+    pub fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<&Node<'_>> {
         let mut nodes = Vec::new();
         for child in &self.children {
             if let CstNode::Node(node) = child

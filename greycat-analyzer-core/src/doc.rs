@@ -4,24 +4,41 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bumpalo::Bump;
 use line_index::{LineCol, LineIndex};
 use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
 
 use crate::{
-    cst::{self, CstStats},
+    cst::{self, CstStats, ParserCtx},
     tokenize,
 };
 
 #[derive(Debug)]
-pub struct Document {
+pub struct Document<'arena> {
     pub uri: Uri,
     pub version: i32,
     pub text: String,
-    pub node: cst::Node,
+    pub node: cst::Node<'arena>,
     filepath: OnceCell<PathBuf>,
 }
 
-impl Document {
+impl<'arena> Document<'arena> {
+    pub fn new(value: TextDocumentItem, arena: &'arena Bump) -> Self {
+        let ctx = ParserCtx {
+            arena,
+            tokens: &tokenize(&value.text),
+        };
+        let node = cst::parse(ctx);
+
+        Self {
+            uri: value.uri,
+            version: value.version,
+            text: value.text,
+            node,
+            filepath: OnceCell::new(),
+        }
+    }
+
     /// The absolute path
     pub fn filepath(&self) -> &Path {
         self.filepath
@@ -43,6 +60,7 @@ impl Document {
         &mut self,
         mut changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
+        arena: &'arena Bump,
     ) {
         if self.version >= version {
             return;
@@ -88,26 +106,14 @@ impl Document {
 
         // update CST
         let tokens = tokenize(&self.text);
-        self.node = cst::parse(&tokens);
+        self.node = cst::parse(ParserCtx {
+            arena,
+            tokens: &tokens,
+        });
     }
 }
 
-impl From<TextDocumentItem> for Document {
-    fn from(value: TextDocumentItem) -> Self {
-        let tokens = tokenize(&value.text);
-        let node = cst::parse(&tokens);
-
-        Self {
-            uri: value.uri,
-            version: value.version,
-            text: value.text,
-            node,
-            filepath: OnceCell::new(),
-        }
-    }
-}
-
-impl fmt::Display for Document {
+impl fmt::Display for Document<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let stats = CstStats::from(&self.node);
 

@@ -12,6 +12,9 @@ pub use lexer::*;
 /// Re-export `lsp_types`
 pub use lsp_types;
 
+/// Re-export `bumpalo`
+pub use bumpalo;
+
 // TODO move this to HIR
 #[allow(clippy::ptr_arg)]
 pub fn parse(

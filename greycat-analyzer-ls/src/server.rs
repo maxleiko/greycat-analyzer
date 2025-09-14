@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use greycat_analyzer_core::bumpalo::Bump;
 use log::debug;
 use lsp_server::*;
 use lsp_types::notification::{
@@ -63,6 +64,8 @@ pub fn start_server() -> Result<()> {
 
 fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
     debug!("starting main loop");
+    let arena = Bump::new();
+
     let mut server = Backend {
         client: conn.sender.clone(),
         manager: Default::default(),
@@ -101,16 +104,16 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
             }
             Message::Notification(not) => match not.method.as_str() {
                 DidOpenTextDocument::METHOD => {
-                    server.did_open(not.extract(DidOpenTextDocument::METHOD)?)?
+                    server.did_open(not.extract(DidOpenTextDocument::METHOD)?, &arena)?
                 }
                 DidChangeTextDocument::METHOD => {
-                    server.did_change(not.extract(DidChangeTextDocument::METHOD)?)?
+                    server.did_change(not.extract(DidChangeTextDocument::METHOD)?, &arena)?
                 }
                 DidSaveTextDocument::METHOD => {
-                    server.did_save(not.extract(DidSaveTextDocument::METHOD)?)?
+                    server.did_save(not.extract(DidSaveTextDocument::METHOD)?, &arena)?
                 }
                 DidCloseTextDocument::METHOD => {
-                    server.did_close(not.extract(DidCloseTextDocument::METHOD)?)?
+                    server.did_close(not.extract(DidCloseTextDocument::METHOD)?, &arena)?
                 }
                 _ => {
                     debug!("got notification: {not:#?}");

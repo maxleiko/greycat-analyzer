@@ -38,7 +38,7 @@ impl std::fmt::Display for CstStats {
     }
 }
 
-impl From<&Node> for CstStats {
+impl From<&Node<'_>> for CstStats {
     fn from(value: &Node) -> Self {
         let mut stats = Self::default();
         stats.walk(value);

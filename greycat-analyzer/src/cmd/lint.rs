@@ -6,6 +6,7 @@ use std::{
 
 use crate::utils::AnyError;
 use greycat_analyzer_core::{
+    bumpalo::Bump,
     cst::{ModuleInfo, SourceModule},
     lsp_types::Diagnostic,
 };
@@ -27,27 +28,46 @@ impl Lint {
             .expect("unable to resolve project's parent directory");
 
         let start = Instant::now();
-        let mut mgr = SourceManager::new();
+        let arena = Bump::new();
+        let mut mgr = SourceManager::new(&arena);
         parse_module(project_dir, &project_filepath, &mut mgr)?;
         let took = start.elapsed();
 
         mgr.display_timings();
         println!("Total: {took:?}");
 
+        if !mgr.errors.is_empty() {
+            for (filepath, errors) in mgr.errors {
+                println!("{}: {} errors", filepath.display(), errors.len());
+                for error in errors {
+                    println!(
+                        "{} [{}:{}]",
+                        error.message, error.range.start.line, error.range.start.character
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
 
-#[derive(Default, Debug)]
-struct SourceManager {
-    sources: HashMap<PathBuf, SourceModule>,
+#[derive(Debug)]
+struct SourceManager<'arena> {
+    arena: &'arena Bump,
+    sources: HashMap<PathBuf, SourceModule<'arena>>,
     timings: HashMap<PathBuf, Duration>,
     errors: HashMap<PathBuf, Vec<Diagnostic>>,
 }
 
-impl SourceManager {
-    pub fn new() -> Self {
-        Self::default()
+impl<'arena> SourceManager<'arena> {
+    pub fn new(arena: &'arena Bump) -> Self {
+        Self {
+            arena,
+            sources: Default::default(),
+            timings: Default::default(),
+            errors: Default::default(),
+        }
     }
 
     pub fn display_timings(&self) {
@@ -71,7 +91,7 @@ fn parse_module(
 ) -> Result<(), AnyError> {
     let start = Instant::now();
 
-    let module = greycat_analyzer_core::cst::parse_file(filepath)?;
+    let module = greycat_analyzer_core::cst::parse_file(filepath, mgr.arena)?;
     let took = start.elapsed();
     let info = ModuleInfo::from(&module);
     for lib in &info.libraries {
@@ -80,7 +100,7 @@ fn parse_module(
         //     lib.name.image,
         //     lib.version.map(|s| s.image)
         // );
-        resolve_library(lib.name.image, project_dir, mgr)?;
+        resolve_library(project_dir, lib.name.image, mgr)?;
     }
     let mut files = Vec::new();
     for include in &info.includes {
@@ -117,8 +137,8 @@ fn parse_module(
 }
 
 fn resolve_library(
-    name: &str,
     project_dir: &Path,
+    name: &str,
     mgr: &mut SourceManager,
 ) -> Result<(), AnyError> {
     let lib_dir = project_dir.join("lib").join(name);

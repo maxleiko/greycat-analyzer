@@ -1,5 +1,9 @@
 use std::borrow::Cow;
 
+use bumpalo::{
+    Bump,
+    collections::{CollectIn as _, Vec, vec},
+};
 use serde::Serialize;
 
 use crate::{
@@ -12,14 +16,14 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tokens {
-    pub(crate) leading: Vec<Token>,
+pub struct Tokens<'arena> {
+    pub(crate) leading: Vec<'arena, Token>,
     pub(crate) token: Token,
 }
 
-impl IntoIterator for Tokens {
+impl<'arena> IntoIterator for Tokens<'arena> {
     type Item = Token;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+    type IntoIter = vec::IntoIter<'arena, Self::Item>;
 
     fn into_iter(mut self) -> Self::IntoIter {
         self.leading.push(self.token);
@@ -29,13 +33,13 @@ impl IntoIterator for Tokens {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
-pub enum CstNode {
-    Node(Node),
+pub enum CstNode<'arena> {
+    Node(Node<'arena>),
     Token(Token),
     Error(NodeError),
 }
 
-impl CstNode {
+impl<'arena> CstNode<'arena> {
     pub fn span(&self) -> Cow<'_, Span> {
         match self {
             Self::Node(node) => Cow::Owned(node.span()),
@@ -69,7 +73,7 @@ impl CstNode {
     }
 }
 
-impl std::fmt::Display for CstNode {
+impl std::fmt::Display for CstNode<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Node(node) => write!(f, "{:?}", node.kind),
@@ -80,29 +84,29 @@ impl std::fmt::Display for CstNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Node {
+pub struct Node<'arena> {
     #[serde(rename = "name")]
     pub kind: NodeKind,
-    pub children: Vec<CstNode>,
+    pub children: Vec<'arena, CstNode<'arena>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field_name: Option<&'static str>,
 }
 
-impl Node {
+impl<'arena> Node<'arena> {
     #[inline(always)]
-    pub fn new(kind: NodeKind) -> Self {
+    pub fn new(kind: NodeKind, arena: &'arena Bump) -> Self {
         Self {
             kind,
-            children: Vec::with_capacity(4),
+            children: Vec::with_capacity_in(4, arena),
             field_name: None,
         }
     }
 
     #[inline(always)]
-    pub fn with_capacity(kind: NodeKind, capacity: usize) -> Self {
+    pub fn with_capacity(kind: NodeKind, capacity: usize, arena: &'arena Bump) -> Self {
         Self {
             kind,
-            children: Vec::with_capacity(capacity),
+            children: Vec::with_capacity_in(capacity, arena),
             field_name: None,
         }
     }
@@ -115,7 +119,7 @@ impl Node {
         self.children.is_empty()
     }
 
-    pub fn add<T: AddToNode>(&mut self, value: T) {
+    pub fn add<T: AddToNode<'arena>>(&mut self, value: T) {
         value.append_to(self);
     }
 
@@ -142,28 +146,28 @@ impl Node {
         }
     }
 
-    pub fn last_token_mut(&mut self) -> Option<&mut CstNode> {
+    pub fn last_token_mut(&mut self) -> Option<&mut CstNode<'arena>> {
         self.children.last_mut().and_then(|n| match n {
             CstNode::Node(node) => node.last_token_mut(),
             leaf => Some(leaf),
         })
     }
 
-    pub fn into_children(self) -> Vec<CstNode> {
+    pub fn into_children(self) -> Vec<'arena, CstNode<'arena>> {
         self.children
     }
 
     /// Consumes `self` and returns a `Vec<Node>` of the children.
     ///
     /// Panics if one of the child is not a `Node`
-    pub fn into_nodes(self) -> Vec<Node> {
+    pub fn into_nodes(self, arena: &'arena Bump) -> Vec<'arena, Node<'arena>> {
         self.children
             .into_iter()
             .map(|child| match child {
                 CstNode::Node(node) => node,
                 _ => panic!("expecting only Node, found NodeError or Token"),
             })
-            .collect()
+            .collect_in(arena)
     }
 }
 
@@ -281,7 +285,7 @@ impl NodeError {
 
 impl std::fmt::Display for NodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
+        match &self.kind {
             ErrorKind::ExpectedToken { expected, got } => {
                 write!(f, "expected {expected} got {got}")
             }
@@ -309,7 +313,7 @@ pub enum ErrorKind {
         got: TokenKind,
     },
     Expected {
-        expected: &'static str,
+        expected: Cow<'static, str>,
         got: TokenKind,
     },
 }
@@ -325,46 +329,53 @@ impl std::fmt::Display for ErrorKind {
     }
 }
 
-impl From<Token> for CstNode {
+impl<'arena> From<Token> for CstNode<'arena> {
     #[inline]
     fn from(value: Token) -> Self {
         Self::Token(value)
     }
 }
 
-pub trait AddToNode {
-    fn append_to(self, node: &mut Node);
+pub trait AddToNode<'arena> {
+    fn append_to(self, node: &mut Node<'arena>);
 }
 
-impl AddToNode for Token {
-    fn append_to(self, node: &mut Node) {
+impl<'arena> AddToNode<'arena> for Token {
+    fn append_to(self, node: &mut Node<'arena>) {
         node.children.push(CstNode::Token(self))
     }
 }
 
-impl AddToNode for Tokens {
-    fn append_to(self, node: &mut Node) {
+impl<'arena> AddToNode<'arena> for Tokens<'arena> {
+    fn append_to(self, node: &mut Node<'arena>) {
         node.children.reserve(self.leading.len() + 1);
         self.leading.append_to(node);
         self.token.append_to(node);
     }
 }
 
-impl AddToNode for NodeError {
-    fn append_to(self, node: &mut Node) {
+impl<'arena> AddToNode<'arena> for NodeError {
+    fn append_to(self, node: &mut Node<'arena>) {
         node.children.push(CstNode::Error(self))
     }
 }
 
-impl<T: AddToNode> AddToNode for Vec<T> {
-    fn append_to(self, node: &mut Node) {
+impl<'arena, T: AddToNode<'arena>> AddToNode<'arena> for Vec<'arena, T> {
+    fn append_to(self, node: &mut Node<'arena>) {
         node.children.reserve(self.len());
         self.into_iter().for_each(|item| item.append_to(node));
     }
 }
 
-impl<T: AddToNode, U: AddToNode> AddToNode for Either<T, U> {
-    fn append_to(self, node: &mut Node) {
+impl<'arena, T: AddToNode<'arena>> AddToNode<'arena> for std::vec::Vec<T> {
+    fn append_to(self, node: &mut Node<'arena>) {
+        node.children.reserve(self.len());
+        self.into_iter().for_each(|item| item.append_to(node));
+    }
+}
+
+impl<'arena, T: AddToNode<'arena>, U: AddToNode<'arena>> AddToNode<'arena> for Either<T, U> {
+    fn append_to(self, node: &mut Node<'arena>) {
         match self {
             Self::Left(value) => value.append_to(node),
             Self::Right(value) => value.append_to(node),
@@ -372,22 +383,22 @@ impl<T: AddToNode, U: AddToNode> AddToNode for Either<T, U> {
     }
 }
 
-impl<T: AddToNode> AddToNode for Option<T> {
-    fn append_to(self, node: &mut Node) {
+impl<'arena, T: AddToNode<'arena>> AddToNode<'arena> for Option<T> {
+    fn append_to(self, node: &mut Node<'arena>) {
         if let Some(value) = self {
             value.append_to(node);
         }
     }
 }
 
-impl AddToNode for Node {
-    fn append_to(self, node: &mut Node) {
+impl<'arena> AddToNode<'arena> for Node<'arena> {
+    fn append_to(self, node: &mut Node<'arena>) {
         node.children.push(CstNode::Node(self));
     }
 }
 
-impl<T: AddToNode, U: AddToNode> AddToNode for (T, U) {
-    fn append_to(self, node: &mut Node) {
+impl<'arena, T: AddToNode<'arena>, U: AddToNode<'arena>> AddToNode<'arena> for (T, U) {
+    fn append_to(self, node: &mut Node<'arena>) {
         node.add(self.0);
         node.add(self.1);
     }

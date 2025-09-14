@@ -6,7 +6,7 @@ use crate::{
 };
 
 pub struct DisplayNodeRule<'a> {
-    pub(super) node: &'a Node,
+    pub(super) node: &'a Node<'a>,
     pub(super) source: &'a str,
     pub(super) with_trivia: bool,
 }
@@ -34,7 +34,7 @@ impl<'a> DisplayNodeRule<'a> {
 }
 
 pub struct DisplayNode<'a> {
-    pub(super) node: &'a CstNode,
+    pub(super) node: &'a CstNode<'a>,
     pub(super) source: &'a str,
     pub(super) with_trivia: bool,
 }

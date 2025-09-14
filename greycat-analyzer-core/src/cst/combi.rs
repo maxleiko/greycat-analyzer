@@ -1,4 +1,10 @@
-use std::convert::Infallible;
+use std::{borrow::Cow, convert::Infallible, iter::Sum};
+
+use bumpalo::{
+    Bump,
+    collections::{CollectIn, Vec as BumpVec},
+    vec,
+};
 
 use crate::{Token, TokenKind, cst::Tokens};
 
@@ -51,7 +57,7 @@ pub struct OneOfParseError {
 impl From<CustomParseError> for OneOfParseError {
     fn from(value: CustomParseError) -> Self {
         Self {
-            kinds: vec![Either::Right(value.text)],
+            kinds: std::vec![Either::Right(value.text)],
             got: value.got,
         }
     }
@@ -60,7 +66,7 @@ impl From<CustomParseError> for OneOfParseError {
 impl From<ExpectedParseError> for OneOfParseError {
     fn from(value: ExpectedParseError) -> Self {
         Self {
-            kinds: vec![Either::Left(value.kind)],
+            kinds: std::vec![Either::Left(value.kind)],
             got: value.got,
         }
     }
@@ -118,37 +124,54 @@ impl std::iter::Sum for ParseError {
     }
 }
 
-pub type Res<'t, T, E = ParseError> = std::result::Result<(&'t [Token], T), E>;
+impl std::ops::Add for ParseError {
+    type Output = ParseError;
 
-pub trait Parser<'t, T, E = ParseError> {
-    fn name(&self) -> &'static str {
+    fn add(self, rhs: Self) -> Self::Output {
+        self.and(rhs)
+    }
+}
+
+pub type Res<'t, 'a, T, E = ParseError> = std::result::Result<(ParserCtx<'t, 'a>, T), E>;
+
+#[derive(Clone, Copy)]
+pub struct ParserCtx<'tokens, 'arena> {
+    pub arena: &'arena Bump,
+    pub tokens: &'tokens [Token],
+}
+
+pub trait Parser<'t, 'a, T, E = ParseError> {
+    fn name(&self) -> Cow<'static, str> {
         std::any::type_name_of_val(self)
             .rsplit("::")
             .next()
             .unwrap()
+            .into()
     }
-    fn parse(&self, t: &'t [Token]) -> Res<'t, T, E>;
+
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, T, E>;
 }
 
-impl<'t, T, F, E> Parser<'t, T, E> for F
+impl<'t, 'a, T, F, E> Parser<'t, 'a, T, E> for F
 where
-    F: Fn(&'t [Token]) -> Res<'t, T, E>,
+    F: Fn(ParserCtx<'t, 'a>) -> Res<'t, 'a, T, E>,
 {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, T, E> {
-        self(t)
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, T, E> {
+        self(ctx)
     }
 }
 
-pub fn peek(mut t: &[Token]) -> (&[Token], Tokens) {
-    let leading: Vec<Token> = t
+pub fn peek<'t, 'a>(mut ctx: ParserCtx<'t, 'a>) -> (ParserCtx<'t, 'a>, Tokens<'a>) {
+    let leading: BumpVec<'a, Token> = ctx
+        .tokens
         .iter()
         .take_while(|t| t.kind.is_trivia())
         .copied()
-        .collect();
-    t = &t[leading.len()..];
-    let token = t[0];
-    t = &t[1..];
-    (t, Tokens { leading, token })
+        .collect_in(ctx.arena);
+    ctx.tokens = &ctx.tokens[leading.len()..];
+    let token = ctx.tokens[0];
+    ctx.tokens = &ctx.tokens[1..];
+    (ctx, Tokens { leading, token })
 }
 
 #[derive(Clone, Copy)]
@@ -156,9 +179,9 @@ pub struct Matches {
     kind: TokenKind,
 }
 
-impl<'t> Parser<'t, Tokens> for Matches {
-    fn name(&self) -> &'static str {
-        match self.kind {
+impl<'t, 'a> Parser<'t, 'a, Tokens<'a>> for Matches {
+    fn name(&self) -> Cow<'static, str> {
+        let s = match self.kind {
             TokenKind::EolComment => "eol comment",
             TokenKind::DocComment => "doc",
             TokenKind::BlockComment => "block comment",
@@ -247,13 +270,14 @@ impl<'t> Parser<'t, Tokens> for Matches {
             TokenKind::Without => "'without'",
             TokenKind::Unknown => "unknown",
             TokenKind::Eof => "EOF",
-        }
+        };
+        Cow::Borrowed(s)
     }
 
-    fn parse(&self, t: &'t [Token]) -> Res<'t, Tokens, ParseError> {
-        let (t, tok) = peek(t);
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, Tokens<'a>, ParseError> {
+        let (ctx, tok) = peek(ctx);
         if tok.token.kind == self.kind {
-            Ok((t, tok))
+            Ok((ctx, tok))
         } else {
             Err(ExpectedParseError {
                 kind: self.kind,
@@ -275,11 +299,11 @@ pub struct MatchesOne<const N: usize> {
     error_text: &'static str,
 }
 
-impl<'t, const N: usize> Parser<'t, Tokens> for MatchesOne<N> {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, Tokens, ParseError> {
-        let (t, tok) = peek(t);
+impl<'t, 'a, const N: usize> Parser<'t, 'a, Tokens<'a>> for MatchesOne<N> {
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, Tokens<'a>, ParseError> {
+        let (ctx, tok) = peek(ctx);
         if self.kinds.contains(&tok.token.kind) {
-            Ok((t, tok))
+            Ok((ctx, tok))
         } else {
             Err(CustomParseError {
                 text: self.error_text,
@@ -299,15 +323,18 @@ pub const fn matches_one<const N: usize>(
 }
 
 #[derive(Clone, Copy)]
-pub struct OneOf<'p, 't, T> {
-    parsers: &'p [&'p dyn Parser<'t, T>],
+pub struct OneOf<'p, 't, 'a, T, E> {
+    parsers: &'p [&'p dyn Parser<'t, 'a, T, E>],
 }
 
-impl<'p, 't: 'p, T> Parser<'t, T> for OneOf<'p, 't, T> {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, T, ParseError> {
+impl<'p, 't: 'p, 'a: 'p, T, E> Parser<'t, 'a, T, E> for OneOf<'p, 't, 'a, T, E>
+where
+    E: Sum,
+{
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, T, E> {
         let mut acc = Vec::new();
         for parser in self.parsers {
-            match parser.parse(t) {
+            match parser.parse(ctx) {
                 Ok(res) => return Ok(res),
                 Err(err) => {
                     acc.push(err);
@@ -318,7 +345,9 @@ impl<'p, 't: 'p, T> Parser<'t, T> for OneOf<'p, 't, T> {
     }
 }
 
-pub const fn one_of<'p, 't: 'p, T>(parsers: &'p [&dyn Parser<'t, T>]) -> OneOf<'p, 't, T> {
+pub const fn one_of<'p, 't: 'p, 'a: 'p, T, E>(
+    parsers: &'p [&'p dyn Parser<'t, 'a, T, E>],
+) -> OneOf<'p, 't, 'a, T, E> {
     OneOf { parsers }
 }
 
@@ -328,18 +357,42 @@ pub enum Either<L, R> {
     Right(R),
 }
 
-pub fn either<'t, P1, P2, T1, T2>(p1: P1, p2: P2) -> impl Parser<'t, Either<T1, T2>>
+struct EitherParser<P1, P2> {
+    p1: P1,
+    p2: P2,
+}
+
+impl<'t, 'a, P1, P2, T1, T2> Parser<'t, 'a, Either<T1, T2>> for EitherParser<P1, P2>
 where
-    P1: Parser<'t, T1>,
-    P2: Parser<'t, T2>,
+    P1: Parser<'t, 'a, T1>,
+    P2: Parser<'t, 'a, T2>,
 {
-    move |t| match p1.parse(t) {
-        Ok((t, res)) => Ok((t, Either::Left(res))),
-        Err(err1) => match p2.parse(t) {
-            Ok((t, res)) => Ok((t, Either::Right(res))),
-            Err(err2) => Err(err1.and(err2)),
-        },
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Owned(format!("either {} or {}", self.p1.name(), self.p2.name()))
     }
+
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, Either<T1, T2>> {
+        // Try the first parser
+        match self.p1.parse(ctx) {
+            Ok((ctx, result)) => Ok((ctx, Either::Left(result))),
+            Err(err1) => {
+                // If first parser fails, try the second parser
+                match self.p2.parse(ctx) {
+                    Ok((ctx, result)) => Ok((ctx, Either::Right(result))),
+                    Err(err2) => Err(err1.and(err2)),
+                }
+            }
+        }
+    }
+}
+
+#[inline(always)]
+pub fn either<'t, 'a, P1, P2, T1, T2>(p1: P1, p2: P2) -> impl Parser<'t, 'a, Either<T1, T2>>
+where
+    P1: Parser<'t, 'a, T1>,
+    P2: Parser<'t, 'a, T2>,
+{
+    EitherParser { p1, p2 }
 }
 
 #[derive(Clone, Copy)]
@@ -348,74 +401,53 @@ pub struct Alt<P1, P2> {
     p2: P2,
 }
 
-impl<'t, P1, P2, T> Parser<'t, T> for Alt<P1, P2>
+impl<'t, 'a, P1, P2, T> Parser<'t, 'a, T> for Alt<P1, P2>
 where
-    P1: Parser<'t, T>,
-    P2: Parser<'t, T>,
+    P1: Parser<'t, 'a, T>,
+    P2: Parser<'t, 'a, T>,
 {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, T, ParseError> {
-        match self.p1.parse(t) {
-            Ok((t, res)) => Ok((t, res)),
-            Err(err1) => match self.p2.parse(t) {
-                Ok((t, res)) => Ok((t, res)),
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Owned(format!("{} or {}", self.p1.name(), self.p2.name()))
+    }
+
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, T> {
+        match self.p1.parse(ctx) {
+            Ok((ctx, res)) => Ok((ctx, res)),
+            Err(err1) => match self.p2.parse(ctx) {
+                Ok((ctx, res)) => Ok((ctx, res)),
                 Err(err2) => Err(err1.and(err2)),
             },
         }
     }
 }
 
-pub const fn alt<'t, P1, P2, T>(p1: P1, p2: P2) -> Alt<P1, P2>
+pub const fn alt<'t, 'a, P1, P2, T, E>(p1: P1, p2: P2) -> Alt<P1, P2>
 where
-    P1: Parser<'t, T>,
-    P2: Parser<'t, T>,
+    P1: Parser<'t, 'a, T, E>,
+    P2: Parser<'t, 'a, T, E>,
 {
     Alt { p1, p2 }
 }
 
-pub fn many<'t, P, T>(parser: P) -> impl Parser<'t, Option<Vec<T>>, Infallible>
+pub fn many<'t, 'a, P, T, E>(parser: P) -> impl Parser<'t, 'a, Option<BumpVec<'a, T>>, Infallible>
 where
-    P: Parser<'t, T>,
+    P: Parser<'t, 'a, T, E>,
 {
-    move |t| {
-        let mut items = Vec::new();
-        let mut tokens = t;
-        match parser.parse(tokens) {
-            Ok((t, item)) => {
+    move |ctx: ParserCtx<'t, 'a>| {
+        let mut items = BumpVec::new_in(ctx.arena);
+        let mut c = ctx;
+        match parser.parse(c) {
+            Ok((next, item)) => {
                 items.push(item);
-                tokens = t;
+                c = next;
             }
-            Err(_) => return Ok((tokens, None)),
+            Err(_) => return Ok((c, None)),
         }
-        while let Ok((t, res)) = parser.parse(tokens) {
+        while let Ok((next, res)) = parser.parse(c) {
             items.push(res);
-            tokens = t;
+            c = next;
         }
-        Ok((tokens, Some(items)))
-    }
-}
-
-pub fn many_1<'t, P, T>(parser: P) -> impl Parser<'t, Vec<T>>
-where
-    P: Parser<'t, T>,
-{
-    move |t| {
-        let mut items = Vec::new();
-        let mut tokens = t;
-        loop {
-            match parser.parse(tokens) {
-                Ok((t, item)) => {
-                    items.push(item);
-                    tokens = t;
-                }
-                Err(err) => {
-                    if items.is_empty() {
-                        return Err(err);
-                    } else {
-                        return Ok((tokens, items));
-                    }
-                }
-            }
-        }
+        Ok((c, Some(items)))
     }
 }
 
@@ -424,57 +456,60 @@ pub struct Many1<P> {
     parser: P,
 }
 
-impl<'t, P, T> Parser<'t, Vec<T>> for Many1<P>
+impl<'t, 'a, P, T, E> Parser<'t, 'a, BumpVec<'a, T>, E> for Many1<P>
 where
-    P: Parser<'t, T>,
+    P: Parser<'t, 'a, T, E>,
 {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, Vec<T>, ParseError> {
-        let (t, item) = self.parser.parse(t)?;
-        let mut items = vec![item];
-        let mut tokens = t;
-        while let Ok((t, res)) = self.parser.parse(tokens) {
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, BumpVec<'a, T>, E> {
+        let (ctx, item) = self.parser.parse(ctx)?;
+        let mut items = vec![in ctx.arena; item];
+        let mut c = ctx;
+        while let Ok((next, res)) = self.parser.parse(c) {
             items.push(res);
-            tokens = t;
+            c = next;
         }
-        Ok((tokens, items))
+        Ok((c, items))
     }
 }
 
-pub const fn many1<'t, P, T>(parser: P) -> Many1<P>
+pub const fn many1<'t, 'a, P, T, E>(parser: P) -> Many1<P>
 where
-    P: Parser<'t, T>,
+    P: Parser<'t, 'a, T, E>,
 {
     Many1 { parser }
 }
 
 #[derive(Clone, Copy)]
-pub struct Map<P, A, B> {
+pub struct Map<'t, 'a, P, A, B> {
     parser: P,
-    map: fn(A) -> B,
+    map: fn(A, ParserCtx<'t, 'a>) -> B,
 }
 
-impl<'t, P, A, B> Parser<'t, B> for Map<P, A, B>
+impl<'t, 'a, P, A, B, E> Parser<'t, 'a, B, E> for Map<'t, 'a, P, A, B>
 where
-    P: Parser<'t, A>,
+    P: Parser<'t, 'a, A, E>,
 {
-    fn parse(&self, t: &'t [Token]) -> Res<'t, B, ParseError> {
-        match self.parser.parse(t) {
-            Ok((t, a)) => Ok((t, (self.map)(a))),
+    fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, B, E> {
+        match self.parser.parse(ctx) {
+            Ok((ctx, a)) => Ok((ctx, (self.map)(a, ctx))),
             Err(err) => Err(err),
         }
     }
 }
 
-pub const fn map<'t, P, A, B>(parser: P, map: fn(A) -> B) -> Map<P, A, B>
+pub const fn map<'t, 'a, P, A, B, E>(
+    parser: P,
+    map: fn(A, ParserCtx<'t, 'a>) -> B,
+) -> Map<'t, 'a, P, A, B>
 where
-    P: Parser<'t, A>,
+    P: Parser<'t, 'a, A, E>,
 {
     Map { parser, map }
 }
 
-pub fn opt<'t, P, T>(parser: P) -> impl Parser<'t, Option<T>, Infallible>
+pub fn opt<'t, 'a, P, T>(parser: P) -> impl Parser<'t, 'a, Option<T>, Infallible>
 where
-    P: Parser<'t, T>,
+    P: Parser<'t, 'a, T>,
 {
     move |t| match parser.parse(t) {
         Ok((t, res)) => Ok((t, Some(res))),
@@ -482,10 +517,10 @@ where
     }
 }
 
-pub fn seq2<'t, P1, P2, T>(p1: P1, p2: P2) -> impl Parser<'t, (T, T)>
+pub fn seq2<'t, 'a, P1, P2, T>(p1: P1, p2: P2) -> impl Parser<'t, 'a, (T, T)>
 where
-    P1: Parser<'t, T>,
-    P2: Parser<'t, T>,
+    P1: Parser<'t, 'a, T>,
+    P2: Parser<'t, 'a, T>,
 {
     move |t| {
         let (t, id) = p1.parse(t)?;
@@ -502,13 +537,17 @@ mod test {
 
     #[test]
     fn peeking() {
-        let tokens = tokenize(" fn main");
-        let (_, tok) = peek(&tokens);
-        assert_eq!(tokens.len(), 5);
+        let arena = Bump::new();
+        let ctx = ParserCtx {
+            arena: &arena,
+            tokens: &tokenize(" fn main"),
+        };
+        assert_eq!(ctx.tokens.len(), 5);
+        let (_, tok) = peek(ctx);
         assert_eq!(
             tok,
             Tokens {
-                leading: vec![Token {
+                leading: bumpalo::vec![in &arena; Token {
                     kind: TokenKind::Space(1),
                     span: Span::new(Pos::new(0, 0, 0), Pos::new(0, 1, 1))
                 }],
@@ -522,13 +561,17 @@ mod test {
 
     #[test]
     fn all_spaces() {
-        let tokens = tokenize("  ");
-        let (_, tok) = peek(&tokens);
-        assert_eq!(tokens.len(), 2);
+        let arena = Bump::new();
+        let ctx = ParserCtx {
+            arena: &arena,
+            tokens: &tokenize("  "),
+        };
+        let (_, tok) = peek(ctx);
+        assert_eq!(ctx.tokens.len(), 2);
         assert_eq!(
             tok,
             Tokens {
-                leading: vec![Token {
+                leading: bumpalo::vec![in &arena; Token {
                     kind: TokenKind::Space(2),
                     span: Span::new(Pos::new(0, 0, 0), Pos::new(0, 2, 2))
                 }],
@@ -542,8 +585,12 @@ mod test {
 
     #[test]
     fn matching() {
-        let tokens = tokenize("fn main() {}");
-        let (_, kw) = matches(TokenKind::Fn).parse(&tokens).unwrap();
+        let arena = Bump::new();
+        let ctx = ParserCtx {
+            arena: &arena,
+            tokens: &tokenize("fn main() {}"),
+        };
+        let (_, kw) = matches(TokenKind::Fn).parse(ctx).unwrap();
         assert_eq!(kw.token.kind, TokenKind::Fn);
     }
 }

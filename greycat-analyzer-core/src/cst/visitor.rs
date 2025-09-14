@@ -81,7 +81,7 @@ pub trait Visitable {
     fn accept<V: CstVisitor>(&self, visitor: &mut V) -> VisitResult;
 }
 
-impl Visitable for CstNode {
+impl Visitable for CstNode<'_> {
     fn accept<V: CstVisitor>(&self, visitor: &mut V) -> VisitResult {
         match self {
             CstNode::Node(node) => visit_node(visitor, node),
@@ -133,7 +133,7 @@ pub trait VisitableMut {
     fn accept_mut<V: CstVisitorMut>(&mut self, visitor: &mut V) -> VisitResult;
 }
 
-impl VisitableMut for CstNode {
+impl VisitableMut for CstNode<'_> {
     fn accept_mut<V: CstVisitorMut>(&mut self, visitor: &mut V) -> VisitResult {
         match self {
             CstNode::Node(node) => visit_node_mut(visitor, node),
