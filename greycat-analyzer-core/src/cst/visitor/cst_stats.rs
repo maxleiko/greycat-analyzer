@@ -2,9 +2,9 @@ use crate::cst::*;
 
 #[derive(Default)]
 pub struct CstStats {
-    nodes: usize,
-    tokens: usize,
-    errors: usize,
+    pub nodes: usize,
+    pub tokens: usize,
+    pub errors: usize,
 }
 
 impl CstVisitor for CstStats {

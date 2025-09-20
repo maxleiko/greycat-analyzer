@@ -4,6 +4,8 @@
 /project.gcl
 /gcdata
 /files
+/lib
+/webroot
 
 # WIP
 greycat-analyzer-playground

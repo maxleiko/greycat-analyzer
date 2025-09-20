@@ -332,16 +332,16 @@ where
     E: Sum,
 {
     fn parse(&self, ctx: ParserCtx<'t, 'a>) -> Res<'t, 'a, T, E> {
-        let mut acc = Vec::new();
+        let mut errors = Vec::with_capacity(self.parsers.len());
         for parser in self.parsers {
             match parser.parse(ctx) {
                 Ok(res) => return Ok(res),
                 Err(err) => {
-                    acc.push(err);
+                    errors.push(err);
                 }
             }
         }
-        Err(acc.into_iter().sum())
+        Err(errors.into_iter().sum())
     }
 }
 
