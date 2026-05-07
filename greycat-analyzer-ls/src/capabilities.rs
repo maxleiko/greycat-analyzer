@@ -80,9 +80,12 @@ pub(crate) fn byte_range_to_lsp(text: &str, range: &Range<usize>) -> lsp_types::
 // P3.1 — hover
 // =============================================================================
 
-/// Hover info at `pos`. Surfaces the inferred type of the expression
-/// (from the analyzer's per-expression type table) or, for declaration
-/// names, a short kind-line ("type Foo", "fn greet", etc.).
+/// Hover info at `pos`. Three layers of lookup:
+/// 1. Cursor on an `ident` node — surface the resolver `Definition`'s
+///    binding info (param/local type, decl kind, builtin name).
+/// 2. Cursor inside a non-ident HIR `Expr` — surface
+///    `<short-label>: <inferred-type>`.
+/// 3. No HIR shape covers the cursor — return `None`.
 pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) -> Option<Hover> {
     let byte = position_to_byte(text, pos);
     let node = node_at_offset(root, byte)?;
@@ -90,25 +93,53 @@ pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) 
         return None;
     }
 
-    // Build HIR + resolutions + analysis once. Cheap relative to the
-    // current per-request rebuild model — incremental caching arrives
-    // alongside salsa (P5.5) when profiling demands it.
     let hir = lower_module(text, "module", lib, root);
     let resolutions = resolve(&hir);
     let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
 
-    // Strategy: walk ancestors looking for an HIR-known shape that
-    // covers `node`'s byte range.
-    let target_range = node.byte_range();
-    let mut best: Option<(String, Range<usize>)> = None;
+    // --- Layer 1: ident-based hover (params / locals / decls / builtins).
+    if node.kind() == "ident"
+        && let Some((ident_idx, ident)) = hir
+            .idents
+            .iter()
+            .find(|(_, i)| i.byte_range == node.byte_range())
+    {
+        if let Some(label) = ident_hover_label(&hir, &resolutions, &analysis, ident_idx, ident) {
+            return Some(hover_markup(label, ident.byte_range.clone(), text));
+        }
+        // Decl-defining ident (e.g. cursor on the `helper` in `fn helper()`).
+        if let Some(module) = hir.module.as_ref() {
+            for decl_id in &module.decls {
+                let decl = &hir.decls[*decl_id];
+                if let Some(name_id) = decl.name()
+                    && hir.idents[name_id].byte_range == node.byte_range()
+                {
+                    let label = format!("{} {}", decl_kind_word(decl), ident.text);
+                    return Some(hover_markup(
+                        label,
+                        hir.idents[name_id].byte_range.clone(),
+                        text,
+                    ));
+                }
+            }
+        }
+    }
 
+    // --- Layer 2: non-ident expression hover.
+    let target_range = node.byte_range();
     for ancestor in ancestors(node) {
         let r = ancestor.byte_range();
         if r.start > target_range.start || r.end < target_range.end {
             break;
         }
-        // Find an HIR Expr whose range matches.
-        if let Some((expr_id, expr)) = hir.exprs.iter().find(|(_, e)| e.byte_range() == r)
+        if let Some((expr_id, expr)) = hir
+            .exprs
+            .iter()
+            .filter(|(_, e)| !matches!(e, Expr::Ident(_)))
+            .find(|(_, e)| {
+                let er = e.byte_range();
+                !er.is_empty() && er == r
+            })
             && let Some(ty) = analysis.expr_types.get(&expr_id)
         {
             let label = format!(
@@ -116,44 +147,57 @@ pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) 
                 short_expr_label(&hir, expr),
                 greycat_analyzer_types::display(&analysis.types, *ty),
             );
-            best = Some((label, r));
-            break;
+            return Some(hover_markup(label, r, text));
         }
     }
 
-    if best.is_none() {
-        // Fall back to a decl-name hover: walk module decls and find one
-        // whose name range matches.
-        if let Some(module) = hir.module.as_ref() {
-            for decl_id in &module.decls {
-                let decl = &hir.decls[*decl_id];
-                if let Some(name_id) = decl.name() {
-                    let name_range = hir.idents[name_id].byte_range.clone();
-                    if name_range == node.byte_range() {
-                        let kind_word = match decl {
-                            Decl::Fn(_) => "fn",
-                            Decl::Type(_) => "type",
-                            Decl::Enum(_) => "enum",
-                            Decl::Var(_) => "var",
-                            Decl::Pragma(_) => "@",
-                        };
-                        let label = format!("{kind_word} {}", hir.idents[name_id].text);
-                        best = Some((label, name_range));
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    None
+}
 
-    let (label, range) = best?;
-    Some(Hover {
+fn ident_hover_label(
+    hir: &Hir,
+    resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    ident_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
+    ident: &greycat_analyzer_hir::types::Ident,
+) -> Option<String> {
+    match resolutions.lookup(ident_idx)? {
+        Definition::Param(name) | Definition::Local(name) => {
+            analysis.def_types.get(&name).map(|ty| {
+                format!(
+                    "{}: {}",
+                    ident.text,
+                    greycat_analyzer_types::display(&analysis.types, *ty),
+                )
+            })
+        }
+        Definition::Decl(decl_id) => Some(format!(
+            "{} {}",
+            decl_kind_word(&hir.decls[decl_id]),
+            ident.text
+        )),
+        Definition::Builtin(name) => Some(format!("(builtin) {name}")),
+    }
+}
+
+fn decl_kind_word(decl: &Decl) -> &'static str {
+    match decl {
+        Decl::Fn(_) => "fn",
+        Decl::Type(_) => "type",
+        Decl::Enum(_) => "enum",
+        Decl::Var(_) => "var",
+        Decl::Pragma(_) => "@",
+    }
+}
+
+fn hover_markup(label: String, range: Range<usize>, text: &str) -> Hover {
+    Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value: format!("```greycat\n{label}\n```"),
         }),
         range: Some(byte_range_to_lsp(text, &range)),
-    })
+    }
 }
 
 fn short_expr_label(hir: &Hir, expr: &Expr) -> String {

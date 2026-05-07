@@ -16,10 +16,17 @@
     "vscode:install": "code --install-extension greycat-analyzer.vsix"
   },
   "activationEvents": [
-    "onLanguage:gcl",
     "workspaceContains:project.gcl"
   ],
   "contributes": {
+    "languages": [
+      {
+        "id": "gcl",
+        "aliases": ["GreyCat", "greycat", "gcl"],
+        "extensions": [".gcl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
     "commands": [
       {
         "command": "greycat-analyzer.restart",

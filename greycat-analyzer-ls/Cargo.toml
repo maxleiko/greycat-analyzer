@@ -13,7 +13,6 @@ greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt" }
 
 dashmap = "6.1.0"
 log = "0.4.27"
-# ropey = "1.6.1"
 lsp-server = "0.7.8"
 lsp-types = "0.97.0"
 serde = "1.0.219"

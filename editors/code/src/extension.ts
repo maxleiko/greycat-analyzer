@@ -68,7 +68,7 @@ function startClient() {
     },
     {
       outputChannel: channel,
-      documentSelector: [{ scheme: 'file', language: 'greycat' }],
+      documentSelector: [{ scheme: 'file', language: 'gcl' }],
     }
   );
 

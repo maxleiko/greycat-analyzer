@@ -1,7 +1,7 @@
 #![allow(dead_code)] // TODO remove when stable
 
 mod backend;
-mod capabilities;
+pub mod capabilities;
 mod server;
 
 pub use server::*;
