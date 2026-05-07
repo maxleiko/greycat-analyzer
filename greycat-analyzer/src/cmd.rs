@@ -1,9 +1,7 @@
-mod lint;
-mod lang_server;
 mod cst;
-mod lex;
+mod lang_server;
+mod lint;
 
-pub use lint::Lint;
-pub use lang_server::LangServer;
 pub use cst::Cst;
-pub use lex::Lex;
+pub use lang_server::LangServer;
+pub use lint::Lint;

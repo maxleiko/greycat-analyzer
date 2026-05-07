@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 greycat-analyzer-core = { path = "../greycat-analyzer-core" }
 greycat-analyzer-ls = { path = "../greycat-analyzer-ls" }
+greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }
 
 clap = { version = "4.5.38", features = ["derive"] }
 env_logger = "0.11.8"

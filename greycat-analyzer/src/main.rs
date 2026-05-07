@@ -17,7 +17,6 @@ enum Command {
     Lint(Lint),
     LangServer(LangServer),
     Cst(Cst),
-    Lex(Lex),
 }
 
 fn main() -> Result<(), AnyError> {
@@ -26,6 +25,5 @@ fn main() -> Result<(), AnyError> {
         Command::Lint(cmd) => cmd.run(),
         Command::LangServer(cmd) => cmd.run(),
         Command::Cst(cmd) => cmd.run(),
-        Command::Lex(cmd) => cmd.run(),
     }
 }

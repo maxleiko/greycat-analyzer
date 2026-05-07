@@ -98,7 +98,7 @@ Each phase ends on a milestone. Effort signals: **S** < 1 week, **M** ~1-2 weeks
 - [x] **0.1 Workspace re-shape** (S) — add `greycat-analyzer-syntax` crate; demote `greycat-analyzer-core` to "semantic glue" (will later host HIR/types).
 - [x] **0.2 Tree-sitter integration** (M) — vendor or git-dep `tree-sitter-greycat`; expose `Language`, parse function. Generate a typed-node wrapper layer in `build.rs` from `node-types.json`. (Decision A.)
 - [x] **0.3 Document/Manager port** (M) — replace bumpalo-CST inside `Document` with tree-sitter `Tree`; keep `LineIndex` and `apply_changes`, but call `tree.edit()` + `parser.parse(&new_text, Some(&old_tree))` for incremental reparse.
-- [ ] **0.4 Retire old code** (S) — see §9 for the explicit deletion list.
+- [x] **0.4 Retire old code** (S) — see §9 for the explicit deletion list.
 - [ ] **0.5 Coverage gauntlet** (S) — bulk-parse `lib/std/*.gcl` + every `.gcl` under TS reference fixtures. Assert zero `ERROR`/`MISSING` nodes. File grammar gaps upstream against `tree-sitter-greycat`.
 - [ ] **0.6 Snapshot harness** (S) — wire `insta` and a script that runs both the TS reference and the Rust port over the corpus, diffing CST shape. Pays off through P2.
 
@@ -180,11 +180,12 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] **5.1 WASM build** (M) — expand `parse_cst` to `parse + check + format + diagnostics`; reuse `greycat-analyzer-playground` as the smoke harness.
-- [ ] **5.2 crates.io publish** (S) — `greycat-analyzer-syntax`, `-core`, `-hir`, `-types`, `-analysis`, `-fmt`, `-ls`, plus the `greycat-analyzer` binary.
-- [ ] **5.3 VS Code extension** (S) — wire `editors/code/` to the new LSP binary.
-- [ ] **5.4 Salsa retrofit** (M, optional) — only if profiling shows quadratic blow-up on multi-file edits.
-- [ ] **5.5 Stdlib parity + version pinning** (S) — sync `lib/std/` from upstream; CI gate.
+- [ ] **5.1 WASM API surface** (M) — expose every analyzer stage the playground inspects. Minimum public functions: `parse_sexp`, `parse_tree` (serialized CST), `tokens` (lexable token stream over tree-sitter ranges), `lower_hir`, `infer_types`, `diagnostics`, `format`. Each returns serializable JSON so the playground can render trees side-by-side.
+- [ ] **5.2 Playground as analyzer testbed** (M) — promote `greycat-analyzer-playground` from a parse-only smoke harness to a full inspection UI: Monaco editor wired to the wasm LSP for completion / hover / diagnostics, plus tabbed views for tokens, CST, HIR, type-inference table, and diagnostics. The playground is the visual debugger for every analyzer phase, not just a demo.
+- [ ] **5.3 crates.io publish** (S) — `greycat-analyzer-syntax`, `-core`, `-hir`, `-types`, `-analysis`, `-fmt`, `-ls`, plus the `greycat-analyzer` binary.
+- [ ] **5.4 VS Code extension** (S) — wire `editors/code/` to the new LSP binary.
+- [ ] **5.5 Salsa retrofit** (M, optional) — only if profiling shows quadratic blow-up on multi-file edits.
+- [ ] **5.6 Stdlib parity + version pinning** (S) — sync `lib/std/` from upstream; CI gate.
 
 ---
 

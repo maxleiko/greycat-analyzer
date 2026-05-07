@@ -1,26 +1,13 @@
-mod ast;
-pub mod cst;
-mod lexer;
 pub mod span;
 mod doc;
 mod manager;
 
-pub use manager::*;
 pub use doc::*;
-pub use lexer::*;
+pub use manager::*;
 
 /// Re-export `lsp_types`
 pub use lsp_types;
 
-/// Re-export `bumpalo`
-pub use bumpalo;
-
-// TODO move this to HIR
-#[allow(clippy::ptr_arg)]
-pub fn parse(
-    _filename: &str,
-    _source: &str,
-    _diagnostics: &mut Vec<lsp_types::Diagnostic>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    todo!()
-}
+/// Re-export the syntax crate so downstream users can reach tree-sitter
+/// types and the generated typed-node accessors without a separate dep.
+pub use greycat_analyzer_syntax as syntax;
