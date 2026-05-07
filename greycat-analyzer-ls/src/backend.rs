@@ -1,6 +1,8 @@
+use std::path::{Path, PathBuf};
+
 use crossbeam_channel::Sender;
 use greycat_analyzer_core::{Document, SourceManager};
-use log::debug;
+use log::{debug, warn};
 use lsp_server::*;
 use lsp_types::{
     notification::{Notification as _, PublishDiagnostics},
@@ -29,16 +31,42 @@ impl Backend {
             debug!("workspaces:");
             for ws in workspaces {
                 debug!("- {}={}", ws.name, ws.uri.as_str());
-                // TODO
-                // let ws_root = Path::new(ws.uri.as_str());
-                // let project_path = ws_root.join("project.gcl");
-                // if project_path.exists() {
-                //     let uri = Uri::from_str(project_path.to_str().unwrap())?;
-                //     self.register_project(uri);
-                // }
+                self.load_workspace(&ws.uri);
             }
         }
         Ok(())
+    }
+
+    /// Resolve a workspace-folder URI to a local path, look for
+    /// `project.gcl` at its root, and recursively load every reachable
+    /// module via [`SourceManager::load_project`]. Errors are logged but
+    /// don't fail the LSP handshake — typed diagnostic publication lands
+    /// in P1.4.
+    fn load_workspace(&mut self, ws_uri: &Uri) {
+        let Some(ws_root) = uri_to_path(ws_uri) else {
+            warn!("skipping non-file workspace folder: {}", ws_uri.as_str());
+            return;
+        };
+        let project_file = ws_root.join("project.gcl");
+        if !project_file.is_file() {
+            debug!(
+                "no project.gcl in workspace {} — skipping recursive load",
+                ws_root.display()
+            );
+            return;
+        }
+        let report = self.manager.load_project(&project_file);
+        debug!(
+            "[load_project] {} files loaded from {}",
+            report.loaded.len(),
+            project_file.display()
+        );
+        for lib in &report.unresolved_libraries {
+            warn!("unresolved @library('{lib}') in {}", project_file.display());
+        }
+        for err in &report.errors {
+            warn!("[load_project] {err}");
+        }
     }
 
     pub fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Result<()> {
@@ -72,6 +100,14 @@ impl Backend {
         // self.manager.remove(&params.text_document.uri);
         Ok(())
     }
+}
+
+/// Convert a `file://` URI to a local path. Returns `None` for non-file
+/// schemes (LSP technically allows `untitled:`, `git:`, etc.).
+fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    let s = uri.as_str();
+    let stripped = s.strip_prefix("file://")?;
+    Some(Path::new(stripped).to_path_buf())
 }
 
 pub(crate) fn publish_diagnostics(
