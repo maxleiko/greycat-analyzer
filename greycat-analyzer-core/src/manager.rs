@@ -1,24 +1,98 @@
 use std::{
     cell::{Ref, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use lsp_types::{TextDocumentContentChangeEvent, Uri};
+use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
 
-use crate::Document;
+use crate::{
+    Document,
+    module_desc::{ModuleDesc, parse_module_desc},
+    resolver::{Context, FsContext, library_dir, global_std_dir},
+};
 
-#[derive(Debug, Default)]
-pub struct Manager {
+/// Storage for parsed `.gcl` documents, keyed by LSP `Uri`. Holds a
+/// [`Context`] so callers can trigger recursive loads (`@library` /
+/// `@include`) without threading filesystem access themselves.
+///
+/// Ports `packages/lang/src/project/source_manager.ts` (sources/modules/
+/// errors maps) plus the recursive-load slice of `analyze.ts` (cycle
+/// detection, lib resolution).
+pub struct SourceManager {
     documents: HashMap<Uri, RefCell<Document>>,
+    ctx: Arc<dyn Context>,
 }
 
-impl Manager {
+impl SourceManager {
+    /// Construct a `SourceManager` over the real filesystem. Falls back to
+    /// a dummy GreyCat home when `$GREYCAT_HOME` / `$HOME` are unresolvable
+    /// — recursive loads that cross into `lib/std` will surface that as a
+    /// missing-library at resolve time.
+    pub fn new() -> Self {
+        let ctx: Arc<dyn Context> = match FsContext::new() {
+            Ok(c) => Arc::new(c),
+            Err(_) => Arc::new(FsContext::with_greycat_home(PathBuf::new())),
+        };
+        Self::with_context(ctx)
+    }
+
+    pub fn with_context(ctx: Arc<dyn Context>) -> Self {
+        Self {
+            documents: HashMap::new(),
+            ctx,
+        }
+    }
+
+    pub fn ctx(&self) -> &Arc<dyn Context> {
+        &self.ctx
+    }
+
     pub fn add(&mut self, doc: Document) {
         self.documents.insert(doc.uri.clone(), RefCell::new(doc));
     }
 
+    /// Convenience: build a `Document` from raw text and add it. Mirrors
+    /// TS `addSimpleSource(uri, content, lib)`.
+    pub fn add_simple(
+        &mut self,
+        uri: Uri,
+        text: impl Into<String>,
+        lib: impl Into<String>,
+        opened: bool,
+    ) {
+        let doc = Document::with_lib(
+            TextDocumentItem {
+                uri,
+                language_id: "greycat".into(),
+                version: 0,
+                text: text.into(),
+            },
+            lib,
+            opened,
+        );
+        self.add(doc);
+    }
+
     pub fn get(&self, uri: &Uri) -> Option<&RefCell<Document>> {
         self.documents.get(uri)
+    }
+
+    pub fn remove(&mut self, uri: &Uri) -> Option<Document> {
+        self.documents.remove(uri).map(RefCell::into_inner)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Uri, &RefCell<Document>)> {
+        self.documents.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
     }
 
     pub fn update(
@@ -34,11 +108,146 @@ impl Manager {
             panic!("cannot update unknown document")
         }
     }
+
+    /// Recursively load a `project.gcl` and every module reachable through
+    /// `@include` (project-local) and `@library` (under `<project_dir>/lib/`,
+    /// or `<greycat_home>/lib/std/` for the global `std` fallback).
+    ///
+    /// Cycle-safe: each canonical filepath is parsed at most once. Returns
+    /// the [`LoadReport`] with everything actually parsed in this load,
+    /// including which `@library` declarations couldn't be resolved.
+    ///
+    /// This is the recursive-load slice of TS `analyze.ts:resolve_*` —
+    /// trimmed to path resolution + parsing, with diagnostics deferred to
+    /// P1.4 and the project-graph data model deferred to P2.
+    pub fn load_project(&mut self, project_filepath: &Path) -> LoadReport {
+        let mut report = LoadReport::default();
+        let project_dir = match project_filepath.parent() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                report
+                    .errors
+                    .push(format!("project path has no parent: {}", project_filepath.display()));
+                return report;
+            }
+        };
+
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        // Load the project.gcl itself first.
+        if let Some(uri) = self.load_file(project_filepath, "project", &mut visited, &mut report) {
+            // Walk its mod_pragmas to find @library / @include.
+            let desc = self.module_desc_for(&uri);
+            self.process_includes(&project_dir, &desc, &mut visited, &mut report);
+            self.process_libraries(&project_dir, &desc, &mut visited, &mut report);
+        }
+
+        report
+    }
+
+    fn module_desc_for(&self, uri: &Uri) -> ModuleDesc {
+        let Some(cell) = self.documents.get(uri) else {
+            return ModuleDesc::default();
+        };
+        let doc = cell.borrow();
+        parse_module_desc(uri.clone(), &doc.text, doc.tree.root_node())
+    }
+
+    fn process_includes(
+        &mut self,
+        project_dir: &Path,
+        desc: &ModuleDesc,
+        visited: &mut HashSet<PathBuf>,
+        report: &mut LoadReport,
+    ) {
+        for inc in &desc.includes {
+            let dir = project_dir.join(&inc.value);
+            if !self.ctx.is_dir(&dir) {
+                report.errors.push(format!(
+                    "@include('{}'): directory not found at {}",
+                    inc.value,
+                    dir.display()
+                ));
+                continue;
+            }
+            for path in self.ctx.iter_gcl(&dir) {
+                if let Some(uri) = self.load_file(&path, "project", visited, report) {
+                    let nested = self.module_desc_for(&uri);
+                    self.process_includes(project_dir, &nested, visited, report);
+                    self.process_libraries(project_dir, &nested, visited, report);
+                }
+            }
+        }
+    }
+
+    fn process_libraries(
+        &mut self,
+        project_dir: &Path,
+        desc: &ModuleDesc,
+        visited: &mut HashSet<PathBuf>,
+        report: &mut LoadReport,
+    ) {
+        for lib in &desc.libraries {
+            // Local library wins (`<project_dir>/lib/<name>/`). Global `std`
+            // falls back to `<greycat_home>/lib/std/`. Other libs without a
+            // local copy are reported as unresolved.
+            let local = library_dir(project_dir, &lib.name);
+            let lib_root = if self.ctx.is_dir(&local) {
+                local
+            } else if lib.name == "std" {
+                let global = global_std_dir(self.ctx.greycat_home());
+                if self.ctx.is_dir(&global) {
+                    global
+                } else {
+                    report.unresolved_libraries.push(lib.name.clone());
+                    continue;
+                }
+            } else {
+                report.unresolved_libraries.push(lib.name.clone());
+                continue;
+            };
+
+            for path in self.ctx.iter_gcl(&lib_root) {
+                self.load_file(&path, &lib.name, visited, report);
+            }
+        }
+    }
+
+    fn load_file(
+        &mut self,
+        path: &Path,
+        lib: &str,
+        visited: &mut HashSet<PathBuf>,
+        report: &mut LoadReport,
+    ) -> Option<Uri> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !visited.insert(canonical.clone()) {
+            return None; // already loaded — cycle-safe
+        }
+        let text = match self.ctx.read(&canonical) {
+            Ok(t) => t,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("cannot read {}: {e}", canonical.display()));
+                return None;
+            }
+        };
+        let uri = path_to_uri(&canonical);
+        self.add_simple(uri.clone(), text, lib, false);
+        report.loaded.push(uri.clone());
+        Some(uri)
+    }
 }
 
-impl std::fmt::Display for Manager {
+impl Default for SourceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for SourceManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Manager({}):", self.documents.len())?;
+        writeln!(f, "SourceManager({}):", self.documents.len())?;
         let last_i = self.documents.len().saturating_sub(1);
         for (i, doc) in self.documents.values().enumerate() {
             let doc = doc.borrow();
@@ -48,5 +257,207 @@ impl std::fmt::Display for Manager {
             }
         }
         Ok(())
+    }
+}
+
+/// Outcome of [`SourceManager::load_project`].
+#[derive(Debug, Default, Clone)]
+pub struct LoadReport {
+    /// URIs of every document loaded during the call (excluding ones that
+    /// were already in the manager).
+    pub loaded: Vec<Uri>,
+    /// `@library` declarations that couldn't be resolved to a directory.
+    /// Surface these as diagnostics in P1.4.
+    pub unresolved_libraries: Vec<String>,
+    /// Filesystem / decoding errors encountered along the way. Strings for
+    /// now — typed diagnostics arrive in P1.4.
+    pub errors: Vec<String>,
+}
+
+fn path_to_uri(path: &Path) -> Uri {
+    let s = format!("file://{}", path.display());
+    s.parse::<Uri>()
+        .unwrap_or_else(|_| "file:///invalid".parse().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    /// In-memory `Context` for tests — keeps these hermetic, no temp dirs,
+    /// no `$HOME` / `$GREYCAT_HOME` mutation.
+    #[derive(Default)]
+    struct MemContext {
+        files: std::sync::Mutex<HashMap<PathBuf, String>>,
+        dirs: std::sync::Mutex<HashSet<PathBuf>>,
+        greycat_home: PathBuf,
+    }
+
+    impl MemContext {
+        fn add_file(&self, path: PathBuf, content: &str) {
+            // Mark every ancestor as a directory so is_dir / iter_gcl
+            // walking matches a real filesystem.
+            for ancestor in path.ancestors().skip(1) {
+                self.dirs.lock().unwrap().insert(ancestor.to_path_buf());
+            }
+            self.files.lock().unwrap().insert(path, content.to_string());
+        }
+    }
+
+    impl Context for MemContext {
+        fn read(&self, path: &Path) -> std::io::Result<String> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, path.display().to_string())
+                })
+        }
+
+        fn iter_gcl(&self, dir: &Path) -> Vec<PathBuf> {
+            let mut out: Vec<PathBuf> = self
+                .files
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|p| p.starts_with(dir))
+                .filter(|p| {
+                    p.extension().and_then(|s| s.to_str()) == Some("gcl")
+                })
+                .cloned()
+                .collect();
+            out.sort();
+            out
+        }
+
+        fn is_dir(&self, path: &Path) -> bool {
+            self.dirs.lock().unwrap().contains(path)
+        }
+
+        fn greycat_home(&self) -> &Path {
+            &self.greycat_home
+        }
+    }
+
+    fn uri(path: &str) -> Uri {
+        Uri::from_str(&format!("file://{path}")).unwrap()
+    }
+
+    #[test]
+    fn add_simple_round_trip() {
+        let ctx = Arc::new(MemContext::default());
+        let mut mgr = SourceManager::with_context(ctx);
+        mgr.add_simple(
+            uri("/proj/src/a.gcl"),
+            "fn a() {}\n",
+            "project",
+            false,
+        );
+        assert_eq!(mgr.len(), 1);
+        let cell = mgr.get(&uri("/proj/src/a.gcl")).unwrap();
+        let doc = cell.borrow();
+        assert_eq!(doc.lib, "project");
+        assert!(!doc.opened);
+        assert_eq!(doc.root_node().kind(), "module");
+    }
+
+    #[test]
+    fn load_project_walks_includes_and_local_lib() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        ctx.add_file(
+            PathBuf::from("/proj/project.gcl"),
+            "@library(\"std\", \"1.0\");\n@include(\"src\");\n",
+        );
+        ctx.add_file(PathBuf::from("/proj/src/main.gcl"), "fn main() {}\n");
+        ctx.add_file(PathBuf::from("/proj/src/util.gcl"), "fn util() {}\n");
+        ctx.add_file(PathBuf::from("/proj/lib/std/core.gcl"), "fn core() {}\n");
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+
+        // 1 project.gcl + 2 include files + 1 lib file
+        assert_eq!(report.loaded.len(), 4, "loaded: {:?}", report.loaded);
+        assert!(report.unresolved_libraries.is_empty());
+        assert!(report.errors.is_empty());
+
+        let main_uri = uri("/proj/src/main.gcl");
+        let main = mgr.get(&main_uri).unwrap().borrow();
+        assert_eq!(main.lib, "project");
+
+        let core_uri = uri("/proj/lib/std/core.gcl");
+        let core_doc = mgr.get(&core_uri).unwrap().borrow();
+        assert_eq!(core_doc.lib, "std");
+    }
+
+    #[test]
+    fn load_project_global_std_fallback() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        ctx.add_file(
+            PathBuf::from("/proj/project.gcl"),
+            "@library(\"std\", \"1.0\");\n",
+        );
+        ctx.add_file(PathBuf::from("/gcat/lib/std/core.gcl"), "fn core() {}\n");
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+        assert_eq!(report.loaded.len(), 2, "loaded: {:?}", report.loaded);
+        assert!(report.unresolved_libraries.is_empty());
+        assert_eq!(
+            mgr.get(&uri("/gcat/lib/std/core.gcl"))
+                .unwrap()
+                .borrow()
+                .lib,
+            "std"
+        );
+    }
+
+    #[test]
+    fn load_project_unresolved_library_reported() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        ctx.add_file(
+            PathBuf::from("/proj/project.gcl"),
+            "@library(\"missing\", \"1.0\");\n",
+        );
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+        assert_eq!(report.loaded.len(), 1); // just the project.gcl
+        assert_eq!(report.unresolved_libraries, vec!["missing".to_string()]);
+    }
+
+    #[test]
+    fn load_project_cycle_safe() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        // Two files that both `@include("src")` — the second walk through
+        // `src/` should be a no-op because file paths are already visited.
+        ctx.add_file(
+            PathBuf::from("/proj/project.gcl"),
+            "@include(\"src\");\n",
+        );
+        ctx.add_file(
+            PathBuf::from("/proj/src/a.gcl"),
+            "@include(\"src\");\nfn a() {}\n",
+        );
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+        assert_eq!(report.loaded.len(), 2);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
     }
 }

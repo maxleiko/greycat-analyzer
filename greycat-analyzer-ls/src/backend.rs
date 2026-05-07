@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use greycat_analyzer_core::{Document, Manager};
+use greycat_analyzer_core::{Document, SourceManager};
 use log::debug;
 use lsp_server::*;
 use lsp_types::{
@@ -11,7 +11,7 @@ use crate::Result;
 
 pub struct Backend {
     pub client: Sender<Message>,
-    pub manager: Manager,
+    pub manager: SourceManager,
 }
 
 impl Backend {

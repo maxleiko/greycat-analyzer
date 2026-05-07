@@ -15,12 +15,26 @@ pub struct Document {
     pub version: i32,
     pub text: String,
     pub tree: Tree,
+    /// The library this document belongs to. `"project"` for project-local
+    /// modules, the library name (e.g. `"std"`) for files loaded via
+    /// `@library(...)`. Mirrors TS `SourceFile.lib`.
+    pub lib: String,
+    /// `true` if the document was opened by the LSP client (vs.
+    /// transitively loaded from disk by the source manager). Mirrors
+    /// TS `SourceFile.opened`.
+    pub opened: bool,
     parser: Parser,
     filepath: OnceCell<PathBuf>,
 }
 
 impl Document {
+    /// Create a document for an LSP-opened text document. `lib` defaults
+    /// to `"project"`.
     pub fn new(value: TextDocumentItem) -> Self {
+        Self::with_lib(value, "project", true)
+    }
+
+    pub fn with_lib(value: TextDocumentItem, lib: impl Into<String>, opened: bool) -> Self {
         let mut parser = syntax::parser();
         let tree = parse(&mut parser, &value.text, None);
         Self {
@@ -28,6 +42,8 @@ impl Document {
             version: value.version,
             text: value.text,
             tree,
+            lib: lib.into(),
+            opened,
             parser,
             filepath: OnceCell::new(),
         }
