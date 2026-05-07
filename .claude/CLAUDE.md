@@ -75,6 +75,35 @@ cd greycat-analyzer-playground && pnpm install && pnpm dev
 - **`/target`, `/project.gcl`, `/gcdata`, `/files`, `/lib`, `/webroot`** are git-ignored. `project.gcl` at the repo root is local scratch (real GreyCat project for dogfooding) — do not commit.
 - **Playground (`greycat-analyzer-playground/`) is git-ignored and intentionally outside the workspace.** Treat it as a separate npm project.
 
+## Commit cadence (ROADMAP execution)
+
+While executing [ROADMAP.md](../ROADMAP.md), **one commit per chunk** (the `[ ]` items inside each phase). This keeps the history bisectable and lets the user review the port one workpackage at a time.
+
+Standing authorization: commit per chunk without asking each time. The user has explicitly opted in to this cadence — do not prompt for permission per commit.
+
+Per-chunk checklist before committing:
+
+1. `cargo build --workspace` clean.
+2. `cargo test --workspace` clean (or, for chunks that intentionally don't add tests, the existing tests still pass).
+3. Tick the chunk in ROADMAP.md (`[ ]` → `[x]`) in the same commit.
+4. Stage only the files relevant to the chunk; never `git add -A`.
+5. Don't skip hooks, don't amend prior commits.
+
+Commit message format — match the existing log style (short, lowercase, area-prefixed):
+
+```
+P<phase>.<chunk>: <terse summary>
+```
+
+Examples:
+- `P0.1: workspace re-shape, add greycat-analyzer-syntax crate`
+- `P0.3: port Document/Manager to tree-sitter Tree`
+- `P2.4: type system core — Type enum, subtyping, generics`
+
+Body is optional; add one when the *why* isn't obvious from the diff (architectural choice, deferred work, surprising trade-off). No `Co-Authored-By` footer — repo history doesn't use them.
+
+If a chunk is too big for one commit, split it into smaller chunks in ROADMAP.md first, then commit per sub-chunk. Do not bundle multiple chunks into one commit.
+
 ## GreyCat language context
 
 When reading or generating `.gcl` files, GreyCat is a unified language + temporal/graph DB. Notable bits this analyzer must understand:
