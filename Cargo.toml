@@ -11,6 +11,21 @@ members = [
   "greycat-analyzer-types",
   "greycat-analyzer-wasm",
 ]
+# `fuzz/` (P10.2) is a separate cargo project; it picks up
+# `cargo fuzz run` only when invoked from inside that directory and
+# is intentionally not a workspace member to avoid pulling
+# `libfuzzer-sys` into normal `cargo build --workspace` runs.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/maxleiko/greycat-analyzer"
+authors = ["maxleiko"]
+description = "Static analyzer, LSP server, formatter, and linter for the GreyCat language"
+keywords = ["greycat", "lsp", "language-server", "static-analysis", "tree-sitter"]
+categories = ["development-tools", "compilers", "parsing"]
 
 [profile.release]
 strip = true

@@ -1,15 +1,21 @@
 [package]
 name = "greycat-analyzer-ls"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-greycat-analyzer-core = { path = "../greycat-analyzer-core" }
-greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }
-greycat-analyzer-hir = { path = "../greycat-analyzer-hir" }
-greycat-analyzer-analysis = { path = "../greycat-analyzer-analysis" }
-greycat-analyzer-types = { path = "../greycat-analyzer-types" }
-greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt" }
+greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
+greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
+greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }
+greycat-analyzer-analysis = { path = "../greycat-analyzer-analysis", version = "0.1.0" }
+greycat-analyzer-types = { path = "../greycat-analyzer-types", version = "0.1.0" }
+greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt", version = "0.1.0" }
 
 dashmap = "6.1.0"
 log = "0.4.27"

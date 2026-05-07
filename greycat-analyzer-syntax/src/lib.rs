@@ -1,3 +1,19 @@
+//! Tree-sitter wrapper for the greycat language — owns parsing
+//! and the generated typed-node accessors that downstream crates
+//! (HIR lowering, formatter, LSP capabilities) use to navigate the
+//! CST.
+//!
+//! This crate is the *only* place where `tree-sitter` and the
+//! grammar's `parser.c` are linked. Everything else consumes the
+//! [`tree_sitter`] re-export from here so versions stay in lockstep
+//! and the grammar pin (the submodule SHA at
+//! `vendor/tree-sitter-greycat`) is the single source of truth.
+//!
+//! Decision A (ROADMAP §3): no rowan/syntree facade — tree-sitter
+//! already provides lossless trivia, incremental reparse, and
+//! green/red trees. Typed accessors are generated via `build.rs` from
+//! `node-types.json` (~300 LoC vs. several thousand hand-maintained).
+
 use tree_sitter::{Language, Parser, Tree};
 
 pub use tree_sitter;

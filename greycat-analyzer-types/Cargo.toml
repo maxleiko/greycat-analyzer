@@ -1,8 +1,14 @@
 [package]
 name = "greycat-analyzer-types"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-greycat-analyzer-hir = { path = "../greycat-analyzer-hir" }
-greycat-analyzer-core = { path = "../greycat-analyzer-core" }
+greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }
+greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
