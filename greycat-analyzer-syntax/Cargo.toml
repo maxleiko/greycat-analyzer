@@ -6,7 +6,7 @@ build = "build.rs"
 
 [dependencies]
 tree-sitter = "0.26"
-tree-sitter-greycat = { git = "https://github.com/maxleiko/tree-sitter-greycat", branch = "main" }
+tree-sitter-greycat = { path = "../vendor/tree-sitter-greycat" }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }

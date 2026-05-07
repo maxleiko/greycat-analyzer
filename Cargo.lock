@@ -668,9 +668,9 @@ dependencies = [
 [[package]]
 name = "tree-sitter-greycat"
 version = "0.1.0"
-source = "git+https://github.com/maxleiko/tree-sitter-greycat?branch=main#1bec7c1d87186eed2e5e57c74cbb31e7de299ea4"
 dependencies = [
  "cc",
+ "tree-sitter",
  "tree-sitter-language",
 ]
 

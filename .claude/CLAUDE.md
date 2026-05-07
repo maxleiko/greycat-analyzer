@@ -12,7 +12,7 @@ Rust edition 2024. Workspace resolver `"3"`.
 
 | Crate | Purpose |
 |---|---|
-| [greycat-analyzer-syntax](../greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](https://github.com/maxleiko/tree-sitter-greycat). |
+| [greycat-analyzer-syntax](../greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](../vendor/tree-sitter-greycat/) (vendored as a git submodule). |
 | [greycat-analyzer-core](../greycat-analyzer-core/) | `Document`, `Manager`, `span`, project graph, module resolver. |
 | [greycat-analyzer-ls](../greycat-analyzer-ls/) | LSP server (`lsp-server` + `crossbeam-channel`). |
 | [greycat-analyzer](../greycat-analyzer/) | CLI binary (`clap` subcommands in [src/cmd/](../greycat-analyzer/src/cmd/)). |
@@ -27,7 +27,27 @@ Dependency direction: `syntax → core → (hir → types → analysis) → {ls,
 
 Always parse via `greycat-analyzer-syntax::parse(source)`. The tree-sitter grammar is at ABI v15, so the host `tree-sitter` crate must be ≥ `0.26`.
 
-Tree-sitter owns scanning; do not add a separate Rust lexer. The retired hand-rolled CST/AST/lexer in `greycat-analyzer-core/src/{cst,ast,lexer}/` is being deleted in P0.4 — do not extend it.
+Tree-sitter owns scanning; do not add a separate Rust lexer.
+
+### Grammar lives in this repo
+
+`tree-sitter-greycat` is a **git submodule** at [vendor/tree-sitter-greycat/](../vendor/tree-sitter-greycat/), pulled in as a Cargo `path` dep. That means: when the parser disagrees with the TS reference, **edit the grammar locally and re-run `cargo test --workspace`** instead of allowlisting the divergence in the analyzer.
+
+Grammar edit loop:
+
+```sh
+# 1. Edit vendor/tree-sitter-greycat/grammar.js
+# 2. Regenerate parser.c + node-types.json
+cd vendor/tree-sitter-greycat && npx tree-sitter generate && cd -
+# 3. Re-run gauntlet
+cargo test -p greycat-analyzer-syntax --test coverage
+```
+
+The syntax crate's `build.rs` reads `node-types.json` directly from the submodule; there is no vendored copy in `greycat-analyzer-syntax/`. The submodule SHA *is* the grammar pin.
+
+When grammar fixes are ready, commit inside the submodule and push to `maxleiko/tree-sitter-greycat`, then bump the submodule pointer here. The submodule's own [CLAUDE.md](../vendor/tree-sitter-greycat/.claude/CLAUDE.md) has the full grammar workflow (scanner.c boundary, query updates, etc.).
+
+**Hard rule:** when the gauntlet flags ERROR/MISSING, when CST shape diverges from TS reference, when typed-node accessors return `None` where the reference produces a value — pause and ask. Default answer is "fix the grammar," not "work around it." `KNOWN_GRAMMAR_GAPS` in `greycat-analyzer-syntax/tests/coverage.rs` is a temporary buffer between *gap discovered* and *grammar fixed*; it should be empty most of the time.
 
 ## Common commands
 
@@ -39,7 +59,10 @@ cargo install --path greycat-analyzer --debug        # install CLI on host
 cargo run -p greycat-analyzer -- lint <args>
 cargo run -p greycat-analyzer -- lang-server
 cargo run -p greycat-analyzer -- cst <file>
-cargo run -p greycat-analyzer -- lex <file>          # retired in P0.4
+
+# stdlib coverage (optional — needs greycat installed)
+greycat install                                      # populates lib/std/
+cargo test -p greycat-analyzer-syntax --test coverage
 
 # wasm
 cd greycat-analyzer-wasm && wasm-pack build --target web
@@ -51,9 +74,9 @@ cd greycat-analyzer-playground && pnpm install && pnpm dev
 
 ## Conventions
 
-- **Arena lifetimes:** legacy `bumpalo::Bump`-backed types in `core` (e.g. `Document<'arena>`, `Manager<'arena>`) carry an `'arena` lifetime. P0.3 replaces this with tree-sitter `Tree`; new code should not introduce new `'arena` parameters.
 - **`lsp_types` is re-exported from `greycat-analyzer-core`** — depend on `greycat_analyzer_core::lsp_types` from downstream crates so versions stay in lockstep.
-- **Gitignored at repo root:** `/target`, `/project.gcl`, `/gcdata`, `/files`, `/lib`, `/webroot`, `greycat-analyzer-playground`. The root `project.gcl` is local scratch; do not commit.
+- **Gitignored at repo root:** `/target`, `/gcdata`, `/files`, `/lib`, `/webroot`, `greycat-analyzer-playground`. The root [project.gcl](../project.gcl) IS committed — it pins the stdlib version via `@library("std", "...")` and drives `greycat install`.
+- **Conformance corpus:** vendored TS reference parser/project fixtures live at [tests/corpus/](../tests/corpus/). Stdlib (`lib/std/*.gcl`) is *not* vendored — populate via `greycat install`. The coverage gauntlet handles both.
 - **Examples** for ad-hoc parsing live in [examples/](../examples/). Use these as inputs when smoke-testing parser changes.
 
 ## Commit cadence (ROADMAP execution)

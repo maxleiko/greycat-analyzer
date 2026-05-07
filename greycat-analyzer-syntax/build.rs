@@ -127,11 +127,17 @@ fn rust_ident(s: &str) -> String {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=node-types.json");
+    // Single source of truth: read node-types.json directly from the
+    // tree-sitter-greycat submodule. No vendored copy in this crate.
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let json_path = manifest_dir
+        .parent()
+        .expect("syntax crate has a parent dir")
+        .join("vendor/tree-sitter-greycat/src/node-types.json");
+
+    println!("cargo:rerun-if-changed={}", json_path.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    let json_path = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-        .join("node-types.json");
     let json = fs::read_to_string(&json_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", json_path.display()));
     let nodes: Vec<NodeType> =

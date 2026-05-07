@@ -84,17 +84,4 @@ mod tests {
         assert!(module.cast::<FnDecl>().is_none());
     }
 
-    /// Guard against silent drift between the vendored `node-types.json` and
-    /// the `tree-sitter-greycat` git dependency. If this fails, re-copy from
-    /// the cargo git checkout.
-    #[test]
-    fn vendored_node_types_match_dep() {
-        let vendored = include_str!("../node-types.json");
-        let upstream = tree_sitter_greycat::NODE_TYPES;
-        assert_eq!(
-            vendored.trim(),
-            upstream.trim(),
-            "vendored node-types.json drifted from tree-sitter-greycat dep"
-        );
-    }
 }
