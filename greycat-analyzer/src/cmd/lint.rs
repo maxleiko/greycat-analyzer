@@ -7,8 +7,15 @@ use std::{
 
 use greycat_analyzer_core::{
     diagnostics::{format_cli, parse_diagnostics},
+    lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange},
     resolver::{Context, FsContext},
 };
+use greycat_analyzer_analysis::{
+    analyzer::{Severity, analyze},
+    lint::{LintSeverity, run_lints},
+    resolver::resolve,
+};
+use greycat_analyzer_hir::lower_module;
 
 use crate::utils::AnyError;
 
@@ -45,7 +52,38 @@ impl Lint {
                 .parse(&source, None)
                 .expect("tree-sitter parse never returns None without a cancellation flag");
             let took = start.elapsed();
-            let diagnostics = parse_diagnostics(tree.root_node(), &source);
+            let mut diagnostics = parse_diagnostics(tree.root_node(), &source);
+            // Pipe semantic + lint diagnostics through the cli output too.
+            let hir = lower_module(&source, "module", "project", tree.root_node());
+            let resolutions = resolve(&hir);
+            let analysis = analyze(&hir, &resolutions);
+            for d in &analysis.diagnostics {
+                diagnostics.push(Diagnostic {
+                    range: byte_range_to_lsp(&source, &d.byte_range),
+                    severity: Some(match d.severity {
+                        Severity::Error => DiagnosticSeverity::ERROR,
+                        Severity::Warning => DiagnosticSeverity::WARNING,
+                        Severity::Hint => DiagnosticSeverity::HINT,
+                    }),
+                    code: Some(NumberOrString::String("semantic".into())),
+                    source: Some("greycat-analyzer".into()),
+                    message: d.message.clone(),
+                    ..Default::default()
+                });
+            }
+            for l in run_lints(&hir, &resolutions) {
+                diagnostics.push(Diagnostic {
+                    range: byte_range_to_lsp(&source, &l.byte_range),
+                    severity: Some(match l.severity {
+                        LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                        LintSeverity::Hint => DiagnosticSeverity::HINT,
+                    }),
+                    code: Some(NumberOrString::String(l.rule.into())),
+                    source: Some("lint".into()),
+                    message: l.message,
+                    ..Default::default()
+                });
+            }
             entries.push(Entry {
                 path,
                 source,
@@ -108,5 +146,29 @@ struct Entry {
     source: String,
     took: Duration,
     nodes: usize,
-    diagnostics: Vec<greycat_analyzer_core::lsp_types::Diagnostic>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+fn byte_range_to_lsp(text: &str, range: &std::ops::Range<usize>) -> LspRange {
+    fn position_at(text: &str, byte: usize) -> Position {
+        let mut line = 0u32;
+        let mut col = 0u32;
+        let prefix = &text[..byte.min(text.len())];
+        for c in prefix.chars() {
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += c.len_utf8() as u32;
+            }
+        }
+        Position {
+            line,
+            character: col,
+        }
+    }
+    LspRange {
+        start: position_at(text, range.start),
+        end: position_at(text, range.end),
+    }
 }

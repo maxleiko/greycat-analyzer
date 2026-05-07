@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::analyzer::{Severity, analyze};
+use greycat_analyzer_analysis::lint::{LintSeverity, run_lints};
 use greycat_analyzer_analysis::resolver::resolve;
 use greycat_analyzer_core::{Document, SourceManager, diagnostics::parse_diagnostics};
 use greycat_analyzer_hir::lower_module;
@@ -160,7 +161,8 @@ pub(crate) fn semantic_diagnostics_for_text(
     let hir = lower_module(text, "module", lib, root);
     let resolutions = resolve(&hir);
     let analysis = analyze(&hir, &resolutions);
-    analysis
+
+    let mut out: Vec<Diagnostic> = analysis
         .diagnostics
         .iter()
         .map(|d| Diagnostic {
@@ -175,7 +177,24 @@ pub(crate) fn semantic_diagnostics_for_text(
             message: d.message.clone(),
             ..Default::default()
         })
-        .collect()
+        .collect();
+
+    // Lint findings — own source ("lint") so editors can group / mute them
+    // separately from parse + semantic.
+    for lint in run_lints(&hir, &resolutions) {
+        out.push(Diagnostic {
+            range: byte_range_to_lsp_range(text, &lint.byte_range),
+            severity: Some(match lint.severity {
+                LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                LintSeverity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(lint.rule.into())),
+            source: Some("lint".into()),
+            message: lint.message,
+            ..Default::default()
+        });
+    }
+    out
 }
 
 /// Convert a byte range against `text` to an LSP `Range`. The mapping

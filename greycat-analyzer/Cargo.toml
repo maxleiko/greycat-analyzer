@@ -8,6 +8,8 @@ greycat-analyzer-core = { path = "../greycat-analyzer-core" }
 greycat-analyzer-ls = { path = "../greycat-analyzer-ls" }
 greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }
 greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt" }
+greycat-analyzer-hir = { path = "../greycat-analyzer-hir" }
+greycat-analyzer-analysis = { path = "../greycat-analyzer-analysis" }
 
 clap = { version = "4.5.38", features = ["derive"] }
 env_logger = "0.11.8"
