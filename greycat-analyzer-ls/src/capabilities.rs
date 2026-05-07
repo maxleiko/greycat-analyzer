@@ -176,7 +176,8 @@ fn ident_hover_label(
             decl_kind_word(&hir.decls[decl_id]),
             ident.text
         )),
-        Definition::Builtin(name) => Some(format!("(builtin) {name}")),
+        Definition::Generic(_) => Some(format!("(type parameter) {}", ident.text)),
+        Definition::Project => Some(format!("(project) {}", ident.text)),
     }
 }
 
@@ -329,8 +330,10 @@ pub fn goto_definition(
             let name = hir.decls[decl_id].name()?;
             hir.idents[name].byte_range.clone()
         }
-        Definition::Local(name) | Definition::Param(name) => hir.idents[name].byte_range.clone(),
-        Definition::Builtin(_) => return None,
+        Definition::Local(name) | Definition::Param(name) | Definition::Generic(name) => {
+            hir.idents[name].byte_range.clone()
+        }
+        Definition::Project => return None,
     };
 
     Some(GotoDefinitionResponse::Scalar(Location {
@@ -830,7 +833,8 @@ pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Se
                         },
                         Some(Definition::Local(_)) => TOK_VAR,
                         Some(Definition::Param(_)) => TOK_PARAM,
-                        Some(Definition::Builtin(_)) => TOK_TYPE,
+                        Some(Definition::Generic(_)) => TOK_TYPE,
+                        Some(Definition::Project) => TOK_TYPE,
                         None => return true,
                     };
                     push(&mut events, ty);

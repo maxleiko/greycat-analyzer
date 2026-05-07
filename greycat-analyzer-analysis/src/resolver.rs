@@ -1,4 +1,4 @@
-//! Symbol resolver / name binding (P2.3).
+//! Symbol resolver / name binding (P2.3, extended in P6.2).
 //!
 //! Walks an [`Hir`] and produces a [`Resolutions`] table that maps each
 //! ident-use site to the declaration or local that introduces it. Builds
@@ -8,13 +8,20 @@
 //! Scope semantics mirror the TS reference (`packages/lang/src/analysis/
 //! environment.ts` + `resolver.ts`):
 //! - Module scope: top-level decls (fn / type / enum / var).
-//! - Function scope: parameters + locally-declared vars.
+//! - Function scope: parameters + locally-declared vars + the fn's own
+//!   generic params.
+//! - Type scope: the type's generic params (visible inside the type's
+//!   attributes and methods).
 //! - Block scope: nested var declarations, shadowing parent block.
 //! - For / for-in / try-catch introduce their own scope for their bound
 //!   names.
+//! - **Project scope** (P6.2): consulted after every local scope misses
+//!   — names registered in the shared [`ProjectIndex`] (runtime types,
+//!   primitives by name, and decls from other modules) bind to
+//!   [`Definition::Project`].
 //!
 //! Member-access (`a.b`) is *not* resolved here — the property `b` needs
-//! the receiver's type, which is P2.4/P2.5 territory. Only the head of
+//! the receiver's type, which is P6.3 territory. Only the head of
 //! the chain (`a`) is bound now.
 
 use std::collections::HashMap;
@@ -27,6 +34,8 @@ use greycat_analyzer_hir::types::{
     Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, VarDeclTop, WhileStmt,
 };
 
+use crate::stdlib::ProjectIndex;
+
 /// Where a use of an `Ident` resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Definition {
@@ -37,50 +46,17 @@ pub enum Definition {
     Local(Idx<Ident>),
     /// A function parameter.
     Param(Idx<Ident>),
-    /// A built-in type or value name resolved against the static
-    /// [`BUILTIN_TYPES`] table. Until P2.6 imports stdlib, this is the
-    /// stand-in that keeps `int`, `String`, `Array`, etc. from showing
-    /// up as unresolved.
-    Builtin(&'static str),
+    /// A type-parameter declaration (`type Foo<T>` / `fn f<T>(...)`).
+    /// Points back at the binding ident so capabilities can offer goto-
+    /// definition. Inference / constraint handling is **P7.4**.
+    Generic(Idx<Ident>),
+    /// A name resolved against the shared [`ProjectIndex`] — either a
+    /// runtime-implemented type / native fn, a registered primitive
+    /// name, or a top-level decl from another module. The variant
+    /// carries no detail today; cross-module decl pointers + member
+    /// resolution land in P6.3 / P8.2.
+    Project,
 }
-
-/// The well-known names the type system / analyzer treats as built-in,
-/// drawn from the TS reference's `StdCoreTypes` interface plus a few
-/// keyword-shaped values. This table goes away once P2.6 ingests
-/// `lib/std/*.gcl` and these names start resolving to real declarations.
-pub const BUILTIN_TYPES: &[&str] = &[
-    // primitive types
-    "any",
-    "null",
-    "bool",
-    "char",
-    "int",
-    "float",
-    "String",
-    "duration",
-    "time",
-    "geo",
-    // collections / generics
-    "Array",
-    "Map",
-    "Set",
-    "node",
-    "nodeTime",
-    "nodeGeo",
-    "nodeList",
-    "nodeIndex",
-    // function / type / tuple
-    "function",
-    "type",
-    "tuple",
-    "field",
-    "t2",
-    "t3",
-    "t4",
-    "t2f",
-    "t3f",
-    "t4f",
-];
 
 /// Resolution table — built by [`resolve`].
 #[derive(Debug, Default)]
@@ -115,18 +91,19 @@ impl Scope {
 struct Cx<'a> {
     hir: &'a Hir,
     scopes: Vec<Scope>,
+    /// Project-level fallback for names that miss every local scope.
+    /// Per-file callers pass an empty [`ProjectIndex::new`]; the project
+    /// pipeline (P6.1) passes the index it just rebuilt.
+    index: &'a ProjectIndex,
     res: Resolutions,
 }
 
 impl<'a> Cx<'a> {
-    fn new(hir: &'a Hir) -> Self {
-        let mut builtins = Scope::default();
-        for &name in BUILTIN_TYPES {
-            builtins.insert(name.to_string(), Definition::Builtin(name));
-        }
+    fn new(hir: &'a Hir, index: &'a ProjectIndex) -> Self {
         Self {
             hir,
-            scopes: vec![builtins, Scope::default()],
+            scopes: vec![Scope::default()],
+            index,
             res: Resolutions::default(),
         }
     }
@@ -144,7 +121,7 @@ impl<'a> Cx<'a> {
             .expect("at least one scope is always live")
     }
 
-    fn lookup(&self, name: &str) -> Option<Definition> {
+    fn lookup_local(&self, name: &str) -> Option<Definition> {
         for scope in self.scopes.iter().rev() {
             if let Some(d) = scope.names.get(name) {
                 return Some(*d);
@@ -159,20 +136,38 @@ impl<'a> Cx<'a> {
 
     fn record_use(&mut self, idx: Idx<Ident>) {
         let name = self.ident_text(idx).to_string();
-        match self.lookup(&name) {
-            Some(def) => {
-                self.res.uses.insert(idx, def);
-            }
-            None => {
-                self.res.unresolved.push(idx);
-            }
+        if let Some(def) = self.lookup_local(&name) {
+            self.res.uses.insert(idx, def);
+            return;
         }
+        if self.index.has_name(&name) {
+            self.res.uses.insert(idx, Definition::Project);
+            return;
+        }
+        self.res.unresolved.push(idx);
     }
 }
 
-/// Run name resolution against `hir`.
+/// Run name resolution against `hir` with no cross-module context — the
+/// fallback index is just [`ProjectIndex::new`], which knows the
+/// language primitives and runtime-implemented type names but no
+/// user-declared decls. Per-file callers (tests, per-request
+/// capabilities) use this; the project pipeline uses
+/// [`resolve_with_index`] so cross-module names also resolve.
 pub fn resolve(hir: &Hir) -> Resolutions {
-    let mut cx = Cx::new(hir);
+    let index = ProjectIndex::new();
+    resolve_inner(hir, &index)
+}
+
+/// Run name resolution against `hir`, falling back to `index` for names
+/// that aren't satisfied by any local scope. P6.2 entry point used by
+/// the project pipeline.
+pub fn resolve_with_index(hir: &Hir, index: &ProjectIndex) -> Resolutions {
+    resolve_inner(hir, index)
+}
+
+fn resolve_inner(hir: &Hir, index: &ProjectIndex) -> Resolutions {
+    let mut cx = Cx::new(hir, index);
 
     let Some(module) = hir.module.as_ref() else {
         return cx.res;
@@ -216,6 +211,12 @@ fn visit_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
 
 fn visit_fn_decl(cx: &mut Cx, d: &FnDecl) {
     cx.push_scope();
+    // Generic params first so type-refs in param / return position can
+    // see them.
+    for g in &d.generics {
+        let name = cx.ident_text(*g).to_string();
+        cx.current_mut().insert(name, Definition::Generic(*g));
+    }
     // Parameters become Param bindings in the function scope.
     for param_id in &d.params {
         let p = cx.hir.fn_params[*param_id].clone();
@@ -236,6 +237,11 @@ fn visit_fn_decl(cx: &mut Cx, d: &FnDecl) {
 
 fn visit_type_decl(cx: &mut Cx, d: &TypeDecl) {
     cx.push_scope();
+    // Generic params visible inside attribute types and method bodies.
+    for g in &d.generics {
+        let name = cx.ident_text(*g).to_string();
+        cx.current_mut().insert(name, Definition::Generic(*g));
+    }
     if let Some(sup) = d.supertype {
         visit_type_ref(cx, sup);
     }
@@ -604,5 +610,54 @@ fn f(p: Foo): Foo { return p; }
             kind: "",
             byte_range: 0..0,
         };
+    }
+
+    #[test]
+    fn generic_param_resolves_to_generic_definition() {
+        let src = "fn id<T>(x: T): T { return x; }\n";
+        let (hir, res) = analyze(src);
+        let t_uses: Vec<_> = hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.text == "T")
+            .filter_map(|(idx, _)| res.uses.get(&idx))
+            .collect();
+        // Two uses of `T` (param type, return type) — both bind to the
+        // generic decl ident. The declaring `T` itself is a definition,
+        // not a use, so it's not in res.uses.
+        assert_eq!(t_uses.len(), 2);
+        for d in t_uses {
+            assert!(matches!(d, Definition::Generic(_)));
+        }
+        assert!(res.unresolved.is_empty());
+    }
+
+    #[test]
+    fn project_index_fallback_resolves_cross_module_name() {
+        use crate::stdlib::ProjectIndex;
+        // Module A declares `Helper` as a top-level type. Module B
+        // refers to `Helper` — without a ProjectIndex it'd be
+        // unresolved; with one ingested from A it binds to Project.
+        let other_src = "type Helper {}\n";
+        let other_tree = parse(other_src);
+        let other_hir = lower_module(other_src, "a", "p", other_tree.root_node());
+
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&other_hir);
+
+        let user_src = "fn use_helper(h: Helper) {}\n";
+        let user_tree = parse(user_src);
+        let user_hir = lower_module(user_src, "b", "p", user_tree.root_node());
+        let res = resolve_with_index(&user_hir, &idx);
+
+        let helper_uses: Vec<_> = user_hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.text == "Helper")
+            .filter_map(|(idx, _)| res.uses.get(&idx))
+            .collect();
+        assert_eq!(helper_uses.len(), 1);
+        assert!(matches!(helper_uses[0], Definition::Project));
+        assert!(res.unresolved.is_empty());
     }
 }

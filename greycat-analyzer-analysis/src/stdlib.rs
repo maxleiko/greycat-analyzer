@@ -12,7 +12,7 @@
 //! .gcl source captures the signature; this module collects them so
 //! call-site type checking works even though there's no body to walk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::types::{Decl, FnDecl, TypeRef as HirTypeRef};
@@ -54,6 +54,12 @@ pub struct ProjectIndex {
     pub types: TypeArena,
     pub registry: TypeRegistry,
     pub natives: NativeRegistry,
+    /// Top-level value-position names from every ingested module —
+    /// non-native `fn` declarations, top-level `var` declarations.
+    /// Lets the resolver answer "is this name known anywhere in the
+    /// project?" without needing the cross-module decl pointer (a
+    /// later P6.x deliverable).
+    pub values: HashSet<String>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -63,6 +69,7 @@ impl ProjectIndex {
     pub fn new() -> Self {
         let mut idx = Self::default();
         seed_builtin_primitives(&mut idx.types);
+        seed_builtin_names(&mut idx.types, &mut idx.registry);
         idx
     }
 
@@ -105,16 +112,32 @@ impl ProjectIndex {
                     }
                 }
                 Decl::Fn(fnd) => {
+                    let name = hir.idents[fnd.name].text.clone();
                     if fnd.modifiers.native {
                         let sig = native_signature_for(hir, fnd, &mut self.types);
-                        let name = hir.idents[fnd.name].text.clone();
-                        self.natives.register(name, sig);
+                        self.natives.register(name.clone(), sig);
+                    } else {
+                        self.values.insert(name);
                     }
                 }
-                Decl::Var(_) | Decl::Pragma(_) => {}
+                Decl::Var(vd) => {
+                    let name = hir.idents[vd.name].text.clone();
+                    self.values.insert(name);
+                }
+                Decl::Pragma(_) => {}
             }
         }
         self.modules_ingested += 1;
+    }
+
+    /// `true` iff `name` resolves against any name the project knows:
+    /// a registered type / enum, a native fn signature, or a top-level
+    /// non-native fn / var. Resolver uses this as the post-local-scope
+    /// fallback (P6.2).
+    pub fn has_name(&self, name: &str) -> bool {
+        self.registry.lookup(name).is_some()
+            || self.natives.lookup(name).is_some()
+            || self.values.contains(name)
     }
 }
 
@@ -135,6 +158,60 @@ fn seed_builtin_primitives(arena: &mut TypeArena) {
     let _ = arena.any();
     let _ = arena.never();
 }
+
+/// Names the analyzer treats as known without an `.gcl` declaration in
+/// scope: the GreyCat primitives plus the runtime-implemented types
+/// (collections, node tags, function/tuple/field markers). Registering
+/// them here is what lets the resolver retire its hard-coded
+/// `BUILTIN_TYPES` allowlist (P6.2) — every name a user can write
+/// resolves through one path now.
+fn seed_builtin_names(arena: &mut TypeArena, registry: &mut TypeRegistry) {
+    // Primitives — registered by name so the resolver's project-index
+    // fallback finds them. The TypeIds returned here are the same ones
+    // `arena.primitive(...)` allocated in seed_builtin_primitives.
+    registry.register("bool", arena.primitive(Primitive::Bool));
+    registry.register("int", arena.primitive(Primitive::Int));
+    registry.register("float", arena.primitive(Primitive::Float));
+    registry.register("char", arena.primitive(Primitive::Char));
+    registry.register("String", arena.primitive(Primitive::String));
+    registry.register("time", arena.primitive(Primitive::Time));
+    registry.register("duration", arena.primitive(Primitive::Duration));
+    registry.register("geo", arena.primitive(Primitive::Geo));
+    registry.register("any", arena.any());
+    registry.register("null", arena.null());
+
+    // Runtime-implemented named types — no `.gcl` decl. Drawn from the
+    // TS `StdCoreTypes` interface plus the t<n> / t<n>f tuple shapes.
+    for &name in BUILTIN_RUNTIME_TYPES {
+        let id = arena.named(name);
+        registry.register(name, id);
+    }
+}
+
+/// Type names whose declaration lives in the GreyCat runtime, not in
+/// any `.gcl` file. The resolver treats a hit against this list (via
+/// the project index registry) as a successful binding. P7.3 refines
+/// the subtyping rules these tags participate in.
+pub const BUILTIN_RUNTIME_TYPES: &[&str] = &[
+    "Array",
+    "Map",
+    "Set",
+    "node",
+    "nodeTime",
+    "nodeGeo",
+    "nodeList",
+    "nodeIndex",
+    "function",
+    "type",
+    "tuple",
+    "field",
+    "t2",
+    "t3",
+    "t4",
+    "t2f",
+    "t3f",
+    "t4f",
+];
 
 fn native_signature_for(hir: &Hir, fnd: &FnDecl, types: &mut TypeArena) -> NativeSignature {
     let params = fnd

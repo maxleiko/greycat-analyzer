@@ -459,7 +459,10 @@ impl<'a> Cx<'a> {
                     .get(&def)
                     .copied()
                     .unwrap_or_else(|| self.any()),
-                Some(Definition::Decl(_)) | Some(Definition::Builtin(_)) | None => self.any(),
+                Some(Definition::Decl(_))
+                | Some(Definition::Generic(_))
+                | Some(Definition::Project)
+                | None => self.any(),
             },
             Expr::Literal(LiteralExpr { kind, .. }) => match kind {
                 LiteralKind::Bool => self.primitive(Primitive::Bool),

@@ -20,7 +20,7 @@ use greycat_analyzer_hir::{Hir, lower_module};
 
 use crate::analyzer::{AnalysisResult, analyze};
 use crate::lint::{LintDiagnostic, run_lints};
-use crate::resolver::{Resolutions, resolve};
+use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::ProjectIndex;
 
 /// Per-document outputs of the analyzer pipeline. Held by
@@ -81,7 +81,7 @@ impl ProjectAnalysis {
         // Pass 2: per-module resolver + analyzer + lints. The per-module
         // analyzer still owns its own arena; P6.2 reroutes the lookups.
         for (uri, hir) in hirs {
-            let resolutions = resolve(&hir);
+            let resolutions = resolve_with_index(&hir, &self.index);
             let analysis = analyze(&hir, &resolutions);
             let lints = run_lints(&hir, &resolutions);
             self.modules.insert(
@@ -107,7 +107,10 @@ impl ProjectAnalysis {
         // Drop cache entries for URIs no longer in the manager. `Uri`
         // has interior mutability for LSP wire-form caching, so we key
         // the live set by string instead of stuffing it into a HashSet.
-        let live: HashSet<String> = manager.iter().map(|(u, _)| u.as_str().to_string()).collect();
+        let live: HashSet<String> = manager
+            .iter()
+            .map(|(u, _)| u.as_str().to_string())
+            .collect();
         self.modules.retain(|u, _| live.contains(u.as_str()));
 
         // Lower the changed doc fresh; reuse cached HIRs for the rest.
@@ -148,7 +151,7 @@ impl ProjectAnalysis {
             self.modules.remove(uri);
             return;
         };
-        let resolutions = resolve(&hir);
+        let resolutions = resolve_with_index(&hir, &self.index);
         let analysis = analyze(&hir, &resolutions);
         let lints = run_lints(&hir, &resolutions);
         self.modules.insert(
