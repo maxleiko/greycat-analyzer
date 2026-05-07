@@ -29,11 +29,11 @@ export class GcCstPanel extends GcBasePanel {
         opacity: 0.55;
       }
       .field {
-        color: var(--wa-color-brand-primary, #4f8cff);
+        color: var(--wa-color-brand-on-normal);
         font-weight: 600;
       }
       .kind {
-        color: var(--wa-color-text-normal, inherit);
+        color: var(--wa-color-text-normal);
       }
       .text {
         opacity: 0.7;
@@ -45,7 +45,7 @@ export class GcCstPanel extends GcBasePanel {
       }
       .error,
       .missing {
-        background: var(--wa-color-danger-default, #c00);
+        background: var(--wa-color-danger-fill-loud);
         color: white;
         padding: 0 4px;
         border-radius: 3px;

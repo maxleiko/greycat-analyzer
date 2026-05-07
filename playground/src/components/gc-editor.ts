@@ -1,8 +1,17 @@
-// Monaco-backed editor pane. Emits a `gc-source-change` CustomEvent on
-// every keystroke so the parent <gc-playground> can fan out to the
-// inspection panels.
+// Monaco-backed editor pane.
+//
+// Monaco does **not** behave inside a Lit shadow root: it injects its
+// own stylesheet into `document.head`, queries computed styles on the
+// host, and creates internal positioning elements that need to escape
+// any encapsulating shadow tree. The classic symptom (and what we hit
+// in the first cut of this component) is a tiny gray rectangle plus
+// the "real" source rendered as plaintext underneath.
+//
+// Fix: render in light DOM by overriding `createRenderRoot()`. The
+// element's own width / height comes from the parent layout via the
+// global rule in `src/style.css`.
 
-import { LitElement, css, html } from "lit";
+import { LitElement, html } from "lit";
 import { customElement, property } from "lit/decorators.js";
 import * as monaco from "monaco-editor";
 
@@ -18,31 +27,25 @@ self.MonacoEnvironment = {
 
 @customElement("gc-editor")
 export class GcEditor extends LitElement {
-  static styles = css`
-    :host {
-      display: block;
-      width: 100%;
-      height: 100%;
-    }
-    .host {
-      width: 100%;
-      height: 100%;
-    }
-  `;
-
   @property({ type: String }) source = "";
 
   private editor?: monaco.editor.IStandaloneCodeEditor;
   private hostEl?: HTMLDivElement;
   private suppressChange = false;
 
-  // Render an inert div; Monaco mounts into it after firstUpdated.
+  /** Render in light DOM so Monaco can do its thing. */
+  protected createRenderRoot(): HTMLElement | DocumentFragment {
+    return this;
+  }
+
   protected render() {
-    return html`<div class="host" part="host"></div>`;
+    return html`<div class="gc-editor-host"></div>`;
   }
 
   protected firstUpdated() {
-    this.hostEl = this.renderRoot.querySelector(".host") as HTMLDivElement;
+    this.hostEl = this.renderRoot.querySelector(
+      ".gc-editor-host",
+    ) as HTMLDivElement;
     this.editor = monaco.editor.create(this.hostEl, {
       value: this.source,
       language: "plaintext",
@@ -55,6 +58,7 @@ export class GcEditor extends LitElement {
       fontSize: 13,
       tabSize: 4,
       insertSpaces: true,
+      scrollBeyondLastLine: false,
     });
 
     this.editor.onDidChangeModelContent(() => {

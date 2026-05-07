@@ -5,7 +5,7 @@
 // - enum
 // - function with parameters, locals, and a binary expression.
 
-export const SAMPLE_SOURCE = `@library("std", "1.0");
+export const SAMPLE_SOURCE = `@library("std", "8.0.269-dev");
 
 enum Color {
     Red,

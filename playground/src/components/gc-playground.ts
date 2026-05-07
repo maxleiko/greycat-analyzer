@@ -2,7 +2,7 @@
 // next to a tab group of inspection panels (right). Each panel
 // receives `source` as a reactive property and re-renders on edit.
 
-import { LitElement, html, css } from "lit";
+import { LitElement, css, html } from "lit";
 import { customElement, state } from "lit/decorators.js";
 import { SAMPLE_SOURCE } from "../sample.ts";
 
@@ -10,65 +10,73 @@ import { SAMPLE_SOURCE } from "../sample.ts";
 export class GcPlayground extends LitElement {
   static styles = css`
     :host {
-      display: flex;
+      display: grid;
+      grid-template-columns: 1fr;
+      grid-template-rows: 100vh;
       height: 100vh;
       width: 100vw;
-      font-family: var(--code-font, monospace);
+      box-sizing: border-box;
+      background: var(--wa-color-surface-default);
+      color: var(--wa-color-text-normal);
+      font-family: var(--wa-font-family-body, system-ui, sans-serif);
     }
 
     wa-split-panel {
-      flex: 1;
+      width: 100%;
+      height: 100%;
       --divider-width: 4px;
     }
 
     .editor-pane {
+      width: 100%;
       height: 100%;
       box-sizing: border-box;
-      border-right: 1px solid var(--wa-color-neutral-200, #e0e0e0);
+      overflow: hidden;
+      background: var(--wa-color-surface-lowered);
     }
 
     .panels {
-      height: 100%;
-      box-sizing: border-box;
       display: flex;
       flex-direction: column;
+      width: 100%;
+      height: 100%;
+      box-sizing: border-box;
+      overflow: hidden;
+      background: var(--wa-color-surface-default);
+    }
+
+    header.bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.5rem 1rem;
+      border-bottom: 1px solid var(--wa-color-surface-border);
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+
+    header.bar .badge {
+      margin-left: auto;
+      font-weight: 400;
+      font-size: 0.85em;
+      color: var(--wa-color-text-quiet);
     }
 
     wa-tab-group {
-      flex: 1;
+      flex: 1 1 auto;
+      min-height: 0;
       display: flex;
       flex-direction: column;
-      overflow: hidden;
-      --indicator-color: var(--wa-color-brand-primary, #4f8cff);
     }
 
     wa-tab-group::part(body) {
-      flex: 1;
+      flex: 1 1 auto;
       overflow: auto;
     }
 
     wa-tab-panel {
-      height: 100%;
-      box-sizing: border-box;
+      display: block;
       padding: 0.75rem 1rem;
-      overflow: auto;
-    }
-
-    header {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.5rem 0.75rem;
-      border-bottom: 1px solid var(--wa-color-neutral-200, #e0e0e0);
-      font-family: var(--wa-font-family-body, sans-serif);
-      font-weight: 600;
-    }
-
-    .badge {
-      margin-left: auto;
-      font-weight: 400;
-      font-size: 0.85em;
-      opacity: 0.7;
     }
   `;
 
@@ -88,8 +96,8 @@ export class GcPlayground extends LitElement {
           ></gc-editor>
         </div>
         <div slot="end" class="panels">
-          <header>
-            greycat-analyzer playground
+          <header class="bar">
+            <span>greycat-analyzer playground</span>
             <span class="badge">${this.source.length} bytes</span>
           </header>
           <wa-tab-group>

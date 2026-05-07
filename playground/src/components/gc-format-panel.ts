@@ -23,11 +23,11 @@ export class GcFormatPanel extends GcBasePanel {
         font-size: 0.85em;
       }
       .clean {
-        background: var(--wa-color-success-default, #2a9d2a);
+        background: var(--wa-color-success-fill-loud);
         color: white;
       }
       .drift {
-        background: var(--wa-color-warning-default, #f0a020);
+        background: var(--wa-color-warning-fill-loud);
         color: white;
       }
       .columns {
@@ -45,7 +45,7 @@ export class GcFormatPanel extends GcBasePanel {
         max-height: 60vh;
         overflow: auto;
         padding: 0.5rem 0.75rem;
-        background: var(--wa-color-neutral-100, #f5f5f5);
+        background: var(--wa-color-surface-lowered);
         border-radius: 4px;
       }
     `,

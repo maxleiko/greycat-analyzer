@@ -42,7 +42,7 @@ export class GcHirPanel extends GcBasePanel {
         padding: 2px 0;
       }
       .kind {
-        color: var(--wa-color-brand-primary, #4f8cff);
+        color: var(--wa-color-brand-on-normal);
         margin-right: 0.5rem;
         font-weight: 600;
       }

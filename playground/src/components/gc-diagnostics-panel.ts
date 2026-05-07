@@ -21,7 +21,7 @@ export class GcDiagnosticsPanel extends GcBasePanel {
     GcBasePanel.styles,
     css`
       .ok {
-        color: var(--wa-color-success-default, #2a9d2a);
+        color: var(--wa-color-success-fill-loud);
         padding: 0.5rem 0.75rem;
         border: 1px solid currentColor;
         border-radius: 4px;
@@ -36,7 +36,7 @@ export class GcDiagnosticsPanel extends GcBasePanel {
       }
       li {
         padding: 4px 0;
-        border-bottom: 1px solid var(--wa-color-neutral-100, #f0f0f0);
+        border-bottom: 1px solid var(--wa-color-surface-border);
       }
       .pos {
         opacity: 0.6;
@@ -51,15 +51,15 @@ export class GcDiagnosticsPanel extends GcBasePanel {
         margin-right: 0.5rem;
       }
       .error {
-        background: var(--wa-color-danger-default, #c00);
+        background: var(--wa-color-danger-fill-loud);
         color: white;
       }
       .warning {
-        background: var(--wa-color-warning-default, #f0a020);
+        background: var(--wa-color-warning-fill-loud);
         color: white;
       }
       .hint {
-        background: var(--wa-color-neutral-300, #d0d0d0);
+        background: var(--wa-color-surface-border);
       }
       .source {
         opacity: 0.6;

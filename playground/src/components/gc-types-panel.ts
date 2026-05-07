@@ -23,14 +23,14 @@ export class GcTypesPanel extends GcBasePanel {
       td {
         text-align: left;
         padding: 2px 8px;
-        border-bottom: 1px solid var(--wa-color-neutral-100, #f0f0f0);
+        border-bottom: 1px solid var(--wa-color-surface-border);
       }
       .range {
         opacity: 0.55;
         font-variant-numeric: tabular-nums;
       }
       .ty {
-        color: var(--wa-color-brand-primary, #4f8cff);
+        color: var(--wa-color-brand-on-normal);
         font-weight: 600;
       }
       .src {

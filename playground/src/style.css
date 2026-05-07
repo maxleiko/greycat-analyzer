@@ -1,9 +1,13 @@
+/* App-level styling. Most colors / spacing flow through WebAwesome's
+   `--wa-*` design tokens — that's why webawesome.css is imported first
+   in main.ts. Extra rules live here for things WebAwesome doesn't
+   own (Monaco container, our own custom-element layout). */
+
 :root {
-  color-scheme: light dark;
-  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-  font-size: 14px;
   --code-font: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular,
     Menlo, monospace;
+  font-family: var(--wa-font-family-body, 'Inter', system-ui, sans-serif);
+  font-size: var(--wa-font-size-m, 14px);
 }
 
 html,
@@ -12,21 +16,25 @@ body {
   padding: 0;
   height: 100vh;
   overflow: hidden;
-}
-
-body {
-  background: var(--wa-color-surface-default, #fafafa);
-  color: var(--wa-color-text-normal, #1a1a1a);
-}
-
-@media (prefers-color-scheme: dark) {
-  body {
-    background: #0e0e10;
-    color: #e6e6e6;
-  }
+  background: var(--wa-color-surface-default);
+  color: var(--wa-color-text-normal);
 }
 
 gc-playground {
-  display: flex;
+  display: block;
+  width: 100vw;
   height: 100vh;
+}
+
+/* gc-editor renders in light DOM (Monaco can't live inside a Lit
+   shadow root). Style the container directly here. */
+gc-editor {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+gc-editor .gc-editor-host {
+  width: 100%;
+  height: 100%;
 }

@@ -1,13 +1,9 @@
-// Playground entry point. Wires up WebAwesome, registers Lit components,
-// and mounts the root `<gc-playground>` element from index.html.
+// Playground entry point. Pulls in WebAwesome (single bundled
+// stylesheet + auto-loader), our app stylesheet, then registers each
+// Lit component.
 
-import "@awesome.me/webawesome/dist/components/split-panel/split-panel.js";
-import "@awesome.me/webawesome/dist/components/tab-group/tab-group.js";
-import "@awesome.me/webawesome/dist/components/tab/tab.js";
-import "@awesome.me/webawesome/dist/components/tab-panel/tab-panel.js";
-import "@awesome.me/webawesome/dist/components/details/details.js";
-import "@awesome.me/webawesome/dist/components/badge/badge.js";
-import "@awesome.me/webawesome/dist/components/icon/icon.js";
+import "@awesome.me/webawesome/dist/styles/webawesome.css";
+import "@awesome.me/webawesome/dist/webawesome.loader.js";
 
 import "./style.css";
 import "./components/gc-playground.ts";

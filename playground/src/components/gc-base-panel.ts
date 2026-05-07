@@ -38,7 +38,7 @@ export abstract class GcBasePanel extends LitElement {
     }
 
     .error {
-      color: var(--wa-color-danger-default, #c00);
+      color: var(--wa-color-danger-fill-loud);
       padding: 0.5rem 0.75rem;
       border: 1px solid currentColor;
       border-radius: 4px;

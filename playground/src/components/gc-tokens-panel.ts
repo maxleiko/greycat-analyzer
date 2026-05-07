@@ -25,14 +25,14 @@ export class GcTokensPanel extends GcBasePanel {
       td {
         text-align: left;
         padding: 2px 8px;
-        border-bottom: 1px solid var(--wa-color-neutral-100, #f0f0f0);
+        border-bottom: 1px solid var(--wa-color-surface-border);
       }
       th {
         font-weight: 600;
         opacity: 0.8;
       }
       .kind {
-        color: var(--wa-color-brand-primary, #4f8cff);
+        color: var(--wa-color-brand-on-normal);
       }
       .range {
         opacity: 0.6;

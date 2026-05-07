@@ -4,14 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>greycat-analyzer playground</title>
-    <link
-      rel="stylesheet"
-      href="/node_modules/@awesome.me/webawesome/dist/styles/themes/default.css"
-    />
-    <link
-      rel="stylesheet"
-      href="/node_modules/@awesome.me/webawesome/dist/styles/native.css"
-    />
+    <script>
+      // WebAwesome's default theme is class-driven (`.wa-dark` / `.wa-light`).
+      // Set it before the body renders so we don't flash the wrong theme.
+      const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.classList.add(dark ? 'wa-dark' : 'wa-light');
+    </script>
   </head>
   <body>
     <gc-playground></gc-playground>
