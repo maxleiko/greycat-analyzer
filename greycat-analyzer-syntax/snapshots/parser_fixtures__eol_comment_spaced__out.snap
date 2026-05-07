@@ -1,0 +1,14 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn main() { // spaced\n    // indented\n}"
+---
+(module
+  (fn_decl
+    name: (ident 'main')
+    params: (fn_params '()')
+    body: (block
+      (line_comment '// spaced')
+      (line_comment '// indented')
+    )
+  )
+)

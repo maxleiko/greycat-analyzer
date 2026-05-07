@@ -1,0 +1,23 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "@expose\nfn foo(): int {\n    return 42;\n}"
+---
+(module
+  (fn_decl
+    (annotations
+      (annotation
+        (ident 'expose')
+      )
+    )
+    name: (ident 'foo')
+    params: (fn_params '()')
+    return_type: (type_ident
+      name: (ident 'int')
+    )
+    body: (block
+      (return_stmt
+        (number '42')
+      )
+    )
+  )
+)

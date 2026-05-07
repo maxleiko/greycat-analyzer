@@ -1,0 +1,15 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "type GenericTypeWithWayTooLongParams<AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB, CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC> {}"
+---
+(module
+  (type_decl
+    name: (ident 'GenericTypeWithWayTooLongParams')
+    params: (type_params
+      (ident 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')
+      (ident 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB')
+      (ident 'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC')
+    )
+    body: (type_body '{}')
+  )
+)

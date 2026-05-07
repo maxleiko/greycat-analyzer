@@ -1,0 +1,63 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "/// Foo\n@bar\n/// Baz\n\n\nfn main() {\n    var x = 0;\n        var y = 1;\nvar z = 2;\n\n    /* block comment */\n    if (x < z) {\n        var x = 1;\n\nprintln(\"hello\");\n    }\n}\n"
+---
+(module
+  (fn_decl
+    (doc
+      (doc_comment '/// Foo')
+    )
+    (annotations
+      (annotation
+        (ident 'bar')
+      )
+    )
+    (line_comment '/// Baz')
+    name: (ident 'main')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 'x')
+        (initializer
+          expr: (number '0')
+        )
+      )
+      (var_decl
+        name: (ident 'y')
+        (initializer
+          expr: (number '1')
+        )
+      )
+      (var_decl
+        name: (ident 'z')
+        (initializer
+          expr: (number '2')
+        )
+      )
+      (if_stmt
+        condition: (binary_expr
+          left: (ident 'x')
+          right: (ident 'z')
+        )
+        then_branch: (block
+          (var_decl
+            name: (ident 'x')
+            (initializer
+              expr: (number '1')
+            )
+          )
+          (expr_stmt
+            (call_expr
+              fn: (ident 'println')
+              (args
+                (string
+                  (string_fragment 'hello')
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

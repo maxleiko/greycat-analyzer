@@ -1,0 +1,47 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn main() {\nif(x<0) { var y = Foo { yolo: \"hello this is a really long long long long text, lorem ipsum\", datathings: TimeZone ::Luxembourg};}\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'main')
+    params: (fn_params '()')
+    body: (block
+      (if_stmt
+        condition: (binary_expr
+          left: (ident 'x')
+          right: (number '0')
+        )
+        then_branch: (block
+          (var_decl
+            name: (ident 'y')
+            (initializer
+              expr: (object_expr
+                type: (type_ident
+                  name: (ident 'Foo')
+                )
+                (object_fields
+                  (object_field
+                    name: (ident 'yolo')
+                    value: (string
+                      (string_fragment 'hello this is a really long long long long text, lorem ipsum')
+                    )
+                  )
+                  (object_field
+                    name: (ident 'datathings')
+                    value: (static_expr
+                      (type_ident
+                        name: (ident 'TimeZone')
+                      )
+                      property: (ident 'Luxembourg')
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

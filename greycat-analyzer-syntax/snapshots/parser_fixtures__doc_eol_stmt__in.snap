@@ -1,0 +1,22 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "/// Doc\n\n// eol 0\n// eol 1\n// eol 2\n\n@pragma\nfn foo(  ) {  }"
+---
+(module
+  (fn_decl
+    (doc
+      (doc_comment '/// Doc')
+    )
+    (line_comment '// eol 0')
+    (line_comment '// eol 1')
+    (line_comment '// eol 2')
+    (annotations
+      (annotation
+        (ident 'pragma')
+      )
+    )
+    name: (ident 'foo')
+    params: (fn_params '(  )')
+    body: (block '{  }')
+  )
+)

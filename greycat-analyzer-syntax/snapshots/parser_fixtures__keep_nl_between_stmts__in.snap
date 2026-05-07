@@ -1,0 +1,24 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn first() {}\n\n\n\nfn second() {}\n\n/// Should stick to following statement\n\nfn third() {}"
+---
+(module
+  (fn_decl
+    name: (ident 'first')
+    params: (fn_params '()')
+    body: (block '{}')
+  )
+  (fn_decl
+    name: (ident 'second')
+    params: (fn_params '()')
+    body: (block '{}')
+  )
+  (fn_decl
+    (doc
+      (doc_comment '/// Should stick to following statement')
+    )
+    name: (ident 'third')
+    params: (fn_params '()')
+    body: (block '{}')
+  )
+)

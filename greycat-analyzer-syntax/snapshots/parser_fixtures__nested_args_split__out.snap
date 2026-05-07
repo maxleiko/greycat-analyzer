@@ -1,0 +1,69 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "type Foo {\n    static native fn sample(\n        refs: Array<nodeTime>,\n        from: time?,\n        to: time?,\n        maxRows: int,\n        mode: SamplingMode,\n        maxDephasing: duration?,\n        tz: TimeZone?\n    ): Table;\n}"
+---
+(module
+  (type_decl
+    name: (ident 'Foo')
+    body: (type_body
+      (type_method
+        modifiers: (modifiers 'static native')
+        name: (ident 'sample')
+        params: (fn_params
+          param: (fn_param
+            name: (ident 'refs')
+            type: (type_ident
+              name: (ident 'Array')
+              params: (type_ident
+                name: (ident 'nodeTime')
+              )
+            )
+          )
+          param: (fn_param
+            name: (ident 'from')
+            type: (type_ident
+              name: (ident 'time')
+              (optional '?')
+            )
+          )
+          param: (fn_param
+            name: (ident 'to')
+            type: (type_ident
+              name: (ident 'time')
+              (optional '?')
+            )
+          )
+          param: (fn_param
+            name: (ident 'maxRows')
+            type: (type_ident
+              name: (ident 'int')
+            )
+          )
+          param: (fn_param
+            name: (ident 'mode')
+            type: (type_ident
+              name: (ident 'SamplingMode')
+            )
+          )
+          param: (fn_param
+            name: (ident 'maxDephasing')
+            type: (type_ident
+              name: (ident 'duration')
+              (optional '?')
+            )
+          )
+          param: (fn_param
+            name: (ident 'tz')
+            type: (type_ident
+              name: (ident 'TimeZone')
+              (optional '?')
+            )
+          )
+        )
+        return_type: (type_ident
+          name: (ident 'Table')
+        )
+      )
+    )
+  )
+)

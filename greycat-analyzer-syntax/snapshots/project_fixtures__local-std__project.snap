@@ -1,0 +1,19 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "@library(\"std\", \"1.2.3\");\n"
+---
+(module
+  (mod_pragma
+    (annotation
+      (ident 'library')
+      (args
+        (string
+          (string_fragment 'std')
+        )
+        (string
+          (string_fragment '1.2.3')
+        )
+      )
+    )
+  )
+)

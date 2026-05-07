@@ -1,0 +1,27 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "type Foo {\n    a: int;\n    b: float;\n}"
+---
+(module
+  (type_decl
+    name: (ident 'Foo')
+    body: (type_body
+      (type_attr
+        name: (ident 'a')
+        type: (attr_type
+          (type_ident
+            name: (ident 'int')
+          )
+        )
+      )
+      (type_attr
+        name: (ident 'b')
+        type: (attr_type
+          (type_ident
+            name: (ident 'float')
+          )
+        )
+      )
+    )
+  )
+)
