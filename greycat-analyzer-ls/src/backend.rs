@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::Sender;
+use greycat_analyzer_analysis::analyzer::{Severity, analyze};
+use greycat_analyzer_analysis::resolver::resolve;
 use greycat_analyzer_core::{Document, SourceManager, diagnostics::parse_diagnostics};
+use greycat_analyzer_hir::lower_module;
 use log::{debug, warn};
+use lsp_types::{NumberOrString, Position, Range};
 use lsp_server::*;
 use lsp_types::{
     notification::{Notification as _, PublishDiagnostics},
@@ -26,14 +30,16 @@ impl Backend {
         publish_diagnostics(&self.client, uri, diagnostics, version)
     }
 
-    /// Re-run parse-diagnostics for `uri` and push them to the client.
-    /// Idempotent — publishing the same set is fine, the editor diffs.
+    /// Re-run parse + semantic diagnostics for `uri` and push them to
+    /// the client. Idempotent — publishing the same set is fine, the
+    /// editor diffs.
     fn publish_for(&self, uri: &Uri) -> Result<()> {
         let Some(cell) = self.manager.get(uri) else {
             return Ok(());
         };
         let doc = cell.borrow();
-        let diags = parse_diagnostics(doc.root_node(), &doc.text);
+        let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
+        diags.extend(semantic_diagnostics(&doc.text, &doc.lib, doc.root_node()));
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
 
@@ -137,6 +143,61 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let s = uri.as_str();
     let stripped = s.strip_prefix("file://")?;
     Some(Path::new(stripped).to_path_buf())
+}
+
+/// Run the full pipeline (HIR lower → resolver → analyzer) and convert
+/// every `SemanticDiagnostic` into an `lsp_types::Diagnostic`. The
+/// document text and pre-parsed tree are reused so we don't re-parse.
+fn semantic_diagnostics(
+    text: &str,
+    lib: &str,
+    root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
+) -> Vec<Diagnostic> {
+    let hir = lower_module(text, "module", lib, root);
+    let resolutions = resolve(&hir);
+    let analysis = analyze(&hir, &resolutions);
+    analysis
+        .diagnostics
+        .iter()
+        .map(|d| Diagnostic {
+            range: byte_range_to_lsp_range(text, &d.byte_range),
+            severity: Some(match d.severity {
+                Severity::Error => DiagnosticSeverity::ERROR,
+                Severity::Warning => DiagnosticSeverity::WARNING,
+                Severity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String("semantic".into())),
+            source: Some("greycat-analyzer".into()),
+            message: d.message.clone(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Convert a byte range against `text` to an LSP `Range`. The mapping
+/// uses byte columns for now (consistent with the rest of the codebase).
+fn byte_range_to_lsp_range(text: &str, range: &std::ops::Range<usize>) -> Range {
+    fn position_at(text: &str, byte: usize) -> Position {
+        let mut line = 0u32;
+        let mut col = 0u32;
+        let prefix = &text[..byte.min(text.len())];
+        for c in prefix.chars() {
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += c.len_utf8() as u32;
+            }
+        }
+        Position {
+            line,
+            character: col,
+        }
+    }
+    Range {
+        start: position_at(text, range.start),
+        end: position_at(text, range.end),
+    }
 }
 
 pub(crate) fn publish_diagnostics(
