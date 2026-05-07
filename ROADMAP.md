@@ -134,7 +134,7 @@ Each phase ends on a milestone. Effort signals: **S** < 1 week, **M** ~1-2 weeks
 
 **Chunks:**
 
-- [ ] **2.1 HIR scaffolding** (L) — lower tree-sitter CST to a typed HIR (declarations, expressions, types, patterns). Single typed-AST + type arena, in its own crate. (Decision B.)
+- [x] **2.1 HIR scaffolding** (L) — `greycat-analyzer-hir` ships an arena-backed HIR (`Idx<T>` newtype, append-only `Arena<T>`) covering Module / Decl (Fn / Type / Enum / Var / Pragma) / Stmt (block, var, if, while, do-while, for, for-in, return, break, continue, throw, try, at, assign, expr) / Expr (idents, literals, strings, tuples, arrays, members, arrow, static, offset, calls, binary, unary, paren, lambda, object) / TypeRef. Lowering walker (`lower_module`) is tolerant — unrecognized constructs land as `Expr::Unsupported { kind, range }` so downstream phases can still skip rather than panic. Tested against the vendored corpus + unit fixtures (5 unit + 1 corpus integration test).
 - [x] **2.2 Crate split** (S, parallel with 2.1) — add `greycat-analyzer-hir`, `-types`, `-analysis`. Final layout per §5. Done up-front so P2.1 lands HIR types directly in their target crate; populated by P2.1 / P2.3 / P2.4 / P2.5.
 - [ ] **2.3 Symbol resolver / name binding** (L) — port `resolver.ts` (1,145) + `environment.ts` (890) + `env_manager.ts`. Produces: definition table, scope tree, reference index.
 - [ ] **2.4 Type system core** (XL) — port `types.ts` (2,811): the `Type` enum, subtyping, generics, function signatures, nullable types, generic substitution.

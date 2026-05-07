@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }
 greycat-analyzer-core = { path = "../greycat-analyzer-core" }
+
+[dev-dependencies]
+greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }
