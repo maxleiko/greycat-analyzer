@@ -65,12 +65,41 @@ pub struct AnalysisResult {
     /// (e.g. the param name in `fn f(x: int)`, the local name in
     /// `var y: T = …`).
     pub def_types: HashMap<Idx<Ident>, TypeId>,
+    /// Module-local map from declared type name to its HIR `TypeDecl`.
+    /// Built when the analyzer walks top-level decls — lets P6.3
+    /// member resolution navigate from a receiver's `TypeId` back to
+    /// the declaring node so attr / method idents can be bound.
+    pub type_decls: HashMap<String, Idx<Decl>>,
+    /// Member-access bindings produced by P6.3: each property ident in
+    /// `a.b` / `a->b` that resolves to a [`TypeAttr`] or to a
+    /// `TypeDecl::methods` entry, keyed by the property `Idx<Ident>`.
+    /// Capabilities consult this in addition to [`Resolutions`] so
+    /// goto-definition / hover work on member access.
+    pub member_uses: HashMap<Idx<Ident>, MemberDef>,
     pub diagnostics: Vec<SemanticDiagnostic>,
+}
+
+/// Where a member-access property name resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemberDef {
+    /// An attribute declared inside a `type X { ... }` body.
+    Attr(Idx<TypeAttr>),
+    /// A method declared inside a `type X { ... }` body. The decl is
+    /// always a `Decl::Fn` — capabilities consume it via the existing
+    /// decl path.
+    Method(Idx<Decl>),
 }
 
 impl AnalysisResult {
     pub fn type_of(&self, expr: Idx<Expr>) -> Option<TypeId> {
         self.expr_types.get(&expr).copied()
+    }
+
+    /// Look up a member-access ident's binding (P6.3). Returns the
+    /// declaring `TypeAttr` or method `Decl` if member resolution
+    /// succeeded for this ident.
+    pub fn member_lookup(&self, ident: Idx<Ident>) -> Option<MemberDef> {
+        self.member_uses.get(&ident).copied()
     }
 }
 
@@ -125,6 +154,10 @@ fn seed_builtins(arena: &mut TypeArena) {
 /// Build a TypeRegistry from the module's user declarations. Each
 /// `type Foo {}` becomes a Named("Foo") TypeId; later phases can
 /// elaborate the type's attribute list separately.
+///
+/// Also populates [`AnalysisResult::type_decls`] (name → HIR
+/// `TypeDecl` index) so P6.3 member resolution can navigate from a
+/// receiver's `TypeId` back to the declaring node.
 fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
     let Some(module) = hir.module.as_ref() else {
         return;
@@ -135,7 +168,8 @@ fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
             Decl::Type(td) => {
                 let name = hir.idents[td.name].text.clone();
                 let id = out.types.named(&name);
-                out.registry.register(name, id);
+                out.registry.register(name.clone(), id);
+                out.type_decls.insert(name, *d);
             }
             Decl::Enum(ed) => {
                 let name = hir.idents[ed.name].text.clone();
@@ -151,7 +185,8 @@ fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
                     },
                     nullable: false,
                 });
-                out.registry.register(name, id);
+                out.registry.register(name.clone(), id);
+                out.type_decls.insert(name, *d);
             }
             _ => {}
         }
@@ -186,6 +221,62 @@ impl<'a> Cx<'a> {
     }
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
         &self.hir.idents[idx].text
+    }
+
+    /// P6.3 member resolution: bind the property ident in `a.b` /
+    /// `a->b` to the matching `TypeAttr` or method `Decl` whenever the
+    /// receiver's type names a `TypeDecl` declared in this module.
+    /// Anonymous types, primitives, and cross-module receivers are
+    /// out of scope here — `Definition::Project` plus P8.x cross-
+    /// module work covers those later.
+    fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
+        let ty = self.out.types.get(recv_ty);
+        let type_name = match &ty.kind {
+            TypeKind::Named { name } => Some(name.clone()),
+            TypeKind::Generic { name, .. } => Some(name.clone()),
+            TypeKind::Anonymous { fields } => {
+                // Anonymous types don't have a backing TypeDecl, so we
+                // resolve their fields directly from the type shape.
+                let prop = self.hir.idents[property].text.clone();
+                if fields.iter().any(|(n, _)| *n == prop) {
+                    // No TypeAttr / Decl to point to — capabilities
+                    // gracefully no-op without a member_uses entry.
+                }
+                None
+            }
+            _ => None,
+        };
+        let Some(name) = type_name else {
+            return;
+        };
+        let Some(decl_id) = self.out.type_decls.get(&name).copied() else {
+            return;
+        };
+        let Decl::Type(type_decl) = self.hir.decls[decl_id].clone() else {
+            return;
+        };
+        let prop_text = self.ident_text(property).to_string();
+
+        for attr_id in &type_decl.attrs {
+            let attr = &self.hir.type_attrs[*attr_id];
+            if self.hir.idents[attr.name].text == prop_text {
+                self.out
+                    .member_uses
+                    .insert(property, MemberDef::Attr(*attr_id));
+                return;
+            }
+        }
+        for method_id in &type_decl.methods {
+            let Decl::Fn(m) = &self.hir.decls[*method_id] else {
+                continue;
+            };
+            if self.hir.idents[m.name].text == prop_text {
+                self.out
+                    .member_uses
+                    .insert(property, MemberDef::Method(*method_id));
+                return;
+            }
+        }
     }
 
     // Lower a syntactic TypeRef to a TypeId.
@@ -495,9 +586,14 @@ impl<'a> Cx<'a> {
                     self.any()
                 }
             }
-            Expr::Member(MemberExpr { receiver, .. })
-            | Expr::Arrow(MemberExpr { receiver, .. }) => {
-                let _ = self.visit_expr(receiver);
+            Expr::Member(MemberExpr {
+                receiver, property, ..
+            })
+            | Expr::Arrow(MemberExpr {
+                receiver, property, ..
+            }) => {
+                let recv_ty = self.visit_expr(receiver);
+                self.resolve_member(recv_ty, property);
                 self.any()
             }
             Expr::Static(s) => {
@@ -648,5 +744,92 @@ mod tests {
         let src = "fn f(a: int, b: float): float { return a + b; }\n";
         let r = analyze_src(src);
         assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn member_access_binds_to_type_attr() {
+        let src = r#"
+type Point {
+    x: int;
+    y: int;
+}
+
+fn first(p: Point): int { return p.x; }
+"#;
+        let tree = parse(src);
+        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let res = resolve(&hir);
+        let analysis = analyze(&hir, &res);
+
+        // Find the property ident `x` inside `p.x` — the second `x`
+        // ident in the source (the first is the attr decl name).
+        let x_uses: Vec<_> = hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.text == "x")
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(x_uses.len(), 2, "expected attr decl + member use");
+
+        // The use site is the second `x` (later byte_range).
+        let mut sorted = x_uses.clone();
+        sorted.sort_by_key(|idx| hir.idents[*idx].byte_range.start);
+        let property = sorted[1];
+
+        let member = analysis
+            .member_lookup(property)
+            .expect("member binding for p.x");
+        assert!(matches!(member, MemberDef::Attr(_)));
+    }
+
+    #[test]
+    fn arrow_access_binds_to_type_attr() {
+        let src = r#"
+type Box {
+    inner: int;
+}
+
+fn read(b: Box): int { return b->inner; }
+"#;
+        let tree = parse(src);
+        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let res = resolve(&hir);
+        let analysis = analyze(&hir, &res);
+
+        let inner_uses: Vec<_> = hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.text == "inner")
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(inner_uses.len(), 2);
+        let mut sorted = inner_uses.clone();
+        sorted.sort_by_key(|idx| hir.idents[*idx].byte_range.start);
+        let property = sorted[1];
+
+        assert!(matches!(
+            analysis.member_lookup(property),
+            Some(MemberDef::Attr(_))
+        ));
+    }
+
+    #[test]
+    fn member_access_unknown_property_has_no_binding() {
+        let src = r#"
+type Point { x: int; }
+fn f(p: Point): int { return p.bogus; }
+"#;
+        let tree = parse(src);
+        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let res = resolve(&hir);
+        let analysis = analyze(&hir, &res);
+
+        let bogus = hir
+            .idents
+            .iter()
+            .find(|(_, i)| i.text == "bogus")
+            .map(|(idx, _)| idx)
+            .expect("bogus ident exists");
+        assert!(analysis.member_lookup(bogus).is_none());
     }
 }

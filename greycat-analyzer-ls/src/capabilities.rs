@@ -161,6 +161,12 @@ fn ident_hover_label(
     ident_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
     ident: &greycat_analyzer_hir::types::Ident,
 ) -> Option<String> {
+    // P6.3: property idents in `a.b` aren't in `Resolutions` — they
+    // bind to a `TypeAttr` / method via the analyzer's member pass.
+    // Check that first so member hovers render with the right shape.
+    if let Some(member) = analysis.member_lookup(ident_idx) {
+        return Some(member_hover_label(hir, analysis, member, ident));
+    }
     match resolutions.lookup(ident_idx)? {
         Definition::Param(name) | Definition::Local(name) => {
             analysis.def_types.get(&name).map(|ty| {
@@ -188,6 +194,44 @@ fn decl_kind_word(decl: &Decl) -> &'static str {
         Decl::Enum(_) => "enum",
         Decl::Var(_) => "var",
         Decl::Pragma(_) => "@",
+    }
+}
+
+/// Hover label for a property ident bound by P6.3 member resolution
+/// (`a.b` / `a->b`). Renders attribute / method shape with the
+/// declared / inferred return type when available.
+fn member_hover_label(
+    hir: &Hir,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    member: greycat_analyzer_analysis::analyzer::MemberDef,
+    ident: &greycat_analyzer_hir::types::Ident,
+) -> String {
+    use greycat_analyzer_analysis::analyzer::MemberDef;
+    match member {
+        MemberDef::Attr(attr_id) => {
+            let attr = &hir.type_attrs[attr_id];
+            if let Some(ty_ref) = attr.ty {
+                let name = &hir.idents[hir.type_refs[ty_ref].name].text;
+                format!("{}: {}", ident.text, name)
+            } else {
+                format!("attr {}", ident.text)
+            }
+        }
+        MemberDef::Method(decl_id) => {
+            // Capture the function-shape: name + return type if declared.
+            let Decl::Fn(fnd) = &hir.decls[decl_id] else {
+                return format!("fn {}", ident.text);
+            };
+            let ret = fnd
+                .return_type
+                .map(|r| hir.idents[hir.type_refs[r].name].text.clone());
+            // Suppress unused-import-of-analysis warning by referencing it.
+            let _ = analysis;
+            match ret {
+                Some(rt) => format!("fn {}(): {}", ident.text, rt),
+                None => format!("fn {}()", ident.text),
+            }
+        }
     }
 }
 
@@ -324,18 +368,38 @@ pub fn goto_definition(
         .find(|(_, i)| i.byte_range == node.byte_range() && i.text == ident_text)?
         .0;
 
-    let def = resolutions.lookup(target)?;
-    let target_range = match def {
-        Definition::Decl(decl_id) => {
+    if let Some(def) = resolutions.lookup(target) {
+        let target_range = match def {
+            Definition::Decl(decl_id) => {
+                let name = hir.decls[decl_id].name()?;
+                hir.idents[name].byte_range.clone()
+            }
+            Definition::Local(name) | Definition::Param(name) | Definition::Generic(name) => {
+                hir.idents[name].byte_range.clone()
+            }
+            Definition::Project => return None,
+        };
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range: byte_range_to_lsp(text, &target_range),
+        }));
+    }
+
+    // P6.3: the property side of `a.b` / `a->b` isn't in `Resolutions`
+    // — bindings live in `AnalysisResult::member_uses`. Run the
+    // analyzer to consult it before giving up.
+    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let member = analysis.member_lookup(target)?;
+    let target_range = match member {
+        greycat_analyzer_analysis::analyzer::MemberDef::Attr(attr_id) => {
+            let name = hir.type_attrs[attr_id].name;
+            hir.idents[name].byte_range.clone()
+        }
+        greycat_analyzer_analysis::analyzer::MemberDef::Method(decl_id) => {
             let name = hir.decls[decl_id].name()?;
             hir.idents[name].byte_range.clone()
         }
-        Definition::Local(name) | Definition::Param(name) | Definition::Generic(name) => {
-            hir.idents[name].byte_range.clone()
-        }
-        Definition::Project => return None,
     };
-
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),
         range: byte_range_to_lsp(text, &target_range),
