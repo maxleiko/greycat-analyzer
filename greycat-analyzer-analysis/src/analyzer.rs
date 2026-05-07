@@ -20,7 +20,7 @@
 //! The design follows TS `analysis/analyzer.ts`: a single recursive
 //! visitor over HIR with an `Inference` table mutated as it goes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use greycat_analyzer_hir::Hir;
@@ -28,8 +28,8 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     AssignStmt, AtStmt, BinOp, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt,
     ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr, ObjectExpr,
-    OffsetExpr, Pragma, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp,
-    VarDeclTop, WhileStmt,
+    OffsetExpr, Pragma, StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef,
+    UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
 };
 use greycat_analyzer_types::{
     Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry, is_assignable_to,
@@ -117,6 +117,7 @@ pub fn analyze(hir: &Hir, res: &Resolutions) -> AnalysisResult {
         res,
         out: &mut out,
         narrows: Vec::new(),
+        chain_member_ifs: HashSet::new(),
     };
     for d in &module.decls {
         cx.visit_decl(*d);
@@ -207,6 +208,21 @@ struct CondNarrows {
     then_typed: Vec<(Idx<Ident>, Idx<TypeRef>)>,
 }
 
+/// One arm in an enum-equality chain (P6.6).
+struct EnumChainArm {
+    if_stmt_id: Idx<Stmt>,
+    variant: String,
+}
+
+/// An `if (x == E::A) else if (x == E::B) ...` chain.
+struct EnumChain {
+    enum_name: String,
+    arms: Vec<EnumChainArm>,
+    /// `true` when the chain ends with a final `else { ... }` or with
+    /// a non-conforming `else if` — both act as catch-alls.
+    has_final_else: bool,
+}
+
 struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
@@ -217,6 +233,10 @@ struct Cx<'a> {
     /// narrowing introduced inside a block stays alive for the rest
     /// of that block but doesn't leak to siblings.
     narrows: Vec<HashMap<Idx<Ident>, TypeId>>,
+    /// `Stmt::If` ids already accounted for as nested members of an
+    /// enclosing exhaustiveness chain (P6.6). Suppresses duplicate
+    /// "non-exhaustive" diagnostics on inner `else if` arms.
+    chain_member_ifs: HashSet<Idx<Stmt>>,
 }
 
 impl<'a> Cx<'a> {
@@ -498,9 +518,15 @@ impl<'a> Cx<'a> {
                 condition,
                 then_branch,
                 else_branch,
-                ..
+                byte_range,
             }) => {
                 self.expect_bool(condition, "if condition");
+                // P6.6 exhaustiveness: only run from a "head" if (i.e.
+                // not already accounted for as a nested else-if).
+                if !self.chain_member_ifs.contains(&stmt_id) {
+                    self.check_enum_exhaustiveness(stmt_id, byte_range.clone());
+                }
+
                 let CondNarrows {
                     then_non_null,
                     else_non_null,
@@ -643,6 +669,140 @@ impl<'a> Cx<'a> {
             _ => {}
         }
         out
+    }
+
+    /// P6.6 exhaustiveness: if `head_id` is the start of an
+    /// `if (x == E::A) { ... } else if (x == E::B) { ... }` chain (no
+    /// final `else`), check that every variant of `E` is covered. Emit
+    /// a `non-exhaustive match over E (missing: …)` diagnostic if not.
+    /// Records every if in the chain in `chain_member_ifs` so nested
+    /// `else if` arms don't re-trigger the analysis.
+    fn check_enum_exhaustiveness(&mut self, head_id: Idx<Stmt>, head_range: Range<usize>) {
+        let Some(chain) = self.extract_enum_chain(head_id) else {
+            return;
+        };
+        // Mark every if in the chain — even non-exhaustive ones —
+        // as already accounted for so nested arms don't re-analyze.
+        for arm in &chain.arms {
+            self.chain_member_ifs.insert(arm.if_stmt_id);
+        }
+        if chain.has_final_else {
+            return;
+        }
+        let Some(enum_id) = self.out.registry.lookup(&chain.enum_name) else {
+            return;
+        };
+        let enum_ty = self.out.types.get(enum_id);
+        let TypeKind::Enum { variants, .. } = &enum_ty.kind else {
+            return;
+        };
+        let variants = variants.clone();
+        let covered: HashSet<&str> = chain.arms.iter().map(|a| a.variant.as_str()).collect();
+        let missing: Vec<&str> = variants
+            .iter()
+            .map(String::as_str)
+            .filter(|v| !covered.contains(v))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let msg = format!(
+            "non-exhaustive match over `{}` (missing: {})",
+            chain.enum_name,
+            missing.join(", "),
+        );
+        self.diag(Severity::Warning, msg, head_range);
+    }
+
+    /// Walk the `else if` chain rooted at `head_id`. Each arm's
+    /// condition must be `x == E::Variant` (or reverse) where `x` is a
+    /// stable Param/Local binding shared across the whole chain.
+    fn extract_enum_chain(&self, head_id: Idx<Stmt>) -> Option<EnumChain> {
+        let Stmt::If(IfStmt {
+            condition,
+            else_branch,
+            ..
+        }) = &self.hir.stmts[head_id]
+        else {
+            return None;
+        };
+        let (binding, enum_name, variant) = self.match_enum_eq(*condition)?;
+        let mut arms = vec![EnumChainArm {
+            if_stmt_id: head_id,
+            variant,
+        }];
+        let mut cursor = *else_branch;
+        let mut has_final_else = false;
+        while let Some(eb_id) = cursor {
+            match &self.hir.stmts[eb_id] {
+                Stmt::If(IfStmt {
+                    condition: c,
+                    else_branch: nested_eb,
+                    ..
+                }) => {
+                    let Some((b, e, v)) = self.match_enum_eq(*c) else {
+                        // A non-conforming `else if` works as a
+                        // catch-all from the chain's perspective.
+                        has_final_else = true;
+                        break;
+                    };
+                    if b != binding || e != enum_name {
+                        has_final_else = true;
+                        break;
+                    }
+                    arms.push(EnumChainArm {
+                        if_stmt_id: eb_id,
+                        variant: v,
+                    });
+                    cursor = *nested_eb;
+                }
+                _ => {
+                    has_final_else = true;
+                    break;
+                }
+            }
+        }
+        Some(EnumChain {
+            enum_name,
+            arms,
+            has_final_else,
+        })
+    }
+
+    fn match_enum_eq(&self, cond_id: Idx<Expr>) -> Option<(Idx<Ident>, String, String)> {
+        let Expr::Binary(BinaryExpr {
+            op: BinOp::Eq,
+            left,
+            right,
+            ..
+        }) = &self.hir.exprs[cond_id]
+        else {
+            return None;
+        };
+        if let Some(t) = self.try_extract_eq(*left, *right) {
+            return Some(t);
+        }
+        self.try_extract_eq(*right, *left)
+    }
+
+    fn try_extract_eq(
+        &self,
+        ident_side: Idx<Expr>,
+        static_side: Idx<Expr>,
+    ) -> Option<(Idx<Ident>, String, String)> {
+        let Expr::Ident(name_idx) = &self.hir.exprs[ident_side] else {
+            return None;
+        };
+        let binding = match self.res.lookup(*name_idx)? {
+            Definition::Param(d) | Definition::Local(d) => d,
+            _ => return None,
+        };
+        let Expr::Static(StaticExpr { ty, property, .. }) = &self.hir.exprs[static_side] else {
+            return None;
+        };
+        let enum_name = self.hir.idents[self.hir.type_refs[*ty].name].text.clone();
+        let variant = self.hir.idents[*property].text.clone();
+        Some((binding, enum_name, variant))
     }
 
     fn ident_compared_to_null(&self, l: Idx<Expr>, r: Idx<Expr>) -> Option<Idx<Ident>> {
@@ -1079,6 +1239,77 @@ fn dispatch(x: any) {
                 .iter()
                 .any(|d| d.message.contains("not assignable")),
             "expected `as Foo` to type as Foo, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_enum_chain_warns() {
+        let src = r#"
+enum Color { Red, Green, Blue }
+fn pick(c: Color): int {
+    if (c == Color::Red) {
+        return 1;
+    } else if (c == Color::Green) {
+        return 2;
+    }
+    return 0;
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("non-exhaustive match over `Color`")
+                    && d.message.contains("Blue")),
+            "expected non-exhaustive diag mentioning Blue, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn exhaustive_enum_chain_silent() {
+        let src = r#"
+enum Color { Red, Green, Blue }
+fn pick(c: Color): int {
+    if (c == Color::Red) {
+        return 1;
+    } else if (c == Color::Green) {
+        return 2;
+    } else if (c == Color::Blue) {
+        return 3;
+    }
+    return 0;
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("non-exhaustive")),
+            "expected no exhaustiveness diag, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn final_else_makes_chain_exhaustive() {
+        let src = r#"
+enum Color { Red, Green, Blue }
+fn pick(c: Color): int {
+    if (c == Color::Red) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("non-exhaustive")),
+            "expected final-else to suppress diag, got: {:?}",
             r.diagnostics
         );
     }

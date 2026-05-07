@@ -397,9 +397,34 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             let then_branch = node
                 .child_by_field_name("then_branch")
                 .and_then(|n| lower_stmt(cx, n))?;
+            // The grammar's `_else_branch` is a hidden rule, so field
+            // annotations sometimes don't propagate to the inner
+            // if_stmt / block. Fall back to scanning the if_stmt's
+            // named children for the second `block` or any `if_stmt`
+            // (the first block is the then_branch, the second — if
+            // present — is the else_branch).
             let else_branch = node
                 .child_by_field_name("else_branch")
-                .and_then(|n| lower_stmt(cx, n));
+                .and_then(|n| lower_stmt(cx, n))
+                .or_else(|| {
+                    let then_id = node.child_by_field_name("then_branch")?.id();
+                    let mut cursor = node.walk();
+                    let mut seen_then = false;
+                    for c in node.named_children(&mut cursor) {
+                        if c.id() == then_id {
+                            seen_then = true;
+                            continue;
+                        }
+                        if !seen_then {
+                            continue;
+                        }
+                        match c.kind() {
+                            "block" | "if_stmt" => return lower_stmt(cx, c),
+                            _ => {}
+                        }
+                    }
+                    None
+                });
             Stmt::If(IfStmt {
                 condition,
                 then_branch,
