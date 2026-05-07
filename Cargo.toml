@@ -1,18 +1,18 @@
 [workspace]
 resolver = "3"
 members = [
-    "greycat-analyzer",
-    "greycat-analyzer-analysis",
-    "greycat-analyzer-core",
-    "greycat-analyzer-fmt",
-    "greycat-analyzer-hir",
-    "greycat-analyzer-ls",
-    "greycat-analyzer-syntax",
-    "greycat-analyzer-types",
-    "greycat-analyzer-wasm",
+  "greycat-analyzer",
+  "greycat-analyzer-analysis",
+  "greycat-analyzer-core",
+  "greycat-analyzer-fmt",
+  "greycat-analyzer-hir",
+  "greycat-analyzer-ls",
+  "greycat-analyzer-syntax",
+  "greycat-analyzer-types",
+  "greycat-analyzer-wasm",
 ]
 
 [profile.release]
 strip = true
-lto = true
+lto = "thin"
 opt-level = 3

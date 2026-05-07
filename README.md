@@ -4,6 +4,19 @@ Rust port of the [GreyCat](https://greycat.io) language frontend — a static an
 
 The CLI binary (`greycat-analyzer`) doubles as the LSP server, so editors only need one executable on `$PATH`.
 
+## Clone
+
+The tree-sitter grammar lives at [vendor/tree-sitter-greycat/](vendor/tree-sitter-greycat/) as a git submodule, and the syntax crate's `build.rs` reads `node-types.json` directly from it — every build needs the submodule populated.
+
+```sh
+git clone --recurse-submodules https://github.com/maxleiko/greycat-analyzer.git
+
+# or, if you already cloned without --recurse-submodules:
+git submodule update --init --recursive
+```
+
+After pulling new commits that bump the submodule pointer, refresh with `git submodule update --init --recursive` (or set `git config submodule.recurse true` once to make `git pull` do it automatically).
+
 ## Install
 
 ```sh
