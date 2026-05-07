@@ -711,6 +711,33 @@ fn emit_var_hints(
 // P3.8 — semantic tokens
 // =============================================================================
 
+// =============================================================================
+// P4.1 — formatting
+// =============================================================================
+
+/// Whole-document formatting. Returns a single `TextEdit` that replaces
+/// the entire document range when the formatter's output differs from
+/// the input. Returns `None` (no edits) when the document is already
+/// formatted.
+pub fn formatting(text: &str, root: tree_sitter::Node<'_>) -> Option<Vec<TextEdit>> {
+    let formatted = greycat_analyzer_fmt::format_tree(text, root);
+    if formatted == text {
+        return Some(Vec::new());
+    }
+    let last_byte = text.len();
+    let end_pos = byte_to_position(text, last_byte);
+    Some(vec![TextEdit {
+        range: lsp_types::Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: end_pos,
+        },
+        new_text: formatted,
+    }])
+}
+
 /// Token type table — must match `SEMANTIC_TOKEN_TYPES` registered with
 /// the client.
 pub const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[

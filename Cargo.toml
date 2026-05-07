@@ -4,6 +4,7 @@ members = [
     "greycat-analyzer",
     "greycat-analyzer-analysis",
     "greycat-analyzer-core",
+    "greycat-analyzer-fmt",
     "greycat-analyzer-hir",
     "greycat-analyzer-ls",
     "greycat-analyzer-syntax",

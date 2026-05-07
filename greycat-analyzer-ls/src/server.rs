@@ -9,8 +9,8 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CodeActionRequest, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
-    GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, References, Rename,
-    SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+    Formatting, GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, References,
+    Rename, SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::*;
 
@@ -73,6 +73,7 @@ pub fn start_server() -> Result<()> {
             })),
             folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+            document_formatting_provider: Some(OneOf::Left(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
@@ -197,6 +198,10 @@ fn handle_request(server: &Backend, req: Request) -> Option<Response> {
         Err(req) => req,
     };
     let req = match try_handle::<InlayHintRequest, _, _>(server, req, inlay_hints_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<Formatting, _, _>(server, req, formatting_handler) {
         Ok(resp) => return Some(resp),
         Err(req) => req,
     };
@@ -373,6 +378,15 @@ fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<
         doc.root_node(),
         &params.range,
     ))
+}
+
+fn formatting_handler(
+    server: &Backend,
+    params: DocumentFormattingParams,
+) -> Option<Vec<TextEdit>> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    capabilities::formatting(&doc.text, doc.root_node())
 }
 
 fn semantic_tokens_handler(

@@ -1,0 +1,7 @@
+[package]
+name = "greycat-analyzer-fmt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }

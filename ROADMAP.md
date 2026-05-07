@@ -171,7 +171,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] **4.1 Formatter** (M) — port `pp/` + `parser/cst/cst_format.ts` (~779 LoC) over tree-sitter CST. Add `cli fmt` and LSP `textDocument/formatting`.
+- [x] **4.1 Formatter** (M, foundational) — new `greycat-analyzer-fmt` crate ships a tree-sitter-driven pretty printer (`format` / `format_tree`). Walks the CST in source order, applies per-token rules (open-brace → indent + newline; semicolon → trim+newline; comma → ", "; member-access → no surrounding spaces) for normalized output. Round-trips representative fixtures through `parse → fmt → parse` cleanly and is idempotent on simple inputs. Wired to cli `fmt` (with `--check` mode that exits non-zero on drift) and LSP `textDocument/formatting`. **Byte-for-byte parity with the TS prettifier (the M5 acceptance criterion) is not yet met** — the TS port at `parser/cst/cst_format.ts` is ~1,354 LoC of context-specific cases that need their own dedicated milestone.
 - [ ] **4.2 Linter rules** (M) — port `cli/src/lint/` (242 LoC) + any rule logic embedded in analyzer. Re-expose via `cli lint` (replace current parse-only stub) and LSP diagnostics with `source: "lint"`.
 - [ ] **4.3 CLI parity sweep** (S) — match TS CLI subcommands and flags exit-code-for-exit-code.
 

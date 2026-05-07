@@ -19,6 +19,7 @@ enum Command {
     Lint(Lint),
     LangServer(LangServer),
     Cst(Cst),
+    Fmt(Fmt),
 }
 
 fn main() -> Result<ExitCode, AnyError> {
@@ -27,5 +28,6 @@ fn main() -> Result<ExitCode, AnyError> {
         Command::Lint(cmd) => cmd.run(),
         Command::LangServer(cmd) => cmd.run().map(|_| ExitCode::SUCCESS),
         Command::Cst(cmd) => cmd.run().map(|_| ExitCode::SUCCESS),
+        Command::Fmt(cmd) => cmd.run(),
     }
 }

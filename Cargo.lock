@@ -288,6 +288,7 @@ dependencies = [
  "clap",
  "env_logger",
  "greycat-analyzer-core",
+ "greycat-analyzer-fmt",
  "greycat-analyzer-ls",
  "greycat-analyzer-syntax",
  "serde",
@@ -319,6 +320,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "greycat-analyzer-fmt"
+version = "0.1.0"
+dependencies = [
+ "greycat-analyzer-syntax",
+]
+
+[[package]]
 name = "greycat-analyzer-hir"
 version = "0.1.0"
 dependencies = [
@@ -335,6 +343,7 @@ dependencies = [
  "dashmap",
  "greycat-analyzer-analysis",
  "greycat-analyzer-core",
+ "greycat-analyzer-fmt",
  "greycat-analyzer-hir",
  "greycat-analyzer-syntax",
  "greycat-analyzer-types",
