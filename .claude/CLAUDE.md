@@ -2,7 +2,7 @@
 
 Rust port of the [GreyCat](https://greycat.io) language frontend: static analyzer, LSP server, formatter, linter. Targets `.gcl` source. Distributed as a CLI binary, an LSP server, a WASM build, and library crates.
 
-The reference implementation is the TypeScript monorepo at `/home/leiko/dev/datathings/greycat/lang`. The Rust port matches its frontend; no runtime/VM is in scope.
+The reference implementation is the TypeScript monorepo at `[/home/leiko/dev/datathings/greycat/lang](https://hub.datathings.com/greycat/lang)`. The Rust port matches its frontend; no runtime/VM is in scope.
 
 **Long-arc plan:** [ROADMAP.md](../ROADMAP.md). Phases P0–P5, milestones M1–M5. Read it before non-trivial work — architectural decisions are locked there.
 
@@ -83,7 +83,7 @@ cd greycat-analyzer-playground && pnpm install && pnpm dev
 
 While executing [ROADMAP.md](../ROADMAP.md), **one commit per chunk** (the `[ ]` items inside each phase). This keeps the history bisectable and lets the user review the port one workpackage at a time.
 
-Standing authorization: commit per chunk without asking each time.
+Standing authorization: commit and **push** per chunk without asking each time. There's no reason to keep a chunk commit local once it's committed; CI / collaborators see it sooner.
 
 Per-chunk checklist:
 
@@ -93,6 +93,9 @@ Per-chunk checklist:
 4. Tick the chunk in ROADMAP.md (`[ ]` → `[x]`) in the same commit.
 5. Stage only the files relevant to the chunk; never `git add -A`.
 6. Don't skip hooks, don't amend prior commits.
+7. `git push origin main` after the commit lands. Same applies to `chore:` / area-prefixed non-chunk commits in this repo.
+
+Submodule commits (e.g. inside `vendor/tree-sitter-greycat/`) are a separate remote with separate blast radius — those still need explicit authorization to push.
 
 Commit message format — match the existing log style (short, lowercase, area-prefixed):
 
