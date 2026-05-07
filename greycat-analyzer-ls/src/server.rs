@@ -9,8 +9,9 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CodeActionRequest, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
-    Formatting, GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, References,
-    Rename, SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+    Formatting, GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest,
+    RangeFormatting, References, Rename, SelectionRangeRequest, SemanticTokensFullRequest,
+    SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::*;
 
@@ -74,6 +75,7 @@ pub fn start_server() -> Result<()> {
             folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
             document_formatting_provider: Some(OneOf::Left(true)),
+            document_range_formatting_provider: Some(OneOf::Left(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
@@ -157,7 +159,7 @@ fn handle_request(server: &Backend, req: Request) -> Option<Response> {
     let req = match try_handle::<lsp_types::request::GotoImplementation, _, _>(
         server,
         req,
-        goto_definition_handler,
+        goto_implementation_handler,
     ) {
         Ok(resp) => return Some(resp),
         Err(req) => req,
@@ -206,6 +208,15 @@ fn handle_request(server: &Backend, req: Request) -> Option<Response> {
         Ok(resp) => return Some(resp),
         Err(req) => req,
     };
+    let req = match try_handle::<RangeFormatting, _, _>(server, req, range_formatting_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req =
+        match try_handle::<WorkspaceSymbolRequest, _, _>(server, req, workspace_symbols_handler) {
+            Ok(resp) => return Some(resp),
+            Err(req) => req,
+        };
     let _req =
         match try_handle::<SemanticTokensFullRequest, _, _>(server, req, semantic_tokens_handler) {
             Ok(resp) => return Some(resp),
@@ -274,6 +285,17 @@ fn goto_definition_handler(
     capabilities::goto_definition(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
 }
 
+fn goto_implementation_handler(
+    server: &Backend,
+    params: GotoDefinitionParams,
+) -> Option<GotoDefinitionResponse> {
+    let uri = params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    capabilities::goto_implementation(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
+}
+
 fn document_symbols_handler(
     server: &Backend,
     params: DocumentSymbolParams,
@@ -289,13 +311,29 @@ fn references_handler(server: &Backend, params: ReferenceParams) -> Option<Vec<L
     let pos = params.text_document_position.position;
     let cell = server.manager.get(&uri)?;
     let doc = cell.borrow();
-    Some(capabilities::references(
-        &doc.text,
-        &doc.lib,
-        doc.root_node(),
-        &uri,
-        pos,
-    ))
+    let mut out = capabilities::references(&doc.text, &doc.lib, doc.root_node(), &uri, pos);
+    // P8.2: extend across the manager — for any other doc, walk its
+    // CST for ident matches with the cursor's text. Pragmatic but
+    // naive: doesn't filter by Definition cross-module since we
+    // don't yet have a global decl table. Good enough for the common
+    // "rename a stdlib symbol, see hits across project files" UX.
+    let cursor_text = capabilities::cursor_text_at(&doc.text, doc.root_node(), pos);
+    if let Some(needle) = cursor_text {
+        drop(doc);
+        for (other_uri, other_cell) in server.manager.iter() {
+            if other_uri == &uri {
+                continue;
+            }
+            let other = other_cell.borrow();
+            out.extend(capabilities::text_matches(
+                &other.text,
+                other.root_node(),
+                other_uri,
+                &needle,
+            ));
+        }
+    }
+    Some(out)
 }
 
 fn prepare_rename_handler(
@@ -312,7 +350,31 @@ fn rename_handler(server: &Backend, params: RenameParams) -> Option<WorkspaceEdi
     let pos = params.text_document_position.position;
     let cell = server.manager.get(&uri)?;
     let doc = cell.borrow();
-    capabilities::rename(&doc.text, doc.root_node(), &uri, pos, &params.new_name)
+    let mut workspace_edit =
+        capabilities::rename(&doc.text, doc.root_node(), &uri, pos, &params.new_name)?;
+    // P8.2: extend rename to other docs by text equality (same caveat
+    // as `references_handler` — pragmatic, not scope-aware across
+    // modules until we have a global decl table).
+    let cursor_text = capabilities::cursor_text_at(&doc.text, doc.root_node(), pos);
+    if let (Some(needle), Some(changes)) = (cursor_text, workspace_edit.changes.as_mut()) {
+        drop(doc);
+        for (other_uri, other_cell) in server.manager.iter() {
+            if other_uri == &uri {
+                continue;
+            }
+            let other = other_cell.borrow();
+            let extra = capabilities::text_matches_as_edits(
+                &other.text,
+                other.root_node(),
+                &needle,
+                &params.new_name,
+            );
+            if !extra.is_empty() {
+                changes.insert(other_uri.clone(), extra);
+            }
+        }
+    }
+    Some(workspace_edit)
 }
 
 fn document_highlight_handler(
@@ -379,6 +441,30 @@ fn formatting_handler(server: &Backend, params: DocumentFormattingParams) -> Opt
     let cell = server.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     capabilities::formatting(&doc.text, doc.root_node())
+}
+
+fn range_formatting_handler(
+    server: &Backend,
+    params: DocumentRangeFormattingParams,
+) -> Option<Vec<TextEdit>> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    capabilities::range_formatting(&doc.text, doc.root_node(), params.range)
+}
+
+fn workspace_symbols_handler(
+    server: &Backend,
+    params: WorkspaceSymbolParams,
+) -> Option<Vec<WorkspaceSymbol>> {
+    let docs: Vec<(Uri, String, String)> = server
+        .manager
+        .iter()
+        .map(|(uri, cell)| {
+            let d = cell.borrow();
+            (uri.clone(), d.lib.clone(), d.text.clone())
+        })
+        .collect();
+    Some(capabilities::workspace_symbols(docs, &params.query))
 }
 
 fn semantic_tokens_handler(

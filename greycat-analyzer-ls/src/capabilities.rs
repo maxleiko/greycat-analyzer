@@ -406,6 +406,53 @@ pub fn goto_definition(
     }))
 }
 
+/// P8.6 — `textDocument/implementation`. For a method-name ident,
+/// returns every concrete (non-`abstract`, non-`native`) method with
+/// that name across all type decls in the module. For other idents,
+/// falls through to [`goto_definition`] so the editor still produces
+/// a useful jump.
+pub fn goto_implementation(
+    text: &str,
+    lib: &str,
+    root: tree_sitter::Node<'_>,
+    uri: &Uri,
+    pos: Position,
+) -> Option<GotoDefinitionResponse> {
+    let byte = position_to_byte(text, pos);
+    let node = node_at_offset(root, byte)?;
+    if node.kind() != "ident" {
+        return goto_definition(text, lib, root, uri, pos);
+    }
+    let cursor_text = text.get(node.byte_range())?.to_string();
+
+    let hir = lower_module(text, "module", lib, root);
+    let mut locations = Vec::new();
+    let Some(module) = hir.module.as_ref() else {
+        return goto_definition(text, lib, root, uri, pos);
+    };
+    for decl_id in &module.decls {
+        if let Decl::Type(td) = &hir.decls[*decl_id] {
+            for method_id in &td.methods {
+                if let Decl::Fn(fnd) = &hir.decls[*method_id] {
+                    if fnd.modifiers.abstract_ || fnd.modifiers.native {
+                        continue;
+                    }
+                    if hir.idents[fnd.name].text == cursor_text {
+                        locations.push(Location {
+                            uri: uri.clone(),
+                            range: byte_range_to_lsp(text, &hir.idents[fnd.name].byte_range),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if locations.is_empty() {
+        return goto_definition(text, lib, root, uri, pos);
+    }
+    Some(GotoDefinitionResponse::Array(locations))
+}
+
 // =============================================================================
 // P3.3 — document symbols
 // =============================================================================
@@ -504,11 +551,147 @@ pub fn references(
     if node.kind() != "ident" {
         return Vec::new();
     }
-    let target_text = text.get(node.byte_range()).unwrap_or("").to_string();
+
+    // P8.1 scope-aware filter: resolve the cursor ident's binding via
+    // `Resolutions`, then collect every use whose `Definition` points
+    // back at the same binding. Falls back to text equality for
+    // `Definition::Project` (cross-module — P8.2 lifts it through the
+    // project pipeline).
+    let hir = lower_module(text, "module", lib, root);
+    let res = resolve(&hir);
+    let Some(cursor_idx) = idx_for_node(&hir, node) else {
+        return Vec::new();
+    };
+    let Some(target) = target_binding(&hir, &res, cursor_idx) else {
+        // Cross-module / unresolved: fall back to text equality so the
+        // capability doesn't go silent on stdlib symbols.
+        return references_by_text(text, root, node, uri);
+    };
+
+    let mut out = Vec::new();
+    // Include the binding site itself.
+    out.push(Location {
+        uri: uri.clone(),
+        range: byte_range_to_lsp(text, &hir.idents[target].byte_range),
+    });
+    for (use_idx, def) in &res.uses {
+        let resolves_to = match def {
+            Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
+            Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
+            Definition::Project => None,
+        };
+        if resolves_to == Some(target) {
+            out.push(Location {
+                uri: uri.clone(),
+                range: byte_range_to_lsp(text, &hir.idents[*use_idx].byte_range),
+            });
+        }
+    }
+    out
+}
+
+/// Map a tree-sitter ident node back to its `Idx<Ident>` in the HIR
+/// arena by byte-range match. Returns `None` if no matching ident was
+/// allocated (e.g., the lowering skipped this shape).
+fn idx_for_node(
+    hir: &Hir,
+    node: tree_sitter::Node<'_>,
+) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
+    hir.idents
+        .iter()
+        .find(|(_, i)| i.byte_range == node.byte_range())
+        .map(|(idx, _)| idx)
+}
+
+/// Resolve `cursor_idx` to the *binding* `Idx<Ident>` (the def site
+/// the resolver would point at). Returns `None` for `Project` /
+/// unresolved idents — caller decides the fallback.
+fn target_binding(
+    hir: &Hir,
+    res: &greycat_analyzer_analysis::resolver::Resolutions,
+    cursor_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
+) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
+    if let Some(def) = res.uses.get(&cursor_idx) {
+        return match def {
+            Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
+            Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
+            Definition::Project => None,
+        };
+    }
+    // Not a use site — cursor is on a binding. Treat the cursor as the
+    // binding itself.
+    Some(cursor_idx)
+}
+
+/// P8.2 helper: pluck the text under the cursor (an ident node).
+/// Returns `None` for non-ident or out-of-range cursors.
+pub fn cursor_text_at(text: &str, root: tree_sitter::Node<'_>, pos: Position) -> Option<String> {
+    let byte = position_to_byte(text, pos);
+    let node = node_at_offset(root, byte)?;
+    if node.kind() != "ident" {
+        return None;
+    }
+    text.get(node.byte_range()).map(|s| s.to_string())
+}
+
+/// P8.2 helper: every `ident` in `root` whose source text equals
+/// `needle`, returned as `Location`s in `uri`. Used by the cross-
+/// module references / rename pass when the cursor's binding is
+/// `Definition::Project` (no scope-aware filter available across
+/// modules until a global decl table lands).
+pub fn text_matches(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    uri: &Uri,
+    needle: &str,
+) -> Vec<Location> {
+    let mut out = Vec::new();
+    walk_named(root, |n| {
+        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == needle {
+            out.push(Location {
+                uri: uri.clone(),
+                range: byte_range_to_lsp(text, &n.byte_range()),
+            });
+        }
+        true
+    });
+    out
+}
+
+/// Same as [`text_matches`] but for a rename — returns a
+/// `Vec<TextEdit>` with `new_text` swapped in.
+pub fn text_matches_as_edits(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    needle: &str,
+    new_text: &str,
+) -> Vec<TextEdit> {
+    let mut out = Vec::new();
+    walk_named(root, |n| {
+        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == needle {
+            out.push(TextEdit {
+                range: byte_range_to_lsp(text, &n.byte_range()),
+                new_text: new_text.to_string(),
+            });
+        }
+        true
+    });
+    out
+}
+
+/// Pre-P8.1 text-equality fallback. Used when the cursor doesn't
+/// resolve through `Resolutions` (e.g., cross-module names) so the
+/// capability still returns useful results.
+fn references_by_text(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    cursor_node: tree_sitter::Node<'_>,
+    uri: &Uri,
+) -> Vec<Location> {
+    let target_text = text.get(cursor_node.byte_range()).unwrap_or("").to_string();
     if target_text.is_empty() {
         return Vec::new();
     }
-
     let mut out = Vec::new();
     walk_named(root, |n| {
         if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
@@ -519,7 +702,6 @@ pub fn references(
         }
         true
     });
-    let _ = lib; // future: cross-module references using lib metadata
     out
 }
 
@@ -552,17 +734,46 @@ pub fn rename(
     if node.kind() != "ident" {
         return None;
     }
-    let target_text = text.get(node.byte_range())?.to_string();
+
+    // P8.1: same scope-aware filter as `references`. Falls back to
+    // text equality when the cursor name doesn't resolve through
+    // `Resolutions` (cross-module — P8.2 picks that up).
+    let hir = lower_module(text, "module", "project", root);
+    let res = resolve(&hir);
     let mut edits = Vec::new();
-    walk_named(root, |n| {
-        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
-            edits.push(TextEdit {
-                range: byte_range_to_lsp(text, &n.byte_range()),
-                new_text: new_name.to_string(),
-            });
+    if let Some(cursor_idx) = idx_for_node(&hir, node)
+        && let Some(target) = target_binding(&hir, &res, cursor_idx)
+    {
+        edits.push(TextEdit {
+            range: byte_range_to_lsp(text, &hir.idents[target].byte_range),
+            new_text: new_name.to_string(),
+        });
+        for (use_idx, def) in &res.uses {
+            let resolves_to = match def {
+                Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
+                Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
+                Definition::Project => None,
+            };
+            if resolves_to == Some(target) {
+                edits.push(TextEdit {
+                    range: byte_range_to_lsp(text, &hir.idents[*use_idx].byte_range),
+                    new_text: new_name.to_string(),
+                });
+            }
         }
-        true
-    });
+    } else {
+        // Fallback: text equality for unresolvable / cross-module names.
+        let target_text = text.get(node.byte_range())?.to_string();
+        walk_named(root, |n| {
+            if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
+                edits.push(TextEdit {
+                    range: byte_range_to_lsp(text, &n.byte_range()),
+                    new_text: new_name.to_string(),
+                });
+            }
+            true
+        });
+    }
     #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice
     let mut changes = std::collections::HashMap::new();
     changes.insert(uri.clone(), edits);
@@ -668,16 +879,23 @@ pub fn code_actions(
     uri: &Uri,
     range: lsp_types::Range,
 ) -> Vec<CodeActionOrCommand> {
-    // Surface a single quickfix per current diagnostic in the requested
-    // range: an empty placeholder edit. The LSP spec lets clients still
-    // render the action even without an edit; this is the foundation
-    // P4.2 / P3.6 will fill in with concrete fixes.
+    // P8.3: emit concrete `TextEdit`s for fixable diagnostics. The
+    // synthesizer maps the diagnostic's `code` to a fix shape:
+    //   - `missing-token` → insert the missing token at the gap
+    //   - `unused-local` / `unused-decl` → "remove" by collapsing the
+    //     declaring statement (best-effort — gives the user a single-
+    //     click delete)
+    //   - `unused-param` → prepend `_` to the parameter name
     let semantic = current_diagnostics(text, lib, root);
     semantic
         .into_iter()
         .filter(|d| ranges_overlap(&d.range, &range))
         .map(|d| {
-            let title = format!("Quickfix: {}", d.message);
+            let edits = synthesize_fix(text, &d);
+            let title = match edits.is_empty() {
+                true => format!("Quickfix: {}", d.message),
+                false => format!("Fix: {}", d.message),
+            };
             CodeActionOrCommand::CodeAction(CodeAction {
                 title,
                 kind: Some(CodeActionKind::QUICKFIX),
@@ -686,7 +904,7 @@ pub fn code_actions(
                     changes: Some({
                         #[allow(clippy::mutable_key_type)]
                         let mut m = std::collections::HashMap::new();
-                        m.insert(uri.clone(), vec![]);
+                        m.insert(uri.clone(), edits);
                         m
                     }),
                     document_changes: None,
@@ -699,6 +917,61 @@ pub fn code_actions(
             })
         })
         .collect()
+}
+
+/// Map a diagnostic to a concrete `Vec<TextEdit>` (P8.3). Returns an
+/// empty vec when no automatic fix is known for this diagnostic shape.
+fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
+    let code = match &diag.code {
+        Some(NumberOrString::String(s)) => s.as_str(),
+        _ => return Vec::new(),
+    };
+    match code {
+        "missing-token" => {
+            // The diagnostic message is "missing `<kind>`". Pluck the
+            // token between backticks and insert it at the diagnostic's
+            // start position (a zero-width range).
+            let Some(token) = diag
+                .message
+                .split_once('`')
+                .and_then(|(_, rest)| rest.split_once('`').map(|(t, _)| t))
+            else {
+                return Vec::new();
+            };
+            vec![TextEdit {
+                range: lsp_types::Range {
+                    start: diag.range.start,
+                    end: diag.range.start,
+                },
+                new_text: token.to_string(),
+            }]
+        }
+        "unused-local" | "unused-decl" => {
+            // Best-effort delete: replace the diagnostic's range with
+            // empty text. Caller's editor will collapse the resulting
+            // empty line; full statement-level deletion lives in P8.4
+            // (lint-fix driver) where we have HIR context.
+            vec![TextEdit {
+                range: diag.range,
+                new_text: String::new(),
+            }]
+        }
+        "unused-param" => {
+            // Prepend `_` to opt out of the rule. Read the source
+            // text at the diagnostic range to produce `_<name>`.
+            let start = position_to_byte(text, diag.range.start);
+            let end = position_to_byte(text, diag.range.end);
+            if end <= start || end > text.len() {
+                return Vec::new();
+            }
+            let name = &text[start..end];
+            vec![TextEdit {
+                range: diag.range,
+                new_text: format!("_{name}"),
+            }]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
@@ -831,6 +1104,79 @@ pub fn formatting(text: &str, root: tree_sitter::Node<'_>) -> Option<Vec<TextEdi
         },
         new_text: formatted,
     }])
+}
+
+/// P8.8 range formatting — format only the text inside `range`. The
+/// foundational formatter (P4.1) operates on whole-tree input, so the
+/// implementation snapshots the slice, formats it, and returns a single
+/// replacement edit covering the requested range. Falls back to no
+/// edits when the slice doesn't change.
+pub fn range_formatting(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    range: lsp_types::Range,
+) -> Option<Vec<TextEdit>> {
+    let _ = root;
+    let start = position_to_byte(text, range.start);
+    let end = position_to_byte(text, range.end);
+    if end <= start || end > text.len() {
+        return Some(Vec::new());
+    }
+    let slice = &text[start..end];
+    let sub_tree = greycat_analyzer_syntax::parse(slice);
+    let formatted = greycat_analyzer_fmt::format_tree(slice, sub_tree.root_node());
+    if formatted == slice {
+        return Some(Vec::new());
+    }
+    Some(vec![TextEdit {
+        range,
+        new_text: formatted,
+    }])
+}
+
+/// P8.5 workspace symbols — aggregate every document's
+/// [`document_symbols`] output, then flatten to `WorkspaceSymbol`s
+/// keyed by URI. The `query` filter is a simple case-insensitive
+/// substring match against the symbol name (TS reference does the
+/// same).
+pub fn workspace_symbols(
+    docs: impl IntoIterator<Item = (Uri, String, String)>,
+    query: &str,
+) -> Vec<WorkspaceSymbol> {
+    let needle = query.to_lowercase();
+    let mut out = Vec::new();
+    for (uri, lib, text) in docs {
+        let tree = greycat_analyzer_syntax::parse(&text);
+        let symbols = document_symbols(&text, &lib, tree.root_node());
+        flatten_workspace(&uri, &symbols, &needle, &mut out);
+    }
+    out
+}
+
+fn flatten_workspace(
+    uri: &Uri,
+    symbols: &[DocumentSymbol],
+    needle: &str,
+    out: &mut Vec<WorkspaceSymbol>,
+) {
+    for sym in symbols {
+        if needle.is_empty() || sym.name.to_lowercase().contains(needle) {
+            out.push(WorkspaceSymbol {
+                name: sym.name.clone(),
+                kind: sym.kind,
+                tags: sym.tags.clone(),
+                container_name: None,
+                location: OneOf::Left(Location {
+                    uri: uri.clone(),
+                    range: sym.selection_range,
+                }),
+                data: None,
+            });
+        }
+        if let Some(children) = &sym.children {
+            flatten_workspace(uri, children, needle, out);
+        }
+    }
 }
 
 /// Token type table — must match `SEMANTIC_TOKEN_TYPES` registered with
