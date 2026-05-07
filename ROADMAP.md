@@ -272,6 +272,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 - [ ] **10.4 Salsa retrofit** (M, profiling-driven) — only when profiling shows quadratic blow-up on multi-file edits in real workspaces. The pure-function design from P6.1 keeps the retrofit cheap. (Subsumes P5.5.)
 - [ ] **10.5 Playground UI maturation** (M) — click-to-jump from CST / HIR / diagnostic rows back to a Monaco editor selection. LSP-in-web-worker so completion / hover / diagnostics fire in the Monaco editor itself, not just in side panels. `localStorage` persistence so refreshes don't lose the user's source.
 - [ ] **10.6 Documentation pass** (S) — crate-level rustdoc landing pages (each `lib.rs` has a real doc paragraph, not a one-liner). A "porting from TS" guide that maps every TS module to its Rust crate. Playground README covering the wasm build flow + how to add a new panel.
+- [ ] **10.7 CLI diagnostic UX (miette)** (S) — replace the one-line `path:line:col: severity: message` formatter in `core::diagnostics::format_cli` with a `miette`-rendered output (source snippet + carets + color) when stdout is a TTY or `--format=pretty` is passed. Keep the existing compact shape as the default for the P10.3 parity oracle (so the diff against TS reference output stays a `diff`, not a normalizer). Adds a `Diagnostic` → `miette::Report` adapter; per-diagnostic `severity`, `code`, and `byte_range` map onto miette's labelled spans.
 
 **M10: published on crates.io; nightly fuzz + diagnostic parity gates green; playground is the analyzer's interactive debugger.**
 
