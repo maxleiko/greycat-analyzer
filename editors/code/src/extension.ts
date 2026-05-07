@@ -49,10 +49,14 @@ async function restart() {
 function startClient() {
   const run: Executable = {
     command: 'greycat-analyzer',
-    args: ['lang-server'],
+    args: ['server'],
     transport: TransportKind.stdio,
     options: {
-      env: { ...process.env, RUST_LOG: 'greycat_analyzer_ls=debug,greycat_analyzer_core=debug' },
+      env: {
+        ...process.env,
+        RUST_LOG:
+          'greycat_analyzer_ls=debug,greycat_analyzer_core=debug,greycat_analyzer_analysis=debug',
+      },
     },
   };
 
