@@ -9,6 +9,8 @@ mod generated {
 }
 pub use generated::*;
 
+pub mod cst;
+
 pub fn language() -> Language {
     tree_sitter_greycat::LANGUAGE.into()
 }
