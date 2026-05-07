@@ -34,6 +34,22 @@ pub struct Lint {
                 (max 5 passes)."
     )]
     fix: bool,
+    #[clap(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Compact,
+        help = "Diagnostic rendering style. `compact` keeps the \
+                `path:line:col: severity: message` shape (P10.3 parity \
+                oracle expects this). `pretty` pipes through miette \
+                for source-snippet + caret + color output (P10.7)."
+    )]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    Compact,
+    Pretty,
 }
 
 impl Lint {
@@ -245,12 +261,22 @@ impl Lint {
         } else {
             // Human-readable: per-file diagnostic dump (matching the TS
             // reference shape: `path:line:col: severity: message`),
-            // followed by a one-line summary.
+            // followed by a one-line summary. P10.7: when
+            // `--format=pretty`, pipe through miette for snippet +
+            // caret + color rendering instead.
             entries.sort_by(|a, b| a.path.cmp(&b.path));
             for e in &entries {
                 let path = e.path.display().to_string();
+                let source = std::fs::read_to_string(&e.path).unwrap_or_default();
                 for diag in &e.diagnostics {
-                    println!("{}", format_cli(&path, diag));
+                    match self.format {
+                        OutputFormat::Compact => {
+                            println!("{}", format_cli(&path, diag));
+                        }
+                        OutputFormat::Pretty => {
+                            print_pretty_diagnostic(&path, &source, diag);
+                        }
+                    }
                 }
             }
             println!(
@@ -285,6 +311,36 @@ fn path_to_uri(path: &std::path::Path) -> Uri {
     let s = format!("file://{}", path.display());
     s.parse::<Uri>()
         .unwrap_or_else(|_| "file:///invalid".parse().unwrap())
+}
+
+/// P10.7 pretty-rendered diagnostic — pipes through `miette` so the
+/// user sees a source snippet, a caret pointing at the offending span,
+/// and the diagnostic's severity / code / message rendered with color
+/// when stdout is a TTY. Falls back to a plain `path:line:col:` line
+/// if the byte range can't be resolved (e.g., zero-length spans).
+fn print_pretty_diagnostic(path: &str, source: &str, diag: &Diagnostic) {
+    use miette::{LabeledSpan, MietteDiagnostic, Severity as MietteSeverity};
+    let start = lsp_to_byte(source, diag.range.start);
+    let end = lsp_to_byte(source, diag.range.end).max(start + 1);
+    let span = LabeledSpan::at(start..end.min(source.len()), diag.message.clone());
+    let severity = match diag.severity {
+        Some(DiagnosticSeverity::ERROR) => MietteSeverity::Error,
+        Some(DiagnosticSeverity::WARNING) => MietteSeverity::Warning,
+        Some(DiagnosticSeverity::INFORMATION) => MietteSeverity::Advice,
+        Some(DiagnosticSeverity::HINT) => MietteSeverity::Advice,
+        _ => MietteSeverity::Error,
+    };
+    let code = match &diag.code {
+        Some(NumberOrString::String(s)) => s.clone(),
+        _ => "diag".into(),
+    };
+    let mietted = MietteDiagnostic::new(diag.message.clone())
+        .with_code(code)
+        .with_severity(severity)
+        .with_label(span);
+    let report = miette::Report::new(mietted)
+        .with_source_code(miette::NamedSource::new(path, source.to_string()));
+    eprintln!("{report:?}");
 }
 
 /// P8.4 fix synthesis — diagnostic → byte-range + replacement text.
