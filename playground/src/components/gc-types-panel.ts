@@ -40,9 +40,9 @@ export class GcTypesPanel extends GcBasePanel {
   ];
 
   protected compute(wasm: any, source: string): TemplateResult {
-    const list = (wasm.infer_types(source) as ExprType[]).slice().sort(
-      (a, b) => a.range.start - b.range.start,
-    );
+    const list = (wasm.infer_types(source) as ExprType[])
+      .slice()
+      .sort((a, b) => a.range.start - b.range.start);
     return html`
       <table>
         <thead>
@@ -59,9 +59,7 @@ export class GcTypesPanel extends GcBasePanel {
                 <td class="range">[${t.range.start}–${t.range.end}]</td>
                 <td class="ty">${t.ty}</td>
                 <td class="src">
-                  ${JSON.stringify(
-                    source.slice(t.range.start, t.range.end).slice(0, 60),
-                  )}
+                  ${JSON.stringify(source.slice(t.range.start, t.range.end).slice(0, 60))}
                 </td>
               </tr>
             `,

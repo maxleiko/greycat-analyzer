@@ -66,19 +66,13 @@ export class GcCstPanel extends GcBasePanel {
   }
 
   private renderNode(node: CstNode): TemplateResult {
-    const fieldLabel = node.field
-      ? html`<span class="field">${node.field}:</span> `
-      : null;
+    const fieldLabel = node.field ? html`<span class="field">${node.field}:</span> ` : null;
     const tag = node.is_error
       ? html`<span class="error">ERROR</span>`
       : node.is_missing
         ? html`<span class="missing">MISSING ${node.kind}</span>`
-        : html`<span class="kind ${node.is_named ? "" : "anon"}"
-            >(${node.kind})</span
-          >`;
-    const range = html`<span class="range"
-      >[${node.range.start}–${node.range.end}]</span
-    >`;
+        : html`<span class="kind ${node.is_named ? "" : "anon"}">(${node.kind})</span>`;
+    const range = html`<span class="range">[${node.range.start}–${node.range.end}]</span>`;
 
     if (node.children.length === 0) {
       const text =

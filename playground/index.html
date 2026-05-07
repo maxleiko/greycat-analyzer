@@ -5,14 +5,52 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>greycat-analyzer playground</title>
     <script>
-      // WebAwesome's default theme is class-driven (`.wa-dark` / `.wa-light`).
-      // Set it before the body renders so we don't flash the wrong theme.
-      const dark = matchMedia('(prefers-color-scheme: dark)').matches;
-      document.documentElement.classList.add(dark ? 'wa-dark' : 'wa-light');
+      const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+      document.documentElement.classList.add(dark ? "wa-dark" : "wa-light");
     </script>
   </head>
-  <body>
-    <gc-playground></gc-playground>
+  <body class="wa-cloak">
+    <header class="topbar">
+      <strong>greycat-analyzer playground</strong>
+      <span class="grow"></span>
+      <span id="bytes" class="muted">0 bytes</span>
+    </header>
+
+    <wa-split-panel position="50" class="layout">
+      <div slot="start" class="editor-pane">
+        <div id="editor-host"></div>
+      </div>
+      <div slot="end" class="panels">
+        <wa-tab-group class="panel-tabs">
+          <wa-tab slot="nav" panel="diagnostics">Diagnostics</wa-tab>
+          <wa-tab slot="nav" panel="cst">CST</wa-tab>
+          <wa-tab slot="nav" panel="tokens">Tokens</wa-tab>
+          <wa-tab slot="nav" panel="hir">HIR</wa-tab>
+          <wa-tab slot="nav" panel="types">Types</wa-tab>
+          <wa-tab slot="nav" panel="format">Format</wa-tab>
+
+          <wa-tab-panel name="diagnostics">
+            <gc-diagnostics-panel></gc-diagnostics-panel>
+          </wa-tab-panel>
+          <wa-tab-panel name="cst">
+            <gc-cst-panel></gc-cst-panel>
+          </wa-tab-panel>
+          <wa-tab-panel name="tokens">
+            <gc-tokens-panel></gc-tokens-panel>
+          </wa-tab-panel>
+          <wa-tab-panel name="hir">
+            <gc-hir-panel></gc-hir-panel>
+          </wa-tab-panel>
+          <wa-tab-panel name="types">
+            <gc-types-panel></gc-types-panel>
+          </wa-tab-panel>
+          <wa-tab-panel name="format">
+            <gc-format-panel></gc-format-panel>
+          </wa-tab-panel>
+        </wa-tab-group>
+      </div>
+    </wa-split-panel>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

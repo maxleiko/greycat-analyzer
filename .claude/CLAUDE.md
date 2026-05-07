@@ -17,7 +17,7 @@ Rust edition 2024. Workspace resolver `"3"`.
 | [greycat-analyzer-ls](../greycat-analyzer-ls/) | LSP server (`lsp-server` + `crossbeam-channel`). |
 | [greycat-analyzer](../greycat-analyzer/) | CLI binary (`clap` subcommands in [src/cmd/](../greycat-analyzer/src/cmd/)). |
 | [greycat-analyzer-wasm](../greycat-analyzer-wasm/) | `cdylib` + `rlib`, `wasm-bindgen` bridge. |
-| [greycat-analyzer-playground/](../greycat-analyzer-playground/) | Vite/TS UI consuming the wasm pkg. **Not** a workspace member; gitignored. |
+| [playground/](playground/) | Vite/TS UI consuming the wasm pkg. **Not** a workspace member; gitignored. |
 
 Future crates (per ROADMAP P2.2): `greycat-analyzer-hir`, `-types`, `-analysis`, `-fmt`.
 

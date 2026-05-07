@@ -58,8 +58,7 @@ export class GcTokensPanel extends GcBasePanel {
               <tr>
                 <td class="kind">${t.kind}</td>
                 <td class="range">
-                  ${t.start.line + 1}:${t.start.column + 1}–${t.end.line +
-                  1}:${t.end.column + 1}
+                  ${t.start.line + 1}:${t.start.column + 1}–${t.end.line + 1}:${t.end.column + 1}
                 </td>
                 <td>${JSON.stringify(t.text)}</td>
               </tr>

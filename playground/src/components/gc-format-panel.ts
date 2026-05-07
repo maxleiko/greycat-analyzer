@@ -59,11 +59,7 @@ export class GcFormatPanel extends GcBasePanel {
         <span class="badge ${clean ? "clean" : "drift"}">
           ${clean ? "idempotent" : "would reformat"}
         </span>
-        ${clean
-          ? null
-          : html`<span style="opacity:.65"
-              >${this.diffSize(source, formatted)}</span
-            >`}
+        ${clean ? null : html`<span style="opacity:.65">${this.diffSize(source, formatted)}</span>`}
       </div>
       <div class="columns">
         <div class="col">

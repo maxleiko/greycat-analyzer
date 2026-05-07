@@ -2,13 +2,7 @@
 // loading / debounce / error display dance so each panel just
 // implements `compute(source)` returning the rendered template.
 
-import {
-  LitElement,
-  html,
-  css,
-  type CSSResultGroup,
-  type TemplateResult,
-} from "lit";
+import { LitElement, html, css, type CSSResultGroup, type TemplateResult } from "lit";
 import { property, state } from "lit/decorators.js";
 import { getWasm } from "../wasm.ts";
 
@@ -54,7 +48,7 @@ export abstract class GcBasePanel extends LitElement {
 
   protected updated(changed: Map<string, unknown>) {
     if (changed.has("source")) {
-      this.recompute();
+      void this.recompute();
     }
   }
 

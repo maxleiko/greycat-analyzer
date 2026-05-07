@@ -73,9 +73,7 @@ export class GcHirPanel extends GcBasePanel {
           (d) => html`
             <li>
               <span class="kind">${d.kind}</span>${d.name}
-              <span class="range" style="opacity:.55"
-                >[${d.range.start}–${d.range.end}]</span
-              >
+              <span class="range" style="opacity:.55">[${d.range.start}–${d.range.end}]</span>
             </li>
           `,
         )}

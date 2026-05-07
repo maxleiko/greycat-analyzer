@@ -69,10 +69,9 @@ export class GcDiagnosticsPanel extends GcBasePanel {
   ];
 
   protected compute(wasm: any, source: string): TemplateResult {
-    const diags = (wasm.diagnostics(source) as Diagnostic[]).slice().sort(
-      (a, b) =>
-        a.start.line - b.start.line || a.start.column - b.start.column,
-    );
+    const diags = (wasm.diagnostics(source) as Diagnostic[])
+      .slice()
+      .sort((a, b) => a.start.line - b.start.line || a.start.column - b.start.column);
 
     if (diags.length === 0) {
       return html`<div class="ok">no diagnostics 🎉</div>`;
@@ -83,14 +82,10 @@ export class GcDiagnosticsPanel extends GcBasePanel {
         ${diags.map(
           (d) => html`
             <li>
-              <span class="pos">
-                ${d.start.line + 1}:${d.start.column + 1}
-              </span>
+              <span class="pos"> ${d.start.line + 1}:${d.start.column + 1} </span>
               <span class="badge ${d.severity}">${d.severity}</span>
               <span>${d.message}</span>
-              <span class="source"
-                >(${d.source}${d.code ? ` · ${d.code}` : ""})</span
-              >
+              <span class="source">(${d.source}${d.code ? ` · ${d.code}` : ""})</span>
             </li>
           `,
         )}

@@ -9,6 +9,12 @@
     "build": "tsc && vp build",
     "preview": "vp preview"
   },
+  "dependencies": {
+    "@awesome.me/webawesome": "^3.6.0",
+    "greycat-analyzer-wasm": "link:../greycat-analyzer-wasm/pkg",
+    "lit": "^3.3.2",
+    "monaco-editor": "^0.55.1"
+  },
   "devDependencies": {
     "typescript": "~6.0.2",
     "vite": "npm:@voidzero-dev/vite-plus-core@latest",
@@ -20,11 +26,5 @@
       "vite": "npm:@voidzero-dev/vite-plus-core@latest",
       "vitest": "npm:@voidzero-dev/vite-plus-test@latest"
     }
-  },
-  "dependencies": {
-    "@awesome.me/webawesome": "^3.6.0",
-    "greycat-analyzer-wasm": "link:../greycat-analyzer-wasm/pkg",
-    "lit": "^3.3.2",
-    "monaco-editor": "^0.55.1"
   }
 }
