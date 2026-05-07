@@ -149,8 +149,8 @@ mod tests {
         // inserts `}` here.
         let ds = diags("fn main() {\n");
         assert!(
-            ds.iter().any(|d| d.message.starts_with("missing `}`")
-                || d.message.starts_with("missing")),
+            ds.iter()
+                .any(|d| d.message.starts_with("missing `}`") || d.message.starts_with("missing")),
             "expected a missing-token diagnostic, got: {ds:?}"
         );
         assert!(
