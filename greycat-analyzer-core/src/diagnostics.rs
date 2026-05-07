@@ -153,9 +153,13 @@ mod tests {
             "expected a missing-`;` diagnostic, got: {ds:?}"
         );
         assert!(
-            ds.iter().all(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            ds.iter()
+                .all(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
         );
-        assert!(ds.iter().all(|d| d.source.as_deref() == Some(DIAGNOSTIC_SOURCE)));
+        assert!(
+            ds.iter()
+                .all(|d| d.source.as_deref() == Some(DIAGNOSTIC_SOURCE))
+        );
     }
 
     #[test]
@@ -170,8 +174,14 @@ mod tests {
     fn format_cli_one_indexed() {
         let diag = Diagnostic {
             range: Range {
-                start: Position { line: 4, character: 7 },
-                end: Position { line: 4, character: 9 },
+                start: Position {
+                    line: 4,
+                    character: 7,
+                },
+                end: Position {
+                    line: 4,
+                    character: 9,
+                },
             },
             severity: Some(DiagnosticSeverity::ERROR),
             message: "boom".into(),

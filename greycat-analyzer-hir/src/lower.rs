@@ -7,9 +7,9 @@ use std::ops::Range;
 
 use greycat_analyzer_syntax::tree_sitter;
 
+use crate::Hir;
 use crate::arena::Idx;
 use crate::types::*;
-use crate::Hir;
 
 pub struct LowerCtx<'src> {
     pub hir: Hir,
@@ -135,7 +135,9 @@ fn lower_fn_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<FnDec
     let return_type = node
         .child_by_field_name("return_type")
         .and_then(|n| lower_type_ref(cx, n));
-    let body = node.child_by_field_name("body").and_then(|b| lower_block(cx, b));
+    let body = node
+        .child_by_field_name("body")
+        .and_then(|b| lower_block(cx, b));
     let doc = doc_text(cx, node);
 
     Some(FnDecl {
@@ -150,10 +152,7 @@ fn lower_fn_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<FnDec
     })
 }
 
-fn lower_generics(
-    cx: &mut LowerCtx,
-    node: Option<tree_sitter::Node<'_>>,
-) -> Vec<Idx<Ident>> {
+fn lower_generics(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Vec<Idx<Ident>> {
     let Some(node) = node else { return Vec::new() };
     let mut out = Vec::new();
     let mut cursor = node.walk();
@@ -165,10 +164,7 @@ fn lower_generics(
     out
 }
 
-fn lower_fn_params(
-    cx: &mut LowerCtx,
-    node: Option<tree_sitter::Node<'_>>,
-) -> Vec<Idx<FnParam>> {
+fn lower_fn_params(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Vec<Idx<FnParam>> {
     let Some(node) = node else { return Vec::new() };
     let mut out = Vec::new();
     let mut cursor = node.walk();
@@ -415,7 +411,9 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             let condition = node
                 .child_by_field_name("condition")
                 .and_then(|n| lower_expr(cx, n))?;
-            let body = node.child_by_field_name("block").and_then(|n| lower_stmt(cx, n))?;
+            let body = node
+                .child_by_field_name("block")
+                .and_then(|n| lower_stmt(cx, n))?;
             Stmt::While(WhileStmt {
                 condition,
                 body,
@@ -423,7 +421,9 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             })
         }
         "do_while_stmt" => {
-            let body = node.child_by_field_name("block").and_then(|n| lower_stmt(cx, n))?;
+            let body = node
+                .child_by_field_name("block")
+                .and_then(|n| lower_stmt(cx, n))?;
             let condition = node
                 .child_by_field_name("condition")
                 .and_then(|n| lower_expr(cx, n))?;
@@ -449,7 +449,9 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             let increment = node
                 .child_by_field_name("it_increment")
                 .and_then(|n| lower_expr(cx, n));
-            let body = node.child_by_field_name("block").and_then(|n| lower_stmt(cx, n))?;
+            let body = node
+                .child_by_field_name("block")
+                .and_then(|n| lower_stmt(cx, n))?;
             Stmt::For(ForStmt {
                 init_name,
                 init_ty,
@@ -470,7 +472,9 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             let range = node
                 .child_by_field_name("range")
                 .and_then(|r| lower_expr(cx, r))?;
-            let body = node.child_by_field_name("block").and_then(|n| lower_stmt(cx, n))?;
+            let body = node
+                .child_by_field_name("block")
+                .and_then(|n| lower_stmt(cx, n))?;
             Stmt::ForIn(ForInStmt {
                 iterator_name,
                 iterator_type,
@@ -514,8 +518,12 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             })
         }
         "at_stmt" => {
-            let expr = node.child_by_field_name("expr").and_then(|n| lower_expr(cx, n))?;
-            let block = node.child_by_field_name("block").and_then(|n| lower_stmt(cx, n))?;
+            let expr = node
+                .child_by_field_name("expr")
+                .and_then(|n| lower_expr(cx, n))?;
+            let block = node
+                .child_by_field_name("block")
+                .and_then(|n| lower_stmt(cx, n))?;
             Stmt::At(AtStmt {
                 expr,
                 block,
@@ -584,8 +592,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         }
         "member_expr" => {
             let prop = node.child_by_field_name("property")?;
-            let receiver = first_named_child_excluding(node, prop.id())
-                .and_then(|n| lower_expr(cx, n))?;
+            let receiver =
+                first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_ident(prop);
             Expr::Member(MemberExpr {
                 receiver,
@@ -595,8 +603,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         }
         "arrow_expr" => {
             let prop = node.child_by_field_name("property")?;
-            let receiver = first_named_child_excluding(node, prop.id())
-                .and_then(|n| lower_expr(cx, n))?;
+            let receiver =
+                first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_ident(prop);
             Expr::Arrow(MemberExpr {
                 receiver,
@@ -695,9 +703,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                     if of.kind() != "object_field" {
                         continue;
                     }
-                    let name = of
-                        .child_by_field_name("name")
-                        .map(|n| cx.alloc_ident(n));
+                    let name = of.child_by_field_name("name").map(|n| cx.alloc_ident(n));
                     let value = of
                         .child_by_field_name("value")
                         .and_then(|v| lower_expr(cx, v));

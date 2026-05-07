@@ -86,9 +86,7 @@ fn pos_at(text: &str, byte: usize) -> Position {
 
 #[wasm_bindgen]
 pub fn parse_sexp(source: &str) -> String {
-    greycat_analyzer_syntax::parse(source)
-        .root_node()
-        .to_sexp()
+    greycat_analyzer_syntax::parse(source).root_node().to_sexp()
 }
 
 // =============================================================================
@@ -161,11 +159,7 @@ struct Token {
 pub fn tokens(source: &str) -> Result<JsValue, JsValue> {
     let tree = greycat_analyzer_syntax::parse(source);
     let mut out = Vec::new();
-    fn walk<'a>(
-        node: tree_sitter::Node<'a>,
-        source: &str,
-        out: &mut Vec<Token>,
-    ) {
+    fn walk<'a>(node: tree_sitter::Node<'a>, source: &str, out: &mut Vec<Token>) {
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
@@ -232,14 +226,15 @@ struct HirCounts {
 }
 
 fn summarize_hir(hir: &Hir) -> HirSummary {
-    let module = hir.module.clone().unwrap_or_else(|| {
-        greycat_analyzer_hir::types::Module {
+    let module = hir
+        .module
+        .clone()
+        .unwrap_or_else(|| greycat_analyzer_hir::types::Module {
             name: "<empty>".into(),
             lib: "project".into(),
             decls: Vec::new(),
             byte_range: 0..0,
-        }
-    });
+        });
     let decls = module
         .decls
         .iter()

@@ -76,7 +76,11 @@ fn find_bad(node: tree_sitter::Node<'_>, path: &Path, out: &mut Vec<Failure>) {
         let pos = node.start_position();
         out.push(Failure {
             path: path.to_path_buf(),
-            kind: if node.is_missing() { "MISSING" } else { "ERROR" },
+            kind: if node.is_missing() {
+                "MISSING"
+            } else {
+                "ERROR"
+            },
             row: pos.row + 1,
             column: pos.column + 1,
             sexp: node.to_sexp(),

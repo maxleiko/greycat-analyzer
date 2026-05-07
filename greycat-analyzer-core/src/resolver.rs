@@ -177,9 +177,7 @@ impl Context for FsContext {
     }
 
     fn is_dir(&self, path: &Path) -> bool {
-        std::fs::metadata(path)
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
+        std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
     }
 
     fn greycat_home(&self) -> &Path {
@@ -291,8 +289,7 @@ mod tests {
 
     #[test]
     fn home_env_absolute_wins() {
-        let got = resolve_greycat_home(Some("/explicit"), Some(Path::new("/home/u")))
-            .unwrap();
+        let got = resolve_greycat_home(Some("/explicit"), Some(Path::new("/home/u"))).unwrap();
         assert_eq!(got, PathBuf::from("/explicit"));
     }
 
@@ -319,7 +316,9 @@ mod tests {
         let ctx = FsContext::with_greycat_home(PathBuf::from("/nonexistent"));
         let files = ctx.iter_gcl(&ws);
         assert!(
-            files.iter().all(|p| p.extension().and_then(|s| s.to_str()) == Some("gcl")),
+            files
+                .iter()
+                .all(|p| p.extension().and_then(|s| s.to_str()) == Some("gcl")),
             "iter_gcl returned a non-.gcl path: {files:?}"
         );
         assert!(
@@ -331,10 +330,7 @@ mod tests {
 
     #[test]
     fn fs_context_iter_gcl_skips_ignored_dirs() {
-        let tmp = std::env::temp_dir().join(format!(
-            "gcat-resolver-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("gcat-resolver-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("node_modules")).unwrap();
         std::fs::create_dir_all(tmp.join("gcdata")).unwrap();

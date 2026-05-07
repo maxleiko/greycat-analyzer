@@ -1,9 +1,9 @@
 pub mod diagnostics;
+mod doc;
+mod manager;
 pub mod module_desc;
 pub mod resolver;
 pub mod span;
-mod doc;
-mod manager;
 
 pub use doc::*;
 pub use manager::*;

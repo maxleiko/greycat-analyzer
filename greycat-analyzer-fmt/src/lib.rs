@@ -258,7 +258,10 @@ type Foo {
         let src = "fn add(a: int, b: int): int { return a + b; }\n";
         let once = format(src);
         let twice = format(&once);
-        assert_eq!(once, twice, "expected idempotency, got\n{once}\n!=\n{twice}");
+        assert_eq!(
+            once, twice,
+            "expected idempotency, got\n{once}\n!=\n{twice}"
+        );
     }
 
     #[test]

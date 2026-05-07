@@ -85,5 +85,4 @@ mod tests {
         // Wrong-kind cast returns None.
         assert!(module.cast::<FnDecl>().is_none());
     }
-
 }

@@ -191,7 +191,7 @@ pub enum AssignOp {
 #[derive(Debug, Clone)]
 pub struct IfStmt {
     pub condition: Idx<Expr>,
-    pub then_branch: Idx<Stmt>,        // Block
+    pub then_branch: Idx<Stmt>,         // Block
     pub else_branch: Option<Idx<Stmt>>, // Block or another IfStmt
     pub byte_range: Span,
 }
@@ -376,11 +376,25 @@ pub struct BinaryExpr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod,
-    Eq, Neq, Lt, Lte, Gt, Gte,
-    And, Or,
-    BitAnd, BitOr, BitXor, Shl, Shr,
-    Coalesce,    // ??
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Coalesce, // ??
     /// Operator we recognized but haven't categorized. Carry the verbatim
     /// text so downstream can still process or reject it.
     Other(&'static str),

@@ -87,13 +87,14 @@ Standing authorization: commit and **push** per chunk without asking each time. 
 
 Per-chunk checklist:
 
-1. `cargo build --workspace` clean.
-2. `cargo clippy --workspace --all-targets` clean (zero warnings, not just zero errors).
-3. `cargo test --workspace` clean (or, for chunks that intentionally don't add tests, the existing tests still pass).
-4. Tick the chunk in ROADMAP.md (`[ ]` → `[x]`) in the same commit.
-5. Stage only the files relevant to the chunk; never `git add -A`.
-6. Don't skip hooks, don't amend prior commits.
-7. `git push origin main` after the commit lands. Same applies to `chore:` / area-prefixed non-chunk commits in this repo.
+1. `cargo fmt --all` (no `--check` — just run it). CI runs `cargo fmt --all --check` and a single drifted file fails the build.
+2. `cargo build --workspace` clean.
+3. `cargo clippy --workspace --all-targets` clean (zero warnings, not just zero errors).
+4. `cargo test --workspace` clean (or, for chunks that intentionally don't add tests, the existing tests still pass).
+5. Tick the chunk in ROADMAP.md (`[ ]` → `[x]`) in the same commit.
+6. Stage only the files relevant to the chunk; never `git add -A`.
+7. Don't skip hooks, don't amend prior commits.
+8. `git push origin main` after the commit lands. Same applies to `chore:` / area-prefixed non-chunk commits in this repo.
 
 Submodule commits (inside `vendor/tree-sitter-greycat/` → `maxleiko/tree-sitter-greycat`) are also pushed immediately. After pushing, bump the parent's submodule pointer in a follow-up commit so the new SHA propagates downstream.
 

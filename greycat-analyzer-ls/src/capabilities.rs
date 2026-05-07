@@ -83,12 +83,7 @@ pub(crate) fn byte_range_to_lsp(text: &str, range: &Range<usize>) -> lsp_types::
 /// Hover info at `pos`. Surfaces the inferred type of the expression
 /// (from the analyzer's per-expression type table) or, for declaration
 /// names, a short kind-line ("type Foo", "fn greet", etc.).
-pub fn hover(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-    pos: Position,
-) -> Option<Hover> {
+pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) -> Option<Hover> {
     let byte = position_to_byte(text, pos);
     let node = node_at_offset(root, byte)?;
     if !node.is_named() {
@@ -113,10 +108,7 @@ pub fn hover(
             break;
         }
         // Find an HIR Expr whose range matches.
-        if let Some((expr_id, expr)) = hir
-            .exprs
-            .iter()
-            .find(|(_, e)| e.byte_range() == r)
+        if let Some((expr_id, expr)) = hir.exprs.iter().find(|(_, e)| e.byte_range() == r)
             && let Some(ty) = analysis.expr_types.get(&expr_id)
         {
             let label = format!(
@@ -145,8 +137,7 @@ pub fn hover(
                             Decl::Var(_) => "var",
                             Decl::Pragma(_) => "@",
                         };
-                        let label =
-                            format!("{kind_word} {}", hir.idents[name_id].text);
+                        let label = format!("{kind_word} {}", hir.idents[name_id].text);
                         best = Some((label, name_range));
                         break;
                     }
@@ -308,11 +299,7 @@ pub fn goto_definition(
 // P3.3 — document symbols
 // =============================================================================
 
-pub fn document_symbols(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-) -> Vec<DocumentSymbol> {
+pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Vec<DocumentSymbol> {
     let hir = lower_module(text, "module", lib, root);
     let module = match hir.module.as_ref() {
         Some(m) => m,
@@ -413,9 +400,7 @@ pub fn references(
 
     let mut out = Vec::new();
     walk_named(root, |n| {
-        if n.kind() == "ident"
-            && text.get(n.byte_range()).unwrap_or("") == target_text
-        {
+        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
             out.push(Location {
                 uri: uri.clone(),
                 range: byte_range_to_lsp(text, &n.byte_range()),
@@ -459,9 +444,7 @@ pub fn rename(
     let target_text = text.get(node.byte_range())?.to_string();
     let mut edits = Vec::new();
     walk_named(root, |n| {
-        if n.kind() == "ident"
-            && text.get(n.byte_range()).unwrap_or("") == target_text
-        {
+        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
             edits.push(TextEdit {
                 range: byte_range_to_lsp(text, &n.byte_range()),
                 new_text: new_name.to_string(),
@@ -501,9 +484,7 @@ pub fn document_highlights(
     }
     let mut out = Vec::new();
     walk_named(root, |n| {
-        if n.kind() == "ident"
-            && text.get(n.byte_range()).unwrap_or("") == target_text
-        {
+        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
             out.push(DocumentHighlight {
                 range: byte_range_to_lsp(text, &n.byte_range()),
                 kind: Some(DocumentHighlightKind::TEXT),
@@ -542,7 +523,10 @@ pub fn selection_ranges(
 pub fn folding_ranges(text: &str, root: tree_sitter::Node<'_>) -> Vec<FoldingRange> {
     let mut out = Vec::new();
     walk_named(root, |n| {
-        if matches!(n.kind(), "block" | "type_body" | "enum_body" | "object_initializers") {
+        if matches!(
+            n.kind(),
+            "block" | "type_body" | "enum_body" | "object_initializers"
+        ) {
             let r = n.byte_range();
             let start = byte_to_position(text, r.start);
             let end = byte_to_position(text, r.end);
@@ -764,11 +748,7 @@ const TOK_NUMBER: u32 = 7;
 const TOK_COMMENT: u32 = 8;
 const TOK_KEYWORD: u32 = 9;
 
-pub fn semantic_tokens(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-) -> SemanticTokens {
+pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> SemanticTokens {
     let hir = lower_module(text, "module", lib, root);
     let resolutions = resolve(&hir);
 

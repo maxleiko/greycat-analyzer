@@ -25,7 +25,9 @@ pub fn node_at_offset<'tree>(root: Node<'tree>, offset: usize) -> Option<Node<'t
 /// Iterator over a node and all its ancestors (innermost first), stopping
 /// when there's no parent left.
 pub fn ancestors(node: Node<'_>) -> Ancestors<'_> {
-    Ancestors { current: Some(node) }
+    Ancestors {
+        current: Some(node),
+    }
 }
 
 pub struct Ancestors<'tree> {
@@ -44,10 +46,7 @@ impl<'tree> Iterator for Ancestors<'tree> {
 /// All children of `node` accessible through field `name`. Tree-sitter's
 /// `children_by_field_name` returns an iterator borrowing a cursor; this
 /// wrapper hides the cursor allocation.
-pub fn children_by_field<'tree>(
-    node: Node<'tree>,
-    name: &str,
-) -> Vec<Node<'tree>> {
+pub fn children_by_field<'tree>(node: Node<'tree>, name: &str) -> Vec<Node<'tree>> {
     let mut cursor = node.walk();
     node.children_by_field_name(name, &mut cursor).collect()
 }

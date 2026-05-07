@@ -300,24 +300,10 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     match (&a.kind, &b.kind) {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
         (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => na == nb,
-        (
-            TypeKind::Generic {
-                name: na,
-                args: aa,
-            },
-            TypeKind::Generic {
-                name: nb,
-                args: ab,
-            },
-        ) => {
-            na == nb
-                && aa.len() == ab.len()
-                && aa.iter().zip(ab).all(|(x, y)| x == y) // invariant
+        (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
+            na == nb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| x == y) // invariant
         }
-        (
-            TypeKind::Tuple { elements: ea },
-            TypeKind::Tuple { elements: eb },
-        ) => {
+        (TypeKind::Tuple { elements: ea }, TypeKind::Tuple { elements: eb }) => {
             ea.len() == eb.len()
                 && ea
                     .iter()

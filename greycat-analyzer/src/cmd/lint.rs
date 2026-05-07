@@ -5,15 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use greycat_analyzer_core::{
-    diagnostics::{format_cli, parse_diagnostics},
-    lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange},
-    resolver::{Context, FsContext},
-};
 use greycat_analyzer_analysis::{
     analyzer::{Severity, analyze},
     lint::{LintSeverity, run_lints},
     resolver::resolve,
+};
+use greycat_analyzer_core::{
+    diagnostics::{format_cli, parse_diagnostics},
+    lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange},
+    resolver::{Context, FsContext},
 };
 use greycat_analyzer_hir::lower_module;
 
@@ -24,7 +24,10 @@ use crate::utils::AnyError;
 pub struct Lint {
     #[clap(help = "Path to a project.gcl")]
     project: PathBuf,
-    #[clap(long, help = "CSV per-file timing summary instead of human-readable diagnostics")]
+    #[clap(
+        long,
+        help = "CSV per-file timing summary instead of human-readable diagnostics"
+    )]
     csv: bool,
 }
 
@@ -37,8 +40,7 @@ impl Lint {
             .parent()
             .expect("unable to resolve project's parent directory");
 
-        let ctx = FsContext::new()
-            .unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
+        let ctx = FsContext::new().unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
         let files = ctx.iter_gcl(project_dir);
 
         let mut parser = greycat_analyzer_syntax::parser();

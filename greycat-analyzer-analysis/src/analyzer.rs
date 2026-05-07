@@ -26,10 +26,10 @@ use std::ops::Range;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
-    AssignStmt, AtStmt, BinaryExpr, BinOp, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt,
-    ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr,
-    ObjectExpr, OffsetExpr, Pragma, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef,
-    UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
+    AssignStmt, AtStmt, BinOp, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt,
+    ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr, ObjectExpr,
+    OffsetExpr, Pragma, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp,
+    VarDeclTop, WhileStmt,
 };
 use greycat_analyzer_types::{
     Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry, is_assignable_to,
@@ -205,11 +205,8 @@ impl<'a> Cx<'a> {
             "null" => self.null(),
             _ => {
                 if !tr.params.is_empty() {
-                    let args: Vec<TypeId> = tr
-                        .params
-                        .iter()
-                        .map(|p| self.lower_type_ref(*p))
-                        .collect();
+                    let args: Vec<TypeId> =
+                        tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
                     self.out.types.generic(name.clone(), args)
                 } else if let Some(id) = self.out.registry.lookup(&name) {
                     id
@@ -242,10 +239,9 @@ impl<'a> Cx<'a> {
         // produces real types instead of `any`.
         for p_id in &d.params {
             let p = self.hir.fn_params[*p_id].clone();
-            let ty = p
-                .ty
-                .map(|t| self.lower_type_ref(t))
-                .unwrap_or_else(|| self.any());
+            let ty =
+                p.ty.map(|t| self.lower_type_ref(t))
+                    .unwrap_or_else(|| self.any());
             self.out.def_types.insert(p.name, ty);
         }
         let return_ty = d
@@ -411,11 +407,7 @@ impl<'a> Cx<'a> {
                             greycat_analyzer_types::display(&self.out.types, value_ty),
                             greycat_analyzer_types::display(&self.out.types, rt),
                         );
-                        self.diag(
-                            Severity::Error,
-                            msg,
-                            self.hir.exprs[v].byte_range(),
-                        );
+                        self.diag(Severity::Error, msg, self.hir.exprs[v].byte_range());
                     }
                 }
             }
@@ -509,7 +501,9 @@ impl<'a> Cx<'a> {
                 let _ = self.lower_type_ref(s.ty);
                 self.any()
             }
-            Expr::Offset(OffsetExpr { receiver, index, .. }) => {
+            Expr::Offset(OffsetExpr {
+                receiver, index, ..
+            }) => {
                 let _ = self.visit_expr(receiver);
                 let _ = self.visit_expr(index);
                 self.any()
@@ -521,7 +515,9 @@ impl<'a> Cx<'a> {
                 }
                 self.any()
             }
-            Expr::Binary(BinaryExpr { op, left, right, .. }) => {
+            Expr::Binary(BinaryExpr {
+                op, left, right, ..
+            }) => {
                 let lt = self.visit_expr(left);
                 let rt = self.visit_expr(right);
                 self.infer_binary(op, lt, rt)
@@ -544,10 +540,9 @@ impl<'a> Cx<'a> {
                 let mut param_tys = Vec::with_capacity(params.len());
                 for p in &params {
                     let p = self.hir.fn_params[*p].clone();
-                    let pt = p
-                        .ty
-                        .map(|t| self.lower_type_ref(t))
-                        .unwrap_or_else(|| self.any());
+                    let pt =
+                        p.ty.map(|t| self.lower_type_ref(t))
+                            .unwrap_or_else(|| self.any());
                     param_tys.push(pt);
                 }
                 let body_ty = self.visit_expr(body);
@@ -603,11 +598,7 @@ mod tests {
     #[test]
     fn clean_function_no_diagnostics() {
         let r = analyze_src("fn add(a: int, b: int): int { return a + b; }\n");
-        assert!(
-            r.diagnostics.is_empty(),
-            "unexpected: {:?}",
-            r.diagnostics
-        );
+        assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
     }
 
     #[test]
@@ -641,7 +632,9 @@ mod tests {
     fn unresolved_name_promoted_to_diagnostic() {
         let r = analyze_src("fn f(): int { return missing; }\n");
         assert!(
-            r.diagnostics.iter().any(|d| d.message.contains("unresolved")),
+            r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("unresolved")),
             "expected unresolved-name diag, got: {:?}",
             r.diagnostics
         );
@@ -651,10 +644,6 @@ mod tests {
     fn binary_arith_widens_to_float() {
         let src = "fn f(a: int, b: float): float { return a + b; }\n";
         let r = analyze_src(src);
-        assert!(
-            r.diagnostics.is_empty(),
-            "unexpected: {:?}",
-            r.diagnostics
-        );
+        assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
     }
 }

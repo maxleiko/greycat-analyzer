@@ -142,8 +142,7 @@ fn native_signature_for(hir: &Hir, fnd: &FnDecl, types: &mut TypeArena) -> Nativ
         .iter()
         .map(|p_id| {
             let p = &hir.fn_params[*p_id];
-            p.ty
-                .map(|t| lower_type_ref(hir, t, types))
+            p.ty.map(|t| lower_type_ref(hir, t, types))
                 .unwrap_or_else(|| types.any())
         })
         .collect();
@@ -259,7 +258,11 @@ private native fn now(): time;
         idx.ingest(&hir);
         let len_after_first = idx.types.len();
         idx.ingest(&hir);
-        assert_eq!(idx.types.len(), len_after_first, "duplicate type registrations");
+        assert_eq!(
+            idx.types.len(),
+            len_after_first,
+            "duplicate type registrations"
+        );
         assert_eq!(idx.modules_ingested, 2);
     }
 }

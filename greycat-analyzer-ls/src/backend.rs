@@ -7,8 +7,8 @@ use greycat_analyzer_analysis::resolver::resolve;
 use greycat_analyzer_core::{Document, SourceManager, diagnostics::parse_diagnostics};
 use greycat_analyzer_hir::lower_module;
 use log::{debug, warn};
-use lsp_types::{NumberOrString, Position, Range};
 use lsp_server::*;
+use lsp_types::{NumberOrString, Position, Range};
 use lsp_types::{
     notification::{Notification as _, PublishDiagnostics},
     *,
@@ -110,11 +110,9 @@ impl Backend {
 
     pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
         let uri = params.text_document.uri.clone();
-        let doc = self.manager.update(
-            &uri,
-            params.content_changes,
-            params.text_document.version,
-        );
+        let doc = self
+            .manager
+            .update(&uri, params.content_changes, params.text_document.version);
         debug!("[did_change] {doc}");
         drop(doc);
         self.publish_for(&uri)?;

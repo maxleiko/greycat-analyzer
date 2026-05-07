@@ -196,8 +196,7 @@ fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
         return;
     };
     let name = cx.ident_text(name_id).to_string();
-    cx.current_mut()
-        .insert(name, Definition::Decl(decl_id));
+    cx.current_mut().insert(name, Definition::Decl(decl_id));
 }
 
 fn visit_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
@@ -290,12 +289,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             cx.pop_scope();
         }
         Stmt::Expr(e) => visit_expr(cx, e),
-        Stmt::Var(LocalVar {
-            name,
-            ty,
-            init,
-            ..
-        }) => {
+        Stmt::Var(LocalVar { name, ty, init, .. }) => {
             if let Some(ty) = ty {
                 visit_type_ref(cx, ty);
             }
@@ -375,8 +369,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 visit_type_ref(cx, t);
             }
             let n = cx.ident_text(iterator_name).to_string();
-            cx.current_mut()
-                .insert(n, Definition::Local(iterator_name));
+            cx.current_mut().insert(n, Definition::Local(iterator_name));
             visit_stmt(cx, body);
             cx.pop_scope();
         }
@@ -427,15 +420,16 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
                 visit_expr(cx, f.value);
             }
         }
-        Expr::Member(MemberExpr { receiver, .. })
-        | Expr::Arrow(MemberExpr { receiver, .. }) => {
+        Expr::Member(MemberExpr { receiver, .. }) | Expr::Arrow(MemberExpr { receiver, .. }) => {
             visit_expr(cx, receiver);
             // The `property` ident is intentionally *not* resolved here —
             // member access binds to a type member, which is type-driven
             // (P2.5).
         }
         Expr::Static(s) => visit_type_ref(cx, s.ty),
-        Expr::Offset(OffsetExpr { receiver, index, .. }) => {
+        Expr::Offset(OffsetExpr {
+            receiver, index, ..
+        }) => {
             visit_expr(cx, receiver);
             visit_expr(cx, index);
         }
@@ -512,10 +506,7 @@ mod tests {
             .collect();
         // Two `x` idents: one is the parameter name (definition),
         // one is the use inside `return x`.
-        let resolved: Vec<_> = x_uses
-            .iter()
-            .filter_map(|idx| res.uses.get(idx))
-            .collect();
+        let resolved: Vec<_> = x_uses.iter().filter_map(|idx| res.uses.get(idx)).collect();
         assert_eq!(resolved.len(), 1, "exactly one *use* of `x`");
         assert!(matches!(resolved[0], Definition::Param(_)));
         assert!(res.unresolved.is_empty());
@@ -596,10 +587,8 @@ fn f(p: Foo): Foo { return p; }
         }
         assert!(res.unresolved.is_empty());
         // Sanity: the resolved decl is in fact the Foo type_decl.
-        if let Some(Definition::Decl(decl_id)) = res
-            .uses
-            .values()
-            .find(|d| matches!(d, Definition::Decl(_)))
+        if let Some(Definition::Decl(decl_id)) =
+            res.uses.values().find(|d| matches!(d, Definition::Decl(_)))
         {
             assert!(matches!(hir.decls[*decl_id], Decl::Type(_)));
         }

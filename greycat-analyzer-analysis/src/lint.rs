@@ -76,14 +76,26 @@ impl LintRule for UnusedLocal {
     }
 }
 
-fn check_fn(hir: &Hir, res: &Resolutions, fnd: &FnDecl, out: &mut Vec<LintDiagnostic>, rule: &'static str) {
+fn check_fn(
+    hir: &Hir,
+    res: &Resolutions,
+    fnd: &FnDecl,
+    out: &mut Vec<LintDiagnostic>,
+    rule: &'static str,
+) {
     let Some(body) = fnd.body else {
         return;
     };
     visit_for_locals(hir, res, body, out, rule);
 }
 
-fn check_type(hir: &Hir, res: &Resolutions, td: &TypeDecl, out: &mut Vec<LintDiagnostic>, rule: &'static str) {
+fn check_type(
+    hir: &Hir,
+    res: &Resolutions,
+    td: &TypeDecl,
+    out: &mut Vec<LintDiagnostic>,
+    rule: &'static str,
+) {
     for method_id in &td.methods {
         if let Decl::Fn(fnd) = &hir.decls[*method_id] {
             check_fn(hir, res, fnd, out, rule);
@@ -225,7 +237,9 @@ fn f(): int {
 "#,
         );
         assert!(
-            diags.iter().any(|d| d.rule == "unused-local" && d.message.contains("`x`")),
+            diags
+                .iter()
+                .any(|d| d.rule == "unused-local" && d.message.contains("`x`")),
             "expected unused-local on x: {diags:?}"
         );
     }
@@ -256,7 +270,9 @@ fn f(x: int, y: int): int {
 "#,
         );
         assert!(
-            diags.iter().any(|d| d.rule == "unused-param" && d.message.contains("`y`")),
+            diags
+                .iter()
+                .any(|d| d.rule == "unused-param" && d.message.contains("`y`")),
             "expected unused-param on y: {diags:?}"
         );
     }

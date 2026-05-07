@@ -184,11 +184,11 @@ fn handle_request(server: &Backend, req: Request) -> Option<Response> {
             Ok(resp) => return Some(resp),
             Err(req) => req,
         };
-    let req =
-        match try_handle::<SelectionRangeRequest, _, _>(server, req, selection_ranges_handler) {
-            Ok(resp) => return Some(resp),
-            Err(req) => req,
-        };
+    let req = match try_handle::<SelectionRangeRequest, _, _>(server, req, selection_ranges_handler)
+    {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
     let req = match try_handle::<FoldingRangeRequest, _, _>(server, req, folding_ranges_handler) {
         Ok(resp) => return Some(resp),
         Err(req) => req,
@@ -205,14 +205,11 @@ fn handle_request(server: &Backend, req: Request) -> Option<Response> {
         Ok(resp) => return Some(resp),
         Err(req) => req,
     };
-    let _req = match try_handle::<SemanticTokensFullRequest, _, _>(
-        server,
-        req,
-        semantic_tokens_handler,
-    ) {
-        Ok(resp) => return Some(resp),
-        Err(req) => req,
-    };
+    let _req =
+        match try_handle::<SemanticTokensFullRequest, _, _>(server, req, semantic_tokens_handler) {
+            Ok(resp) => return Some(resp),
+            Err(req) => req,
+        };
     None
 }
 
@@ -354,10 +351,7 @@ fn folding_ranges_handler(
     Some(capabilities::folding_ranges(&doc.text, doc.root_node()))
 }
 
-fn code_actions_handler(
-    server: &Backend,
-    params: CodeActionParams,
-) -> Option<CodeActionResponse> {
+fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<CodeActionResponse> {
     let cell = server.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     Some(capabilities::code_actions(
@@ -380,10 +374,7 @@ fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<
     ))
 }
 
-fn formatting_handler(
-    server: &Backend,
-    params: DocumentFormattingParams,
-) -> Option<Vec<TextEdit>> {
+fn formatting_handler(server: &Backend, params: DocumentFormattingParams) -> Option<Vec<TextEdit>> {
     let cell = server.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     capabilities::formatting(&doc.text, doc.root_node())

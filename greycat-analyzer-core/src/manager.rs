@@ -10,7 +10,7 @@ use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
 use crate::{
     Document,
     module_desc::{ModuleDesc, parse_module_desc},
-    resolver::{Context, FsContext, library_dir, global_std_dir},
+    resolver::{Context, FsContext, global_std_dir, library_dir},
 };
 
 /// Storage for parsed `.gcl` documents, keyed by LSP `Uri`. Holds a
@@ -125,9 +125,10 @@ impl SourceManager {
         let project_dir = match project_filepath.parent() {
             Some(p) => p.to_path_buf(),
             None => {
-                report
-                    .errors
-                    .push(format!("project path has no parent: {}", project_filepath.display()));
+                report.errors.push(format!(
+                    "project path has no parent: {}",
+                    project_filepath.display()
+                ));
                 return report;
             }
         };
@@ -325,9 +326,7 @@ mod tests {
                 .unwrap()
                 .keys()
                 .filter(|p| p.starts_with(dir))
-                .filter(|p| {
-                    p.extension().and_then(|s| s.to_str()) == Some("gcl")
-                })
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gcl"))
                 .cloned()
                 .collect();
             out.sort();
@@ -351,12 +350,7 @@ mod tests {
     fn add_simple_round_trip() {
         let ctx = Arc::new(MemContext::default());
         let mut mgr = SourceManager::with_context(ctx);
-        mgr.add_simple(
-            uri("/proj/src/a.gcl"),
-            "fn a() {}\n",
-            "project",
-            false,
-        );
+        mgr.add_simple(uri("/proj/src/a.gcl"), "fn a() {}\n", "project", false);
         assert_eq!(mgr.len(), 1);
         let cell = mgr.get(&uri("/proj/src/a.gcl")).unwrap();
         let doc = cell.borrow();
@@ -446,10 +440,7 @@ mod tests {
         };
         // Two files that both `@include("src")` — the second walk through
         // `src/` should be a no-op because file paths are already visited.
-        ctx.add_file(
-            PathBuf::from("/proj/project.gcl"),
-            "@include(\"src\");\n",
-        );
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "@include(\"src\");\n");
         ctx.add_file(
             PathBuf::from("/proj/src/a.gcl"),
             "@include(\"src\");\nfn a() {}\n",
