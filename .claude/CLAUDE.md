@@ -2,7 +2,7 @@
 
 Rust port of the [GreyCat](https://greycat.io) language frontend: static analyzer, LSP server, formatter, linter. Targets `.gcl` source. Distributed as a CLI binary, an LSP server, a WASM build, and library crates.
 
-The reference implementation is the TypeScript monorepo at `[/home/leiko/dev/datathings/greycat/lang](https://hub.datathings.com/greycat/lang)`. The Rust port matches its frontend; no runtime/VM is in scope.
+The reference implementation is the TypeScript monorepo at `https://hub.datathings.com/greycat/lang`. The Rust port matches its frontend; no runtime/VM is in scope.
 
 **Long-arc plan:** [ROADMAP.md](../ROADMAP.md). Phases P0–P5, milestones M1–M5. Read it before non-trivial work — architectural decisions are locked there.
 
