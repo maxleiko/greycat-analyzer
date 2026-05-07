@@ -295,6 +295,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "greycat-analyzer-analysis"
+version = "0.1.0"
+dependencies = [
+ "greycat-analyzer-core",
+ "greycat-analyzer-hir",
+ "greycat-analyzer-syntax",
+ "greycat-analyzer-types",
+]
+
+[[package]]
 name = "greycat-analyzer-core"
 version = "0.1.0"
 dependencies = [
@@ -306,6 +316,14 @@ dependencies = [
  "serde",
  "thiserror",
  "tree-sitter",
+]
+
+[[package]]
+name = "greycat-analyzer-hir"
+version = "0.1.0"
+dependencies = [
+ "greycat-analyzer-core",
+ "greycat-analyzer-syntax",
 ]
 
 [[package]]
@@ -332,6 +350,14 @@ dependencies = [
  "serde_json",
  "tree-sitter",
  "tree-sitter-greycat",
+]
+
+[[package]]
+name = "greycat-analyzer-types"
+version = "0.1.0"
+dependencies = [
+ "greycat-analyzer-core",
+ "greycat-analyzer-hir",
 ]
 
 [[package]]

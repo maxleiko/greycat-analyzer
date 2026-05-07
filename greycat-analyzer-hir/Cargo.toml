@@ -1,0 +1,8 @@
+[package]
+name = "greycat-analyzer-hir"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }
+greycat-analyzer-core = { path = "../greycat-analyzer-core" }

@@ -135,7 +135,7 @@ Each phase ends on a milestone. Effort signals: **S** < 1 week, **M** ~1-2 weeks
 **Chunks:**
 
 - [ ] **2.1 HIR scaffolding** (L) — lower tree-sitter CST to a typed HIR (declarations, expressions, types, patterns). Single typed-AST + type arena, in its own crate. (Decision B.)
-- [ ] **2.2 Crate split** (S, parallel with 2.1) — add `greycat-analyzer-hir`, `-types`, `-analysis`. Final layout per §5.
+- [x] **2.2 Crate split** (S, parallel with 2.1) — add `greycat-analyzer-hir`, `-types`, `-analysis`. Final layout per §5. Done up-front so P2.1 lands HIR types directly in their target crate; populated by P2.1 / P2.3 / P2.4 / P2.5.
 - [ ] **2.3 Symbol resolver / name binding** (L) — port `resolver.ts` (1,145) + `environment.ts` (890) + `env_manager.ts`. Produces: definition table, scope tree, reference index.
 - [ ] **2.4 Type system core** (XL) — port `types.ts` (2,811): the `Type` enum, subtyping, generics, function signatures, nullable types, generic substitution.
 - [ ] **2.5 Analyzer** (XL) — port `analyzer.ts` (4,514): type inference, control-flow narrowing, null-flow, exhaustiveness, unused-decl checks. Plus `declarator.ts`, `hinter.ts`, `actions.ts`.
