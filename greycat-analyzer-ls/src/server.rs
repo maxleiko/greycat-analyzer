@@ -104,6 +104,7 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
     let mut server = Backend {
         client: conn.sender.clone(),
         manager: Default::default(),
+        project_analysis: Default::default(),
     };
 
     server.initialized(&init)?;
