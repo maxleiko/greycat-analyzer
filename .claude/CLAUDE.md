@@ -88,10 +88,11 @@ Standing authorization: commit per chunk without asking each time.
 Per-chunk checklist:
 
 1. `cargo build --workspace` clean.
-2. `cargo test --workspace` clean (or, for chunks that intentionally don't add tests, the existing tests still pass).
-3. Tick the chunk in ROADMAP.md (`[ ]` → `[x]`) in the same commit.
-4. Stage only the files relevant to the chunk; never `git add -A`.
-5. Don't skip hooks, don't amend prior commits.
+2. `cargo clippy --workspace --all-targets` clean (zero warnings, not just zero errors).
+3. `cargo test --workspace` clean (or, for chunks that intentionally don't add tests, the existing tests still pass).
+4. Tick the chunk in ROADMAP.md (`[ ]` → `[x]`) in the same commit.
+5. Stage only the files relevant to the chunk; never `git add -A`.
+6. Don't skip hooks, don't amend prior commits.
 
 Commit message format — match the existing log style (short, lowercase, area-prefixed):
 

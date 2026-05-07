@@ -116,10 +116,11 @@ fn find_gcl_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             find_gcl_files(&path, out);
-        } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("gcl") {
-            if let Ok(canonical) = path.canonicalize() {
-                out.push(canonical);
-            }
+        } else if path.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("gcl")
+            && let Ok(canonical) = path.canonicalize()
+        {
+            out.push(canonical);
         }
     }
 }
