@@ -39,7 +39,8 @@ impl Lint {
             mgr.display_timings_csv(&mut std::io::stdout())?;
         } else {
             mgr.display_timings();
-            println!("Total: {took:?}");
+            let nb_errors = mgr.errors.values().fold(0, |acc, e| acc + e.len());
+            println!("Total: {took:?} ({nb_errors} errors)");
 
             if !mgr.errors.is_empty() {
                 for (filepath, errors) in mgr.errors {
@@ -140,10 +141,11 @@ impl<'arena> SourceManager<'arena> {
         // Sort by duration (ascending - smallest first, largest last)
         timing_pairs.sort_by_key(|(_, duration)| *duration);
 
+        println!("took     nodes    filepath");
         // Display each file with its timing
         for ((path, duration), source) in timing_pairs.iter().zip(self.sources.values()) {
             let stats = CstStats::from(&source.module);
-            println!("{:>8.2?} {:>4} {}", duration, stats.nodes, path.display());
+            println!("{:>8.2?} {:>8} {}", duration, stats.nodes, path.display());
         }
     }
 
