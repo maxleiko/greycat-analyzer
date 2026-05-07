@@ -8,6 +8,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax" }
+greycat-analyzer-core = { path = "../greycat-analyzer-core" }
+greycat-analyzer-hir = { path = "../greycat-analyzer-hir" }
+greycat-analyzer-types = { path = "../greycat-analyzer-types" }
+greycat-analyzer-analysis = { path = "../greycat-analyzer-analysis" }
+greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
 wasm-bindgen = { version = "0.2.100" }
 
 [package.metadata.wasm-pack.profile.release]

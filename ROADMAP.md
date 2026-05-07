@@ -183,7 +183,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] **5.1 WASM API surface** (M) — expose every analyzer stage the playground inspects. Minimum public functions: `parse_sexp`, `parse_tree` (serialized CST), `tokens` (lexable token stream over tree-sitter ranges), `lower_hir`, `infer_types`, `diagnostics`, `format`. Each returns serializable JSON so the playground can render trees side-by-side.
+- [x] **5.1 WASM API surface** (M) — `greycat-analyzer-wasm` exports `parse_sexp` (string), `parse_tree` (full serialized CST with kind / range / field / text / nesting), `tokens` (flat leaf stream with start/end positions + text), `lower_hir` (module name + decl list + per-arena counts), `infer_types` (per-expression byte range + display string), `diagnostics` (parse + semantic + lint, all merged with severity / source / code / position info), and `format` (formatted source). Each export runs its own pipeline pass — caching across exports waits on real profiling data from the playground.
 - [ ] **5.2 Playground as analyzer testbed** (M) — promote `greycat-analyzer-playground` from a parse-only smoke harness to a full inspection UI: Monaco editor wired to the wasm LSP for completion / hover / diagnostics, plus tabbed views for tokens, CST, HIR, type-inference table, and diagnostics. The playground is the visual debugger for every analyzer phase, not just a demo.
 - [ ] **5.3 crates.io publish** (S) — `greycat-analyzer-syntax`, `-core`, `-hir`, `-types`, `-analysis`, `-fmt`, `-ls`, plus the `greycat-analyzer` binary.
 - [ ] **5.4 VS Code extension** (S) — wire `editors/code/` to the new LSP binary.
