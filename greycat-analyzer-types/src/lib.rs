@@ -1,3 +1,531 @@
-//! Type system for greycat — `Type` enum, unifier, generic substitution.
+//! Type system for greycat — foundation port (P2.4).
 //!
-//! Skeleton landed in P2.2; populated in P2.4.
+//! Ports the core of `packages/lang/src/analysis/types.ts` (~2,811 LoC of
+//! TS). This crate is the foundation P2.5 (analyzer) builds on; it owns
+//! the `Type` enum, type interning, and subtyping rules.
+//!
+//! What's here:
+//! - [`Type`]: the central enum (primitives, named, generic, lambda, etc.)
+//! - [`TypeId`]: a `Copy` handle into the [`TypeArena`].
+//! - Primitive type ids (`null_t()`, `int_t()`, ...) for cheap comparisons.
+//! - [`TypeRegistry`]: holds per-module declared types so Named lookups
+//!   work without walking the HIR every time.
+//! - Subtyping (`is_assignable_to`) covering the cases the analyzer needs
+//!   in P2.5: primitive widening, null-into-nullable, generic invariance,
+//!   any/never, lambda variance.
+//!
+//! What's deferred:
+//! - Full TS subtyping rules around node types and runtime tagging.
+//! - Variance for user-declared generics (TS treats them invariantly).
+//! - Inference table / unification beyond simple substitution.
+//!
+//! Decision B: single typed AST + type arena (no separate hir-def/hir-ty
+//! split). Inference table is a thin map from `Idx<Expr>` to `TypeId`
+//! and lives in the analyzer crate, not here.
+
+use std::collections::HashMap;
+
+/// A handle into a [`TypeArena`]. Cheap to copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeId(u32);
+
+impl TypeId {
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// The central type representation.
+///
+/// The TS reference uses a class hierarchy with `nullable` flags per type
+/// instance; we mirror that with a top-level `nullable` field on every
+/// variant via the wrapping [`Type`] struct.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Type {
+    pub kind: TypeKind,
+    /// `true` iff this type allows `null` as a value (the `T?` syntax).
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypeKind {
+    /// `null`-only type. Convertible to any nullable.
+    Null,
+    /// `any` — top type. Anything is assignable to it.
+    Any,
+    /// `never` — bottom type. Used for unreachable code.
+    Never,
+    /// Named primitive — `int`, `float`, `String`, `bool`, `char`,
+    /// `time`, `duration`, `geo`. Carries the canonical name.
+    Primitive(Primitive),
+    /// Named user / stdlib type, identified by its fully-qualified name
+    /// (`<lib>::<module>::<TypeName>` or just `<TypeName>` until we wire
+    /// fully-qualified resolution).
+    Named { name: String },
+    /// Generic type instantiation — `Array<int>`, `Map<String, int>`, etc.
+    Generic { name: String, args: Vec<TypeId> },
+    /// Generic type *parameter* — the `T` inside a `fn<T>(x: T)` body.
+    GenericParam { name: String, owner: GenericOwner },
+    /// Function / lambda type.
+    Lambda(LambdaType),
+    /// Tuple — `t2`, `t3`, `t4` plus their float variants.
+    Tuple { elements: Vec<TypeId> },
+    /// Anonymous object literal type — `{ a: int, b: String }`.
+    Anonymous { fields: Vec<(String, TypeId)> },
+    /// Enum type.
+    Enum { name: String, variants: Vec<String> },
+    /// Union of two-or-more alternatives. Construction normalizes:
+    /// `T | T = T`, `T | null = nullable(T)`.
+    Union { alts: Vec<TypeId> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Primitive {
+    Bool,
+    Int,
+    Float,
+    Char,
+    String,
+    Time,
+    Duration,
+    Geo,
+}
+
+impl Primitive {
+    pub fn name(self) -> &'static str {
+        match self {
+            Primitive::Bool => "bool",
+            Primitive::Int => "int",
+            Primitive::Float => "float",
+            Primitive::Char => "char",
+            Primitive::String => "String",
+            Primitive::Time => "time",
+            Primitive::Duration => "duration",
+            Primitive::Geo => "geo",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LambdaType {
+    pub params: Vec<TypeId>,
+    pub ret: TypeId,
+}
+
+/// Where a generic parameter was declared.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GenericOwner {
+    /// `fn<T>(...)`.
+    Function(String),
+    /// `type Foo<T> {...}`.
+    Type(String),
+}
+
+// =============================================================================
+// Arena
+// =============================================================================
+
+/// Append-only interning arena for `Type`. Two equal `Type` values get
+/// the same [`TypeId`]; comparing for equality is then just an integer
+/// comparison.
+#[derive(Debug, Default)]
+pub struct TypeArena {
+    items: Vec<Type>,
+    intern: HashMap<Type, TypeId>,
+}
+
+impl TypeArena {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn alloc(&mut self, ty: Type) -> TypeId {
+        if let Some(&id) = self.intern.get(&ty) {
+            return id;
+        }
+        let id = TypeId(self.items.len() as u32);
+        self.items.push(ty.clone());
+        self.intern.insert(ty, id);
+        id
+    }
+
+    pub fn get(&self, id: TypeId) -> &Type {
+        &self.items[id.0 as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Make a copy of `id` with `nullable = true`. Idempotent.
+    pub fn nullable(&mut self, id: TypeId) -> TypeId {
+        let mut ty = self.get(id).clone();
+        if ty.nullable {
+            return id;
+        }
+        ty.nullable = true;
+        self.alloc(ty)
+    }
+
+    pub fn primitive(&mut self, p: Primitive) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Primitive(p),
+            nullable: false,
+        })
+    }
+
+    pub fn null(&mut self) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Null,
+            nullable: true,
+        })
+    }
+
+    pub fn any(&mut self) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Any,
+            nullable: true,
+        })
+    }
+
+    pub fn never(&mut self) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Never,
+            nullable: false,
+        })
+    }
+
+    pub fn named(&mut self, name: impl Into<String>) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Named { name: name.into() },
+            nullable: false,
+        })
+    }
+
+    pub fn generic(&mut self, name: impl Into<String>, args: Vec<TypeId>) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Generic {
+                name: name.into(),
+                args,
+            },
+            nullable: false,
+        })
+    }
+
+    pub fn lambda(&mut self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Lambda(LambdaType { params, ret }),
+            nullable: false,
+        })
+    }
+
+    pub fn tuple(&mut self, elements: Vec<TypeId>) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Tuple { elements },
+            nullable: false,
+        })
+    }
+}
+
+// =============================================================================
+// Type registry — holds module-level declared types
+// =============================================================================
+
+/// Looks up named types. P2.5/P2.6 will populate this from HIR + stdlib.
+#[derive(Debug, Default)]
+pub struct TypeRegistry {
+    /// Maps simple type name -> a Named TypeId in the arena.
+    named: HashMap<String, TypeId>,
+}
+
+impl TypeRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, name: impl Into<String>, id: TypeId) {
+        self.named.insert(name.into(), id);
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<TypeId> {
+        self.named.get(name).copied()
+    }
+}
+
+// =============================================================================
+// Subtyping
+// =============================================================================
+
+/// `true` iff a value of `from` is assignable to a slot expecting `to`.
+/// The relation handles primitive widening (int → float), nullability
+/// (T → T?), top/bottom (anything → any, never → anything), and shape
+/// matches for generics / tuples / lambdas. User-declared generics are
+/// invariant in their parameters (TS reference behavior).
+///
+/// Returns `false` for shapes the relation hasn't been formally taught
+/// — better to under-accept and surface false negatives in P2.5 than to
+/// silently widen.
+pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
+    if from == to {
+        return true;
+    }
+    let a = arena.get(from);
+    let b = arena.get(to);
+
+    // Null handling: `null` flows into anything nullable.
+    if matches!(a.kind, TypeKind::Null) {
+        return b.nullable;
+    }
+    // `never` flows everywhere.
+    if matches!(a.kind, TypeKind::Never) {
+        return true;
+    }
+    // `any` is the top type — everything flows into it.
+    if matches!(b.kind, TypeKind::Any) {
+        return true;
+    }
+    // A non-nullable can't widen into a different non-nullable type just
+    // because of nullability difference: `T → T?` is fine, `T? → T` is not.
+    if a.nullable && !b.nullable {
+        return false;
+    }
+
+    match (&a.kind, &b.kind) {
+        (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
+        (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => na == nb,
+        (
+            TypeKind::Generic {
+                name: na,
+                args: aa,
+            },
+            TypeKind::Generic {
+                name: nb,
+                args: ab,
+            },
+        ) => {
+            na == nb
+                && aa.len() == ab.len()
+                && aa.iter().zip(ab).all(|(x, y)| x == y) // invariant
+        }
+        (
+            TypeKind::Tuple { elements: ea },
+            TypeKind::Tuple { elements: eb },
+        ) => {
+            ea.len() == eb.len()
+                && ea
+                    .iter()
+                    .zip(eb)
+                    .all(|(x, y)| is_assignable_to(arena, *x, *y))
+        }
+        (TypeKind::Lambda(la), TypeKind::Lambda(lb)) => {
+            // Contravariant in params, covariant in return. Same as TS.
+            la.params.len() == lb.params.len()
+                && la
+                    .params
+                    .iter()
+                    .zip(&lb.params)
+                    .all(|(p_a, p_b)| is_assignable_to(arena, *p_b, *p_a))
+                && is_assignable_to(arena, la.ret, lb.ret)
+        }
+        (TypeKind::Union { alts }, _) => {
+            // Union assigns into `to` iff every alt does.
+            alts.iter().all(|a| is_assignable_to(arena, *a, to))
+        }
+        (_, TypeKind::Union { alts }) => {
+            // Single value flows into a union if it matches *any* alt.
+            alts.iter().any(|b| is_assignable_to(arena, from, *b))
+        }
+        (TypeKind::Enum { name: na, .. }, TypeKind::Enum { name: nb, .. }) => na == nb,
+        _ => false,
+    }
+}
+
+/// Primitive widening lattice: `int -> float`, plus identity. Strings,
+/// chars, bools etc. don't widen.
+fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
+    if from == to {
+        return true;
+    }
+    matches!((from, to), (Primitive::Int, Primitive::Float))
+}
+
+// =============================================================================
+// Display
+// =============================================================================
+
+pub fn display(arena: &TypeArena, id: TypeId) -> String {
+    let ty = arena.get(id);
+    let mut s = match &ty.kind {
+        TypeKind::Null => "null".to_string(),
+        TypeKind::Any => "any".to_string(),
+        TypeKind::Never => "never".to_string(),
+        TypeKind::Primitive(p) => p.name().to_string(),
+        TypeKind::Named { name } => name.clone(),
+        TypeKind::Generic { name, args } => {
+            let parts: Vec<String> = args.iter().map(|a| display(arena, *a)).collect();
+            format!("{name}<{}>", parts.join(", "))
+        }
+        TypeKind::GenericParam { name, .. } => name.clone(),
+        TypeKind::Lambda(l) => {
+            let parts: Vec<String> = l.params.iter().map(|p| display(arena, *p)).collect();
+            format!("({}) -> {}", parts.join(", "), display(arena, l.ret))
+        }
+        TypeKind::Tuple { elements } => {
+            let parts: Vec<String> = elements.iter().map(|e| display(arena, *e)).collect();
+            format!("({})", parts.join(", "))
+        }
+        TypeKind::Anonymous { fields } => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", display(arena, *t)))
+                .collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
+        TypeKind::Enum { name, .. } => name.clone(),
+        TypeKind::Union { alts } => {
+            let parts: Vec<String> = alts.iter().map(|a| display(arena, *a)).collect();
+            parts.join(" | ")
+        }
+    };
+    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Any) {
+        s.push('?');
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> TypeArena {
+        TypeArena::new()
+    }
+
+    #[test]
+    fn intern_collapses_equal_types() {
+        let mut a = fresh();
+        let i1 = a.primitive(Primitive::Int);
+        let i2 = a.primitive(Primitive::Int);
+        assert_eq!(i1, i2);
+        assert_eq!(a.len(), 1);
+    }
+
+    #[test]
+    fn nullable_idempotent() {
+        let mut a = fresh();
+        let i = a.primitive(Primitive::Int);
+        let q1 = a.nullable(i);
+        let q2 = a.nullable(q1);
+        assert_eq!(q1, q2);
+    }
+
+    #[test]
+    fn int_widens_to_float() {
+        let mut a = fresh();
+        let i = a.primitive(Primitive::Int);
+        let f = a.primitive(Primitive::Float);
+        assert!(is_assignable_to(&a, i, f));
+        assert!(!is_assignable_to(&a, f, i));
+    }
+
+    #[test]
+    fn null_flows_into_nullable_only() {
+        let mut a = fresh();
+        let null = a.null();
+        let int = a.primitive(Primitive::Int);
+        let int_q = a.nullable(int);
+        assert!(is_assignable_to(&a, null, int_q));
+        assert!(!is_assignable_to(&a, null, int));
+    }
+
+    #[test]
+    fn nullable_does_not_silently_narrow() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let int_q = a.nullable(int);
+        assert!(is_assignable_to(&a, int, int_q));
+        assert!(!is_assignable_to(&a, int_q, int));
+    }
+
+    #[test]
+    fn any_top_never_bottom() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let any = a.any();
+        let never = a.never();
+        assert!(is_assignable_to(&a, int, any));
+        assert!(is_assignable_to(&a, never, int));
+    }
+
+    #[test]
+    fn generic_invariant_in_args() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let float = a.primitive(Primitive::Float);
+        let arr_int = a.generic("Array", vec![int]);
+        let arr_float = a.generic("Array", vec![float]);
+        // Even though int->float widens, Array<int> is NOT assignable to
+        // Array<float>. Invariance.
+        assert!(!is_assignable_to(&a, arr_int, arr_float));
+        assert!(is_assignable_to(&a, arr_int, arr_int));
+    }
+
+    #[test]
+    fn lambda_contravariant_params_covariant_return() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let float = a.primitive(Primitive::Float);
+        // (float) -> int  is assignable to  (int) -> float
+        // Param: int (target) -> float (source) yes (int widens to float).
+        // Return: int (source) -> float (target) yes (int widens to float).
+        let f1 = a.lambda(vec![float], int);
+        let f2 = a.lambda(vec![int], float);
+        assert!(is_assignable_to(&a, f1, f2));
+        assert!(!is_assignable_to(&a, f2, f1));
+    }
+
+    #[test]
+    fn union_member_flows_in() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let str_t = a.primitive(Primitive::String);
+        let union = a.alloc(Type {
+            kind: TypeKind::Union {
+                alts: vec![int, str_t],
+            },
+            nullable: false,
+        });
+        assert!(is_assignable_to(&a, int, union));
+        assert!(is_assignable_to(&a, str_t, union));
+        let bool_t = a.primitive(Primitive::Bool);
+        assert!(!is_assignable_to(&a, bool_t, union));
+    }
+
+    #[test]
+    fn registry_lookup() {
+        let mut a = fresh();
+        let mut reg = TypeRegistry::new();
+        let foo = a.named("Foo");
+        reg.register("Foo", foo);
+        assert_eq!(reg.lookup("Foo"), Some(foo));
+        assert!(reg.lookup("Bar").is_none());
+    }
+
+    #[test]
+    fn display_renders_nullable_suffix() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let int_q = a.nullable(int);
+        let str_t = a.primitive(Primitive::String);
+        let arr = a.generic("Array", vec![str_t]);
+        assert_eq!(display(&a, int_q), "int?");
+        assert_eq!(display(&a, arr), "Array<String>");
+    }
+}
