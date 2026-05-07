@@ -30,13 +30,7 @@ use greycat_analyzer_syntax::tree_sitter;
 /// Open Question Q4 (ROADMAP §4) — "fix upstream in tree-sitter-greycat or
 /// work around in the syntax wrapper? Decide per-gap during P0.5". For each
 /// entry below, the resolution is "fix upstream".
-const KNOWN_GRAMMAR_GAPS: &[&str] = &[
-    // `type Foo { a: int; b: float }` — last `type_attr` may omit its trailing
-    // `;`. TS reference accepts it (and the formatter emits the `;` in the
-    // canonical form). tree-sitter-greycat's `type_body` rule currently
-    // requires the terminator. One-line grammar relaxation.
-    "tests/corpus/parser_fixtures/inline_type/in.gcl",
-];
+const KNOWN_GRAMMAR_GAPS: &[&str] = &[];
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

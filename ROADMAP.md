@@ -217,7 +217,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] **7.1 Drain `KNOWN_GRAMMAR_GAPS`** (S) — currently 1 entry (`inline_type/in.gcl` trailing semicolon). One-line grammar relaxation in `vendor/tree-sitter-greycat/grammar.js`, regen, drop the allowlist entry.
+- [x] **7.1 Drain `KNOWN_GRAMMAR_GAPS`** (S) — `type_attr` rule in `vendor/tree-sitter-greycat/grammar.js` made the trailing `_semi` optional, parser regenerated, submodule pointer bumped, and the `KNOWN_GRAMMAR_GAPS` allowlist drained to `&[]`. The `core::diagnostics::missing_token_surfaces` test that relied on the missing-`;` recovery was retargeted at an unclosed-block fixture (`fn main() {`) since `type Foo { a; b }` now parses cleanly.
 - [ ] **7.2 Drain `Expr::Unsupported`** (M) — for every CST shape that lowers to the catch-all variant, add a real HIR variant + lowering rule + analyzer inference rule. Known suspects: template-string interpolation, range expressions, `as` casts (P6.5 covers `is`), generators / `yield`-style constructs. **Acceptance:** an `Unsupported` log over `lib/std/*.gcl` reports zero entries.
 - [ ] **7.3 Type system — node tagging** (M) — `node`, `nodeTime`, `nodeGeo`, `nodeList`, `nodeIndex` get distinct subtyping rules matching the TS runtime's tagging. `is_assignable_to` learns the special cases the TS reference implements for nodes vs. their inner types.
 - [ ] **7.4 Type system — generic constraints + inference table** (M) — `type Foo<T> {…}` with constraint syntax (TS reference: `T : SomeBound`). An `InferenceTable` records unification constraints from usage so a generic arg is *inferred* from a call site rather than read from a declaration. Currently every generic-param falls back to `Any`.

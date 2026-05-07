@@ -145,12 +145,13 @@ mod tests {
 
     #[test]
     fn missing_token_surfaces() {
-        // `inline_type` style — missing trailing `;`. The grammar wants
-        // a terminator after each `type_attr`.
-        let ds = diags("type Foo { a: int; b: float }\n");
+        // Trigger an actual missing-token recovery — ERROR-recovery
+        // inserts `}` here.
+        let ds = diags("fn main() {\n");
         assert!(
-            ds.iter().any(|d| d.message.starts_with("missing `;`")),
-            "expected a missing-`;` diagnostic, got: {ds:?}"
+            ds.iter().any(|d| d.message.starts_with("missing `}`")
+                || d.message.starts_with("missing")),
+            "expected a missing-token diagnostic, got: {ds:?}"
         );
         assert!(
             ds.iter()
