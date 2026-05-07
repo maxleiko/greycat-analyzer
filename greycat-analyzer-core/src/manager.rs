@@ -3,22 +3,21 @@ use std::{
     collections::HashMap,
 };
 
-use bumpalo::Bump;
 use lsp_types::{TextDocumentContentChangeEvent, Uri};
 
 use crate::Document;
 
 #[derive(Debug, Default)]
-pub struct Manager<'arena> {
-    documents: HashMap<Uri, RefCell<Document<'arena>>>,
+pub struct Manager {
+    documents: HashMap<Uri, RefCell<Document>>,
 }
 
-impl<'arena> Manager<'arena> {
-    pub fn add(&mut self, doc: Document<'arena>) {
+impl Manager {
+    pub fn add(&mut self, doc: Document) {
         self.documents.insert(doc.uri.clone(), RefCell::new(doc));
     }
 
-    pub fn get(&self, uri: &Uri) -> Option<&RefCell<Document<'arena>>> {
+    pub fn get(&self, uri: &Uri) -> Option<&RefCell<Document>> {
         self.documents.get(uri)
     }
 
@@ -27,10 +26,9 @@ impl<'arena> Manager<'arena> {
         uri: &Uri,
         changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
-        arena: &'arena Bump,
-    ) -> Ref<'_, Document<'arena>> {
+    ) -> Ref<'_, Document> {
         if let Some(doc) = self.documents.get(uri) {
-            doc.borrow_mut().apply_changes(changes, version, arena);
+            doc.borrow_mut().apply_changes(changes, version);
             doc.borrow()
         } else {
             panic!("cannot update unknown document")
@@ -38,7 +36,7 @@ impl<'arena> Manager<'arena> {
     }
 }
 
-impl std::fmt::Display for Manager<'_> {
+impl std::fmt::Display for Manager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Manager({}):", self.documents.len())?;
         let last_i = self.documents.len().saturating_sub(1);

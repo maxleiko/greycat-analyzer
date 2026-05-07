@@ -262,12 +262,14 @@ name = "greycat-analyzer-core"
 version = "0.1.0"
 dependencies = [
  "bumpalo",
+ "greycat-analyzer-syntax",
  "line-index",
  "log",
  "lsp-types",
  "md5",
  "pretty_assertions",
  "serde",
+ "tree-sitter",
 ]
 
 [[package]]

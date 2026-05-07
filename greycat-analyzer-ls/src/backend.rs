@@ -1,5 +1,5 @@
 use crossbeam_channel::Sender;
-use greycat_analyzer_core::{Document, Manager, bumpalo::Bump};
+use greycat_analyzer_core::{Document, Manager};
 use log::debug;
 use lsp_server::*;
 use lsp_types::{
@@ -9,12 +9,12 @@ use lsp_types::{
 
 use crate::Result;
 
-pub struct Backend<'arena> {
+pub struct Backend {
     pub client: Sender<Message>,
-    pub manager: Manager<'arena>,
+    pub manager: Manager,
 }
 
-impl<'arena> Backend<'arena> {
+impl Backend {
     fn publish_diagnostics(
         &self,
         uri: Uri,
@@ -41,25 +41,24 @@ impl<'arena> Backend<'arena> {
         Ok(())
     }
 
-    pub fn did_open(&mut self, params: DidOpenTextDocumentParams, arena: &'arena Bump) -> Result<()> {
-        let doc = Document::new(params.text_document, arena);
+    pub fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Result<()> {
+        let doc = Document::new(params.text_document);
         debug!("[did_open] {doc}");
         self.manager.add(doc);
         Ok(())
     }
 
-    pub fn did_change(&mut self, params: DidChangeTextDocumentParams, arena: &'arena Bump) -> Result<()> {
+    pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
         let doc = self.manager.update(
             &params.text_document.uri,
             params.content_changes,
             params.text_document.version,
-            arena,
         );
         debug!("[did_change] {doc}");
         Ok(())
     }
 
-    pub fn did_save(&mut self, params: DidSaveTextDocumentParams, _arena: &'arena Bump) -> Result<()> {
+    pub fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Result<()> {
         debug!(
             "[did_save] {} (text={:?})",
             params.text_document.uri.as_str(),
@@ -68,7 +67,7 @@ impl<'arena> Backend<'arena> {
         Ok(())
     }
 
-    pub fn did_close(&mut self, params: DidCloseTextDocumentParams, _arena: &'arena Bump) -> Result<()> {
+    pub fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Result<()> {
         debug!("[did_close] {}", params.text_document.uri.as_str());
         // self.manager.remove(&params.text_document.uri);
         Ok(())
