@@ -1,3 +1,4 @@
+pub mod diagnostics;
 pub mod module_desc;
 pub mod resolver;
 pub mod span;

@@ -1,6 +1,8 @@
 mod cmd;
 mod utils;
 
+use std::process::ExitCode;
+
 use clap::{Parser, Subcommand};
 use cmd::*;
 
@@ -19,11 +21,11 @@ enum Command {
     Cst(Cst),
 }
 
-fn main() -> Result<(), AnyError> {
+fn main() -> Result<ExitCode, AnyError> {
     let cli = Cli::parse();
     match cli.command {
         Command::Lint(cmd) => cmd.run(),
-        Command::LangServer(cmd) => cmd.run(),
-        Command::Cst(cmd) => cmd.run(),
+        Command::LangServer(cmd) => cmd.run().map(|_| ExitCode::SUCCESS),
+        Command::Cst(cmd) => cmd.run().map(|_| ExitCode::SUCCESS),
     }
 }

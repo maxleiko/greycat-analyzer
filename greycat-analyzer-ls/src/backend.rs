@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::Sender;
-use greycat_analyzer_core::{Document, SourceManager};
+use greycat_analyzer_core::{Document, SourceManager, diagnostics::parse_diagnostics};
 use log::{debug, warn};
 use lsp_server::*;
 use lsp_types::{
@@ -24,6 +24,17 @@ impl Backend {
         version: Option<i32>,
     ) -> Result<()> {
         publish_diagnostics(&self.client, uri, diagnostics, version)
+    }
+
+    /// Re-run parse-diagnostics for `uri` and push them to the client.
+    /// Idempotent — publishing the same set is fine, the editor diffs.
+    fn publish_for(&self, uri: &Uri) -> Result<()> {
+        let Some(cell) = self.manager.get(uri) else {
+            return Ok(());
+        };
+        let doc = cell.borrow();
+        let diags = parse_diagnostics(doc.root_node(), &doc.text);
+        self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
 
     pub fn initialized(&mut self, init: &InitializeParams) -> Result<()> {
@@ -67,22 +78,35 @@ impl Backend {
         for err in &report.errors {
             warn!("[load_project] {err}");
         }
+        // Publish parse-diagnostics for every newly-loaded file so the
+        // editor lights up red squiggles for syntax errors across the
+        // whole project, not just files the user opens.
+        for uri in report.loaded {
+            if let Err(e) = self.publish_for(&uri) {
+                warn!("publish_for({}) failed: {e}", uri.as_str());
+            }
+        }
     }
 
     pub fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Result<()> {
+        let uri = params.text_document.uri.clone();
         let doc = Document::new(params.text_document);
         debug!("[did_open] {doc}");
         self.manager.add(doc);
+        self.publish_for(&uri)?;
         Ok(())
     }
 
     pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
+        let uri = params.text_document.uri.clone();
         let doc = self.manager.update(
-            &params.text_document.uri,
+            &uri,
             params.content_changes,
             params.text_document.version,
         );
         debug!("[did_change] {doc}");
+        drop(doc);
+        self.publish_for(&uri)?;
         Ok(())
     }
 
@@ -92,12 +116,17 @@ impl Backend {
             params.text_document.uri.as_str(),
             params.text
         );
+        // Editors may format/lint on save and send the canonical text;
+        // re-publish so any newly-introduced or newly-resolved errors
+        // are visible.
+        self.publish_for(&params.text_document.uri)?;
         Ok(())
     }
 
     pub fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Result<()> {
         debug!("[did_close] {}", params.text_document.uri.as_str());
-        // self.manager.remove(&params.text_document.uri);
+        // Clear diagnostics on close so the editor's stale list goes away.
+        self.publish_diagnostics(params.text_document.uri, Vec::new(), None)?;
         Ok(())
     }
 }
