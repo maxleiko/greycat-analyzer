@@ -1,0 +1,15 @@
+/// Foo
+@bar
+/// Baz
+fn main() {
+    var x = 0;
+    var y = 1;
+    var z = 2;
+
+    /* block comment */
+    if (x < z) {
+        var x = 1;
+
+        println("hello");
+    }
+}

@@ -1,0 +1,4 @@
+@expose
+fn foo(): int {
+    return 42;
+}

@@ -1,0 +1,8 @@
+/// Doc
+
+// eol 0
+// eol 1
+// eol 2
+
+@pragma
+fn foo(  ) {  }

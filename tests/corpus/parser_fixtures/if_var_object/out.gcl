@@ -1,0 +1,8 @@
+fn main() {
+    if (x < 0) {
+        var y = Foo {
+            yolo: "hello this is a really long long long long text, lorem ipsum",
+            datathings: TimeZone::Luxembourg
+        };
+    }
+}

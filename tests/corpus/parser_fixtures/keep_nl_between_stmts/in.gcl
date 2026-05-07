@@ -1,0 +1,9 @@
+fn first() {}
+
+
+
+fn second() {}
+
+/// Should stick to following statement
+
+fn third() {}

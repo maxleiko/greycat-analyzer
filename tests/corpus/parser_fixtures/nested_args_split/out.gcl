@@ -1,0 +1,11 @@
+type Foo {
+    static native fn sample(
+        refs: Array<nodeTime>,
+        from: time?,
+        to: time?,
+        maxRows: int,
+        mode: SamplingMode,
+        maxDephasing: duration?,
+        tz: TimeZone?
+    ): Table;
+}

@@ -1,0 +1,1 @@
+type Foo { a: int; b: float }

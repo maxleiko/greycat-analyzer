@@ -60,9 +60,12 @@ These decisions were made during planning and are not revisited without explicit
 Resolved as we hit them; fold the answer into §3 when locked.
 
 - **Q1:** How do we expose runtime-only built-in functions (those whose body is in the GreyCat runtime, not in `.gcl`) so the analyzer type-checks calls to them? Probable shape: a hand-written Rust table keyed by canonical name, with signatures parsed from a stub `.gcl` file. To resolve in P2.6.
-- **Q2:** Where does the conformance corpus live? Probable answer: `tests/corpus/` checked in, with an upstream-mirror commit hash in `STDLIB_VERSION`. To resolve in P0.5.
+- ~~**Q2:** Where does the conformance corpus live?~~ **Resolved (P0.5).** Two-tier:
+  1. **TS reference parser/project fixtures** — vendored at `tests/corpus/{parser,project}_fixtures/` (analyzer-port artifact, committed).
+  2. **Stdlib (`lib/std/*.gcl`)** — *not* vendored. Repo-root `project.gcl` pins the version via `@library("std", "<release>")`, and `greycat install` populates `lib/`. The coverage gauntlet checks stdlib if present, skips with a notice if not.
+  No `STDLIB_VERSION` file — the pin lives in `project.gcl`.
 - **Q3:** Version-pinning policy with upstream `lang/` — when does the Rust port chase a new TS reference release vs. lock to a known-good commit? To resolve before M3.
-- **Q4:** Tree-sitter grammar gaps (the ~10-15% not yet covered) — fix upstream in `tree-sitter-greycat` or work around in the syntax wrapper? Decide per-gap during P0.5.
+- **Q4:** Tree-sitter grammar gaps — fix upstream in `tree-sitter-greycat` or work around in the syntax wrapper? Decide per-gap. **Mechanism (resolved P0.5):** the coverage gauntlet keeps a `KNOWN_GRAMMAR_GAPS` allowlist in `greycat-analyzer-syntax/tests/coverage.rs`. Each entry pins a workspace-relative file path with a comment describing the rule that needs upstream relaxation. Drop entries from the list as the grammar is fixed. **Current backlog:** 1 entry — `tests/corpus/parser_fixtures/inline_type/in.gcl` (last `type_attr` should not require trailing `;`).
 - **Q5:** WASM bundle size budget. Splitting `analysis` from `core` (Decision D) helps; quantify in P5.1.
 
 ---
@@ -99,11 +102,11 @@ Each phase ends on a milestone. Effort signals: **S** < 1 week, **M** ~1-2 weeks
 - [x] **0.2 Tree-sitter integration** (M) — vendor or git-dep `tree-sitter-greycat`; expose `Language`, parse function. Generate a typed-node wrapper layer in `build.rs` from `node-types.json`. (Decision A.)
 - [x] **0.3 Document/Manager port** (M) — replace bumpalo-CST inside `Document` with tree-sitter `Tree`; keep `LineIndex` and `apply_changes`, but call `tree.edit()` + `parser.parse(&new_text, Some(&old_tree))` for incremental reparse.
 - [x] **0.4 Retire old code** (S) — see §9 for the explicit deletion list.
-- [ ] **0.5 Coverage gauntlet** (S) — bulk-parse `lib/std/*.gcl` + every `.gcl` under TS reference fixtures. Assert zero `ERROR`/`MISSING` nodes. File grammar gaps upstream against `tree-sitter-greycat`.
+- [x] **0.5 Coverage gauntlet** (S) — bulk-parse `lib/std/*.gcl` + every `.gcl` under TS reference fixtures. Assert zero `ERROR`/`MISSING` nodes. File grammar gaps upstream against `tree-sitter-greycat`.
 - [ ] **0.6 Snapshot harness** (S) — wire `insta` and a script that runs both the TS reference and the Rust port over the corpus, diffing CST shape. Pays off through P2.
 
 **Files retired:** see §9.
-**Files added:** `greycat-analyzer-syntax/` crate, `tests/corpus/`, `STDLIB_VERSION`.
+**Files added:** `greycat-analyzer-syntax/` crate, `tests/corpus/` (vendored TS reference parser/project fixtures), `project.gcl` (repo-root, pins stdlib via `@library`).
 
 **M1: tree-sitter parses 100% of `lib/std/*.gcl` and the TS reference test fixtures with zero error nodes; LSP stays alive on edits, diagnostics still empty; snapshot harness green.**
 
