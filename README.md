@@ -134,4 +134,4 @@ cargo test  --workspace
 
 CI (`.github/workflows/ci.yml`) enforces all of these on push.
 
-The roadmap is at [ROADMAP.md](ROADMAP.md). Items the original plan deferred are catalogued in [FOLLOWUP.md](FOLLOWUP.md).
+The roadmap is at [ROADMAP.md](ROADMAP.md). Phases 0–5 are done (M1–M5 reached); Phases 6–10 (M6–M10) carry the work forward to byte-for-byte parity with the TS reference.

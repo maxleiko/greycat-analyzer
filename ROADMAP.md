@@ -185,10 +185,95 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 - [x] **5.1 WASM API surface** (M) — `greycat-analyzer-wasm` exports `parse_sexp` (string), `parse_tree` (full serialized CST with kind / range / field / text / nesting), `tokens` (flat leaf stream with start/end positions + text), `lower_hir` (module name + decl list + per-arena counts), `infer_types` (per-expression byte range + display string), `diagnostics` (parse + semantic + lint, all merged with severity / source / code / position info), and `format` (formatted source). Each export runs its own pipeline pass — caching across exports waits on real profiling data from the playground.
 - [x] **5.2 Playground as analyzer testbed** (M) — fresh playground at [playground/](../playground/), scaffolded via `vp create vite:application` with a TypeScript + Lit + WebAwesome + Monaco stack. `<gc-playground>` lays out a `<wa-split-panel>` with the Monaco editor on the left and a `<wa-tab-group>` of inspection panels on the right: Diagnostics, CST (nested expandable tree), Tokens (table), HIR (decl list + arena counts), Types (per-expression inferred types), Format (side-by-side input vs. fmt output with idempotency badge). Each panel re-runs its own wasm export on every keystroke through a shared lazy-loaded `wasm.ts` initializer. `playground/scripts/build-wasm.sh` wraps `wasm-pack build --target web` with the Emscripten sysroot needed by tree-sitter-greycat's parser.c when compiling for `wasm32-unknown-unknown`. The previous gitignored `greycat-analyzer-playground/` is gone; the new `playground/` is committed.
-- [ ] **5.3 crates.io publish** (S, **deferred**) — workspace ready in shape but each `Cargo.toml` still needs `description` / `license` / `repository` metadata, `path` deps need a `version = "..."` shadow for publish, and a `MIT OR Apache-2.0` license file pair. Mechanical follow-up; not gated on any analyzer work.
+- [ ] **5.3 crates.io publish** (S) — see **P10.1**.
 - [x] **5.4 VS Code extension** (S) — `editors/code/src/extension.ts` already used the rust LSP via the `lang-server` subcommand; updated to the canonical `server` subcommand (P4.3) and broadened the default `RUST_LOG` to include `greycat_analyzer_analysis`. The extension package itself (`package.json`, manifest, scripts/build) was already in place.
-- [ ] **5.5 Salsa retrofit** (M, **optional, deferred**) — only if profiling shows quadratic blow-up on multi-file edits. Foundational design (file-level invalidation as pure functions) already lets a salsa retrofit be cheap; not needed at current scope.
+- [ ] **5.5 Salsa retrofit** (M) — see **P10.4**.
 - [x] **5.6 Stdlib parity + version pinning** (S) — pin lives in repo-root [project.gcl](../project.gcl) (`@library("std", "8.0.269-dev")`). [scripts/check-stdlib.sh](../scripts/check-stdlib.sh) reads the pin, checks that `lib/std/` is populated, and runs the coverage gauntlet (which already covers stdlib when present). New [.github/workflows/ci.yml](../.github/workflows/ci.yml) provides the CI gate: build, clippy with `-D warnings`, `cargo test --workspace`, the coverage gauntlet, and the snapshot harness — every push and PR.
+
+---
+
+### Phase 6 — Analyzer 1:1 with TS (~8-12 weeks)
+
+**Goal:** every behavior in `analysis/analyzer.ts` works the same way against the same input. The Phase 2 analyzer shipped enough scaffolding for the rest of the plan to keep moving (per-expression types, mismatch diagnostics, basic lints); Phase 6 is the parity push.
+
+**Chunks:**
+
+- [ ] **6.1 Project pipeline** (M) — `analyze_project(&SourceManager) -> ProjectAnalysis` driver. Per-document analyzer rebuilds collapse into one pass over the SourceManager, sharing a single `ProjectIndex`. File-level dependency tracking for `did_change` invalidation. LSP `Backend::publish_for` consults the cached project analysis. **Acceptance:** running `cli lint lib/std/` analyzes the whole std lib in a single pass.
+- [ ] **6.2 Cross-module name resolution** (M) — `analysis::resolver` consults `ProjectIndex` after exhausting local scope. Drops the `BUILTIN_TYPES` allowlist (which only existed because stdlib wasn't in scope yet). **Acceptance:** every reference in `lib/std/` resolves; zero "unresolved name" diagnostics on stdlib.
+- [ ] **6.3 Member-access resolution** (S) — `a.b` / `a->b` binds property names to `TypeAttr` / `TypeMethod` declarations. Currently the resolver intentionally skips property idents because they're type-driven; now that types are in place, finish it. **Acceptance:** goto-definition on `point.x` lands on the `x: int;` line of the `Point` type decl.
+- [ ] **6.4 Null-flow narrowing** (M) — `if (x != null) { … }` strips `nullable` from `x` in the then-branch. `if (x == null)` does the same in the else-branch. `x!!` propagates non-null to the rest of the enclosing block. Adds a per-block override layer on top of `analyzer::AnalysisResult::def_types`.
+- [ ] **6.5 `is` type guards + `as` casts** (S) — `if (x is Foo)` narrows `x` to `Foo` in then-branch. `as Foo` produces a typed expression. Both currently land as `Expr::Unsupported`; they get real HIR variants here.
+- [ ] **6.6 Enum / union exhaustiveness** (M) — non-exhaustive `if`/`else if` chains over an enum produce a `non-exhaustive match over Color (missing: Red)` diagnostic. Same for nullable types missing a `null` arm. Walks `if`/`else` chains tracking which constants the conditions discriminate on.
+- [ ] **6.7 Unused-decl warnings** (S) — top-level `fn` / `type` / `enum` / `var` decls never referenced and never `@expose`'d produce a warning. Adds a reverse-reference index (`references_to: HashMap<Idx<Decl>, usize>`) to `Resolutions`.
+- [ ] **6.8 Declarator / hinter / actions ports** (L) — port `analysis/declarator.ts`, `analysis/hinter.ts`, `analysis/actions.ts` (~700 LoC TS combined). Per-decl validation, hover hints, code-action proposals. Each lands behind unit tests against the same fixture inputs the TS suite uses.
+
+**M6: `cli lint lib/std/` reports zero diagnostics; `cli check examples/` matches TS reference output line-for-line; null-flow / `is` / exhaustiveness rules fire on the same snippets the TS analyzer fires on.**
+
+---
+
+### Phase 7 — Grammar & HIR completion (~3-5 weeks)
+
+**Goal:** zero `KNOWN_GRAMMAR_GAPS`, zero `Expr::Unsupported`, full type-system rules.
+
+**Chunks:**
+
+- [ ] **7.1 Drain `KNOWN_GRAMMAR_GAPS`** (S) — currently 1 entry (`inline_type/in.gcl` trailing semicolon). One-line grammar relaxation in `vendor/tree-sitter-greycat/grammar.js`, regen, drop the allowlist entry.
+- [ ] **7.2 Drain `Expr::Unsupported`** (M) — for every CST shape that lowers to the catch-all variant, add a real HIR variant + lowering rule + analyzer inference rule. Known suspects: template-string interpolation, range expressions, `as` casts (P6.5 covers `is`), generators / `yield`-style constructs. **Acceptance:** an `Unsupported` log over `lib/std/*.gcl` reports zero entries.
+- [ ] **7.3 Type system — node tagging** (M) — `node`, `nodeTime`, `nodeGeo`, `nodeList`, `nodeIndex` get distinct subtyping rules matching the TS runtime's tagging. `is_assignable_to` learns the special cases the TS reference implements for nodes vs. their inner types.
+- [ ] **7.4 Type system — generic constraints + inference table** (M) — `type Foo<T> {…}` with constraint syntax (TS reference: `T : SomeBound`). An `InferenceTable` records unification constraints from usage so a generic arg is *inferred* from a call site rather than read from a declaration. Currently every generic-param falls back to `Any`.
+- [ ] **7.5 Type system — anonymous structural compatibility** (S) — `{ a: int, b: String }` vs `{ a: int, b: String, c: bool }` follows the TS structural rules. Currently `is_assignable_to` returns false for distinct anonymous types.
+
+**M7: `lower_module` over `lib/std/*.gcl` produces zero `Expr::Unsupported`; type-system unit tests cover every TS subtyping rule with a fixture pulled from the TS test suite.**
+
+---
+
+### Phase 8 — LSP 1:1 with TS server (~4-6 weeks)
+
+**Goal:** every behavior in `packages/lang/src/lsp.*.test.ts` works the same way against the same input. The Phase 3 capability layer shipped working handlers; Phase 8 closes the gaps that needed Phase 6's project-aware analysis to land first.
+
+**Chunks:**
+
+- [ ] **8.1 Scope-aware rename** (M) — `capabilities::rename` filters by `Resolutions` rather than text equality. Renaming a local `helper` doesn't rename a same-named local in a different scope.
+- [ ] **8.2 Cross-module references + rename** (M) — uses the project pipeline (P6.1) so `references` and `rename` span every module that uses the symbol, with proper edit aggregation per `Uri`.
+- [ ] **8.3 Real code-action edits** (M) — concrete `TextEdit`s replace the empty placeholders shipped in P3.6: "add missing `;`" for `missing-token` diagnostics, "remove unused local" / "remove unused parameter" for the lint rules, "import type X" for unresolved type names (after P6.2). Each fix uses byte ranges from the corresponding diagnostic.
+- [ ] **8.4 Linter fix-application driver** (S) — `cli lint --fix` collects edits, sorts by start position, drops overlapping pairs, applies non-overlapping ones, retries until convergence (max N passes). Mirrors `packages/cli/src/lint/lint.ts`.
+- [ ] **8.5 Workspace symbols** (S) — iterates every document in `SourceManager` and aggregates per-document symbols, instead of re-using the active-document engine.
+- [ ] **8.6 Goto-implementation distinct from goto-definition** (S) — once P7 represents `abstract` methods + their concrete impls, `gotoImplementation` jumps to the override(s) rather than the declaration.
+- [ ] **8.7 Port `lsp.*.test.ts` scenarios** (M) — every TS scenario in the 15 LSP test files mirrored as a Rust integration test using the same fixture inputs. Closes ROADMAP §7-B.
+- [ ] **8.8 LSP `textDocument/rangeFormatting`** (S) — wires the foundational formatter to the range-formatting capability; needed for editor "format selection" UX.
+
+**M8: every LSP capability the TS server advertises behaves the same way under the same prompts; `lsp.*.test.ts` parity tests are green in CI.**
+
+---
+
+### Phase 9 — Formatter byte-for-byte parity (~4-6 weeks)
+
+**Goal:** `fmt(in.gcl) == out.gcl` over every fixture in `tests/corpus/parser_fixtures/`. This is the M5 acceptance criterion that P4.1 explicitly left open — ships as its own milestone because it's a focused parity port.
+
+**Chunks:**
+
+- [ ] **9.1 Port `cst_format.ts`** (XL) — ~1,354 LoC of TS. Per-construct reflow rules (line-break heuristics for long argument lists, alignment of consecutive type attrs, doc-comment placement, blank-line preservation between top-level items, etc.) The foundational printer in `greycat-analyzer-fmt` already handles the trivial cases; this is the long tail.
+- [ ] **9.2 Per-fixture parity gauntlet** (S) — extend the snapshot harness so every `tests/corpus/parser_fixtures/<n>/in.gcl` formatted equals the corresponding `out.gcl` byte-for-byte. CI fails on drift.
+- [ ] **9.3 Idempotency invariant** (S) — `fmt(fmt(x)) == fmt(x)` proven over the entire corpus, not just simple unit fixtures.
+
+**M9: fmt corpus parity test is green; the original M5 acceptance criterion is met. `cli fmt --check lib/std/` matches TS prettifier output byte-for-byte.**
+
+---
+
+### Phase 10 — Distribution + quality gates (~4-6 weeks)
+
+**Goal:** shippable on crates.io, fuzzed continuously, and parity-tested against the TS reference in CI.
+
+**Chunks:**
+
+- [ ] **10.1 crates.io publish** (S) — Cargo.toml metadata (`description`, `license`, `repository`, `keywords`, `categories`) per crate. `version = "..."` shadows on every `path` dep so the published versions don't depend on local paths. `LICENSE-MIT` + `LICENSE-APACHE` at workspace root. Publish in dep order: `syntax → core → hir → types → fmt → analysis → ls → bin`. (Subsumes P5.3.)
+- [ ] **10.2 cargo-fuzz on parser/HIR boundary** (S) — `parse(source) -> Tree` and `lower_module(...)` shouldn't panic on arbitrary UTF-8 input. Fuzz target lives in `fuzz/`. Closes ROADMAP §7-C.
+- [ ] **10.3 TS-vs-Rust diagnostic parity oracle** (M) — once P6 lands, snapshot the analyzer's diagnostic JSON output and diff it against TS reference output over the same corpus. CI gate. Closes ROADMAP §7-A.
+- [ ] **10.4 Salsa retrofit** (M, profiling-driven) — only when profiling shows quadratic blow-up on multi-file edits in real workspaces. The pure-function design from P6.1 keeps the retrofit cheap. (Subsumes P5.5.)
+- [ ] **10.5 Playground UI maturation** (M) — click-to-jump from CST / HIR / diagnostic rows back to a Monaco editor selection. LSP-in-web-worker so completion / hover / diagnostics fire in the Monaco editor itself, not just in side panels. `localStorage` persistence so refreshes don't lose the user's source.
+- [ ] **10.6 Documentation pass** (S) — crate-level rustdoc landing pages (each `lib.rs` has a real doc paragraph, not a one-liner). A "porting from TS" guide that maps every TS module to its Rust crate. Playground README covering the wasm build flow + how to add a new panel.
+
+**M10: published on crates.io; nightly fuzz + diagnostic parity gates green; playground is the analyzer's interactive debugger.**
 
 ---
 
@@ -247,11 +332,16 @@ P2 [10-16w] Semantic layer ─────────── M3   ← dominates
 P3 [4-6w]   LSP capabilities ───────── M4
 P4 [3-4w]   Formatter + linter ─────── M5
 P5 [2-3w]   Distribution
+P6 [8-12w]  Analyzer 1:1 with TS ───── M6   ← dominates the parity push
+P7 [3-5w]   Grammar + HIR completion ─ M7
+P8 [4-6w]   LSP 1:1 with TS ────────── M8
+P9 [4-6w]   Formatter byte-parity ──── M9
+P10 [4-6w]  Distribution + quality ── M10
 ```
 
-Total realistic envelope: **6-9 months full-time**, dominated by Phase 2.
+Total realistic envelope: **12-18 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the gap to 1:1 parity with the TS reference and adds the production gates.
 
-Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through Phase 2.
+Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
 
 ---
 
