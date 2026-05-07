@@ -25,12 +25,17 @@ pub struct Ident {
     pub byte_range: Span,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Modifiers {
     pub private: bool,
     pub static_: bool,
     pub abstract_: bool,
     pub native: bool,
+    /// Annotation names declared on this decl, drawn from grammar
+    /// `annotations` (e.g. `["expose", "permission"]`). Args are
+    /// dropped — the lint layer (P6.7) only needs the bare name to
+    /// detect `@expose` exposure.
+    pub annotations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

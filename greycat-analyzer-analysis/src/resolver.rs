@@ -65,6 +65,11 @@ pub struct Resolutions {
     /// Idents that are *definitions* (the name in `fn foo()` etc.) are
     /// *not* present here — only use sites.
     pub uses: HashMap<Idx<Ident>, Definition>,
+    /// Reverse-reference index (P6.7): how many times each top-level
+    /// `Decl` is referenced through a `Definition::Decl` use. Lets the
+    /// `unused-decl` lint rule check at-a-glance whether a decl is
+    /// never used outside its own declaration.
+    pub references_to: HashMap<Idx<Decl>, usize>,
     /// Idents the resolver couldn't bind. Surface as "unresolved name"
     /// diagnostics in P2.5.
     pub unresolved: Vec<Idx<Ident>>,
@@ -138,6 +143,10 @@ impl<'a> Cx<'a> {
         let name = self.ident_text(idx).to_string();
         if let Some(def) = self.lookup_local(&name) {
             self.res.uses.insert(idx, def);
+            // P6.7: bump the reverse-reference count for top-level decls.
+            if let Definition::Decl(decl_id) = def {
+                *self.res.references_to.entry(decl_id).or_insert(0) += 1;
+            }
             return;
         }
         if self.index.has_name(&name) {

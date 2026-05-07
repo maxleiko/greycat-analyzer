@@ -42,7 +42,11 @@ pub trait LintRule {
 
 /// Run every registered rule in order and return the merged findings.
 pub fn run_lints(hir: &Hir, res: &Resolutions) -> Vec<LintDiagnostic> {
-    let rules: Vec<Box<dyn LintRule>> = vec![Box::new(UnusedLocal), Box::new(UnusedParam)];
+    let rules: Vec<Box<dyn LintRule>> = vec![
+        Box::new(UnusedLocal),
+        Box::new(UnusedParam),
+        Box::new(UnusedDecl),
+    ];
     let mut out = Vec::new();
     for rule in rules {
         rule.check(hir, res, &mut out);
@@ -212,6 +216,80 @@ fn check_fn_params(
     }
 }
 
+// =============================================================================
+// Rule: unused-decl
+// =============================================================================
+
+/// Warn when a top-level `fn` / `type` / `enum` / `var` is never
+/// referenced anywhere in the module *and* doesn't carry a runtime-
+/// exposing annotation (`@expose`). Drives P6.7. The reference count
+/// comes from `Resolutions::references_to`, which the resolver builds
+/// from every `Definition::Decl` use site.
+pub struct UnusedDecl;
+
+impl LintRule for UnusedDecl {
+    fn name(&self) -> &'static str {
+        "unused-decl"
+    }
+
+    fn check(&self, hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
+        let Some(module) = hir.module.as_ref() else {
+            return;
+        };
+        let _ = module; // module-name / lib intentionally unused — the
+        // gate is the `private` modifier (see below).
+        for decl_id in &module.decls {
+            let decl = &hir.decls[*decl_id];
+            // Pragmas + native / abstract fns don't represent user
+            // code that could be "unused" in a meaningful way.
+            let (name_idx, modifiers, kind) = match decl {
+                Decl::Fn(fnd) => (fnd.name, &fnd.modifiers, "fn"),
+                Decl::Type(td) => (td.name, &td.modifiers, "type"),
+                Decl::Enum(ed) => (ed.name, &ed.modifiers, "enum"),
+                Decl::Var(vd) => (vd.name, &vd.modifiers, "var"),
+                Decl::Pragma(_) => continue,
+            };
+            if modifiers.native || modifiers.abstract_ {
+                continue;
+            }
+            // Only `private` decls are checked — anything non-private
+            // is potentially called from outside this module (other
+            // modules, stdlib consumers, runtime tooling) and we can't
+            // see those use sites here.
+            if !modifiers.private {
+                continue;
+            }
+            // `@expose` (and other runtime-exposing annotations) keep
+            // the decl alive even without intra-module references.
+            if exposes_runtime(modifiers) {
+                continue;
+            }
+            let ident = &hir.idents[name_idx];
+            // Underscore-prefixed names are an opt-out marker, mirroring
+            // the param convention.
+            if ident.text.starts_with('_') {
+                continue;
+            }
+            let count = res.references_to.get(decl_id).copied().unwrap_or(0);
+            if count == 0 {
+                out.push(LintDiagnostic {
+                    rule: self.name(),
+                    severity: LintSeverity::Warning,
+                    message: format!("unused private {kind} `{}`", ident.text),
+                    byte_range: ident.byte_range.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
+    modifiers
+        .annotations
+        .iter()
+        .any(|a| a == "expose" || a == "permission" || a == "role" || a == "library")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +376,50 @@ fn f(_unused: int): int {
         assert!(
             !diags.iter().any(|d| d.rule == "unused-param"),
             "native fns shouldn't trigger unused-param: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unused_private_fn_warns() {
+        let diags = lint("private fn unused() {}\nprivate fn used() { used(); }\n");
+        let unused: Vec<_> = diags.iter().filter(|d| d.rule == "unused-decl").collect();
+        assert!(
+            unused
+                .iter()
+                .any(|d| d.message.contains("unused private fn `unused`")),
+            "expected unused-decl on private `unused`, got: {diags:?}"
+        );
+        // `used` references itself recursively → ref count 1 → not warned.
+        assert!(
+            !unused.iter().any(|d| d.message.contains("`used`")),
+            "self-reference should suppress unused-decl: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_private_decl_skipped() {
+        let diags = lint("fn callable() {}\n");
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-decl"),
+            "non-private top-level should not warn (callable from elsewhere): {diags:?}"
+        );
+    }
+
+    #[test]
+    fn exposed_decl_skipped() {
+        let diags = lint("@expose\nprivate fn handler() {}\n");
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-decl"),
+            "@expose should keep decl alive: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn underscore_decl_skipped() {
+        let diags = lint("private fn _scratch() {}\n");
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-decl"),
+            "underscore-prefixed private should not warn: {diags:?}"
         );
     }
 }

@@ -109,6 +109,31 @@ fn lower_modifiers(cx: &LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Modifi
     m
 }
 
+/// Collect annotation names (e.g. `["expose", "permission"]`) from the
+/// `annotations` named child of a decl-level node. Args are dropped —
+/// downstream consumers (P6.7 unused-decl lint) only need the bare name.
+fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<String> {
+    let mut cursor = decl_node.walk();
+    let Some(annots_node) = decl_node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "annotations")
+    else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut c2 = annots_node.walk();
+    for ann in annots_node.named_children(&mut c2) {
+        if ann.kind() != "annotation" {
+            continue;
+        }
+        let mut c3 = ann.walk();
+        if let Some(ident) = ann.named_children(&mut c3).find(|n| n.kind() == "ident") {
+            names.push(cx.text(ident).to_string());
+        }
+    }
+    names
+}
+
 fn doc_text(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Option<String> {
     let doc = node
         .named_children(&mut node.walk())
@@ -129,7 +154,8 @@ fn doc_text(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Option<String> {
 fn lower_fn_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<FnDecl> {
     let name_node = node.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
-    let modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    modifiers.annotations = lower_annotations(cx, node);
     let generics = lower_generics(cx, node.child_by_field_name("generics"));
     let params = lower_fn_params(cx, node.child_by_field_name("params"));
     let return_type = node
@@ -191,7 +217,8 @@ fn lower_fn_params(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Ve
 fn lower_type_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<TypeDecl> {
     let name_node = node.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
-    let modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    modifiers.annotations = lower_annotations(cx, node);
     let generics = lower_generics(cx, node.child_by_field_name("params"));
     let supertype = node
         .child_by_field_name("supertype")
@@ -234,7 +261,8 @@ fn lower_type_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Typ
 fn lower_type_attr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<TypeAttr> {
     let name_node = node.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
-    let modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    modifiers.annotations = lower_annotations(cx, node);
     let ty = node
         .child_by_field_name("type")
         .and_then(|n| lower_type_ref(cx, n));
@@ -257,7 +285,8 @@ fn lower_type_attr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Typ
 fn lower_enum_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<EnumDecl> {
     let name_node = node.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
-    let modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    modifiers.annotations = lower_annotations(cx, node);
     let mut fields = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
         let mut cursor = body.walk();
@@ -292,7 +321,8 @@ fn lower_enum_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Enu
 fn lower_top_var(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<VarDeclTop> {
     let name_node = node.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
-    let modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
+    modifiers.annotations = lower_annotations(cx, node);
     let ty = node
         .child_by_field_name("type")
         .and_then(|n| lower_type_ref(cx, n));
