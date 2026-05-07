@@ -116,6 +116,7 @@ pub fn analyze(hir: &Hir, res: &Resolutions) -> AnalysisResult {
         hir,
         res,
         out: &mut out,
+        narrows: Vec::new(),
     };
     for d in &module.decls {
         cx.visit_decl(*d);
@@ -193,10 +194,25 @@ fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
     }
 }
 
+/// Narrowings derived from an `if` condition (P6.4). Each list holds
+/// the *binding* idents (from `Resolutions`) whose nullable type should
+/// be stripped in the matching branch.
+#[derive(Default)]
+struct CondNarrows {
+    then_non_null: Vec<Idx<Ident>>,
+    else_non_null: Vec<Idx<Ident>>,
+}
+
 struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
     out: &'a mut AnalysisResult,
+    /// Null-flow narrowing stack (P6.4). Each frame is a binding ident
+    /// → temporary `TypeId` override. Frames are pushed on block /
+    /// then-branch / else-branch entry and popped on exit, so a
+    /// narrowing introduced inside a block stays alive for the rest
+    /// of that block but doesn't leak to siblings.
+    narrows: Vec<HashMap<Idx<Ident>, TypeId>>,
 }
 
 impl<'a> Cx<'a> {
@@ -221,6 +237,37 @@ impl<'a> Cx<'a> {
     }
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
         &self.hir.idents[idx].text
+    }
+
+    fn push_narrow(&mut self) {
+        self.narrows.push(HashMap::new());
+    }
+    fn pop_narrow(&mut self) {
+        self.narrows.pop();
+    }
+    fn write_narrow(&mut self, name: Idx<Ident>, ty: TypeId) {
+        if let Some(top) = self.narrows.last_mut() {
+            top.insert(name, ty);
+        }
+    }
+    /// Innermost-first lookup of a binding ident's current type:
+    /// narrowing frames win over `def_types`, mirroring the way TS
+    /// `narrowing.ts` overlays branch-local strips on the env.
+    fn lookup_def_type(&self, name: Idx<Ident>) -> Option<TypeId> {
+        for frame in self.narrows.iter().rev() {
+            if let Some(t) = frame.get(&name) {
+                return Some(*t);
+            }
+        }
+        self.out.def_types.get(&name).copied()
+    }
+    fn strip_nullable(&mut self, ty: TypeId) -> TypeId {
+        let mut t = self.out.types.get(ty).clone();
+        if !t.nullable {
+            return ty;
+        }
+        t.nullable = false;
+        self.out.types.alloc(t)
     }
 
     /// P6.3 member resolution: bind the property ident in `a.b` /
@@ -400,9 +447,11 @@ impl<'a> Cx<'a> {
         let stmt = self.hir.stmts[stmt_id].clone();
         match stmt {
             Stmt::Block(stmts) => {
+                self.push_narrow();
                 for s in stmts {
                     self.visit_stmt(s, return_ty);
                 }
+                self.pop_narrow();
             }
             Stmt::Expr(e) => {
                 let _ = self.visit_expr(e);
@@ -448,9 +497,31 @@ impl<'a> Cx<'a> {
                 ..
             }) => {
                 self.expect_bool(condition, "if condition");
+                let CondNarrows {
+                    then_non_null,
+                    else_non_null,
+                } = self.derive_cond_narrows(condition);
+
+                self.push_narrow();
+                for ident in &then_non_null {
+                    if let Some(cur) = self.lookup_def_type(*ident) {
+                        let stripped = self.strip_nullable(cur);
+                        self.write_narrow(*ident, stripped);
+                    }
+                }
                 self.visit_stmt(then_branch, return_ty);
+                self.pop_narrow();
+
                 if let Some(eb) = else_branch {
+                    self.push_narrow();
+                    for ident in &else_non_null {
+                        if let Some(cur) = self.lookup_def_type(*ident) {
+                            let stripped = self.strip_nullable(cur);
+                            self.write_narrow(*ident, stripped);
+                        }
+                    }
                     self.visit_stmt(eb, return_ty);
+                    self.pop_narrow();
                 }
             }
             Stmt::While(WhileStmt {
@@ -521,6 +592,65 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// P6.4 narrowing analyzer for if-conditions. Recognizes the
+    /// surface forms `x != null`, `x == null`, and their reversed
+    /// twins (`null != x` / `null == x`). Conjunctive narrowings
+    /// (`x != null && y != null`) are intentionally minimal here —
+    /// extend in a follow-up if the corpus pushes for it.
+    fn derive_cond_narrows(&self, cond_id: Idx<Expr>) -> CondNarrows {
+        let mut out = CondNarrows::default();
+        if let Expr::Binary(BinaryExpr {
+            op, left, right, ..
+        }) = &self.hir.exprs[cond_id]
+        {
+            let op = *op;
+            if !matches!(op, BinOp::Eq | BinOp::Neq) {
+                return out;
+            }
+            let Some(name_idx) = self.ident_compared_to_null(*left, *right) else {
+                return out;
+            };
+            let Some(def) = (match self.res.lookup(name_idx) {
+                Some(Definition::Param(d)) | Some(Definition::Local(d)) => Some(d),
+                _ => None,
+            }) else {
+                return out;
+            };
+            match op {
+                BinOp::Neq => out.then_non_null.push(def),
+                BinOp::Eq => out.else_non_null.push(def),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn ident_compared_to_null(&self, l: Idx<Expr>, r: Idx<Expr>) -> Option<Idx<Ident>> {
+        let le = &self.hir.exprs[l];
+        let re = &self.hir.exprs[r];
+        if let (
+            Expr::Ident(name),
+            Expr::Literal(LiteralExpr {
+                kind: LiteralKind::Null,
+                ..
+            }),
+        ) = (le, re)
+        {
+            return Some(*name);
+        }
+        if let (
+            Expr::Literal(LiteralExpr {
+                kind: LiteralKind::Null,
+                ..
+            }),
+            Expr::Ident(name),
+        ) = (le, re)
+        {
+            return Some(*name);
+        }
+        None
+    }
+
     fn expect_bool(&mut self, expr: Idx<Expr>, label: &str) {
         let ty = self.visit_expr(expr);
         let bool_t = self.primitive(Primitive::Bool);
@@ -544,12 +674,9 @@ impl<'a> Cx<'a> {
         let expr = self.hir.exprs[expr_id].clone();
         match expr {
             Expr::Ident(idx) => match self.res.lookup(idx) {
-                Some(Definition::Param(def)) | Some(Definition::Local(def)) => self
-                    .out
-                    .def_types
-                    .get(&def)
-                    .copied()
-                    .unwrap_or_else(|| self.any()),
+                Some(Definition::Param(def)) | Some(Definition::Local(def)) => {
+                    self.lookup_def_type(def).unwrap_or_else(|| self.any())
+                }
                 Some(Definition::Decl(_))
                 | Some(Definition::Generic(_))
                 | Some(Definition::Project)
@@ -627,10 +754,18 @@ impl<'a> Cx<'a> {
                     UnaryOp::Not => self.primitive(Primitive::Bool),
                     UnaryOp::Neg | UnaryOp::BitNot => inner,
                     UnaryOp::NonNullAssert => {
-                        // `x!!` — strip nullable.
-                        let mut ty = self.out.types.get(inner).clone();
-                        ty.nullable = false;
-                        self.out.types.alloc(ty)
+                        // `x!!` strips nullable from the result and (P6.4)
+                        // narrows the operand binding for the rest of the
+                        // enclosing block when the operand is an Ident
+                        // bound to a Param/Local.
+                        let result = self.strip_nullable(inner);
+                        if let Expr::Ident(name_idx) = self.hir.exprs[operand].clone()
+                            && let Some(Definition::Param(def) | Definition::Local(def)) =
+                                self.res.lookup(name_idx)
+                        {
+                            self.write_narrow(def, result);
+                        }
+                        result
                     }
                 }
             }
@@ -811,6 +946,73 @@ fn read(b: Box): int { return b->inner; }
             analysis.member_lookup(property),
             Some(MemberDef::Attr(_))
         ));
+    }
+
+    #[test]
+    fn null_neq_narrows_then_branch() {
+        // `if (x != null) { use(x) }` — inside the then-branch x is
+        // non-null, so passing it to a slot expecting non-null int
+        // shouldn't error.
+        let src = r#"
+fn use_int(v: int) {}
+fn f(x: int?) {
+    if (x != null) {
+        use_int(x);
+    }
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error inside narrowed then-branch, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn null_eq_narrows_else_branch() {
+        // `if (x == null) { ... } else { use(x) }` narrows x in else.
+        let src = r#"
+fn use_int(v: int) {}
+fn f(x: int?) {
+    if (x == null) {
+    } else {
+        use_int(x);
+    }
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error inside narrowed else-branch, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn non_null_assert_narrows_rest_of_block() {
+        // `x!!;` propagates non-null to subsequent uses of x in the
+        // same block. Without P6.4 narrowing, the second `use_int(x)`
+        // would error.
+        let src = r#"
+fn use_int(v: int) {}
+fn f(x: int?) {
+    use_int(x!!);
+    use_int(x);
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error after `x!!`, got: {:?}",
+            r.diagnostics
+        );
     }
 
     #[test]
