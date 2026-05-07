@@ -297,11 +297,34 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         return false;
     }
 
+    // P7.3 node tagging: `node<T>` / `nodeTime<T>` / etc. auto-deref to
+    // their inner `T`. The reverse direction stays asymmetric — a bare
+    // `T` cannot promote to a tagged-node form without an explicit
+    // constructor call.
+    if let TypeKind::Generic { name, args } = &a.kind
+        && is_node_tag(name)
+        && args.len() == 1
+        && is_assignable_to(arena, args[0], to)
+    {
+        return true;
+    }
+
     match (&a.kind, &b.kind) {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
         (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => na == nb,
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
             na == nb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| x == y) // invariant
+        }
+        // P7.5 anonymous structural compat: a value of `{a: A, b: B}`
+        // is assignable to `{a: A}` (width subtyping — source may have
+        // *extra* fields). Each shared field's source type must be
+        // assignable to the target's field type.
+        (TypeKind::Anonymous { fields: fa }, TypeKind::Anonymous { fields: fb }) => {
+            fb.iter().all(|(name, want)| {
+                fa.iter()
+                    .find(|(n, _)| n == name)
+                    .is_some_and(|(_, got)| is_assignable_to(arena, *got, *want))
+            })
         }
         (TypeKind::Tuple { elements: ea }, TypeKind::Tuple { elements: eb }) => {
             ea.len() == eb.len()
@@ -335,6 +358,106 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
 
 /// Primitive widening lattice: `int -> float`, plus identity. Strings,
 /// chars, bools etc. don't widen.
+/// `true` for any of the runtime "node-tag" generic names that
+/// auto-deref to their inner type in the assignability relation
+/// (P7.3). Drawn from the TS reference's `StdCoreTypes` interface.
+pub fn is_node_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "node" | "nodeTime" | "nodeGeo" | "nodeList" | "nodeIndex"
+    )
+}
+
+// =============================================================================
+// Inference table (P7.4 — foundational pass)
+// =============================================================================
+
+/// Per-call constraint table that records "type-parameter `T` was
+/// witnessed at type `…`" pairs as the analyzer walks a generic call
+/// site. After all arguments have been visited, [`InferenceTable::solve`]
+/// substitutes accumulated witnesses into the declared return type.
+///
+/// **Scope:** records and substitutes simple `GenericParam` ↔ concrete
+/// pairs. Constraint propagation (e.g. `T : SomeBound` requiring the
+/// witness to satisfy the bound), variance handling beyond what
+/// [`is_assignable_to`] already provides, and union-of-witnesses
+/// merging are deferred — this is the seam, not a full Hindley-Milner.
+#[derive(Debug, Default)]
+pub struct InferenceTable {
+    bindings: HashMap<String, TypeId>,
+}
+
+impl InferenceTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a witness for a generic param. If the same param has
+    /// already been bound, the new witness is dropped — the analyzer's
+    /// caller should already have type-checked it against the prior
+    /// witness through [`is_assignable_to`].
+    pub fn bind(&mut self, name: impl Into<String>, ty: TypeId) {
+        self.bindings.entry(name.into()).or_insert(ty);
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<TypeId> {
+        self.bindings.get(name).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    /// Substitute every `GenericParam(name)` in `ty` with the recorded
+    /// witness. Idempotent — re-applying produces the same result.
+    pub fn substitute(&self, arena: &mut TypeArena, ty: TypeId) -> TypeId {
+        let t = arena.get(ty).clone();
+        match &t.kind {
+            TypeKind::GenericParam { name, .. } => {
+                if let Some(witness) = self.bindings.get(name) {
+                    let nullable = t.nullable;
+                    if !nullable {
+                        return *witness;
+                    }
+                    arena.nullable(*witness)
+                } else {
+                    ty
+                }
+            }
+            TypeKind::Generic { name, args } => {
+                let new_args: Vec<TypeId> =
+                    args.iter().map(|a| self.substitute(arena, *a)).collect();
+                if new_args == *args {
+                    ty
+                } else {
+                    let name = name.clone();
+                    let mut new_t = arena.generic(name, new_args);
+                    if t.nullable {
+                        new_t = arena.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            TypeKind::Tuple { elements } => {
+                let new_els: Vec<TypeId> = elements
+                    .iter()
+                    .map(|e| self.substitute(arena, *e))
+                    .collect();
+                if new_els == *elements {
+                    ty
+                } else {
+                    let mut new_t = arena.tuple(new_els);
+                    if t.nullable {
+                        new_t = arena.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            _ => ty,
+        }
+    }
+}
+
 fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
     if from == to {
         return true;
@@ -513,5 +636,64 @@ mod tests {
         let arr = a.generic("Array", vec![str_t]);
         assert_eq!(display(&a, int_q), "int?");
         assert_eq!(display(&a, arr), "Array<String>");
+    }
+
+    #[test]
+    fn node_tag_auto_derefs_to_inner() {
+        let mut a = fresh();
+        let person = a.named("Person");
+        let node_person = a.generic("node", vec![person]);
+        // node<Person> → Person  (auto-deref)
+        assert!(is_assignable_to(&a, node_person, person));
+        // Person → node<Person>  is NOT auto-promoted.
+        assert!(!is_assignable_to(&a, person, node_person));
+    }
+
+    #[test]
+    fn inference_table_substitutes_generic_params() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let t_param = a.alloc(Type {
+            kind: TypeKind::GenericParam {
+                name: "T".into(),
+                owner: GenericOwner::Type("Foo".into()),
+            },
+            nullable: false,
+        });
+        let arr_t = a.generic("Array", vec![t_param]);
+
+        let mut tbl = InferenceTable::new();
+        tbl.bind("T", int);
+
+        let resolved = tbl.substitute(&mut a, arr_t);
+        let resolved_kind = &a.get(resolved).kind;
+        let TypeKind::Generic { name, args } = resolved_kind else {
+            panic!("expected Array<int>, got {resolved_kind:?}");
+        };
+        assert_eq!(name, "Array");
+        assert_eq!(args, &vec![int]);
+    }
+
+    #[test]
+    fn anonymous_width_subtyping() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let str_t = a.primitive(Primitive::String);
+        let two = a.alloc(Type {
+            kind: TypeKind::Anonymous {
+                fields: vec![("a".into(), int), ("b".into(), str_t)],
+            },
+            nullable: false,
+        });
+        let one = a.alloc(Type {
+            kind: TypeKind::Anonymous {
+                fields: vec![("a".into(), int)],
+            },
+            nullable: false,
+        });
+        // {a, b} → {a}  (width subtyping: extra field b is fine)
+        assert!(is_assignable_to(&a, two, one));
+        // {a} → {a, b}  is NOT — would be missing field b.
+        assert!(!is_assignable_to(&a, one, two));
     }
 }
