@@ -95,7 +95,7 @@ Per-chunk checklist:
 6. Don't skip hooks, don't amend prior commits.
 7. `git push origin main` after the commit lands. Same applies to `chore:` / area-prefixed non-chunk commits in this repo.
 
-Submodule commits (e.g. inside `vendor/tree-sitter-greycat/`) are a separate remote with separate blast radius — those still need explicit authorization to push.
+Submodule commits (inside `vendor/tree-sitter-greycat/` → `maxleiko/tree-sitter-greycat`) are also pushed immediately. After pushing, bump the parent's submodule pointer in a follow-up commit so the new SHA propagates downstream.
 
 Commit message format — match the existing log style (short, lowercase, area-prefixed):
 
