@@ -2,7 +2,12 @@
 name = "greycat-analyzer-syntax"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 tree-sitter = "0.26"
 tree-sitter-greycat = { git = "https://github.com/maxleiko/tree-sitter-greycat", branch = "main" }
+
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
