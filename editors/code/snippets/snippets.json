@@ -1,0 +1,22 @@
+{
+	"For": {
+		"prefix": ["for"],
+		"body": ["for (var ${1:i} = 0; ${1:i} < ${2:arr}.size(); ${1:i}++) {", "  var element = ${2:arr}.get(${1:i});\n  $0", "}"]
+	},
+	"ForIn": {
+		"prefix": ["for in"],
+		"body": ["for (${1:key}, ${2:value} in ${3:iter}) {", "  $0", "}"]
+	},
+	"While Loop": {
+		"prefix": ["while"],
+		"body": ["while (${1:condition}) {", "  $0", "}"]
+	},	
+	"Do Loop": {
+		"prefix": ["do"],
+		"body": ["do {", "  $0", "} while (${1:condition});"]
+	},
+	"Try/Catch": {
+		"prefix": ["try"],
+		"body": ["try {", "  $0", "} catch (${1:err}) {", "  ", "}"]
+	}
+}

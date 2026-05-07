@@ -21,10 +21,31 @@
   "contributes": {
     "languages": [
       {
-        "id": "gcl",
-        "aliases": ["GreyCat", "greycat", "gcl"],
+        "id": "greycat",
+        "aliases": ["GreyCat", "Greycat", "greycat", "gcl"],
         "extensions": [".gcl"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./grammar/language-configuration.json",
+        "icon": {
+          "light": "./icons/light/gcl.svg",
+          "dark": "./icons/dark/gcl.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "greycat",
+        "scopeName": "source.gcl",
+        "path": "./grammar/Greycat.tmLanguage",
+        "embeddedLanguages": {
+          "source.md": "markdown",
+          "meta.embedded.doc.gcl": "markdown"
+        }
+      }
+    ],
+    "snippets": [
+      {
+        "language": "greycat",
+        "path": "./snippets/snippets.json"
       }
     ],
     "commands": [
