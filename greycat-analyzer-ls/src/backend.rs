@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::Sender;
-use greycat_analyzer_analysis::analyzer::{Severity, analyze};
-use greycat_analyzer_analysis::lint::{LintSeverity, run_lints};
-use greycat_analyzer_analysis::resolver::resolve;
+use greycat_analyzer_analysis::analyzer::Severity;
+use greycat_analyzer_analysis::lint::LintSeverity;
+use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_core::{Document, SourceManager, diagnostics::parse_diagnostics};
-use greycat_analyzer_hir::lower_module;
 use log::{debug, warn};
 use lsp_server::*;
 use lsp_types::{NumberOrString, Position, Range};
@@ -19,6 +18,7 @@ use crate::Result;
 pub struct Backend {
     pub client: Sender<Message>,
     pub manager: SourceManager,
+    pub project_analysis: ProjectAnalysis,
 }
 
 impl Backend {
@@ -31,20 +31,19 @@ impl Backend {
         publish_diagnostics(&self.client, uri, diagnostics, version)
     }
 
-    /// Re-run parse + semantic diagnostics for `uri` and push them to
-    /// the client. Idempotent — publishing the same set is fine, the
-    /// editor diffs.
+    /// Pull cached parse + semantic + lint diagnostics for `uri` and
+    /// push them to the client. The cache is populated by
+    /// [`ProjectAnalysis::analyze`] on workspace load and by
+    /// [`ProjectAnalysis::invalidate`] on every `did_open` / `did_change`.
     fn publish_for(&self, uri: &Uri) -> Result<()> {
         let Some(cell) = self.manager.get(uri) else {
             return Ok(());
         };
         let doc = cell.borrow();
         let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
-        diags.extend(semantic_diagnostics_for_text(
-            &doc.text,
-            &doc.lib,
-            doc.root_node(),
-        ));
+        if let Some(module) = self.project_analysis.module(uri) {
+            diags.extend(diagnostics_from_module(&doc.text, module));
+        }
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
 
@@ -89,9 +88,9 @@ impl Backend {
         for err in &report.errors {
             warn!("[load_project] {err}");
         }
-        // Publish parse-diagnostics for every newly-loaded file so the
-        // editor lights up red squiggles for syntax errors across the
-        // whole project, not just files the user opens.
+        // Single project-wide pipeline pass over everything we just
+        // loaded — the per-doc analyses land in the cache.
+        self.project_analysis.rebuild(&self.manager);
         for uri in report.loaded {
             if let Err(e) = self.publish_for(&uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
@@ -104,6 +103,7 @@ impl Backend {
         let doc = Document::new(params.text_document);
         debug!("[did_open] {doc}");
         self.manager.add(doc);
+        self.project_analysis.invalidate(&self.manager, &uri);
         self.publish_for(&uri)?;
         Ok(())
     }
@@ -115,6 +115,7 @@ impl Backend {
             .update(&uri, params.content_changes, params.text_document.version);
         debug!("[did_change] {doc}");
         drop(doc);
+        self.project_analysis.invalidate(&self.manager, &uri);
         self.publish_for(&uri)?;
         Ok(())
     }
@@ -148,19 +149,13 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     Some(Path::new(stripped).to_path_buf())
 }
 
-/// Run the full pipeline (HIR lower → resolver → analyzer) and convert
-/// every `SemanticDiagnostic` into an `lsp_types::Diagnostic`. The
-/// document text and pre-parsed tree are reused so we don't re-parse.
-pub(crate) fn semantic_diagnostics_for_text(
-    text: &str,
-    lib: &str,
-    root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
-) -> Vec<Diagnostic> {
-    let hir = lower_module(text, "module", lib, root);
-    let resolutions = resolve(&hir);
-    let analysis = analyze(&hir, &resolutions);
-
-    let mut out: Vec<Diagnostic> = analysis
+/// Render a cached [`ModuleAnalysis`] as `lsp_types::Diagnostic`s.
+/// Pulls semantic diagnostics out of `analysis.diagnostics` and lint
+/// findings out of `lints` so the LSP publish list looks the same as
+/// it did before P6.1 — only the path through the pipeline changed.
+fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = module
+        .analysis
         .diagnostics
         .iter()
         .map(|d| Diagnostic {
@@ -177,9 +172,7 @@ pub(crate) fn semantic_diagnostics_for_text(
         })
         .collect();
 
-    // Lint findings — own source ("lint") so editors can group / mute them
-    // separately from parse + semantic.
-    for lint in run_lints(&hir, &resolutions) {
+    for lint in &module.lints {
         out.push(Diagnostic {
             range: byte_range_to_lsp_range(text, &lint.byte_range),
             severity: Some(match lint.severity {
@@ -188,7 +181,7 @@ pub(crate) fn semantic_diagnostics_for_text(
             }),
             code: Some(NumberOrString::String(lint.rule.into())),
             source: Some("lint".into()),
-            message: lint.message,
+            message: lint.message.clone(),
             ..Default::default()
         });
     }

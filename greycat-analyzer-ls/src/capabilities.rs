@@ -11,6 +11,8 @@
 
 use std::ops::Range;
 
+use greycat_analyzer_analysis::analyzer::Severity;
+use greycat_analyzer_analysis::lint::{LintSeverity, run_lints};
 use greycat_analyzer_analysis::resolver::{Definition, resolve};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::lower_module;
@@ -18,8 +20,6 @@ use greycat_analyzer_hir::types::{Decl, Expr};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset, walk_named};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::*;
-
-use crate::backend::semantic_diagnostics_for_text;
 
 // =============================================================================
 // Position helpers
@@ -605,7 +605,7 @@ pub fn code_actions(
     // range: an empty placeholder edit. The LSP spec lets clients still
     // render the action even without an edit; this is the foundation
     // P4.2 / P3.6 will fill in with concrete fixes.
-    let semantic = semantic_diagnostics_for_text(text, lib, root);
+    let semantic = current_diagnostics(text, lib, root);
     semantic
         .into_iter()
         .filter(|d| ranges_overlap(&d.range, &range))
@@ -877,5 +877,63 @@ fn encode_semantic_tokens(mut events: Vec<SemanticTokenEvent>) -> SemanticTokens
     SemanticTokens {
         result_id: None,
         data,
+    }
+}
+
+// =============================================================================
+// On-demand diagnostics for capabilities that don't sit on the publish path
+// =============================================================================
+
+/// Run the full pipeline (HIR lower → resolver → analyzer + lints) against
+/// `text` and convert every finding to an `lsp_types::Diagnostic`. Used by
+/// per-request capabilities like `code_actions` that need a fresh diagnostic
+/// list without consulting the [`crate::backend::Backend`]'s cached
+/// [`greycat_analyzer_analysis::project::ProjectAnalysis`].
+pub(crate) fn current_diagnostics(
+    text: &str,
+    lib: &str,
+    root: tree_sitter::Node<'_>,
+) -> Vec<Diagnostic> {
+    let hir = lower_module(text, "module", lib, root);
+    let resolutions = resolve(&hir);
+    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+
+    let mut out: Vec<Diagnostic> = analysis
+        .diagnostics
+        .iter()
+        .map(|d| Diagnostic {
+            range: byte_range_to_lsp_range(text, &d.byte_range),
+            severity: Some(match d.severity {
+                Severity::Error => DiagnosticSeverity::ERROR,
+                Severity::Warning => DiagnosticSeverity::WARNING,
+                Severity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String("semantic".into())),
+            source: Some("greycat-analyzer".into()),
+            message: d.message.clone(),
+            ..Default::default()
+        })
+        .collect();
+
+    for lint in run_lints(&hir, &resolutions) {
+        out.push(Diagnostic {
+            range: byte_range_to_lsp_range(text, &lint.byte_range),
+            severity: Some(match lint.severity {
+                LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                LintSeverity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(lint.rule.into())),
+            source: Some("lint".into()),
+            message: lint.message,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+fn byte_range_to_lsp_range(text: &str, range: &std::ops::Range<usize>) -> lsp_types::Range {
+    lsp_types::Range {
+        start: byte_to_position(text, range.start),
+        end: byte_to_position(text, range.end),
     }
 }
