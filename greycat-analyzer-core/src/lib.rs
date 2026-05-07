@@ -1,3 +1,4 @@
+pub mod resolver;
 pub mod span;
 mod doc;
 mod manager;

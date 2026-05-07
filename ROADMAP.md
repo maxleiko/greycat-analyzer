@@ -118,7 +118,7 @@ Each phase ends on a milestone. Effort signals: **S** < 1 week, **M** ~1-2 weeks
 
 **Chunks:**
 
-- [ ] **1.1 Module resolver** (S) — port `packages/resolver/` (~92 LoC); `@library/...` + `@include/...` resolution (pure path math).
+- [x] **1.1 Module resolver** (S) — port `packages/resolver/` (~92 LoC); `@library/...` + `@include/...` resolution (pure path math). Lives at `greycat-analyzer-core::resolver`: `Context` trait (`read` / `iter_gcl` / `is_dir` / `greycat_home`), `FsContext` impl, `try_greycat_home()` (env or `$HOME/.greycat`), path helpers (`library_dir`, `global_std_dir`, `include_dir`, `installed_file_path`), `parse_installed_file`. The cli `lint` walker now goes through `Context::iter_gcl` so `node_modules`/`gcdata`/`.git` are skipped.
 - [ ] **1.2 Source manager** (M) — port `source_manager.ts` + `module_desc.ts`: recursive load of `project.gcl`, dependency graph, cycle detection. `Manager` becomes a thin index over a new `SourceManager`.
 - [ ] **1.3 Workspace-folder loading** (S) — wire the commented-out block in `greycat-analyzer-ls/src/backend.rs` to walk `project.gcl`, register modules, parse them.
 - [ ] **1.4 Parse diagnostics + LSP publish** (S) — walk tree-sitter `ERROR`/`MISSING` nodes, convert to `lsp_types::Diagnostic`, publish on `did_open`/`did_change`/`did_save`. Replace the parse-only output in `cmd/lint.rs` with a real `Diagnostic` formatter.

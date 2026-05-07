@@ -1,8 +1,10 @@
 use std::{
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
+
+use greycat_analyzer_core::resolver::{Context, FsContext};
 
 use crate::utils::AnyError;
 
@@ -24,9 +26,13 @@ impl Lint {
             .parent()
             .expect("unable to resolve project's parent directory");
 
-        let mut files = Vec::new();
-        find_gcl_files(project_dir, &mut files);
-        files.sort();
+        // FsContext::new resolves $GREYCAT_HOME; for the parse-only stub
+        // we don't actually use greycat_home, so swallow that error and
+        // fall back to a placeholder. Once P1.2 lands, the SourceManager
+        // will own the Context and surface HomeError properly.
+        let ctx = FsContext::new()
+            .unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
+        let files = ctx.iter_gcl(project_dir);
 
         let mut parser = greycat_analyzer_syntax::parser();
 
@@ -106,21 +112,4 @@ fn count_error_nodes(node: greycat_analyzer_syntax::tree_sitter::Node<'_>) -> us
         count += count_error_nodes(child);
     }
     count
-}
-
-fn find_gcl_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            find_gcl_files(&path, out);
-        } else if path.is_file()
-            && path.extension().and_then(|s| s.to_str()) == Some("gcl")
-            && let Ok(canonical) = path.canonicalize()
-        {
-            out.push(canonical);
-        }
-    }
 }
