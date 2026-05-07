@@ -154,14 +154,14 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks (each S–M):**
 
-- [ ] **3.1** Hover + signature help — needs types, resolver.
-- [ ] **3.2** Goto definition + goto implementation — needs reference index.
-- [ ] **3.3** Document symbols + workspace symbols.
-- [ ] **3.4** Find references + rename (M) — rename needs careful CST text-edit construction.
-- [ ] **3.5** Document highlight + selection ranges + folding ranges — pure CST.
-- [ ] **3.6** Code actions + quickfixes (M) — depends on which TS code actions exist.
-- [ ] **3.7** Inlay hints — needs inferred types.
-- [ ] **3.8** Semantic tokens (M) — port `highlighter.ts` over tree-sitter queries.
+- [x] **3.1** Hover + signature help — `capabilities::hover` walks ancestors finding the smallest HIR expression that covers the cursor and renders a markdown popup with `<short-label>: <inferred-type>`. Falls back to `kind name` for declaration names. `capabilities::signature_help` walks up to the enclosing `call_expr`, looks up the matching `fn_decl`, and renders the signature with parameter labels via `ParameterLabel::LabelOffsets`.
+- [x] **3.2** Goto definition + goto implementation — `capabilities::goto_definition` consumes the resolver's `Definition` for the ident at the cursor and returns a `Location` to the defining ident's range. `gotoImplementation` reuses the same handler (P3.2 scope: methods don't yet have separate impls vs. decls).
+- [x] **3.3** Document symbols + workspace symbols — `capabilities::document_symbols` builds a nested `DocumentSymbol` tree for the module's top-level decls plus type-attrs and methods as children. Workspace symbols re-use the document-symbols engine across the SourceManager.
+- [x] **3.4** Find references + rename (M) — `references` and `rename` walk the CST for every `ident` whose source text matches the cursor's, building Locations / TextEdits respectively. `prepare_rename` advertises the renamable range with the current name as placeholder. Cross-module / scope-aware renaming arrives once multi-module reference index lands.
+- [x] **3.5** Document highlight + selection ranges + folding ranges — pure CST, no analysis pass: highlights = same-text idents in the file; selection ranges = ancestor chain from the leaf node; folding ranges = `block` / `type_body` / `enum_body` / `object_initializers` spans more than one line.
+- [x] **3.6** Code actions + quickfixes (M) — emits one quickfix per overlapping semantic diagnostic in the requested range. Empty edits today — concrete fix synthesis (e.g. "add missing `;`") arrives alongside the linter rules in P4.2.
+- [x] **3.7** Inlay hints — emits a `: <type>` annotation after every `var` whose type is inferred (no declared annotation, has an initializer). Anchored on the variable's name end position. Range filter respects the client's request range.
+- [x] **3.8** Semantic tokens (M) — walks named tree-sitter nodes, looks up each ident through resolver `Definition`s, and emits typed tokens (FUNCTION / TYPE / ENUM / VARIABLE / PARAMETER) plus literal/comment tokens. Encodes deltas per LSP semantic-tokens spec; legend advertised in `initialize`.
 
 **M4: every LSP capability the TS server advertises is wired and returns non-empty results on a sample workspace; ported `lsp.*.test.ts` scenarios pass as Rust integration tests.**
 

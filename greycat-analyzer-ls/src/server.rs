@@ -7,11 +7,16 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
     Notification as _,
 };
-use lsp_types::request::GotoDefinition;
+use lsp_types::request::{
+    CodeActionRequest, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
+    GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, References, Rename,
+    SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+};
 use lsp_types::*;
 
 use crate::Result;
 use crate::backend::Backend;
+use crate::capabilities;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -49,6 +54,37 @@ pub fn start_server() -> Result<()> {
                 }),
                 ..Default::default()
             }),
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            signature_help_provider: Some(SignatureHelpOptions {
+                trigger_characters: Some(vec!["(".into(), ",".into()]),
+                retrigger_characters: None,
+                work_done_progress_options: Default::default(),
+            }),
+            definition_provider: Some(OneOf::Left(true)),
+            implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+            references_provider: Some(OneOf::Left(true)),
+            document_highlight_provider: Some(OneOf::Left(true)),
+            document_symbol_provider: Some(OneOf::Left(true)),
+            workspace_symbol_provider: Some(OneOf::Left(true)),
+            code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+            rename_provider: Some(OneOf::Right(RenameOptions {
+                prepare_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            })),
+            folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+            selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+            inlay_hint_provider: Some(OneOf::Left(true)),
+            semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                SemanticTokensOptions {
+                    legend: SemanticTokensLegend {
+                        token_types: capabilities::SEMANTIC_TOKEN_TYPES.to_vec(),
+                        token_modifiers: vec![],
+                    },
+                    range: Some(false),
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    work_done_progress_options: Default::default(),
+                },
+            )),
             ..Default::default()
         },
     });
@@ -77,29 +113,12 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
                 if conn.handle_shutdown(&req)? {
                     return Ok(());
                 }
-
                 debug!("got request: {req:?}");
-                match cast_req::<GotoDefinition>(req) {
-                    Ok((id, params)) => {
-                        debug!("got gotoDefinition request #{id}: {params:?}");
-                        let result = Some(GotoDefinitionResponse::Array(Vec::new()));
-                        let result = serde_json::to_value(&result).unwrap();
-                        let resp = Response {
-                            id,
-                            result: Some(result),
-                            error: None,
-                        };
-                        conn.sender.send(Message::Response(resp))?;
-                        continue;
-                    }
-                    Err(err @ ExtractError::JsonError { .. }) => panic!("{err:?}"),
-                    Err(ExtractError::MethodMismatch(req)) => req,
-                };
-                // ...
+                if let Some(response) = handle_request(&server, req) {
+                    conn.sender.send(Message::Response(response))?;
+                }
             }
-            Message::Response(resp) => {
-                debug!("got response: {resp:?}");
-            }
+            Message::Response(resp) => debug!("got response: {resp:?}"),
             Message::Notification(not) => match not.method.as_str() {
                 DidOpenTextDocument::METHOD => {
                     server.did_open(not.extract(DidOpenTextDocument::METHOD)?)?
@@ -113,19 +132,258 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
                 DidCloseTextDocument::METHOD => {
                     server.did_close(not.extract(DidCloseTextDocument::METHOD)?)?
                 }
-                _ => {
-                    debug!("got notification: {not:#?}");
-                }
+                _ => debug!("got notification: {not:#?}"),
             },
         }
     }
     Ok(())
 }
 
-fn cast_req<R>(req: Request) -> std::result::Result<(RequestId, R::Params), ExtractError<Request>>
+fn handle_request(server: &Backend, req: Request) -> Option<Response> {
+    let req = match try_handle::<HoverRequest, _, _>(server, req, hover_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<SignatureHelpRequest, _, _>(server, req, signature_help_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<GotoDefinition, _, _>(server, req, goto_definition_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<lsp_types::request::GotoImplementation, _, _>(
+        server,
+        req,
+        goto_definition_handler,
+    ) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<DocumentSymbolRequest, _, _>(server, req, document_symbols_handler)
+    {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<References, _, _>(server, req, references_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<PrepareRenameRequest, _, _>(server, req, prepare_rename_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<Rename, _, _>(server, req, rename_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req =
+        match try_handle::<DocumentHighlightRequest, _, _>(server, req, document_highlight_handler)
+        {
+            Ok(resp) => return Some(resp),
+            Err(req) => req,
+        };
+    let req =
+        match try_handle::<SelectionRangeRequest, _, _>(server, req, selection_ranges_handler) {
+            Ok(resp) => return Some(resp),
+            Err(req) => req,
+        };
+    let req = match try_handle::<FoldingRangeRequest, _, _>(server, req, folding_ranges_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<CodeActionRequest, _, _>(server, req, code_actions_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<InlayHintRequest, _, _>(server, req, inlay_hints_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let _req = match try_handle::<SemanticTokensFullRequest, _, _>(
+        server,
+        req,
+        semantic_tokens_handler,
+    ) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    None
+}
+
+fn try_handle<R, F, T>(
+    server: &Backend,
+    req: Request,
+    handler: F,
+) -> std::result::Result<Response, Request>
 where
     R: lsp_types::request::Request,
     R::Params: serde::de::DeserializeOwned,
+    R::Result: serde::Serialize,
+    F: Fn(&Backend, R::Params) -> T,
+    T: serde::Serialize,
 {
-    req.extract(R::METHOD)
+    let cloned = req.clone();
+    match req.extract::<R::Params>(R::METHOD) {
+        Ok((id, params)) => {
+            let result = handler(server, params);
+            let result = serde_json::to_value(&result).unwrap();
+            Ok(Response {
+                id,
+                result: Some(result),
+                error: None,
+            })
+        }
+        Err(ExtractError::JsonError { .. }) => Err(cloned),
+        Err(ExtractError::MethodMismatch(req)) => Err(req),
+    }
+}
+
+// =============================================================================
+// Per-capability handlers — pull the relevant `Document` out of the manager
+// and forward to `capabilities`.
+// =============================================================================
+
+fn hover_handler(server: &Backend, params: HoverParams) -> Option<Hover> {
+    let uri = params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    capabilities::hover(&doc.text, &doc.lib, doc.root_node(), pos)
+}
+
+fn signature_help_handler(server: &Backend, params: SignatureHelpParams) -> Option<SignatureHelp> {
+    let uri = params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    capabilities::signature_help(&doc.text, &doc.lib, doc.root_node(), pos)
+}
+
+fn goto_definition_handler(
+    server: &Backend,
+    params: GotoDefinitionParams,
+) -> Option<GotoDefinitionResponse> {
+    let uri = params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    capabilities::goto_definition(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
+}
+
+fn document_symbols_handler(
+    server: &Backend,
+    params: DocumentSymbolParams,
+) -> Option<DocumentSymbolResponse> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    let syms = capabilities::document_symbols(&doc.text, &doc.lib, doc.root_node());
+    Some(DocumentSymbolResponse::Nested(syms))
+}
+
+fn references_handler(server: &Backend, params: ReferenceParams) -> Option<Vec<Location>> {
+    let uri = params.text_document_position.text_document.uri;
+    let pos = params.text_document_position.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    Some(capabilities::references(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        &uri,
+        pos,
+    ))
+}
+
+fn prepare_rename_handler(
+    server: &Backend,
+    params: TextDocumentPositionParams,
+) -> Option<PrepareRenameResponse> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    capabilities::prepare_rename(&doc.text, doc.root_node(), params.position)
+}
+
+fn rename_handler(server: &Backend, params: RenameParams) -> Option<WorkspaceEdit> {
+    let uri = params.text_document_position.text_document.uri;
+    let pos = params.text_document_position.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    capabilities::rename(&doc.text, doc.root_node(), &uri, pos, &params.new_name)
+}
+
+fn document_highlight_handler(
+    server: &Backend,
+    params: DocumentHighlightParams,
+) -> Option<Vec<DocumentHighlight>> {
+    let uri = params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    Some(capabilities::document_highlights(
+        &doc.text,
+        doc.root_node(),
+        pos,
+    ))
+}
+
+fn selection_ranges_handler(
+    server: &Backend,
+    params: SelectionRangeParams,
+) -> Option<Vec<SelectionRange>> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    Some(capabilities::selection_ranges(
+        &doc.text,
+        doc.root_node(),
+        &params.positions,
+    ))
+}
+
+fn folding_ranges_handler(
+    server: &Backend,
+    params: FoldingRangeParams,
+) -> Option<Vec<FoldingRange>> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    Some(capabilities::folding_ranges(&doc.text, doc.root_node()))
+}
+
+fn code_actions_handler(
+    server: &Backend,
+    params: CodeActionParams,
+) -> Option<CodeActionResponse> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    Some(capabilities::code_actions(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        &params.text_document.uri,
+        params.range,
+    ))
+}
+
+fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<InlayHint>> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    Some(capabilities::inlay_hints(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        &params.range,
+    ))
+}
+
+fn semantic_tokens_handler(
+    server: &Backend,
+    params: SemanticTokensParams,
+) -> Option<SemanticTokensResult> {
+    let cell = server.manager.get(&params.text_document.uri)?;
+    let doc = cell.borrow();
+    Some(SemanticTokensResult::Tokens(capabilities::semantic_tokens(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+    )))
 }

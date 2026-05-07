@@ -337,6 +337,7 @@ dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-hir",
  "greycat-analyzer-syntax",
+ "greycat-analyzer-types",
  "log",
  "lsp-server",
  "lsp-types",

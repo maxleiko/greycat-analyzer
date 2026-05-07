@@ -39,7 +39,11 @@ impl Backend {
         };
         let doc = cell.borrow();
         let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
-        diags.extend(semantic_diagnostics(&doc.text, &doc.lib, doc.root_node()));
+        diags.extend(semantic_diagnostics_for_text(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+        ));
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
 
@@ -148,7 +152,7 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 /// Run the full pipeline (HIR lower → resolver → analyzer) and convert
 /// every `SemanticDiagnostic` into an `lsp_types::Diagnostic`. The
 /// document text and pre-parsed tree are reused so we don't re-parse.
-fn semantic_diagnostics(
+pub(crate) fn semantic_diagnostics_for_text(
     text: &str,
     lib: &str,
     root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
