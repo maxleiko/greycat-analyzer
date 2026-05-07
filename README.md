@@ -134,4 +134,4 @@ cargo test  --workspace
 
 CI (`.github/workflows/ci.yml`) enforces all of these on push.
 
-The roadmap is at [ROADMAP.md](ROADMAP.md).
+The roadmap is at [ROADMAP.md](ROADMAP.md). Items the original plan deferred are catalogued in [FOLLOWUP.md](FOLLOWUP.md).
