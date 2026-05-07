@@ -1,0 +1,32 @@
+:root {
+  color-scheme: light dark;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 14px;
+  --code-font: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular,
+    Menlo, monospace;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+body {
+  background: var(--wa-color-surface-default, #fafafa);
+  color: var(--wa-color-text-normal, #1a1a1a);
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #0e0e10;
+    color: #e6e6e6;
+  }
+}
+
+gc-playground {
+  display: flex;
+  height: 100vh;
+}
