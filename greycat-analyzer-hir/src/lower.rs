@@ -651,14 +651,40 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "binary_expr" => {
+            // P6.5: `is` / `as` use a `type_ident` on the right rather
+            // than another expr. Detect them here and emit dedicated
+            // HIR variants instead of forcing them through Binary.
+            let op_text = operator_text(cx, node);
+            if op_text == "is" || op_text == "as" {
+                let value = node
+                    .child_by_field_name("left")
+                    .and_then(|n| lower_expr(cx, n))?;
+                let ty = node
+                    .child_by_field_name("right")
+                    .and_then(|n| lower_type_ref(cx, n))?;
+                let br = node.byte_range();
+                return Some(cx.hir.exprs.alloc(if op_text == "is" {
+                    Expr::Is {
+                        value,
+                        ty,
+                        byte_range: br,
+                    }
+                } else {
+                    Expr::Cast {
+                        value,
+                        ty,
+                        byte_range: br,
+                    }
+                }));
+            }
+
             let left = node
                 .child_by_field_name("left")
                 .and_then(|n| lower_expr(cx, n))?;
             let right = node
                 .child_by_field_name("right")
                 .and_then(|n| lower_expr(cx, n))?;
-            // The operator is an anonymous child between the two; pluck it.
-            let op = bin_op_for(operator_text(cx, node));
+            let op = bin_op_for(op_text);
             Expr::Binary(BinaryExpr {
                 op,
                 left,

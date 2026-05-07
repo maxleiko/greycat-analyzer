@@ -194,13 +194,17 @@ fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
     }
 }
 
-/// Narrowings derived from an `if` condition (P6.4). Each list holds
-/// the *binding* idents (from `Resolutions`) whose nullable type should
-/// be stripped in the matching branch.
+/// Narrowings derived from an `if` condition (P6.4 / P6.5). Each list
+/// holds *binding* idents (from `Resolutions`) and the override type to
+/// install in the matching branch — `None` means "strip nullable from
+/// the current type", `Some(ty)` means "set to this concrete type"
+/// (used by `is` type guards).
 #[derive(Default)]
 struct CondNarrows {
     then_non_null: Vec<Idx<Ident>>,
     else_non_null: Vec<Idx<Ident>>,
+    /// `(binding, type)` pairs from `x is T` — narrow x to T in then.
+    then_typed: Vec<(Idx<Ident>, Idx<TypeRef>)>,
 }
 
 struct Cx<'a> {
@@ -500,6 +504,7 @@ impl<'a> Cx<'a> {
                 let CondNarrows {
                     then_non_null,
                     else_non_null,
+                    then_typed,
                 } = self.derive_cond_narrows(condition);
 
                 self.push_narrow();
@@ -508,6 +513,10 @@ impl<'a> Cx<'a> {
                         let stripped = self.strip_nullable(cur);
                         self.write_narrow(*ident, stripped);
                     }
+                }
+                for (ident, ty_ref) in &then_typed {
+                    let ty = self.lower_type_ref(*ty_ref);
+                    self.write_narrow(*ident, ty);
                 }
                 self.visit_stmt(then_branch, return_ty);
                 self.pop_narrow();
@@ -599,28 +608,39 @@ impl<'a> Cx<'a> {
     /// extend in a follow-up if the corpus pushes for it.
     fn derive_cond_narrows(&self, cond_id: Idx<Expr>) -> CondNarrows {
         let mut out = CondNarrows::default();
-        if let Expr::Binary(BinaryExpr {
-            op, left, right, ..
-        }) = &self.hir.exprs[cond_id]
-        {
-            let op = *op;
-            if !matches!(op, BinOp::Eq | BinOp::Neq) {
-                return out;
+        match &self.hir.exprs[cond_id] {
+            Expr::Binary(BinaryExpr {
+                op, left, right, ..
+            }) => {
+                let op = *op;
+                if !matches!(op, BinOp::Eq | BinOp::Neq) {
+                    return out;
+                }
+                let Some(name_idx) = self.ident_compared_to_null(*left, *right) else {
+                    return out;
+                };
+                let Some(def) = (match self.res.lookup(name_idx) {
+                    Some(Definition::Param(d)) | Some(Definition::Local(d)) => Some(d),
+                    _ => None,
+                }) else {
+                    return out;
+                };
+                match op {
+                    BinOp::Neq => out.then_non_null.push(def),
+                    BinOp::Eq => out.else_non_null.push(def),
+                    _ => {}
+                }
             }
-            let Some(name_idx) = self.ident_compared_to_null(*left, *right) else {
-                return out;
-            };
-            let Some(def) = (match self.res.lookup(name_idx) {
-                Some(Definition::Param(d)) | Some(Definition::Local(d)) => Some(d),
-                _ => None,
-            }) else {
-                return out;
-            };
-            match op {
-                BinOp::Neq => out.then_non_null.push(def),
-                BinOp::Eq => out.else_non_null.push(def),
-                _ => {}
+            // P6.5: `x is T` narrows x to T in the then-branch.
+            Expr::Is { value, ty, .. } => {
+                if let Expr::Ident(name_idx) = &self.hir.exprs[*value]
+                    && let Some(Definition::Param(def) | Definition::Local(def)) =
+                        self.res.lookup(*name_idx)
+                {
+                    out.then_typed.push((def, *ty));
+                }
             }
+            _ => {}
         }
         out
     }
@@ -781,6 +801,14 @@ impl<'a> Cx<'a> {
                 }
                 let body_ty = self.visit_expr(body);
                 self.out.types.lambda(param_tys, body_ty)
+            }
+            Expr::Is { value, .. } => {
+                let _ = self.visit_expr(value);
+                self.primitive(Primitive::Bool)
+            }
+            Expr::Cast { value, ty, .. } => {
+                let _ = self.visit_expr(value);
+                self.lower_type_ref(ty)
             }
             Expr::Unsupported { .. } => self.any(),
         }
@@ -1011,6 +1039,46 @@ fn f(x: int?) {
                 .iter()
                 .any(|d| d.message.contains("not assignable")),
             "expected no nullability error after `x!!`, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn is_guard_narrows_then_branch() {
+        let src = r#"
+type Foo {}
+fn use_foo(f: Foo) {}
+fn dispatch(x: any) {
+    if (x is Foo) {
+        use_foo(x);
+    }
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected `is`-narrowed `x` to satisfy `Foo` arg, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn as_cast_adopts_target_type() {
+        let src = r#"
+type Foo {}
+fn use_foo(f: Foo) {}
+fn dispatch(x: any) {
+    use_foo(x as Foo);
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected `as Foo` to type as Foo, got: {:?}",
             r.diagnostics
         );
     }

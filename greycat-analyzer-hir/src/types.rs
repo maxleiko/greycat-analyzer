@@ -268,6 +268,22 @@ pub enum Expr {
     Unary(UnaryExpr),
     Paren(Idx<Expr>, Span),
     Lambda(LambdaExpr),
+    /// `value is Type` — runtime type guard, evaluates to `bool`.
+    /// Recognized by the analyzer to narrow `value` in the matching
+    /// branch when used inside an `if` condition (P6.5).
+    Is {
+        value: Idx<Expr>,
+        ty: Idx<TypeRef>,
+        byte_range: Span,
+    },
+    /// `value as Type` — type ascription / cast, evaluates to `Type`.
+    /// The runtime semantics are a checked downcast; the analyzer just
+    /// adopts the cast's declared type as the expression's type.
+    Cast {
+        value: Idx<Expr>,
+        ty: Idx<TypeRef>,
+        byte_range: Span,
+    },
     /// Anything we haven't lowered yet — keeps the byte range so downstream
     /// passes can still gracefully skip. Will shrink as P2.3-P2.5 demand
     /// more precise variants.
@@ -292,6 +308,7 @@ impl Expr {
             Expr::Binary(b) => b.byte_range.clone(),
             Expr::Unary(u) => u.byte_range.clone(),
             Expr::Lambda(l) => l.byte_range.clone(),
+            Expr::Is { byte_range, .. } | Expr::Cast { byte_range, .. } => byte_range.clone(),
             Expr::Unsupported { byte_range, .. } => byte_range.clone(),
         }
     }

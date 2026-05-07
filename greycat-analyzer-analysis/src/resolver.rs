@@ -464,6 +464,10 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             visit_expr(cx, body);
             cx.pop_scope();
         }
+        Expr::Is { value, ty, .. } | Expr::Cast { value, ty, .. } => {
+            visit_expr(cx, value);
+            visit_type_ref(cx, ty);
+        }
         Expr::Unsupported { .. } => {
             // Lowering hasn't expanded this shape yet; nothing to bind.
         }
