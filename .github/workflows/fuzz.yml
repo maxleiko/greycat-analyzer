@@ -1,0 +1,46 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Nightly at 03:00 UTC.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parser, hir_lower, format_round_trip]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Run fuzz target (10 minutes)
+        working-directory: fuzz
+        # `-max_total_time` is libfuzzer's "stop after N seconds". The
+        # job is wall-clocked at 30m via `timeout-minutes` above so a
+        # hung run can't hold the runner forever.
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
