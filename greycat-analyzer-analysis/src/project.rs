@@ -143,11 +143,20 @@ impl ProjectAnalysis {
         // global decl table.
         self.resolve_cross_module_members();
 
-        // Pass 3.5 (P15.7): cross-module call return-type inference.
-        // Walks every module's `Expr::Call` whose callee is `Expr::Static`
-        // bound to a foreign method, looks up the foreign method's
-        // declared return type, translates it into the current module's
-        // type arena, and updates `analysis.expr_types[call_id]`.
+        // Pass 3.4 (P16.3): cross-module member-expr typing. After
+        // pass 3 binds `foreign_member_uses`, walk every module's
+        // `Expr::Member` / `Expr::Arrow` and write back the foreign
+        // attr / method's translated type so `var s = recv.attr` /
+        // method-ref shapes carry the right type instead of `any`.
+        self.infer_cross_module_member_types();
+
+        // Pass 3.5 (P15.7 + P16.4): cross-module call return-type
+        // inference. Walks every module's `Expr::Call` whose callee is
+        // `Expr::Static`, `Expr::QualifiedStatic`, or `Expr::Member` /
+        // `Expr::Arrow` bound to a method, looks up the method's
+        // declared return type, translates it into the current
+        // module's type arena, and updates
+        // `analysis.expr_types[call_id]`.
         self.infer_cross_module_call_types();
 
         // Pass 3.6 (P15.10): call-site arg-type validation. Runs after
@@ -228,6 +237,87 @@ impl ProjectAnalysis {
                 for (prop_idx, fm) in entries {
                     m.analysis.foreign_member_uses.insert(prop_idx, fm);
                 }
+            }
+        }
+    }
+
+    /// P16.3 — cross-module member-expr typing. After pass 3 binds
+    /// `foreign_member_uses` (the property idents in `recv.attr` /
+    /// `recv->method` whose receiver type lives in another module),
+    /// walk every module's `Expr::Member` / `Expr::Arrow` and write
+    /// back the foreign attr / method's translated declared type so
+    /// `var x = recv.attr` and method-ref shapes carry the right type
+    /// instead of the placeholder `any`. Mirrors the
+    /// `read_type_shape` + `mint_type_shape` pattern from pass 3.5.
+    fn infer_cross_module_member_types(&mut self) {
+        use crate::analyzer::MemberDef;
+        use greycat_analyzer_hir::types::{Expr, Stmt};
+
+        #[allow(clippy::mutable_key_type)]
+        let mut expr_updates: HashMap<Uri, Vec<(Idx<Expr>, TypeShape)>> = HashMap::new();
+        for (cur_uri, cur_module) in &self.modules {
+            for (expr_id, expr) in cur_module.hir.exprs.iter() {
+                let property_idx = match expr {
+                    Expr::Member(m) | Expr::Arrow(m) => m.property,
+                    _ => continue,
+                };
+                // Cross-module bindings only — intra-module Member
+                // typing already lands in the analyzer's first pass
+                // (P16.1).
+                let Some(foreign) = cur_module.analysis.foreign_member_uses.get(&property_idx)
+                else {
+                    continue;
+                };
+                let shape = match foreign.member {
+                    MemberDef::Attr(attr_id) => {
+                        let foreign_module = match self.modules.get(&foreign.uri) {
+                            Some(m) => m,
+                            None => continue,
+                        };
+                        let attr = &foreign_module.hir.type_attrs[attr_id];
+                        match attr.ty {
+                            Some(declared_ref) => {
+                                read_type_shape(&foreign_module.hir, declared_ref)
+                            }
+                            None => TypeShape::Any,
+                        }
+                    }
+                    MemberDef::Method(_) => TypeShape::Named {
+                        name: "function".to_string(),
+                        params: vec![],
+                    },
+                };
+                expr_updates
+                    .entry(cur_uri.clone())
+                    .or_default()
+                    .push((expr_id, shape));
+            }
+        }
+
+        for (uri, entries) in expr_updates {
+            let Some(m) = self.modules.get_mut(&uri) else {
+                continue;
+            };
+            let mut touched: HashMap<Idx<Expr>, greycat_analyzer_types::TypeId> = HashMap::new();
+            for (expr_id, shape) in entries {
+                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                m.analysis.expr_types.insert(expr_id, ty);
+                touched.insert(expr_id, ty);
+            }
+            for (_stmt_id, stmt) in m.hir.stmts.iter() {
+                let Stmt::Var(local) = stmt else {
+                    continue;
+                };
+                let Some(init) = local.init else {
+                    continue;
+                };
+                if local.ty.is_some() {
+                    continue;
+                }
+                let Some(new_ty) = touched.get(&init).copied() else {
+                    continue;
+                };
+                m.analysis.def_types.insert(local.name, new_ty);
             }
         }
     }
@@ -356,9 +446,11 @@ impl ProjectAnalysis {
                         ));
                 }
             }
-            // 1b) Call(Static or QualifiedStatic) — overrides the
-            // static expr_type and also drives the call's return-type
-            // inference.
+            // 1b) Call(Static / QualifiedStatic / Member / Arrow) —
+            // overrides the static expr_type and drives the call's
+            // return-type inference. P16.4 adds the Member / Arrow
+            // arms so chained method calls (`x.s.size()`,
+            // `recv->method(...)`) type as the method's return type.
             for (call_id, call_expr) in cur_module.hir.exprs.iter() {
                 let Expr::Call(call) = call_expr else {
                     continue;
@@ -374,6 +466,9 @@ impl ProjectAnalysis {
                         cur_module,
                         chain,
                     ),
+                    Expr::Member(m) | Expr::Arrow(m) => {
+                        resolve_member_call_return_shape(&self.modules, cur_module, m.property)
+                    }
                     _ => None,
                 };
                 let Some(shape) = shape else {
@@ -730,8 +825,10 @@ impl ProjectAnalysis {
         // is invalidated. Cheap because `deferred_member_uses` is small
         // per module and the work is purely table-lookup.
         self.resolve_cross_module_members();
-        // P15.7: cross-module call return-type inference + bare-ident
-        // and qualified-static type fixups.
+        // P16.3: cross-module member-expr typing.
+        self.infer_cross_module_member_types();
+        // P15.7 + P16.4: cross-module call return-type inference +
+        // bare-ident and qualified-static type fixups.
         self.infer_cross_module_call_types();
         // P15.10: call-site arg-type validation (depends on pass 3.5
         // having settled inner static-expr return types).
@@ -1104,6 +1201,37 @@ fn resolve_static_call_return_shape(
         return Some(read_type_shape(&cur.hir, ret));
     }
     if let Some(foreign) = cur.analysis.foreign_member_lookup(s.property)
+        && let MemberDef::Method(decl_id) = foreign.member
+        && let Some(foreign_module) = modules.get(&foreign.uri)
+        && let Decl::Fn(fnd) = &foreign_module.hir.decls[decl_id]
+        && let Some(ret) = fnd.return_type
+    {
+        return Some(read_type_shape(&foreign_module.hir, ret));
+    }
+    None
+}
+
+/// P16.4 — return-type for `recv.method(args)` / `recv->method(args)`.
+/// Looks up the property's binding (intra-module via `member_uses`,
+/// cross-module via `foreign_member_uses`) and reads the bound
+/// method's declared return type. Returns `None` for attr bindings
+/// (calling a field is nonsense), un-bound properties, or methods
+/// without a declared return type.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_member_call_return_shape(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    cur: &ModuleAnalysis,
+    property_idx: Idx<greycat_analyzer_hir::types::Ident>,
+) -> Option<TypeShape> {
+    use crate::analyzer::MemberDef;
+    if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(property_idx) {
+        let Decl::Fn(fnd) = &cur.hir.decls[decl_id] else {
+            return None;
+        };
+        let ret = fnd.return_type?;
+        return Some(read_type_shape(&cur.hir, ret));
+    }
+    if let Some(foreign) = cur.analysis.foreign_member_lookup(property_idx)
         && let MemberDef::Method(decl_id) = foreign.member
         && let Some(foreign_module) = modules.get(&foreign.uri)
         && let Decl::Fn(fnd) = &foreign_module.hir.decls[decl_id]
