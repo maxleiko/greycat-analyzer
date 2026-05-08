@@ -272,6 +272,37 @@ fn cross_module_rename_aggregates_text_edits_per_uri() {
     }
 }
 
+/// P15.9 — cursor on the module-name segment of a `static_expr`
+/// chain (`runtime::Identity::create`) jumps to that module's file.
+#[test]
+fn goto_module_segment_jumps_to_named_module_file() {
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri.clone(),
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { runtime::Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let user_cell = mgr.get(&user_uri).expect("user doc");
+    let user_doc = user_cell.borrow();
+    // Cursor on the leftmost `runtime` ident (line 0, col 14).
+    let loc =
+        capabilities::goto_module_segment(&user_doc.text, user_doc.root_node(), pos(0, 14), &mgr)
+            .expect("goto-def on `runtime` segment");
+    assert_eq!(loc.uri, runtime_uri);
+    assert_eq!(loc.range.start.line, 0);
+    assert_eq!(loc.range.start.character, 0);
+}
+
 /// P15.7 — `var x = Identity::create(...)` should infer x as
 /// `Identity`, not `any`. The call's expr_type is the foreign
 /// method's `return_type`, and the local var's `def_types` entry

@@ -698,6 +698,59 @@ pub fn goto_definition(
     }))
 }
 
+/// P15.9 — goto-def on a module-name segment of a `static_expr` chain.
+/// In `runtime::Identity::create`, the leftmost ident `runtime` names
+/// the module that owns `Identity`. This helper checks whether the
+/// cursor sits on the leftmost segment of such a chain and, if so,
+/// returns the URI of the matching `.gcl` file (jumping to its first
+/// line). Returns `None` otherwise — caller falls through to the
+/// regular goto-def flow.
+pub fn goto_module_segment(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    pos: Position,
+    manager: &SourceManager,
+) -> Option<Location> {
+    let byte = position_to_byte(text, pos);
+    let node = node_at_offset(root, byte)?;
+    if node.kind() != "ident" {
+        return None;
+    }
+    // The leftmost `type_ident` in a `static_expr` chain is the
+    // module-name slot. Walk up to confirm the parent shape.
+    let parent = node.parent()?;
+    if parent.kind() != "type_ident" {
+        return None;
+    }
+    let static_parent = parent.parent()?;
+    if static_parent.kind() != "static_expr" {
+        return None;
+    }
+    let cursor_text = text.get(node.byte_range())?.to_string();
+    // Match against any cached doc whose `name()` matches the cursor
+    // text. `Document::name()` is the filename without `.gcl`, which
+    // is the convention GreyCat's `runtime::X` chains rely on.
+    for (uri, cell) in manager.iter() {
+        let doc = cell.borrow();
+        if doc.name() == cursor_text {
+            return Some(Location {
+                uri: uri.clone(),
+                range: lsp_types::Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                },
+            });
+        }
+    }
+    None
+}
+
 /// P11.3 — turn a `Definition::ProjectDecl { uri, decl }` into the
 /// concrete `Location` of the foreign module's decl-name range. Pure
 /// helper: caller fetches the foreign HIR + text from the project-

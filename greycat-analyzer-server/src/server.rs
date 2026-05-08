@@ -293,6 +293,13 @@ fn goto_definition_handler(
     let pos = params.text_document_position_params.position;
     let cell = server.manager.get(&uri)?;
     let doc = cell.borrow();
+    // P15.9 — module-name segment in a static_expr chain
+    // (`runtime::X::Y`) jumps to the named module's file.
+    if let Some(loc) =
+        capabilities::goto_module_segment(&doc.text, doc.root_node(), pos, &server.manager)
+    {
+        return Some(GotoDefinitionResponse::Scalar(loc));
+    }
     if let Some(loc) =
         capabilities::goto_definition(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
     {
