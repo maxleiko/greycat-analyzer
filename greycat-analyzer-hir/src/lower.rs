@@ -603,11 +603,14 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         }
         "number" | "char" | "false" | "true" | "null" | "this" | "iso8601" => {
             // `number` covers every numeric form (int/decimal/scientific/
-            // suffixed) — duration / float / time dispatch by suffix
-            // content is the analyzer's job (P13.3); lowering just lands
-            // a `LiteralKind::Number` and carries the literal text.
+            // suffixed). P13.3: dispatch typed-suffix literals to their
+            // own `LiteralKind` so the analyzer doesn't have to inspect
+            // raw text for `_time` / `_duration` / unit suffixes. Plain
+            // numeric / `_f` float literals stay `LiteralKind::Number`
+            // (float vs int dispatch happens in the analyzer via
+            // `numeric_literal_kind`).
             let lit_kind = match kind {
-                "number" => LiteralKind::Number,
+                "number" => classify_number(cx, node),
                 "char" => LiteralKind::Char,
                 "false" | "true" => LiteralKind::Bool,
                 "null" => LiteralKind::Null,
@@ -812,6 +815,68 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         },
     };
     Some(cx.hir.exprs.alloc(expr))
+}
+
+/// P13.3 — classify a `number` CST node by its typed suffix.
+///
+/// Walks `(number_suffixed (number_int|number_decimal|number_scientific)
+/// (number_suffix) ...)` and inspects each suffix lexeme:
+/// - `time` → [`LiteralKind::Time`].
+/// - any duration-unit suffix (`y`, `d`, `h`, `m`, `s`, `ms`, `us`,
+///   `ns`, `min`, `sec`, `hour`, `day`, `week`, `month`, `year`) or
+///   the explicit `_duration` form → [`LiteralKind::Duration`].
+/// - everything else (including `_f` float, `_node*` casts, plain
+///   numbers) → [`LiteralKind::Number`]. The analyzer's
+///   `numeric_literal_kind` then dispatches `_f`/`.`/scientific
+///   between `int` and `float`.
+fn classify_number(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> LiteralKind {
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        if child.kind() != "number_suffixed" {
+            continue;
+        }
+        let mut sc = child.walk();
+        for sub in child.named_children(&mut sc) {
+            if sub.kind() != "number_suffix" {
+                continue;
+            }
+            let raw = cx.text(sub).trim_matches('_');
+            if raw.eq_ignore_ascii_case("time") {
+                return LiteralKind::Time;
+            }
+            if is_duration_suffix(raw) {
+                return LiteralKind::Duration;
+            }
+        }
+    }
+    LiteralKind::Number
+}
+
+fn is_duration_suffix(s: &str) -> bool {
+    matches!(
+        s,
+        "duration"
+            | "y"
+            | "d"
+            | "h"
+            | "m"
+            | "s"
+            | "ms"
+            | "us"
+            | "ns"
+            | "min"
+            | "sec"
+            | "hour"
+            | "day"
+            | "week"
+            | "month"
+            | "year"
+            | "minute"
+            | "second"
+            | "millisecond"
+            | "microsecond"
+            | "nanosecond"
+    )
 }
 
 fn lower_expr_list(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Vec<Idx<Expr>> {

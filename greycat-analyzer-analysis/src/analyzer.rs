@@ -1216,7 +1216,7 @@ impl<'a> Cx<'a> {
                 LiteralKind::Null => self.null(),
                 LiteralKind::This => self.any(),
                 LiteralKind::Duration => self.primitive(Primitive::Duration),
-                LiteralKind::Iso8601 => self.primitive(Primitive::Time),
+                LiteralKind::Time | LiteralKind::Iso8601 => self.primitive(Primitive::Time),
             },
             Expr::String(StringExpr { .. }) => self.primitive(Primitive::String),
             Expr::Tuple(items, _) => {

@@ -334,6 +334,10 @@ pub enum LiteralKind {
     Null,
     This,
     Duration,
+    /// P13.3 — typed-suffix `123_time` literals. Distinct from
+    /// [`Self::Iso8601`], which only covers ISO-8601 string-shaped
+    /// time literals.
+    Time,
     Iso8601,
 }
 
