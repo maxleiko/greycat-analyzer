@@ -272,6 +272,63 @@ fn cross_module_rename_aggregates_text_edits_per_uri() {
     }
 }
 
+/// P15.x — hover on each segment of a `Type::method` static expression.
+/// The `Type` ident lowers as a TypeRef name (resolver records it as a
+/// `ProjectDecl` cross-module hit); the `method` ident is bound via
+/// the analyzer's `foreign_member_uses` map (P15.6). Both should
+/// surface a markup hover.
+#[test]
+fn hover_works_on_static_expr_segments() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var x = Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).expect("user doc");
+    let doc = cell.borrow();
+    // Cursor on `Identity` (col 23 — between I and d).
+    let h_ident = capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        pos(0, 23),
+        &user_uri,
+        &pa,
+        &mgr,
+    );
+    assert!(
+        h_ident.is_some(),
+        "hover should fire on `Identity` segment of static expression"
+    );
+    // Cursor on `create` (col 35 — somewhere in the property).
+    let h_method = capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        pos(0, 35),
+        &user_uri,
+        &pa,
+        &mgr,
+    );
+    assert!(
+        h_method.is_some(),
+        "hover should fire on `create` segment of static expression"
+    );
+}
+
 /// P15.9 — cursor on the module-name segment of a `static_expr`
 /// chain (`runtime::Identity::create`) jumps to that module's file.
 #[test]
@@ -346,6 +403,42 @@ fn cross_module_static_call_infers_return_type() {
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
     );
+}
+
+/// P15.x — `var w = runtime::Identity;` (module-prefixed type
+/// reference) infers as `type` (the runtime native — type decls
+/// become `type` values when referenced via `module::Type`).
+#[test]
+fn module_prefixed_type_ref_infers_type() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(runtime_uri, "type Identity { id: int; }\n", "p", false);
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var w = runtime::Identity; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let w_local = user_module
+        .hir
+        .idents
+        .iter()
+        .find(|(_, i)| i.text == "w")
+        .map(|(idx, _)| idx)
+        .expect("`w` ident");
+    let ty = user_module
+        .analysis
+        .def_types
+        .get(&w_local)
+        .copied()
+        .expect("def_type for w");
+    let display = greycat_analyzer_types::display(&user_module.analysis.types, ty);
+    assert_eq!(display, "type", "w should infer as `type`, got `{display}`");
 }
 
 /// P15.7 — `var y = Identity::create;` (method reference, no call)

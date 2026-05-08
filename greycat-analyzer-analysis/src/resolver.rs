@@ -185,6 +185,14 @@ impl<'a> Cx<'a> {
             self.res.uses.insert(idx, Definition::Project);
             return;
         }
+        // P15.x — known module name (the leftmost segment of a
+        // `module::Decl` chain). Bind to `Project` so it's not
+        // flagged unresolved; goto-def hits via `goto_module_segment`
+        // (P15.9), inference via pass 3.5.
+        if self.index.has_module(&name) {
+            self.res.uses.insert(idx, Definition::Project);
+            return;
+        }
         self.res.unresolved.push(idx);
     }
 }

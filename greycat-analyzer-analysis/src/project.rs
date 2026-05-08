@@ -260,10 +260,11 @@ impl ProjectAnalysis {
                 let Expr::Static(s) = static_expr else {
                     continue;
                 };
-                let shape = match resolve_static_member_shape(&self.modules, cur_module, s) {
-                    Some(sh) => sh,
-                    None => continue,
-                };
+                let shape =
+                    match resolve_static_member_shape(&self.modules, &self.index, cur_module, s) {
+                        Some(sh) => sh,
+                        None => continue,
+                    };
                 expr_updates
                     .entry(cur_uri.clone())
                     .or_default()
@@ -590,6 +591,7 @@ fn collect_chain(
 #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
 fn resolve_static_member_shape(
     modules: &HashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
     cur: &ModuleAnalysis,
     s: &greycat_analyzer_hir::types::StaticExpr,
 ) -> Option<TypeShape> {
@@ -601,6 +603,40 @@ fn resolve_static_member_shape(
         if modules.contains_key(&foreign.uri) {
             return Some(static_shape_from_member(&foreign.member));
         }
+    }
+    // P15.x — `module::Decl` shape. Read the static_expr's TypeRef
+    // text; if it matches a known module name, look up the property
+    // as a top-level decl in that module's HIR. Type/enum decls
+    // become `type` (the runtime native), fn decls become `function`,
+    // and var decls inherit their declared type.
+    let ty_name = cur.hir.idents[cur.hir.type_refs[s.ty].name].text.as_str();
+    let module_uri = index.module_uri(ty_name)?;
+    let module = modules.get(module_uri)?;
+    let property_text = cur.hir.idents[s.property].text.as_str();
+    let module_root = module.hir.module.as_ref()?;
+    for decl_id in &module_root.decls {
+        let decl = &module.hir.decls[*decl_id];
+        let Some(name_id) = decl.name() else {
+            continue;
+        };
+        if module.hir.idents[name_id].text != property_text {
+            continue;
+        }
+        return Some(match decl {
+            Decl::Type(_) | Decl::Enum(_) => TypeShape::Named {
+                name: "type".to_string(),
+                params: Vec::new(),
+            },
+            Decl::Fn(_) => TypeShape::Named {
+                name: "function".to_string(),
+                params: Vec::new(),
+            },
+            Decl::Var(vd) => match vd.ty {
+                Some(t) => read_type_shape(&module.hir, t),
+                None => TypeShape::Any,
+            },
+            Decl::Pragma(_) => return None,
+        });
     }
     None
 }

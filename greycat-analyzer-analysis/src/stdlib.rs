@@ -81,6 +81,12 @@ pub struct ProjectIndex {
     /// chunks light up "is this module allowed to call X?" checks the
     /// TS reference declarator threads through `mod.permissions`.
     pub module_permissions: HashMap<Uri, HashSet<String>>,
+    /// P15.x — module-name → URI. Populated from each ingested doc's
+    /// filename stem (i.e. `Document::name()`). Lets the resolver
+    /// recognize `runtime` in `runtime::Identity::create` as a known
+    /// module name (rather than flagging it as unresolved), and lets
+    /// pass 3.5 infer types for `module::Decl` static expressions.
+    pub module_names: HashMap<String, Uri>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -136,6 +142,12 @@ impl ProjectIndex {
         let Some(module) = hir.module.as_ref() else {
             return;
         };
+        // P15.x — capture the module's name (URI's filename stem
+        // without `.gcl`) so resolver / pass 3.5 can recognize
+        // `module::Decl` chains.
+        if let Some(name) = module_name_from_uri(uri) {
+            self.module_names.insert(name, uri.clone());
+        }
         for decl_id in &module.decls {
             let modifiers = match &hir.decls[*decl_id] {
                 Decl::Type(td) => {
@@ -269,6 +281,34 @@ impl ProjectIndex {
         self.registry.lookup(name).is_some()
             || self.natives.lookup(name).is_some()
             || self.values.contains(name)
+    }
+
+    /// P15.x — `true` iff `name` matches a known module (any ingested
+    /// doc whose filename stem equals `name`). Lets the resolver
+    /// recognize `runtime` in `runtime::Identity::create` as a module.
+    pub fn has_module(&self, name: &str) -> bool {
+        self.module_names.contains_key(name)
+    }
+
+    /// P15.x — return the URI of the module whose filename stem
+    /// matches `name`, if any.
+    pub fn module_uri(&self, name: &str) -> Option<&Uri> {
+        self.module_names.get(name)
+    }
+}
+
+/// P15.x — extract the module name from a URI (filename without
+/// `.gcl`). Mirrors [`Document::name`](greycat_analyzer_core::Document)
+/// without the borrow on a manager.
+fn module_name_from_uri(uri: &Uri) -> Option<String> {
+    let s = uri.as_str();
+    let stripped = s.strip_prefix("file://").unwrap_or(s);
+    let last = stripped.rsplit(['/', '\\']).next()?;
+    let stem = last.strip_suffix(".gcl").unwrap_or(last);
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
     }
 }
 
