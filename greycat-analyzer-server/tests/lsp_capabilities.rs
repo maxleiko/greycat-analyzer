@@ -204,6 +204,44 @@ fn cross_module_member_resolution_binds_foreign_attr() {
 }
 
 #[test]
+fn cross_module_goto_implementation_walks_every_module() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let a = Uri::from_str("file:///a.gcl").unwrap();
+    let b = Uri::from_str("file:///b.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        a.clone(),
+        "type Foo {\n    fn run(): int { return 1; }\n}\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        b.clone(),
+        "type Bar {\n    fn run(): int { return 2; }\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    // Cursor on `run` in a.gcl line 1 col 8 (0-indexed: "    fn run" → r at col 7).
+    let resp =
+        capabilities::goto_implementation_across_project(&pa, &mgr, &a, pos(1, 8)).expect("hits");
+    let GotoDefinitionResponse::Array(locs) = resp else {
+        panic!("expected array of impls");
+    };
+    let uris: std::collections::HashSet<_> =
+        locs.iter().map(|l| l.uri.as_str().to_owned()).collect();
+    assert!(
+        uris.contains(a.as_str()),
+        "should include Foo::run in a.gcl: {locs:?}"
+    );
+    assert!(
+        uris.contains(b.as_str()),
+        "should include Bar::run in b.gcl: {locs:?}"
+    );
+}
+
+#[test]
 fn cross_module_decl_location_points_at_foreign_name() {
     use greycat_analyzer_hir::lower_module;
     let foreign_text = "type Helper {}\n";

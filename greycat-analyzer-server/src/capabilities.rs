@@ -524,6 +524,68 @@ pub fn goto_implementation(
     Some(GotoDefinitionResponse::Array(locations))
 }
 
+/// P11.6 — project-wide `textDocument/implementation`. Walks every
+/// cached module's `TypeDecl::methods` for concrete (non-`abstract`,
+/// non-`native`) methods whose name matches the cursor's ident text.
+/// Falls through to in-module [`goto_implementation`] (which itself
+/// falls through to [`goto_definition`]) for non-method idents and
+/// when no project-wide method match is found.
+pub fn goto_implementation_across_project(
+    project: &ProjectAnalysis,
+    manager: &SourceManager,
+    cursor_uri: &Uri,
+    cursor_pos: Position,
+) -> Option<GotoDefinitionResponse> {
+    let cell = manager.get(cursor_uri)?;
+    let doc = cell.borrow();
+    let byte = position_to_byte(&doc.text, cursor_pos);
+    let node = node_at_offset(doc.root_node(), byte)?;
+    if node.kind() != "ident" {
+        return goto_implementation(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos);
+    }
+    let cursor_text = doc.text.get(node.byte_range())?.to_string();
+    drop(doc);
+
+    let mut locations = Vec::new();
+    for (uri, module) in project.iter() {
+        let Some(module_root) = module.hir.module.as_ref() else {
+            continue;
+        };
+        let Some(other_cell) = manager.get(uri) else {
+            continue;
+        };
+        let other_doc = other_cell.borrow();
+        for decl_id in &module_root.decls {
+            let Decl::Type(td) = &module.hir.decls[*decl_id] else {
+                continue;
+            };
+            for method_id in &td.methods {
+                let Decl::Fn(fnd) = &module.hir.decls[*method_id] else {
+                    continue;
+                };
+                if fnd.modifiers.abstract_ || fnd.modifiers.native {
+                    continue;
+                }
+                if module.hir.idents[fnd.name].text == cursor_text {
+                    locations.push(Location {
+                        uri: uri.clone(),
+                        range: byte_range_to_lsp(
+                            &other_doc.text,
+                            &module.hir.idents[fnd.name].byte_range,
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    if locations.is_empty() {
+        let cell = manager.get(cursor_uri)?;
+        let doc = cell.borrow();
+        return goto_implementation(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos);
+    }
+    Some(GotoDefinitionResponse::Array(locations))
+}
+
 // =============================================================================
 // P3.3 — document symbols
 // =============================================================================

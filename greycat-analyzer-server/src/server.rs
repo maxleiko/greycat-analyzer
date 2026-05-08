@@ -334,11 +334,17 @@ fn goto_implementation_handler(
     server: &Backend,
     params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
+    // P11.6: walk every cached module's TypeDecl methods (not just the
+    // current module) — falls through to in-module goto_implementation
+    // → goto_definition when there's no method match.
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    let cell = server.manager.get(&uri)?;
-    let doc = cell.borrow();
-    capabilities::goto_implementation(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
+    capabilities::goto_implementation_across_project(
+        &server.project_analysis,
+        &server.manager,
+        &uri,
+        pos,
+    )
 }
 
 fn document_symbols_handler(
