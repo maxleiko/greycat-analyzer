@@ -251,12 +251,35 @@ fn emit_token(source: &str, node: Node<'_>, out: &mut String, state: &mut State)
             state.last_emitted = Some(EmittedKind::Other);
             state.suppress_space = true;
         }
-        // `<` / `>` for generics — strip leading space when the previous
-        // token is an ident (so `Array<T>` not `Array <T>`); no space
-        // after `<`, no space before `>`.
+        // `<` / `>` are dual-use. Generics (`Array<T>`) want tight
+        // spacing; comparisons (`x < z`) want spaces around. Discriminate
+        // by parent kind: generic containers in the grammar are
+        // `type_params` and `type_ident` (which carries `< … >` for
+        // nested instantiations).
         "<" | ">" => {
-            trim_trailing_spaces(out);
-            out.push_str(text);
+            let in_generic = node
+                .parent()
+                .map(|p| matches!(p.kind(), "type_params" | "type_ident"))
+                .unwrap_or(false);
+            if in_generic {
+                trim_trailing_spaces(out);
+                out.push_str(text);
+                state.last_emitted = Some(EmittedKind::Other);
+                state.suppress_space = true;
+            } else {
+                emit_binary_op(out, state, text);
+            }
+        }
+        // Binary / assignment operators — surround with spaces.
+        "=" | "==" | "!=" | "<=" | ">=" | "+" | "-" | "*" | "/" | "%" | "&&" | "||" | "+="
+        | "-=" | "*=" | "/=" | "%=" | "??" => {
+            emit_binary_op(out, state, text);
+        }
+        // Unary `!` — no space after, possibly space before (handled
+        // by ensure_leading_space).
+        "!" => {
+            ensure_leading_space(out, state);
+            out.push('!');
             state.last_emitted = Some(EmittedKind::Other);
             state.suppress_space = true;
         }
@@ -329,7 +352,21 @@ fn emit_token(source: &str, node: Node<'_>, out: &mut String, state: &mut State)
         }
     }
     state.last_byte = node.end_byte();
-    state.last_was_doc = matches!(kind, "doc_comment");
+    state.last_was_doc = matches!(kind, "doc_comment" | "line_comment");
+}
+
+/// Emit a binary operator — `<op>` surrounded by spaces. Wraps the
+/// pre-emit cleanup so the previous token's trailing whitespace is
+/// canonicalized.
+fn emit_binary_op(out: &mut String, state: &mut State, text: &str) {
+    trim_trailing_spaces(out);
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(text);
+    out.push(' ');
+    state.last_emitted = Some(EmittedKind::Other);
+    state.suppress_space = true;
 }
 
 /// Push a single ASCII space when one is *needed* — i.e. the previous
@@ -344,7 +381,8 @@ fn ensure_leading_space(out: &mut String, state: &State) {
         return;
     }
     let last = out.chars().next_back();
-    let needs = match last {
+    let needs = matches!(
+        last,
         Some(c)
             if c.is_ascii_alphanumeric()
                 || c == '_'
@@ -352,12 +390,8 @@ fn ensure_leading_space(out: &mut String, state: &State) {
                 || c == ']'
                 || c == '}'
                 || c == '?'
-                || c == '"' =>
-        {
-            true
-        }
-        _ => false,
-    };
+                || c == '"'
+    );
     if needs {
         out.push(' ');
     }

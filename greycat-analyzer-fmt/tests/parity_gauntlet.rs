@@ -53,7 +53,7 @@ fn formatter_parity_against_corpus() {
     // remaining hard cases need line-length-aware reflow (args_split,
     // nested_args_split, if_var_object) plus the comment + annotation
     // ordering edge case (doc_eol_stmt, stmts_rules).
-    const MATCH_FLOOR: usize = 3;
+    const MATCH_FLOOR: usize = 4;
     let _ = total;
     assert!(
         matches >= MATCH_FLOOR,
