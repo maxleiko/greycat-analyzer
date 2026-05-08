@@ -648,6 +648,104 @@ fn completion_lists_runtime_types() {
     );
 }
 
+/// P15.2.4 — `.` member completion lists the receiver's attrs and
+/// non-static methods.
+#[test]
+fn completion_after_dot_lists_attrs_and_methods() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Point { x: int; y: int; fn norm(): int { return 0; } }\nfn use_(p: Point) { p. }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after the `.` (line 1 col 22).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 22),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"x"), "got: {labels:?}");
+    assert!(labels.contains(&"y"), "got: {labels:?}");
+    assert!(labels.contains(&"norm"), "got: {labels:?}");
+    // No keyword leak.
+    assert!(!labels.contains(&"return"), "got: {labels:?}");
+}
+
+/// P15.2.4 — typed prefix filters the member completion list.
+#[test]
+fn completion_after_dot_prefix_filters() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Point { x: int; y: int; }\nfn use_(p: Point) { p.x }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after the `x` (line 1 col 23).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 23),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"x"), "got: {labels:?}");
+    assert!(
+        !labels.contains(&"y"),
+        "non-matching attr leaked: {labels:?}"
+    );
+}
+
+/// P15.2.4 — cross-module member completion: receiver's type lives in
+/// a different module than the cursor's. Lists the foreign type's
+/// attrs.
+#[test]
+fn completion_after_dot_cross_module() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let shapes_uri = Uri::from_str("file:///shapes.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(shapes_uri, "type Point { x: int; y: int; }\n", "p", false);
+    mgr.add_simple(user_uri.clone(), "fn use_(p: Point) { p. }\n", "p", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(0, 22),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"x"), "got: {labels:?}");
+    assert!(labels.contains(&"y"), "got: {labels:?}");
+}
+
 /// P15.2.2 — keyword completion does not fire after `.` (member access
 /// RHS is owned by P15.2.4).
 #[test]

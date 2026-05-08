@@ -2256,6 +2256,12 @@ pub fn completion_with_project(
             items,
         });
     }
+    if let Some(items) = member_completion(text, root, byte, uri, project) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     if let Some(items) = ident_or_keyword_completion(text, node, byte, uri, project) {
         return Some(CompletionList {
             is_incomplete: false,
@@ -3012,6 +3018,342 @@ fn stmt_byte_range(
         HS::Return(Some(e)) => hir.exprs[*e].byte_range(),
         HS::Throw(e) => hir.exprs[*e].byte_range(),
         HS::Return(None) | HS::Break | HS::Continue => 0..0,
+    }
+}
+
+// =============================================================================
+// P15.2.4 — member completion after `.` / `->`
+// =============================================================================
+
+/// Member-access completion: when the cursor sits in `recv.|prop` /
+/// `recv->|prop`, list the receiver type's attrs + methods. Cross-
+/// module receivers consult `ProjectIndex::decl_locations` to navigate
+/// to the foreign type's HIR.
+///
+/// Tolerant of error-recovery: when the user has typed `p.` (a
+/// half-formed member access whose receiver lives inside an `ERROR`
+/// node), the HIR doesn't carry an `Expr::Ident` for the receiver, so
+/// we fall back to a CST-based ident lookup that consults the
+/// resolver and `def_types` for the receiver's type.
+fn member_completion(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+    uri: &Uri,
+    project: &ProjectAnalysis,
+) -> Option<Vec<CompletionItem>> {
+    let typed = ident_prefix_at_cursor(text, cursor_byte);
+    let prefix_lower = typed.to_lowercase();
+    let prefix_start = cursor_byte.saturating_sub(typed.len());
+    let bytes = text.as_bytes();
+    if prefix_start > bytes.len() {
+        return None;
+    }
+    // Determine separator: `.` (member) or `->` (arrow). Position of
+    // the receiver's last byte (exclusive end) lives at `recv_end`.
+    let recv_end = if prefix_start >= 1 && bytes[prefix_start - 1] == b'.' {
+        prefix_start - 1
+    } else if prefix_start >= 2
+        && bytes[prefix_start - 2] == b'-'
+        && bytes[prefix_start - 1] == b'>'
+    {
+        prefix_start - 2
+    } else {
+        return None;
+    };
+
+    let module = project.module(uri)?;
+    let recv_ty = receiver_type_at(text, root, module, recv_end)?;
+    let name = type_head_name(&module.analysis.types, recv_ty)?;
+
+    let mut items: Vec<CompletionItem> = Vec::new();
+    // Try in-module first.
+    if let Some(decl_id) = module.analysis.type_decls.get(&name).copied()
+        && let Decl::Type(td) = &module.hir.decls[decl_id]
+    {
+        collect_type_members(&module.hir, td, &prefix_lower, &mut items);
+    }
+    // Fall through to cross-module if in-module produced nothing.
+    if items.is_empty()
+        && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&name).first()
+        && let Some(fmod) = project.module(foreign_uri)
+        && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+    {
+        collect_type_members(&fmod.hir, td, &prefix_lower, &mut items);
+    }
+
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
+}
+
+/// Find the receiver's `TypeId` whose CST span ends at `recv_end`.
+/// Three-stage:
+/// 1. **HIR fast path** — match an `Expr` whose byte_range ends there
+///    against `analysis.expr_types`. Works for the common `recv.x`
+///    case where the parser produced a `member_expr`.
+/// 2. **CST + resolver fallback** — when the parser put the half-
+///    formed access in an `ERROR` recovery node, no `Expr` covers
+///    the receiver. We walk up the CST from the byte before
+///    `recv_end`, find a named node whose `end_byte == recv_end`,
+///    and try to resolve it via `Resolutions` + `def_types`.
+/// 3. **CST + name-in-scope fallback** — when the receiver isn't
+///    even in `Resolutions` (because the lowering skipped its
+///    enclosing ERROR), look the receiver text up by name in the
+///    enclosing fn's scope (params + nested var decls).
+fn receiver_type_at(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    module: &greycat_analyzer_analysis::project::ModuleAnalysis,
+    recv_end: usize,
+) -> Option<greycat_analyzer_types::TypeId> {
+    if let Some((id, _)) = module
+        .hir
+        .exprs
+        .iter()
+        .filter(|(_, e)| e.byte_range().end == recv_end)
+        .max_by_key(|(_, e)| e.byte_range().end - e.byte_range().start)
+        && let Some(ty) = module.analysis.expr_types.get(&id).copied()
+    {
+        return Some(ty);
+    }
+    if recv_end == 0 {
+        return None;
+    }
+    let leaf = node_at_offset(root, recv_end - 1)?;
+    let mut cur = leaf;
+    let recv_node = loop {
+        if cur.is_named() && cur.end_byte() == recv_end {
+            break cur;
+        }
+        match cur.parent() {
+            Some(p) if p.end_byte() <= recv_end + 1 => cur = p,
+            _ => return None,
+        }
+    };
+    if recv_node.kind() != "ident" {
+        return None;
+    }
+    let r = recv_node.byte_range();
+    // Stage 2: ident already lowered into the HIR — resolver path.
+    if let Some((ident_idx, _)) = module.hir.idents.iter().find(|(_, i)| i.byte_range == r) {
+        use greycat_analyzer_analysis::resolver::Definition;
+        if let Some(def) = module.resolutions.lookup(ident_idx) {
+            let ident_for_lookup = match def {
+                Definition::Param(id) | Definition::Local(id) | Definition::Generic(id) => Some(id),
+                _ => None,
+            };
+            if let Some(id) = ident_for_lookup
+                && let Some(ty) = module.analysis.def_types.get(&id).copied()
+            {
+                return Some(ty);
+            }
+        }
+    }
+    // Stage 3: ident dropped by lowering (lives inside an ERROR);
+    // resolve by name lookup.
+    let recv_text = text.get(r)?.to_string();
+    lookup_name_type_at(&module.hir, &module.analysis, recv_end, &recv_text)
+}
+
+/// Walk the HIR for a Param / Local binding whose name matches `name`
+/// and whose enclosing scope contains `cursor_byte`. Returns its
+/// `TypeId` from `def_types`.
+fn lookup_name_type_at(
+    hir: &greycat_analyzer_hir::Hir,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    cursor_byte: usize,
+    name: &str,
+) -> Option<greycat_analyzer_types::TypeId> {
+    use greycat_analyzer_hir::types::Decl as HD;
+    let module = hir.module.as_ref()?;
+    for &decl_id in &module.decls {
+        let r = hir.decls[decl_id].byte_range();
+        if !(r.start <= cursor_byte && cursor_byte <= r.end) {
+            continue;
+        }
+        match &hir.decls[decl_id] {
+            HD::Fn(fnd) => {
+                if let Some(t) = lookup_name_type_in_fn(hir, analysis, cursor_byte, fnd, name) {
+                    return Some(t);
+                }
+            }
+            HD::Type(td) => {
+                for &m_id in &td.methods {
+                    let mr = hir.decls[m_id].byte_range();
+                    if !(mr.start <= cursor_byte && cursor_byte <= mr.end) {
+                        continue;
+                    }
+                    if let HD::Fn(fnd) = &hir.decls[m_id]
+                        && let Some(t) =
+                            lookup_name_type_in_fn(hir, analysis, cursor_byte, fnd, name)
+                    {
+                        return Some(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn lookup_name_type_in_fn(
+    hir: &greycat_analyzer_hir::Hir,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    cursor_byte: usize,
+    fnd: &greycat_analyzer_hir::types::FnDecl,
+    name: &str,
+) -> Option<greycat_analyzer_types::TypeId> {
+    for p_id in &fnd.params {
+        let p = &hir.fn_params[*p_id];
+        if hir.idents[p.name].text == name {
+            return analysis.def_types.get(&p.name).copied();
+        }
+    }
+    if let Some(body) = fnd.body {
+        return lookup_name_type_in_stmt(hir, analysis, cursor_byte, body, name);
+    }
+    None
+}
+
+fn lookup_name_type_in_stmt(
+    hir: &greycat_analyzer_hir::Hir,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    cursor_byte: usize,
+    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
+    name: &str,
+) -> Option<greycat_analyzer_types::TypeId> {
+    use greycat_analyzer_hir::types::Stmt as HS;
+    match &hir.stmts[stmt_id] {
+        HS::Block(stmts) => {
+            for s in stmts {
+                let r = stmt_byte_range(hir, *s);
+                if r.end <= cursor_byte {
+                    if let HS::Var(lv) = &hir.stmts[*s]
+                        && hir.idents[lv.name].text == name
+                    {
+                        return analysis.def_types.get(&lv.name).copied();
+                    }
+                } else if r.start <= cursor_byte
+                    && cursor_byte <= r.end
+                    && let Some(t) = lookup_name_type_in_stmt(hir, analysis, cursor_byte, *s, name)
+                {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        HS::If(s) => {
+            let r = stmt_byte_range(hir, s.then_branch);
+            if r.start <= cursor_byte && cursor_byte <= r.end {
+                return lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.then_branch, name);
+            }
+            if let Some(eb) = s.else_branch {
+                let er = stmt_byte_range(hir, eb);
+                if er.start <= cursor_byte && cursor_byte <= er.end {
+                    return lookup_name_type_in_stmt(hir, analysis, cursor_byte, eb, name);
+                }
+            }
+            None
+        }
+        HS::While(s) => lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name),
+        HS::DoWhile(s) => lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name),
+        HS::For(s) => {
+            if let Some(name_id) = s.init_name
+                && hir.idents[name_id].text == name
+            {
+                return analysis.def_types.get(&name_id).copied();
+            }
+            lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name)
+        }
+        HS::ForIn(s) => {
+            if hir.idents[s.iterator_name].text == name {
+                return analysis.def_types.get(&s.iterator_name).copied();
+            }
+            lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name)
+        }
+        HS::Try(s) => {
+            let tr = stmt_byte_range(hir, s.try_block);
+            if tr.start <= cursor_byte && cursor_byte <= tr.end {
+                return lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.try_block, name);
+            }
+            let cr = stmt_byte_range(hir, s.catch_block);
+            if cr.start <= cursor_byte && cursor_byte <= cr.end {
+                if let Some(err_id) = s.error_param
+                    && hir.idents[err_id].text == name
+                {
+                    return analysis.def_types.get(&err_id).copied();
+                }
+                return lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.catch_block, name);
+            }
+            None
+        }
+        HS::At(s) => lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.block, name),
+        _ => None,
+    }
+}
+
+/// Read the head name of `id` from `arena` — the bare type name
+/// stripped of nullability / generic args. Returns `None` for shapes
+/// without a single name (lambdas, tuples, anonymous structures).
+fn type_head_name(
+    arena: &greycat_analyzer_types::TypeArena,
+    id: greycat_analyzer_types::TypeId,
+) -> Option<String> {
+    use greycat_analyzer_types::TypeKind;
+    let t = arena.get(id);
+    match &t.kind {
+        TypeKind::Named { name } | TypeKind::Generic { name, .. } => Some(name.clone()),
+        TypeKind::Primitive(p) => Some(p.name().to_string()),
+        _ => None,
+    }
+}
+
+/// Walk a `TypeDecl`'s attrs + methods and emit one `CompletionItem`
+/// per name that survives the `prefix_lower` filter. Skips abstract /
+/// native methods only on the static-completion side (P15.2.5);
+/// instance access lists everything.
+fn collect_type_members(
+    hir: &greycat_analyzer_hir::Hir,
+    td: &greycat_analyzer_hir::types::TypeDecl,
+    prefix_lower: &str,
+    items: &mut Vec<CompletionItem>,
+) {
+    for attr_id in &td.attrs {
+        let a = &hir.type_attrs[*attr_id];
+        let name = hir.idents[a.name].text.clone();
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            insert_text: Some(name),
+            ..Default::default()
+        });
+    }
+    for method_id in &td.methods {
+        let Decl::Fn(m) = &hir.decls[*method_id] else {
+            continue;
+        };
+        // `static` methods don't apply to instance access (P15.2.5
+        // owns the static-call path); skip them here.
+        if m.modifiers.static_ {
+            continue;
+        }
+        let name = hir.idents[m.name].text.clone();
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::METHOD),
+            insert_text: Some(name),
+            ..Default::default()
+        });
     }
 }
 
