@@ -7,7 +7,7 @@
 //! grammar's `parser.c` are linked. Everything else consumes the
 //! [`tree_sitter`] re-export from here so versions stay in lockstep
 //! and the grammar pin (the submodule SHA at
-//! `vendor/tree-sitter-greycat`) is the single source of truth.
+//! `tree-sitter-greycat`) is the single source of truth.
 //!
 //! Decision A (ROADMAP §3): no rowan/syntree facade — tree-sitter
 //! already provides lossless trivia, incremental reparse, and

@@ -7,7 +7,7 @@
 #
 # Pre-flight (do these before running):
 #   1. `cargo login <token>` is configured.
-#   2. The submodule `vendor/tree-sitter-greycat` is published as a
+#   2. The submodule `tree-sitter-greycat` is published as a
 #      crate (or its parser.c vendored into greycat-analyzer-syntax)
 #      — `greycat-analyzer-syntax` currently uses a path dep to it
 #      and won't publish without that.
@@ -23,7 +23,7 @@ ORDER=(
   greycat-analyzer-types
   greycat-analyzer-fmt
   greycat-analyzer-analysis
-  greycat-analyzer-ls
+  greycat-analyzer-server
   greycat-analyzer-wasm
   greycat-analyzer
 )

@@ -12,13 +12,13 @@ Rust edition 2024. Workspace resolver `"3"`. Workspace metadata (`license = "MIT
 
 | Crate | Purpose |
 |---|---|
-| [greycat-analyzer-syntax](../greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](../vendor/tree-sitter-greycat/) (vendored as a git submodule). |
+| [greycat-analyzer-syntax](../greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](../tree-sitter-greycat/) (git submodule at the repo root). |
 | [greycat-analyzer-core](../greycat-analyzer-core/) | `Document`, `SourceManager`, `span`, project graph, `@library` / `@include` resolver, parse diagnostics. Re-exports `lsp_types` and `greycat_analyzer_syntax`. |
 | [greycat-analyzer-hir](../greycat-analyzer-hir/) | Arena-backed typed HIR, CST→HIR lowering. |
 | [greycat-analyzer-types](../greycat-analyzer-types/) | `Type` / `TypeKind`, `TypeArena`, subtyping (`is_assignable_to`), `InferenceTable` foundation. |
 | [greycat-analyzer-analysis](../greycat-analyzer-analysis/) | Resolver, analyzer (inference + null-flow + `is`-narrowing + enum exhaustiveness + member resolution), lints, `ProjectAnalysis` driver, `ProjectIndex` cross-module index, `actions` vocabulary. |
 | [greycat-analyzer-fmt](../greycat-analyzer-fmt/) | Formatter (foundational; per-construct parity with TS `cst_format.ts` is P9.1). |
-| [greycat-analyzer-ls](../greycat-analyzer-ls/) | LSP server (`lsp-server` + `crossbeam-channel`). Capability handlers in [src/capabilities.rs](../greycat-analyzer-ls/src/capabilities.rs). |
+| [greycat-analyzer-server](../greycat-analyzer-server/) | LSP server (`lsp-server` + `crossbeam-channel`). Capability handlers in [src/capabilities.rs](../greycat-analyzer-server/src/capabilities.rs). |
 | [greycat-analyzer](../greycat-analyzer/) | CLI binary `greycat-lang`. `clap` subcommands in [src/cmd/](../greycat-analyzer/src/cmd/). |
 | [greycat-analyzer-wasm](../greycat-analyzer-wasm/) | `cdylib` + `rlib`, `wasm-bindgen` bridge. Drives the playground. |
 | [playground/](../playground/) | Vite/TS/Lit/WebAwesome/Monaco UI consuming the wasm pkg. **Committed**, *not* a workspace member. |
@@ -45,21 +45,21 @@ Tree-sitter owns scanning; do not add a separate Rust lexer.
 
 ### Grammar lives in this repo
 
-`tree-sitter-greycat` is a **git submodule** at [vendor/tree-sitter-greycat/](../vendor/tree-sitter-greycat/), pulled in as a Cargo `path` dep. That means: when the parser disagrees with the TS reference, **edit the grammar locally and re-run `cargo test --workspace`** instead of allowlisting the divergence in the analyzer.
+`tree-sitter-greycat` is a **git submodule** at [tree-sitter-greycat/](../tree-sitter-greycat/) (repo root), pulled in as a Cargo `path` dep. That means: when the parser disagrees with the TS reference, **edit the grammar locally and re-run `cargo test --workspace`** instead of allowlisting the divergence in the analyzer.
 
 Grammar edit loop:
 
 ```sh
-# 1. Edit vendor/tree-sitter-greycat/grammar.js
+# 1. Edit tree-sitter-greycat/grammar.js
 # 2. Regenerate parser.c + node-types.json
-cd vendor/tree-sitter-greycat && tree-sitter generate && cd -
+cd tree-sitter-greycat && tree-sitter generate && cd -
 # 3. Re-run gauntlet
 cargo test -p greycat-analyzer-syntax --test coverage
 ```
 
 The syntax crate's `build.rs` reads `node-types.json` directly from the submodule; there is no vendored copy in `greycat-analyzer-syntax/`. The submodule SHA *is* the grammar pin.
 
-When grammar fixes are ready, commit inside the submodule and push to `maxleiko/tree-sitter-greycat`, then bump the submodule pointer here. The submodule's own [CLAUDE.md](../vendor/tree-sitter-greycat/.claude/CLAUDE.md) has the full grammar workflow (scanner.c boundary, query updates, etc.).
+When grammar fixes are ready, commit inside the submodule and push to `maxleiko/tree-sitter-greycat`, then bump the submodule pointer here. The submodule's own [CLAUDE.md](../tree-sitter-greycat/.claude/CLAUDE.md) has the full grammar workflow (scanner.c boundary, query updates, etc.).
 
 **Hard rule:** when the gauntlet flags ERROR/MISSING, when CST shape diverges from TS reference, when typed-node accessors return `None` where the reference produces a value — pause and ask. Default answer is "fix the grammar," not "work around it." `KNOWN_GRAMMAR_GAPS` in `greycat-analyzer-syntax/tests/coverage.rs` is a temporary buffer between *gap discovered* and *grammar fixed*; it should be empty most of the time (currently `&[]`).
 
@@ -67,7 +67,7 @@ When grammar fixes are ready, commit inside the submodule and push to `maxleiko/
 
 Verification order:
 
-1. Inspect `vendor/tree-sitter-greycat/grammar.js` for the existing rule shape.
+1. Inspect `tree-sitter-greycat/grammar.js` for the existing rule shape.
 2. Search the stdlib (`lib/std/*.gcl`) and corpus (`tests/corpus/`) for real examples of the construct.
 3. Invoke the `/greycat:greycat` skill — it has the canonical syntax/semantics reference.
 4. Read the TS reference at `https://hub.datathings.com/greycat/lang` if you have a checkout / can git clone with ssh.
@@ -141,7 +141,7 @@ Per-chunk checklist:
 7. Don't skip hooks, don't amend prior commits, don't pass `-c commit.gpgsign=false` (signing is off globally; the flag is unnecessary noise).
 8. `git push origin main` after the commit lands. Same applies to `chore:` / area-prefixed non-chunk commits in this repo.
 
-Submodule commits (inside `vendor/tree-sitter-greycat/` → `maxleiko/tree-sitter-greycat`) are also pushed immediately. After pushing, bump the parent's submodule pointer in a follow-up commit so the new SHA propagates downstream.
+Submodule commits (inside `tree-sitter-greycat/` → `maxleiko/tree-sitter-greycat`) are also pushed immediately. After pushing, bump the parent's submodule pointer in a follow-up commit so the new SHA propagates downstream.
 
 Commit message format — match the existing log style (short, lowercase, area-prefixed):
 

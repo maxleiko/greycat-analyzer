@@ -6,7 +6,7 @@ members = [
   "greycat-analyzer-core",
   "greycat-analyzer-fmt",
   "greycat-analyzer-hir",
-  "greycat-analyzer-ls",
+  "greycat-analyzer-server",
   "greycat-analyzer-syntax",
   "greycat-analyzer-types",
   "greycat-analyzer-wasm",

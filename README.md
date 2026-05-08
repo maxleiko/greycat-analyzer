@@ -6,7 +6,7 @@ The CLI binary (`greycat-analyzer`) doubles as the LSP server, so editors only n
 
 ## Clone
 
-The tree-sitter grammar lives at [vendor/tree-sitter-greycat/](vendor/tree-sitter-greycat/) as a git submodule, and the syntax crate's `build.rs` reads `node-types.json` directly from it — every build needs the submodule populated.
+The tree-sitter grammar lives at [tree-sitter-greycat/](tree-sitter-greycat/) as a git submodule at the repo root, and the syntax crate's `build.rs` reads `node-types.json` directly from it — every build needs the submodule populated.
 
 ```sh
 git clone --recurse-submodules https://github.com/maxleiko/greycat-analyzer.git
@@ -118,13 +118,13 @@ pnpm dev     # opens the playground at http://localhost:5173
 
 | Crate | Purpose |
 |---|---|
-| [greycat-analyzer-syntax](greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](vendor/tree-sitter-greycat/) (vendored as a git submodule). Generated typed-node accessors. |
+| [greycat-analyzer-syntax](greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](tree-sitter-greycat/) (git submodule at the repo root). Generated typed-node accessors. |
 | [greycat-analyzer-core](greycat-analyzer-core/) | `Document`, `SourceManager`, project graph, module resolver, parse diagnostics. |
 | [greycat-analyzer-hir](greycat-analyzer-hir/) | Arena-backed HIR + CST→HIR lowering. |
 | [greycat-analyzer-types](greycat-analyzer-types/) | `Type` enum, interning arena, subtyping, generics. |
 | [greycat-analyzer-analysis](greycat-analyzer-analysis/) | Resolver, analyzer, lint rules, stdlib ingestion. |
 | [greycat-analyzer-fmt](greycat-analyzer-fmt/) | Tree-sitter-driven formatter. |
-| [greycat-analyzer-ls](greycat-analyzer-ls/) | LSP server + capability handlers. |
+| [greycat-analyzer-server](greycat-analyzer-server/) | LSP server + capability handlers. |
 | [greycat-analyzer-wasm](greycat-analyzer-wasm/) | WASM bindings exposing every stage to the playground. |
 | [greycat-analyzer](greycat-analyzer/) | The `greycat-analyzer` CLI binary. |
 

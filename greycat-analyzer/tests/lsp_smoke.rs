@@ -13,7 +13,7 @@
 //! reported (binary doesn't recognize its own subcommand, doesn't
 //! initialize, doesn't reply to a hover) without porting the full
 //! 15-file `lsp.*.test.ts` suite. Per-capability behavior is covered
-//! by `greycat-analyzer-ls/tests/capabilities.rs`.
+//! by `greycat-analyzer-server/tests/capabilities.rs`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};

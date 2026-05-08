@@ -1,5 +1,5 @@
 use clap::Parser;
-use greycat_analyzer_ls::start_server;
+use greycat_analyzer_server::start_server;
 
 use crate::utils::AnyError;
 

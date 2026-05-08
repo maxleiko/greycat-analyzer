@@ -14,7 +14,7 @@
 
 use std::str::FromStr;
 
-use greycat_analyzer_ls::capabilities;
+use greycat_analyzer_server::capabilities;
 use greycat_analyzer_syntax::parse;
 use lsp_types::*;
 

@@ -28,13 +28,13 @@ Each TypeScript subsystem in `packages/lang/src/` (the reference implementation)
 | Visitors (8 patterns) | `visitor/` | 3,399 | `greycat-analyzer-syntax` (queries) + `greycat-analyzer-hir` |
 | Pretty printer / formatter | `pp/` + `parser/cst/cst_format.ts` | 779 | `greycat-analyzer-fmt` |
 | Project manager (multi-module, dep graph) | `project/` | 3,969 | `greycat-analyzer-core` |
-| LSP capability handlers | `lsp/` (+ 1,527 LoC of tests) | 49 | `greycat-analyzer-ls` |
-| LSP server transport | `packages/server/` | 1,228 | `greycat-analyzer-ls` |
+| LSP capability handlers | `lsp/` (+ 1,527 LoC of tests) | 49 | `greycat-analyzer-server` |
+| LSP server transport | `packages/server/` | 1,228 | `greycat-analyzer-server` |
 | CLI driver | `packages/cli/` | 743 | `greycat-analyzer` (bin) |
 | Linter | `packages/cli/src/lint/` | 242 | `greycat-analyzer-analysis` (rules) + `greycat-analyzer` (CLI) |
 | Module resolver (`@library`, `@include`) | `packages/resolver/` | 92 | `greycat-analyzer-core` |
 | Error infrastructure | `errors.ts` | 145 | `greycat-analyzer-analysis` (or shared) |
-| Highlighter (semantic tokens) | `highlighter.ts` | 141 | `greycat-analyzer-ls` |
+| Highlighter (semantic tokens) | `highlighter.ts` | 141 | `greycat-analyzer-server` |
 | Stdlib (in GreyCat itself) | `lib/std/*.gcl` | 3,314 | vendored corpus (not ported) |
 
 ---
@@ -80,7 +80,7 @@ Resolved as we hit them; fold the answer into §3 when locked.
 | `greycat-analyzer-types` | `Type`, unifier, inference table | new |
 | `greycat-analyzer-analysis` | Resolver, analyzer, narrowing, lint rules | new |
 | `greycat-analyzer-fmt` | Formatter | new |
-| `greycat-analyzer-ls` | LSP server | survives |
+| `greycat-analyzer-server` | LSP server | survives |
 | `greycat-analyzer` | CLI binary | survives |
 | `greycat-analyzer-wasm` | WASM bindings | survives |
 
@@ -217,7 +217,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [x] **7.1 Drain `KNOWN_GRAMMAR_GAPS`** (S) — `type_attr` rule in `vendor/tree-sitter-greycat/grammar.js` made the trailing `_semi` optional, parser regenerated, submodule pointer bumped, and the `KNOWN_GRAMMAR_GAPS` allowlist drained to `&[]`. The `core::diagnostics::missing_token_surfaces` test that relied on the missing-`;` recovery was retargeted at an unclosed-block fixture (`fn main() {`) since `type Foo { a; b }` now parses cleanly.
+- [x] **7.1 Drain `KNOWN_GRAMMAR_GAPS`** (S) — `type_attr` rule in `tree-sitter-greycat/grammar.js` made the trailing `_semi` optional, parser regenerated, submodule pointer bumped, and the `KNOWN_GRAMMAR_GAPS` allowlist drained to `&[]`. The `core::diagnostics::missing_token_surfaces` test that relied on the missing-`;` recovery was retargeted at an unclosed-block fixture (`fn main() {`) since `type Foo { a; b }` now parses cleanly.
 - [x] **7.2 Drain `Expr::Unsupported`** (M) — new `greycat-analyzer-hir/tests/unsupported_audit.rs` walks `lib/std/*.gcl` plus every parser fixture, counts distinct `Expr::Unsupported.kind` values, and asserts the histogram is empty. As of this chunk, **zero distinct `Unsupported` kinds** appear over 20 .gcl files. The earlier suspects (`is` / `as`) were retired in P6.5; what remained turned out to already lower cleanly. The audit is a permanent regression guard — a future grammar / lowering change that re-introduces an unsupported shape now fails the test instead of silently degrading.
 - [x] **7.3 Type system — node tagging** (M, foundational pass) — `is_assignable_to` learned a node-tag auto-deref rule: when `from` is a `Generic { name, args: [inner] }` and `name` is in `is_node_tag` (`node` / `nodeTime` / `nodeGeo` / `nodeList` / `nodeIndex`), the relation falls back to `is_assignable_to(arena, inner, to)`. The reverse direction stays asymmetric — bare `T` does *not* auto-promote to `node<T>`. Full TS semantics around tagged-mutation tracking remain a deeper port.
 - [x] **7.4 Type system — inference table** (M, foundational pass) — new `InferenceTable` with `bind(name, ty)` / `lookup` / `substitute(arena, ty)`. `substitute` walks `Generic` / `Tuple` / `GenericParam` recursively and replaces `GenericParam(name)` with the recorded witness, preserving nullability. Per-call constraint propagation (record on argument visit, substitute on return type) is still TODO; this chunk lands the foundation so the analyzer / call-site machinery has a typed seam to fill in. 1 unit test. **Note:** GreyCat has no generic-bound syntax — there's nothing like Rust's `T: Bound`; the chunk is purely about inference / unification.
@@ -239,7 +239,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 - [x] **8.4 Linter fix-application driver** (S) — `cli lint --fix` flag added. Driver loop: synthesize per-file edits via `diag_to_edit` (mirrors `synthesize_fix`), sort by start, drop overlapping ranges, apply non-overlapping ones in reverse, write file back, re-run pipeline. Caps at 5 passes. `[fix] applied N edit(s)` summary printed when any fixes apply. Mirrors `packages/cli/src/lint/lint.ts`.
 - [x] **8.5 Workspace symbols** (S) — new `capabilities::workspace_symbols(docs, query)` aggregates per-document `document_symbols` output into `WorkspaceSymbol`s with case-insensitive substring filtering by `query`. `workspace_symbols_handler` in server.rs collects every doc's text+lib from the SourceManager and feeds it through. Wired into `handle_request` via `WorkspaceSymbolRequest`.
 - [x] **8.6 Goto-implementation distinct from goto-definition** (S) — new `capabilities::goto_implementation` walks every `TypeDecl` in the module and collects concrete (non-`abstract`, non-`native`) methods whose name matches the cursor. Returns `GotoDefinitionResponse::Array(locations)` so editors render a picker. Falls through to `goto_definition` for non-method idents.
-- [x] **8.7 Port `lsp.*.test.ts` scenarios** (M, honest first pass) — new `greycat-analyzer-ls/tests/lsp_capabilities.rs` exercises every capability via direct function calls on representative source snippets (16 tests covering hover / document symbols / folding / highlights / rename / references / goto-def / goto-impl / formatting / workspace symbols / signature help / inlay hints / selection ranges / semantic tokens / code actions). Full JSON-RPC harness parity with the 15 TS scenario files is left for a future chunk; this gives a regression guard without setting up a wire-protocol harness.
+- [x] **8.7 Port `lsp.*.test.ts` scenarios** (M, honest first pass) — new `greycat-analyzer-server/tests/lsp_capabilities.rs` exercises every capability via direct function calls on representative source snippets (16 tests covering hover / document symbols / folding / highlights / rename / references / goto-def / goto-impl / formatting / workspace symbols / signature help / inlay hints / selection ranges / semantic tokens / code actions). Full JSON-RPC harness parity with the 15 TS scenario files is left for a future chunk; this gives a regression guard without setting up a wire-protocol harness.
 - [x] **8.8 LSP `textDocument/rangeFormatting`** (S) — new `capabilities::range_formatting` parses the slice between the requested LSP positions, runs `greycat_analyzer_fmt::format_tree` on it, and returns a single replacement `TextEdit`. Wired through `range_formatting_handler` and advertised in `server.rs` `initialize` via `document_range_formatting_provider: Some(OneOf::Left(true))`.
 
 **M8: every LSP capability the TS server advertises behaves the same way under the same prompts; `lsp.*.test.ts` parity tests are green in CI.**
@@ -271,7 +271,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 - [x] **10.3 TS-vs-Rust diagnostic parity oracle** (M, harness only) — `scripts/parity-oracle.sh` runs the Rust port + TS reference (when available locally) over the same corpus, normalizes both into `path:line:col:` shape, and emits a `diff -u`. The CI gate that closes §7-A waits on P6 / P7 fully landing so the diff is small enough to be useful as a regression budget; the harness ships now so the snapshot can be taken at any time during the parity push.
 - [ ] ~~**10.4 Salsa retrofit** (M, profiling-driven) — explicitly deferred. The acceptance criterion is "profiling shows quadratic blow-up on multi-file edits"; until that signal arrives, retrofitting salsa is premature optimization. The pure-function design from P6.1 keeps the retrofit cheap when it does become necessary. (Subsumes P5.5.)~~ → **moved to P14.6.**
 - [ ] ~~**10.5 Playground UI maturation** (M, deferred) — large frontend scope (click-to-jump from CST / HIR / diagnostic rows back to Monaco; LSP-in-web-worker for in-editor completion / hover / diagnostics; `localStorage` persistence). Deferred as a discrete frontend project rather than rolled into this roadmap pass; the playground exists today (see `playground/`) and serves as the analyzer testbed (P5.2).~~ → **moved to P14.7.**
-- [x] **10.6 Documentation pass** (S) — crate-level rustdoc paragraphs added to `greycat-analyzer-syntax`, `greycat-analyzer-core`, `greycat-analyzer-ls`, and `greycat-analyzer-analysis` lib.rs heads (the others — `-hir`, `-types`, `-fmt`, `-wasm` — already had real doc paragraphs). New `docs/porting-from-ts.md` maps every TS subsystem under `packages/lang/src/` to its target Rust crate plus called-out divergences (no hand-rolled lexer, no general visitor framework, etc.). Playground README is left for the P10.5 follow-up since it's part of the playground UI maturation work.
+- [x] **10.6 Documentation pass** (S) — crate-level rustdoc paragraphs added to `greycat-analyzer-syntax`, `greycat-analyzer-core`, `greycat-analyzer-server`, and `greycat-analyzer-analysis` lib.rs heads (the others — `-hir`, `-types`, `-fmt`, `-wasm` — already had real doc paragraphs). New `docs/porting-from-ts.md` maps every TS subsystem under `packages/lang/src/` to its target Rust crate plus called-out divergences (no hand-rolled lexer, no general visitor framework, etc.). Playground README is left for the P10.5 follow-up since it's part of the playground UI maturation work.
 - [x] **10.7 CLI diagnostic UX (miette)** (S) — `cli lint` defaults to `pretty` (miette: source snippet + caret + color) when stdout is a TTY, and to `compact` (`path:line:col: severity: message`) when piped — so the P10.3 parity oracle and grep-style consumers keep a stable diffable shape. `--format={compact,pretty}` overrides explicitly. The `--format` field is `Option<OutputFormat>`; `OutputFormat::auto()` consults `std::io::IsTerminal` at run time to pick the default. New `print_pretty_diagnostic` helper maps `Diagnostic.severity` / `code` / `range` onto a `MietteDiagnostic` with a `LabeledSpan`. `miette = { version = "7", features = ["fancy"] }` added to the cli crate.
 
 **M10: published on crates.io; nightly fuzz + diagnostic parity gates green; playground is the analyzer's interactive debugger.**
@@ -407,7 +407,7 @@ Net deletion: ~3.4k Rust LoC.
 Survives, internals replaced:
 
 - `greycat-analyzer-core/src/{doc.rs, manager.rs, span.rs}` — public shape preserved.
-- `greycat-analyzer-ls/src/{server.rs, backend.rs, project.rs}` — lifecycle plumbing kept; capability handlers added in P3.
+- `greycat-analyzer-server/src/{server.rs, backend.rs, project.rs}` — lifecycle plumbing kept; capability handlers added in P3.
 - `greycat-analyzer/src/{main.rs, cmd.rs, cmd/lint.rs, cmd/lang_server.rs, utils.rs}` — CLI structure kept; subcommand bodies rewritten as features land.
 
 ---

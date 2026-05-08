@@ -11,7 +11,7 @@ categories.workspace = true
 
 [dependencies]
 greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
-greycat-analyzer-ls = { path = "../greycat-analyzer-ls", version = "0.1.0" }
+greycat-analyzer-server = { path = "../greycat-analyzer-server", version = "0.1.0" }
 greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
 greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt", version = "0.1.0" }
 greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }

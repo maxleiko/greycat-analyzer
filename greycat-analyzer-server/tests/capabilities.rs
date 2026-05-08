@@ -1,13 +1,13 @@
 //! Integration tests for the LSP capability handlers.
 //!
 //! Bypasses the JSON-RPC plumbing and calls each handler in
-//! `greycat_analyzer_ls::capabilities` with curated source snippets.
+//! `greycat_analyzer_server::capabilities` with curated source snippets.
 //! That gives us solid coverage of the actual logic (HIR walking,
 //! resolver / analyzer interaction, position math) without the overhead
 //! of spinning up the full server. A separate end-to-end protocol smoke
 //! test in [`lsp_smoke.rs`](./lsp_smoke.rs) covers the JSON-RPC half.
 
-use greycat_analyzer_ls::capabilities;
+use greycat_analyzer_server::capabilities;
 use greycat_analyzer_syntax::parse;
 use lsp_types::*;
 

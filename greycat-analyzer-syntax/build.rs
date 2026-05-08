@@ -133,7 +133,7 @@ fn main() {
     let json_path = manifest_dir
         .parent()
         .expect("syntax crate has a parent dir")
-        .join("vendor/tree-sitter-greycat/src/node-types.json");
+        .join("tree-sitter-greycat/src/node-types.json");
 
     println!("cargo:rerun-if-changed={}", json_path.display());
     println!("cargo:rerun-if-changed=build.rs");

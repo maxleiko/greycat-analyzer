@@ -18,15 +18,15 @@ to its target Rust crate. Use it as the lookup table when triaging
 | Visitors | `visitor/` | tree-sitter queries + HIR walks (no general visitor framework) |
 | Pretty printer / formatter | `pp/` + `parser/cst/cst_format.ts` | [`greycat-analyzer-fmt`](../greycat-analyzer-fmt/) |
 | Project manager (multi-module, dep graph) | `project/` | [`greycat-analyzer-core::SourceManager`](../greycat-analyzer-core/src/manager.rs) + [`greycat-analyzer-analysis::project::ProjectAnalysis`](../greycat-analyzer-analysis/src/project.rs) |
-| LSP capability handlers | `lsp/` | [`greycat-analyzer-ls::capabilities`](../greycat-analyzer-ls/src/capabilities.rs) |
-| LSP server transport | `packages/server/` | [`greycat-analyzer-ls::server`](../greycat-analyzer-ls/src/server.rs) |
+| LSP capability handlers | `lsp/` | [`greycat-analyzer-server::capabilities`](../greycat-analyzer-server/src/capabilities.rs) |
+| LSP server transport | `packages/server/` | [`greycat-analyzer-server::server`](../greycat-analyzer-server/src/server.rs) |
 | CLI driver | `packages/cli/` | [`greycat-analyzer`](../greycat-analyzer/) |
 | Linter | `packages/cli/src/lint/` | [`greycat-analyzer-analysis::lint`](../greycat-analyzer-analysis/src/lint.rs) |
 | Module resolver (`@library`, `@include`) | `packages/resolver/` | [`greycat-analyzer-core::resolver`](../greycat-analyzer-core/src/resolver.rs) |
 | Error infrastructure | `errors.ts` | folded into `analysis::analyzer::SemanticDiagnostic` + `lint::LintDiagnostic` |
-| Highlighter (semantic tokens) | `highlighter.ts` | [`greycat-analyzer-ls::capabilities::semantic_tokens`](../greycat-analyzer-ls/src/capabilities.rs) |
+| Highlighter (semantic tokens) | `highlighter.ts` | [`greycat-analyzer-server::capabilities::semantic_tokens`](../greycat-analyzer-server/src/capabilities.rs) |
 | Code-action vocabulary | `analysis/actions.ts` | [`greycat-analyzer-analysis::actions`](../greycat-analyzer-analysis/src/actions.rs) |
-| Hinter (inlay hints) | `analysis/hinter.ts` | [`greycat-analyzer-ls::capabilities::inlay_hints`](../greycat-analyzer-ls/src/capabilities.rs) |
+| Hinter (inlay hints) | `analysis/hinter.ts` | [`greycat-analyzer-server::capabilities::inlay_hints`](../greycat-analyzer-server/src/capabilities.rs) |
 | Declarator | `analysis/declarator.ts` | folded into `analysis::analyzer::register_module_types` + `stdlib::ProjectIndex::ingest` |
 | Stdlib (in GreyCat itself) | `lib/std/*.gcl` | vendored corpus (not ported — analyzed as ordinary modules) |
 
@@ -55,18 +55,18 @@ to its target Rust crate. Use it as the lookup table when triaging
 The roadmap (`ROADMAP.md`) tracks every chunk by phase. Key entry
 points:
 
-- P0: `vendor/tree-sitter-greycat`, `greycat-analyzer-syntax`
+- P0: `tree-sitter-greycat`, `greycat-analyzer-syntax`
 - P1: `greycat-analyzer-core::SourceManager`,
   `greycat-analyzer-core::diagnostics`
 - P2: `greycat-analyzer-hir`, `greycat-analyzer-types`,
   `greycat-analyzer-analysis::{resolver,analyzer,stdlib}`
-- P3: `greycat-analyzer-ls::capabilities` (every handler)
+- P3: `greycat-analyzer-server::capabilities` (every handler)
 - P4: `greycat-analyzer-fmt`,
   `greycat-analyzer-analysis::lint`
 - P5: `greycat-analyzer-wasm`, `playground/`
 - P6: `greycat-analyzer-analysis::project` + per-feature deepening
 - P7: `greycat-analyzer-types` (subtyping rules) + grammar / HIR
   drains
-- P8: `greycat-analyzer-ls` capability deepening + tests
+- P8: `greycat-analyzer-server` capability deepening + tests
 - P9: `greycat-analyzer-fmt` byte-parity port
 - P10: distribution + quality gates

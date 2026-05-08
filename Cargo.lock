@@ -336,7 +336,7 @@ dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-fmt",
  "greycat-analyzer-hir",
- "greycat-analyzer-ls",
+ "greycat-analyzer-server",
  "greycat-analyzer-syntax",
  "miette",
  "serde",
@@ -383,7 +383,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "greycat-analyzer-ls"
+name = "greycat-analyzer-server"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",

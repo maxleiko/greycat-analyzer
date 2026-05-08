@@ -1,3 +1,3 @@
-[submodule "vendor/tree-sitter-greycat"]
-	path = vendor/tree-sitter-greycat
+[submodule "tree-sitter-greycat"]
+	path = tree-sitter-greycat
 	url = git@github.com:maxleiko/tree-sitter-greycat.git
