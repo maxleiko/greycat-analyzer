@@ -1,13 +1,12 @@
 @library("std", "8.0.269-dev");
 
-type Foo {
-    s: String;
+enum Foo {
+    a,
+    "str field",
 }
 
-fn foo(x: Foo) {
-    var s = x.s.size();
+fn test() {
+    expect_string_nullable(project::Foo::"str field");
 }
 
-fn bar(x: node<Foo>) {
-    var s = x.
-}
+fn expect_string_nullable(_: Foo) {}

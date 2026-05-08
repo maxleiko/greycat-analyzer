@@ -433,17 +433,24 @@ impl ProjectAnalysis {
                                 decl: type_decl_id,
                             },
                         ));
-                    let QualifiedTarget::Member(member) = target;
-                    chain_member_updates
-                        .entry(cur_uri.clone())
-                        .or_default()
-                        .push((
-                            chain[2],
-                            ForeignMember {
-                                uri: module_uri,
-                                member,
-                            },
-                        ));
+                    if let QualifiedTarget::Member(member) = target {
+                        chain_member_updates
+                            .entry(cur_uri.clone())
+                            .or_default()
+                            .push((
+                                chain[2],
+                                ForeignMember {
+                                    uri: module_uri,
+                                    member,
+                                },
+                            ));
+                    }
+                    // EnumVariant binding intentionally has no
+                    // `foreign_member_uses` entry — variants aren't
+                    // attrs / methods and the analyzer doesn't track
+                    // them in `member_uses`. Hover / goto-def for the
+                    // last segment will fall back to the chain[1]
+                    // type-decl binding (already populated above).
                 }
             }
             // 1b) Call(Static / QualifiedStatic / Member / Arrow / Ident)
@@ -1099,8 +1106,7 @@ fn resolve_qualified_static_shape(
     cur: &ModuleAnalysis,
     chain: &[Idx<greycat_analyzer_hir::types::Ident>],
 ) -> Option<TypeShape> {
-    let (module_uri, type_decl_id, foreign) = resolve_qualified_chain(modules, index, cur, chain)?;
-    let _ = (module_uri, type_decl_id);
+    let (module_uri, _type_decl_id, foreign) = resolve_qualified_chain(modules, index, cur, chain)?;
     use crate::analyzer::MemberDef;
     Some(match foreign {
         QualifiedTarget::Member(MemberDef::Method(_)) => TypeShape::Named {
@@ -1111,6 +1117,19 @@ fn resolve_qualified_static_shape(
             name: "field".to_string(),
             params: Vec::new(),
         },
+        // Enum-variant access — the value's type is the enum itself,
+        // not `field` / `function`. Mirrors the in-module
+        // `Expr::Static` handling for `Foo::a`.
+        QualifiedTarget::EnumVariant { decl } => {
+            let foreign_module = modules.get(&module_uri)?;
+            let Decl::Enum(ed) = &foreign_module.hir.decls[decl] else {
+                return None;
+            };
+            TypeShape::Named {
+                name: foreign_module.hir.idents[ed.name].text.clone(),
+                params: Vec::new(),
+            }
+        }
     })
 }
 
@@ -1137,6 +1156,12 @@ fn resolve_qualified_static_call_shape(
 
 enum QualifiedTarget {
     Member(crate::analyzer::MemberDef),
+    /// Enum-variant access — `module::Foo::a` where `Foo` is an
+    /// enum decl and `a` matches one of its variants. Carries the
+    /// enum decl so callers can mint the enum's TypeShape.
+    EnumVariant {
+        decl: Idx<Decl>,
+    },
 }
 
 /// Walk a `module::Type::member` chain and resolve each segment.
@@ -1159,42 +1184,59 @@ fn resolve_qualified_chain(
     let module_uri = index.module_uri(module_name)?.clone();
     let foreign = modules.get(&module_uri)?;
     let foreign_root = foreign.hir.module.as_ref()?;
-    let mut type_decl_id: Option<Idx<Decl>> = None;
+    // Look for the named decl — could be a `type` or `enum`.
+    let mut found: Option<Idx<Decl>> = None;
     for decl_id in &foreign_root.decls {
-        let Decl::Type(td) = &foreign.hir.decls[*decl_id] else {
-            continue;
+        let name_text = match &foreign.hir.decls[*decl_id] {
+            Decl::Type(td) => &foreign.hir.idents[td.name].text,
+            Decl::Enum(ed) => &foreign.hir.idents[ed.name].text,
+            _ => continue,
         };
-        if foreign.hir.idents[td.name].text == type_name {
-            type_decl_id = Some(*decl_id);
+        if name_text == type_name {
+            found = Some(*decl_id);
             break;
         }
     }
-    let type_decl_id = type_decl_id?;
-    let Decl::Type(td) = &foreign.hir.decls[type_decl_id] else {
-        return None;
-    };
-    for attr_id in &td.attrs {
-        if foreign.hir.idents[foreign.hir.type_attrs[*attr_id].name].text == member_name {
-            return Some((
-                module_uri,
-                type_decl_id,
-                QualifiedTarget::Member(MemberDef::Attr(*attr_id)),
-            ));
+    let type_decl_id = found?;
+    match &foreign.hir.decls[type_decl_id] {
+        Decl::Enum(ed) => {
+            for f in &ed.fields {
+                if foreign.hir.idents[foreign.hir.enum_fields[*f].name].text == member_name {
+                    return Some((
+                        module_uri,
+                        type_decl_id,
+                        QualifiedTarget::EnumVariant { decl: type_decl_id },
+                    ));
+                }
+            }
+            None
         }
-    }
-    for method_id in &td.methods {
-        let Decl::Fn(m) = &foreign.hir.decls[*method_id] else {
-            continue;
-        };
-        if foreign.hir.idents[m.name].text == member_name {
-            return Some((
-                module_uri,
-                type_decl_id,
-                QualifiedTarget::Member(MemberDef::Method(*method_id)),
-            ));
+        Decl::Type(td) => {
+            for attr_id in &td.attrs {
+                if foreign.hir.idents[foreign.hir.type_attrs[*attr_id].name].text == member_name {
+                    return Some((
+                        module_uri,
+                        type_decl_id,
+                        QualifiedTarget::Member(MemberDef::Attr(*attr_id)),
+                    ));
+                }
+            }
+            for method_id in &td.methods {
+                let Decl::Fn(m) = &foreign.hir.decls[*method_id] else {
+                    continue;
+                };
+                if foreign.hir.idents[m.name].text == member_name {
+                    return Some((
+                        module_uri,
+                        type_decl_id,
+                        QualifiedTarget::Member(MemberDef::Method(*method_id)),
+                    ));
+                }
+            }
+            None
         }
+        _ => None,
     }
-    None
 }
 
 /// P15.7 — figure out what return type a `Call(callee=Static)` should

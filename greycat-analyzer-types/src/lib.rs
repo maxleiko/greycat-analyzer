@@ -370,6 +370,17 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             alts.iter().any(|b| is_assignable_to(arena, from, *b))
         }
         (TypeKind::Enum { name: na, .. }, TypeKind::Enum { name: nb, .. }) => na == nb,
+        // Cross-arena enum identity: when one side resolves to the
+        // registered `Enum { name, variants }` shape and the other
+        // crossed an arena boundary as a bare `Named { name }` (the
+        // post-pass mints param types via `mint_type_shape`, which
+        // produces `Named` for any non-builtin name without consulting
+        // the home module's registry), treat them as the same type
+        // when names agree. Otherwise an enum value flowing into an
+        // enum-typed slot lights up "value of type `Foo` is not
+        // assignable to parameter `_: Foo`" false positives.
+        (TypeKind::Enum { name: na, .. }, TypeKind::Named { name: nb })
+        | (TypeKind::Named { name: nb }, TypeKind::Enum { name: na, .. }) => na == nb,
         _ => false,
     }
 }

@@ -34,6 +34,28 @@ impl<'src> LowerCtx<'src> {
             byte_range: node.byte_range(),
         })
     }
+
+    /// Allocate an ident for a property-position node that may be
+    /// either a plain `ident` or a quoted `string` (the grammar
+    /// accepts `Foo::a` and `Foo::"a"` interchangeably for enum
+    /// variant access). For the `string` form, store the unquoted
+    /// fragment text so `member_uses` / variant lookups succeed
+    /// without callers having to strip quotes.
+    fn alloc_property_ident(&mut self, node: tree_sitter::Node<'_>) -> Idx<Ident> {
+        if node.kind() == "string" {
+            let mut c = node.walk();
+            if let Some(frag) = node
+                .named_children(&mut c)
+                .find(|n| n.kind() == "string_fragment")
+            {
+                return self.hir.idents.alloc(Ident {
+                    text: self.text(frag).to_string(),
+                    byte_range: node.byte_range(),
+                });
+            }
+        }
+        self.alloc_ident(node)
+    }
 }
 
 pub fn lower_module(
@@ -778,7 +800,10 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 }
             } else {
                 let ty = lower_type_ref(cx, head)?;
-                let property = cx.alloc_ident(prop);
+                // The property can be either an `ident` (`Foo::a`) or a
+                // quoted `string` (`Foo::"a"`); both forms are valid
+                // enum-variant access syntax.
+                let property = cx.alloc_property_ident(prop);
                 Expr::Static(StaticExpr {
                     ty,
                     property,
@@ -1041,7 +1066,9 @@ fn collect_static_chain_idents(
     } else {
         return false;
     }
-    out.push(cx.alloc_ident(prop));
+    // Trailing chain segment can be `ident` or quoted `string`
+    // (`module::Foo::"a"` is valid enum-variant access).
+    out.push(cx.alloc_property_ident(prop));
     true
 }
 

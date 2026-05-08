@@ -3470,28 +3470,52 @@ fn static_completion(
 
     let mut items: Vec<CompletionItem> = Vec::new();
 
-    // Type-receiver branch: enumerate the type's static methods.
+    // Receiver branch: type-decl → static methods, enum-decl →
+    // variants. The `recv` text matches a top-level decl name in some
+    // module (resolved through the project decl table).
     if let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&recv).first()
         && let Some(fmod) = project.module(foreign_uri)
-        && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
     {
-        for method_id in &td.methods {
-            let Decl::Fn(m) = &fmod.hir.decls[*method_id] else {
-                continue;
-            };
-            if !m.modifiers.static_ {
-                continue;
+        match &fmod.hir.decls[*foreign_decl_id] {
+            Decl::Type(td) => {
+                for method_id in &td.methods {
+                    let Decl::Fn(m) = &fmod.hir.decls[*method_id] else {
+                        continue;
+                    };
+                    if !m.modifiers.static_ {
+                        continue;
+                    }
+                    let name = fmod.hir.idents[m.name].text.clone();
+                    if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::METHOD),
+                        insert_text: Some(name),
+                        ..Default::default()
+                    });
+                }
             }
-            let name = fmod.hir.idents[m.name].text.clone();
-            if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
-                continue;
+            Decl::Enum(ed) => {
+                // `Foo::|` where `Foo` is an enum — surface every
+                // variant. `EnumMember` would be ideal but the LSP
+                // protocol only ships `EnumMember` from 3.16+; LSP
+                // clients fall back to ENUM rendering.
+                for f in &ed.fields {
+                    let name = fmod.hir.idents[fmod.hir.enum_fields[*f].name].text.clone();
+                    if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::ENUM_MEMBER),
+                        insert_text: Some(name),
+                        ..Default::default()
+                    });
+                }
             }
-            items.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::METHOD),
-                insert_text: Some(name),
-                ..Default::default()
-            });
+            _ => {}
         }
     }
 

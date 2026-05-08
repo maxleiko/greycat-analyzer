@@ -1367,6 +1367,20 @@ impl<'a> Cx<'a> {
                 // `deferred_member_uses` (P11.5).
                 let recv_ty = self.lower_type_ref(s.ty);
                 self.resolve_member(recv_ty, s.property);
+                // Enum-variant access: `Foo::a` where `Foo` is an enum
+                // and `a` is one of its variants — the value's type is
+                // the enum itself, not `any`. Without this the static-
+                // expr post-pass falls through to `any` (variants don't
+                // appear in `type_decls.attrs` / `.methods`), which
+                // cascades into `value of type 'any' is not assignable
+                // to parameter '_: Foo'` false-positives at every call
+                // site that takes the enum as a parameter.
+                if let TypeKind::Enum { variants, .. } = &self.out.types.get(recv_ty).kind {
+                    let prop = self.hir.idents[s.property].text.as_str();
+                    if variants.iter().any(|v| v == prop) {
+                        return recv_ty;
+                    }
+                }
                 self.any()
             }
             Expr::QualifiedStatic { .. } => {

@@ -320,6 +320,115 @@ fn inlay_hints_with_project_use_cross_module_call_return_types() {
     );
 }
 
+/// Anchors enum-variant access typing across all four valid forms:
+///   - `Foo::a`              (Static, ident property)
+///   - `Foo::"a"`            (Static, string property)
+///   - `project::Foo::a`     (QualifiedStatic, ident property)
+///   - `project::Foo::"a"`   (QualifiedStatic, string property)
+///
+/// Each must type as `Foo` (the enum) so passing it to a
+/// `_: Foo` parameter doesn't trip the call-arg validator's
+/// "value of type `any` is not assignable" false-positive.
+#[test]
+fn enum_variant_access_types_as_enum_in_all_four_forms() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    use std::str::FromStr;
+
+    let uri = Uri::from_str("file:///project.gcl").unwrap();
+    let src = "enum Foo { a, b }\n\
+        fn test() {\n\
+        \x20   take(Foo::a);\n\
+        \x20   take(Foo::\"a\");\n\
+        \x20   take(project::Foo::a);\n\
+        \x20   take(project::Foo::\"a\");\n\
+        }\n\
+        fn take(_: Foo) {}\n";
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(uri.clone(), src, "project", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let module = pa.module(&uri).expect("module cached");
+
+    // Every Static / QualifiedStatic expression in this fixture
+    // should carry a `Foo`-shaped type (Enum or Named with name
+    // "Foo"); none should be `any`.
+    use greycat_analyzer_hir::types::Expr;
+    let mut static_count = 0usize;
+    for (idx, expr) in module.hir.exprs.iter() {
+        let is_static = matches!(expr, Expr::Static(_) | Expr::QualifiedStatic { .. });
+        if !is_static {
+            continue;
+        }
+        static_count += 1;
+        let ty = module
+            .analysis
+            .expr_types
+            .get(&idx)
+            .copied()
+            .unwrap_or_else(|| panic!("static expr at idx {idx:?} has no expr_types entry"));
+        let display = greycat_analyzer_types::display(&module.analysis.types, ty);
+        assert_eq!(
+            display, "Foo",
+            "static expression should type as `Foo` (enum), got `{display}`"
+        );
+    }
+    assert_eq!(
+        static_count, 4,
+        "expected 4 static expressions in the fixture, got {static_count}"
+    );
+
+    // The call-arg validator must accept all four call sites — no
+    // semantic diagnostics should fire on this module.
+    let diag_msgs: Vec<_> = module
+        .analysis
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        diag_msgs.is_empty(),
+        "expected no semantic diagnostics on enum-variant calls, got {diag_msgs:?}"
+    );
+}
+
+/// Anchors completion for enum variants: typing `Foo::|` should list
+/// the enum's variants (`a`, `b`) — alongside any other completion
+/// surface. Reproduces the user's report that no completion shows
+/// up after `Foo::`.
+#[test]
+fn completion_after_enum_double_colon_lists_variants() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    use std::str::FromStr;
+
+    let uri = Uri::from_str("file:///project.gcl").unwrap();
+    let src = "enum Foo { alpha, beta }\nfn test() {\n    var x = Foo::\n}\n";
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(uri.clone(), src, "project", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&uri).unwrap();
+    let doc = cell.borrow();
+
+    // Cursor at the `\n` right after `Foo::` on line 2.
+    let cursor = src.find("Foo::").unwrap() + "Foo::".len();
+    let line = src[..cursor].matches('\n').count() as u32;
+    let col = (cursor - src[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(line, col),
+        &uri,
+        &pa,
+        None,
+    )
+    .unwrap_or_else(|| panic!("expected completion response after `Foo::`"));
+    let labels: Vec<_> = list.items.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"alpha") && labels.contains(&"beta"),
+        "expected enum variants `alpha`, `beta` in `Foo::` completion, got {labels:?}"
+    );
+}
+
 /// Mirrors the user's project.gcl: a bare-ident call `foo()` to a
 /// fn declared in the same module with a `String?` return type. The
 /// analyzer's first pass returns `any` for non-generic Ident-callee
