@@ -160,24 +160,12 @@ impl ProjectAnalysis {
         self.infer_cross_module_call_types();
 
         // Pass 3.6 (P15.10): call-site arg-type validation. Runs after
-        // pass 3.5 so outer calls whose args contain inner static-expr
-        // calls (e.g. `expect_Identity(Identity::create(...))`) see the
-        // post-pass-3.5 inner-call return type instead of the
-        // placeholder `any` the analyzer first-pass left behind.
-        self.validate_call_arg_types();
-
-        // Pass 3.7: condition-type validation. Drains every module's
-        // `bool_check_conditions` queue and emits `"<label> must be
-        // \`bool\`, got \`T\`"` whenever the condition's now-settled
-        // type isn't bool-assignable. Same rationale as 3.6 — the
-        // first-pass would have surfaced false positives for
-        // cross-module Call / Member-call conditions whose return
-        // type wasn't yet inferred.
         // Architectural assertion: nothing earlier in the pipeline
         // may emit type-relation diagnostics — those would compare
         // against pre-fixup `expr_types` and surface false-positives
         // for cross-module Calls. `validate_type_relations` is the
-        // sole producer.
+        // sole producer; it covers var-init / assign / return /
+        // condition / call-arg checks in one walk.
         #[cfg(debug_assertions)]
         self.assert_no_type_relation_diags_yet();
         self.validate_type_relations();
@@ -583,91 +571,77 @@ impl ProjectAnalysis {
     /// cross-module return-type inferences (otherwise outer calls
     /// whose args are inner static-expr calls would all surface
     /// "value of type `any`" false positives).
-    fn validate_call_arg_types(&mut self) {
-        use crate::analyzer::{SemanticDiagnostic, Severity};
+    /// Walk every module's `Expr::Call` and emit a diagnostic for
+    /// each arg whose settled type isn't assignable to the
+    /// corresponding declared param. Folded into the unified
+    /// validation phase so all type-relation diagnostics share one
+    /// producer.
+    fn collect_call_arg_diags(&self, cur_uri: &Uri) -> Vec<crate::analyzer::SemanticDiagnostic> {
+        use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
         use greycat_analyzer_hir::types::Expr;
 
-        #[allow(clippy::mutable_key_type)]
-        let mut diag_updates: HashMap<Uri, Vec<SemanticDiagnostic>> = HashMap::new();
-        for (cur_uri, cur_module) in &self.modules {
-            for (_call_id, call_expr) in cur_module.hir.exprs.iter() {
-                let Expr::Call(call) = call_expr else {
+        let cur_module = match self.modules.get(cur_uri) {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for (_call_id, call_expr) in cur_module.hir.exprs.iter() {
+            let Expr::Call(call) = call_expr else {
+                continue;
+            };
+            let Some((foreign_uri_opt, fn_decl_id)) =
+                resolve_call_target(&self.modules, &self.index, cur_module, call.callee)
+            else {
+                continue;
+            };
+            let foreign_module = match &foreign_uri_opt {
+                Some(u) => self.modules.get(u),
+                None => Some(cur_module),
+            };
+            let Some(fn_module) = foreign_module else {
+                continue;
+            };
+            let Decl::Fn(fnd) = &fn_module.hir.decls[fn_decl_id] else {
+                continue;
+            };
+            if !fnd.generics.is_empty() {
+                continue;
+            }
+            let pair_count = fnd.params.len().min(call.args.len());
+            for i in 0..pair_count {
+                let p = &fn_module.hir.fn_params[fnd.params[i]];
+                let Some(declared_ref) = p.ty else {
                     continue;
                 };
-                let Some((foreign_uri_opt, fn_decl_id)) =
-                    resolve_call_target(&self.modules, &self.index, cur_module, call.callee)
-                else {
-                    continue;
+                let declared_shape = read_type_shape(&fn_module.hir, declared_ref);
+                let arg_ty = match cur_module.analysis.expr_types.get(&call.args[i]).copied() {
+                    Some(t) => t,
+                    None => continue,
                 };
-                let foreign_module = match &foreign_uri_opt {
-                    Some(u) => self.modules.get(u),
-                    None => Some(cur_module),
-                };
-                let Some(fn_module) = foreign_module else {
-                    continue;
-                };
-                let Decl::Fn(fnd) = &fn_module.hir.decls[fn_decl_id] else {
-                    continue;
-                };
-                if !fnd.generics.is_empty() {
-                    continue;
-                }
-                let pair_count = fnd.params.len().min(call.args.len());
-                for i in 0..pair_count {
-                    let p = &fn_module.hir.fn_params[fnd.params[i]];
-                    let Some(declared_ref) = p.ty else {
-                        continue;
+                let mut tmp_arena = cur_module.analysis.types.clone();
+                let declared_ty = mint_type_shape(&declared_shape, &mut tmp_arena);
+                if !greycat_analyzer_types::is_assignable_to(&tmp_arena, arg_ty, declared_ty) {
+                    let p_name = fn_module.hir.idents[p.name].text.clone();
+                    let arg_display =
+                        greycat_analyzer_types::display(&cur_module.analysis.types, arg_ty);
+                    let declared_display = greycat_analyzer_types::display(&tmp_arena, declared_ty);
+                    let r = match &cur_module.hir.exprs[call.args[i]] {
+                        Expr::Ident(idx) => cur_module.hir.idents[*idx].byte_range.clone(),
+                        other => other.byte_range(),
                     };
-                    // Translate the declared param type from the foreign
-                    // (or in-module) HIR into the *caller's* arena.
-                    let declared_shape = read_type_shape(&fn_module.hir, declared_ref);
-                    let arg_ty = match cur_module.analysis.expr_types.get(&call.args[i]).copied() {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    // We need a TypeId for the declared shape in the
-                    // caller's arena to compare. Mint it via a temp
-                    // arena clone — we don't want to mutate
-                    // `cur_module.analysis.types` from this read-only
-                    // pass, so we work with a clone.
-                    let mut tmp_arena = cur_module.analysis.types.clone();
-                    let declared_ty = mint_type_shape(&declared_shape, &mut tmp_arena);
-                    if !greycat_analyzer_types::is_assignable_to(&tmp_arena, arg_ty, declared_ty) {
-                        let p_name = fn_module.hir.idents[p.name].text.clone();
-                        let arg_display =
-                            greycat_analyzer_types::display(&cur_module.analysis.types, arg_ty);
-                        let declared_display =
-                            greycat_analyzer_types::display(&tmp_arena, declared_ty);
-                        let msg = format!(
+                    out.push(SemanticDiagnostic {
+                        severity: Severity::Error,
+                        message: format!(
                             "value of type `{}` is not assignable to parameter `{}: {}`",
                             arg_display, p_name, declared_display
-                        );
-                        // `Expr::Ident` returns 0..0 from `byte_range()`;
-                        // grab the ident's actual byte_range from the
-                        // arena so the diagnostic anchors at the call-
-                        // site arg, not at line 1 col 1.
-                        let r = match &cur_module.hir.exprs[call.args[i]] {
-                            Expr::Ident(idx) => cur_module.hir.idents[*idx].byte_range.clone(),
-                            other => other.byte_range(),
-                        };
-                        diag_updates
-                            .entry(cur_uri.clone())
-                            .or_default()
-                            .push(SemanticDiagnostic {
-                                severity: Severity::Error,
-                                message: msg,
-                                byte_range: r,
-                                category: crate::analyzer::DiagCategory::TypeRelation,
-                            });
-                    }
+                        ),
+                        byte_range: r,
+                        category: DiagCategory::TypeRelation,
+                    });
                 }
             }
         }
-        for (uri, diags) in diag_updates {
-            if let Some(m) = self.modules.get_mut(&uri) {
-                m.analysis.diagnostics.extend(diags);
-            }
-        }
+        out
     }
 
     /// Pass 3.7 — unified type-relation validation. Walks every
@@ -712,6 +686,10 @@ impl ProjectAnalysis {
         for (cur_uri, cur_module) in &self.modules {
             let mut diags: Vec<SemanticDiagnostic> = Vec::new();
             validate_module_type_relations(cur_module, &mut diags);
+            // Call-arg validation needs cross-module access (foreign
+            // fn signatures), so it lives on `&self` rather than the
+            // free walker.
+            diags.extend(self.collect_call_arg_diags(cur_uri));
             if !diags.is_empty() {
                 diag_updates.insert(cur_uri.clone(), diags);
             }
@@ -922,15 +900,10 @@ impl ProjectAnalysis {
         // P15.7 + P16.4: cross-module call return-type inference +
         // bare-ident and qualified-static type fixups.
         self.infer_cross_module_call_types();
-        // P15.10: call-site arg-type validation (depends on pass 3.5
-        // having settled inner static-expr return types).
-        self.validate_call_arg_types();
-        // Pass 3.7: condition-type validation.
         // Architectural assertion: nothing earlier in the pipeline
-        // may emit type-relation diagnostics — those would compare
-        // against pre-fixup `expr_types` and surface false-positives
-        // for cross-module Calls. `validate_type_relations` is the
-        // sole producer.
+        // may emit type-relation diagnostics. `validate_type_relations`
+        // is the sole producer; it covers var-init / assign / return /
+        // condition / call-arg checks in one walk.
         #[cfg(debug_assertions)]
         self.assert_no_type_relation_diags_yet();
         self.validate_type_relations();
