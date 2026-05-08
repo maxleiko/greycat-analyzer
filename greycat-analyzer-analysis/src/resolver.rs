@@ -648,6 +648,8 @@ fn f(p: Foo): Foo { return p; }
     #[test]
     fn project_index_fallback_resolves_cross_module_name() {
         use crate::stdlib::ProjectIndex;
+        use greycat_analyzer_core::lsp_types::Uri;
+        use std::str::FromStr;
         // Module A declares `Helper` as a top-level type. Module B
         // refers to `Helper` — without a ProjectIndex it'd be
         // unresolved; with one ingested from A it binds to Project.
@@ -656,7 +658,7 @@ fn f(p: Foo): Foo { return p; }
         let other_hir = lower_module(other_src, "a", "p", other_tree.root_node());
 
         let mut idx = ProjectIndex::new();
-        idx.ingest(&other_hir);
+        idx.ingest(&Uri::from_str("file:///proj/a.gcl").unwrap(), &other_hir);
 
         let user_src = "fn use_helper(h: Helper) {}\n";
         let user_tree = parse(user_src);

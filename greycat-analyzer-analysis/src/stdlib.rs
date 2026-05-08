@@ -14,7 +14,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
+use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Decl, FnDecl, TypeRef as HirTypeRef};
 use greycat_analyzer_types::{Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry};
 
@@ -60,6 +62,12 @@ pub struct ProjectIndex {
     /// project?" without needing the cross-module decl pointer (a
     /// later P6.x deliverable).
     pub values: HashSet<String>,
+    /// Cross-module decl table (P11.1): name → every `(Uri, Idx<Decl>)`
+    /// pair that introduces a top-level decl with this name across the
+    /// project. Collisions are kept; disambiguation happens at the use
+    /// site via the importing module's lib/include closure (P11.2+).
+    /// Pragma decls have no name and are excluded.
+    pub decl_locations: HashMap<String, Vec<(Uri, Idx<Decl>)>>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -74,9 +82,11 @@ impl ProjectIndex {
     }
 
     /// Walk a HIR module's top-level decls and register everything that's
-    /// a type-name (type / enum) or a native function. Re-entrant: calling
-    /// twice with the same module is a no-op apart from the counter.
-    pub fn ingest(&mut self, hir: &Hir) {
+    /// a type-name (type / enum) or a native function, recording each
+    /// named decl into [`Self::decl_locations`] keyed by `uri`. Re-entrant:
+    /// calling twice with the same `(uri, hir)` is a no-op apart from the
+    /// counter — duplicate `(uri, decl_id)` pairs are not appended.
+    pub fn ingest(&mut self, uri: &Uri, hir: &Hir) {
         let Some(module) = hir.module.as_ref() else {
             return;
         };
@@ -90,8 +100,9 @@ impl ProjectIndex {
                         // Named(name); P2.4's generic instantiation logic
                         // takes over at use sites.
                         let id = self.types.named(&name);
-                        self.registry.register(name, id);
+                        self.registry.register(name.clone(), id);
                     }
+                    self.record_decl_location(name, uri, *decl_id);
                 }
                 Decl::Enum(ed) => {
                     let name = hir.idents[ed.name].text.clone();
@@ -108,8 +119,9 @@ impl ProjectIndex {
                             },
                             nullable: false,
                         });
-                        self.registry.register(name, id);
+                        self.registry.register(name.clone(), id);
                     }
+                    self.record_decl_location(name, uri, *decl_id);
                 }
                 Decl::Fn(fnd) => {
                     let name = hir.idents[fnd.name].text.clone();
@@ -117,17 +129,39 @@ impl ProjectIndex {
                         let sig = native_signature_for(hir, fnd, &mut self.types);
                         self.natives.register(name.clone(), sig);
                     } else {
-                        self.values.insert(name);
+                        self.values.insert(name.clone());
                     }
+                    self.record_decl_location(name, uri, *decl_id);
                 }
                 Decl::Var(vd) => {
                     let name = hir.idents[vd.name].text.clone();
-                    self.values.insert(name);
+                    self.values.insert(name.clone());
+                    self.record_decl_location(name, uri, *decl_id);
                 }
                 Decl::Pragma(_) => {}
             }
         }
         self.modules_ingested += 1;
+    }
+
+    fn record_decl_location(&mut self, name: String, uri: &Uri, decl_id: Idx<Decl>) {
+        let entry = self.decl_locations.entry(name).or_default();
+        if !entry.iter().any(|(u, d)| u == uri && *d == decl_id) {
+            entry.push((uri.clone(), decl_id));
+        }
+    }
+
+    /// Cross-module decl lookup (P11.1): every `(Uri, Idx<Decl>)` pair
+    /// known under this name. Empty slice when the name is unknown.
+    /// Built-in runtime type names (`Array`, `Map`, …) and language
+    /// primitives have no `.gcl` decl and so never appear here — use
+    /// [`Self::has_name`] to ask the broader "is this name known?"
+    /// question.
+    pub fn locate_decl(&self, name: &str) -> &[(Uri, Idx<Decl>)] {
+        self.decl_locations
+            .get(name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// `true` iff `name` resolves against any name the project knows:
@@ -272,10 +306,15 @@ mod tests {
     use super::*;
     use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
+    use std::str::FromStr;
 
     fn lower(src: &str) -> Hir {
         let tree = parse(src);
         lower_module(src, "stdmod", "std", tree.root_node())
+    }
+
+    fn uri(path: &str) -> Uri {
+        Uri::from_str(&format!("file://{path}")).unwrap()
     }
 
     #[test]
@@ -293,7 +332,7 @@ type Company {
 "#,
         );
         let mut idx = ProjectIndex::new();
-        idx.ingest(&hir);
+        idx.ingest(&uri("/proj/people.gcl"), &hir);
         assert_eq!(idx.modules_ingested, 1);
         assert!(idx.registry.lookup("Person").is_some());
         assert!(idx.registry.lookup("Company").is_some());
@@ -303,7 +342,7 @@ type Company {
     fn ingest_registers_enum_decls() {
         let hir = lower("enum Color { Red, Green, Blue }\n");
         let mut idx = ProjectIndex::new();
-        idx.ingest(&hir);
+        idx.ingest(&uri("/proj/color.gcl"), &hir);
         let id = idx.registry.lookup("Color").expect("Color registered");
         let ty = idx.types.get(id);
         let TypeKind::Enum { variants, .. } = &ty.kind else {
@@ -321,7 +360,7 @@ private native fn now(): time;
 "#,
         );
         let mut idx = ProjectIndex::new();
-        idx.ingest(&hir);
+        idx.ingest(&uri("/proj/io.gcl"), &hir);
         let read = idx.natives.lookup("read_file").expect("read_file present");
         assert_eq!(read.params.len(), 1);
         let now = idx.natives.lookup("now").expect("now present");
@@ -331,15 +370,70 @@ private native fn now(): time;
     #[test]
     fn ingest_is_idempotent_on_repeated_calls() {
         let hir = lower("type T {}\n");
+        let u = uri("/proj/t.gcl");
         let mut idx = ProjectIndex::new();
-        idx.ingest(&hir);
+        idx.ingest(&u, &hir);
         let len_after_first = idx.types.len();
-        idx.ingest(&hir);
+        idx.ingest(&u, &hir);
         assert_eq!(
             idx.types.len(),
             len_after_first,
             "duplicate type registrations"
         );
         assert_eq!(idx.modules_ingested, 2);
+        // decl_locations is also idempotent — the same (uri, decl_id)
+        // pair shouldn't be appended twice.
+        assert_eq!(idx.locate_decl("T").len(), 1);
+    }
+
+    #[test]
+    fn locate_decl_records_uri_and_decl_id() {
+        // Acceptance for P11.1: querying the index for a declared type
+        // returns the URI of the module that introduced it and a
+        // matching `Idx<Decl>`. Synthetic stand-in for `Permission` in
+        // `lib/std/runtime.gcl` so the test doesn't depend on `greycat
+        // install` having been run.
+        let hir = lower("private type Permission {}\n");
+        let permission_uri = uri("/proj/lib/std/runtime.gcl");
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&permission_uri, &hir);
+
+        let hits = idx.locate_decl("Permission");
+        assert_eq!(hits.len(), 1, "exactly one Permission decl across project");
+        let (found_uri, decl_id) = &hits[0];
+        assert_eq!(found_uri, &permission_uri);
+        assert!(matches!(&hir.decls[*decl_id], Decl::Type(_)));
+    }
+
+    #[test]
+    fn locate_decl_keeps_collisions_across_modules() {
+        // Same name in two modules should produce two entries — P11.2
+        // disambiguates at the use site via the importer's lib/include
+        // closure, but the table itself keeps every hit.
+        let hir_a = lower("type Helper {}\n");
+        let hir_b = lower("type Helper {}\n");
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&uri("/proj/a.gcl"), &hir_a);
+        idx.ingest(&uri("/proj/b.gcl"), &hir_b);
+        let hits = idx.locate_decl("Helper");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, uri("/proj/a.gcl"));
+        assert_eq!(hits[1].0, uri("/proj/b.gcl"));
+    }
+
+    #[test]
+    fn locate_decl_records_fns_and_top_vars() {
+        let hir = lower(
+            r#"
+fn helper(): int { return 1; }
+var TOP: int = 1;
+"#,
+        );
+        let u = uri("/proj/m.gcl");
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&u, &hir);
+        assert_eq!(idx.locate_decl("helper").len(), 1);
+        assert_eq!(idx.locate_decl("TOP").len(), 1);
+        assert!(idx.locate_decl("missing").is_empty());
     }
 }

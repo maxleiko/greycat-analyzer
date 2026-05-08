@@ -284,7 +284,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] **11.1 Global decl table** (M) — `ProjectIndex` gains `decl_locations: HashMap<String, Vec<(Uri, Idx<Decl>)>>` populated by `ingest`. Collisions across modules are kept; disambiguation happens at the use site via the importing module's lib/include closure. `ProjectAnalysis::analyze` repopulates on every rebuild. Acceptance: querying the index for `"Permission"` returns the URI of `lib/std/runtime.gcl` and the matching `Idx<Decl>`.
+- [x] **11.1 Global decl table** (M) — `ProjectIndex` gains `decl_locations: HashMap<String, Vec<(Uri, Idx<Decl>)>>` populated by `ingest`. Collisions across modules are kept; disambiguation happens at the use site via the importing module's lib/include closure. `ProjectAnalysis::analyze` repopulates on every rebuild. Acceptance: querying the index for `"Permission"` returns the URI of `lib/std/runtime.gcl` and the matching `Idx<Decl>`.
 
 - [ ] **11.2 `Definition::Project` carries detail** (M) — replace the unit `Definition::Project` with `Definition::ProjectDecl { uri, decl }`. Resolver's `record_use` consults the global decl table when local scope misses; capabilities pattern-match the new shape. Stays `Copy` since `Idx` is `Copy` and `Uri` already is. Adjusts capabilities + analyzer + lints downstream.
 

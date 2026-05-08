@@ -74,7 +74,7 @@ impl ProjectAnalysis {
         for (uri, cell) in manager.iter() {
             let doc = cell.borrow();
             let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
-            self.index.ingest(&hir);
+            self.index.ingest(uri, &hir);
             hirs.push((uri.clone(), hir));
         }
 
@@ -124,13 +124,13 @@ impl ProjectAnalysis {
         // fresh index is what makes deletions visible.
         let mut new_index = ProjectIndex::new();
         if let Some(hir) = &changed_hir {
-            new_index.ingest(hir);
+            new_index.ingest(uri, hir);
         }
         for (other_uri, ma) in &self.modules {
             if other_uri == uri {
                 continue;
             }
-            new_index.ingest(&ma.hir);
+            new_index.ingest(other_uri, &ma.hir);
         }
         // For docs that are in the manager but not yet in the cache
         // (e.g. freshly added, never analyzed), lower them so the index
@@ -142,7 +142,7 @@ impl ProjectAnalysis {
             }
             let doc = cell.borrow();
             let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
-            new_index.ingest(&hir);
+            new_index.ingest(other_uri, &hir);
         }
         self.index = new_index;
 
