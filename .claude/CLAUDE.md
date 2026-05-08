@@ -70,8 +70,9 @@ Verification order:
 1. Inspect `tree-sitter-greycat/grammar.js` for the existing rule shape.
 2. Search the stdlib (`lib/std/*.gcl`) and corpus (`tests/corpus/`) for real examples of the construct.
 3. Invoke the `/greycat:greycat` skill — it has the canonical syntax/semantics reference.
-4. Read the TS reference at `https://hub.datathings.com/greycat/lang` if you have a checkout / can git clone with ssh.
-5. If still unresolved after (1)–(4): **STOP and ask the user.** Even in auto-mode.
+4. Read the TS reference at `https://hub.datathings.com/greycat/lang` if you have a checkout / can git clone with ssh (`git clone git@hub.datathings.com:greycat/lang.git`).
+5. **Run against `greycat run`** — the GreyCat compiler is the *true oracle* for what is and isn't valid. Write a minimal `project.gcl`, run `greycat run`, and read the diagnostic. Caveat: the runtime compiler doesn't do control-flow analysis (narrowing, exhaustiveness, etc.), so behaviors that depend on those still need to be validated through the TS reference / corpus / runtime *assignment* (e.g. provoke the error by actually running the call). When the TS reference and the runtime disagree (it has happened — see P12.2 generic variance), trust the runtime.
+6. If still unresolved after (1)–(5): **STOP and ask the user.** Even in auto-mode.
 
 If for any reason you cannot stop (truly unattended run), leave a `// FIXME(syntax-assumption): <what you assumed and why>` comment beside the change AND append a one-line entry to [`docs/syntax-assumptions.log`](../docs/syntax-assumptions.log) so the user can find every assumption on return. Never ship a grammar / lowering change that bakes in a syntactic assumption silently.
 
