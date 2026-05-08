@@ -486,6 +486,36 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 ---
 
+### TS-side dump tooling (oracle for parity work)
+
+The TS reference (`greycat-lang`) ships three subcommands as of 2026-05-08
+that dump the typed-AST / typed-HIR for direct comparison against the
+Rust port. These are the **source of truth** for inferred-type / binding
+shapes — when in doubt, run the TS dump and match it.
+
+| Subcommand | Output | Use case |
+|---|---|---|
+| `greycat-lang dump-types <path> [--filter R]` | JSONL: one record per typed expression with `kind`, `range` (UTF-8 byte half-open), `line:col`, `type` (FQN form like `core::Array<core::int \| null>`), `nullable`, `text` | inferred-type parity oracle |
+| `greycat-lang dump-resolutions <path> [--filter R]` | JSONL: one record per ident use with `refKind` / `declKind` / `name` / `decl: { fqn, file, range, line, col }` | resolver / cross-module binding oracle |
+| `greycat-lang dump-hir <path> [--filter R] [--pretty]` | single JSON: `modules[]` with `types`/`enums`/`functions`/`vars`, each carrying signature, span, and a typed AST body where every node has `kind`/`span`/`type`/`nullable` | full snapshot diffs |
+
+**Stability hints honored:**
+- Output sorted by `(file, line, col, byteStart, byteEnd)` for clean diffs.
+- Single canonical type printer (TS `shared.ts:159`) emits FQN-or-builtin form; same string regardless of context.
+- Half-open UTF-8 byte ranges (matches tree-sitter conventions).
+- `--filter B` / `B-B` / `L:C` / `L:C-L:C` for narrowing.
+- Single-file mode walks up to find `project.gcl`, analyzes the whole project for cross-module resolutions, then scopes output to just that file.
+
+**Use it as a parity oracle, not a parity contract:** any analyzer / resolver change that affects `expr_types` / `member_uses` / `def_types` should be validated by running both `dump-types` outputs and comparing. **But the TS reference isn't always right** — it carries historical accommodations the Rust port doesn't need to inherit. The dump is the oracle for "what does TS produce here?"; the *correctness call* still lives with the type system / language reference.
+
+**Implementation pointer (TS side):** `packages/cli/src/dump/` with a `RecordingAnalyzer` Proxy at `shared.ts:303` that wraps `GreycatAnalyzer.analyze()` to capture per-node `Value` returns.
+
+**Intentional divergences from TS (allow-list for the P18 parity gate):**
+- **Method-access without call (`x.s.method`) types as `function`, not the method's return type.** TS auto-evaluates the access to the call's return type, which conflates the *method-reference value* with the *call result*. Methods are first-class `function` values in gcl; the Rust port respects that distinction. (P16.1's `MemberDef::Method → Named("function")` is the correct shape.)
+- More entries land here as we discover them — each one needs a one-line justification rooted in the language reference, not TS-inertia.
+
+---
+
 ### Phase 17 — Real-corpus parity ratchet (~1-2 weeks)
 
 **Goal:** drop the false-positive count on real-world projects to (near) zero, so the diagnostic-parity oracle (P14.2) can ratchet meaningfully. Driven by [tests/parity/registry_baseline/REPORT.md](../tests/parity/registry_baseline/REPORT.md), which captured 224 false-positive diagnostics on `~/dev/datathings/greycat/apps/registry` against TS reference's 0. Every chunk targets a specific bucket from that report.
@@ -509,6 +539,41 @@ P17 sits in parallel with P16: P16 handles "Bucket A" (member-flow `any` cascade
 - [ ] **17.7 Re-baseline + parity ratchet test** (S) — re-run both linters on the registry project after P17.2-6 land, regenerate [registry_baseline/](../tests/parity/registry_baseline/), and add a CI test (`registry_parity_floor`) that asserts the rust output's diagnostic count is `<= N` for some N that ratchets toward zero. Mirrors the formatter parity gauntlet's `MATCH_FLOOR` pattern. P14.2 (the diagnostic parity gate) consumes this as one of its corpora.
 
 **M17:** `greycat-analyzer lint` on `~/dev/datathings/greycat/apps/registry` produces ≤ 5 residual diagnostics (all genuine), down from 224. The registry-parity CI gate is green and the floor is live.
+
+---
+
+### Phase 18 — Typed-AST parity oracle (~1-2 weeks)
+
+**Goal:** turn the TS-side `dump-types` / `dump-resolutions` / `dump-hir` subcommands into a CI-grade parity gate so any analyzer / resolver change is validated against the oracle automatically. Closes ROADMAP §7-A end-to-end with a stronger signal than the diagnostic-diff (P14.2) — it catches silent typing regressions where the type is wrong but no diagnostic fires (which is what the registry baseline shows: 96 of 121 errors were downstream effects of silent `any`-typing).
+
+P18 sits after P16/P17 — they fix the gross gaps; P18 ratchets the residual diff toward zero with the oracle's help.
+
+**Chunks:**
+
+- [ ] **18.1 Mirror `dump-types` / `dump-resolutions` on the Rust side** (M) — new `greycat-analyzer dump-types <path> [--filter R]` and `dump-resolutions` subcommands in [`greycat-analyzer/src/cmd/`](../greycat-analyzer/src/cmd/) that emit the **same JSONL shape** as the TS reference. Every record:
+  - `file`, `range: [start, end]` (UTF-8 byte half-open), `line`, `col`, `endLine`, `endCol`
+  - `kind`: matches TS's CST node kind names (`Identifier`, `InstanceAccessExpr`, `CallExpr`, `TypeIdent`, `NumLit`, `StringLit`, etc. — port the canonical list from `packages/lang/src/parser/cst/cst_kind.ts` or wherever it lives).
+  - `type`: matches TS's canonical FQN form (`core::int`, `core::Array<core::int | null>`). Need a `display_fqn(type_id)` helper alongside the existing `display(type_id)` to render in TS's canonical shape.
+  - `nullable`: matches `Type.nullable`.
+  - `text`: source slice for the node.
+
+  Sort by `(file, line, col, byteStart, byteEnd)`. Same `--filter` shape (`B`, `B-B`, `L:C`, `L:C-L:C`).
+
+- [ ] **18.2 `parity-types.sh` driver + diff helper** (S) — new [`scripts/parity-types.sh`](../scripts/parity-types.sh) takes a `<project_or_file>` and runs both:
+  ```sh
+  greycat-lang dump-types <path>      | sort > /tmp/_ts.jsonl
+  greycat-analyzer dump-types <path>  | sort > /tmp/_rust.jsonl
+  diff -u /tmp/_ts.jsonl /tmp/_rust.jsonl
+  ```
+  + a `parity-resolutions.sh` companion. Output is a unified diff scoped to the typed-AST. The script exits non-zero when the diff is non-empty so it composes into CI.
+
+- [ ] **18.3 `tests/parity/<corpus>/{types.diff, resolutions.diff}` baselines + intentional-divergence allow-list** (S) — capture the current diff output verbatim under `tests/parity/registry_baseline/`, `tests/parity/project_gcl/`, `tests/parity/lib_std/`. The diff files become the regression budget — any analyzer change that grows the diff fails CI; shrinks pass and update the baseline. Mirrors how `formatter-parity-against-corpus` ratchets `MATCH_FLOOR`. **Allow-list:** [`tests/parity/divergences.toml`](../tests/parity/divergences.toml) (new file) holds intentional divergences, each entry: `{ kind: <CST kind>, ts_type: <FQN>, rust_type: <FQN>, reason: <one-line> }`. The diff helper subtracts allow-listed entries before comparing, so the gate only fires on *unintended* drift. Today's allow-list entry: method-ref typing (see "Intentional divergences" above).
+
+- [ ] **18.4 CI parity gauntlet** (S) — new `.github/workflows/parity.yml` job runs `parity-types.sh` + `parity-resolutions.sh` over every corpus and asserts the diff line-count is ≤ the committed baseline. Two helper bins: `cargo run -p parity-floor -- types` reports current-vs-baseline counts so contributors can see the dial without running the full diff.
+
+- [ ] **18.5 Per-bucket ratchet on the registry corpus** (M) — open a tracking issue per residual diff bucket discovered by 18.3. Each subsequent P18.5.x chunk is "close bucket X by N entries". Stops when registry baseline is empty. Same gauntlet pattern as the formatter: ratchet the floor down per chunk.
+
+**M18:** `parity-types.sh ~/dev/datathings/greycat/apps/registry` reports an empty diff. CI runs the gauntlet on every push; analyzer / resolver regressions break the build immediately. ROADMAP §7-A's "are we 1:1?" answer is automated.
 
 ---
 
@@ -579,9 +644,10 @@ P14 [2-3w]   Final parity gate ────── M14   ← the "are we 1:1?" ga
 P15 [3-4w]   Interactive-LSP sweep ── M15   ← hover / completion / pragma diags
 P16 [2-3w]   Member-flow + node-deref M16   ← member-call typing, auto-deref completion
 P17 [1-2w]   Real-corpus parity ratch M17   ← lowering bugs surfaced by greycat/apps/registry
+P18 [1-2w]   Typed-AST parity oracle  M18   ← dump-types CI gate, residual-diff ratchet
 ```
 
-Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface; P16 (~2-3 weeks) tightens up the member-access type chain that pass 3.5 left at `any`; P17 (~1-2 weeks) drains the lowering / lint-policy bucket surfaced by running against a real project.
+Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface; P16 (~2-3 weeks) tightens up the member-access type chain that pass 3.5 left at `any`; P17 (~1-2 weeks) drains the lowering / lint-policy bucket surfaced by running against a real project; P18 (~1-2 weeks) wires the TS dump-types subcommand into a CI parity gate.
 
 Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3 → P14.2) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
 
