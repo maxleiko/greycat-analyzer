@@ -323,19 +323,15 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
         (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => na == nb,
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
-            // P12.2: covariant in every generic parameter. Matches the TS
-            // reference's `GreycatGenericType.isAssignableTo` (this.generics[i]
-            // .isAssignableTo(other.generics[i]) for every i, after a name
-            // / arity check). Supertype-chain assignability across different
-            // generic names (`type Child<T> extends Parent<T>`) lives on a
-            // later phase — the analyzer doesn't yet thread declared
-            // supertypes into [`is_assignable_to`].
-            na == nb
-                && aa.len() == ab.len()
-                && aa
-                    .iter()
-                    .zip(ab)
-                    .all(|(x, y)| is_assignable_to(arena, *x, *y))
+            // P12.2: invariant in every generic parameter. The TS
+            // reference checker (`GreycatGenericType.isAssignableTo`)
+            // implements covariance, but the GreyCat runtime — the
+            // true oracle — rejects covariant assignment (e.g.
+            // `Array<float>` is *not* assignable to `Array<int>`).
+            // We follow the runtime, not the TS checker. Supertype-
+            // chain assignability across different generic names
+            // (`type Child<T> extends Parent<T>`) is a later phase.
+            na == nb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| x == y)
         }
         // P7.5 anonymous structural compat: a value of `{a: A, b: B}`
         // is assignable to `{a: A}` (width subtyping — source may have
@@ -480,6 +476,97 @@ impl InferenceTable {
     }
 }
 
+/// `true` iff `from` can be casted to `to` via the GreyCat `as` operator.
+///
+/// Mirrors the TS reference's `isCastable` (`packages/lang/src/analysis/
+/// utils.ts:360`). Cast rules are asymmetric to assignability — `int as
+/// nodeTime` is allowed even though `int` doesn't assign-flow into
+/// `nodeTime`. Implements (P12.3 — deeper node-tag rules):
+/// - `any → any` always.
+/// - Nullables: `T?` casts the same as `T`.
+/// - `int ↔ {int, float, node, nodeTime, nodeList, nodeIndex, nodeGeo}`.
+/// - `float ↔ {int, float}`.
+/// - `node{,Time,List,Index,Geo} ↔ {self, int}`.
+/// - `String ↔ String`.
+/// - `char ↔ {char, String, int}`.
+/// - `bool ↔ bool`.
+/// - `t{2,3,4}{,f} → int`.
+/// - Enums → `int`.
+/// - Anything else falls through to "same head name OR `from` assignable
+///   to `to` (no inheritance check yet — that lands when supertype
+///   chains thread through the analyzer)".
+pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
+    let from_t = arena.get(from);
+    let to_t = arena.get(to);
+
+    // any target absorbs any non-null source.
+    if matches!(to_t.kind, TypeKind::Any) && !from_t.nullable {
+        return true;
+    }
+
+    // Union: cast iff any alt casts. Source nullability is otherwise
+    // ignored — the TS reference's `from = from.nn()` strip is purely
+    // about treating `T?` like `T` for kind dispatch, which we get
+    // for free by reading `from_t.kind` directly.
+    if let TypeKind::Union { alts } = &from_t.kind {
+        return alts.iter().any(|a| is_castable(arena, *a, to));
+    }
+    if matches!(from_t.kind, TypeKind::Enum { .. }) && is_int_target(to_t) {
+        return true;
+    }
+
+    let to_head = generic_or_named_name(to_t);
+    match &from_t.kind {
+        TypeKind::Any => true,
+        TypeKind::Primitive(Primitive::Int) => {
+            matches!(
+                to_head.as_deref(),
+                Some("node" | "nodeTime" | "nodeList" | "nodeIndex" | "nodeGeo")
+            ) || is_primitive(to_t, Primitive::Int)
+                || is_primitive(to_t, Primitive::Float)
+        }
+        TypeKind::Primitive(Primitive::Float) => {
+            is_primitive(to_t, Primitive::Int) || is_primitive(to_t, Primitive::Float)
+        }
+        TypeKind::Primitive(Primitive::String) => is_primitive(to_t, Primitive::String),
+        TypeKind::Primitive(Primitive::Char) => {
+            is_primitive(to_t, Primitive::Char)
+                || is_primitive(to_t, Primitive::String)
+                || is_primitive(to_t, Primitive::Int)
+        }
+        TypeKind::Primitive(Primitive::Bool) => is_primitive(to_t, Primitive::Bool),
+        // node-tag heads: cast to int or to themselves (covariant
+        // generic args via the `same head name` branch — narrows are
+        // P12.4 territory).
+        TypeKind::Generic { name, .. } | TypeKind::Named { name } if is_node_tag(name) => {
+            is_int_target(to_t) || matches!(to_head.as_deref(), Some(n) if n == name)
+        }
+        // Tuple primitives → int.
+        TypeKind::Generic { name, .. } | TypeKind::Named { name }
+            if matches!(name.as_str(), "t2" | "t3" | "t4" | "t2f" | "t3f" | "t4f") =>
+        {
+            is_int_target(to_t)
+        }
+        _ => is_assignable_to(arena, from, to),
+    }
+}
+
+fn generic_or_named_name(t: &Type) -> Option<String> {
+    match &t.kind {
+        TypeKind::Generic { name, .. } | TypeKind::Named { name } => Some(name.clone()),
+        TypeKind::Primitive(p) => Some(p.name().to_string()),
+        _ => None,
+    }
+}
+
+fn is_primitive(t: &Type, p: Primitive) -> bool {
+    matches!(t.kind, TypeKind::Primitive(q) if q == p)
+}
+
+fn is_int_target(t: &Type) -> bool {
+    is_primitive(t, Primitive::Int)
+}
+
 fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
     if from == to {
         return true;
@@ -596,21 +683,19 @@ mod tests {
     }
 
     #[test]
-    fn generic_covariant_in_args() {
+    fn generic_invariant_in_args() {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
         let float = a.primitive(Primitive::Float);
-        let str_t = a.primitive(Primitive::String);
         let arr_int = a.generic("Array", vec![int]);
         let arr_float = a.generic("Array", vec![float]);
-        let arr_str = a.generic("Array", vec![str_t]);
-        // P12.2: covariance in every generic param matches TS reference
-        // (`GreycatGenericType.isAssignableTo`). Array<int> → Array<float>
-        // because int widens to float, but the reverse stays asymmetric
-        // and unrelated element types still mismatch.
-        assert!(is_assignable_to(&a, arr_int, arr_float));
+        // P12.2 (matches the GreyCat runtime, *not* the TS reference
+        // checker): generic args are invariant. Even though `int`
+        // widens to `float`, `Array<int>` is **not** assignable to
+        // `Array<float>` (the runtime rejects this — we trust the
+        // runtime as the oracle). The reverse is also rejected.
+        assert!(!is_assignable_to(&a, arr_int, arr_float));
         assert!(!is_assignable_to(&a, arr_float, arr_int));
-        assert!(!is_assignable_to(&a, arr_int, arr_str));
         assert!(is_assignable_to(&a, arr_int, arr_int));
     }
 
@@ -620,10 +705,9 @@ mod tests {
         let int = a.primitive(Primitive::Int);
         let arr_int = a.generic("Array", vec![int]);
         let set_int = a.generic("Set", vec![int]);
-        // Different generic names with the same args still mismatch —
-        // covariance doesn't paper over the head type. Inheritance-aware
-        // assignability (`type Child<T> extends Parent<T>`) is a later
-        // phase.
+        // Different generic names with the same args still mismatch.
+        // Inheritance-aware assignability (`type Child<T> extends
+        // Parent<T>`) is a later phase.
         assert!(!is_assignable_to(&a, arr_int, set_int));
     }
 

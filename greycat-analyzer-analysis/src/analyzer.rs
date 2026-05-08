@@ -33,7 +33,7 @@ use greycat_analyzer_hir::types::{
 };
 use greycat_analyzer_types::{
     GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_assignable_to,
+    is_assignable_to, is_castable,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -1205,8 +1205,23 @@ impl<'a> Cx<'a> {
                 self.primitive(Primitive::Bool)
             }
             Expr::Cast { value, ty, .. } => {
-                let _ = self.visit_expr(value);
-                self.lower_type_ref(ty)
+                let from_ty = self.visit_expr(value);
+                let to_ty = self.lower_type_ref(ty);
+                // P12.3: validate the cast against the GreyCat `as`
+                // rules (mirrors TS `isCastable`). Surfaces invalid
+                // casts as a diagnostic; the resulting expression
+                // type is still `to_ty` so downstream inference
+                // doesn't cascade.
+                if !is_castable(&self.out.types, from_ty, to_ty) {
+                    let r = self.hir.exprs[expr_id].byte_range();
+                    let msg = format!(
+                        "cannot cast `{}` to `{}`",
+                        greycat_analyzer_types::display(&self.out.types, from_ty),
+                        greycat_analyzer_types::display(&self.out.types, to_ty),
+                    );
+                    self.diag(Severity::Error, msg, r);
+                }
+                to_ty
             }
             Expr::Unsupported { .. } => self.any(),
         }
@@ -1297,6 +1312,41 @@ mod tests {
                 .any(|d| d.message.contains("unresolved")),
             "expected unresolved-name diag, got: {:?}",
             r.diagnostics
+        );
+    }
+
+    #[test]
+    fn cast_rejects_invalid_string_to_int() {
+        // P12.3: `String as int` is rejected by the GreyCat cast rules.
+        // The expression's type still becomes `int` (so downstream
+        // inference doesn't cascade), but a diagnostic surfaces.
+        let src = r#"
+fn f(s: String): int { return s as int; }
+"#;
+        let r = analyze_src(src);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot cast")),
+            "expected cast diagnostic, got: {:?}",
+            r.diagnostics,
+        );
+    }
+
+    #[test]
+    fn cast_int_to_node_tag_is_allowed() {
+        // P12.3: `int as nodeTime<T>` is one of the asymmetric promotion
+        // rules — int casts to any of the node-tag heads.
+        let src = r#"
+fn f(i: int): nodeTime { return i as nodeTime; }
+"#;
+        let r = analyze_src(src);
+        assert!(
+            r.diagnostics
+                .iter()
+                .all(|d| !d.message.contains("cannot cast")),
+            "did not expect cast diagnostic, got: {:?}",
+            r.diagnostics,
         );
     }
 
