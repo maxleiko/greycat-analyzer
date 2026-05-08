@@ -70,7 +70,7 @@ Verification order:
 1. Inspect `vendor/tree-sitter-greycat/grammar.js` for the existing rule shape.
 2. Search the stdlib (`lib/std/*.gcl`) and corpus (`tests/corpus/`) for real examples of the construct.
 3. Invoke the `/greycat:greycat` skill — it has the canonical syntax/semantics reference.
-4. Read the TS reference at `https://hub.datathings.com/greycat/lang` if you have a checkout / can web-fetch.
+4. Read the TS reference at `https://hub.datathings.com/greycat/lang` if you have a checkout / can git clone with ssh.
 5. If still unresolved after (1)–(4): **STOP and ask the user.** Even in auto-mode.
 
 If for any reason you cannot stop (truly unattended run), leave a `// FIXME(syntax-assumption): <what you assumed and why>` comment beside the change AND append a one-line entry to [`docs/syntax-assumptions.log`](../docs/syntax-assumptions.log) so the user can find every assumption on return. Never ship a grammar / lowering change that bakes in a syntactic assumption silently.
