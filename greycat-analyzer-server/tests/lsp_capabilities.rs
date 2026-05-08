@@ -479,6 +479,56 @@ fn completion_inside_at_include_drills_into_subdirs() {
     fs::remove_dir_all(&tmp).ok();
 }
 
+/// P15.2.1 — typing `@` at top level emits the pragma list (mirrors the
+/// TS reference's `PRAGMA_COMPLETION_ITEMS`).
+#[test]
+fn completion_after_at_emits_pragma_list() {
+    let src = "@\n";
+    let tree = parse(src);
+    // Cursor sits right after the `@` (col 1).
+    let list =
+        capabilities::completion(src, tree.root_node(), pos(0, 1), None).expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    for expected in [
+        "@library",
+        "@include",
+        "@role",
+        "@permission",
+        "@expose",
+        "@volatile",
+    ] {
+        assert!(
+            labels.contains(&expected),
+            "expected `{expected}` in pragma completion list: {labels:?}"
+        );
+    }
+    // Snippet items advertise `InsertTextFormat::Snippet`.
+    let lib = list
+        .items
+        .iter()
+        .find(|i| i.label == "@library")
+        .expect("@library entry");
+    assert_eq!(lib.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    assert_eq!(
+        lib.insert_text.as_deref(),
+        Some("library(\"$1\", \"$2\");$0"),
+    );
+}
+
+/// P15.2.1 — typing `@li` filters the pragma list to entries whose name
+/// (post-`@`) starts with `li`.
+#[test]
+fn completion_after_at_prefix_filters() {
+    let src = "@li\n";
+    let tree = parse(src);
+    let list =
+        capabilities::completion(src, tree.root_node(), pos(0, 3), None).expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"@library"), "got: {labels:?}");
+    assert!(!labels.contains(&"@include"), "got: {labels:?}");
+    assert!(!labels.contains(&"@expose"), "got: {labels:?}");
+}
+
 /// P15.x — hover on the `create` segment of the simple `Identity::create`
 /// (cross-module method) renders the foreign method's signature, not
 /// "expression: function".

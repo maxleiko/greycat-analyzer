@@ -2213,6 +2213,12 @@ pub fn completion(
             items,
         });
     }
+    if let Some(items) = pragma_completion(text, byte) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     None
 }
 
@@ -2358,6 +2364,116 @@ fn string_prefix_at_cursor(
     }
     let upto = cursor_byte.min(r.end);
     text.get(content_start..upto).unwrap_or("").to_string()
+}
+
+// =============================================================================
+// P15.2.1 — pragma completion after `@`
+// =============================================================================
+
+/// Emit pragma completion items when the cursor sits right after a `@`
+/// or partway through an annotation name (`@li|brary`). Mirrors the TS
+/// reference's `PRAGMA_COMPLETION_ITEMS` set
+/// (`packages/lang/src/project/analysis_result.ts:2537`). Returns `None`
+/// when the cursor isn't in an annotation-start position so the parent
+/// dispatcher can fall through to other completion shapes.
+fn pragma_completion(text: &str, cursor_byte: usize) -> Option<Vec<CompletionItem>> {
+    let typed = pragma_prefix_at_cursor(text, cursor_byte)?;
+    let prefix_lower = typed.to_lowercase();
+    let mut items = pragma_items()
+        .into_iter()
+        .filter(|item| {
+            // Strip the leading `@` from the label before prefix-matching.
+            let name = item.label.trim_start_matches('@');
+            prefix_lower.is_empty() || name.to_lowercase().starts_with(&prefix_lower)
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
+}
+
+/// Walk back from `cursor_byte` over `[A-Za-z0-9_]*` and check that the
+/// preceding byte is `@`. Returns the typed prefix between `@` and the
+/// cursor (empty string when the user just hit `@`). `None` when there's
+/// no `@` or the run isn't word-shaped.
+fn pragma_prefix_at_cursor(text: &str, cursor_byte: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let cap = cursor_byte.min(bytes.len());
+    let mut i = cap;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i == 0 || bytes[i - 1] != b'@' {
+        return None;
+    }
+    Some(text.get(i..cap).unwrap_or("").to_string())
+}
+
+/// The pragma list. Snippet bodies match the TS reference shape so
+/// editors that honor `InsertTextFormat::Snippet` get tabstop-driven
+/// completions for the parametric forms (`@library`, `@include`,
+/// `@role`, `@permission`). Bare forms (`@expose`, `@volatile`) skip
+/// the snippet format flag.
+fn pragma_items() -> Vec<CompletionItem> {
+    vec![
+        CompletionItem {
+            label: "@library".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("library(\"$1\", \"$2\");$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("Adds a library to the project".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@include".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("include(\"$1\");$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("Adds a source directory to the project".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@role".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("role(\"$1\", \"$2\");$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("Defines a role for the project".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@permission".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("permission(\"$1\")$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some(
+                "Defines a permission for the project, or give a permission to a function".into(),
+            ),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@expose".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("expose".into()),
+            detail: Some("Registers the function as an http endpoint".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@volatile".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("volatile".into()),
+            detail: Some(
+                "Volatile types cannot be stored in graph and have loose upgrade rules".into(),
+            ),
+            ..Default::default()
+        },
+    ]
 }
 
 // =============================================================================
