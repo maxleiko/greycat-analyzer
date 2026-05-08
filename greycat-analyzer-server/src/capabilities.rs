@@ -183,7 +183,9 @@ fn ident_hover_label(
             ident.text
         )),
         Definition::Generic(_) => Some(format!("(type parameter) {}", ident.text)),
-        Definition::Project => Some(format!("(project) {}", ident.text)),
+        Definition::ProjectDecl { .. } | Definition::Project => {
+            Some(format!("(project) {}", ident.text))
+        }
     }
 }
 
@@ -377,7 +379,11 @@ pub fn goto_definition(
             Definition::Local(name) | Definition::Param(name) | Definition::Generic(name) => {
                 hir.idents[name].byte_range.clone()
             }
-            Definition::Project => return None,
+            // P11.2 records the cross-module decl pointer here, but
+            // resolving it to a `Location` requires reading the foreign
+            // module's text — that's P11.3. For now fall through so
+            // the member-access lookup below still runs.
+            Definition::ProjectDecl { .. } | Definition::Project => return None,
         };
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
@@ -578,7 +584,10 @@ pub fn references(
         let resolves_to = match def {
             Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
             Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
-            Definition::Project => None,
+            // Cross-module `ProjectDecl` use sites point at a foreign
+            // HIR — they don't share the local `target` ident. P11.4
+            // walks every doc's `Resolutions` to filter these by URI.
+            Definition::ProjectDecl { .. } | Definition::Project => None,
         };
         if resolves_to == Some(target) {
             out.push(Location {
@@ -615,7 +624,7 @@ fn target_binding(
         return match def {
             Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
             Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
-            Definition::Project => None,
+            Definition::ProjectDecl { .. } | Definition::Project => None,
         };
     }
     // Not a use site — cursor is on a binding. Treat the cursor as the
@@ -752,7 +761,7 @@ pub fn rename(
             let resolves_to = match def {
                 Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
                 Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
-                Definition::Project => None,
+                Definition::ProjectDecl { .. } | Definition::Project => None,
             };
             if resolves_to == Some(target) {
                 edits.push(TextEdit {
@@ -1244,7 +1253,7 @@ pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Se
                         Some(Definition::Local(_)) => TOK_VAR,
                         Some(Definition::Param(_)) => TOK_PARAM,
                         Some(Definition::Generic(_)) => TOK_TYPE,
-                        Some(Definition::Project) => TOK_TYPE,
+                        Some(Definition::ProjectDecl { .. } | Definition::Project) => TOK_TYPE,
                         None => return true,
                     };
                     push(&mut events, ty);

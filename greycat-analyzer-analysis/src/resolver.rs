@@ -15,9 +15,13 @@
 //! - Block scope: nested var declarations, shadowing parent block.
 //! - For / for-in / try-catch introduce their own scope for their bound
 //!   names.
-//! - **Project scope** (P6.2): consulted after every local scope misses
-//!   — names registered in the shared [`ProjectIndex`] (runtime types,
-//!   primitives by name, and decls from other modules) bind to
+//! - **Project scope** (P6.2 / P11.2): consulted after every local scope
+//!   misses. Names that match a top-level decl from another module
+//!   (looked up through [`ProjectIndex::locate_decl`]) bind to the
+//!   detailed [`Definition::ProjectDecl`] carrying the foreign module's
+//!   `Uri` + `Idx<Decl>`. Names that the project knows but that have no
+//!   `.gcl` decl (runtime-implemented types like `Array` / `Map`, native
+//!   fn signatures, primitives by name) fall back to the unit
 //!   [`Definition::Project`].
 //!
 //! Member-access (`a.b`) is *not* resolved here — the property `b` needs
@@ -26,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -37,7 +42,10 @@ use greycat_analyzer_hir::types::{
 use crate::stdlib::ProjectIndex;
 
 /// Where a use of an `Ident` resolves to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Not `Copy` — `ProjectDecl` carries an `Uri` which isn't `Copy`. Clone
+/// at use sites where you need owned values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Definition {
     /// A top-level declaration in the same module — `Idx<Decl>` indexes
     /// the HIR decls arena.
@@ -50,11 +58,18 @@ pub enum Definition {
     /// Points back at the binding ident so capabilities can offer goto-
     /// definition. Inference / constraint handling is **P7.4**.
     Generic(Idx<Ident>),
-    /// A name resolved against the shared [`ProjectIndex`] — either a
-    /// runtime-implemented type / native fn, a registered primitive
-    /// name, or a top-level decl from another module. The variant
-    /// carries no detail today; cross-module decl pointers + member
-    /// resolution land in P6.3 / P8.2.
+    /// A name resolved through the shared [`ProjectIndex`] to a
+    /// concrete top-level decl in another module (P11.2). `uri` /
+    /// `decl` together let cross-module capabilities (goto-def,
+    /// references, rename, member access) skip text-equality fallbacks.
+    /// When [`ProjectIndex::locate_decl`] returns multiple hits the
+    /// resolver picks the first; lib/include-aware disambiguation
+    /// rides on later phases.
+    ProjectDecl { uri: Uri, decl: Idx<Decl> },
+    /// A name the project knows but that has no `.gcl` decl: runtime-
+    /// implemented types (`Array`, `Map`, `Set`, `node*`, `function`,
+    /// `tuple`, `field`, `t2`-`t4f`), language primitives by name, and
+    /// native fn signatures.
     Project,
 }
 
@@ -77,7 +92,7 @@ pub struct Resolutions {
 
 impl Resolutions {
     pub fn lookup(&self, ident: Idx<Ident>) -> Option<Definition> {
-        self.uses.get(&ident).copied()
+        self.uses.get(&ident).cloned()
     }
 }
 
@@ -129,7 +144,7 @@ impl<'a> Cx<'a> {
     fn lookup_local(&self, name: &str) -> Option<Definition> {
         for scope in self.scopes.iter().rev() {
             if let Some(d) = scope.names.get(name) {
-                return Some(*d);
+                return Some(d.clone());
             }
         }
         None
@@ -142,11 +157,28 @@ impl<'a> Cx<'a> {
     fn record_use(&mut self, idx: Idx<Ident>) {
         let name = self.ident_text(idx).to_string();
         if let Some(def) = self.lookup_local(&name) {
-            self.res.uses.insert(idx, def);
             // P6.7: bump the reverse-reference count for top-level decls.
-            if let Definition::Decl(decl_id) = def {
-                *self.res.references_to.entry(decl_id).or_insert(0) += 1;
+            if let Definition::Decl(decl_id) = &def {
+                *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
             }
+            self.res.uses.insert(idx, def);
+            return;
+        }
+        // P11.2: prefer a concrete cross-module decl pointer over the
+        // unit `Project` placeholder. `locate_decl` may return multiple
+        // hits for collisions across modules; pick the first — lib/
+        // include-aware disambiguation lives on later phases. Names
+        // that the project knows but that have no `.gcl` decl
+        // (runtime types, primitives by name, native fns) fall through
+        // to the unit `Project` variant below.
+        if let Some((uri, decl)) = self.index.locate_decl(&name).first() {
+            self.res.uses.insert(
+                idx,
+                Definition::ProjectDecl {
+                    uri: uri.clone(),
+                    decl: *decl,
+                },
+            );
             return;
         }
         if self.index.has_name(&name) {
@@ -648,17 +680,18 @@ fn f(p: Foo): Foo { return p; }
     #[test]
     fn project_index_fallback_resolves_cross_module_name() {
         use crate::stdlib::ProjectIndex;
-        use greycat_analyzer_core::lsp_types::Uri;
         use std::str::FromStr;
         // Module A declares `Helper` as a top-level type. Module B
         // refers to `Helper` — without a ProjectIndex it'd be
-        // unresolved; with one ingested from A it binds to Project.
+        // unresolved; with one ingested from A it binds to ProjectDecl
+        // carrying A's URI + the Helper decl id (P11.2).
         let other_src = "type Helper {}\n";
         let other_tree = parse(other_src);
         let other_hir = lower_module(other_src, "a", "p", other_tree.root_node());
 
+        let other_uri = Uri::from_str("file:///proj/a.gcl").unwrap();
         let mut idx = ProjectIndex::new();
-        idx.ingest(&Uri::from_str("file:///proj/a.gcl").unwrap(), &other_hir);
+        idx.ingest(&other_uri, &other_hir);
 
         let user_src = "fn use_helper(h: Helper) {}\n";
         let user_tree = parse(user_src);
@@ -672,7 +705,31 @@ fn f(p: Foo): Foo { return p; }
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         assert_eq!(helper_uses.len(), 1);
-        assert!(matches!(helper_uses[0], Definition::Project));
+        let Definition::ProjectDecl { uri, decl } = helper_uses[0] else {
+            panic!("expected ProjectDecl, got {:?}", helper_uses[0]);
+        };
+        assert_eq!(uri, &other_uri);
+        assert!(matches!(other_hir.decls[*decl], Decl::Type(_)));
         assert!(res.unresolved.is_empty());
+    }
+
+    #[test]
+    fn project_index_fallback_keeps_unit_project_for_runtime_types() {
+        // `Array` / `Map` / `node` etc. are seeded into the project
+        // index by name but have no `.gcl` decl. They should still
+        // resolve — to the unit `Project` placeholder, not ProjectDecl.
+        let src = "fn f(a: Array<int>) {}\n";
+        let tree = parse(src);
+        let hir = lower_module(src, "m", "p", tree.root_node());
+        let idx = crate::stdlib::ProjectIndex::new();
+        let res = resolve_with_index(&hir, &idx);
+        let array_uses: Vec<_> = hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.text == "Array")
+            .filter_map(|(idx, _)| res.uses.get(&idx))
+            .collect();
+        assert_eq!(array_uses.len(), 1);
+        assert!(matches!(array_uses[0], Definition::Project));
     }
 }

@@ -859,6 +859,7 @@ impl<'a> Cx<'a> {
                 }
                 Some(Definition::Decl(_))
                 | Some(Definition::Generic(_))
+                | Some(Definition::ProjectDecl { .. })
                 | Some(Definition::Project)
                 | None => self.any(),
             },
