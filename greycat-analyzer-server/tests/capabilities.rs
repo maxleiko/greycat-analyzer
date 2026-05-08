@@ -320,28 +320,33 @@ fn inlay_hints_with_project_use_cross_module_call_return_types() {
     );
 }
 
-/// Anchors enum-variant access typing across all four valid forms:
-///   - `Foo::a`              (Static, ident property)
-///   - `Foo::"a"`            (Static, string property)
-///   - `project::Foo::a`     (QualifiedStatic, ident property)
-///   - `project::Foo::"a"`   (QualifiedStatic, string property)
-///
-/// Each must type as `Foo` (the enum) so passing it to a
-/// `_: Foo` parameter doesn't trip the call-arg validator's
-/// "value of type `any` is not assignable" false-positive.
+/// Anchors enum-variant access typing across every valid form.
+/// Variants can be declared with either an ident name (`a`) or a
+/// quoted-string name (`"str field"`); access goes through either
+/// `Static` (`Foo::a`, `Foo::"str field"`) or `QualifiedStatic`
+/// (`project::Foo::a`, `project::Foo::"str field"`). Each form must
+/// type as `Foo` so passing it to a `_: Foo` parameter doesn't trip
+/// the call-arg validator's "value of type `any`" false-positive.
 #[test]
-fn enum_variant_access_types_as_enum_in_all_four_forms() {
+fn enum_variant_access_types_as_enum_in_every_form() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
     use std::str::FromStr;
 
     let uri = Uri::from_str("file:///project.gcl").unwrap();
-    let src = "enum Foo { a, b }\n\
+    // 6 static-access call sites: 4 ident-named forms + 2
+    // string-named forms (in-module + qualified). The string-named
+    // variant `"str field"` exercises both `enum_field` lowering for
+    // string names and the qualified-chain matching against
+    // multi-word names.
+    let src = "enum Foo { a, b, \"str field\" }\n\
         fn test() {\n\
         \x20   take(Foo::a);\n\
         \x20   take(Foo::\"a\");\n\
         \x20   take(project::Foo::a);\n\
         \x20   take(project::Foo::\"a\");\n\
+        \x20   take(Foo::\"str field\");\n\
+        \x20   take(project::Foo::\"str field\");\n\
         }\n\
         fn take(_: Foo) {}\n";
     let mut mgr = SourceManager::new();
@@ -349,9 +354,6 @@ fn enum_variant_access_types_as_enum_in_all_four_forms() {
     let pa = ProjectAnalysis::analyze(&mgr);
     let module = pa.module(&uri).expect("module cached");
 
-    // Every Static / QualifiedStatic expression in this fixture
-    // should carry a `Foo`-shaped type (Enum or Named with name
-    // "Foo"); none should be `any`.
     use greycat_analyzer_hir::types::Expr;
     let mut static_count = 0usize;
     for (idx, expr) in module.hir.exprs.iter() {
@@ -373,11 +375,11 @@ fn enum_variant_access_types_as_enum_in_all_four_forms() {
         );
     }
     assert_eq!(
-        static_count, 4,
-        "expected 4 static expressions in the fixture, got {static_count}"
+        static_count, 6,
+        "expected 6 static expressions in the fixture (4 ident + 2 string), got {static_count}"
     );
 
-    // The call-arg validator must accept all four call sites — no
+    // The call-arg validator must accept every call site — no
     // semantic diagnostics should fire on this module.
     let diag_msgs: Vec<_> = module
         .analysis
@@ -391,41 +393,114 @@ fn enum_variant_access_types_as_enum_in_all_four_forms() {
     );
 }
 
-/// Anchors completion for enum variants: typing `Foo::|` should list
-/// the enum's variants (`a`, `b`) — alongside any other completion
-/// surface. Reproduces the user's report that no completion shows
-/// up after `Foo::`.
+/// Anchors completion for enum variants. Three scenarios:
+///
+/// 1. `Foo::|` → list every variant. Ident-shaped names (`alpha`)
+///    appear bare; non-ident names (`"Africa/Abidjan"`) come with
+///    their quotes so accepting the completion produces valid syntax.
+/// 2. `Foo::"Afr|"` → cursor inside a quoted property — list every
+///    variant, filter by prefix, emit bare text (the opening quote
+///    is already in the buffer, so re-quoting would double-up).
+/// 3. `Foo::"a|"` → string-mode prefix filter; only variants whose
+///    HIR name starts with `a` show up (`alpha`, `America/...`).
+///
+/// Mirrors the real-world `core::TimeZone` shape (600+ IANA-spelled
+/// variants in stdlib). Reproduces the user's reports that (a) no
+/// completion fired after `Foo::`, and (b) typing inside the quotes
+/// failed to surface variants whose names start with the typed
+/// prefix.
 #[test]
 fn completion_after_enum_double_colon_lists_variants() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
     use std::str::FromStr;
 
+    fn complete_at(
+        mgr: &SourceManager,
+        uri: &Uri,
+        pa: &ProjectAnalysis,
+        cursor_byte: usize,
+    ) -> Vec<String> {
+        let cell = mgr.get(uri).unwrap();
+        let doc = cell.borrow();
+        let line = doc.text[..cursor_byte].matches('\n').count() as u32;
+        let col = (cursor_byte
+            - doc.text[..cursor_byte]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0)) as u32;
+        let list = capabilities::completion_with_project(
+            &doc.text,
+            doc.root_node(),
+            pos(line, col),
+            uri,
+            pa,
+            None,
+        )
+        .unwrap_or_else(|| panic!("no completion at byte {cursor_byte}"));
+        list.items.into_iter().map(|c| c.label).collect()
+    }
+
     let uri = Uri::from_str("file:///project.gcl").unwrap();
-    let src = "enum Foo { alpha, beta }\nfn test() {\n    var x = Foo::\n}\n";
+    // Mirrors `core::TimeZone`'s shape: an enum with IANA-style
+    // string variants alongside ident-shaped ones. A real-world
+    // `core::TimeZone` ships 600+ such names (`"Africa/Abidjan"`,
+    // `"America/New_York"`, …); the per-variant completion path
+    // must stay allocation-light.
+    let src = "enum Foo { alpha, beta, \"Africa/Abidjan\", \"America/New_York\", \"str field\" }\n\
+        fn test() {\n\
+        \x20   var a = Foo::\n\
+        \x20   var b = Foo::\"Afr\";\n\
+        \x20   var c = Foo::\"a\";\n\
+        }\n";
     let mut mgr = SourceManager::new();
     mgr.add_simple(uri.clone(), src, "project", false);
     let pa = ProjectAnalysis::analyze(&mgr);
-    let cell = mgr.get(&uri).unwrap();
-    let doc = cell.borrow();
 
-    // Cursor at the `\n` right after `Foo::` on line 2.
-    let cursor = src.find("Foo::").unwrap() + "Foo::".len();
-    let line = src[..cursor].matches('\n').count() as u32;
-    let col = (cursor - src[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
-    let list = capabilities::completion_with_project(
-        &doc.text,
-        doc.root_node(),
-        pos(line, col),
+    // 1. `Foo::|` — every variant. Ident-shaped names appear bare;
+    //    non-ident names (slash, space) are wrapped in quotes so
+    //    accepting the completion produces valid syntax.
+    let labels = complete_at(
+        &mgr,
         &uri,
         &pa,
-        None,
-    )
-    .unwrap_or_else(|| panic!("expected completion response after `Foo::`"));
-    let labels: Vec<_> = list.items.iter().map(|c| c.label.as_str()).collect();
+        src.find("Foo::\n").unwrap() + "Foo::".len(),
+    );
     assert!(
-        labels.contains(&"alpha") && labels.contains(&"beta"),
-        "expected enum variants `alpha`, `beta` in `Foo::` completion, got {labels:?}"
+        labels.iter().any(|l| l == "alpha")
+            && labels.iter().any(|l| l == "beta")
+            && labels.iter().any(|l| l == "\"Africa/Abidjan\"")
+            && labels.iter().any(|l| l == "\"America/New_York\"")
+            && labels.iter().any(|l| l == "\"str field\""),
+        "expected every variant (with string-named ones quoted) at `Foo::`, got {labels:?}"
+    );
+
+    // 2. `Foo::"Afr|"` — string-mode, prefix filter on `Afr`. The
+    //    opening quote is in the buffer so the inserted text is
+    //    bare (no leading `"`).
+    let cursor = src.find("\"Afr\"").unwrap() + "\"Afr".len();
+    let labels = complete_at(&mgr, &uri, &pa, cursor);
+    assert!(
+        labels.iter().any(|l| l == "Africa/Abidjan"),
+        "expected `Africa/Abidjan` (bare) in `Foo::\"Afr|\"` completion, got {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "\"Africa/Abidjan\""),
+        "string-mode completion should not re-quote variants (opening `\"` is already typed), got {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "alpha"),
+        "string-mode prefix filter should drop non-matching variants, got {labels:?}"
+    );
+
+    // 3. `Foo::"a|"` — string-mode, prefix `a`. Matches `alpha`
+    //    (case-insensitive) and `"America/New_York"` (which surfaces
+    //    bare since we're inside the quotes).
+    let cursor = src.find("\"a\"").unwrap() + "\"a".len();
+    let labels = complete_at(&mgr, &uri, &pa, cursor);
+    assert!(
+        labels.iter().any(|l| l == "alpha") && labels.iter().any(|l| l == "America/New_York"),
+        "expected both `alpha` and `America/New_York` inside `Foo::\"a|\"`, got {labels:?}"
     );
 }
 

@@ -2714,6 +2714,63 @@ fn ident_prefix_at_cursor(text: &str, cursor_byte: usize) -> String {
     text.get(i..cap).unwrap_or("").to_string()
 }
 
+/// `true` iff `s` matches the grammar's `ident` shape
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Names that fail this — e.g. enum
+/// variants declared as `"Africa/Abidjan"` — must be re-quoted
+/// when the completion machinery surfaces them at a `Type::|`
+/// insertion site.
+fn is_ident_like(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Build a [`CompletionItem`] for an enum variant. `name` is the
+/// variant's HIR-stored spelling (always unquoted, even for
+/// string-named variants — quotes are stripped at lowering time so
+/// `member_uses` matches against the chain's property text).
+///
+/// Spelling rules at the insertion site:
+///   - If the cursor is inside a quoted property (`Foo::"Tim|"`),
+///     the opening `"` is already in the buffer; emit the bare
+///     variant text.
+///   - Otherwise, emit ident-shaped names bare (`Foo::alpha`) and
+///     escape + wrap non-ident names so the result is valid syntax
+///     (`Foo::"Africa/Abidjan"`).
+///
+/// Allocates exactly two `String`s per item — one for the label and
+/// one for the insert text, both of which `lsp_types::CompletionItem`
+/// requires by ownership. The escape pass writes into a single
+/// pre-sized buffer (no `String::replace` chains).
+fn enum_variant_completion_item(name: &str, in_string: bool) -> CompletionItem {
+    let display = if in_string || is_ident_like(name) {
+        name.to_string()
+    } else {
+        let mut s = String::with_capacity(name.len() + 2);
+        s.push('"');
+        for c in name.chars() {
+            match c {
+                '\\' => s.push_str("\\\\"),
+                '"' => s.push_str("\\\""),
+                _ => s.push(c),
+            }
+        }
+        s.push('"');
+        s
+    };
+    CompletionItem {
+        label: display.clone(),
+        kind: Some(CompletionItemKind::ENUM_MEMBER),
+        insert_text: Some(display),
+        ..Default::default()
+    }
+}
+
 /// Every reserved word the user can type at a statement / expression
 /// position. Mirrors the keywords baked into the tree-sitter grammar
 /// (`grammar.js`): the modifiers (`private`, `static`, `abstract`,
@@ -3465,7 +3522,7 @@ fn static_completion(
     cursor_byte: usize,
     project: &greycat_analyzer_analysis::project::ProjectAnalysis,
 ) -> Option<Vec<CompletionItem>> {
-    let (recv, _, typed) = static_receiver_at(text, cursor_byte)?;
+    let (recv, _, typed, in_string) = static_receiver_at(text, cursor_byte)?;
     let prefix_lower = typed.to_lowercase();
 
     let mut items: Vec<CompletionItem> = Vec::new();
@@ -3499,20 +3556,16 @@ fn static_completion(
             }
             Decl::Enum(ed) => {
                 // `Foo::|` where `Foo` is an enum — surface every
-                // variant. `EnumMember` would be ideal but the LSP
-                // protocol only ships `EnumMember` from 3.16+; LSP
-                // clients fall back to ENUM rendering.
+                // variant. Common in stdlib: `core::TimeZone` ships
+                // 600+ IANA-spelled variants (`"Africa/Abidjan"`,
+                // `"America/New_York"`, …) so we keep the per-item
+                // path allocation-light.
                 for f in &ed.fields {
-                    let name = fmod.hir.idents[fmod.hir.enum_fields[*f].name].text.clone();
+                    let name = fmod.hir.idents[fmod.hir.enum_fields[*f].name].text.as_str();
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        insert_text: Some(name),
-                        ..Default::default()
-                    });
+                    items.push(enum_variant_completion_item(name, in_string));
                 }
             }
             _ => {}
@@ -3556,17 +3609,50 @@ fn static_completion(
 }
 
 /// Walk back from `cursor_byte` to extract the static-access receiver.
-/// Returns `(receiver_text, separator_start, typed_prefix)` when the
-/// cursor sits in a `recv::|prefix` shape; `None` otherwise.
-fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<(String, usize, String)> {
-    let typed = ident_prefix_at_cursor(text, cursor_byte);
+/// Returns `(receiver_text, separator_start, typed_prefix, in_string)`
+/// when the cursor sits in a `recv::|prefix` shape OR
+/// `recv::"prefix|`. `in_string` is `true` for the latter; it tells
+/// the enum-completion arm to skip the surrounding quotes (the
+/// opening `"` is already in the buffer).
+fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<(String, usize, String, bool)> {
     let bytes = text.as_bytes();
     let cap = cursor_byte.min(bytes.len());
+
+    // Detect the cursor sitting inside `recv::"…|"` first. Walk back
+    // from the cursor over any chars that aren't `"` until we find
+    // the opening `"`. If that `"` is preceded by `::`, we're in
+    // string-property completion mode and the prefix is the inner
+    // chars typed so far.
+    {
+        let mut i = cap;
+        while i > 0 && bytes[i - 1] != b'"' {
+            i -= 1;
+        }
+        if i >= 3 && bytes[i - 1] == b'"' && bytes[i - 2] == b':' && bytes[i - 3] == b':' {
+            let typed = text.get(i..cap).unwrap_or("").to_string();
+            let sep_start = i - 3;
+            let recv = walk_back_receiver(bytes, sep_start, text)?;
+            return Some((recv, sep_start, typed, true));
+        }
+    }
+
+    // Plain `recv::|prefix` mode (the receiver's property is an
+    // ident-shaped run of alphanumerics).
+    let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_start = cap.saturating_sub(typed.len());
     if prefix_start < 2 || bytes[prefix_start - 1] != b':' || bytes[prefix_start - 2] != b':' {
         return None;
     }
     let sep_start = prefix_start - 2;
+    let recv = walk_back_receiver(bytes, sep_start, text)?;
+    Some((recv, sep_start, typed, false))
+}
+
+/// Shared receiver walk-back used by both static-completion modes
+/// (ident property and string property). Walks left from `sep_start`
+/// over `[A-Za-z0-9_]` chars and slices the receiver text. Returns
+/// `None` when no receiver run is present.
+fn walk_back_receiver(bytes: &[u8], sep_start: usize, text: &str) -> Option<String> {
     let mut i = sep_start;
     while i > 0 {
         let b = bytes[i - 1];
@@ -3579,8 +3665,7 @@ fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<(String, usize, 
     if i == sep_start {
         return None;
     }
-    let recv = text.get(i..sep_start)?.to_string();
-    Some((recv, sep_start, typed))
+    text.get(i..sep_start).map(str::to_string)
 }
 
 // =============================================================================

@@ -340,22 +340,35 @@ fn lower_enum_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Enu
     if let Some(body) = node.child_by_field_name("body") {
         let mut cursor = body.walk();
         for c in body.named_children(&mut cursor) {
-            if c.kind() == "enum_field"
-                && let Some(field_name) = c
-                    .named_children(&mut c.walk())
-                    .find(|n| n.kind() == "ident")
-            {
-                let nid = cx.alloc_ident(field_name);
-                let value = c
-                    .named_children(&mut c.walk())
-                    .find(|n| n.kind() != "ident")
-                    .and_then(|v| lower_expr(cx, v));
-                fields.push(cx.hir.enum_fields.alloc(EnumField {
-                    name: nid,
-                    value,
-                    byte_range: c.byte_range(),
-                }));
+            if c.kind() != "enum_field" {
+                continue;
             }
+            // Grammar: `enum_field: (ident | string) optional( "(" _expr ")" )`.
+            // The first named child is the field name (ident OR
+            // quoted string for multi-word names like
+            // `enum E { "str field" }`); any *subsequent* named child
+            // is the optional value expression. The earlier
+            // `find(|n| n.kind() == "ident")` lowering silently
+            // dropped string-named variants from the HIR, so
+            // `Foo::"str field"` access could never resolve.
+            let mut walker = c.walk();
+            let mut child_iter = c.named_children(&mut walker);
+            let Some(name_node) = child_iter.next() else {
+                continue;
+            };
+            if !matches!(name_node.kind(), "ident" | "string") {
+                continue;
+            }
+            let value_node = child_iter.next();
+            drop(child_iter);
+            drop(walker);
+            let nid = cx.alloc_property_ident(name_node);
+            let value = value_node.and_then(|v| lower_expr(cx, v));
+            fields.push(cx.hir.enum_fields.alloc(EnumField {
+                name: nid,
+                value,
+                byte_range: c.byte_range(),
+            }));
         }
     }
     Some(EnumDecl {
