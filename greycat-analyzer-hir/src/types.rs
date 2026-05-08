@@ -371,11 +371,53 @@ pub enum LiteralKind {
 
 #[derive(Debug, Clone)]
 pub struct StringExpr {
-    /// Concatenated raw fragments — interpolation parts are not lowered
-    /// here. This is enough for semantic checks that only need to know
-    /// "this is a string".
-    pub value: String,
+    /// P17.5 — `parts` carries the lowered text fragments and
+    /// `${expr}` interpolation expressions in source order. A
+    /// non-template string (no `${…}`) lowers to a single
+    /// `StringPart::Lit` covering the inner text. Template strings
+    /// lower to alternating `Lit` / `Interp` entries. Each part keeps
+    /// its own byte range so the parity oracle / capabilities can
+    /// emit per-fragment records (`RawStringExpr` /
+    /// `InterpolationExpr`) and the resolver / analyzer can recurse
+    /// into each `Interp.expr`.
+    pub parts: Vec<StringPart>,
     pub byte_range: Span,
+}
+
+impl StringExpr {
+    /// Concatenated raw fragments — interpolation parts are skipped.
+    /// Sufficient for "is this a string?" plus the few sites that need
+    /// the literal value (e.g. `@permission("admin")` extraction in
+    /// [`crate`]'s `stdlib::ProjectIndex::ingest`).
+    pub fn raw_value(&self) -> String {
+        let mut out = String::new();
+        for p in &self.parts {
+            if let StringPart::Lit { text, .. } = p {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    /// `true` iff at least one part is a `${expr}` interpolation.
+    pub fn has_interpolation(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, StringPart::Interp { .. }))
+    }
+}
+
+/// P17.5 — one piece of a [`StringExpr`].
+#[derive(Debug, Clone)]
+pub enum StringPart {
+    /// Raw text between (or around) interpolations. The byte range
+    /// covers just the fragment in source — not the surrounding `"`
+    /// quote chars or `${...}` markers.
+    Lit { text: String, byte_range: Span },
+    /// A `${expr}` interpolation. The inner expression lives in the
+    /// HIR `exprs` arena. The byte range covers the whole `${expr}`
+    /// (matches TS reference's `InterpolationExpr` span).
+    Interp { expr: Idx<Expr>, byte_range: Span },
 }
 
 #[derive(Debug, Clone)]

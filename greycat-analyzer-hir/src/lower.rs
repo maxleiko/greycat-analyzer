@@ -429,11 +429,14 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
         "var_decl" => {
             let name_node = node.child_by_field_name("name")?;
             let name = cx.alloc_ident(name_node);
-            // The grammar puts `: T` on a sibling without a field; the type
-            // ident node, if present, is the second `type_ident` child.
+            // The grammar puts the type either as a direct `type_ident`
+            // child (rare local-var shape) or wrapped in a
+            // `type_decorator` (the canonical `var x: T` shape — see
+            // grammar.js's `var_decl`). Accept either; `lower_type_ref`
+            // handles both.
             let ty = node
                 .named_children(&mut node.walk())
-                .find(|c| c.kind() == "type_ident")
+                .find(|c| matches!(c.kind(), "type_ident" | "type_decorator"))
                 .and_then(|n| lower_type_ref(cx, n));
             let init = node
                 .named_children(&mut node.walk())
@@ -681,15 +684,41 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "string" => {
-            let mut value = String::new();
+            // P17.5 — walk every child in source order and capture
+            // both the text fragments and the `${expr}` interpolation
+            // expressions. Non-template strings lower to a single
+            // `Lit` part; template strings produce alternating
+            // `Lit`/`Interp` parts.
+            let mut parts: Vec<StringPart> = Vec::new();
             let mut c = node.walk();
             for piece in node.named_children(&mut c) {
-                if piece.kind() == "string_fragment" {
-                    value.push_str(cx.text(piece));
+                match piece.kind() {
+                    "string_fragment" | "string_escape_sequence" => {
+                        parts.push(StringPart::Lit {
+                            text: cx.text(piece).to_string(),
+                            byte_range: piece.byte_range(),
+                        });
+                    }
+                    "string_substitution" => {
+                        if let Some(inner) = piece.child_by_field_name("_expr").or_else(|| {
+                            // Grammar: `string_substitution: ${ _expr }`.
+                            // `_expr` is hidden, so it has no field tag —
+                            // walk named children for the inner expr.
+                            let mut sc = piece.walk();
+                            piece.named_children(&mut sc).find(|n| n.kind() != "")
+                        }) && let Some(expr) = lower_expr(cx, inner)
+                        {
+                            parts.push(StringPart::Interp {
+                                expr,
+                                byte_range: piece.byte_range(),
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
             Expr::String(StringExpr {
-                value,
+                parts,
                 byte_range: node.byte_range(),
             })
         }
@@ -1116,7 +1145,12 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
         name,
         params,
         optional,
-        byte_range: range_of(node),
+        // P18.1 — store the `type_ident`'s own byte range, not the
+        // wrapper's (`attr_type` / `type_decorator` include the leading
+        // `:` / annotation tokens). The TS reference's `dump-types`
+        // emits `TypeIdent` records over the type_ident span; matching
+        // that lets the parity oracle diff cleanly.
+        byte_range: range_of(inner),
     }))
 }
 
