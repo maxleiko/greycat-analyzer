@@ -2262,6 +2262,12 @@ pub fn completion_with_project(
             items,
         });
     }
+    if let Some(items) = static_completion(text, byte, project) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     if let Some(items) = ident_or_keyword_completion(text, node, byte, uri, project) {
         return Some(CompletionList {
             is_incomplete: false,
@@ -3355,6 +3361,123 @@ fn collect_type_members(
             ..Default::default()
         });
     }
+}
+
+// =============================================================================
+// P15.2.5 — static completion after `::`
+// =============================================================================
+
+/// Static-access completion: when the cursor sits in `Type::|prop` or
+/// `module::|name`, list the type's static methods or the module's
+/// top-level decls. Receiver detection:
+/// - Walk back from the cursor over `[A-Za-z0-9_]*` (typed prefix).
+/// - Confirm `::` precedes the prefix.
+/// - Walk back further over `[A-Za-z0-9_]+` to capture the receiver
+///   ident.
+///
+/// Two dispatch shapes:
+/// 1. `Type::|` — receiver matches a known type decl. Emit its
+///    `static` methods. Chain context (`module::Type::|`) is
+///    transparent: we still look the type up by name.
+/// 2. `module::|` — receiver matches `ProjectIndex::module_names`.
+///    Emit that module's top-level decls.
+fn static_completion(
+    text: &str,
+    cursor_byte: usize,
+    project: &greycat_analyzer_analysis::project::ProjectAnalysis,
+) -> Option<Vec<CompletionItem>> {
+    let (recv, _, typed) = static_receiver_at(text, cursor_byte)?;
+    let prefix_lower = typed.to_lowercase();
+
+    let mut items: Vec<CompletionItem> = Vec::new();
+
+    // Type-receiver branch: enumerate the type's static methods.
+    if let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&recv).first()
+        && let Some(fmod) = project.module(foreign_uri)
+        && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+    {
+        for method_id in &td.methods {
+            let Decl::Fn(m) = &fmod.hir.decls[*method_id] else {
+                continue;
+            };
+            if !m.modifiers.static_ {
+                continue;
+            }
+            let name = fmod.hir.idents[m.name].text.clone();
+            if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+                continue;
+            }
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::METHOD),
+                insert_text: Some(name),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Module-receiver branch: enumerate the module's top-level decls.
+    if let Some(mod_uri) = project.index.module_names.get(&recv).cloned()
+        && let Some(mod_analysis) = project.module(&mod_uri)
+        && let Some(module_hir) = mod_analysis.hir.module.as_ref()
+    {
+        for &decl_id in &module_hir.decls {
+            let Some(name_id) = mod_analysis.hir.decls[decl_id].name() else {
+                continue;
+            };
+            let name = mod_analysis.hir.idents[name_id].text.clone();
+            if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+                continue;
+            }
+            let kind = match &mod_analysis.hir.decls[decl_id] {
+                Decl::Fn(_) => CompletionItemKind::FUNCTION,
+                Decl::Type(_) => CompletionItemKind::CLASS,
+                Decl::Enum(_) => CompletionItemKind::ENUM,
+                Decl::Var(_) => CompletionItemKind::VARIABLE,
+                Decl::Pragma(_) => continue,
+            };
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(kind),
+                insert_text: Some(name),
+                ..Default::default()
+            });
+        }
+    }
+
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
+}
+
+/// Walk back from `cursor_byte` to extract the static-access receiver.
+/// Returns `(receiver_text, separator_start, typed_prefix)` when the
+/// cursor sits in a `recv::|prefix` shape; `None` otherwise.
+fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<(String, usize, String)> {
+    let typed = ident_prefix_at_cursor(text, cursor_byte);
+    let bytes = text.as_bytes();
+    let cap = cursor_byte.min(bytes.len());
+    let prefix_start = cap.saturating_sub(typed.len());
+    if prefix_start < 2 || bytes[prefix_start - 1] != b':' || bytes[prefix_start - 2] != b':' {
+        return None;
+    }
+    let sep_start = prefix_start - 2;
+    let mut i = sep_start;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i == sep_start {
+        return None;
+    }
+    let recv = text.get(i..sep_start)?.to_string();
+    Some((recv, sep_start, typed))
 }
 
 // =============================================================================

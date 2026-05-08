@@ -717,6 +717,74 @@ fn completion_after_dot_prefix_filters() {
     );
 }
 
+/// P15.2.5 — `Type::|` static completion lists the type's static
+/// methods.
+#[test]
+fn completion_after_double_colon_lists_static_methods() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Point { static fn origin(): Point { return Point{}; } fn norm(): int { return 0; } }\nfn main() { Point:: }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `Point::` (line 1 col 19).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 19),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"origin"), "got: {labels:?}");
+    assert!(
+        !labels.contains(&"norm"),
+        "non-static method leaked: {labels:?}"
+    );
+}
+
+/// P15.2.5 — `module::|` static completion lists the foreign module's
+/// top-level decls.
+#[test]
+fn completion_after_double_colon_lists_module_decls() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\nfn helper(): int { return 0; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(user_uri.clone(), "fn main() { runtime:: }\n", "p", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(0, 21),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"Identity"), "got: {labels:?}");
+    assert!(labels.contains(&"helper"), "got: {labels:?}");
+}
+
 /// P15.2.4 — cross-module member completion: receiver's type lives in
 /// a different module than the cursor's. Lists the foreign type's
 /// attrs.

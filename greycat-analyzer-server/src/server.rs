@@ -78,7 +78,13 @@ pub fn start_server() -> Result<()> {
             document_range_formatting_provider: Some(OneOf::Left(true)),
             completion_provider: Some(CompletionOptions {
                 resolve_provider: Some(false),
-                trigger_characters: Some(vec!["\"".into(), "@".into()]),
+                trigger_characters: Some(vec![
+                    "\"".into(),
+                    "@".into(),
+                    ".".into(),
+                    ":".into(),
+                    ">".into(),
+                ]),
                 ..Default::default()
             }),
             inlay_hint_provider: Some(OneOf::Left(true)),
