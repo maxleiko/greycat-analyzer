@@ -1576,6 +1576,23 @@ pub fn folding_ranges(text: &str, root: tree_sitter::Node<'_>) -> Vec<FoldingRan
 // P3.6 — code actions
 // =============================================================================
 
+/// Project-aware variant — reads the cached diagnostics + lints from
+/// the [`ProjectAnalysis`] entry for `uri` instead of re-running the
+/// whole pipeline. Same convention as the rest of the
+/// `*_with_project` family: the LSP server handler in
+/// [`crate::server`] always goes through this path so the cross-
+/// module fixup passes (P15.7 / P16.3 / P16.4) feed into the
+/// diagnostic list.
+pub fn code_actions_with_project(
+    module: &ModuleAnalysis,
+    text: &str,
+    uri: &Uri,
+    range: lsp_types::Range,
+) -> Vec<CodeActionOrCommand> {
+    let semantic = diagnostics_from_module(text, module);
+    code_actions_from_diagnostics(text, uri, range, semantic)
+}
+
 pub fn code_actions(
     text: &str,
     lib: &str,
@@ -1591,6 +1608,15 @@ pub fn code_actions(
     //     click delete)
     //   - `unused-param` → prepend `_` to the parameter name
     let semantic = current_diagnostics(text, lib, root);
+    code_actions_from_diagnostics(text, uri, range, semantic)
+}
+
+fn code_actions_from_diagnostics(
+    text: &str,
+    uri: &Uri,
+    range: lsp_types::Range,
+    semantic: Vec<Diagnostic>,
+) -> Vec<CodeActionOrCommand> {
     semantic
         .into_iter()
         .filter(|d| ranges_overlap(&d.range, &range))
@@ -3737,11 +3763,11 @@ fn children_by_field_name<'a>(
 // On-demand diagnostics for capabilities that don't sit on the publish path
 // =============================================================================
 
-/// Run the full pipeline (HIR lower → resolver → analyzer + lints) against
-/// `text` and convert every finding to an `lsp_types::Diagnostic`. Used by
-/// per-request capabilities like `code_actions` that need a fresh diagnostic
-/// list without consulting the [`crate::backend::Backend`]'s cached
-/// [`greycat_analyzer_analysis::project::ProjectAnalysis`].
+/// Single-file pipeline (HIR lower → resolver → analyzer + lints) against
+/// `text`, returning every finding as `lsp_types::Diagnostic`. Used by
+/// the legacy [`code_actions`] shim — the LSP server's
+/// `code_actions_handler` reads from the project cache via
+/// [`code_actions_with_project`] / [`diagnostics_from_module`] instead.
 pub(crate) fn current_diagnostics(
     text: &str,
     lib: &str,
@@ -3750,7 +3776,6 @@ pub(crate) fn current_diagnostics(
     let hir = lower_module(text, "module", lib, root);
     let resolutions = resolve(&hir);
     let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
-
     let mut out: Vec<Diagnostic> = analysis
         .diagnostics
         .iter()
@@ -3767,7 +3792,6 @@ pub(crate) fn current_diagnostics(
             ..Default::default()
         })
         .collect();
-
     for lint in run_lints(&hir, &resolutions) {
         out.push(Diagnostic {
             range: byte_range_to_lsp_range(text, &lint.byte_range),
@@ -3779,6 +3803,46 @@ pub(crate) fn current_diagnostics(
             code: Some(NumberOrString::String(lint.rule.into())),
             source: Some("lint".into()),
             message: lint.message,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// Project-aware diagnostics — read the cached analyzer + lints from
+/// the [`ModuleAnalysis`] entry for this module and convert each
+/// finding to an `lsp_types::Diagnostic`. Mirrors the body of the cli
+/// `lint` command's per-module conversion (P14.5) so the LSP and the
+/// CLI surface the same diagnostic shape.
+pub(crate) fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = module
+        .analysis
+        .diagnostics
+        .iter()
+        .map(|d| Diagnostic {
+            range: byte_range_to_lsp_range(text, &d.byte_range),
+            severity: Some(match d.severity {
+                Severity::Error => DiagnosticSeverity::ERROR,
+                Severity::Warning => DiagnosticSeverity::WARNING,
+                Severity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String("semantic".into())),
+            source: Some("greycat-analyzer".into()),
+            message: d.message.clone(),
+            ..Default::default()
+        })
+        .collect();
+    for lint in &module.lints {
+        out.push(Diagnostic {
+            range: byte_range_to_lsp_range(text, &lint.byte_range),
+            severity: Some(match lint.severity {
+                LintSeverity::Error => DiagnosticSeverity::ERROR,
+                LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                LintSeverity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(lint.rule.into())),
+            source: Some("lint".into()),
+            message: lint.message.clone(),
             ..Default::default()
         });
     }

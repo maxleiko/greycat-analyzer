@@ -482,10 +482,14 @@ fn folding_ranges_handler(
 fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<CodeActionResponse> {
     let cell = server.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
-    Some(capabilities::code_actions(
+    // Read from the cache so cross-module diagnostics (P15.10 arg-type
+    // validation) flow into the code-action list. The legacy single-
+    // file `capabilities::code_actions` re-runs lower+resolve+analyze
+    // and skips the project pipeline.
+    let module = server.project_analysis.module(&params.text_document.uri)?;
+    Some(capabilities::code_actions_with_project(
+        module,
         &doc.text,
-        &doc.lib,
-        doc.root_node(),
         &params.text_document.uri,
         params.range,
     ))
