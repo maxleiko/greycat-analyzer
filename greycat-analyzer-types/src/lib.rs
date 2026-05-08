@@ -624,6 +624,93 @@ pub fn display(arena: &TypeArena, id: TypeId) -> String {
     s
 }
 
+/// P18.1 — fully-qualified-name display, matching the TS reference's
+/// canonical printer (e.g. `core::int`, `core::Array<core::int | null>`,
+/// `project::Foo`).
+///
+/// `home_lib` resolves a Named/Generic/Enum's home module (e.g. `Foo →
+/// "project"`, `node → "core"`). Returning `None` falls back to the
+/// `core` library — matches TS's behavior for builtins not in the
+/// project decl table.
+///
+/// Differences from [`display`]:
+/// - Primitives, builtin runtime types, and unresolved names get a
+///   `core::` prefix.
+/// - User types resolve to `<lib>::<Name>` via `home_lib`.
+/// - `nullable` is rendered as ` | null` instead of the `?` suffix.
+/// - `any` (always nullable) is rendered as `core::any | null`.
+pub fn display_fqn(
+    arena: &TypeArena,
+    id: TypeId,
+    home_lib: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let ty = arena.get(id);
+    let mut s = match &ty.kind {
+        // TS reference's `dump-types` emits the bare null literal as
+        // `null`, not `core::null` — match that.
+        TypeKind::Null => "null".to_string(),
+        TypeKind::Any => "core::any".to_string(),
+        TypeKind::Never => "core::never".to_string(),
+        TypeKind::Primitive(p) => format!("core::{}", p.name()),
+        TypeKind::Named { name } => format!(
+            "{}::{}",
+            home_lib(name).unwrap_or_else(|| "core".to_string()),
+            name
+        ),
+        TypeKind::Generic { name, args } => {
+            let lib = home_lib(name).unwrap_or_else(|| "core".to_string());
+            let parts: Vec<String> = args
+                .iter()
+                .map(|a| display_fqn(arena, *a, home_lib))
+                .collect();
+            format!("{lib}::{name}<{}>", parts.join(", "))
+        }
+        TypeKind::GenericParam { name, .. } => name.clone(),
+        TypeKind::Lambda(l) => {
+            let parts: Vec<String> = l
+                .params
+                .iter()
+                .map(|p| display_fqn(arena, *p, home_lib))
+                .collect();
+            format!(
+                "({}) -> {}",
+                parts.join(", "),
+                display_fqn(arena, l.ret, home_lib)
+            )
+        }
+        TypeKind::Tuple { elements } => {
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|e| display_fqn(arena, *e, home_lib))
+                .collect();
+            format!("({})", parts.join(", "))
+        }
+        TypeKind::Anonymous { fields } => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", display_fqn(arena, *t, home_lib)))
+                .collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
+        TypeKind::Enum { name, .. } => format!(
+            "{}::{}",
+            home_lib(name).unwrap_or_else(|| "core".to_string()),
+            name
+        ),
+        TypeKind::Union { alts } => {
+            let parts: Vec<String> = alts
+                .iter()
+                .map(|a| display_fqn(arena, *a, home_lib))
+                .collect();
+            parts.join(" | ")
+        }
+    };
+    if ty.nullable && !matches!(ty.kind, TypeKind::Null) {
+        s.push_str(" | null");
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

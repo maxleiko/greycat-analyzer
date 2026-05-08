@@ -338,6 +338,7 @@ dependencies = [
  "greycat-analyzer-hir",
  "greycat-analyzer-server",
  "greycat-analyzer-syntax",
+ "greycat-analyzer-types",
  "miette",
  "serde",
  "serde_json",
