@@ -270,17 +270,42 @@ impl ProjectAnalysis {
                     .or_default()
                     .push((static_id, shape));
             }
-            // 1b) Call(Static) — overrides the static expr_type and
-            // also drives the call's return-type inference.
+            // 1a-bis) QualifiedStatic standalone shapes (P15.8 chained).
+            for (qstatic_id, qstatic_expr) in cur_module.hir.exprs.iter() {
+                let Expr::QualifiedStatic { chain, .. } = qstatic_expr else {
+                    continue;
+                };
+                let Some(shape) =
+                    resolve_qualified_static_shape(&self.modules, &self.index, cur_module, chain)
+                else {
+                    continue;
+                };
+                expr_updates
+                    .entry(cur_uri.clone())
+                    .or_default()
+                    .push((qstatic_id, shape));
+            }
+            // 1b) Call(Static or QualifiedStatic) — overrides the
+            // static expr_type and also drives the call's return-type
+            // inference.
             for (call_id, call_expr) in cur_module.hir.exprs.iter() {
                 let Expr::Call(call) = call_expr else {
                     continue;
                 };
-                let Expr::Static(s) = &cur_module.hir.exprs[call.callee] else {
-                    continue;
+                let callee_expr = &cur_module.hir.exprs[call.callee];
+                let shape = match callee_expr {
+                    Expr::Static(s) => {
+                        resolve_static_call_return_shape(&self.modules, cur_module, s)
+                    }
+                    Expr::QualifiedStatic { chain, .. } => resolve_qualified_static_call_shape(
+                        &self.modules,
+                        &self.index,
+                        cur_module,
+                        chain,
+                    ),
+                    _ => None,
                 };
-                let Some(shape) = resolve_static_call_return_shape(&self.modules, cur_module, s)
-                else {
+                let Some(shape) = shape else {
                     continue;
                 };
                 expr_updates
@@ -653,6 +678,118 @@ fn static_shape_from_member(member: &crate::analyzer::MemberDef) -> TypeShape {
             params: Vec::new(),
         },
     }
+}
+
+/// P15.8 — resolve a 3-segment `module::Type::member` chain to its
+/// foreign decl shape. Returns the static-expr-as-value type:
+/// methods → `function`, attrs → `field`, types → `type`.
+/// Returns `None` for chains that don't match a known module / type
+/// / member, or for chains of length other than 3 (length 2 is
+/// already handled by `Expr::Static`; longer chains aren't supported
+/// yet).
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_qualified_static_shape(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    cur: &ModuleAnalysis,
+    chain: &[Idx<greycat_analyzer_hir::types::Ident>],
+) -> Option<TypeShape> {
+    let (module_uri, type_decl_id, foreign) = resolve_qualified_chain(modules, index, cur, chain)?;
+    let _ = (module_uri, type_decl_id);
+    use crate::analyzer::MemberDef;
+    Some(match foreign {
+        QualifiedTarget::Member(MemberDef::Method(_)) => TypeShape::Named {
+            name: "function".to_string(),
+            params: Vec::new(),
+        },
+        QualifiedTarget::Member(MemberDef::Attr(_)) => TypeShape::Named {
+            name: "field".to_string(),
+            params: Vec::new(),
+        },
+    })
+}
+
+/// P15.8 — return the call return type for `module::Type::method(...)`.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_qualified_static_call_shape(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    cur: &ModuleAnalysis,
+    chain: &[Idx<greycat_analyzer_hir::types::Ident>],
+) -> Option<TypeShape> {
+    use crate::analyzer::MemberDef;
+    let (module_uri, _type_decl_id, target) = resolve_qualified_chain(modules, index, cur, chain)?;
+    let QualifiedTarget::Member(MemberDef::Method(decl_id)) = target else {
+        return None;
+    };
+    let foreign_module = modules.get(&module_uri)?;
+    let Decl::Fn(fnd) = &foreign_module.hir.decls[decl_id] else {
+        return None;
+    };
+    let ret = fnd.return_type?;
+    Some(read_type_shape(&foreign_module.hir, ret))
+}
+
+enum QualifiedTarget {
+    Member(crate::analyzer::MemberDef),
+}
+
+/// Walk a `module::Type::member` chain and resolve each segment.
+/// Returns (foreign_module_uri, type_decl_id, target). Length
+/// must be exactly 3; other lengths return `None`.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_qualified_chain(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    cur: &ModuleAnalysis,
+    chain: &[Idx<greycat_analyzer_hir::types::Ident>],
+) -> Option<(Uri, Idx<Decl>, QualifiedTarget)> {
+    use crate::analyzer::MemberDef;
+    if chain.len() != 3 {
+        return None;
+    }
+    let module_name = cur.hir.idents[chain[0]].text.as_str();
+    let type_name = cur.hir.idents[chain[1]].text.as_str();
+    let member_name = cur.hir.idents[chain[2]].text.as_str();
+    let module_uri = index.module_uri(module_name)?.clone();
+    let foreign = modules.get(&module_uri)?;
+    let foreign_root = foreign.hir.module.as_ref()?;
+    let mut type_decl_id: Option<Idx<Decl>> = None;
+    for decl_id in &foreign_root.decls {
+        let Decl::Type(td) = &foreign.hir.decls[*decl_id] else {
+            continue;
+        };
+        if foreign.hir.idents[td.name].text == type_name {
+            type_decl_id = Some(*decl_id);
+            break;
+        }
+    }
+    let type_decl_id = type_decl_id?;
+    let Decl::Type(td) = &foreign.hir.decls[type_decl_id] else {
+        return None;
+    };
+    for attr_id in &td.attrs {
+        if foreign.hir.idents[foreign.hir.type_attrs[*attr_id].name].text == member_name {
+            return Some((
+                module_uri,
+                type_decl_id,
+                QualifiedTarget::Member(MemberDef::Attr(*attr_id)),
+            ));
+        }
+    }
+    for method_id in &td.methods {
+        let Decl::Fn(m) = &foreign.hir.decls[*method_id] else {
+            continue;
+        };
+        if foreign.hir.idents[m.name].text == member_name {
+            return Some((
+                module_uri,
+                type_decl_id,
+                QualifiedTarget::Member(MemberDef::Method(*method_id)),
+            ));
+        }
+    }
+    None
 }
 
 /// P15.7 — figure out what return type a `Call(callee=Static)` should

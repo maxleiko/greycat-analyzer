@@ -405,6 +405,92 @@ fn cross_module_static_call_infers_return_type() {
     );
 }
 
+/// P15.8 — `var x = runtime::Identity::create("a", "b");` (chained
+/// `module::Type::method(...)` call) infers `x: Identity`.
+#[test]
+fn qualified_static_call_infers_return_type() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var x = runtime::Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let x_local = user_module
+        .hir
+        .idents
+        .iter()
+        .find(|(_, i)| i.text == "x")
+        .map(|(idx, _)| idx)
+        .expect("`x` ident");
+    let ty = user_module
+        .analysis
+        .def_types
+        .get(&x_local)
+        .copied()
+        .expect("def_type for x");
+    let display = greycat_analyzer_types::display(&user_module.analysis.types, ty);
+    assert_eq!(
+        display, "Identity",
+        "x should infer as `Identity`, got `{display}`"
+    );
+}
+
+/// P15.8 — `var y = runtime::Identity::create;` (chained method ref)
+/// infers `y: function`.
+#[test]
+fn qualified_static_method_ref_infers_function() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var y = runtime::Identity::create; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let y_local = user_module
+        .hir
+        .idents
+        .iter()
+        .find(|(_, i)| i.text == "y")
+        .map(|(idx, _)| idx)
+        .expect("`y` ident");
+    let ty = user_module
+        .analysis
+        .def_types
+        .get(&y_local)
+        .copied()
+        .expect("def_type for y");
+    let display = greycat_analyzer_types::display(&user_module.analysis.types, ty);
+    assert_eq!(
+        display, "function",
+        "y should infer as `function`, got `{display}`"
+    );
+}
+
 /// P15.x — `var w = runtime::Identity;` (module-prefixed type
 /// reference) infers as `type` (the runtime native — type decls
 /// become `type` values when referenced via `module::Type`).

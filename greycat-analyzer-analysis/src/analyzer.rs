@@ -1262,6 +1262,13 @@ impl<'a> Cx<'a> {
                 self.resolve_member(recv_ty, s.property);
                 self.any()
             }
+            Expr::QualifiedStatic { .. } => {
+                // P15.8 — chained `module::Type::name` shapes.
+                // Member binding + return-type / static-shape inference
+                // happen in `ProjectAnalysis` pass 3.5 because they need
+                // cross-module HIR access. Default to `any` here.
+                self.any()
+            }
             Expr::Offset(OffsetExpr {
                 receiver, index, ..
             }) => {

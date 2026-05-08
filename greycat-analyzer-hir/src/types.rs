@@ -276,6 +276,16 @@ pub enum Expr {
     Member(MemberExpr),
     Arrow(MemberExpr), // `n->name` — same shape, different access semantics
     Static(StaticExpr),
+    /// P15.8 — chained `module::Type::method` (or longer). The
+    /// HIR `StaticExpr` only models `Type::name` because its `ty`
+    /// slot is a `TypeRef` and the grammar allows a nested
+    /// `static_expr` as the head. For chains the lowering emits
+    /// this flat-`Vec<Idx<Ident>>` shape instead. Each segment is
+    /// an `ident` from the source. Length is always >= 2.
+    QualifiedStatic {
+        chain: Vec<Idx<Ident>>,
+        byte_range: Span,
+    },
     Offset(OffsetExpr),
     Call(CallExpr),
     Binary(BinaryExpr),
@@ -317,6 +327,7 @@ impl Expr {
             Expr::Object(o) => o.byte_range.clone(),
             Expr::Member(m) | Expr::Arrow(m) => m.byte_range.clone(),
             Expr::Static(s) => s.byte_range.clone(),
+            Expr::QualifiedStatic { byte_range, .. } => byte_range.clone(),
             Expr::Offset(o) => o.byte_range.clone(),
             Expr::Call(c) => c.byte_range.clone(),
             Expr::Binary(b) => b.byte_range.clone(),

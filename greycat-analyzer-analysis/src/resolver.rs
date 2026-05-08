@@ -482,6 +482,15 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             // (P2.5).
         }
         Expr::Static(s) => visit_type_ref(cx, s.ty),
+        Expr::QualifiedStatic { chain, .. } => {
+            // P15.8 — bind the leftmost segment as a regular use
+            // (typically a module name or a type name). Subsequent
+            // segments are members and bind via type-driven resolution
+            // in the analyzer / pass 3.5, not here.
+            if let Some(first) = chain.first() {
+                cx.record_use(*first);
+            }
+        }
         Expr::Offset(OffsetExpr {
             receiver, index, ..
         }) => {

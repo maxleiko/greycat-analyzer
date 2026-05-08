@@ -701,15 +701,32 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "static_expr" => {
+            // P15.8 — chained `module::Type::name` shapes can't fit
+            // the simple `StaticExpr { ty: TypeRef, property: Ident }`
+            // shape because the head is itself a `static_expr`, not a
+            // `type_ident`. Detect the chain and lower as
+            // `Expr::QualifiedStatic { chain: Vec<Idx<Ident>> }` with
+            // every segment as a flat ident.
             let prop = node.child_by_field_name("property")?;
-            let ty_node = first_named_child_excluding(node, prop.id())?;
-            let ty = lower_type_ref(cx, ty_node)?;
-            let property = cx.alloc_ident(prop);
-            Expr::Static(StaticExpr {
-                ty,
-                property,
-                byte_range: node.byte_range(),
-            })
+            let head = first_named_child_excluding(node, prop.id())?;
+            if head.kind() == "static_expr" {
+                let mut chain = Vec::new();
+                if !collect_static_chain_idents(cx, node, &mut chain) {
+                    return None;
+                }
+                Expr::QualifiedStatic {
+                    chain,
+                    byte_range: node.byte_range(),
+                }
+            } else {
+                let ty = lower_type_ref(cx, head)?;
+                let property = cx.alloc_ident(prop);
+                Expr::Static(StaticExpr {
+                    ty,
+                    property,
+                    byte_range: node.byte_range(),
+                })
+            }
         }
         "offset_expr" => {
             // `recv[index]` — two named children (recv, index).
@@ -924,6 +941,50 @@ fn first_named_child_excluding<'tree>(
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|c| c.id() != excluded_id)
+}
+
+/// P15.8 — walk a chained `static_expr` node left-to-right and
+/// alloc each segment's ident into the HIR's idents arena, pushing
+/// the resulting `Idx<Ident>` into `out`. Returns `false` if any
+/// segment's ident node is missing (a malformed chain).
+///
+/// For `runtime::Identity::create`, `out` ends up as
+/// `[runtime, Identity, create]`.
+///
+/// The leftmost segment is wrapped in a `type_ident` (because the
+/// grammar sets the head's first form to `type_ident`); subsequent
+/// segments come from each `static_expr.property` ident.
+fn collect_static_chain_idents(
+    cx: &mut LowerCtx,
+    node: tree_sitter::Node<'_>,
+    out: &mut Vec<Idx<Ident>>,
+) -> bool {
+    if node.kind() != "static_expr" {
+        return false;
+    }
+    let prop = match node.child_by_field_name("property") {
+        Some(p) => p,
+        None => return false,
+    };
+    let head = match first_named_child_excluding(node, prop.id()) {
+        Some(h) => h,
+        None => return false,
+    };
+    if head.kind() == "static_expr" {
+        if !collect_static_chain_idents(cx, head, out) {
+            return false;
+        }
+    } else if head.kind() == "type_ident" {
+        let name_node = match head.child_by_field_name("name") {
+            Some(n) => n,
+            None => return false,
+        };
+        out.push(cx.alloc_ident(name_node));
+    } else {
+        return false;
+    }
+    out.push(cx.alloc_ident(prop));
+    true
 }
 
 fn operator_text<'src>(cx: &LowerCtx<'src>, node: tree_sitter::Node<'_>) -> &'src str {
