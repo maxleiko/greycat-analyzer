@@ -1251,7 +1251,15 @@ impl<'a> Cx<'a> {
                 self.any()
             }
             Expr::Static(s) => {
-                let _ = self.lower_type_ref(s.ty);
+                // P15.6 — `Type::method` resolution. Lower the receiver
+                // type so cross-module receivers land as `Named(name)`
+                // (via `lower_type_ref`'s `index.has_name(&name)` arm),
+                // then run `resolve_member` on the property: in-module
+                // hits land in `member_uses`; cross-module hits get
+                // deferred to the project pipeline's pass 3 via
+                // `deferred_member_uses` (P11.5).
+                let recv_ty = self.lower_type_ref(s.ty);
+                self.resolve_member(recv_ty, s.property);
                 self.any()
             }
             Expr::Offset(OffsetExpr {

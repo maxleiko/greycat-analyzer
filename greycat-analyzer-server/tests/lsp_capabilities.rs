@@ -272,6 +272,47 @@ fn cross_module_rename_aggregates_text_edits_per_uri() {
     }
 }
 
+/// P15.6 — `Identity::create` (`static_expr` against a cross-module
+/// type) should bind the property ident to the foreign method via
+/// `foreign_member_uses`, just like `.` member access does for attrs.
+#[test]
+fn cross_module_static_call_binds_foreign_method() {
+    use greycat_analyzer_analysis::analyzer::MemberDef;
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri.clone(),
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var x = Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let create_uses: Vec<_> = user_module
+        .hir
+        .idents
+        .iter()
+        .filter(|(_, i)| i.text == "create")
+        .map(|(idx, _)| idx)
+        .collect();
+    assert_eq!(create_uses.len(), 1, "one `create` ident in main.gcl");
+    let foreign = user_module
+        .analysis
+        .foreign_member_lookup(create_uses[0])
+        .expect("foreign method binding for `Identity::create`");
+    assert_eq!(foreign.uri, runtime_uri);
+    assert!(matches!(foreign.member, MemberDef::Method(_)));
+}
+
 #[test]
 fn cross_module_member_resolution_binds_foreign_attr() {
     use greycat_analyzer_analysis::analyzer::MemberDef;
