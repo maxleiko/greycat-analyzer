@@ -187,8 +187,23 @@ pub fn pragma_diagnostics(
             ));
             continue;
         }
+        // P17.4 — a library is "resolved" when at least one of the
+        // following holds:
+        //   1. `<project>/lib/<name>/` is a directory (the canonical
+        //      code-library shape).
+        //   2. `<project>/webroot/<name>/` is a directory (asset-only
+        //      libraries like `explorer` ship as webroot bundles with
+        //      no `.gcl` content).
+        //   3. `<project>/lib/installed` lists `<name>=...` (the manifest
+        //      `greycat install` writes; counts even when the dir hasn't
+        //      been materialized in this checkout).
+        //   4. The `std` fallback at `<greycat_home>/lib/std/`.
+        // Only when *none* of these match do we surface a diagnostic.
         let local = library_dir(project_dir, &lib.name);
+        let webroot = project_dir.join("webroot").join(&lib.name);
         let resolved = ctx.is_dir(&local)
+            || ctx.is_dir(&webroot)
+            || installed_manifest_lists(ctx, project_dir, &lib.name)
             || (lib.name == "std" && ctx.is_dir(&global_std_dir(ctx.greycat_home())));
         if !resolved {
             out.push(make_pragma_diag(
@@ -201,6 +216,20 @@ pub fn pragma_diagnostics(
         }
     }
     out
+}
+
+/// `true` iff `<project>/lib/installed` exists and contains a line
+/// starting with `<name>=`. The `installed` manifest is what
+/// `greycat install` writes when it materializes a library, and a
+/// name being listed there is a strong signal the library is meant
+/// to be present even if its directory hasn't been extracted yet.
+fn installed_manifest_lists(ctx: &dyn Context, project_dir: &std::path::Path, name: &str) -> bool {
+    let manifest = project_dir.join("lib").join("installed");
+    let Ok(text) = ctx.read(&manifest) else {
+        return false;
+    };
+    let prefix = format!("{name}=");
+    text.lines().any(|line| line.starts_with(&prefix))
 }
 
 fn make_pragma_diag(
@@ -282,16 +311,21 @@ mod tests {
         parse_diagnostics(tree.root_node(), source)
     }
 
-    /// In-memory `Context` for pragma_diagnostics tests — only `is_dir`
-    /// is exercised, the rest are stubs.
+    /// In-memory `Context` for pragma_diagnostics tests. Tracks
+    /// known directories + (P17.4) optional `path → contents` map for
+    /// reading the `lib/installed` manifest.
     struct PragmaCtx {
         dirs: std::collections::HashSet<PathBuf>,
+        files: HashMap<PathBuf, String>,
         greycat_home: PathBuf,
     }
 
     impl Context for PragmaCtx {
-        fn read(&self, _path: &Path) -> std::io::Result<String> {
-            Err(std::io::Error::other("stub"))
+        fn read(&self, path: &Path) -> std::io::Result<String> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("not found"))
         }
         fn iter_gcl(&self, _dir: &Path) -> Vec<PathBuf> {
             Vec::new()
@@ -310,6 +344,7 @@ mod tests {
         let desc = parse_module_desc(uri, source, tree.root_node());
         let ctx = PragmaCtx {
             dirs: dirs.iter().map(PathBuf::from).collect(),
+            files: HashMap::new(),
             greycat_home: PathBuf::from("/gcat"),
         };
         let project_dir = Path::new("/proj");
@@ -416,6 +451,48 @@ mod tests {
         assert!(
             map.contains_key("unresolved-library"),
             "expected unresolved-library, got: {map:?}"
+        );
+    }
+
+    /// P17.4 — `@library("explorer", ...)` resolves to a webroot
+    /// asset library: `<project>/webroot/<name>/` exists even though
+    /// `<project>/lib/<name>/` does not.
+    #[test]
+    fn pragma_diagnostics_library_resolves_from_webroot() {
+        let src = "@library(\"explorer\", \"1.0\");\n";
+        let map = pragma_diags(src, &["/proj/webroot/explorer"]);
+        assert!(
+            !map.contains_key("unresolved-library"),
+            "expected webroot fallback to resolve, got: {map:?}"
+        );
+    }
+
+    /// P17.4 — `@library("foo", ...)` resolves when `lib/installed`
+    /// lists the name. Useful for asset-only libs that haven't yet
+    /// extracted their dir.
+    #[test]
+    fn pragma_diagnostics_library_resolves_from_installed_manifest() {
+        let src = "@library(\"foo\", \"1.0\");\n";
+        let tree = greycat_analyzer_syntax::parse(src);
+        let uri = Uri::from_str("file:///proj/project.gcl").unwrap();
+        let desc = parse_module_desc(uri, src, tree.root_node());
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/proj/lib/installed"),
+            "std=8.0.269-dev\nfoo=1.0\n".into(),
+        );
+        let ctx = PragmaCtx {
+            dirs: Default::default(),
+            files,
+            greycat_home: PathBuf::from("/gcat"),
+        };
+        let project_dir = Path::new("/proj");
+        let out = pragma_diagnostics(src, &desc, project_dir, &ctx);
+        assert!(
+            !out.iter().any(
+                |d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "unresolved-library")
+            ),
+            "expected `lib/installed` manifest to resolve `foo`, got: {out:?}"
         );
     }
 
