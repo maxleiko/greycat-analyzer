@@ -545,21 +545,40 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             })
         }
         "for_in_stmt" => {
-            let iter_param = node.child_by_field_name("iterator")?;
-            let iter_name_node = iter_param.child_by_field_name("name")?;
-            let iterator_name = cx.alloc_ident(iter_name_node);
-            let iterator_type = iter_param
-                .child_by_field_name("type")
-                .and_then(|t| lower_type_ref(cx, t));
+            // P17.2 — the grammar's `for_in_stmt` carries `sepBy2(",",
+            // for_in_param)` (no field name on the params themselves)
+            // plus a field-tagged `iterator: _expr` for the iterable
+            // and `block: block` for the body. Previous lowering
+            // misread `child_by_field_name("iterator")` as a param
+            // wrapper and asked for `name` on it, dropping the whole
+            // for-in via `?` short-circuit. Walk named children for
+            // `for_in_param` nodes.
+            let mut cursor = node.walk();
+            let mut params: Vec<ForInParam> = Vec::new();
+            for c in node.named_children(&mut cursor) {
+                if c.kind() != "for_in_param" {
+                    continue;
+                }
+                let Some(name_node) = c.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = cx.alloc_ident(name_node);
+                let ty = c
+                    .child_by_field_name("type")
+                    .and_then(|t| lower_type_ref(cx, t));
+                params.push(ForInParam { name, ty });
+            }
+            if params.is_empty() {
+                return None;
+            }
             let range = node
-                .child_by_field_name("range")
+                .child_by_field_name("iterator")
                 .and_then(|r| lower_expr(cx, r))?;
             let body = node
                 .child_by_field_name("block")
                 .and_then(|n| lower_stmt(cx, n))?;
             Stmt::ForIn(ForInStmt {
-                iterator_name,
-                iterator_type,
+                params,
                 range,
                 body,
                 byte_range: node.byte_range(),

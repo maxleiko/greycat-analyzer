@@ -2979,8 +2979,10 @@ fn collect_stmt_scope(
         HS::ForIn(s) => {
             let br = stmt_byte_range(hir, s.body);
             if br.start <= cursor_byte && cursor_byte <= br.end {
-                let n = hir.idents[s.iterator_name].text.clone();
-                out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                for p in &s.params {
+                    let n = hir.idents[p.name].text.clone();
+                    out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                }
                 collect_stmt_scope(hir, s.body, cursor_byte, out);
             }
         }
@@ -3288,8 +3290,10 @@ fn lookup_name_type_in_stmt(
             lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name)
         }
         HS::ForIn(s) => {
-            if hir.idents[s.iterator_name].text == name {
-                return analysis.def_types.get(&s.iterator_name).copied();
+            for p in &s.params {
+                if hir.idents[p.name].text == name {
+                    return analysis.def_types.get(&p.name).copied();
+                }
             }
             lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name)
         }

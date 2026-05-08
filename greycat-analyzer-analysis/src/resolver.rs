@@ -412,19 +412,20 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             cx.pop_scope();
         }
         Stmt::ForIn(ForInStmt {
-            iterator_name,
-            iterator_type,
+            params,
             range,
             body,
             ..
         }) => {
             visit_expr(cx, range);
             cx.push_scope();
-            if let Some(t) = iterator_type {
-                visit_type_ref(cx, t);
+            for p in &params {
+                if let Some(t) = p.ty {
+                    visit_type_ref(cx, t);
+                }
+                let n = cx.ident_text(p.name).to_string();
+                cx.current_mut().insert(n, Definition::Local(p.name));
             }
-            let n = cx.ident_text(iterator_name).to_string();
-            cx.current_mut().insert(n, Definition::Local(iterator_name));
             visit_stmt(cx, body);
             cx.pop_scope();
         }
@@ -751,6 +752,34 @@ fn f(p: Foo): Foo { return p; }
         assert_eq!(uri, &other_uri);
         assert!(matches!(other_hir.decls[*decl], Decl::Type(_)));
         assert!(res.unresolved.is_empty());
+    }
+
+    /// P17.2 — `for (i, x in xs) { ... i ... x ... }` should bind both
+    /// `i` and `x` as locals in the body. Was silently dropping the
+    /// entire `for_in_stmt` because lowering misread the iterator
+    /// expression as a param wrapper (the `?` short-circuit on the
+    /// non-existent `name` field returned `None`).
+    #[test]
+    fn for_in_tuple_form_binds_both_params() {
+        let src = "fn f(xs: Array<int>) { for (i, x in xs) { var s = i + x; } }\n";
+        let (hir, res) = analyze(src);
+        for name in ["i", "x"] {
+            let uses: Vec<_> = hir
+                .idents
+                .iter()
+                .filter(|(_, id)| id.text == name)
+                .filter_map(|(idx, _)| res.uses.get(&idx))
+                .collect();
+            assert!(
+                uses.iter().any(|d| matches!(d, Definition::Local(_))),
+                "expected `{name}` use to bind to a Local, got {uses:?}"
+            );
+        }
+        assert!(
+            res.unresolved.is_empty(),
+            "no idents should be unresolved, got {:?}",
+            res.unresolved
+        );
     }
 
     /// P17.3 — `try { ... } catch (ex) { ... ex ... }` should bind

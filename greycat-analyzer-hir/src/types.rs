@@ -237,11 +237,19 @@ pub struct ForStmt {
 
 #[derive(Debug, Clone)]
 pub struct ForInStmt {
-    pub iterator_name: Idx<Ident>,
-    pub iterator_type: Option<Idx<TypeRef>>,
+    /// Binders introduced by this for-in. The grammar's `sepBy2`
+    /// guarantees `params.len() >= 2` — typically `(index, value)` or
+    /// `(key, value)`.
+    pub params: Vec<ForInParam>,
     pub range: Idx<Expr>,
     pub body: Idx<Stmt>,
     pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForInParam {
+    pub name: Idx<Ident>,
+    pub ty: Option<Idx<TypeRef>>,
 }
 
 #[derive(Debug, Clone)]
