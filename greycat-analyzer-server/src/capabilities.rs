@@ -2228,6 +2228,43 @@ pub fn completion(
     None
 }
 
+/// P15.2.3 — completion with project context. Same dispatcher chain as
+/// [`completion`], but the ident-position branch enumerates scope-
+/// visible names (locals / params / generics / in-module decls) plus
+/// the cross-module project surface (`ProjectIndex::values` /
+/// `decl_locations` / `BUILTIN_RUNTIME_TYPES` / primitives) alongside
+/// the keyword list. Typed prefix filters all of them.
+pub fn completion_with_project(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    pos: Position,
+    uri: &Uri,
+    project: &ProjectAnalysis,
+    project_root: Option<&std::path::Path>,
+) -> Option<CompletionList> {
+    let byte = position_to_byte(text, pos);
+    let node = node_at_offset(root, byte)?;
+    if let Some(items) = include_dir_completion(text, node, byte, project_root) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
+    if let Some(items) = pragma_completion(text, byte) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
+    if let Some(items) = ident_or_keyword_completion(text, node, byte, uri, project) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
+    None
+}
+
 /// P15.4 — `@include("<cursor>")` directory completion. Activated when
 /// the cursor sits inside a `string` (or its `string_fragment` child)
 /// whose enclosing `mod_pragma`'s annotation name is `include`. Walks
@@ -2602,6 +2639,381 @@ const ALL_KEYWORDS: &[&str] = &[
     "native", "null", "private", "return", "static", "this", "throw", "true", "try", "type", "var",
     "while",
 ];
+
+// =============================================================================
+// P15.2.3 — scope-aware ident completion
+// =============================================================================
+
+/// Emit a unified list of keywords + scope-visible names + project-wide
+/// surface at an ident position. Mirrors the TS reference's
+/// `Environment::suggest` (`packages/lang/src/analysis/environment.ts`)
+/// — the per-suggestion `kind` is derived from each name's
+/// `Definition` shape.
+fn ident_or_keyword_completion(
+    text: &str,
+    node: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+    uri: &Uri,
+    project: &ProjectAnalysis,
+) -> Option<Vec<CompletionItem>> {
+    if !is_keyword_position(text, node, cursor_byte) {
+        return None;
+    }
+    let typed = ident_prefix_at_cursor(text, cursor_byte);
+    let prefix_lower = typed.to_lowercase();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items: Vec<CompletionItem> = Vec::new();
+
+    // Keywords first, alphabetic-sorted under `sort_text` so they land
+    // toward the bottom of the suggestion popup (idents typically win).
+    for kw in ALL_KEYWORDS {
+        if !prefix_lower.is_empty() && !kw.starts_with(&prefix_lower) {
+            continue;
+        }
+        if seen.insert((*kw).into()) {
+            items.push(CompletionItem {
+                label: (*kw).into(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some((*kw).into()),
+                sort_text: Some(format!("z_{kw}")),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Scope-visible names — this module's HIR walked top-to-cursor.
+    if let Some(module) = project.module(uri) {
+        let names = scope_names_at(&module.hir, cursor_byte);
+        for (name, kind, sort_pri) in names {
+            if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+                continue;
+            }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(kind),
+                insert_text: Some(name),
+                sort_text: Some(sort_pri.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Project surface — every cross-module top-level decl + primitives
+    // + runtime types + native fn signatures. `module(uri)` guarded
+    // to avoid double-emitting in-module decls.
+    let in_module: std::collections::HashSet<String> = project
+        .module(uri)
+        .map(|m| {
+            m.hir
+                .module
+                .as_ref()
+                .map(|md| {
+                    md.decls
+                        .iter()
+                        .filter_map(|d| m.hir.decls[*d].name())
+                        .map(|n| m.hir.idents[n].text.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    for (name, locs) in &project.index.decl_locations {
+        if in_module.contains(name) {
+            continue;
+        }
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let kind = decl_locs_kind(project, locs);
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(kind),
+            insert_text: Some(name.clone()),
+            sort_text: Some(format!("y_{name}")),
+            ..Default::default()
+        });
+    }
+    for name in project.index.values.iter() {
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            insert_text: Some(name.clone()),
+            sort_text: Some(format!("y_{name}")),
+            ..Default::default()
+        });
+    }
+    for name in project.index.module_names.keys() {
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::MODULE),
+            insert_text: Some(name.clone()),
+            sort_text: Some(format!("x_{name}")),
+            ..Default::default()
+        });
+    }
+    for name in greycat_analyzer_analysis::stdlib::BUILTIN_RUNTIME_TYPES {
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if !seen.insert((*name).into()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: (*name).into(),
+            kind: Some(CompletionItemKind::CLASS),
+            insert_text: Some((*name).into()),
+            sort_text: Some(format!("y_{name}")),
+            ..Default::default()
+        });
+    }
+
+    if items.is_empty() {
+        return None;
+    }
+    Some(items)
+}
+
+/// Pick the `CompletionItemKind` for a name resolving through the
+/// project index's decl table. When the name has multiple home
+/// locations we pick the first; that's the same disambiguation policy
+/// the resolver uses (P11.2).
+fn decl_locs_kind(
+    project: &ProjectAnalysis,
+    locs: &[(Uri, greycat_analyzer_hir::arena::Idx<Decl>)],
+) -> CompletionItemKind {
+    if let Some((uri, decl_id)) = locs.first()
+        && let Some(m) = project.module(uri)
+    {
+        match &m.hir.decls[*decl_id] {
+            Decl::Fn(_) => CompletionItemKind::FUNCTION,
+            Decl::Type(_) => CompletionItemKind::CLASS,
+            Decl::Enum(_) => CompletionItemKind::ENUM,
+            Decl::Var(_) => CompletionItemKind::VARIABLE,
+            Decl::Pragma(_) => CompletionItemKind::CONSTANT,
+        }
+    } else {
+        CompletionItemKind::TEXT
+    }
+}
+
+/// Walk the HIR to collect every name visible at `cursor_byte`. Returns
+/// `(name, completion_kind, sort_priority)` triples. Lower sort_priority
+/// strings sort earlier — locals win over module decls.
+///
+/// This is a stand-alone walker that doesn't share state with the
+/// resolver. The duplication is intentional — the resolver's `Cx`
+/// builds full bindings (with `Definition` data), but completion only
+/// needs the name + a kind hint, and re-running the resolver per
+/// keystroke would be wasteful.
+fn scope_names_at(
+    hir: &greycat_analyzer_hir::Hir,
+    cursor_byte: usize,
+) -> Vec<(String, CompletionItemKind, &'static str)> {
+    use greycat_analyzer_hir::types::Decl as HD;
+    let mut out: Vec<(String, CompletionItemKind, &'static str)> = Vec::new();
+    let Some(module) = hir.module.as_ref() else {
+        return out;
+    };
+    // Module-level decls are always visible (forward-ref allowed).
+    for &decl_id in &module.decls {
+        if let Some(name_id) = hir.decls[decl_id].name() {
+            let name = hir.idents[name_id].text.clone();
+            let kind = match &hir.decls[decl_id] {
+                HD::Fn(_) => CompletionItemKind::FUNCTION,
+                HD::Type(_) => CompletionItemKind::CLASS,
+                HD::Enum(_) => CompletionItemKind::ENUM,
+                HD::Var(_) => CompletionItemKind::VARIABLE,
+                HD::Pragma(_) => continue,
+            };
+            out.push((name, kind, "n_"));
+        }
+    }
+    // Descend into the declaration that contains the cursor.
+    for &decl_id in &module.decls {
+        let r = hir.decls[decl_id].byte_range();
+        if !(r.start <= cursor_byte && cursor_byte <= r.end) {
+            continue;
+        }
+        match &hir.decls[decl_id] {
+            HD::Fn(d) => collect_fn_scope(hir, d, cursor_byte, &mut out),
+            HD::Type(d) => {
+                for g in &d.generics {
+                    let n = hir.idents[*g].text.clone();
+                    out.push((n, CompletionItemKind::TYPE_PARAMETER, "g_"));
+                }
+                for &m_id in &d.methods {
+                    let mr = hir.decls[m_id].byte_range();
+                    if !(mr.start <= cursor_byte && cursor_byte <= mr.end) {
+                        continue;
+                    }
+                    if let HD::Fn(fd) = &hir.decls[m_id] {
+                        collect_fn_scope(hir, fd, cursor_byte, &mut out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn collect_fn_scope(
+    hir: &greycat_analyzer_hir::Hir,
+    fnd: &greycat_analyzer_hir::types::FnDecl,
+    cursor_byte: usize,
+    out: &mut Vec<(String, CompletionItemKind, &'static str)>,
+) {
+    for g in &fnd.generics {
+        let n = hir.idents[*g].text.clone();
+        out.push((n, CompletionItemKind::TYPE_PARAMETER, "g_"));
+    }
+    for p in &fnd.params {
+        let p = &hir.fn_params[*p];
+        let n = hir.idents[p.name].text.clone();
+        out.push((n, CompletionItemKind::VARIABLE, "a_"));
+    }
+    if let Some(body) = fnd.body {
+        collect_stmt_scope(hir, body, cursor_byte, out);
+    }
+}
+
+fn collect_stmt_scope(
+    hir: &greycat_analyzer_hir::Hir,
+    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
+    cursor_byte: usize,
+    out: &mut Vec<(String, CompletionItemKind, &'static str)>,
+) {
+    use greycat_analyzer_hir::types::Stmt as HS;
+    match &hir.stmts[stmt_id] {
+        HS::Block(stmts) => {
+            for s in stmts {
+                let r = stmt_byte_range(hir, *s);
+                // Var bindings introduced *before* the cursor.
+                if r.end <= cursor_byte {
+                    if let HS::Var(lv) = &hir.stmts[*s] {
+                        let n = hir.idents[lv.name].text.clone();
+                        out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                    }
+                } else if r.start <= cursor_byte && cursor_byte <= r.end {
+                    collect_stmt_scope(hir, *s, cursor_byte, out);
+                }
+            }
+        }
+        HS::If(s) => {
+            let r = stmt_byte_range(hir, s.then_branch);
+            if r.start <= cursor_byte && cursor_byte <= r.end {
+                collect_stmt_scope(hir, s.then_branch, cursor_byte, out);
+            }
+            if let Some(eb) = s.else_branch {
+                let er = stmt_byte_range(hir, eb);
+                if er.start <= cursor_byte && cursor_byte <= er.end {
+                    collect_stmt_scope(hir, eb, cursor_byte, out);
+                }
+            }
+        }
+        HS::While(s) => {
+            let br = stmt_byte_range(hir, s.body);
+            if br.start <= cursor_byte && cursor_byte <= br.end {
+                collect_stmt_scope(hir, s.body, cursor_byte, out);
+            }
+        }
+        HS::DoWhile(s) => {
+            let br = stmt_byte_range(hir, s.body);
+            if br.start <= cursor_byte && cursor_byte <= br.end {
+                collect_stmt_scope(hir, s.body, cursor_byte, out);
+            }
+        }
+        HS::For(s) => {
+            let br = stmt_byte_range(hir, s.body);
+            if br.start <= cursor_byte && cursor_byte <= br.end {
+                if let Some(name_id) = s.init_name {
+                    let n = hir.idents[name_id].text.clone();
+                    out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                }
+                collect_stmt_scope(hir, s.body, cursor_byte, out);
+            }
+        }
+        HS::ForIn(s) => {
+            let br = stmt_byte_range(hir, s.body);
+            if br.start <= cursor_byte && cursor_byte <= br.end {
+                let n = hir.idents[s.iterator_name].text.clone();
+                out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                collect_stmt_scope(hir, s.body, cursor_byte, out);
+            }
+        }
+        HS::Try(s) => {
+            let tr = stmt_byte_range(hir, s.try_block);
+            if tr.start <= cursor_byte && cursor_byte <= tr.end {
+                collect_stmt_scope(hir, s.try_block, cursor_byte, out);
+            }
+            let cr = stmt_byte_range(hir, s.catch_block);
+            if cr.start <= cursor_byte && cursor_byte <= cr.end {
+                if let Some(err_id) = s.error_param {
+                    let n = hir.idents[err_id].text.clone();
+                    out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                }
+                collect_stmt_scope(hir, s.catch_block, cursor_byte, out);
+            }
+        }
+        HS::At(s) => {
+            let br = stmt_byte_range(hir, s.block);
+            if br.start <= cursor_byte && cursor_byte <= br.end {
+                collect_stmt_scope(hir, s.block, cursor_byte, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stmt_byte_range(
+    hir: &greycat_analyzer_hir::Hir,
+    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
+) -> std::ops::Range<usize> {
+    use greycat_analyzer_hir::types::Stmt as HS;
+    match &hir.stmts[stmt_id] {
+        HS::Block(stmts) => {
+            if let (Some(first), Some(last)) = (stmts.first(), stmts.last()) {
+                let f = stmt_byte_range(hir, *first);
+                let l = stmt_byte_range(hir, *last);
+                f.start..l.end
+            } else {
+                0..0
+            }
+        }
+        HS::Var(s) => s.byte_range.clone(),
+        HS::Assign(s) => s.byte_range.clone(),
+        HS::If(s) => s.byte_range.clone(),
+        HS::While(s) => s.byte_range.clone(),
+        HS::DoWhile(s) => s.byte_range.clone(),
+        HS::For(s) => s.byte_range.clone(),
+        HS::ForIn(s) => s.byte_range.clone(),
+        HS::Try(s) => s.byte_range.clone(),
+        HS::At(s) => s.byte_range.clone(),
+        HS::Expr(e) => hir.exprs[*e].byte_range(),
+        HS::Return(Some(e)) => hir.exprs[*e].byte_range(),
+        HS::Throw(e) => hir.exprs[*e].byte_range(),
+        HS::Return(None) | HS::Break | HS::Continue => 0..0,
+    }
+}
 
 // =============================================================================
 // On-demand diagnostics for capabilities that don't sit on the publish path

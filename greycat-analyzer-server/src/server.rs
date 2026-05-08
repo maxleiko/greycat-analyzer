@@ -490,10 +490,12 @@ fn completion_handler(server: &Backend, params: CompletionParams) -> Option<Comp
     let pos = params.text_document_position.position;
     let cell = server.manager.get(&uri)?;
     let doc = cell.borrow();
-    let list = capabilities::completion(
+    let list = capabilities::completion_with_project(
         &doc.text,
         doc.root_node(),
         pos,
+        &uri,
+        &server.project_analysis,
         server.project_root.as_deref(),
     )?;
     Some(CompletionResponse::List(list))

@@ -551,6 +551,103 @@ fn completion_inside_string_skips_keywords() {
     }
 }
 
+/// P15.2.3 — scope-aware ident completion surfaces locals + params +
+/// module-level decls alongside keywords.
+#[test]
+fn completion_scope_aware_lists_locals_and_decls() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn helper(): int { return 1; }\nfn main(seed: int) {\n  var counter = 0;\n  c\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `c` on line 3 col 3.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(3, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"counter"), "got: {labels:?}");
+    assert!(labels.contains(&"catch"), "got: {labels:?}");
+    // `helper` does not match prefix `c`, so should be filtered out.
+    assert!(!labels.contains(&"helper"), "got: {labels:?}");
+}
+
+/// P15.2.3 — params and locals defined before the cursor are visible;
+/// locals defined later are not.
+#[test]
+fn completion_scope_excludes_later_locals() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() {\n  var early = 1;\n  e\n  var later = 2;\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `e` on line 2 col 3.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"early"), "got: {labels:?}");
+    assert!(
+        !labels.contains(&"later"),
+        "future-local leaked into completion: {labels:?}"
+    );
+}
+
+/// P15.2.3 — runtime-only types (Array, Map, etc.) and primitives
+/// surface from the project index.
+#[test]
+fn completion_lists_runtime_types() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(user_uri.clone(), "fn main() {\n  A\n}\n", "p", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"Array"),
+        "Array runtime type missing: {labels:?}"
+    );
+}
+
 /// P15.2.2 — keyword completion does not fire after `.` (member access
 /// RHS is owned by P15.2.4).
 #[test]
