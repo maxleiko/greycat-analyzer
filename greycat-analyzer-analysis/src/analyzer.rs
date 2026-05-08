@@ -942,36 +942,55 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// P6.4 narrowing analyzer for if-conditions. Recognizes the
-    /// surface forms `x != null`, `x == null`, and their reversed
-    /// twins (`null != x` / `null == x`). Conjunctive narrowings
-    /// (`x != null && y != null`) are intentionally minimal here —
-    /// extend in a follow-up if the corpus pushes for it.
+    /// Narrowing analyzer for if-conditions.
+    ///
+    /// Recognizes (P6.4) `x != null` / `x == null` and (P6.5) `x is T`,
+    /// plus (P13.2) conjunctive / disjunctive combinations:
+    /// - `A && B` then-branch: union of both narrowings (both held).
+    /// - `A || B` else-branch: union of both `else` narrowings (both
+    ///   inverses held). Mixed forms can't safely narrow either side.
     fn derive_cond_narrows(&self, cond_id: Idx<Expr>) -> CondNarrows {
         let mut out = CondNarrows::default();
         match &self.hir.exprs[cond_id] {
             Expr::Binary(BinaryExpr {
                 op, left, right, ..
-            }) => {
-                let op = *op;
-                if !matches!(op, BinOp::Eq | BinOp::Neq) {
-                    return out;
+            }) => match *op {
+                BinOp::And => {
+                    let l = self.derive_cond_narrows(*left);
+                    let r = self.derive_cond_narrows(*right);
+                    // Then: both A and B held — union both narrows.
+                    out.then_non_null.extend(l.then_non_null);
+                    out.then_non_null.extend(r.then_non_null);
+                    out.then_typed.extend(l.then_typed);
+                    out.then_typed.extend(r.then_typed);
+                    // Else: at least one failed — can't narrow confidently.
                 }
-                let Some(name_idx) = self.ident_compared_to_null(*left, *right) else {
-                    return out;
-                };
-                let Some(def) = (match self.res.lookup(name_idx) {
-                    Some(Definition::Param(d)) | Some(Definition::Local(d)) => Some(d),
-                    _ => None,
-                }) else {
-                    return out;
-                };
-                match op {
-                    BinOp::Neq => out.then_non_null.push(def),
-                    BinOp::Eq => out.else_non_null.push(def),
-                    _ => {}
+                BinOp::Or => {
+                    let l = self.derive_cond_narrows(*left);
+                    let r = self.derive_cond_narrows(*right);
+                    // Else: NOT(A || B) ≡ !A AND !B — union else narrows.
+                    out.else_non_null.extend(l.else_non_null);
+                    out.else_non_null.extend(r.else_non_null);
+                    // Then: at least one held — can't narrow either.
                 }
-            }
+                BinOp::Eq | BinOp::Neq => {
+                    let Some(name_idx) = self.ident_compared_to_null(*left, *right) else {
+                        return out;
+                    };
+                    let Some(def) = (match self.res.lookup(name_idx) {
+                        Some(Definition::Param(d)) | Some(Definition::Local(d)) => Some(d),
+                        _ => None,
+                    }) else {
+                        return out;
+                    };
+                    match *op {
+                        BinOp::Neq => out.then_non_null.push(def),
+                        BinOp::Eq => out.else_non_null.push(def),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            },
             // P6.5: `x is T` narrows x to T in the then-branch.
             Expr::Is { value, ty, .. } => {
                 if let Expr::Ident(name_idx) = &self.hir.exprs[*value]
@@ -981,6 +1000,8 @@ impl<'a> Cx<'a> {
                     out.then_typed.push((def, *ty));
                 }
             }
+            // Strip parens before re-deriving.
+            Expr::Paren(inner, _) => return self.derive_cond_narrows(*inner),
             _ => {}
         }
         out
@@ -1596,6 +1617,53 @@ fn f(x: int?) {
                 .iter()
                 .any(|d| d.message.contains("not assignable")),
             "expected no nullability error inside narrowed else-branch, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn conjunctive_narrowing_then_branch() {
+        // P13.2: `if (x != null && y != null) { use(x); use(y); }` —
+        // both x and y narrowed to non-null in the then-branch.
+        let src = r#"
+fn use_int(v: int) {}
+fn f(x: int?, y: int?) {
+    if (x != null && y != null) {
+        use_int(x);
+        use_int(y);
+    }
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error in conjunctive then-branch, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn disjunctive_narrowing_else_branch() {
+        // P13.2: `if (x == null || y == null) { } else { use(x); use(y); }` —
+        // both narrowed to non-null in the else-branch.
+        let src = r#"
+fn use_int(v: int) {}
+fn f(x: int?, y: int?) {
+    if (x == null || y == null) {
+    } else {
+        use_int(x);
+        use_int(y);
+    }
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error in disjunctive else-branch, got: {:?}",
             r.diagnostics
         );
     }
