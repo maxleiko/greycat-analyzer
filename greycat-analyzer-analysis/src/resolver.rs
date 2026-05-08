@@ -462,7 +462,17 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
     let expr = cx.hir.exprs[expr_id].clone();
     match expr {
         Expr::Ident(idx) => cx.record_use(idx),
-        Expr::Literal(_) | Expr::String(StringExpr { .. }) => {}
+        Expr::Literal(_) => {}
+        Expr::String(StringExpr { parts, .. }) => {
+            // P17.5 — recurse into `${expr}` interpolations so inner
+            // idents are bound (otherwise variables referenced only
+            // inside template strings stay `unresolved`).
+            for part in parts {
+                if let greycat_analyzer_hir::types::StringPart::Interp { expr, .. } = part {
+                    visit_expr(cx, expr);
+                }
+            }
+        }
         Expr::Tuple(items, _) | Expr::Array(items, _) => {
             for e in items {
                 visit_expr(cx, e);

@@ -932,8 +932,48 @@ impl<'a> Cx<'a> {
                 }
                 self.visit_stmt(body, return_ty);
             }
-            Stmt::ForIn(ForInStmt { range, body, .. }) => {
-                let _ = self.visit_expr(range);
+            Stmt::ForIn(ForInStmt {
+                params,
+                range,
+                body,
+                ..
+            }) => {
+                let range_ty = self.visit_expr(range);
+                // P18.x — bind each iterator param's def_type from the
+                // iterable's element type. Grammar guarantees
+                // `params.len() >= 2` (tuple form). Common shapes:
+                //   - `Array<T>`  -> (index: int, value: T)
+                //   - `Map<K, V>` -> (key: K,    value: V)
+                //   - `Set<T>`    -> (index: int, value: T)
+                //   - other       -> all params keep their declared
+                //                    type (if any) or `any`.
+                let any_id = self.any();
+                let int_id = self.primitive(Primitive::Int);
+                let inferred: Vec<TypeId> = match self.out.types.get(range_ty).kind.clone() {
+                    TypeKind::Generic { name, args } if name == "Array" || name == "Set" => {
+                        let elem = args.first().copied().unwrap_or(any_id);
+                        if params.len() == 2 {
+                            vec![int_id, elem]
+                        } else {
+                            vec![any_id; params.len()]
+                        }
+                    }
+                    TypeKind::Generic { name, args } if name == "Map" => {
+                        if args.len() >= 2 && params.len() == 2 {
+                            vec![args[0], args[1]]
+                        } else {
+                            vec![any_id; params.len()]
+                        }
+                    }
+                    _ => vec![any_id; params.len()],
+                };
+                for (p, inf_ty) in params.iter().zip(inferred.iter()) {
+                    let bound_ty = match p.ty {
+                        Some(t) => self.lower_type_ref(t),
+                        None => *inf_ty,
+                    };
+                    self.out.def_types.insert(p.name, bound_ty);
+                }
                 self.visit_stmt(body, return_ty);
             }
             Stmt::Return(value) => {
@@ -1246,7 +1286,19 @@ impl<'a> Cx<'a> {
                 LiteralKind::Duration => self.primitive(Primitive::Duration),
                 LiteralKind::Time | LiteralKind::Iso8601 => self.primitive(Primitive::Time),
             },
-            Expr::String(StringExpr { .. }) => self.primitive(Primitive::String),
+            Expr::String(StringExpr { parts, .. }) => {
+                // P17.5 — visit each `${expr}` interpolation so the
+                // analyzer types and binds the inner identifiers
+                // (otherwise locals referenced only inside template
+                // strings would surface as `unused-local` and never
+                // get an `expr_types` entry).
+                for part in &parts {
+                    if let greycat_analyzer_hir::types::StringPart::Interp { expr, .. } = part {
+                        let _ = self.visit_expr(*expr);
+                    }
+                }
+                self.primitive(Primitive::String)
+            }
             Expr::Tuple(items, _) => {
                 let elems: Vec<TypeId> = items.iter().map(|i| self.visit_expr(*i)).collect();
                 self.out.types.tuple(elems)

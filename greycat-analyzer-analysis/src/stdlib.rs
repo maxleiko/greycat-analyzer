@@ -216,7 +216,7 @@ impl ProjectIndex {
                         self.module_permissions
                             .entry(uri.clone())
                             .or_default()
-                            .insert(s.value.clone());
+                            .insert(s.raw_value());
                     }
                     None
                 }
