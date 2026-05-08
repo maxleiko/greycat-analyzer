@@ -63,6 +63,23 @@ When grammar fixes are ready, commit inside the submodule and push to `maxleiko/
 
 **Hard rule:** when the gauntlet flags ERROR/MISSING, when CST shape diverges from TS reference, when typed-node accessors return `None` where the reference produces a value — pause and ask. Default answer is "fix the grammar," not "work around it." `KNOWN_GRAMMAR_GAPS` in `greycat-analyzer-syntax/tests/coverage.rs` is a temporary buffer between *gap discovered* and *grammar fixed*; it should be empty most of the time (currently `&[]`).
 
+**Hard rule — never assume GreyCat syntax (auto-mode included):** before adding, narrowing, or restricting any grammar / lowering / analyzer rule based on a guess about what is "valid GreyCat," verify against an authoritative source. Stopping to verify is mandatory — auto-mode does **not** waive this. The cost of one paused turn is far less than the cost of regressing the corpus or shipping a parser that rejects valid programs.
+
+Verification order:
+
+1. Inspect `vendor/tree-sitter-greycat/grammar.js` for the existing rule shape.
+2. Search the stdlib (`lib/std/*.gcl`) and corpus (`tests/corpus/`) for real examples of the construct.
+3. Invoke the `/greycat:greycat` skill — it has the canonical syntax/semantics reference.
+4. Read the TS reference at `https://hub.datathings.com/greycat/lang` if you have a checkout / can web-fetch.
+5. If still unresolved after (1)–(4): **STOP and ask the user.** Even in auto-mode.
+
+If for any reason you cannot stop (truly unattended run), leave a `// FIXME(syntax-assumption): <what you assumed and why>` comment beside the change AND append a one-line entry to [`docs/syntax-assumptions.log`](../docs/syntax-assumptions.log) so the user can find every assumption on return. Never ship a grammar / lowering change that bakes in a syntactic assumption silently.
+
+Counter-examples (do not repeat):
+- Hallucinating `T: Bound` generic-bound syntax — `.gcl` has no such form.
+- Assuming typed-suffix literals require a leading `_` — they do not. `42time`, `42_time`, `1.79e+308_f` are all valid; the leading `_` is a formatter convention, not a grammar requirement.
+- Using `token.immediate` on `number_suffix` to fix the static-init parse: shifted the lexer balance and made `e` win over scientific-notation `"e"` in `1e3`. Lex-level changes here need to preserve the existing scientific / suffix tie-break.
+
 ## Common commands
 
 ```sh
