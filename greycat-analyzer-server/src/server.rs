@@ -8,10 +8,10 @@ use lsp_types::notification::{
     Notification as _,
 };
 use lsp_types::request::{
-    CodeActionRequest, DocumentHighlightRequest, DocumentSymbolRequest, FoldingRangeRequest,
-    Formatting, GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest,
-    RangeFormatting, References, Rename, SelectionRangeRequest, SemanticTokensFullRequest,
-    SignatureHelpRequest, WorkspaceSymbolRequest,
+    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
+    FoldingRangeRequest, Formatting, GotoDefinition, HoverRequest, InlayHintRequest,
+    PrepareRenameRequest, RangeFormatting, References, Rename, SelectionRangeRequest,
+    SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::*;
 
@@ -76,6 +76,11 @@ pub fn start_server() -> Result<()> {
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
             document_formatting_provider: Some(OneOf::Left(true)),
             document_range_formatting_provider: Some(OneOf::Left(true)),
+            completion_provider: Some(CompletionOptions {
+                resolve_provider: Some(false),
+                trigger_characters: Some(vec!["\"".into()]),
+                ..Default::default()
+            }),
             inlay_hint_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
@@ -205,6 +210,10 @@ fn handle_request(server: &Backend, req: Request) -> Option<Response> {
         Ok(resp) => return Some(resp),
         Err(req) => req,
     };
+    let req = match try_handle::<Completion, _, _>(server, req, completion_handler) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
     let req = match try_handle::<Formatting, _, _>(server, req, formatting_handler) {
         Ok(resp) => return Some(resp),
         Err(req) => req,
@@ -316,6 +325,23 @@ fn goto_definition_handler(
         decl,
     }) = module.resolutions.lookup(cursor_idx)
     {
+        drop(doc);
+        let foreign_module = server.project_analysis.module(&foreign_uri)?;
+        let foreign_cell = server.manager.get(&foreign_uri)?;
+        let foreign_doc = foreign_cell.borrow();
+        return capabilities::cross_module_decl_location(
+            &foreign_uri,
+            &foreign_doc.text,
+            &foreign_module.hir,
+            decl,
+        )
+        .map(GotoDefinitionResponse::Scalar);
+    }
+    // P15.x: chain-segment binding (e.g. `Identity` in
+    // `runtime::Identity::create` -> the foreign `type Identity`).
+    if let Some(fdecl) = module.analysis.foreign_decl_lookup(cursor_idx) {
+        let foreign_uri = fdecl.uri.clone();
+        let decl = fdecl.decl;
         drop(doc);
         let foreign_module = server.project_analysis.module(&foreign_uri)?;
         let foreign_cell = server.manager.get(&foreign_uri)?;
@@ -457,6 +483,20 @@ fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<Co
         &params.text_document.uri,
         params.range,
     ))
+}
+
+fn completion_handler(server: &Backend, params: CompletionParams) -> Option<CompletionResponse> {
+    let uri = params.text_document_position.text_document.uri;
+    let pos = params.text_document_position.position;
+    let cell = server.manager.get(&uri)?;
+    let doc = cell.borrow();
+    let list = capabilities::completion(
+        &doc.text,
+        doc.root_node(),
+        pos,
+        server.project_root.as_deref(),
+    )?;
+    Some(CompletionResponse::List(list))
 }
 
 fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<InlayHint>> {

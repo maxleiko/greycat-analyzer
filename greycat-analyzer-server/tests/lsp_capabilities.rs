@@ -405,6 +405,221 @@ fn cross_module_static_call_infers_return_type() {
     );
 }
 
+/// P15.4 — `@include("<cursor>")` directory completion lists the
+/// project root's subdirectories.
+#[test]
+fn completion_inside_at_include_lists_subdirs() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!(
+        "p15_4_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(tmp.join("src")).unwrap();
+    fs::create_dir_all(tmp.join("vendor")).unwrap();
+    fs::create_dir_all(tmp.join("node_modules")).unwrap(); // should be skipped
+
+    let src = "@include(\"\");\n";
+    let tree = parse(src);
+    // Cursor sits between the two quotes (col 10).
+    let list = capabilities::completion(src, tree.root_node(), pos(0, 10), Some(&tmp))
+        .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"src"),
+        "expected `src` directory in completion list: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"vendor"),
+        "expected `vendor` directory in completion list: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"node_modules"),
+        "node_modules should be filtered out: {labels:?}"
+    );
+    fs::remove_dir_all(&tmp).ok();
+}
+
+/// P15.4 — typing a `/` after a directory name continues completion
+/// into that directory's subdirs.
+#[test]
+fn completion_inside_at_include_drills_into_subdirs() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!(
+        "p15_4_drill_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(tmp.join("playground/scripts")).unwrap();
+    fs::create_dir_all(tmp.join("playground/dist")).unwrap();
+    fs::create_dir_all(tmp.join("playground/node_modules")).unwrap();
+
+    let src = "@include(\"playground/\");\n";
+    let tree = parse(src);
+    // Cursor sits between the trailing `/` and the closing quote (col 21).
+    let list = capabilities::completion(src, tree.root_node(), pos(0, 21), Some(&tmp))
+        .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"scripts"),
+        "expected `scripts` subdir: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"dist"),
+        "expected `dist` subdir: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"node_modules"),
+        "node_modules should still be filtered: {labels:?}"
+    );
+    fs::remove_dir_all(&tmp).ok();
+}
+
+/// P15.x — hover on the `create` segment of the simple `Identity::create`
+/// (cross-module method) renders the foreign method's signature, not
+/// "expression: function".
+#[test]
+fn hover_on_static_method_renders_signature() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var x = Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).expect("user doc");
+    let doc = cell.borrow();
+    // Cursor on `create` (col 32 — within "Identity::create").
+    let h = capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        pos(0, 32),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover present on `create`");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("fn create"),
+        "hover should render fn signature, got: {value}"
+    );
+    assert!(
+        !value.contains("expression: function"),
+        "hover should not fall through to expression-typed layer 2: {value}"
+    );
+}
+
+/// P15.x — chain-segment hover: `Identity` in
+/// `runtime::Identity::create` renders the foreign `type Identity`.
+#[test]
+fn hover_on_chain_type_segment_renders_foreign_type() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var x = runtime::Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).expect("user doc");
+    let doc = cell.borrow();
+    // Cursor on `Identity` segment (col 32 — within "runtime::Identity::create").
+    let h = capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        pos(0, 32),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover present on `Identity` chain segment");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("type Identity"),
+        "hover should render the foreign type, got: {value}"
+    );
+    assert!(
+        value.contains("defined in `runtime`"),
+        "hover should include the provenance footnote, got: {value}"
+    );
+}
+
+/// P15.x — chain-segment hover: `create` in
+/// `runtime::Identity::create` renders the foreign method.
+#[test]
+fn hover_on_chain_member_segment_renders_foreign_method() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var x = runtime::Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).expect("user doc");
+    let doc = cell.borrow();
+    // Cursor on `create` segment (col 41 — within "runtime::Identity::create").
+    let h = capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        pos(0, 41),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover present on `create` chain segment");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("fn create"),
+        "hover should render the foreign method, got: {value}"
+    );
+}
+
 /// P15.10 — call-site arg-type validation. The user's baseline:
 /// passing `42` (int) where `Identity` is expected should produce a
 /// typed diagnostic at the offending arg's range.

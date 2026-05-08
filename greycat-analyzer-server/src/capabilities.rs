@@ -285,6 +285,37 @@ fn ident_hover_markdown(
     if let Some(member) = analysis.member_lookup(ident_idx) {
         return Some(member_hover_markdown(hir, member, ident));
     }
+    // P11.5 — cross-module member binding (`a.b` where the receiver
+    // type lives in another module, or `Type::method` where Type is
+    // declared cross-module). The foreign decl's HIR lives in another
+    // module, so we render its signature there.
+    if let Some(ctx) = project
+        && let Some(foreign) = analysis.foreign_member_lookup(ident_idx)
+        && let Some(fmod) = ctx.project.module(&foreign.uri)
+    {
+        let provenance = module_label_for_uri(&foreign.uri);
+        return Some(foreign_member_hover_markdown(
+            &fmod.hir,
+            &foreign.member,
+            ident,
+            &provenance,
+        ));
+    }
+    // P15.x — chain-segment foreign-decl binding (e.g. `Identity` in
+    // `runtime::Identity::create`). Renders the foreign type/fn/enum
+    // decl with a `defined in <module>` footnote.
+    if let Some(ctx) = project
+        && let Some(fdecl) = analysis.foreign_decl_lookup(ident_idx)
+        && let Some(fmod) = ctx.project.module(&fdecl.uri)
+        && (fdecl.decl.into_raw() as usize) < fmod.hir.decls.len()
+    {
+        let provenance = module_label_for_uri(&fdecl.uri);
+        return Some(render_decl_hover_markdown(
+            &fmod.hir,
+            &fmod.hir.decls[fdecl.decl],
+            Some(&provenance),
+        ));
+    }
     match resolutions.lookup(ident_idx)? {
         Definition::Param(name) | Definition::Local(name) => {
             analysis.def_types.get(&name).map(|ty| {
@@ -349,6 +380,39 @@ fn member_hover_markdown(
             render_decl_hover_markdown(hir, decl, None)
         }
     }
+}
+
+/// P15.x — cross-module variant of [`member_hover_markdown`]. Reads
+/// the foreign HIR for the attr / method and appends an italic
+/// `*defined in `<module>`*` footnote.
+fn foreign_member_hover_markdown(
+    foreign_hir: &Hir,
+    member: &greycat_analyzer_analysis::analyzer::MemberDef,
+    ident: &greycat_analyzer_hir::types::Ident,
+    provenance: &str,
+) -> String {
+    use greycat_analyzer_analysis::analyzer::MemberDef;
+    let mut out = match member {
+        MemberDef::Attr(attr_id) => {
+            let attr = &foreign_hir.type_attrs[*attr_id];
+            let ty_str = attr
+                .ty
+                .map(|t| render_type_ref(foreign_hir, t))
+                .unwrap_or_else(|| "any".into());
+            let mut s = String::new();
+            push_doc_section(&mut s, attr.doc.as_deref());
+            s.push_str(&wrap_code(&format!("{}: {}", ident.text, ty_str)));
+            s
+        }
+        MemberDef::Method(decl_id) => {
+            let decl = &foreign_hir.decls[*decl_id];
+            render_decl_hover_markdown(foreign_hir, decl, None)
+        }
+    };
+    out.push_str("\n\n*defined in `");
+    out.push_str(provenance);
+    out.push_str("`*");
+    out
 }
 
 /// P15.1 — render a top-level decl as hover markdown. Output layout:
@@ -2121,6 +2185,179 @@ fn encode_semantic_tokens(mut events: Vec<SemanticTokenEvent>) -> SemanticTokens
         result_id: None,
         data,
     }
+}
+
+// =============================================================================
+// P15.4 — completion (foundational; only @include path completion today)
+// =============================================================================
+
+/// LSP `textDocument/completion`. Foundational entry — today only handles
+/// `@include("<cursor>")` directory completion (P15.4). Future chunks
+/// extend this to scope-aware ident completion (P15.2), member
+/// completion after `.` / `->`, and `@library` version completion via
+/// the GreyCat registry (P15.3).
+///
+/// Returns `None` (LSP-side: empty list) when the cursor isn't in a
+/// shape we know how to complete yet.
+pub fn completion(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    pos: Position,
+    project_root: Option<&std::path::Path>,
+) -> Option<CompletionList> {
+    let byte = position_to_byte(text, pos);
+    let node = node_at_offset(root, byte)?;
+    if let Some(items) = include_dir_completion(text, node, byte, project_root) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
+    None
+}
+
+/// P15.4 — `@include("<cursor>")` directory completion. Activated when
+/// the cursor sits inside a `string` (or its `string_fragment` child)
+/// whose enclosing `mod_pragma`'s annotation name is `include`. Walks
+/// the project root directly (a one-level `read_dir`, no recursion)
+/// and returns each subdirectory as a `CompletionItem`. Case-insensitive
+/// prefix-matches the cursor's already-typed text.
+fn include_dir_completion(
+    text: &str,
+    node: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+    project_root: Option<&std::path::Path>,
+) -> Option<Vec<CompletionItem>> {
+    let project_root = project_root?;
+    // Walk up to find the enclosing `string` node, then confirm the
+    // chain is `string -> args -> annotation` with annotation name
+    // `include`.
+    let string_node = ancestor_with_kind(node, "string")?;
+    let args_node = ancestor_with_kind(string_node, "args")?;
+    let annotation_node = ancestor_with_kind(args_node, "annotation")?;
+    let mut name_cursor = annotation_node.walk();
+    let name_text = annotation_node
+        .named_children(&mut name_cursor)
+        .find(|c| c.kind() == "ident")
+        .and_then(|c| text.get(c.byte_range()))?;
+    if name_text != "include" {
+        return None;
+    }
+    let mod_pragma = ancestor_with_kind(annotation_node, "mod_pragma")?;
+    let _ = mod_pragma; // confirm we're inside a top-level pragma
+
+    // Read what the user has typed so far (the prefix between `"` and
+    // the cursor). The string node's text range is the whole `"..."`;
+    // the inner `string_fragment` child holds the unescaped content.
+    let typed = string_prefix_at_cursor(text, string_node, cursor_byte);
+    // Split on `/`: everything up to the last `/` is the directory
+    // path the user is drilling into; the part after is the prefix
+    // for the next completion list. Examples:
+    //   ""             -> base = project_root, prefix = ""
+    //   "src"          -> base = project_root, prefix = "src"
+    //   "src/"         -> base = project_root/src, prefix = ""
+    //   "src/util"     -> base = project_root/src, prefix = "util"
+    let (rel_dir, prefix) = match typed.rsplit_once('/') {
+        Some((dir, name)) => (dir.to_string(), name.to_string()),
+        None => (String::new(), typed.clone()),
+    };
+    let mut base = project_root.to_path_buf();
+    if !rel_dir.is_empty() {
+        for seg in rel_dir.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            // Reject `..` to keep completion anchored under project_root.
+            if seg == ".." {
+                return Some(Vec::new());
+            }
+            base.push(seg);
+        }
+    }
+    let entries = match std::fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(_) => return Some(Vec::new()),
+    };
+    let mut items = Vec::new();
+    let prefix_lower = prefix.to_lowercase();
+    // Conventional ignores apply at the project root only — a user
+    // explicitly drilling into `lib/` or `target/` should still see
+    // what's there.
+    let at_root = rel_dir.is_empty();
+    let skip: &[&str] = if at_root {
+        &[
+            "node_modules",
+            "gcdata",
+            ".git",
+            "target",
+            "lib",
+            "bin",
+            "files",
+            "webroot",
+        ]
+    } else {
+        &["node_modules", ".git"]
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if skip.contains(&name_str) || name_str.starts_with('.') {
+            continue;
+        }
+        if !prefix_lower.is_empty() && !name_str.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name_str.to_string(),
+            kind: Some(CompletionItemKind::FOLDER),
+            detail: Some("@include directory".into()),
+            insert_text: Some(name_str.to_string()),
+            ..Default::default()
+        });
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
+}
+
+fn ancestor_with_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut cur = node;
+    loop {
+        if cur.kind() == kind {
+            return Some(cur);
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Read the text inside a `string` node from its opening quote up to
+/// `cursor_byte`. Used for prefix-matching against the typed text
+/// before the cursor.
+fn string_prefix_at_cursor(
+    text: &str,
+    string_node: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+) -> String {
+    let r = string_node.byte_range();
+    let raw = text.get(r.clone()).unwrap_or("");
+    // Strip the leading quote(s).
+    let opener_len = if raw.starts_with('"') { 1 } else { 0 };
+    let content_start = r.start + opener_len;
+    if cursor_byte <= content_start {
+        return String::new();
+    }
+    let upto = cursor_byte.min(r.end);
+    text.get(content_start..upto).unwrap_or("").to_string()
 }
 
 // =============================================================================

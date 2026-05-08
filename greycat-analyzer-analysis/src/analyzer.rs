@@ -145,6 +145,13 @@ pub struct AnalysisResult {
     /// in this module. The project pipeline drains these in a post-pass
     /// against [`crate::stdlib::ProjectIndex::decl_locations`].
     pub deferred_member_uses: Vec<(Idx<Ident>, String)>,
+    /// P15.x — chain-segment bindings populated by `ProjectAnalysis`
+    /// pass 3.5 for `Expr::QualifiedStatic` shapes. Each segment ident
+    /// (chain[1] = the type, chain[2] = the member when length is 3)
+    /// binds to the foreign top-level decl that declares it. Lets
+    /// hover / goto-def show the right content for each segment of
+    /// `runtime::Identity::create`.
+    pub foreign_decl_uses: HashMap<Idx<Ident>, ForeignDecl>,
     pub diagnostics: Vec<SemanticDiagnostic>,
 }
 
@@ -169,6 +176,15 @@ pub struct ForeignMember {
     pub member: MemberDef,
 }
 
+/// P15.x — a top-level decl reference resolved into another module.
+/// Used for chain-segment bindings (`runtime::Identity::create` —
+/// chain[1] points at runtime.gcl's `type Identity` decl).
+#[derive(Debug, Clone)]
+pub struct ForeignDecl {
+    pub uri: greycat_analyzer_core::lsp_types::Uri,
+    pub decl: Idx<Decl>,
+}
+
 impl AnalysisResult {
     pub fn type_of(&self, expr: Idx<Expr>) -> Option<TypeId> {
         self.expr_types.get(&expr).copied()
@@ -186,6 +202,12 @@ impl AnalysisResult {
     /// ([`Self::member_lookup`]) or unresolved.
     pub fn foreign_member_lookup(&self, ident: Idx<Ident>) -> Option<&ForeignMember> {
         self.foreign_member_uses.get(&ident)
+    }
+
+    /// P15.x — look up a chain-segment binding (e.g. `Identity` in
+    /// `runtime::Identity::create` -> the foreign type decl).
+    pub fn foreign_decl_lookup(&self, ident: Idx<Ident>) -> Option<&ForeignDecl> {
+        self.foreign_decl_uses.get(&ident)
     }
 }
 

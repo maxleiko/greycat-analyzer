@@ -248,6 +248,7 @@ impl ProjectAnalysis {
     /// Concrete returns (`Identity`, `String`, `Array<Permission>`)
     /// flow through cleanly.
     fn infer_cross_module_call_types(&mut self) {
+        use crate::analyzer::{ForeignDecl, ForeignMember};
         use greycat_analyzer_hir::types::{Expr, Stmt};
 
         // Phase 1 — read-only: collect the type-shape that each
@@ -256,6 +257,23 @@ impl ProjectAnalysis {
         // their `def_types` afterwards.
         #[allow(clippy::mutable_key_type)]
         let mut expr_updates: HashMap<Uri, Vec<(Idx<Expr>, TypeShape)>> = HashMap::new();
+        // P15.x — chain-segment bindings collected during the same
+        // QualifiedStatic walk. chain[1] (the type segment) lands in
+        // `chain_type_updates`; chain[2] (the member segment) lands
+        // in `chain_member_updates`. Phase 2 writes them into
+        // `analysis.foreign_decl_uses` / `foreign_member_uses` so
+        // hover / goto-def see the right foreign target on every
+        // segment.
+        #[allow(clippy::mutable_key_type)]
+        let mut chain_type_updates: HashMap<
+            Uri,
+            Vec<(Idx<greycat_analyzer_hir::types::Ident>, ForeignDecl)>,
+        > = HashMap::new();
+        #[allow(clippy::mutable_key_type)]
+        let mut chain_member_updates: HashMap<
+            Uri,
+            Vec<(Idx<greycat_analyzer_hir::types::Ident>, ForeignMember)>,
+        > = HashMap::new();
         // For each module, find every Expr::Static and decide what
         // its expr_type should be (method-ref → function,
         // attr-ref → field, etc.). Then for any Expr::Call whose
@@ -309,6 +327,34 @@ impl ProjectAnalysis {
                     .entry(cur_uri.clone())
                     .or_default()
                     .push((qstatic_id, shape));
+                // Bind chain[1] (the type segment) and chain[2] (the
+                // member segment) to their foreign decls so hover /
+                // goto-def can render the right thing on each part.
+                if let Some((module_uri, type_decl_id, target)) =
+                    resolve_qualified_chain(&self.modules, &self.index, cur_module, chain)
+                {
+                    chain_type_updates
+                        .entry(cur_uri.clone())
+                        .or_default()
+                        .push((
+                            chain[1],
+                            ForeignDecl {
+                                uri: module_uri.clone(),
+                                decl: type_decl_id,
+                            },
+                        ));
+                    let QualifiedTarget::Member(member) = target;
+                    chain_member_updates
+                        .entry(cur_uri.clone())
+                        .or_default()
+                        .push((
+                            chain[2],
+                            ForeignMember {
+                                uri: module_uri,
+                                member,
+                            },
+                        ));
+                }
             }
             // 1b) Call(Static or QualifiedStatic) — overrides the
             // static expr_type and also drives the call's return-type
@@ -373,6 +419,22 @@ impl ProjectAnalysis {
                     continue;
                 };
                 m.analysis.def_types.insert(local.name, new_ty);
+            }
+        }
+
+        // Phase 2 (continued) — write chain-segment bindings.
+        for (uri, entries) in chain_type_updates {
+            if let Some(m) = self.modules.get_mut(&uri) {
+                for (ident_idx, fd) in entries {
+                    m.analysis.foreign_decl_uses.insert(ident_idx, fd);
+                }
+            }
+        }
+        for (uri, entries) in chain_member_updates {
+            if let Some(m) = self.modules.get_mut(&uri) {
+                for (ident_idx, fm) in entries {
+                    m.analysis.foreign_member_uses.insert(ident_idx, fm);
+                }
             }
         }
     }
