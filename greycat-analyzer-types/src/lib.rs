@@ -219,6 +219,16 @@ impl TypeArena {
         })
     }
 
+    pub fn generic_param(&mut self, name: impl Into<String>, owner: GenericOwner) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::GenericParam {
+                name: name.into(),
+                owner,
+            },
+            nullable: false,
+        })
+    }
+
     pub fn lambda(&mut self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Lambda(LambdaType { params, ret }),

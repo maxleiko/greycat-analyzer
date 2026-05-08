@@ -32,7 +32,8 @@ use greycat_analyzer_hir::types::{
     UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
 };
 use greycat_analyzer_types::{
-    Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry, is_assignable_to,
+    GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
+    is_assignable_to,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -163,6 +164,7 @@ pub fn analyze_with_index(hir: &Hir, res: &Resolutions, index: &ProjectIndex) ->
         index,
         narrows: Vec::new(),
         chain_member_ifs: HashSet::new(),
+        generics_in_scope: Vec::new(),
     };
     for d in &module.decls {
         cx.visit_decl(*d);
@@ -287,6 +289,14 @@ struct Cx<'a> {
     /// enclosing exhaustiveness chain (P6.6). Suppresses duplicate
     /// "non-exhaustive" diagnostics on inner `else if` arms.
     chain_member_ifs: HashSet<Idx<Stmt>>,
+    /// P12.1 generic-context stack: type-parameter names visible at the
+    /// current scope, mapped to their declaring [`GenericOwner`].
+    /// Entered on `fn f<T>(...)` / `type Foo<T> {}` and used by
+    /// `lower_type_ref` to mint `GenericParam(name, owner)` instead
+    /// of `Named(name)` / `Any` for in-scope generics. The stack is a
+    /// `Vec<HashMap>` so nested fns inside a generic type see both
+    /// outer and inner names.
+    generics_in_scope: Vec<HashMap<String, GenericOwner>>,
 }
 
 impl<'a> Cx<'a> {
@@ -423,6 +433,12 @@ impl<'a> Cx<'a> {
                     let args: Vec<TypeId> =
                         tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
                     self.out.types.generic(name.clone(), args)
+                } else if let Some(owner) = self.lookup_generic(&name) {
+                    // P12.1: name matches a fn / type generic param in
+                    // scope — produce a `GenericParam` rather than a
+                    // bare `Named`, so call-site inference can record
+                    // witnesses for it.
+                    self.out.types.generic_param(name.clone(), owner)
                 } else if let Some(id) = self.out.registry.lookup(&name) {
                     id
                 } else if self.index.has_name(&name) {
@@ -445,6 +461,125 @@ impl<'a> Cx<'a> {
         base
     }
 
+    /// P12.1 — call-site generic inference. Returns `Some(return_ty)`
+    /// when `callee` resolves to a non-native fn decl with `generics`
+    /// declared; the witnesses come from each `(declared_param,
+    /// arg_ty)` pair via [`Self::collect_witnesses`]. Returns `None`
+    /// for non-fn callees (lambdas, member calls, cross-module decls
+    /// not yet wired into the analyzer's HIR cache, etc.) so the
+    /// caller falls back to `any`.
+    fn try_generic_call_inference(
+        &mut self,
+        callee: Idx<Expr>,
+        arg_tys: &[TypeId],
+        call_range: Range<usize>,
+    ) -> Option<TypeId> {
+        let Expr::Ident(name_idx) = self.hir.exprs[callee].clone() else {
+            return None;
+        };
+        let Definition::Decl(decl_id) = self.res.lookup(name_idx)? else {
+            // Cross-module / param-as-fn / lambda callees aren't
+            // handled in this pass — they fall back to `any`.
+            return None;
+        };
+        let Decl::Fn(fnd) = self.hir.decls[decl_id].clone() else {
+            return None;
+        };
+        if fnd.generics.is_empty() {
+            return None;
+        }
+        // Lower the declared signature with the fn's generics in scope.
+        let owner = GenericOwner::Function(self.hir.idents[fnd.name].text.clone());
+        self.push_generic_scope(&fnd.generics, owner);
+        let declared_params: Vec<TypeId> = fnd
+            .params
+            .iter()
+            .map(|p_id| {
+                self.hir.fn_params[*p_id]
+                    .ty
+                    .map(|t| self.lower_type_ref(t))
+                    .unwrap_or_else(|| self.any())
+            })
+            .collect();
+        let declared_return = fnd
+            .return_type
+            .map(|t| self.lower_type_ref(t))
+            .unwrap_or_else(|| self.any());
+        self.pop_generic_scope();
+
+        let mut tbl = InferenceTable::new();
+        let pair_count = declared_params.len().min(arg_tys.len());
+        for i in 0..pair_count {
+            self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
+        }
+        Some(tbl.substitute(&mut self.out.types, declared_return))
+    }
+
+    /// Walk `param_ty` (declared) against `arg_ty` (witness). When
+    /// `param_ty` is a [`TypeKind::GenericParam`], record `arg_ty` as
+    /// the witness; if a different witness was already recorded for
+    /// the same name, emit a `cannot infer T: A conflicts with B`
+    /// diagnostic. Recursively descends into matching `Generic` /
+    /// `Tuple` shapes so nested generic params get bound (e.g.
+    /// `Array<T>` against `Array<int>` binds `T → int`).
+    fn collect_witnesses(
+        &mut self,
+        param_ty: TypeId,
+        arg_ty: TypeId,
+        tbl: &mut InferenceTable,
+        call_range: &Range<usize>,
+    ) {
+        let pk = self.out.types.get(param_ty).clone();
+        if let TypeKind::GenericParam { name, .. } = &pk.kind {
+            // If the param is `T?`, the witness is whatever the arg
+            // strips down to without nullable.
+            let witness = if pk.nullable {
+                self.strip_nullable(arg_ty)
+            } else {
+                arg_ty
+            };
+            if let Some(prior) = tbl.lookup(name) {
+                if prior != witness {
+                    let msg = format!(
+                        "cannot infer `{}`: `{}` conflicts with `{}`",
+                        name,
+                        greycat_analyzer_types::display(&self.out.types, prior),
+                        greycat_analyzer_types::display(&self.out.types, witness),
+                    );
+                    self.diag(Severity::Error, msg, call_range.clone());
+                }
+                return;
+            }
+            tbl.bind(name.clone(), witness);
+            return;
+        }
+        let ak = self.out.types.get(arg_ty).clone();
+        if let (
+            TypeKind::Generic { name: pn, args: pa },
+            TypeKind::Generic { name: an, args: aa },
+        ) = (&pk.kind, &ak.kind)
+        {
+            if pn == an && pa.len() == aa.len() {
+                let pa = pa.clone();
+                let aa = aa.clone();
+                for (p, a) in pa.iter().zip(aa.iter()) {
+                    self.collect_witnesses(*p, *a, tbl, call_range);
+                }
+            }
+            return;
+        }
+        if let (TypeKind::Tuple { elements: pe }, TypeKind::Tuple { elements: ae }) =
+            (&pk.kind, &ak.kind)
+            && pe.len() == ae.len()
+        {
+            let pe = pe.clone();
+            let ae = ae.clone();
+            for (p, a) in pe.iter().zip(ae.iter()) {
+                self.collect_witnesses(*p, *a, tbl, call_range);
+            }
+        }
+    }
+
     fn visit_decl(&mut self, decl_id: Idx<Decl>) {
         let decl = self.hir.decls[decl_id].clone();
         match decl {
@@ -457,6 +592,11 @@ impl<'a> Cx<'a> {
     }
 
     fn visit_fn_decl(&mut self, d: &FnDecl) {
+        // P12.1: register the fn's generic params into scope so
+        // `lower_type_ref` mints `GenericParam` for each `T` mention
+        // instead of falling back to `any`.
+        let owner = GenericOwner::Function(self.hir.idents[d.name].text.clone());
+        self.push_generic_scope(&d.generics, owner);
         // Bind parameter types into def_types so identifier inference
         // produces real types instead of `any`.
         for p_id in &d.params {
@@ -473,9 +613,14 @@ impl<'a> Cx<'a> {
         if let Some(body) = d.body {
             self.visit_stmt(body, Some(return_ty));
         }
+        self.pop_generic_scope();
     }
 
     fn visit_type_decl(&mut self, d: &TypeDecl) {
+        // P12.1: type-level generics are visible in attrs + method
+        // signatures.
+        let owner = GenericOwner::Type(self.hir.idents[d.name].text.clone());
+        self.push_generic_scope(&d.generics, owner);
         for attr_id in &d.attrs {
             let a = self.hir.type_attrs[*attr_id].clone();
             self.visit_type_attr(&a);
@@ -485,6 +630,29 @@ impl<'a> Cx<'a> {
                 self.visit_fn_decl(&fnd);
             }
         }
+        self.pop_generic_scope();
+    }
+
+    fn push_generic_scope(&mut self, generics: &[Idx<Ident>], owner: GenericOwner) {
+        let mut frame = HashMap::new();
+        for g in generics {
+            let name = self.hir.idents[*g].text.clone();
+            frame.insert(name, owner.clone());
+        }
+        self.generics_in_scope.push(frame);
+    }
+
+    fn pop_generic_scope(&mut self) {
+        self.generics_in_scope.pop();
+    }
+
+    fn lookup_generic(&self, name: &str) -> Option<GenericOwner> {
+        for frame in self.generics_in_scope.iter().rev() {
+            if let Some(owner) = frame.get(name) {
+                return Some(owner.clone());
+            }
+        }
+        None
     }
 
     fn visit_type_attr(&mut self, a: &TypeAttr) {
@@ -976,10 +1144,19 @@ impl<'a> Cx<'a> {
                 self.any()
             }
             Expr::Call(CallExpr { callee, args, .. }) => {
-                let _ = self.visit_expr(callee);
-                for a in args.iter() {
-                    let _ = self.visit_expr(*a);
+                let callee_ty = self.visit_expr(callee);
+                let arg_tys: Vec<TypeId> = args.iter().map(|a| self.visit_expr(*a)).collect();
+                // P12.1: if the callee resolves to an in-module fn decl
+                // with generics, run constraint-based inference. Cross-
+                // module generic inference (callee is `ProjectDecl`)
+                // and method-call generic inference are deferred —
+                // they need foreign HIR access the analyzer doesn't yet
+                // carry.
+                let call_range = self.hir.exprs[expr_id].byte_range();
+                if let Some(ret) = self.try_generic_call_inference(callee, &arg_tys, call_range) {
+                    return ret;
                 }
+                let _ = callee_ty;
                 self.any()
             }
             Expr::Binary(BinaryExpr {
@@ -1120,6 +1297,40 @@ mod tests {
                 .any(|d| d.message.contains("unresolved")),
             "expected unresolved-name diag, got: {:?}",
             r.diagnostics
+        );
+    }
+
+    #[test]
+    fn generic_call_inference_substitutes_return_type() {
+        // P12.1: `id<T>(x: T): T` called with `id(1)` should produce
+        // an `int`-typed call expression, not `any`.
+        let src = r#"
+fn id<T>(x: T): T { return x; }
+fn caller(): int { return id(1); }
+"#;
+        let r = analyze_src(src);
+        assert!(
+            r.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            r.diagnostics,
+        );
+    }
+
+    #[test]
+    fn generic_call_inference_reports_witness_conflict() {
+        // P12.1: `pair<T>(a: T, b: T): T` called with `pair(1, "s")`
+        // should emit a `cannot infer T` conflict diagnostic.
+        let src = r#"
+fn pair<T>(a: T, b: T): T { return a; }
+fn caller() { pair(1, "s"); }
+"#;
+        let r = analyze_src(src);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot infer")),
+            "expected witness-conflict diag, got: {:?}",
+            r.diagnostics,
         );
     }
 
