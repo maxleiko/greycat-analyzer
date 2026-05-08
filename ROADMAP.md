@@ -452,6 +452,40 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 ---
 
+### Phase 16 — Member-flow inference & node-deref (~2-3 weeks)
+
+**Goal:** chained member expressions (`x.s.size()`), method calls on primitive / cross-module receivers, and node-deref completion all behave the way the user expects. Closes the three bugs surfaced against the canonical [project.gcl](../project.gcl):
+
+1. `var s = x.s.size();` infers `s: int`, not `s: any` — the `Expr::Member` arm's `self.any()` short-circuit hides the attr's declared type, and `Expr::Call` short-circuits the same way.
+2. Completion on `x.s.|` (where `x.s: String`) lists `String`'s methods (`size`, `to_lower`, etc.) — `resolve_member` doesn't know how to find members on a `Primitive` receiver.
+3. Completion on `x: node<Foo>` `.|` surfaces both node's own methods *and* `Foo`'s attrs/methods with a `.` → `->` rewrite — the TS reference does this via `derefType.suggest()` + `additionalTextEdits`.
+
+**Chunks:**
+
+- [ ] **16.1 Member-expr typing (intra-module)** (S) — `Expr::Member` / `Expr::Arrow` arm in [analyzer.rs:1265](../greycat-analyzer-analysis/src/analyzer.rs#L1265) consults `member_uses[property]` after `resolve_member`. `MemberDef::Attr(id)` → return the attr's `lower_type_ref(ty)`. `MemberDef::Method(_)` → return `Named("function")` (gcl's first-class function type). The signature-shaped hover already comes from `member_uses` consulting `decl.method`'s declared params/return separately, so `expr_type` only needs to capture "this is a function value", not the full signature.
+
+- [ ] **16.2 Primitive receiver member resolution** (S) — `resolve_member` in [analyzer.rs:441](../greycat-analyzer-analysis/src/analyzer.rs#L441) extracts a type name from `TypeKind::Primitive` (e.g. `Primitive::String → "String"`, `Primitive::Int → "int"`) and falls through to the existing `type_decls` (in-module) → `decl_locations` (cross-module) lookup path. Lets `"hello".size()`, `1.to_string()`, etc. bind to the foreign primitive type's methods.
+
+- [ ] **16.3 Member-expr typing (cross-module)** (M) — new `ProjectAnalysis` pass 3.7 (after pass 3.5 settles static-call returns and pass 3 binds foreign members) walks each module's `foreign_member_uses[ident] = ForeignMember { uri, member: Attr(attr_id) }` and writes the foreign attr's translated declared type into the local module's `expr_types` for the parent `Expr::Member` / `Expr::Arrow`. Same pass re-links `def_types` for `var x = recv.attr` shapes so inlay hints / hover / downstream inference all see the right type. Mirrors the P15.7 / P15.8 `read_type_shape` + `mint_type_shape` pattern.
+
+- [ ] **16.4 Call-on-member return-type inference** (M) — extend `infer_cross_module_call_types` in [project.rs:250](../greycat-analyzer-analysis/src/project.rs#L250) to recognize `Expr::Call { callee: Expr::Member(..) | Expr::Arrow(..) }`. Pull the method via `member_uses[property]` (intra-module) → `foreign_member_uses[property]` (cross-module), translate its `return_type` into the caller's arena, write it onto the call's `expr_types`. Same writeback re-links `def_types` for `var s = recv.method(...)`. This is what flips `x.s.size()` from `any` to `int`.
+
+- [ ] **16.5 node-tag / `@deref` auto-deref (analyzer + completion)** (M) — coupled fix so navigation and completion arrive together:
+  - **Completion side** ([capabilities.rs](../greycat-analyzer-server/src/capabilities.rs) `member_completion`): when receiver type is `Generic { name: <is_node_tag>, args: [inner] }` *or* the receiver type carries `@deref("method")` (P13.5's `TypeFlags::deref`), and the separator is `.`:
+    - Emit the receiver type's own members verbatim (current behavior).
+    - Plus the inner / deref'd type's members each carrying `additional_text_edits: [TextEdit { range: <sep_range>, new_text: "->" }]` so accepting them rewrites `.` → `->` in source.
+
+    When the separator is `->`: list the inner / deref'd type's members directly (no rewrite needed).
+  - **Analyzer side** (`resolve_member`): `Expr::Arrow` with a node-tag / `@deref` receiver resolves the property against the inner type, recording the binding into `member_uses` so 16.1's typing, hover, and goto-def all light up for `n->field` shapes. `Expr::Member` (regular `.`) with a node-tag receiver still resolves against the tag's own methods only — the `.` → `->` rewrite advice from completion is what lets users *type* the right shape; the analyzer doesn't silently auto-deref `.`.
+
+- [ ] **16.6 `arrow on non-deref receiver` lint** (S) — new `LintRule` (rule code: `arrow-on-non-deref`) walks every `Expr::Arrow` and emits an error when the receiver's type is neither a node tag (`is_node_tag` from `greycat-analyzer-types`) nor carries `@deref(...)` in `ProjectIndex::type_flags`. Severity `Error` so it surfaces in cli `lint` and the LSP red-squiggle layer. Mirrors the runtime's "cannot deref" rejection — caught at edit time instead of run time.
+
+  Out of scope: chained generic inference (`Array<int>::iter().next()`). The runtime doesn't currently support chained generic instantiation either, so we'd be inventing semantics.
+
+**M16:** `cargo run -- lint project.gcl` reports zero false `any` types in `var s = x.s.size()` (s infers `int`); LSP `textDocument/completion` on `x.|` where `x: node<Foo>` returns both node's own method list and `Foo`'s attrs with the `.→->` rewrite; cross-module `recv.attr.method()` chains type correctly through the cached `ProjectAnalysis`; `recv->prop` on a non-deref receiver fires an `arrow-on-non-deref` error.
+
+---
+
 ## 7. Test strategy
 
 Three layers, no "port every TS test" milestone (tarpit).
@@ -517,9 +551,10 @@ P12 [4-6w]   Type system completion ─ M12
 P13 [3-4w]   Analyzer parity closeout ─ M13
 P14 [2-3w]   Final parity gate ────── M14   ← the "are we 1:1?" gate
 P15 [3-4w]   Interactive-LSP sweep ── M15   ← hover / completion / pragma diags
+P16 [2-3w]   Member-flow + node-deref M16   ← member-call typing, auto-deref completion
 ```
 
-Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface.
+Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface; P16 (~2-3 weeks) tightens up the member-access type chain that pass 3.5 left at `any`.
 
 Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3 → P14.2) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
 
