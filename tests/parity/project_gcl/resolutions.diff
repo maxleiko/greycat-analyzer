@@ -1,0 +1,15 @@
+[parity-resolutions] running TS reference: /home/leiko/.greycat/bin/greycat-lang dump-resolutions project.gcl
+[parity-resolutions] running Rust port: cargo run --manifest-path /home/leiko/dev/leiko/rust/greycat-analyzer/Cargo.toml -q -p greycat-analyzer -- dump-resolutions project.gcl
+[parity-resolutions] diff (TS → Rust), with allow-list applied:
+--- /tmp/parity-res-YbnD2E/ts.filtered.jsonl	2026-05-08 20:14:31.928255471 +0200
++++ /tmp/parity-res-YbnD2E/rust.filtered.jsonl	2026-05-08 20:14:31.965255416 +0200
+@@ -2,8 +2,6 @@
+ {"file":"project.gcl","range":[113,114],"line":11,"col":7,"endLine":11,"endCol":8,"refKind":"var","declKind":"FnParam","name":"x","decl":{"fqn":"x","file":"project.gcl","range":[113,114],"line":11,"col":7}}
+ {"file":"project.gcl","range":[116,120],"line":11,"col":10,"endLine":11,"endCol":14,"refKind":"type","declKind":"TypeDecl","name":"node","decl":{"fqn":"core::node","file":"lib/std/core.gcl","range":[10064,10068],"line":217,"col":12}}
+ {"file":"project.gcl","range":[121,124],"line":11,"col":15,"endLine":11,"endCol":18,"refKind":"type","declKind":"TypeDecl","name":"Foo","decl":{"fqn":"project::Foo","file":"project.gcl","range":[38,41],"line":3,"col":5}}
+-{"file":"project.gcl","range":[137,138],"line":12,"col":8,"endLine":12,"endCol":9,"refKind":"var","declKind":"VarDecl","name":"s","decl":{"fqn":"s","file":"project.gcl","range":[137,138],"line":12,"col":8}}
+-{"file":"project.gcl","range":[141,142],"line":12,"col":12,"endLine":12,"endCol":13,"refKind":"var","declKind":"FnParam","name":"x","decl":{"fqn":"x","file":"project.gcl","range":[113,114],"line":11,"col":7}}
+ {"file":"project.gcl","range":[38,41],"line":3,"col":5,"endLine":3,"endCol":8,"refKind":"type","declKind":"TypeDecl","name":"Foo","decl":{"fqn":"project::Foo","file":"project.gcl","range":[38,41],"line":3,"col":5}}
+ {"file":"project.gcl","range":[51,57],"line":4,"col":7,"endLine":4,"endCol":13,"refKind":"type","declKind":"TypeDecl","name":"String","decl":{"fqn":"core::String","file":"lib/std/core.gcl","range":[28562,28568],"line":592,"col":12}}
+ {"file":"project.gcl","range":[65,68],"line":7,"col":3,"endLine":7,"endCol":6,"refKind":"fn","declKind":"FnDecl","name":"foo","decl":{"fqn":"project::foo","file":"project.gcl","range":[65,68],"line":7,"col":3}}
+[parity-resolutions] DIFF — rust=11 lines, ts=13 lines

@@ -1,0 +1,14 @@
+[parity-types] running TS reference: /home/leiko/.greycat/bin/greycat-lang dump-types project.gcl
+[parity-types] running Rust port: cargo run --manifest-path /home/leiko/dev/leiko/rust/greycat-analyzer/Cargo.toml -q -p greycat-analyzer -- dump-types project.gcl
+[parity-types] diff (TS → Rust), with allow-list applied:
+--- /tmp/parity-types-36lZXv/ts.filtered.jsonl	2026-05-08 20:14:31.486256122 +0200
++++ /tmp/parity-types-36lZXv/rust.filtered.jsonl	2026-05-08 20:14:31.517256076 +0200
+@@ -1,7 +1,5 @@
+ {"file":"project.gcl","range":[116,125],"line":11,"col":10,"endLine":11,"endCol":19,"kind":"TypeIdent","type":"core::node<project::Foo>","nullable":false,"text":"node<Foo>"}
+ {"file":"project.gcl","range":[121,124],"line":11,"col":15,"endLine":11,"endCol":18,"kind":"TypeIdent","type":"project::Foo","nullable":false,"text":"Foo"}
+-{"file":"project.gcl","range":[141,142],"line":12,"col":12,"endLine":12,"endCol":13,"kind":"Identifier","type":"core::node<project::Foo>","nullable":false,"text":"x"}
+-{"file":"project.gcl","range":[141,144],"line":12,"col":12,"endLine":12,"endCol":15,"kind":"InstanceAccessExpr","type":"core::any | null","nullable":true,"text":"x.\n"}
+ {"file":"project.gcl","range":[51,57],"line":4,"col":7,"endLine":4,"endCol":13,"kind":"TypeIdent","type":"core::String","nullable":false,"text":"String"}
+ {"file":"project.gcl","range":[72,75],"line":7,"col":10,"endLine":7,"endCol":13,"kind":"TypeIdent","type":"project::Foo","nullable":false,"text":"Foo"}
+ {"file":"project.gcl","range":[91,101],"line":8,"col":12,"endLine":8,"endCol":22,"kind":"CallExpr","type":"core::int","nullable":false,"text":"x.s.size()"}
+[parity-types] DIFF — rust=8 lines, ts=10 lines

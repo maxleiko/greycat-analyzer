@@ -1,1 +1,13 @@
 @library("std", "8.0.269-dev");
+
+type Foo {
+    s: String;
+}
+
+fn foo(x: Foo) {
+    var s = x.s.size();
+}
+
+fn bar(x: node<Foo>) {
+    var s = x.
+}
