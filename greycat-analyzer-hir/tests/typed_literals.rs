@@ -54,6 +54,29 @@ fn float_suffix_stays_number_for_text_inspection() {
 }
 
 #[test]
+fn map_two_generic_params_lower_both() {
+    // Regression: `Map<K, V>` had only `K` captured (P14.9 fix).
+    let src = "type T { paths: Map<String, Inner>?; }\ntype Inner {}\n";
+    let tree = parse(src);
+    let hir = lower_module(src, "m", "p", tree.root_node());
+    let attr = hir
+        .type_attrs
+        .iter()
+        .find(|(_, a)| hir.idents[a.name].text == "paths")
+        .map(|(_, a)| a.clone())
+        .expect("paths attr");
+    let tr = &hir.type_refs[attr.ty.expect("typed")];
+    assert_eq!(hir.idents[tr.name].text, "Map");
+    assert_eq!(tr.params.len(), 2, "expected both K and V params");
+    let names: Vec<_> = tr
+        .params
+        .iter()
+        .map(|p| hir.idents[hir.type_refs[*p].name].text.clone())
+        .collect();
+    assert_eq!(names, vec!["String", "Inner"]);
+}
+
+#[test]
 fn plain_number_stays_number() {
     let src = "fn f() {\n    var i = 42;\n}\n";
     assert_eq!(first_var_init_kind(src, 0), LiteralKind::Number);

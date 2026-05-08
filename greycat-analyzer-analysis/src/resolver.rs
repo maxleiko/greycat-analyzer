@@ -544,6 +544,29 @@ mod tests {
     }
 
     #[test]
+    fn forward_ref_to_type_in_nested_generic_param() {
+        // P14.9 regression: `type T { paths: Map<String, Inner>?; }`
+        // followed by `type Inner {}` — the forward reference to
+        // `Inner` in the second generic-param slot should resolve via
+        // the two-pass module-scope seed.
+        let src = "type T { paths: Map<String, Inner>?; }\ntype Inner {}\n";
+        let (hir, res) = analyze(src);
+        let inner_uses: Vec<_> = hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.text == "Inner")
+            .filter_map(|(idx, _)| res.uses.get(&idx))
+            .collect();
+        assert_eq!(inner_uses.len(), 1, "Inner used once: {:?}", res.unresolved);
+        assert!(matches!(inner_uses[0], Definition::Decl(_)));
+        assert!(
+            res.unresolved.is_empty(),
+            "unresolved: {:?}",
+            res.unresolved
+        );
+    }
+
+    #[test]
     fn param_use_resolves_to_param() {
         let src = "fn id(x: int): int { return x; }\n";
         let (hir, res) = analyze(src);

@@ -1003,22 +1003,20 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
     }
     let name_node = inner.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
+    // Collect every `type_ident` child (other than the head `name`) as
+    // a generic param. The grammar emits one `params:`-tagged child per
+    // arg (`Map<K, V>` yields two `params: type_ident` nodes), so we
+    // can't rely on `child_by_field_name("params")` — that returns
+    // only the first. Walking the named children directly captures
+    // them all.
     let mut params = Vec::new();
-    if let Some(p) = inner.child_by_field_name("params") {
-        if let Some(t) = lower_type_ref(cx, p) {
-            params.push(t);
-        } else {
-            // params is itself a type_ident in tree-sitter, but for a multi-
-            // param case it should iterate. Walk siblings if needed.
-            let mut cursor = inner.walk();
-            for c in inner.named_children(&mut cursor) {
-                if c.kind() == "type_ident"
-                    && c.id() != name_node.id()
-                    && let Some(tp) = lower_type_ref(cx, c)
-                {
-                    params.push(tp);
-                }
-            }
+    let mut cursor = inner.walk();
+    for c in inner.named_children(&mut cursor) {
+        if c.kind() == "type_ident"
+            && c.id() != name_node.id()
+            && let Some(tp) = lower_type_ref(cx, c)
+        {
+            params.push(tp);
         }
     }
     let optional = inner

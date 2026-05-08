@@ -142,6 +142,14 @@ impl ProjectAnalysis {
         // wasn't declared in that module — and resolve them through the
         // global decl table.
         self.resolve_cross_module_members();
+
+        // Pass 4 (P14.9): bump `references_to` for every decl that's
+        // referenced from another module via a qualified-name access
+        // (`<module>::<name>`, `<module>::<type>::<name>`, etc.). Lets
+        // the unused-decl lint correctly skip `private` decls that
+        // are referenced through their fully-qualified name from
+        // elsewhere in the project.
+        self.compute_qualified_refs(manager);
     }
 
     /// Walk each module's `deferred_member_uses` and bind the foreign
@@ -207,6 +215,114 @@ impl ProjectAnalysis {
                     m.analysis.foreign_member_uses.insert(prop_idx, fm);
                 }
             }
+        }
+    }
+
+    /// P14.9 — walk every module's CST for qualified-name access
+    /// patterns (`<module>::<name>`, `<module>::<type>::<name>`, etc.)
+    /// and bump `references_to` for the matching decl in the named
+    /// module. This is what lets the `unused-decl` lint correctly
+    /// skip `private` decls that are only reachable through their
+    /// fully-qualified name from other modules.
+    ///
+    /// Walks the **CST** rather than the HIR because nested
+    /// `static_expr` shapes (`A::B::C`) don't lower cleanly into the
+    /// current `StaticExpr { ty: TypeRef, property: Ident }` shape
+    /// (the inner `A::B` would have to live in a `TypeRef` slot,
+    /// which the grammar doesn't allow). The CST keeps the chain as
+    /// nested `static_expr` nodes regardless.
+    fn compute_qualified_refs(&mut self, manager: &SourceManager) {
+        use greycat_analyzer_core::lsp_types::Uri as _Uri;
+
+        // 1. module name → declaring URI.
+        #[allow(clippy::mutable_key_type)]
+        let mut by_name: HashMap<String, _Uri> = HashMap::new();
+        for (uri, cell) in manager.iter() {
+            let doc = cell.borrow();
+            by_name.insert(doc.name().to_string(), uri.clone());
+        }
+
+        // 2. Walk every module's CST for `static_expr` nodes whose
+        // chain root names a known module. Collect bumps.
+        #[allow(clippy::mutable_key_type)]
+        let mut bumps: HashMap<_Uri, Vec<Idx<Decl>>> = HashMap::new();
+        for (uri, cell) in manager.iter() {
+            let doc = cell.borrow();
+            let text = &doc.text;
+            let root = doc.root_node();
+            greycat_analyzer_syntax::cst::walk_named(root, |node| {
+                if node.kind() != "static_expr" {
+                    return true;
+                }
+                // Outer static — only process top-level chains; inner
+                // ones propagate from there. Skip if our parent is
+                // also a `static_expr` (we'd double-count otherwise).
+                if let Some(parent) = node.parent()
+                    && parent.kind() == "static_expr"
+                {
+                    return true;
+                }
+                let chain = qualified_chain(node, text);
+                if chain.len() < 2 {
+                    return true;
+                }
+                let Some(target_uri) = by_name.get(&chain[0]) else {
+                    return true;
+                };
+                // Skip self-references — qualified access to a decl
+                // in the *current* module is treated as intra-module.
+                if target_uri == uri {
+                    return true;
+                }
+                let Some(target_module) = self.modules.get(target_uri) else {
+                    return true;
+                };
+                // Match each subsequent ident in the chain against any
+                // decl with that name in the target module. `chain[1]`
+                // is the most common case (top-level decl); deeper
+                // segments name attrs / methods / variants and are
+                // outside the unused-decl lint's scope (intra-type
+                // members aren't in `references_to`).
+                let target_root = match target_module.hir.module.as_ref() {
+                    Some(m) => m,
+                    None => return true,
+                };
+                let needle = &chain[1];
+                for decl_id in &target_root.decls {
+                    if let Some(name_idx) = target_module.hir.decls[*decl_id].name()
+                        && target_module.hir.idents[name_idx].text == *needle
+                    {
+                        bumps.entry(target_uri.clone()).or_default().push(*decl_id);
+                        break;
+                    }
+                }
+                true
+            });
+        }
+
+        // 3. Apply bumps.
+        for (uri, decls) in bumps {
+            let Some(m) = self.modules.get_mut(&uri) else {
+                continue;
+            };
+            for decl in decls {
+                *m.resolutions.references_to.entry(decl).or_insert(0) += 1;
+            }
+        }
+
+        // 4. Re-run UnusedDecl with the enriched reference counts.
+        // Other lints aren't affected by qualified refs, so we only
+        // refresh that one rule per module.
+        for module in self.modules.values_mut() {
+            module.lints.retain(|l| l.rule != "unused-decl");
+            let mut new_lints = Vec::new();
+            crate::lint::LintRule::check(
+                &crate::lint::UnusedDecl,
+                &module.hir,
+                &module.resolutions,
+                &mut new_lints,
+            );
+            module.lints.append(&mut new_lints);
         }
     }
 
@@ -296,6 +412,8 @@ impl ProjectAnalysis {
         // is invalidated. Cheap because `deferred_member_uses` is small
         // per module and the work is purely table-lookup.
         self.resolve_cross_module_members();
+        // P14.9: re-derive qualified-name reference counts.
+        self.compute_qualified_refs(manager);
     }
 
     pub fn module(&self, uri: &Uri) -> Option<&ModuleAnalysis> {
@@ -312,6 +430,47 @@ impl ProjectAnalysis {
 
     pub fn is_empty(&self) -> bool {
         self.modules.is_empty()
+    }
+}
+
+/// P14.9 — pull every ident text from a `static_expr` chain (left to
+/// right). For `runtime::ResponseCode::ok` returns
+/// `["runtime", "ResponseCode", "ok"]`. The leftmost segment comes
+/// from the chain root's `type_ident.name`; subsequent segments come
+/// from each enclosing `static_expr.property`.
+fn qualified_chain(
+    node: greycat_analyzer_syntax::tree_sitter::Node<'_>,
+    text: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_chain(node, text, &mut out);
+    out
+}
+
+fn collect_chain(
+    node: greycat_analyzer_syntax::tree_sitter::Node<'_>,
+    text: &str,
+    out: &mut Vec<String>,
+) {
+    if node.kind() == "static_expr" {
+        // Recurse into the left side first, then append our property.
+        let property = node.child_by_field_name("property");
+        let left = node
+            .named_children(&mut node.walk())
+            .find(|c| Some(c.id()) != property.map(|p| p.id()));
+        if let Some(left) = left {
+            collect_chain(left, text, out);
+        }
+        if let Some(p) = property
+            && let Some(s) = text.get(p.byte_range())
+        {
+            out.push(s.to_string());
+        }
+    } else if node.kind() == "type_ident"
+        && let Some(name) = node.child_by_field_name("name")
+        && let Some(s) = text.get(name.byte_range())
+    {
+        out.push(s.to_string());
     }
 }
 
@@ -398,6 +557,33 @@ mod tests {
         assert!(
             b.analysis.diagnostics.is_empty(),
             "b.gcl shouldn't have grown new diagnostics"
+        );
+    }
+
+    #[test]
+    fn qualified_access_keeps_private_decl_alive() {
+        // P14.9: a `private fn handler() {}` in helper.gcl is reachable
+        // from main.gcl via `helper::handler()`. The unused-decl lint
+        // should not flag it.
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/helper.gcl"),
+            "private fn handler(): int { return 1; }\n",
+            "p",
+            false,
+        );
+        mgr.add_simple(
+            uri("/proj/main.gcl"),
+            "fn main() { helper::handler(); }\n",
+            "p",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        let helper = pa.module(&uri("/proj/helper.gcl")).expect("helper module");
+        assert!(
+            !helper.lints.iter().any(|l| l.rule == "unused-decl"),
+            "helper::handler should be marked alive by qualified ref: {:?}",
+            helper.lints
         );
     }
 
