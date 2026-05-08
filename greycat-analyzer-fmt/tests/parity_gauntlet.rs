@@ -49,14 +49,16 @@ fn formatter_parity_against_corpus() {
         "[parity_gauntlet] {matches}/{total} fixtures format byte-for-byte; mismatches: {mismatches:?}"
     );
     // Regression budget: at least the fixtures that match today must
-    // continue to match. Adjust this floor up as P9.1 lands rules.
-    // The constant ratchets — bump it as the formatter improves.
-    const MATCH_FLOOR: usize = 0;
+    // continue to match. Bump as P14.3 lands more rules. The two
+    // remaining hard cases need line-length-aware reflow (args_split,
+    // nested_args_split, if_var_object) plus the comment + annotation
+    // ordering edge case (doc_eol_stmt, stmts_rules).
+    const MATCH_FLOOR: usize = 3;
     let _ = total;
-    let _ = matches;
-    let _floor: usize = MATCH_FLOOR;
-    // Always-true today (floor = 0) — the eprintln above is the
-    // load-bearing telemetry until P9.1 starts landing.
+    assert!(
+        matches >= MATCH_FLOOR,
+        "formatter parity regressed: {matches} matches < floor {MATCH_FLOOR}; mismatches: {mismatches:?}"
+    );
 }
 
 #[test]
@@ -96,10 +98,12 @@ fn formatter_idempotent_on_corpus() {
         }
     }
     eprintln!("[idempotency] {idempotent}/{total} fixtures idempotent; violators: {violators:?}");
-    // Regression budget: prevent slip below today's baseline. Adjust
-    // up as P9.1 lands fixes. Always-true at floor = 0; eprintln
-    // above is the load-bearing telemetry.
-    const IDEMPOTENT_FLOOR: usize = 0;
-    let _ = idempotent;
-    let _floor: usize = IDEMPOTENT_FLOOR;
+    // Regression budget: prevent slip below today's baseline. Bump as
+    // P14.3 / P9.1 lands fixes.
+    const IDEMPOTENT_FLOOR: usize = 6;
+    let _ = total;
+    assert!(
+        idempotent >= IDEMPOTENT_FLOOR,
+        "formatter idempotency regressed: {idempotent} idempotent < floor {IDEMPOTENT_FLOOR}; violators: {violators:?}"
+    );
 }

@@ -352,7 +352,18 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 - [ ] **14.2 Diagnostic parity gate in CI** (M) — `scripts/parity-oracle.sh` becomes a CI step gated against a per-fixture diff budget that ratchets toward zero. Closes ROADMAP §7-A. Gates on P11/P12/P13 fully landing so the diff is small enough to ratchet meaningfully.
 
-- [ ] **14.3 Formatter parity floor ratchets to 8/8** (XL — bundles P9.1) — actually ports `cst_format.ts`'s per-construct rules. The parity gauntlet's `MATCH_FLOOR` ratchets up as rules land. Idempotency-violating string-literal whitespace bug fixed as part of this. Closes M9.
+- **14.3 Formatter parity floor ratchets toward 8/8** (XL — bundles P9.1) — ports `cst_format.ts`'s per-construct rules incrementally; the parity gauntlet's `MATCH_FLOOR` ratchets up as rules land. **Current baseline: 3/8 byte-for-byte, 6/8 idempotent.** Rules added in this pass:
+  - `:` is no-space-before, space-after (covers fn params, type-attrs, `var x: T`).
+  - `::` and `?` and `<` / `>` are tight (no space around).
+  - `@` is the annotation-opener: no surrounding space.
+  - Empty container `{}` (block / type_body / object_initializers / object_fields with zero named children) stays on one line.
+  - `type_body` `}` inserts a missing `;` before close.
+  - Trailing newline mirrors the input (the corpus fixtures don't carry one; saved files usually do).
+  - Annotations group emits a trailing newline so `@pragma\nfn foo()` survives the formatter.
+  - Blank lines between top-level / sibling decls are preserved; doc-comments suppress the gap so they "stick" to their decl.
+  - Inline EOL `// ...` comments after a `{` / `;` survive on the same line (uses source-byte gap to detect).
+
+  Remaining hard cases (not in this pass): line-length-aware reflow for long `<...>` / `(...)` (args_split, nested_args_split, if_var_object), block-comment placement, and the comment-vs-blank-line ordering nuance (doc_eol_stmt, stmts_rules). M9 acceptance ("8/8") still depends on these.
 
 - [x] **14.4 Continuous fuzzing** (S) — new [`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) runs all three targets (`parser`, `hir_lower`, `format_round_trip`) on a nightly schedule + manual dispatch. Each fuzz target gets a 10-minute libfuzzer budget (`-max_total_time=600`) wrapped in a 30-minute hard wall-clock cap. Failures upload `fuzz/artifacts/<target>/` as a job artifact for triage. Closes ROADMAP §7-C's runtime portion (the harness already shipped in P10.2).
 
