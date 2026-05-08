@@ -362,7 +362,12 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 - [ ] **14.7 Playground UI maturation** (M) — moved up from P10.5. Click-to-jump from CST / HIR / diagnostic rows back to a Monaco editor selection; LSP-in-web-worker so completion / hover / diagnostics fire in the Monaco editor itself, not just in side panels; `localStorage` persistence so refreshes don't lose the user's source. Discrete frontend project — the playground exists today (P5.2) and serves as the analyzer testbed; this chunk is the polish pass once the analyzer is parity-complete.
 
-**M14: published on crates.io; nightly fuzz green; diagnostic parity diff is empty over the corpus; formatter byte-for-byte parity (M9) met. The Rust port is 1:1 with the TS reference. (P14.6 / P14.7 ride alongside but don't gate the milestone — they're consolidated here so the deferred work has a single home.)**
+- [ ] **14.8 Playground project loading + exposed-API browser** (M) — two new playground capabilities once P11 (cross-module identity) and P13.4 (`ProjectIndex.exposed`) have landed:
+  - **Load a project from disk.** Today the playground only edits a single in-memory buffer. Add a "Load project" entry point that walks a user-selected directory (browser File System Access API where available, falling back to a `<input type="file" webkitdirectory>` upload), recognizes `project.gcl` as the entrypoint, and feeds every reachable `.gcl` (via `SourceManager::load_project` semantics) into the wasm analyzer as a multi-doc `SourceManager`. The Monaco editor switches to a file-tree-aware shell so users can hop between modules; cross-module navigation (P11.3 / P11.4) hits real Locations.
+  - **Exposed-API browser panel.** New right-rail tab consuming `ProjectIndex::exposed` (already populated by `ingest`). Lists every `@expose("rename")` site grouped by exposure key, with the local name, declaring file, and signature. Clicking an entry jumps the editor to the decl. Doubles as a "what's the runtime API surface of this project?" overview the CLI doesn't surface today.
+  - Both rely on a wasm export that returns the `ProjectIndex.exposed` map shape (URI-relative paths, decl byte ranges) and a wasm entry that takes `Vec<(uri, text, lib)>` so the playground can drive a multi-doc analysis without round-tripping each file individually. Add those exports as part of this chunk.
+
+**M14: published on crates.io; nightly fuzz green; diagnostic parity diff is empty over the corpus; formatter byte-for-byte parity (M9) met. The Rust port is 1:1 with the TS reference. (P14.6 / P14.7 / P14.8 ride alongside but don't gate the milestone — they're consolidated here so the deferred work has a single home.)**
 
 ---
 
