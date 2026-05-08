@@ -19,19 +19,25 @@ expression: "/// Foo\n@bar\n/// Baz\nfn main() {\n    var x = 0;\n    var y = 1;
       (var_decl
         name: (ident 'x')
         (initializer
-          expr: (number '0')
+          expr: (number
+            (number_int '0')
+          )
         )
       )
       (var_decl
         name: (ident 'y')
         (initializer
-          expr: (number '1')
+          expr: (number
+            (number_int '1')
+          )
         )
       )
       (var_decl
         name: (ident 'z')
         (initializer
-          expr: (number '2')
+          expr: (number
+            (number_int '2')
+          )
         )
       )
       (if_stmt
@@ -43,7 +49,9 @@ expression: "/// Foo\n@bar\n/// Baz\nfn main() {\n    var x = 0;\n    var y = 1;
           (var_decl
             name: (ident 'x')
             (initializer
-              expr: (number '1')
+              expr: (number
+                (number_int '1')
+              )
             )
           )
           (expr_stmt

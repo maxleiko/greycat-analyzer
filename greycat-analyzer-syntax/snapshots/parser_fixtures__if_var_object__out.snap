@@ -10,7 +10,9 @@ expression: "fn main() {\n    if (x < 0) {\n        var y = Foo {\n            y
       (if_stmt
         condition: (binary_expr
           left: (ident 'x')
-          right: (number '0')
+          right: (number
+            (number_int '0')
+          )
         )
         then_branch: (block
           (var_decl

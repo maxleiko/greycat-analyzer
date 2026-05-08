@@ -601,14 +601,17 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             let id = cx.alloc_ident(node);
             Expr::Ident(id)
         }
-        "number" | "char" | "false" | "true" | "null" | "this" | "duration" | "iso8601" => {
+        "number" | "char" | "false" | "true" | "null" | "this" | "iso8601" => {
+            // `number` covers every numeric form (int/decimal/scientific/
+            // suffixed) — duration / float / time dispatch by suffix
+            // content is the analyzer's job (P13.3); lowering just lands
+            // a `LiteralKind::Number` and carries the literal text.
             let lit_kind = match kind {
                 "number" => LiteralKind::Number,
                 "char" => LiteralKind::Char,
                 "false" | "true" => LiteralKind::Bool,
                 "null" => LiteralKind::Null,
                 "this" => LiteralKind::This,
-                "duration" => LiteralKind::Duration,
                 "iso8601" => LiteralKind::Iso8601,
                 _ => unreachable!(),
             };

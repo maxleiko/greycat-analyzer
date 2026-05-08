@@ -16,7 +16,9 @@ expression: "@expose\nfn foo(): int {\n    return 42;\n}"
     )
     body: (block
       (return_stmt
-        (number '42')
+        (number
+          (number_int '42')
+        )
       )
     )
   )

@@ -10,7 +10,9 @@ expression: "fn main() {\nif(x<0) { var y = Foo { yolo: \"hello this is a really
       (if_stmt
         condition: (binary_expr
           left: (ident 'x')
-          right: (number '0')
+          right: (number
+            (number_int '0')
+          )
         )
         then_branch: (block
           (var_decl
