@@ -1311,13 +1311,202 @@ pub fn inlay_hints(
     let mut out = Vec::new();
     for decl_id in &module.decls {
         if let Decl::Fn(fnd) = &hir.decls[*decl_id] {
+            // P13.7: return-type hint when the fn has no declared
+            // return type but the analyzer inferred one from the body.
+            if fnd.return_type.is_none()
+                && let Some(body) = fnd.body
+                && let Some(ty) = inferred_fn_return(&hir, &analysis, body)
+            {
+                let name_range = &hir.idents[fnd.name].byte_range;
+                if name_range.start <= want.1 && name_range.end >= want.0 {
+                    let label =
+                        format!(": {}", greycat_analyzer_types::display(&analysis.types, ty));
+                    out.push(InlayHint {
+                        position: byte_to_position(text, name_range.end),
+                        label: InlayHintLabel::String(label),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: None,
+                        padding_right: None,
+                        data: None,
+                    });
+                }
+            }
             // Walk the body for `var name = expr;` shapes (no declared type).
             if let Some(body) = fnd.body {
                 emit_var_hints(&hir, &analysis, body, want, text, &mut out);
+                // P13.7: argument-name hints inside the body.
+                emit_call_arg_hints(&hir, &resolutions, body, want, text, &mut out);
             }
         }
     }
     out
+}
+
+/// P13.7 — peek at the last expression-shaped statement of a fn body
+/// to infer its return type. Returns `None` for blocks that don't end
+/// in a `Stmt::Return(...)` with an inferred-type expression.
+fn inferred_fn_return(
+    hir: &Hir,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    body: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
+) -> Option<greycat_analyzer_types::TypeId> {
+    use greycat_analyzer_hir::types::Stmt;
+    let stmts = match &hir.stmts[body] {
+        Stmt::Block(s) => s,
+        _ => return None,
+    };
+    for s in stmts.iter().rev() {
+        if let Stmt::Return(Some(e)) = &hir.stmts[*s] {
+            return analysis.expr_types.get(e).copied();
+        }
+    }
+    None
+}
+
+/// P13.7 — walk the body for `Expr::Call` and emit one
+/// `<param_name>:` hint anchored at the start of each positional arg.
+fn emit_call_arg_hints(
+    hir: &Hir,
+    resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
+    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
+    want: (usize, usize),
+    text: &str,
+    out: &mut Vec<InlayHint>,
+) {
+    use greycat_analyzer_hir::types::Stmt;
+    let stmt = &hir.stmts[stmt_id];
+    match stmt {
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                emit_call_arg_hints(hir, resolutions, *s, want, text, out);
+            }
+        }
+        Stmt::Expr(e)
+        | Stmt::Return(Some(e))
+        | Stmt::Throw(e)
+        | Stmt::Var(greycat_analyzer_hir::types::LocalVar { init: Some(e), .. }) => {
+            emit_call_arg_hints_expr(hir, resolutions, *e, want, text, out);
+        }
+        Stmt::Assign(a) => {
+            emit_call_arg_hints_expr(hir, resolutions, a.target, want, text, out);
+            emit_call_arg_hints_expr(hir, resolutions, a.value, want, text, out);
+        }
+        Stmt::If(i) => {
+            emit_call_arg_hints_expr(hir, resolutions, i.condition, want, text, out);
+            emit_call_arg_hints(hir, resolutions, i.then_branch, want, text, out);
+            if let Some(eb) = i.else_branch {
+                emit_call_arg_hints(hir, resolutions, eb, want, text, out);
+            }
+        }
+        Stmt::While(w) => {
+            emit_call_arg_hints_expr(hir, resolutions, w.condition, want, text, out);
+            emit_call_arg_hints(hir, resolutions, w.body, want, text, out);
+        }
+        Stmt::DoWhile(w) => {
+            emit_call_arg_hints(hir, resolutions, w.body, want, text, out);
+            emit_call_arg_hints_expr(hir, resolutions, w.condition, want, text, out);
+        }
+        Stmt::For(f) => emit_call_arg_hints(hir, resolutions, f.body, want, text, out),
+        Stmt::ForIn(f) => {
+            emit_call_arg_hints_expr(hir, resolutions, f.range, want, text, out);
+            emit_call_arg_hints(hir, resolutions, f.body, want, text, out);
+        }
+        Stmt::Try(t) => {
+            emit_call_arg_hints(hir, resolutions, t.try_block, want, text, out);
+            emit_call_arg_hints(hir, resolutions, t.catch_block, want, text, out);
+        }
+        Stmt::At(a) => {
+            emit_call_arg_hints_expr(hir, resolutions, a.expr, want, text, out);
+            emit_call_arg_hints(hir, resolutions, a.block, want, text, out);
+        }
+        _ => {}
+    }
+}
+
+fn emit_call_arg_hints_expr(
+    hir: &Hir,
+    resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
+    expr_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
+    want: (usize, usize),
+    text: &str,
+    out: &mut Vec<InlayHint>,
+) {
+    use greycat_analyzer_hir::types::{CallExpr, Expr};
+    match &hir.exprs[expr_id] {
+        Expr::Call(CallExpr { callee, args, .. }) => {
+            // Recurse into nested args first so hints fire on inner
+            // calls too.
+            emit_call_arg_hints_expr(hir, resolutions, *callee, want, text, out);
+            for a in args {
+                emit_call_arg_hints_expr(hir, resolutions, *a, want, text, out);
+            }
+            // Look up callee's params.
+            if let Expr::Ident(name_idx) = &hir.exprs[*callee]
+                && let Some(Definition::Decl(decl_id)) = resolutions.lookup(*name_idx)
+                && let Decl::Fn(fnd) = &hir.decls[decl_id]
+            {
+                for (i, arg) in args.iter().enumerate() {
+                    let Some(p_id) = fnd.params.get(i) else {
+                        break;
+                    };
+                    let p = &hir.fn_params[*p_id];
+                    let param_name = hir.idents[p.name].text.clone();
+                    if param_name.starts_with('_') {
+                        continue;
+                    }
+                    let arg_range = match &hir.exprs[*arg] {
+                        Expr::Ident(ident_idx) => hir.idents[*ident_idx].byte_range.clone(),
+                        other => other.byte_range(),
+                    };
+                    if arg_range.start > want.1 || arg_range.end < want.0 {
+                        continue;
+                    }
+                    out.push(InlayHint {
+                        position: byte_to_position(text, arg_range.start),
+                        label: InlayHintLabel::String(format!("{param_name}:")),
+                        kind: Some(InlayHintKind::PARAMETER),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: None,
+                        padding_right: Some(true),
+                        data: None,
+                    });
+                }
+            }
+        }
+        Expr::Tuple(items, _) | Expr::Array(items, _) => {
+            for e in items {
+                emit_call_arg_hints_expr(hir, resolutions, *e, want, text, out);
+            }
+        }
+        Expr::Member(m) | Expr::Arrow(m) => {
+            emit_call_arg_hints_expr(hir, resolutions, m.receiver, want, text, out);
+        }
+        Expr::Offset(o) => {
+            emit_call_arg_hints_expr(hir, resolutions, o.receiver, want, text, out);
+            emit_call_arg_hints_expr(hir, resolutions, o.index, want, text, out);
+        }
+        Expr::Binary(b) => {
+            emit_call_arg_hints_expr(hir, resolutions, b.left, want, text, out);
+            emit_call_arg_hints_expr(hir, resolutions, b.right, want, text, out);
+        }
+        Expr::Unary(u) => emit_call_arg_hints_expr(hir, resolutions, u.operand, want, text, out),
+        Expr::Paren(inner, _) => {
+            emit_call_arg_hints_expr(hir, resolutions, *inner, want, text, out)
+        }
+        Expr::Object(o) => {
+            for f in &o.fields {
+                emit_call_arg_hints_expr(hir, resolutions, f.value, want, text, out);
+            }
+        }
+        Expr::Lambda(l) => emit_call_arg_hints_expr(hir, resolutions, l.body, want, text, out),
+        Expr::Is { value, .. } | Expr::Cast { value, .. } => {
+            emit_call_arg_hints_expr(hir, resolutions, *value, want, text, out);
+        }
+        _ => {}
+    }
 }
 
 fn emit_var_hints(

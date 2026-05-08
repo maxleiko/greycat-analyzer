@@ -352,6 +352,51 @@ fn inlay_hints_emit_var_type() {
 }
 
 #[test]
+fn inlay_hints_emit_argument_names() {
+    // P13.7: `f(1, 2)` against `fn f(x: int, y: int)` emits `x:` / `y:`
+    // hints anchored at each arg position.
+    let src = "fn f(x: int, y: int) {}\nfn caller() {\n    f(1, 2);\n}\n";
+    let tree = parse(src);
+    let r = lsp_types::Range {
+        start: pos(0, 0),
+        end: pos(10, 0),
+    };
+    let hints = capabilities::inlay_hints(src, "project", tree.root_node(), &r);
+    let labels: Vec<String> = hints
+        .iter()
+        .filter_map(|h| match &h.label {
+            lsp_types::InlayHintLabel::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "x:"),
+        "expected `x:` arg-name hint: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "y:"),
+        "expected `y:` arg-name hint: {labels:?}"
+    );
+}
+
+#[test]
+fn inlay_hints_emit_inferred_return_type() {
+    // P13.7: a fn with no declared return type but a `return …;` body
+    // gets a `: <inferred>` hint anchored after the fn name.
+    let src = "fn ret() {\n    return 42;\n}\n";
+    let tree = parse(src);
+    let r = lsp_types::Range {
+        start: pos(0, 0),
+        end: pos(10, 0),
+    };
+    let hints = capabilities::inlay_hints(src, "project", tree.root_node(), &r);
+    let has_int = hints
+        .iter()
+        .any(|h| matches!(&h.label, lsp_types::InlayHintLabel::String(s) if s.contains("int")));
+    assert!(has_int, "expected return-type hint with `int`: {hints:?}");
+}
+
+#[test]
 fn selection_ranges_cover_cursor() {
     let src = "fn x(): int { return 1 + 2; }\n";
     let tree = parse(src);
