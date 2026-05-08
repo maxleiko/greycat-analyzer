@@ -37,19 +37,33 @@ pub struct Lint {
     #[clap(
         long,
         value_enum,
-        default_value_t = OutputFormat::Compact,
-        help = "Diagnostic rendering style. `compact` keeps the \
-                `path:line:col: severity: message` shape (P10.3 parity \
-                oracle expects this). `pretty` pipes through miette \
-                for source-snippet + caret + color output (P10.7)."
+        help = "Diagnostic rendering style. Defaults to `pretty` (miette: \
+                source-snippet + caret + color) when stdout is a TTY and \
+                `compact` (`path:line:col: severity: message`) when piped — \
+                so the P10.3 parity oracle still gets a stable diffable \
+                shape. Pass explicitly to override."
     )]
-    format: OutputFormat,
+    format: Option<OutputFormat>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     Compact,
     Pretty,
+}
+
+impl OutputFormat {
+    /// TTY-aware default: `pretty` interactively, `compact` when
+    /// piped. Mirrors what the P10.7 roadmap entry promised
+    /// (`miette when stdout is a TTY OR --format=pretty`).
+    fn auto() -> Self {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            OutputFormat::Pretty
+        } else {
+            OutputFormat::Compact
+        }
+    }
 }
 
 impl Lint {
@@ -259,17 +273,18 @@ impl Lint {
                 )?;
             }
         } else {
-            // Human-readable: per-file diagnostic dump (matching the TS
-            // reference shape: `path:line:col: severity: message`),
-            // followed by a one-line summary. P10.7: when
-            // `--format=pretty`, pipe through miette for snippet +
-            // caret + color rendering instead.
+            // Human-readable: per-file diagnostic dump. P10.7: pretty
+            // by default when stdout is a TTY (miette: snippet + caret
+            // + color), compact when piped so the parity oracle and
+            // grep-style consumers keep a stable shape. Explicit
+            // `--format` always wins.
+            let render = self.format.unwrap_or_else(OutputFormat::auto);
             entries.sort_by(|a, b| a.path.cmp(&b.path));
             for e in &entries {
                 let path = e.path.display().to_string();
                 let source = std::fs::read_to_string(&e.path).unwrap_or_default();
                 for diag in &e.diagnostics {
-                    match self.format {
+                    match render {
                         OutputFormat::Compact => {
                             println!("{}", format_cli(&path, diag));
                         }
