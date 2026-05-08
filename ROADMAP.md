@@ -185,9 +185,9 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 - [x] **5.1 WASM API surface** (M) — `greycat-analyzer-wasm` exports `parse_sexp` (string), `parse_tree` (full serialized CST with kind / range / field / text / nesting), `tokens` (flat leaf stream with start/end positions + text), `lower_hir` (module name + decl list + per-arena counts), `infer_types` (per-expression byte range + display string), `diagnostics` (parse + semantic + lint, all merged with severity / source / code / position info), and `format` (formatted source). Each export runs its own pipeline pass — caching across exports waits on real profiling data from the playground.
 - [x] **5.2 Playground as analyzer testbed** (M) — fresh playground at [playground/](../playground/), scaffolded via `vp create vite:application` with a TypeScript + Lit + WebAwesome + Monaco stack. `<gc-playground>` lays out a `<wa-split-panel>` with the Monaco editor on the left and a `<wa-tab-group>` of inspection panels on the right: Diagnostics, CST (nested expandable tree), Tokens (table), HIR (decl list + arena counts), Types (per-expression inferred types), Format (side-by-side input vs. fmt output with idempotency badge). Each panel re-runs its own wasm export on every keystroke through a shared lazy-loaded `wasm.ts` initializer. `playground/scripts/build-wasm.sh` wraps `wasm-pack build --target web` with the Emscripten sysroot needed by tree-sitter-greycat's parser.c when compiling for `wasm32-unknown-unknown`. The previous gitignored `greycat-analyzer-playground/` is gone; the new `playground/` is committed.
-- [ ] **5.3 crates.io publish** (S) — see **P10.1**.
+- [ ] ~~**5.3 crates.io publish** (S) — see **P10.1**.~~ → **moved to P14.1** (publish unblock; the path-dep on `tree-sitter-greycat` is the actual blocker).
 - [x] **5.4 VS Code extension** (S) — `editors/code/src/extension.ts` already used the rust LSP via the `lang-server` subcommand; updated to the canonical `server` subcommand (P4.3) and broadened the default `RUST_LOG` to include `greycat_analyzer_analysis`. The extension package itself (`package.json`, manifest, scripts/build) was already in place.
-- [ ] **5.5 Salsa retrofit** (M) — see **P10.4**.
+- [ ] ~~**5.5 Salsa retrofit** (M) — see **P10.4**.~~ → **moved to P14.6** (still profiling-driven; tracked there alongside the other production gates).
 - [x] **5.6 Stdlib parity + version pinning** (S) — pin lives in repo-root [project.gcl](../project.gcl) (`@library("std", "8.0.269-dev")`). [scripts/check-stdlib.sh](../scripts/check-stdlib.sh) reads the pin, checks that `lib/std/` is populated, and runs the coverage gauntlet (which already covers stdlib when present). New [.github/workflows/ci.yml](../.github/workflows/ci.yml) provides the CI gate: build, clippy with `-D warnings`, `cargo test --workspace`, the coverage gauntlet, and the snapshot harness — every push and PR.
 
 ---
@@ -220,7 +220,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 - [x] **7.1 Drain `KNOWN_GRAMMAR_GAPS`** (S) — `type_attr` rule in `vendor/tree-sitter-greycat/grammar.js` made the trailing `_semi` optional, parser regenerated, submodule pointer bumped, and the `KNOWN_GRAMMAR_GAPS` allowlist drained to `&[]`. The `core::diagnostics::missing_token_surfaces` test that relied on the missing-`;` recovery was retargeted at an unclosed-block fixture (`fn main() {`) since `type Foo { a; b }` now parses cleanly.
 - [x] **7.2 Drain `Expr::Unsupported`** (M) — new `greycat-analyzer-hir/tests/unsupported_audit.rs` walks `lib/std/*.gcl` plus every parser fixture, counts distinct `Expr::Unsupported.kind` values, and asserts the histogram is empty. As of this chunk, **zero distinct `Unsupported` kinds** appear over 20 .gcl files. The earlier suspects (`is` / `as`) were retired in P6.5; what remained turned out to already lower cleanly. The audit is a permanent regression guard — a future grammar / lowering change that re-introduces an unsupported shape now fails the test instead of silently degrading.
 - [x] **7.3 Type system — node tagging** (M, foundational pass) — `is_assignable_to` learned a node-tag auto-deref rule: when `from` is a `Generic { name, args: [inner] }` and `name` is in `is_node_tag` (`node` / `nodeTime` / `nodeGeo` / `nodeList` / `nodeIndex`), the relation falls back to `is_assignable_to(arena, inner, to)`. The reverse direction stays asymmetric — bare `T` does *not* auto-promote to `node<T>`. Full TS semantics around tagged-mutation tracking remain a deeper port.
-- [x] **7.4 Type system — generic constraints + inference table** (M, foundational pass) — new `InferenceTable` with `bind(name, ty)` / `lookup` / `substitute(arena, ty)`. `substitute` walks `Generic` / `Tuple` / `GenericParam` recursively and replaces `GenericParam(name)` with the recorded witness, preserving nullability. The constraint-bound syntax (`T : SomeBound`) and per-call propagation (record on argument visit, substitute on return type) are still TODO; this chunk lands the foundation so the analyzer / call-site machinery has a typed seam to fill in. 1 unit test.
+- [x] **7.4 Type system — inference table** (M, foundational pass) — new `InferenceTable` with `bind(name, ty)` / `lookup` / `substitute(arena, ty)`. `substitute` walks `Generic` / `Tuple` / `GenericParam` recursively and replaces `GenericParam(name)` with the recorded witness, preserving nullability. Per-call constraint propagation (record on argument visit, substitute on return type) is still TODO; this chunk lands the foundation so the analyzer / call-site machinery has a typed seam to fill in. 1 unit test. **Note:** GreyCat has no generic-bound syntax — there's nothing like Rust's `T: Bound`; the chunk is purely about inference / unification.
 - [x] **7.5 Type system — anonymous structural compatibility** (S) — `(Anonymous, Anonymous)` arm in `is_assignable_to` now implements width subtyping: every field present in `to` must exist in `from` with an assignable type. Extra fields on `from` are fine. 1 unit test.
 
 **M7: `lower_module` over `lib/std/*.gcl` produces zero `Expr::Unsupported`; type-system unit tests cover every TS subtyping rule with a fixture pulled from the TS test suite.**
@@ -252,7 +252,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] **9.1 Port `cst_format.ts`** (XL) — ~1,354 LoC of TS. Per-construct reflow rules (line-break heuristics for long argument lists, alignment of consecutive type attrs, doc-comment placement, blank-line preservation between top-level items, etc.). The foundational printer in `greycat-analyzer-fmt` already handles the trivial cases; this is the long tail. **Honest first-pass status (this chunk):** parity gauntlet (P9.2) and idempotency tester (P9.3) shipped as the measurement infrastructure. Current parity floor: **0/8 fixtures byte-for-byte**; current idempotency floor: **0/8 idempotent on `out.gcl` re-format** (string-literal whitespace handling has a known bug). The actual port of `cst_format.ts` per-construct rules remains the long tail and is left for follow-up commits.
+- [ ] ~~**9.1 Port `cst_format.ts`** (XL) — ~1,354 LoC of TS. Per-construct reflow rules (line-break heuristics for long argument lists, alignment of consecutive type attrs, doc-comment placement, blank-line preservation between top-level items, etc.). The foundational printer in `greycat-analyzer-fmt` already handles the trivial cases; this is the long tail. **Honest first-pass status (this chunk):** parity gauntlet (P9.2) and idempotency tester (P9.3) shipped as the measurement infrastructure. Current parity floor: **0/8 fixtures byte-for-byte**; current idempotency floor: **0/8 idempotent on `out.gcl` re-format** (string-literal whitespace handling has a known bug). The actual port of `cst_format.ts` per-construct rules remains the long tail and is left for follow-up commits.~~ → **moved to P14.3** (formatter parity floor ratchets to 8/8 — bundles the `cst_format.ts` port + the string-literal whitespace bug fix).
 - [x] **9.2 Per-fixture parity gauntlet** (S) — `greycat-analyzer-fmt/tests/parity_gauntlet.rs::formatter_parity_against_corpus` walks every `tests/corpus/parser_fixtures/<n>/{in.gcl,out.gcl}` pair, formats `in.gcl`, compares to `out.gcl`, and asserts `matches >= MATCH_FLOOR` (a regression budget that ratchets up as P9.1 rules land). Fixture mismatches are logged via `eprintln` so CI surfaces the per-name list.
 - [x] **9.3 Idempotency invariant** (S) — `parity_gauntlet.rs::formatter_idempotent_on_corpus` checks `fmt(fmt(x)) == fmt(x)` over every fixture's `out.gcl` and tracks an `idempotent` counter against an `IDEMPOTENT_FLOOR` regression budget. Honest baseline noted above; the test won't fail CI on the existing string-whitespace bug but will catch any *further* regressions while P9.1 is in progress.
 
@@ -269,12 +269,100 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 - [x] **10.1 crates.io publish prep** (S, no actual publish) — `LICENSE-MIT` + `LICENSE-APACHE` at workspace root. `[workspace.package]` metadata (`license = "MIT OR Apache-2.0"`, `repository`, `authors`, `description`, `keywords`, `categories`) inherited via `*.workspace = true` on every crate. Path deps gained explicit `version = "0.1.0"` guards so cargo can resolve to crates.io versions at publish time. New `scripts/publish.sh` walks the dep order (`syntax → core → hir → types → fmt → analysis → ls → wasm → bin`) with `--dry-run` support. **Not yet runnable end-to-end** — `greycat-analyzer-syntax` still uses a path dep on the vendored `tree-sitter-greycat` submodule, which isn't on crates.io; the actual publish is gated on either publishing the grammar crate first or vendoring its `parser.c` into the syntax crate. Documented in the script's pre-flight.
 - [x] **10.2 cargo-fuzz on parser/HIR boundary** (S) — `fuzz/` directory (excluded from the workspace) with three targets: `parser` (UTF-8 → `parse`), `hir_lower` (UTF-8 → `parse → lower_module`), `format_round_trip` (`parse → format_tree → parse` re-parse cleanliness). README covers running with `cargo +nightly fuzz run`. Closes ROADMAP §7-C.
 - [x] **10.3 TS-vs-Rust diagnostic parity oracle** (M, harness only) — `scripts/parity-oracle.sh` runs the Rust port + TS reference (when available locally) over the same corpus, normalizes both into `path:line:col:` shape, and emits a `diff -u`. The CI gate that closes §7-A waits on P6 / P7 fully landing so the diff is small enough to be useful as a regression budget; the harness ships now so the snapshot can be taken at any time during the parity push.
-- [ ] **10.4 Salsa retrofit** (M, profiling-driven) — explicitly deferred. The acceptance criterion is "profiling shows quadratic blow-up on multi-file edits"; until that signal arrives, retrofitting salsa is premature optimization. The pure-function design from P6.1 keeps the retrofit cheap when it does become necessary. (Subsumes P5.5.)
-- [ ] **10.5 Playground UI maturation** (M, deferred) — large frontend scope (click-to-jump from CST / HIR / diagnostic rows back to Monaco; LSP-in-web-worker for in-editor completion / hover / diagnostics; `localStorage` persistence). Deferred as a discrete frontend project rather than rolled into this roadmap pass; the playground exists today (see `playground/`) and serves as the analyzer testbed (P5.2).
+- [ ] ~~**10.4 Salsa retrofit** (M, profiling-driven) — explicitly deferred. The acceptance criterion is "profiling shows quadratic blow-up on multi-file edits"; until that signal arrives, retrofitting salsa is premature optimization. The pure-function design from P6.1 keeps the retrofit cheap when it does become necessary. (Subsumes P5.5.)~~ → **moved to P14.6.**
+- [ ] ~~**10.5 Playground UI maturation** (M, deferred) — large frontend scope (click-to-jump from CST / HIR / diagnostic rows back to Monaco; LSP-in-web-worker for in-editor completion / hover / diagnostics; `localStorage` persistence). Deferred as a discrete frontend project rather than rolled into this roadmap pass; the playground exists today (see `playground/`) and serves as the analyzer testbed (P5.2).~~ → **moved to P14.7.**
 - [x] **10.6 Documentation pass** (S) — crate-level rustdoc paragraphs added to `greycat-analyzer-syntax`, `greycat-analyzer-core`, `greycat-analyzer-ls`, and `greycat-analyzer-analysis` lib.rs heads (the others — `-hir`, `-types`, `-fmt`, `-wasm` — already had real doc paragraphs). New `docs/porting-from-ts.md` maps every TS subsystem under `packages/lang/src/` to its target Rust crate plus called-out divergences (no hand-rolled lexer, no general visitor framework, etc.). Playground README is left for the P10.5 follow-up since it's part of the playground UI maturation work.
 - [x] **10.7 CLI diagnostic UX (miette)** (S) — `cli lint` defaults to `pretty` (miette: source snippet + caret + color) when stdout is a TTY, and to `compact` (`path:line:col: severity: message`) when piped — so the P10.3 parity oracle and grep-style consumers keep a stable diffable shape. `--format={compact,pretty}` overrides explicitly. The `--format` field is `Option<OutputFormat>`; `OutputFormat::auto()` consults `std::io::IsTerminal` at run time to pick the default. New `print_pretty_diagnostic` helper maps `Diagnostic.severity` / `code` / `range` onto a `MietteDiagnostic` with a `LabeledSpan`. `miette = { version = "7", features = ["fancy"] }` added to the cli crate.
 
 **M10: published on crates.io; nightly fuzz + diagnostic parity gates green; playground is the analyzer's interactive debugger.**
+
+---
+
+### Phase 11 — Cross-module identity (~3-5 weeks)
+
+**Goal:** lift `Definition::Project` from "resolved, no detail" to "resolved to (uri, decl_id)" so every capability that needs cross-module navigation (goto-def, references, rename, member-access) stops falling back to text equality. P8.1 / P8.2 / P8.6 land scope-aware semantics for *intra-module* names; this phase finishes the job across modules.
+
+**Chunks:**
+
+- [ ] **11.1 Global decl table** (M) — `ProjectIndex` gains `decl_locations: HashMap<String, Vec<(Uri, Idx<Decl>)>>` populated by `ingest`. Collisions across modules are kept; disambiguation happens at the use site via the importing module's lib/include closure. `ProjectAnalysis::analyze` repopulates on every rebuild. Acceptance: querying the index for `"Permission"` returns the URI of `lib/std/runtime.gcl` and the matching `Idx<Decl>`.
+
+- [ ] **11.2 `Definition::Project` carries detail** (M) — replace the unit `Definition::Project` with `Definition::ProjectDecl { uri, decl }`. Resolver's `record_use` consults the global decl table when local scope misses; capabilities pattern-match the new shape. Stays `Copy` since `Idx` is `Copy` and `Uri` already is. Adjusts capabilities + analyzer + lints downstream.
+
+- [ ] **11.3 Cross-module goto-definition** (S) — `goto_definition` returns `Location { uri: <decl_uri>, range: <name_range> }` for `Definition::ProjectDecl`. Capability handler reads the manager's other doc to compute the range.
+
+- [ ] **11.4 Cross-module references + rename** (M) — replaces P8.2's text-equality fallback. References iterates every doc's `Resolutions::uses`, filters by `Definition::ProjectDecl` target. Rename does the same and aggregates per-Uri `TextEdit`s. Drops `cursor_text_at` / `text_matches` / `text_matches_as_edits` once unused.
+
+- [ ] **11.5 Cross-module member resolution** (M) — `a.b` where the receiver type is declared in another module: navigate via the global decl table to the foreign `TypeDecl`, find the property, record into `member_uses` with `MemberDef::Attr` / `MemberDef::Method` referencing the foreign module's HIR. The `analyzer::Cx` gains read-only access to other modules' HIRs through `ProjectAnalysis`.
+
+- [ ] **11.6 Cross-module goto-implementation** (S) — `goto_implementation` walks every type decl across the manager (not just the current module) for concrete methods matching the cursor.
+
+**M11: cross-module navigation (goto-def / goto-impl / references / rename / member access) works end-to-end on a multi-file project; the unit `Definition::Project` placeholder is gone.**
+
+---
+
+### Phase 12 — Type system completion (~4-6 weeks)
+
+**Goal:** real generic inference + variance + the rest of the TS subtyping rules. P7's "foundational pass" entries get their full deepening here. (GreyCat has no generic-bound syntax — `T: Bound` is a Rust concept; nothing analogous exists in `.gcl`.)
+
+**Chunks:**
+
+- [ ] **12.1 Generic inference at call sites** (M) — analyzer's `Expr::Call` builds an `InferenceTable` from argument-type witnesses against the callee's declared parameter types, solves, then substitutes into the return type. Replaces today's "every generic-param falls back to `Any`" stub. New diagnostic when witnesses conflict (`f<T>(x: T, y: T)` called with `f(1, "s")` produces `cannot infer T: int conflicts with String`).
+
+- [ ] **12.2 Variance for user-declared generics** (S) — match the TS reference semantics around when user-declared `Generic<T>` types are assignable based on `T` covariance / contravariance / invariance. Today every user generic is invariant (P2.4 default).
+
+- [ ] **12.3 Deeper node-tag rules** (M) — full TS reference semantics for `node` / `nodeTime` / `nodeGeo` / `nodeList` / `nodeIndex`: tagged-mutation tracking, asymmetric promotion rules, conversion-method recognition. P7.3 only landed auto-deref; this chunk lands the rest.
+
+- [ ] **12.4 TS subtyping fixtures gauntlet** (S) — port the TS `analysis/typesystem.test.ts` fixture suite (or its intent) into Rust unit tests so every TS subtyping rule has a corresponding test that flags drift.
+
+**M12: every TS subtyping rule has a passing Rust unit test pulled from the TS suite; the type-system foundational-pass disclaimers in P7's roadmap entries are lifted.**
+
+---
+
+### Phase 13 — Analyzer parity closeout (~3-4 weeks)
+
+**Goal:** CFG-aware narrowing, declarator/hinter deep ports, decl-level annotation flags, typed-suffix literals — the long tail of "behaves the same as the TS analyzer on the same input."
+
+**Chunks:**
+
+- [ ] **13.1 CFG-aware narrowing (early-return)** (M) — when a then-branch ends in `return` / `throw` / `break` / `continue`, the post-if scope inherits the else-branch's narrowing. Adds a small terminal-statement detector to `analyzer::Cx`. Handles the common `if (x == null) { return; } use(x);` idiom.
+
+- [ ] **13.2 Conjunctive / disjunctive narrowings** (S) — `x != null && y != null` narrows both `x` and `y` in the then-branch; `x == null || y == null` is the inverse for else. `derive_cond_narrows` recurses through `BinOp::And` / `BinOp::Or` and merges.
+
+- [ ] **13.3 Typed-suffix literal lowering** (S) — `123_time`, `1d_duration`, etc. lower to `LiteralKind::Time` / `LiteralKind::Duration` instead of `LiteralKind::Number`. Resolves the 2 stdlib-residual diagnostics on `static min: time = -9223372036854775808_time;`. Grammar already produces the right node kinds; HIR `lower_expr` needs to inspect the suffix.
+
+- [ ] **13.4 `@expose("rename")` capture into ExposedMap** (M) — `Modifiers::annotations` becomes `Vec<Annotation { name: String, args: Vec<String> }>`. `ProjectIndex` gains `exposed: HashMap<String, Vec<ExposureSite>>` keyed by the rename string. Capabilities / lints can ask "is this name exposed at the runtime API surface?".
+
+- [ ] **13.5 Decl-level type flags** (M) — `@iterable` / `@deref` / `@primitive` annotations on a type decl become bits the type system reads: `@iterable` adds `for x in foo` legality, `@deref` makes the type behave like its inner type for member access, `@primitive` exempts it from structural rules. Adds the corresponding `is_assignable_to` cases.
+
+- [ ] **13.6 declarator.ts deep port residual** (S) — the rest of `analysis/declarator.ts` not covered by `register_module_types` / `ProjectIndex::ingest` / earlier chunks. Permission tracking on modules (`@permission` pragma → `module.permissions`). Per-decl validation diagnostics the TS reference emits (e.g., "static field cannot have an initializer that depends on `this`").
+
+- [ ] **13.7 hinter.ts deep port residual** (S) — per-call **argument-name** inlay hints (`f(x: 1, y: 2)` rendered before each arg position), lambda-param inlay hints, return-type inlay hints on multi-line fn decls. P3.7 only landed `var x = ...` annotations.
+
+**M13: `cli lint project.gcl` returns zero diagnostics on a workspace whose project.gcl pulls in stdlib (closing the original M3 acceptance gap from typed-suffix literals); the lsp.*.test.ts parity tests (P8.7) are deepened with the full set of TS scenario inputs and pass.**
+
+---
+
+### Phase 14 — Final parity gate (~2-3 weeks)
+
+**Goal:** turn the harnesses (P10.3 parity oracle, fuzz, formatter parity gauntlet) into actual CI gates and resolve the publish blocker. Closes ROADMAP §7-A end-to-end.
+
+**Chunks:**
+
+- [ ] **14.1 Publish unblock** (S) — either publish `tree-sitter-greycat` to crates.io (preferred — keeps the submodule SHA as the grammar pin) and bump `greycat-analyzer-syntax` to consume the published version, or vendor `parser.c` + `node-types.json` directly into `greycat-analyzer-syntax/src/grammar/` and drop the path-dep. Either path lets `scripts/publish.sh` actually run end-to-end. Subsumes the "currently blocked" note in P10.1.
+
+- [ ] **14.2 Diagnostic parity gate in CI** (M) — `scripts/parity-oracle.sh` becomes a CI step gated against a per-fixture diff budget that ratchets toward zero. Closes ROADMAP §7-A. Gates on P11/P12/P13 fully landing so the diff is small enough to ratchet meaningfully.
+
+- [ ] **14.3 Formatter parity floor ratchets to 8/8** (XL — bundles P9.1) — actually ports `cst_format.ts`'s per-construct rules. The parity gauntlet's `MATCH_FLOOR` ratchets up as rules land. Idempotency-violating string-literal whitespace bug fixed as part of this. Closes M9.
+
+- [ ] **14.4 Continuous fuzzing** (S) — nightly CI runs `cargo fuzz run parser`, `hir_lower`, `format_round_trip` for N minutes each. Crashes get filed as issues automatically (or at minimum land in `fuzz/artifacts/<target>/` for triage).
+
+- [ ] **14.5 `lint --csv` per-file timing restored** (S) — `LoadReport` carries `loaded: Vec<(Uri, Duration)>` instead of `Vec<Uri>` so the CLI's CSV mode shows per-file parse durations again. Regression introduced by the `iter_gcl → load_project` migration.
+
+- [ ] **14.6 Salsa retrofit** (M, profiling-driven) — moved up from P10.4 / P5.5. Still gated on profiling showing quadratic blow-up on multi-file edits in real workspaces; the pure-function design from P6.1 keeps the retrofit cheap when the signal arrives. **Not** required for M14 — listed here to consolidate the deferred work into the parity-finish phase rather than leave it dangling under P10.
+
+- [ ] **14.7 Playground UI maturation** (M) — moved up from P10.5. Click-to-jump from CST / HIR / diagnostic rows back to a Monaco editor selection; LSP-in-web-worker so completion / hover / diagnostics fire in the Monaco editor itself, not just in side panels; `localStorage` persistence so refreshes don't lose the user's source. Discrete frontend project — the playground exists today (P5.2) and serves as the analyzer testbed; this chunk is the polish pass once the analyzer is parity-complete.
+
+**M14: published on crates.io; nightly fuzz green; diagnostic parity diff is empty over the corpus; formatter byte-for-byte parity (M9) met. The Rust port is 1:1 with the TS reference. (P14.6 / P14.7 ride alongside but don't gate the milestone — they're consolidated here so the deferred work has a single home.)**
 
 ---
 
@@ -327,22 +415,28 @@ Survives, internals replaced:
 ## 10. Sequencing & timeline
 
 ```
-P0 [4-6w]   Foundation reset ───────── M1
-P1 [2-3w]   Project + parse diags ──── M2
-P2 [10-16w] Semantic layer ─────────── M3   ← dominates
-P3 [4-6w]   LSP capabilities ───────── M4
-P4 [3-4w]   Formatter + linter ─────── M5
-P5 [2-3w]   Distribution
-P6 [8-12w]  Analyzer 1:1 with TS ───── M6   ← dominates the parity push
-P7 [3-5w]   Grammar + HIR completion ─ M7
-P8 [4-6w]   LSP 1:1 with TS ────────── M8
-P9 [4-6w]   Formatter byte-parity ──── M9
-P10 [4-6w]  Distribution + quality ── M10
+P0  [4-6w]   Foundation reset ──────── M1
+P1  [2-3w]   Project + parse diags ─── M2
+P2  [10-16w] Semantic layer ────────── M3   ← dominates the original push
+P3  [4-6w]   LSP capabilities ──────── M4
+P4  [3-4w]   Formatter + linter ────── M5
+P5  [2-3w]   Distribution
+P6  [8-12w]  Analyzer 1:1 with TS ──── M6   ← dominates the parity push
+P7  [3-5w]   Grammar + HIR completion ─ M7
+P8  [4-6w]   LSP 1:1 with TS ───────── M8
+P9  [4-6w]   Formatter byte-parity ─── M9
+P10 [4-6w]   Distribution + quality ── M10
+P11 [3-5w]   Cross-module identity ── M11   ← unblocks P12-P14 cross-module work
+P12 [4-6w]   Type system completion ─ M12
+P13 [3-4w]   Analyzer parity closeout ─ M13
+P14 [2-3w]   Final parity gate ────── M14   ← the "are we 1:1?" gate
 ```
 
-Total realistic envelope: **12-18 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the gap to 1:1 parity with the TS reference and adds the production gates.
+Total realistic envelope: **12-18 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1.
 
-Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
+Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3 → P14.2) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
+
+P11 is on the critical path for P12–P14 because most cross-module capabilities (member resolution across modules, scope-aware rename / references / goto-def across modules, real `Definition::Project` data) blocks behind a global decl table. P12 and P13 can run in parallel after P11. P14 gates on all of P11/P12/P13.
 
 ---
 
