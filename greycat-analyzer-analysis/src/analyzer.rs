@@ -152,6 +152,16 @@ pub struct AnalysisResult {
     /// hover / goto-def show the right content for each segment of
     /// `runtime::Identity::create`.
     pub foreign_decl_uses: HashMap<Idx<Ident>, ForeignDecl>,
+    /// Conditions whose type must be `bool` (`if`, `while`, `do-while`,
+    /// `for`-mid condition). Recorded by the analyzer's first pass
+    /// after `visit_expr` populates `expr_types`; the
+    /// [`crate::project::ProjectAnalysis`] post-pass that runs after
+    /// cross-module call return-type inference drains these and emits
+    /// the "X must be `bool`, got `T`" diagnostic. Doing the check at
+    /// first-pass time surfaces false positives whenever the condition
+    /// is a Call whose return type isn't resolved until the project
+    /// pipeline writes it back (e.g. `if (cross_module_fn()) {}`).
+    pub bool_check_conditions: Vec<(Idx<Expr>, &'static str)>,
     pub diagnostics: Vec<SemanticDiagnostic>,
 }
 
@@ -1235,17 +1245,30 @@ impl<'a> Cx<'a> {
         None
     }
 
-    fn expect_bool(&mut self, expr: Idx<Expr>, label: &str) {
+    fn expect_bool(&mut self, expr: Idx<Expr>, label: &'static str) {
         let ty = self.visit_expr(expr);
         let bool_t = self.primitive(Primitive::Bool);
-        if !is_assignable_to(&self.out.types, ty, bool_t) {
-            let msg = format!(
-                "{label} must be `bool`, got `{}`",
-                greycat_analyzer_types::display(&self.out.types, ty),
-            );
-            let r = self.hir.exprs[expr].byte_range();
-            self.diag(Severity::Error, msg, r);
+        if is_assignable_to(&self.out.types, ty, bool_t) {
+            return;
         }
+        // The first pass returns `any` for cross-module / Member-call
+        // / bare-Ident-call shapes until `infer_cross_module_call_types`
+        // writes the real return type back. Defer the diagnostic for
+        // those — the project pipeline's `validate_condition_types`
+        // post-pass re-checks once the type has settled. Concrete
+        // non-bool types (`int`, `String`, …) still emit eagerly so
+        // single-file `analyze` calls (unit tests, the per-file LSP
+        // fallback) keep catching the obvious mistakes.
+        if matches!(self.out.types.get(ty).kind, TypeKind::Any) {
+            self.out.bool_check_conditions.push((expr, label));
+            return;
+        }
+        let msg = format!(
+            "{label} must be `bool`, got `{}`",
+            greycat_analyzer_types::display(&self.out.types, ty),
+        );
+        let r = self.hir.exprs[expr].byte_range();
+        self.diag(Severity::Error, msg, r);
     }
 
     fn visit_expr(&mut self, expr_id: Idx<Expr>) -> TypeId {

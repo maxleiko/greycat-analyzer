@@ -166,6 +166,15 @@ impl ProjectAnalysis {
         // placeholder `any` the analyzer first-pass left behind.
         self.validate_call_arg_types();
 
+        // Pass 3.7: condition-type validation. Drains every module's
+        // `bool_check_conditions` queue and emits `"<label> must be
+        // \`bool\`, got \`T\`"` whenever the condition's now-settled
+        // type isn't bool-assignable. Same rationale as 3.6 — the
+        // first-pass would have surfaced false positives for
+        // cross-module Call / Member-call conditions whose return
+        // type wasn't yet inferred.
+        self.validate_condition_types();
+
         // Pass 4 (P14.9): bump `references_to` for every decl that's
         // referenced from another module via a qualified-name access
         // (`<module>::<name>`, `<module>::<type>::<name>`, etc.). Lets
@@ -653,6 +662,56 @@ impl ProjectAnalysis {
         }
     }
 
+    /// Pass 3.7 — drain every module's `bool_check_conditions`
+    /// queue and emit `"<label> must be \`bool\`, got \`T\`"` for
+    /// any condition whose post-pass-3.5 type isn't bool-assignable.
+    /// Same rationale as `validate_call_arg_types`: doing this in
+    /// the analyzer's first pass surfaced false positives for
+    /// `if (cross_module_fn()) {}` because the call's return type
+    /// hadn't been inferred yet.
+    fn validate_condition_types(&mut self) {
+        use crate::analyzer::{SemanticDiagnostic, Severity};
+        use greycat_analyzer_hir::types::Expr;
+        use greycat_analyzer_types::{Primitive, is_assignable_to};
+
+        #[allow(clippy::mutable_key_type)]
+        let mut diag_updates: HashMap<Uri, Vec<SemanticDiagnostic>> = HashMap::new();
+        for (cur_uri, cur_module) in &self.modules {
+            // Mint a `bool` TypeId in a temp arena clone — we only
+            // need it to compare via `is_assignable_to` and don't
+            // want to mutate the module's arena from a read-only pass.
+            let mut tmp_arena = cur_module.analysis.types.clone();
+            let bool_t = tmp_arena.primitive(Primitive::Bool);
+
+            for (expr_id, label) in &cur_module.analysis.bool_check_conditions {
+                let Some(ty) = cur_module.analysis.expr_types.get(expr_id).copied() else {
+                    continue;
+                };
+                if is_assignable_to(&tmp_arena, ty, bool_t) {
+                    continue;
+                }
+                let display = greycat_analyzer_types::display(&cur_module.analysis.types, ty);
+                let r = match &cur_module.hir.exprs[*expr_id] {
+                    Expr::Ident(name_idx) => cur_module.hir.idents[*name_idx].byte_range.clone(),
+                    other => other.byte_range(),
+                };
+                diag_updates
+                    .entry(cur_uri.clone())
+                    .or_default()
+                    .push(SemanticDiagnostic {
+                        severity: Severity::Error,
+                        message: format!("{label} must be `bool`, got `{display}`"),
+                        byte_range: r,
+                    });
+            }
+        }
+        for (uri, diags) in diag_updates {
+            if let Some(m) = self.modules.get_mut(&uri) {
+                m.analysis.diagnostics.extend(diags);
+            }
+        }
+    }
+
     /// P14.9 — walk every module's CST for qualified-name access
     /// patterns (`<module>::<name>`, `<module>::<type>::<name>`, etc.)
     /// and bump `references_to` for the matching decl in the named
@@ -855,6 +914,8 @@ impl ProjectAnalysis {
         // P15.10: call-site arg-type validation (depends on pass 3.5
         // having settled inner static-expr return types).
         self.validate_call_arg_types();
+        // Pass 3.7: condition-type validation.
+        self.validate_condition_types();
         // P14.9: re-derive qualified-name reference counts.
         self.compute_qualified_refs(manager);
     }
@@ -1531,5 +1592,61 @@ mod tests {
         pa.invalidate(&mgr, &uri("/proj/a.gcl"));
         assert_eq!(pa.len(), 0);
         assert!(pa.module(&uri("/proj/a.gcl")).is_none());
+    }
+
+    /// Anchors the rule that cross-module / bare-Ident-call
+    /// conditions don't surface a false-positive bool diagnostic.
+    /// The analyzer's first pass returns `any` for such calls so it
+    /// queues the check into `bool_check_conditions`; the post-pass
+    /// `validate_condition_types` re-checks once
+    /// `infer_cross_module_call_types` has settled the call's
+    /// return type.
+    #[test]
+    fn condition_bool_check_uses_post_pass_types() {
+        let mut mgr = SourceManager::new();
+        // Cross-module: `is_something()` returns `bool` from another file.
+        mgr.add_simple(
+            uri("/proj/lib.gcl"),
+            "native fn is_something(): bool;\n",
+            "project",
+            false,
+        );
+        mgr.add_simple(
+            uri("/proj/main.gcl"),
+            "fn t() {\n    if (is_something()) {}\n}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        let m = pa.module(&uri("/proj/main.gcl")).unwrap();
+        let bool_diag = m
+            .analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("if condition must be `bool`"));
+        assert!(
+            !bool_diag,
+            "no `if condition must be bool` diagnostic should fire when the callee returns bool, got: {:?}",
+            m.analysis.diagnostics
+        );
+
+        // Real failure case: `if (1) {}` must still fire eagerly.
+        let mut mgr2 = SourceManager::new();
+        mgr2.add_simple(
+            uri("/proj/main.gcl"),
+            "fn t() {\n    if (1) {}\n}\n",
+            "project",
+            false,
+        );
+        let pa2 = ProjectAnalysis::analyze(&mgr2);
+        let m2 = pa2.module(&uri("/proj/main.gcl")).unwrap();
+        assert!(
+            m2.analysis
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("if condition must be `bool`")),
+            "expected eager bool-check diagnostic on `if (1)`, got: {:?}",
+            m2.analysis.diagnostics
+        );
     }
 }
