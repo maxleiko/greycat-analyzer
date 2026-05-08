@@ -11,15 +11,18 @@ use greycat_analyzer_core::{
     SourceManager,
     diagnostics::{format_cli, parse_diagnostics},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
-    resolver::{Context, FsContext},
+    resolver::FsContext,
 };
 
 use crate::utils::AnyError;
 
 #[derive(clap::Parser)]
-#[clap(about = "Lint a project: parse every reachable .gcl and print syntax diagnostics")]
+#[clap(about = "Lint a GreyCat project. Loads the entrypoint and walks its \
+             @library / @include pragmas to discover modules — only \
+             reachable files are analyzed.")]
 pub struct Lint {
-    #[clap(help = "Path to a project.gcl")]
+    #[clap(help = "Path to a project.gcl entrypoint (or any single .gcl \
+                file to lint in isolation).")]
     project: PathBuf,
     #[clap(
         long,
@@ -71,44 +74,43 @@ impl Lint {
         env_logger::init();
 
         let project_filepath = self.project.canonicalize()?;
-        let project_dir = project_filepath
-            .parent()
-            .expect("unable to resolve project's parent directory");
-
-        let ctx = FsContext::new().unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
-        let files = ctx.iter_gcl(project_dir);
-
-        // Pass 1: read + parse every file by feeding it through a
-        // `SourceManager`. `add_simple` runs the tree-sitter parse so
-        // per-file parse time falls out naturally.
-        let total_start = Instant::now();
-        let mut mgr = SourceManager::with_context(Arc::new(ctx));
-        let mut stubs: Vec<EntryStub> = Vec::with_capacity(files.len());
-        for path in files {
-            let source = std::fs::read_to_string(&path)?;
-            let parse_start = Instant::now();
-            let uri = path_to_uri(&path);
-            mgr.add_simple(uri.clone(), source, "project", false);
-            stubs.push(EntryStub {
-                path,
-                uri,
-                took: parse_start.elapsed(),
-            });
+        if project_filepath.is_dir() {
+            eprintln!(
+                "error: expected a path to project.gcl (or any .gcl entrypoint), got directory {}",
+                project_filepath.display()
+            );
+            return Ok(ExitCode::FAILURE);
         }
 
-        // Pass 2: one project-level analyzer pipeline over every doc.
-        // Replaces the previous per-file `lower → resolve → analyze →
-        // run_lints` loop (P6.1 acceptance criterion).
+        // Load the project graph properly: parse the entrypoint, walk
+        // its `@library` / `@include` pragmas, and pull in only the
+        // modules the entrypoint actually depends on. The previous
+        // `iter_gcl(project_dir)` flat-walk picked up every `.gcl`
+        // under the project directory regardless of inclusion — wrong
+        // for GreyCat's project model, where the entrypoint's pragmas
+        // are the source of truth.
+        let total_start = Instant::now();
+        let ctx = FsContext::new().unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(&project_filepath);
+        for lib in &report.unresolved_libraries {
+            eprintln!("warning: unresolved @library('{lib}')");
+        }
+        for err in &report.errors {
+            eprintln!("warning: {err}");
+        }
+
+        // One project-level analyzer pipeline over every reachable doc.
         let analysis = ProjectAnalysis::analyze(&mgr);
         let total = total_start.elapsed();
 
-        // Hydrate cli `Entry`s with diagnostics from the cache.
-        let mut entries: Vec<Entry> = Vec::with_capacity(stubs.len());
-        for stub in stubs {
-            let cell = mgr.get(&stub.uri).expect("doc must be in manager");
+        // Hydrate cli `Entry`s from the manager's loaded set.
+        let mut entries: Vec<Entry> = Vec::with_capacity(mgr.len());
+        for (uri, cell) in mgr.iter() {
             let doc = cell.borrow();
+            let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
             let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
-            if let Some(module) = analysis.module(&stub.uri) {
+            if let Some(module) = analysis.module(uri) {
                 for d in &module.analysis.diagnostics {
                     diagnostics.push(Diagnostic {
                         range: byte_range_to_lsp(&doc.text, &d.byte_range),
@@ -138,25 +140,28 @@ impl Lint {
                 }
             }
             entries.push(Entry {
-                path: stub.path,
-                took: stub.took,
+                path,
+                took: Duration::ZERO,
                 nodes: doc.root_node().descendant_count(),
                 diagnostics,
             });
         }
 
-        // P8.4: lint fix-application driver. Re-runs the pipeline up
-        // to N times, each pass synthesizes auto-fixes for the live
-        // diagnostics, applies non-overlapping ones in reverse order,
-        // and writes the file back. Stops on convergence (no fixes
-        // applied) or after 5 passes.
+        // P8.4: lint fix-application driver. Each pass synthesizes
+        // auto-fixes for the live diagnostics, applies non-overlapping
+        // ones in reverse order, writes the file back, and re-runs
+        // `load_project` + `ProjectAnalysis` so the @library/@include
+        // closure stays the source of truth. Stops on convergence (no
+        // fixes applied) or after 5 passes.
         let mut fixes_applied = 0usize;
         if self.fix {
             const MAX_PASSES: usize = 5;
             for _pass in 0..MAX_PASSES {
                 let mut applied_this_pass = 0usize;
                 for entry in &mut entries {
-                    let original = std::fs::read_to_string(&entry.path)?;
+                    let Ok(original) = std::fs::read_to_string(&entry.path) else {
+                        continue;
+                    };
                     let mut edits: Vec<(std::ops::Range<usize>, String)> = entry
                         .diagnostics
                         .iter()
@@ -165,8 +170,6 @@ impl Lint {
                     if edits.is_empty() {
                         continue;
                     }
-                    // Sort by start; drop overlaps; apply in reverse so
-                    // earlier ranges keep their byte offsets.
                     edits.sort_by_key(|(r, _)| r.start);
                     let mut non_overlap: Vec<(std::ops::Range<usize>, String)> = Vec::new();
                     let mut last_end = 0usize;
@@ -191,28 +194,20 @@ impl Lint {
                     break;
                 }
                 fixes_applied += applied_this_pass;
-                // Re-run analysis on the edited files for the next pass.
+                // Re-derive the project graph on disk now that files
+                // have been edited.
                 let mut new_mgr = SourceManager::with_context(Arc::new(
-                    FsContext::with_greycat_home(PathBuf::new()),
+                    FsContext::new()
+                        .unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new())),
                 ));
-                let mut new_stubs: Vec<EntryStub> = Vec::with_capacity(entries.len());
-                for entry in &entries {
-                    let source = std::fs::read_to_string(&entry.path)?;
-                    let uri = path_to_uri(&entry.path);
-                    new_mgr.add_simple(uri.clone(), source, "project", false);
-                    new_stubs.push(EntryStub {
-                        path: entry.path.clone(),
-                        uri,
-                        took: entry.took,
-                    });
-                }
+                let _ = new_mgr.load_project(&project_filepath);
                 let new_analysis = ProjectAnalysis::analyze(&new_mgr);
                 entries.clear();
-                for stub in new_stubs {
-                    let cell = new_mgr.get(&stub.uri).expect("doc must be in manager");
+                for (uri, cell) in new_mgr.iter() {
                     let doc = cell.borrow();
+                    let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
                     let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
-                    if let Some(module) = new_analysis.module(&stub.uri) {
+                    if let Some(module) = new_analysis.module(uri) {
                         for d in &module.analysis.diagnostics {
                             diagnostics.push(Diagnostic {
                                 range: byte_range_to_lsp(&doc.text, &d.byte_range),
@@ -242,8 +237,8 @@ impl Lint {
                         }
                     }
                     entries.push(Entry {
-                        path: stub.path,
-                        took: stub.took,
+                        path,
+                        took: Duration::ZERO,
                         nodes: doc.root_node().descendant_count(),
                         diagnostics,
                     });
@@ -309,12 +304,6 @@ impl Lint {
     }
 }
 
-struct EntryStub {
-    path: PathBuf,
-    uri: Uri,
-    took: Duration,
-}
-
 struct Entry {
     path: PathBuf,
     took: Duration,
@@ -322,10 +311,14 @@ struct Entry {
     diagnostics: Vec<Diagnostic>,
 }
 
-fn path_to_uri(path: &std::path::Path) -> Uri {
-    let s = format!("file://{}", path.display());
-    s.parse::<Uri>()
-        .unwrap_or_else(|_| "file:///invalid".parse().unwrap())
+/// Best-effort conversion of a `file://` URI back to a local path so
+/// the cli can render `path:line:col:` shapes and read source for
+/// pretty rendering. Non-file schemes return `None` and the caller
+/// falls back to the URI string.
+fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    let s = uri.as_str();
+    let stripped = s.strip_prefix("file://")?;
+    Some(PathBuf::from(stripped))
 }
 
 /// P10.7 pretty-rendered diagnostic — pipes through `miette` so the
