@@ -104,11 +104,22 @@ impl Lint {
         let analysis = ProjectAnalysis::analyze(&mgr);
         let total = total_start.elapsed();
 
+        // P14.5: per-uri load-phase timings come from the load report;
+        // build an index so the manager.iter() loop below can pick the
+        // matching read / parse durations per file.
+        #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+        let load_by_uri: std::collections::HashMap<
+            Uri,
+            greycat_analyzer_core::LoadTimings,
+        > = report.loaded.iter().cloned().collect();
+
         // Hydrate cli `Entry`s from the manager's loaded set.
         let mut entries: Vec<Entry> = Vec::with_capacity(mgr.len());
         for (uri, cell) in mgr.iter() {
             let doc = cell.borrow();
             let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
+            let load = load_by_uri.get(uri).copied().unwrap_or_default();
+            let timings = analysis.module(uri).map(|m| m.timings).unwrap_or_default();
             let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
             if let Some(module) = analysis.module(uri) {
                 for d in &module.analysis.diagnostics {
@@ -142,7 +153,12 @@ impl Lint {
             }
             entries.push(Entry {
                 path,
-                took: Duration::ZERO,
+                read: load.read,
+                parse: load.parse,
+                lower: timings.lower,
+                resolve: timings.resolve,
+                analyze: timings.analyze,
+                lint: timings.lint,
                 nodes: doc.root_node().descendant_count(),
                 diagnostics,
             });
@@ -201,12 +217,22 @@ impl Lint {
                     FsContext::new()
                         .unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new())),
                 ));
-                let _ = new_mgr.load_project(&project_filepath);
+                let new_report = new_mgr.load_project(&project_filepath);
+                #[allow(clippy::mutable_key_type)]
+                let new_load_by_uri: std::collections::HashMap<
+                    Uri,
+                    greycat_analyzer_core::LoadTimings,
+                > = new_report.loaded.iter().cloned().collect();
                 let new_analysis = ProjectAnalysis::analyze(&new_mgr);
                 entries.clear();
                 for (uri, cell) in new_mgr.iter() {
                     let doc = cell.borrow();
                     let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
+                    let load = new_load_by_uri.get(uri).copied().unwrap_or_default();
+                    let timings = new_analysis
+                        .module(uri)
+                        .map(|m| m.timings)
+                        .unwrap_or_default();
                     let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
                     if let Some(module) = new_analysis.module(uri) {
                         for d in &module.analysis.diagnostics {
@@ -240,7 +266,12 @@ impl Lint {
                     }
                     entries.push(Entry {
                         path,
-                        took: Duration::ZERO,
+                        read: load.read,
+                        parse: load.parse,
+                        lower: timings.lower,
+                        resolve: timings.resolve,
+                        analyze: timings.analyze,
+                        lint: timings.lint,
                         nodes: doc.root_node().descendant_count(),
                         diagnostics,
                     });
@@ -256,17 +287,30 @@ impl Lint {
 
         if self.csv {
             let mut w = std::io::stdout();
-            writeln!(w, "duration_us,nb_nodes,nb_diagnostics,filepath")?;
-            // CSV mode preserves the timing-sorted view from the previous stub.
-            entries.sort_by_key(|e| e.took);
+            // P14.5: per-phase microsecond columns (read = file I/O,
+            // parse = tree-sitter, lower = HIR walker, resolve / analyze
+            // / lint = analyzer pipeline). `total_us` is the sum of all
+            // phase columns. Sorted by total descending so the heaviest
+            // file lands at the top.
+            writeln!(
+                w,
+                "total_us,read_us,parse_us,lower_us,resolve_us,analyze_us,lint_us,nb_nodes,nb_diagnostics,filepath"
+            )?;
+            entries.sort_by_key(|e| std::cmp::Reverse(e.total()));
             for e in &entries {
                 writeln!(
                     w,
-                    "{},{},{},{}",
-                    e.took.as_micros(),
+                    "{},{},{},{},{},{},{},{},{},{}",
+                    e.total().as_micros(),
+                    e.read.as_micros(),
+                    e.parse.as_micros(),
+                    e.lower.as_micros(),
+                    e.resolve.as_micros(),
+                    e.analyze.as_micros(),
+                    e.lint.as_micros(),
                     e.nodes,
                     e.diagnostics.len(),
-                    e.path.display()
+                    e.path.display(),
                 )?;
             }
         } else {
@@ -308,9 +352,26 @@ impl Lint {
 
 struct Entry {
     path: PathBuf,
-    took: Duration,
+    /// File I/O (`Context::read`).
+    read: Duration,
+    /// Tree-sitter parse (`syntax::parse`).
+    parse: Duration,
+    /// CST → HIR walker (`lower_module`).
+    lower: Duration,
+    /// Resolver (`resolve_with_index`).
+    resolve: Duration,
+    /// Analyzer (`analyze_with_index`).
+    analyze: Duration,
+    /// Lint rules (`run_lints`).
+    lint: Duration,
     nodes: usize,
     diagnostics: Vec<Diagnostic>,
+}
+
+impl Entry {
+    fn total(&self) -> Duration {
+        self.read + self.parse + self.lower + self.resolve + self.analyze + self.lint
+    }
 }
 
 /// Best-effort conversion of a `file://` URI back to a local path so

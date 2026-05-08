@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
@@ -224,6 +225,11 @@ impl SourceManager {
         if !visited.insert(canonical.clone()) {
             return None; // already loaded — cycle-safe
         }
+        // P14.5: split the read and parse phases so cli `lint --csv`
+        // can surface them separately. `add_simple` triggers the
+        // tree-sitter parse internally; bracketing it captures the
+        // parse-only duration.
+        let read_start = Instant::now();
         let text = match self.ctx.read(&canonical) {
             Ok(t) => t,
             Err(e) => {
@@ -233,9 +239,14 @@ impl SourceManager {
                 return None;
             }
         };
+        let read = read_start.elapsed();
         let uri = path_to_uri(&canonical);
+        let parse_start = Instant::now();
         self.add_simple(uri.clone(), text, lib, false);
-        report.loaded.push(uri.clone());
+        let parse = parse_start.elapsed();
+        report
+            .loaded
+            .push((uri.clone(), LoadTimings { read, parse }));
         Some(uri)
     }
 }
@@ -264,15 +275,41 @@ impl std::fmt::Display for SourceManager {
 /// Outcome of [`SourceManager::load_project`].
 #[derive(Debug, Default, Clone)]
 pub struct LoadReport {
-    /// URIs of every document loaded during the call (excluding ones that
-    /// were already in the manager).
-    pub loaded: Vec<Uri>,
+    /// URIs of every document loaded during the call (excluding ones
+    /// that were already in the manager) paired with [`LoadTimings`]
+    /// — file-read + tree-sitter-parse durations measured separately.
+    /// P14.5 restored and enriched the per-file timing the flat
+    /// `iter_gcl` walk used to surface in cli `lint --csv`.
+    pub loaded: Vec<(Uri, LoadTimings)>,
     /// `@library` declarations that couldn't be resolved to a directory.
     /// Surface these as diagnostics in P1.4.
     pub unresolved_libraries: Vec<String>,
     /// Filesystem / decoding errors encountered along the way. Strings for
     /// now — typed diagnostics arrive in P1.4.
     pub errors: Vec<String>,
+}
+
+/// P14.5 — per-file load-phase timings.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LoadTimings {
+    /// `Context::read` — file I/O / decoding.
+    pub read: Duration,
+    /// `Document::with_lib` — tree-sitter parse (`syntax::parse`).
+    pub parse: Duration,
+}
+
+impl LoadTimings {
+    pub fn total(&self) -> Duration {
+        self.read + self.parse
+    }
+}
+
+impl LoadReport {
+    /// Iterator over the loaded URIs (compat shim for callers that
+    /// don't need the per-file timing).
+    pub fn loaded_uris(&self) -> impl Iterator<Item = &Uri> {
+        self.loaded.iter().map(|(u, _)| u)
+    }
 }
 
 fn path_to_uri(path: &Path) -> Uri {

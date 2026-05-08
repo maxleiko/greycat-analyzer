@@ -91,7 +91,7 @@ impl Backend {
         // Single project-wide pipeline pass over everything we just
         // loaded — the per-doc analyses land in the cache.
         self.project_analysis.rebuild(&self.manager);
-        for uri in report.loaded {
+        for (uri, _) in report.loaded {
             if let Err(e) = self.publish_for(&uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
             }

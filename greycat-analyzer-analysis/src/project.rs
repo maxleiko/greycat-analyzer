@@ -13,6 +13,7 @@
 //! gives that work the cache-shaped seam to plug into.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
@@ -34,6 +35,31 @@ pub struct ModuleAnalysis {
     pub resolutions: Resolutions,
     pub analysis: AnalysisResult,
     pub lints: Vec<LintDiagnostic>,
+    /// P14.5 — per-phase wall-clock timings captured during the
+    /// last `rebuild` / `invalidate`. Useful for surfacing where the
+    /// pipeline spends its time (`cli lint --csv`).
+    pub timings: ModuleTimings,
+}
+
+/// P14.5 — per-module pipeline timings.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ModuleTimings {
+    /// Time spent in `lower_module` (CST → HIR walker).
+    pub lower: Duration,
+    /// Resolver pass (`resolve_with_index`).
+    pub resolve: Duration,
+    /// Analyzer pass (`analyze_with_index`).
+    pub analyze: Duration,
+    /// Lint rules (`run_lints`).
+    pub lint: Duration,
+}
+
+impl ModuleTimings {
+    /// Sum of every recorded phase. Doesn't include `parse` / file
+    /// I/O, which lives in `LoadReport.loaded`'s per-uri duration.
+    pub fn total(&self) -> Duration {
+        self.lower + self.resolve + self.analyze + self.lint
+    }
 }
 
 /// Project-level analysis cache.
@@ -72,20 +98,32 @@ impl ProjectAnalysis {
 
         // Pass 1: lower every doc to HIR and ingest into the project
         // index so types declared in one module are visible to peers.
-        let mut hirs: Vec<(Uri, Hir)> = Vec::with_capacity(manager.len());
+        let mut hirs: Vec<(Uri, Hir, Duration)> = Vec::with_capacity(manager.len());
         for (uri, cell) in manager.iter() {
             let doc = cell.borrow();
+            let lower_start = Instant::now();
             let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
+            let lower_took = lower_start.elapsed();
             self.index.ingest(uri, &hir);
-            hirs.push((uri.clone(), hir));
+            hirs.push((uri.clone(), hir, lower_took));
         }
 
         // Pass 2: per-module resolver + analyzer + lints. The per-module
         // analyzer still owns its own arena; P6.2 reroutes the lookups.
-        for (uri, hir) in hirs {
+        for (uri, hir, lower_took) in hirs {
+            let mut timings = ModuleTimings {
+                lower: lower_took,
+                ..ModuleTimings::default()
+            };
+            let t0 = Instant::now();
             let resolutions = resolve_with_index(&hir, &self.index);
+            timings.resolve = t0.elapsed();
+            let t1 = Instant::now();
             let analysis = analyze_with_index(&hir, &resolutions, &self.index);
+            timings.analyze = t1.elapsed();
+            let t2 = Instant::now();
             let lints = run_lints(&hir, &resolutions);
+            timings.lint = t2.elapsed();
             self.modules.insert(
                 uri,
                 ModuleAnalysis {
@@ -93,6 +131,7 @@ impl ProjectAnalysis {
                     resolutions,
                     analysis,
                     lints,
+                    timings,
                 },
             );
         }
@@ -189,9 +228,13 @@ impl ProjectAnalysis {
         self.modules.retain(|u, _| live.contains(u.as_str()));
 
         // Lower the changed doc fresh; reuse cached HIRs for the rest.
+        let mut lower_took = Duration::ZERO;
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
-            lower_module(&doc.text, "module", &doc.lib, doc.root_node())
+            let start = Instant::now();
+            let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
+            lower_took = start.elapsed();
+            hir
         });
 
         // Rebuild the shared index. ingest is name-additive (idempotent
@@ -226,9 +269,19 @@ impl ProjectAnalysis {
             self.modules.remove(uri);
             return;
         };
+        let mut timings = ModuleTimings {
+            lower: lower_took,
+            ..ModuleTimings::default()
+        };
+        let t0 = Instant::now();
         let resolutions = resolve_with_index(&hir, &self.index);
+        timings.resolve = t0.elapsed();
+        let t1 = Instant::now();
         let analysis = analyze_with_index(&hir, &resolutions, &self.index);
+        timings.analyze = t1.elapsed();
+        let t2 = Instant::now();
         let lints = run_lints(&hir, &resolutions);
+        timings.lint = t2.elapsed();
         self.modules.insert(
             uri.clone(),
             ModuleAnalysis {
@@ -236,6 +289,7 @@ impl ProjectAnalysis {
                 resolutions,
                 analysis,
                 lints,
+                timings,
             },
         );
         // P11.5: re-resolve cross-module member bindings whenever a doc
