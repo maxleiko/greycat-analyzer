@@ -2274,6 +2274,12 @@ pub fn completion_with_project(
             items,
         });
     }
+    if let Some(items) = object_field_completion(text, node, byte, uri, project) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     if let Some(items) = ident_or_keyword_completion(text, node, byte, uri, project) {
         return Some(CompletionList {
             is_incomplete: false,
@@ -3601,6 +3607,89 @@ fn type_position_completion(
     }
     items.sort_by(|a, b| a.label.cmp(&b.label));
     Some(items)
+}
+
+// =============================================================================
+// P15.2.7 — object literal field completion
+// =============================================================================
+
+/// Object-literal field completion: cursor sits inside an
+/// `object_initializers` / `object_fields` body (`Type { | }` or
+/// `Type { x: 1, | }`). Resolves the surrounding `object_expr`'s
+/// `type_ident` head, then emits the type's `attrs` as `FIELD`
+/// completions, skipping ones already named in the literal.
+fn object_field_completion(
+    text: &str,
+    node: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+    uri: &Uri,
+    project: &greycat_analyzer_analysis::project::ProjectAnalysis,
+) -> Option<Vec<CompletionItem>> {
+    // Walk up to find the enclosing `object_initializers` /
+    // `object_fields` block. `object_field` walks one extra level.
+    let body = ancestor_with_kind(node, "object_initializers")
+        .or_else(|| ancestor_with_kind(node, "object_fields"))?;
+    let object_expr = ancestor_with_kind(body, "object_expr")?;
+    let type_ident = children_by_field_name(object_expr, "type")?;
+    let type_name_node = type_ident.named_child(0)?;
+    if type_name_node.kind() != "ident" {
+        return None;
+    }
+    let type_name = text.get(type_name_node.byte_range())?.to_string();
+
+    let typed = ident_prefix_at_cursor(text, cursor_byte);
+    let prefix_lower = typed.to_lowercase();
+
+    // Find the type's HIR (in-module first, then cross-module).
+    let module = project.module(uri)?;
+    let mut items: Vec<CompletionItem> = Vec::new();
+    if let Some(decl_id) = module.analysis.type_decls.get(&type_name).copied()
+        && let Decl::Type(td) = &module.hir.decls[decl_id]
+    {
+        emit_attrs(&module.hir, td, &prefix_lower, &mut items);
+    }
+    if items.is_empty()
+        && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&type_name).first()
+        && let Some(fmod) = project.module(foreign_uri)
+        && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+    {
+        emit_attrs(&fmod.hir, td, &prefix_lower, &mut items);
+    }
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
+}
+
+fn emit_attrs(
+    hir: &greycat_analyzer_hir::Hir,
+    td: &greycat_analyzer_hir::types::TypeDecl,
+    prefix_lower: &str,
+    items: &mut Vec<CompletionItem>,
+) {
+    for attr_id in &td.attrs {
+        let a = &hir.type_attrs[*attr_id];
+        let name = hir.idents[a.name].text.clone();
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            insert_text: Some(format!("{name}: ")),
+            ..Default::default()
+        });
+    }
+}
+
+/// Helper mirroring `tree_sitter::Node::child_by_field_name` that
+/// returns an `Option`.
+fn children_by_field_name<'a>(
+    node: tree_sitter::Node<'a>,
+    field: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    node.child_by_field_name(field)
 }
 
 // =============================================================================

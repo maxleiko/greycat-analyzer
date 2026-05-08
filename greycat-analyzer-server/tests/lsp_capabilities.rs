@@ -717,6 +717,43 @@ fn completion_after_dot_prefix_filters() {
     );
 }
 
+/// P15.2.7 — `Type { |` lists the type's attrs as FIELD completions.
+#[test]
+fn completion_inside_object_literal_lists_attrs() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Point { x: int; y: int; fn norm(): int { return 0; } }\nfn main(): Point { return Point{ x: 1,  }; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor inside the object literal body between the comma and
+    // the closing brace (line 1 col 39).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 39),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"x"), "got: {labels:?}");
+    assert!(labels.contains(&"y"), "got: {labels:?}");
+    // Methods aren't fields.
+    assert!(
+        !labels.contains(&"norm"),
+        "method leaked into object literal: {labels:?}"
+    );
+}
+
 /// P15.2.6 — type-position completion at `var x: |` lists in-module
 /// type decls and runtime types, but not values like fn names.
 #[test]
