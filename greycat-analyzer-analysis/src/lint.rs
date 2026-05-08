@@ -11,6 +11,7 @@
 //! the LSP code-action layer has concrete edit suggestions to apply
 //! (P3.6 placeholder).
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use greycat_analyzer_hir::Hir;
@@ -21,6 +22,7 @@ use crate::resolver::{Definition, Resolutions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintSeverity {
+    Error,
     Warning,
     Hint,
 }
@@ -46,6 +48,7 @@ pub fn run_lints(hir: &Hir, res: &Resolutions) -> Vec<LintDiagnostic> {
         Box::new(UnusedLocal),
         Box::new(UnusedParam),
         Box::new(UnusedDecl),
+        Box::new(DuplicateDecl),
     ];
     let mut out = Vec::new();
     for rule in rules {
@@ -283,6 +286,48 @@ impl LintRule for UnusedDecl {
     }
 }
 
+// =============================================================================
+// Rule: duplicate-decl  (P13.6 — declarator.ts residual)
+// =============================================================================
+
+/// Error when two top-level decls share a name in the same module.
+/// Mirrors the TS reference declarator's `Type 'X' is already
+/// declared` / `Identifier 'X' is already declared` checks
+/// (`packages/lang/src/analysis/declarator.ts:130`).
+pub struct DuplicateDecl;
+
+impl LintRule for DuplicateDecl {
+    fn name(&self) -> &'static str {
+        "duplicate-decl"
+    }
+
+    fn check(&self, hir: &Hir, _res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
+        let Some(module) = hir.module.as_ref() else {
+            return;
+        };
+        let mut seen: HashMap<String, ()> = HashMap::new();
+        for decl_id in &module.decls {
+            let Some(name_id) = hir.decls[*decl_id].name() else {
+                continue;
+            };
+            // Skip pragma-pragma duplicates (multiple `@library` /
+            // `@include` pragmas with the same key are normal).
+            if matches!(&hir.decls[*decl_id], Decl::Pragma(_)) {
+                continue;
+            }
+            let ident = &hir.idents[name_id];
+            if seen.insert(ident.text.clone(), ()).is_some() {
+                out.push(LintDiagnostic {
+                    rule: self.name(),
+                    severity: LintSeverity::Error,
+                    message: format!("identifier `{}` is already declared", ident.text),
+                    byte_range: ident.byte_range.clone(),
+                });
+            }
+        }
+    }
+}
+
 fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
     modifiers.annotations.iter().any(|a| {
         matches!(
@@ -422,6 +467,29 @@ fn f(_unused: int): int {
         assert!(
             !diags.iter().any(|d| d.rule == "unused-decl"),
             "underscore-prefixed private should not warn: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_decl_flagged() {
+        // P13.6: two top-level decls sharing a name surfaces a
+        // `duplicate-decl` error.
+        let diags = lint("fn foo() {}\nfn foo() {}\n");
+        let dup: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule == "duplicate-decl")
+            .collect();
+        assert_eq!(dup.len(), 1, "expected one duplicate-decl: {diags:?}");
+        assert!(dup[0].message.contains("foo"));
+        assert_eq!(dup[0].severity, LintSeverity::Error);
+    }
+
+    #[test]
+    fn duplicate_decl_distinct_names_silent() {
+        let diags = lint("fn foo() {}\nfn bar() {}\n");
+        assert!(
+            !diags.iter().any(|d| d.rule == "duplicate-decl"),
+            "distinct names should not flag: {diags:?}"
         );
     }
 }

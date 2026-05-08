@@ -176,6 +176,7 @@ fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagnosti
         out.push(Diagnostic {
             range: byte_range_to_lsp_range(text, &lint.byte_range),
             severity: Some(match lint.severity {
+                LintSeverity::Error => DiagnosticSeverity::ERROR,
                 LintSeverity::Warning => DiagnosticSeverity::WARNING,
                 LintSeverity::Hint => DiagnosticSeverity::HINT,
             }),

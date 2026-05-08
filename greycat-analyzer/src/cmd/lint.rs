@@ -129,6 +129,7 @@ impl Lint {
                     diagnostics.push(Diagnostic {
                         range: byte_range_to_lsp(&doc.text, &l.byte_range),
                         severity: Some(match l.severity {
+                            LintSeverity::Error => DiagnosticSeverity::ERROR,
                             LintSeverity::Warning => DiagnosticSeverity::WARNING,
                             LintSeverity::Hint => DiagnosticSeverity::HINT,
                         }),
@@ -226,6 +227,7 @@ impl Lint {
                             diagnostics.push(Diagnostic {
                                 range: byte_range_to_lsp(&doc.text, &l.byte_range),
                                 severity: Some(match l.severity {
+                                    LintSeverity::Error => DiagnosticSeverity::ERROR,
                                     LintSeverity::Warning => DiagnosticSeverity::WARNING,
                                     LintSeverity::Hint => DiagnosticSeverity::HINT,
                                 }),

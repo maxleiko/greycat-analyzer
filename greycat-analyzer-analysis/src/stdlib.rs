@@ -77,6 +77,10 @@ pub struct ProjectIndex {
     /// `@primitive` annotations on a `type` decl. Keyed by the
     /// declared type name (`Array`, `nodeTime`, …).
     pub type_flags: HashMap<String, TypeFlags>,
+    /// P13.6 — per-module `@permission("name")` pragmas. Lets later
+    /// chunks light up "is this module allowed to call X?" checks the
+    /// TS reference declarator threads through `mod.permissions`.
+    pub module_permissions: HashMap<Uri, HashSet<String>>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -190,7 +194,20 @@ impl ProjectIndex {
                     self.record_decl_location(name, uri, *decl_id);
                     Some(&vd.modifiers)
                 }
-                Decl::Pragma(_) => None,
+                Decl::Pragma(p) => {
+                    // P13.6: capture `@permission("name")` mod-pragmas
+                    // into the project-wide `module_permissions` map.
+                    if hir.idents[p.name].text == "permission"
+                        && let Some(arg_expr) = p.args.first()
+                        && let greycat_analyzer_hir::types::Expr::String(s) = &hir.exprs[*arg_expr]
+                    {
+                        self.module_permissions
+                            .entry(uri.clone())
+                            .or_default()
+                            .insert(s.value.clone());
+                    }
+                    None
+                }
             };
             // P13.4: walk modifiers' annotations for `@expose("name")`
             // and capture the rename target into the project-wide
@@ -584,6 +601,21 @@ type Plain {}
 
         // Plain has no annotations — kept out of the map.
         assert!(!idx.type_flags.contains_key("Plain"));
+    }
+
+    #[test]
+    fn ingest_captures_permission_pragmas_per_module() {
+        // P13.6: `@permission("name")` pragma populates
+        // ProjectIndex::module_permissions[uri].
+        let hir = lower("@permission(\"admin\");\n@permission(\"user\");\nfn handler() {}\n");
+        let u = uri("/proj/api.gcl");
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&u, &hir);
+
+        let perms = idx.module_permissions.get(&u).expect("permissions tracked");
+        assert!(perms.contains("admin"));
+        assert!(perms.contains("user"));
+        assert_eq!(perms.len(), 2);
     }
 
     #[test]

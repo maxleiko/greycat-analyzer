@@ -362,6 +362,7 @@ pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
     }
     for l in run_lints(&hir, &resolutions) {
         let sev = match l.severity {
+            LintSeverity::Error => "error",
             LintSeverity::Warning => "warning",
             LintSeverity::Hint => "hint",
         };
