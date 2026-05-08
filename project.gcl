@@ -1,15 +1,1 @@
 @library("std", "8.0.269-dev");
-
-enum Foo {
-    a,
-    "str field",
-    "str field 2",
-    other,
-}
-
-fn test() {
-    expect_string_nullable(Foo::"str field");
-    expect_string_nullable(project::Foo::"str field");
-}
-
-fn expect_string_nullable(_: Foo) {}

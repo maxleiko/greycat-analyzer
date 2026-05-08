@@ -211,7 +211,7 @@ fn check_fn_params(
         if !used {
             out.push(LintDiagnostic {
                 rule,
-                severity: LintSeverity::Hint,
+                severity: LintSeverity::Warning,
                 message: format!("unused parameter `{}`", ident.text),
                 byte_range: ident.byte_range.clone(),
             });
