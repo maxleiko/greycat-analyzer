@@ -568,10 +568,16 @@ fn is_int_target(t: &Type) -> bool {
 }
 
 fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
-    if from == to {
-        return true;
-    }
-    matches!((from, to), (Primitive::Int, Primitive::Float))
+    // P12.4: GreyCat's runtime rejects every primitive-to-primitive
+    // widening at parameter / variable binding (verified via
+    // `greycat run`: `var i: int = 1; take(i)` against `take(_: float)`
+    // is rejected as "argument of type 'int' is not assignable to
+    // parameter '_' of type 'float'"). Literals can lower to a
+    // matching primitive at use site (`var f: float = 1` is fine
+    // because `1` lowers to `float` in that position) but bindings
+    // do not widen. Even `int → float`, the canonical TS-reference
+    // widening, fails. Mirror the runtime: identity only.
+    from == to
 }
 
 // =============================================================================
@@ -645,12 +651,25 @@ mod tests {
     }
 
     #[test]
-    fn int_widens_to_float() {
+    fn primitives_do_not_cross_widen() {
+        // P12.4: the GreyCat runtime rejects every primitive-to-primitive
+        // widening at parameter / binding sites — including `int → float`,
+        // which the TS reference checker permits. Verified live via
+        // `greycat run`: `var i: int = 1; take(i)` against
+        // `take(_: float)` is rejected. Identity is the only flow.
         let mut a = fresh();
         let i = a.primitive(Primitive::Int);
         let f = a.primitive(Primitive::Float);
-        assert!(is_assignable_to(&a, i, f));
+        let s = a.primitive(Primitive::String);
+        let c = a.primitive(Primitive::Char);
+        assert!(!is_assignable_to(&a, i, f));
         assert!(!is_assignable_to(&a, f, i));
+        assert!(!is_assignable_to(&a, c, i));
+        assert!(!is_assignable_to(&a, i, c));
+        assert!(!is_assignable_to(&a, c, s));
+        assert!(!is_assignable_to(&a, s, c));
+        assert!(is_assignable_to(&a, i, i));
+        assert!(is_assignable_to(&a, f, f));
     }
 
     #[test]
@@ -715,12 +734,17 @@ mod tests {
     fn lambda_contravariant_params_covariant_return() {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
-        let float = a.primitive(Primitive::Float);
-        // (float) -> int  is assignable to  (int) -> float
-        // Param: int (target) -> float (source) yes (int widens to float).
-        // Return: int (source) -> float (target) yes (int widens to float).
-        let f1 = a.lambda(vec![float], int);
-        let f2 = a.lambda(vec![int], float);
+        let any = a.any();
+        // After P12.4 dropped int→float widening, exercise the variance
+        // through the `any` top type. `f1: (any) -> int` is assignable
+        // to `f2: (int) -> any`:
+        //   * param: f2.param `int` → f1.param `any`  ✓ (int → any).
+        //   * return: f1.ret `int` → f2.ret `any`     ✓ (int → any).
+        // Reverse fails: `f2: (int) -> any` → `f1: (any) -> int` would
+        // need `any → int` for the param (`any` is nullable, `int` is
+        // not — rejected by the null-flow check).
+        let f1 = a.lambda(vec![any], int);
+        let f2 = a.lambda(vec![int], any);
         assert!(is_assignable_to(&a, f1, f2));
         assert!(!is_assignable_to(&a, f2, f1));
     }

@@ -39,6 +39,39 @@ use greycat_analyzer_types::{
 use crate::resolver::{Definition, Resolutions};
 use crate::stdlib::ProjectIndex;
 
+/// P12.4 — classify a numeric literal's source text as `int` or
+/// `float`. Returns `Primitive::Float` for literals that contain a
+/// decimal point, scientific notation (`1e3`, `1.5E-2`), or trailing
+/// `_f` suffix; everything else falls back to `Primitive::Int`. Other
+/// typed suffixes (`_time`, `_duration`, …) leave `LiteralKind::Number`
+/// untyped today; P13.3 promotes those to dedicated `LiteralKind`
+/// variants so this helper only sees float / int candidates.
+fn numeric_literal_kind(text: &str) -> Primitive {
+    if text.ends_with("_f") {
+        return Primitive::Float;
+    }
+    if text.contains('.') {
+        return Primitive::Float;
+    }
+    // Scientific notation: an `e` / `E` immediately preceded by an
+    // ASCII digit and followed by `+` / `-` or another digit. Guards
+    // against false positives on typed suffixes like `_time` (contains
+    // 'e' but not at a digit-anchored position).
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if (b == b'e' || b == b'E') && i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_digit()
+                && let Some(&next) = bytes.get(i + 1)
+                && (next == b'+' || next == b'-' || next.is_ascii_digit())
+            {
+                return Primitive::Float;
+            }
+        }
+    }
+    Primitive::Int
+}
+
 /// Severity sketch for analyzer diagnostics. Maps onto `lsp_types::DiagnosticSeverity`
 /// at the LSP boundary (P2.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1091,9 +1124,19 @@ impl<'a> Cx<'a> {
                 | Some(Definition::Project)
                 | None => self.any(),
             },
-            Expr::Literal(LiteralExpr { kind, .. }) => match kind {
+            Expr::Literal(LiteralExpr { kind, text, .. }) => match kind {
                 LiteralKind::Bool => self.primitive(Primitive::Bool),
-                LiteralKind::Number => self.primitive(Primitive::Int),
+                LiteralKind::Number => {
+                    // P12.4: differentiate int vs float numeric literals
+                    // by inspecting the source text. `1`, `42`, `0xff`,
+                    // `0b10` lower to `int`; literals with a decimal
+                    // point, scientific exponent, or trailing `_f`
+                    // suffix lower to `float`. Other typed suffixes
+                    // (`_time`, `_duration`, …) keep `Number`-shaped
+                    // text but the lowering layer should mint a typed
+                    // `LiteralKind` for them (P13.3 deepens this).
+                    self.primitive(numeric_literal_kind(text.as_str()))
+                }
                 LiteralKind::Char => self.primitive(Primitive::Char),
                 LiteralKind::Null => self.null(),
                 LiteralKind::This => self.any(),
