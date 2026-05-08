@@ -486,6 +486,32 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 ---
 
+### Phase 17 — Real-corpus parity ratchet (~1-2 weeks)
+
+**Goal:** drop the false-positive count on real-world projects to (near) zero, so the diagnostic-parity oracle (P14.2) can ratchet meaningfully. Driven by [tests/parity/registry_baseline/REPORT.md](../tests/parity/registry_baseline/REPORT.md), which captured 224 false-positive diagnostics on `~/dev/datathings/greycat/apps/registry` against TS reference's 0. Every chunk targets a specific bucket from that report.
+
+P17 sits in parallel with P16: P16 handles "Bucket A" (member-flow `any` cascades) via the typing pipeline; P17 handles the lowering / lint-policy bugs that surface as Buckets B-F regardless of typing.
+
+**Chunks:**
+
+- [x] **17.1 Capture baseline** (S) — done in this session. [tests/parity/registry_baseline/](../tests/parity/registry_baseline/) holds the TS + Rust outputs verbatim plus a bucketed analysis. The `REPORT.md` is the source-of-truth tracking doc for everything below.
+
+- [ ] **17.2 `for-in` lowering + tuple-form support** (M) — fix [`hir/lower.rs:547`](../greycat-analyzer-hir/src/lower.rs#L547) which reads `child_by_field_name("iterator")` (the iterable expr) and asks for `name` on it, dropping the entire `for_in_stmt` from the HIR via the `?` short-circuit. Walk named children for `for_in_param` nodes instead. Extend `ForInStmt` to carry `Vec<Idx<Ident>>` for params so the tuple form `for (i, x in xs)` is representable. Resolver / analyzer / completion-scope-walker / formatter call sites all need the new shape. **Acceptance:** for-in body content reaches the resolver — `migrate_branch` (called only inside a for-in body) is no longer flagged as unused; new HIR unit test `for_in_tuple_form_lowers_both_params`.
+
+- [ ] **17.3 `catch (ex)` param binding** (XS) — [`hir/lower.rs:589`](../greycat-analyzer-hir/src/lower.rs#L589) asks for `child_by_field_name("name")` on `_catch_param`, but [`_catch_param`](../tree-sitter-greycat/grammar.js#L170) is `seq("(", $.ident, ")")` with no `name` field. Walk named children for the `ident` instead. **Acceptance:** the registry baseline's `unresolved name 'ex'` diagnostic disappears; new resolver unit test for `try { ... } catch (e) { ... e ... }`.
+
+- [ ] **17.4 `@library` webroot fallback** (S) — `pragma_diagnostics`'s `unresolved-library` check only inspects `<project>/lib/<name>/` and `<greycat_home>/lib/std/`. Real projects use libraries that ship as webroot assets (e.g. `explorer` lives at `<project>/webroot/explorer/`, not `<project>/lib/explorer/`). Either accept any `<project>/<dir>/<name>/` location, or — cleaner — only flag a library that's referenced at the `<lib>::<name>` static-call level but not present anywhere; pure asset libraries should silently pass. **Acceptance:** the registry baseline's `@library('explorer'): library not found` warning disappears.
+
+- [ ] **17.5 String-interpolation `${expr}` lowering** (M) — [`hir/types.rs:365`](../greycat-analyzer-hir/src/types.rs#L365) `StringExpr.value` stores raw fragments concatenated; the `${expr}` parts are dropped before the resolver sees them. Replace with `StringExpr { parts: Vec<StringPart> }` where `StringPart::Lit(String) | Interp(Idx<Expr>)`. Lowering walks `string` node's `string_fragment` + interpolation children. Resolver visits `Interp` exprs. Knock-on effects: analyzer's type rules need to handle interpolation as type-checked sub-exprs (each `Interp` should accept any value expressible as a `String` via runtime `to_string()`); the formatter and `Expr::Unsupported` audit need to keep working. **Acceptance:** locals / params referenced only inside `"${name}"` interpolations are no longer flagged as unused; new HIR test for `"hello ${name}"` exposing two `StringPart`s.
+
+- [ ] **17.6 Gate unused-local / unused-param behind `--lint-unused`** (S) — TS reference doesn't emit unused-local / unused-param at all by default. Gate the [`unused-local`](../greycat-analyzer-analysis/src/lint.rs) + [`unused-param`](../greycat-analyzer-analysis/src/lint.rs) lint rules behind a CLI flag (`greycat-lang lint --lint-unused`) and an LSP setting (later — for now, off in the LSP path too). Default `lint` matches TS's "trust the user" policy. **Acceptance:** registry baseline's 31 + 23 unused-param/local warnings disappear at the default cli flag set; explicit `--lint-unused` re-enables them.
+
+- [ ] **17.7 Re-baseline + parity ratchet test** (S) — re-run both linters on the registry project after P17.2-6 land, regenerate [registry_baseline/](../tests/parity/registry_baseline/), and add a CI test (`registry_parity_floor`) that asserts the rust output's diagnostic count is `<= N` for some N that ratchets toward zero. Mirrors the formatter parity gauntlet's `MATCH_FLOOR` pattern. P14.2 (the diagnostic parity gate) consumes this as one of its corpora.
+
+**M17:** `greycat-analyzer lint` on `~/dev/datathings/greycat/apps/registry` produces ≤ 5 residual diagnostics (all genuine), down from 224. The registry-parity CI gate is green and the floor is live.
+
+---
+
 ## 7. Test strategy
 
 Three layers, no "port every TS test" milestone (tarpit).
@@ -552,9 +578,10 @@ P13 [3-4w]   Analyzer parity closeout ─ M13
 P14 [2-3w]   Final parity gate ────── M14   ← the "are we 1:1?" gate
 P15 [3-4w]   Interactive-LSP sweep ── M15   ← hover / completion / pragma diags
 P16 [2-3w]   Member-flow + node-deref M16   ← member-call typing, auto-deref completion
+P17 [1-2w]   Real-corpus parity ratch M17   ← lowering bugs surfaced by greycat/apps/registry
 ```
 
-Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface; P16 (~2-3 weeks) tightens up the member-access type chain that pass 3.5 left at `any`.
+Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface; P16 (~2-3 weeks) tightens up the member-access type chain that pass 3.5 left at `any`; P17 (~1-2 weeks) drains the lowering / lint-policy bucket surfaced by running against a real project.
 
 Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3 → P14.2) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
 
