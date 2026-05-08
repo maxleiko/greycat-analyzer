@@ -2743,11 +2743,16 @@ fn is_ident_like(s: &str) -> bool {
 ///     escape + wrap non-ident names so the result is valid syntax
 ///     (`Foo::"Africa/Abidjan"`).
 ///
-/// Allocates exactly two `String`s per item — one for the label and
-/// one for the insert text, both of which `lsp_types::CompletionItem`
-/// requires by ownership. The escape pass writes into a single
-/// pre-sized buffer (no `String::replace` chains).
-fn enum_variant_completion_item(name: &str, in_string: bool) -> CompletionItem {
+/// `replace_range` is the LSP range covering the surrounding word
+/// at the cursor. Threading it through `text_edit` is what makes
+/// "ask for completion mid-word" honest — the accepted text
+/// replaces the existing word instead of doubling it via a naive
+/// `insert_text` insertion at the cursor.
+fn enum_variant_completion_item(
+    name: &str,
+    in_string: bool,
+    replace_range: lsp_types::Range,
+) -> CompletionItem {
     let display = if in_string || is_ident_like(name) {
         name.to_string()
     } else {
@@ -2766,7 +2771,30 @@ fn enum_variant_completion_item(name: &str, in_string: bool) -> CompletionItem {
     CompletionItem {
         label: display.clone(),
         kind: Some(CompletionItemKind::ENUM_MEMBER),
-        insert_text: Some(display),
+        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+            range: replace_range,
+            new_text: display,
+        })),
+        ..Default::default()
+    }
+}
+
+/// Build a [`CompletionItem`] for a static method or module-level
+/// decl reached through `Recv::|`. Same `text_edit`-based
+/// replace-range plumbing as [`enum_variant_completion_item`] so
+/// mid-ident invocation doesn't duplicate the typed prefix.
+fn static_completion_item(
+    name: String,
+    kind: CompletionItemKind,
+    replace_range: lsp_types::Range,
+) -> CompletionItem {
+    CompletionItem {
+        label: name.clone(),
+        kind: Some(kind),
+        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+            range: replace_range,
+            new_text: name,
+        })),
         ..Default::default()
     }
 }
@@ -3208,14 +3236,14 @@ fn member_completion(
 
     let mut items: Vec<CompletionItem> = Vec::new();
     // Try in-module first.
-    if let Some(decl_id) = module.analysis.type_decls.get(&name).copied()
+    if let Some(decl_id) = module.analysis.type_decls.get(name).copied()
         && let Decl::Type(td) = &module.hir.decls[decl_id]
     {
         collect_type_members(&module.hir, td, &prefix_lower, &mut items);
     }
     // Fall through to cross-module if in-module produced nothing.
     if items.is_empty()
-        && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&name).first()
+        && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(name).first()
         && let Some(fmod) = project.module(foreign_uri)
         && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
     {
@@ -3444,12 +3472,12 @@ fn lookup_name_type_in_stmt(
 fn type_head_name(
     arena: &greycat_analyzer_types::TypeArena,
     id: greycat_analyzer_types::TypeId,
-) -> Option<String> {
+) -> Option<&str> {
     use greycat_analyzer_types::TypeKind;
     let t = arena.get(id);
     match &t.kind {
-        TypeKind::Named { name } | TypeKind::Generic { name, .. } => Some(name.clone()),
-        TypeKind::Primitive(p) => Some(p.name().to_string()),
+        TypeKind::Named { name } | TypeKind::Generic { name, .. } => Some(name),
+        TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }
 }
@@ -3522,15 +3550,19 @@ fn static_completion(
     cursor_byte: usize,
     project: &greycat_analyzer_analysis::project::ProjectAnalysis,
 ) -> Option<Vec<CompletionItem>> {
-    let (recv, _, typed, in_string) = static_receiver_at(text, cursor_byte)?;
-    let prefix_lower = typed.to_lowercase();
+    let ctx = static_receiver_at(text, cursor_byte)?;
+    let prefix_lower = ctx.typed.to_lowercase();
+    let replace_range = lsp_types::Range {
+        start: byte_to_position(text, ctx.replace_range.start),
+        end: byte_to_position(text, ctx.replace_range.end),
+    };
 
     let mut items: Vec<CompletionItem> = Vec::new();
 
     // Receiver branch: type-decl → static methods, enum-decl →
     // variants. The `recv` text matches a top-level decl name in some
     // module (resolved through the project decl table).
-    if let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&recv).first()
+    if let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&ctx.recv).first()
         && let Some(fmod) = project.module(foreign_uri)
     {
         match &fmod.hir.decls[*foreign_decl_id] {
@@ -3546,12 +3578,11 @@ fn static_completion(
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::METHOD),
-                        insert_text: Some(name),
-                        ..Default::default()
-                    });
+                    items.push(static_completion_item(
+                        name,
+                        CompletionItemKind::METHOD,
+                        replace_range,
+                    ));
                 }
             }
             Decl::Enum(ed) => {
@@ -3565,7 +3596,11 @@ fn static_completion(
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
-                    items.push(enum_variant_completion_item(name, in_string));
+                    items.push(enum_variant_completion_item(
+                        name,
+                        ctx.in_string,
+                        replace_range,
+                    ));
                 }
             }
             _ => {}
@@ -3573,7 +3608,7 @@ fn static_completion(
     }
 
     // Module-receiver branch: enumerate the module's top-level decls.
-    if let Some(mod_uri) = project.index.module_names.get(&recv).cloned()
+    if let Some(mod_uri) = project.index.module_names.get(&ctx.recv).cloned()
         && let Some(mod_analysis) = project.module(&mod_uri)
         && let Some(module_hir) = mod_analysis.hir.module.as_ref()
     {
@@ -3592,12 +3627,7 @@ fn static_completion(
                 Decl::Var(_) => CompletionItemKind::VARIABLE,
                 Decl::Pragma(_) => continue,
             };
-            items.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(kind),
-                insert_text: Some(name),
-                ..Default::default()
-            });
+            items.push(static_completion_item(name, kind, replace_range));
         }
     }
 
@@ -3608,44 +3638,97 @@ fn static_completion(
     Some(items)
 }
 
-/// Walk back from `cursor_byte` to extract the static-access receiver.
-/// Returns `(receiver_text, separator_start, typed_prefix, in_string)`
-/// when the cursor sits in a `recv::|prefix` shape OR
-/// `recv::"prefix|`. `in_string` is `true` for the latter; it tells
-/// the enum-completion arm to skip the surrounding quotes (the
-/// opening `"` is already in the buffer).
-fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<(String, usize, String, bool)> {
+/// Receiver context for `Recv::|prop` / `Recv::"prop|"` completion.
+///
+/// `replace_range` covers the whole property token at the cursor —
+/// from the start of the typed prefix to the end of the surrounding
+/// ident run (or to the closing `"` for string-mode). Threading this
+/// into every completion item's `text_edit` is what keeps "ask for
+/// completion in the middle of a word" honest: the accepted text
+/// replaces the existing word instead of doubling it via a naive
+/// `insert_text` insertion at the cursor.
+struct StaticRecvCtx {
+    /// Receiver name (`Foo`, `runtime`, …). Plain ident text, no
+    /// quotes / separators.
+    recv: String,
+    /// What the user has typed so far at the cursor; the prefix
+    /// filter for completion items. Always derived from the source
+    /// chars from `replace_range.start..cursor_byte`.
+    typed: String,
+    /// Replace-range as UTF-8 byte offsets. For ident-mode this is
+    /// `[prop_start..prop_end]` covering every alphanumeric run
+    /// around the cursor. For string-mode this is the inner content
+    /// span `[after_open_quote..before_close_quote]` (cursor INSIDE
+    /// the quotes, opening/closing kept).
+    replace_range: std::ops::Range<usize>,
+    /// `true` when the cursor sits inside `Recv::"…|"`. The opening
+    /// `"` is in the buffer, so completion items emit bare names
+    /// (no re-quoting).
+    in_string: bool,
+}
+
+/// Walk back from `cursor_byte` to extract the static-access receiver
+/// and the byte range to replace. Returns `None` when the cursor
+/// isn't in a `Recv::|` / `Recv::"|"` shape.
+fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<StaticRecvCtx> {
     let bytes = text.as_bytes();
     let cap = cursor_byte.min(bytes.len());
 
-    // Detect the cursor sitting inside `recv::"…|"` first. Walk back
-    // from the cursor over any chars that aren't `"` until we find
-    // the opening `"`. If that `"` is preceded by `::`, we're in
-    // string-property completion mode and the prefix is the inner
-    // chars typed so far.
+    // String-mode: the cursor sits inside `recv::"…|…"`. Walk back
+    // over non-`"` chars to find the opening quote, then forward
+    // from the cursor over non-`"` chars to find the closing quote
+    // (or EOL — we stop at `\n` so an unterminated string doesn't
+    // swallow the rest of the file).
     {
         let mut i = cap;
-        while i > 0 && bytes[i - 1] != b'"' {
+        while i > 0 && bytes[i - 1] != b'"' && bytes[i - 1] != b'\n' {
             i -= 1;
         }
         if i >= 3 && bytes[i - 1] == b'"' && bytes[i - 2] == b':' && bytes[i - 3] == b':' {
-            let typed = text.get(i..cap).unwrap_or("").to_string();
+            let inner_start = i;
+            let mut j = cap;
+            while j < bytes.len() && bytes[j] != b'"' && bytes[j] != b'\n' {
+                j += 1;
+            }
+            let inner_end = j;
+            let typed = text.get(inner_start..cap).unwrap_or("").to_string();
             let sep_start = i - 3;
             let recv = walk_back_receiver(bytes, sep_start, text)?;
-            return Some((recv, sep_start, typed, true));
+            return Some(StaticRecvCtx {
+                recv,
+                typed,
+                replace_range: inner_start..inner_end,
+                in_string: true,
+            });
         }
     }
 
-    // Plain `recv::|prefix` mode (the receiver's property is an
-    // ident-shaped run of alphanumerics).
+    // Ident-mode: `recv::|prop`. Walk back over `[A-Za-z0-9_]` for
+    // the prefix and forward from the cursor over the same class
+    // for the rest of the surrounding ident — so completion in the
+    // middle of `Foo::Tim|eZone` replaces the whole `TimeZone` run.
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_start = cap.saturating_sub(typed.len());
     if prefix_start < 2 || bytes[prefix_start - 1] != b':' || bytes[prefix_start - 2] != b':' {
         return None;
     }
+    let mut j = cap;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            j += 1;
+        } else {
+            break;
+        }
+    }
     let sep_start = prefix_start - 2;
     let recv = walk_back_receiver(bytes, sep_start, text)?;
-    Some((recv, sep_start, typed, false))
+    Some(StaticRecvCtx {
+        recv,
+        typed,
+        replace_range: prefix_start..j,
+        in_string: false,
+    })
 }
 
 /// Shared receiver walk-back used by both static-completion modes

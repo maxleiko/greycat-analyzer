@@ -415,12 +415,12 @@ fn completion_after_enum_double_colon_lists_variants() {
     use greycat_analyzer_core::SourceManager;
     use std::str::FromStr;
 
-    fn complete_at(
+    fn complete_items(
         mgr: &SourceManager,
         uri: &Uri,
         pa: &ProjectAnalysis,
         cursor_byte: usize,
-    ) -> Vec<String> {
+    ) -> Vec<CompletionItem> {
         let cell = mgr.get(uri).unwrap();
         let doc = cell.borrow();
         let line = doc.text[..cursor_byte].matches('\n').count() as u32;
@@ -438,7 +438,65 @@ fn completion_after_enum_double_colon_lists_variants() {
             None,
         )
         .unwrap_or_else(|| panic!("no completion at byte {cursor_byte}"));
-        list.items.into_iter().map(|c| c.label).collect()
+        list.items
+    }
+
+    fn complete_at(
+        mgr: &SourceManager,
+        uri: &Uri,
+        pa: &ProjectAnalysis,
+        cursor_byte: usize,
+    ) -> Vec<String> {
+        complete_items(mgr, uri, pa, cursor_byte)
+            .into_iter()
+            .map(|c| c.label)
+            .collect()
+    }
+
+    /// Apply a completion item's `text_edit` to `text`, returning the
+    /// resulting buffer. Anchors the architectural rule: every
+    /// completion item must use `text_edit` (not `insert_text`) so
+    /// asking for completion mid-ident replaces the surrounding word
+    /// instead of doubling it.
+    fn apply_edit(text: &str, item: &CompletionItem) -> String {
+        let edit = match item
+            .text_edit
+            .as_ref()
+            .unwrap_or_else(|| panic!("completion item `{}` is missing text_edit", item.label))
+        {
+            CompletionTextEdit::Edit(e) => e,
+            CompletionTextEdit::InsertAndReplace(_) => {
+                panic!("test only handles CompletionTextEdit::Edit")
+            }
+        };
+        let start = position_to_byte(text, edit.range.start);
+        let end = position_to_byte(text, edit.range.end);
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..start]);
+        out.push_str(&edit.new_text);
+        out.push_str(&text[end..]);
+        out
+    }
+
+    fn position_to_byte(text: &str, p: Position) -> usize {
+        let mut line = 0u32;
+        let mut byte = 0usize;
+        for ch in text.chars() {
+            if line == p.line
+                && (byte - text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32
+                    == p.character
+            {
+                return byte;
+            }
+            byte += ch.len_utf8();
+            if ch == '\n' {
+                if line == p.line {
+                    return byte - 1;
+                }
+                line += 1;
+            }
+        }
+        byte
     }
 
     let uri = Uri::from_str("file:///project.gcl").unwrap();
@@ -447,12 +505,14 @@ fn completion_after_enum_double_colon_lists_variants() {
     // `core::TimeZone` ships 600+ such names (`"Africa/Abidjan"`,
     // `"America/New_York"`, …); the per-variant completion path
     // must stay allocation-light.
-    let src = "enum Foo { alpha, beta, \"Africa/Abidjan\", \"America/New_York\", \"str field\" }\n\
-        fn test() {\n\
-        \x20   var a = Foo::\n\
-        \x20   var b = Foo::\"Afr\";\n\
-        \x20   var c = Foo::\"a\";\n\
-        }\n";
+    let src = concat!(
+        "enum Foo { alpha, beta, \"Africa/Abidjan\", \"America/New_York\", \"str field\" }\n",
+        "fn test() {\n",
+        "    var a = Foo::\n",
+        "    var b = Foo::\"Afr\";\n",
+        "    var c = Foo::\"a\";\n",
+        "}\n",
+    );
     let mut mgr = SourceManager::new();
     mgr.add_simple(uri.clone(), src, "project", false);
     let pa = ProjectAnalysis::analyze(&mgr);
@@ -501,6 +561,70 @@ fn completion_after_enum_double_colon_lists_variants() {
     assert!(
         labels.iter().any(|l| l == "alpha") && labels.iter().any(|l| l == "America/New_York"),
         "expected both `alpha` and `America/New_York` inside `Foo::\"a|\"`, got {labels:?}"
+    );
+
+    // 4. Mid-ident invocation. The user has typed `Foo::TimeZone`
+    //    and re-invokes completion with the cursor in the middle
+    //    (`Foo::Tim|eZone`). Accepting `TimeStamp` (which matches
+    //    the `Tim` prefix) must REPLACE the whole `TimeZone` token,
+    //    not insert at the cursor — the previous `insert_text`-only
+    //    shape produced `Foo::TimTimeStampeZone`.
+    let mid_src = concat!(
+        "enum E { alpha, TimeStamp, TimeZone }\n",
+        "fn t() {\n",
+        "    var x = E::TimeZone;\n",
+        "}\n",
+    );
+    let mid_uri = Uri::from_str("file:///mid.gcl").unwrap();
+    let mut mid_mgr = SourceManager::new();
+    mid_mgr.add_simple(mid_uri.clone(), mid_src, "project", false);
+    let mid_pa = ProjectAnalysis::analyze(&mid_mgr);
+    // Cursor right after the `Tim` prefix on line 3 (the use site,
+    // not the decl).
+    let use_offset = mid_src.find("E::TimeZone").unwrap() + "E::Tim".len();
+    let items = complete_items(&mid_mgr, &mid_uri, &mid_pa, use_offset);
+    let timestamp = items
+        .iter()
+        .find(|c| c.label == "TimeStamp")
+        .unwrap_or_else(|| panic!("expected `TimeStamp` at mid-ident cursor, got {items:?}"));
+    let after = apply_edit(mid_src, timestamp);
+    assert!(
+        after.contains("E::TimeStamp;"),
+        "mid-ident completion must replace the whole token; got `{after}`"
+    );
+    assert!(
+        !after.contains("TimTimeStampeZone") && !after.contains("TimeStampeZone"),
+        "mid-ident completion must not double the surrounding ident; got `{after}`"
+    );
+
+    // 5. Mid-string-property invocation. The user has typed
+    //    `F::"TimeZone"` and re-invokes completion with the cursor
+    //    after the `Tim` prefix. Accepting `TimeStamp` must replace
+    //    the whole inner string content (the closing `"` stays put).
+    let mid_str_src = concat!(
+        "enum F { \"TimeStamp\", \"TimeZone\" }\n",
+        "fn t() {\n",
+        "    var x = F::\"TimeZone\";\n",
+        "}\n",
+    );
+    let mid_str_uri = Uri::from_str("file:///midstr.gcl").unwrap();
+    let mut mid_str_mgr = SourceManager::new();
+    mid_str_mgr.add_simple(mid_str_uri.clone(), mid_str_src, "project", false);
+    let mid_str_pa = ProjectAnalysis::analyze(&mid_str_mgr);
+    let use_offset = mid_str_src.find("F::\"TimeZone\"").unwrap() + "F::\"Tim".len();
+    let items = complete_items(&mid_str_mgr, &mid_str_uri, &mid_str_pa, use_offset);
+    let timestamp = items
+        .iter()
+        .find(|c| c.label == "TimeStamp")
+        .unwrap_or_else(|| panic!("expected `TimeStamp` inside the string, got {items:?}"));
+    let after = apply_edit(mid_str_src, timestamp);
+    assert!(
+        after.contains("F::\"TimeStamp\";"),
+        "mid-string completion must replace the whole inner content; got `{after}`"
+    );
+    assert!(
+        !after.contains("TimTimeStampeZone") && !after.contains("TimeStampeZone"),
+        "mid-string completion must not leak the original suffix; got `{after}`"
     );
 }
 
