@@ -39,6 +39,29 @@ use greycat_analyzer_types::{
 use crate::resolver::{Definition, Resolutions};
 use crate::stdlib::ProjectIndex;
 
+/// P13.1 — does this statement always exit the enclosing control
+/// flow (`return`, `throw`, `break`, `continue`)? `Block` recurses
+/// into its last statement. `If` requires *both* branches to
+/// terminate (no else → not terminal). Used by the analyzer to lift
+/// the else-branch's narrowing into the post-if scope when the
+/// then-branch always exits early — handles the `if (x == null)
+/// { return; } use(x);` idiom.
+fn stmt_terminates(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
+    match &hir.stmts[stmt_id] {
+        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break | Stmt::Continue => true,
+        Stmt::Block(stmts) => stmts.last().is_some_and(|s| stmt_terminates(hir, *s)),
+        Stmt::If(IfStmt {
+            then_branch,
+            else_branch,
+            ..
+        }) => {
+            stmt_terminates(hir, *then_branch)
+                && else_branch.is_some_and(|e| stmt_terminates(hir, e))
+        }
+        _ => false,
+    }
+}
+
 /// P12.4 — classify a numeric literal's source text as `int` or
 /// `float`. Returns `Primitive::Float` for literals that contain a
 /// decimal point, scientific notation (`1e3`, `1.5E-2`), or trailing
@@ -807,8 +830,9 @@ impl<'a> Cx<'a> {
                 }
                 self.visit_stmt(then_branch, return_ty);
                 self.pop_narrow();
+                let then_terminates = stmt_terminates(self.hir, then_branch);
 
-                if let Some(eb) = else_branch {
+                let else_terminates = if let Some(eb) = else_branch {
                     self.push_narrow();
                     for ident in &else_non_null {
                         if let Some(cur) = self.lookup_def_type(*ident) {
@@ -818,6 +842,36 @@ impl<'a> Cx<'a> {
                     }
                     self.visit_stmt(eb, return_ty);
                     self.pop_narrow();
+                    stmt_terminates(self.hir, eb)
+                } else {
+                    false
+                };
+
+                // P13.1 CFG-aware narrowing — early return / throw etc.
+                // If the then-branch always exits the surrounding flow
+                // (return / throw / break / continue), the post-if
+                // scope inherits the *else* condition's narrowing
+                // (e.g. `if (x == null) { return; } use(x);` — `x` is
+                // non-null after the if). Mirrored for the else side.
+                if then_terminates {
+                    for ident in &else_non_null {
+                        if let Some(cur) = self.lookup_def_type(*ident) {
+                            let stripped = self.strip_nullable(cur);
+                            self.write_narrow(*ident, stripped);
+                        }
+                    }
+                }
+                if else_terminates {
+                    for ident in &then_non_null {
+                        if let Some(cur) = self.lookup_def_type(*ident) {
+                            let stripped = self.strip_nullable(cur);
+                            self.write_narrow(*ident, stripped);
+                        }
+                    }
+                    for (ident, ty_ref) in &then_typed {
+                        let ty = self.lower_type_ref(*ty_ref);
+                        self.write_narrow(*ident, ty);
+                    }
                 }
             }
             Stmt::While(WhileStmt {
@@ -1542,6 +1596,52 @@ fn f(x: int?) {
                 .iter()
                 .any(|d| d.message.contains("not assignable")),
             "expected no nullability error inside narrowed else-branch, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn early_return_narrows_post_if_scope() {
+        // P13.1: `if (x == null) { return; } use_int(x);` — after
+        // the early-return then-branch, `x` is non-null in the rest
+        // of the enclosing block.
+        let src = r#"
+fn use_int(v: int) {}
+fn f(x: int?) {
+    if (x == null) {
+        return;
+    }
+    use_int(x);
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error after early-return narrowing, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn early_throw_narrows_post_if_scope() {
+        // P13.1 mirror: `throw` also terminates the then-branch.
+        let src = r#"
+fn use_int(v: int) {}
+fn f(x: int?) {
+    if (x == null) {
+        throw "oops";
+    }
+    use_int(x);
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error after early-throw narrowing, got: {:?}",
             r.diagnostics
         );
     }

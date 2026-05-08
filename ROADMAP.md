@@ -324,7 +324,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] **13.1 CFG-aware narrowing (early-return)** (M) — when a then-branch ends in `return` / `throw` / `break` / `continue`, the post-if scope inherits the else-branch's narrowing. Adds a small terminal-statement detector to `analyzer::Cx`. Handles the common `if (x == null) { return; } use(x);` idiom.
+- [x] **13.1 CFG-aware narrowing (early-return)** (M) — new `stmt_terminates(hir, stmt)` walker recognizes `return` / `throw` / `break` / `continue` (and their nested-block variants; `if` terminates iff both branches do). Analyzer's `Stmt::If` checks each branch's terminal status after visiting it; if the then-branch terminates, the post-if scope inherits the else-side `non_null` narrowing into the enclosing block frame; mirrored for the else side (which also propagates `then_typed` from `is`-guards). Handles the `if (x == null) { return; } use(x);` and `if (x == null) { throw; } use(x);` idioms; 2 new unit tests.
 
 - [ ] **13.2 Conjunctive / disjunctive narrowings** (S) — `x != null && y != null` narrows both `x` and `y` in the then-branch; `x == null || y == null` is the inverse for else. `derive_cond_narrows` recurses through `BinOp::And` / `BinOp::Or` and merges.
 
