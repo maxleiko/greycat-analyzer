@@ -320,6 +320,55 @@ fn inlay_hints_with_project_use_cross_module_call_return_types() {
     );
 }
 
+/// Mirrors the user's project.gcl: a bare-ident call `foo()` to a
+/// fn declared in the same module with a `String?` return type. The
+/// analyzer's first pass returns `any` for non-generic Ident-callee
+/// calls; the cross-module post-pass closes the gap by reading the
+/// fn's declared return type. Without this, var-init typing
+/// (`var s = foo();`) and inlay hints fall back to `any` even when
+/// the return type is right there in the source.
+#[test]
+fn inlay_hints_with_project_use_bare_ident_call_return_types() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    use std::str::FromStr;
+
+    let main_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        main_uri.clone(),
+        "native fn foo(): String?;\n\nfn main() {\n    var s = foo();\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&main_uri).expect("doc");
+    let doc = cell.borrow();
+    let module = pa.module(&main_uri).expect("module cached");
+
+    let range = lsp_types::Range {
+        start: pos(0, 0),
+        end: pos(99, 0),
+    };
+    let hints = capabilities::inlay_hints_with_project(module, &doc.text, &range);
+    let var_hint = hints
+        .iter()
+        .find(|h| {
+            matches!(
+                &h.label,
+                InlayHintLabel::String(s) if s.contains("String")
+            )
+        })
+        .unwrap_or_else(|| panic!("expected `: String?` inlay hint on `var s`, got {hints:?}"));
+    let InlayHintLabel::String(label) = &var_hint.label else {
+        unreachable!()
+    };
+    assert_eq!(
+        label, ": String?",
+        "bare-ident fn call return type should propagate, got `{label}`"
+    );
+}
+
 // =============================================================================
 // formatting
 // =============================================================================

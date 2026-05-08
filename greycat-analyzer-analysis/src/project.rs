@@ -446,11 +446,20 @@ impl ProjectAnalysis {
                         ));
                 }
             }
-            // 1b) Call(Static / QualifiedStatic / Member / Arrow) —
-            // overrides the static expr_type and drives the call's
-            // return-type inference. P16.4 adds the Member / Arrow
-            // arms so chained method calls (`x.s.size()`,
-            // `recv->method(...)`) type as the method's return type.
+            // 1b) Call(Static / QualifiedStatic / Member / Arrow / Ident)
+            // — overrides the post-analysis expr_type with the call's
+            // declared return-type. The analyzer's first pass returns
+            // `any` for every Call (modulo generic constraint solving),
+            // so this post-pass is the *only* place a call gets its
+            // proper return type. Every callee shape that resolves to
+            // a `Decl::Fn` must be covered here — otherwise inlay
+            // hints, hover, var-init typing, etc. all fall back to
+            // `any` for that shape.
+            //
+            // P16.4 added Member / Arrow. The Ident arm covers bare
+            // same-module / cross-module fn-decl calls (`foo()` /
+            // `module::foo()` shapes routed through `Definition::Decl`
+            // and `Definition::ProjectDecl`).
             for (call_id, call_expr) in cur_module.hir.exprs.iter() {
                 let Expr::Call(call) = call_expr else {
                     continue;
@@ -469,6 +478,12 @@ impl ProjectAnalysis {
                     Expr::Member(m) | Expr::Arrow(m) => {
                         resolve_member_call_return_shape(&self.modules, cur_module, m.property)
                     }
+                    Expr::Ident(_) => resolve_ident_call_return_shape(
+                        &self.modules,
+                        &self.index,
+                        cur_module,
+                        call.callee,
+                    ),
                     _ => None,
                 };
                 let Some(shape) = shape else {
@@ -1209,6 +1224,39 @@ fn resolve_static_call_return_shape(
         return Some(read_type_shape(&foreign_module.hir, ret));
     }
     None
+}
+
+/// Return-type for a bare-ident fn call (`foo()` / `module::foo()`
+/// where the callee resolves to a `Decl::Fn`). Reuses
+/// [`resolve_call_target`] which already knows how to walk the
+/// resolver tables. Returns `None` for callees that aren't fn decls
+/// (calling a local / param / type — those produce `any` anyway in
+/// the first pass) or for fn decls without a declared return type.
+///
+/// This closes the architectural gap that surfaced as
+/// `var s = foo()` typing as `any` even when `foo: () -> String?` was
+/// declared in the same module — the analyzer's first-pass
+/// `Expr::Call` arm short-circuits to `any` for non-generic Ident
+/// callees because resolving the callee needs the full
+/// `ProjectAnalysis` context, which doesn't exist yet inside the
+/// per-module analyzer.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_ident_call_return_shape(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    cur: &ModuleAnalysis,
+    callee: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
+) -> Option<TypeShape> {
+    let (foreign_uri, decl_id) = resolve_call_target(modules, index, cur, callee)?;
+    let host_hir = match foreign_uri {
+        Some(uri) => &modules.get(&uri)?.hir,
+        None => &cur.hir,
+    };
+    let Decl::Fn(fnd) = &host_hir.decls[decl_id] else {
+        return None;
+    };
+    let ret = fnd.return_type?;
+    Some(read_type_shape(host_hir, ret))
 }
 
 /// P16.4 — return-type for `recv.method(args)` / `recv->method(args)`.
