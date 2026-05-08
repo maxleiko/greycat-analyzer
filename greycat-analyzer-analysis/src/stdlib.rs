@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, FnDecl, TypeRef as HirTypeRef};
+use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeRef as HirTypeRef};
 use greycat_analyzer_types::{Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry};
 
 /// Cross-module registry of native-bound function signatures. Keyed by
@@ -73,9 +73,34 @@ pub struct ProjectIndex {
     /// no arg) → every site that exposed under that key. Lets lints /
     /// capabilities ask "is this name part of the runtime API?".
     pub exposed: HashMap<String, Vec<ExposureSite>>,
+    /// P13.5 — per-type flag bits drawn from `@iterable` / `@deref` /
+    /// `@primitive` annotations on a `type` decl. Keyed by the
+    /// declared type name (`Array`, `nodeTime`, …).
+    pub type_flags: HashMap<String, TypeFlags>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
+}
+
+/// P13.5 — annotation-derived flag bits on a type declaration.
+///
+/// - `iterable`: `for x in t` is legal when `t` is this type.
+/// - `deref`: `Some("method")` when the type carries
+///   `@deref("method")`; member access on this type can also resolve
+///   through the named method's return type when the property isn't
+///   on the type itself. `None` for types without `@deref`.
+/// - `primitive`: exempts the type from structural-compatibility
+///   rules — assigned only by exact-name match.
+///
+/// Wiring these into the analyzer's behavior happens incrementally —
+/// today they're a populated data table the analyzer can read; full
+/// `for-in` legality / member-resolution-through-deref / primitive-
+/// strict-equality semantics are downstream follow-ups.
+#[derive(Debug, Default, Clone)]
+pub struct TypeFlags {
+    pub iterable: bool,
+    pub deref: Option<String>,
+    pub primitive: bool,
 }
 
 /// P13.4 — a single `@expose`-annotated decl, recorded for the
@@ -118,6 +143,12 @@ impl ProjectIndex {
                         // takes over at use sites.
                         let id = self.types.named(&name);
                         self.registry.register(name.clone(), id);
+                    }
+                    // P13.5: capture @iterable / @deref / @primitive
+                    // flag bits into the per-type table.
+                    let flags = derive_type_flags(&td.modifiers.annotations);
+                    if flags.iterable || flags.deref.is_some() || flags.primitive {
+                        self.type_flags.entry(name.clone()).or_insert(flags);
                     }
                     self.record_decl_location(name, uri, *decl_id);
                     Some(&td.modifiers)
@@ -295,6 +326,21 @@ pub const BUILTIN_RUNTIME_TYPES: &[&str] = &[
     "t3f",
     "t4f",
 ];
+
+/// P13.5 — read `@iterable` / `@deref` / `@primitive` annotations on a
+/// type decl into a [`TypeFlags`] record.
+fn derive_type_flags(annotations: &[Annotation]) -> TypeFlags {
+    let mut flags = TypeFlags::default();
+    for ann in annotations {
+        match ann.name.as_str() {
+            "iterable" => flags.iterable = true,
+            "primitive" => flags.primitive = true,
+            "deref" => flags.deref = ann.args.first().cloned().or(Some(String::new())),
+            _ => {}
+        }
+    }
+    flags
+}
 
 fn native_signature_for(hir: &Hir, fnd: &FnDecl, types: &mut TypeArena) -> NativeSignature {
     let params = fnd
@@ -505,6 +551,39 @@ fn ignored() {}
             "@library annotation shouldn't add to exposed map: {:?}",
             idx.exposed.keys().collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn ingest_captures_type_flags_from_annotations() {
+        // P13.5: @iterable / @deref / @primitive annotations on a type
+        // decl populate ProjectIndex.type_flags.
+        let hir = lower(
+            r#"
+@iterable
+@deref("resolve")
+type Bag {}
+
+@primitive
+type Marker {}
+
+type Plain {}
+"#,
+        );
+        let u = uri("/proj/m.gcl");
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&u, &hir);
+
+        let bag = idx.type_flags.get("Bag").expect("Bag flags");
+        assert!(bag.iterable);
+        assert_eq!(bag.deref.as_deref(), Some("resolve"));
+        assert!(!bag.primitive);
+
+        let marker = idx.type_flags.get("Marker").expect("Marker flags");
+        assert!(marker.primitive);
+        assert!(!marker.iterable);
+
+        // Plain has no annotations — kept out of the map.
+        assert!(!idx.type_flags.contains_key("Plain"));
     }
 
     #[test]
