@@ -753,6 +753,35 @@ fn f(p: Foo): Foo { return p; }
         assert!(res.unresolved.is_empty());
     }
 
+    /// P17.3 — `try { ... } catch (ex) { ... ex ... }` should bind
+    /// `ex` as a Local in the catch block. Was silently unresolved
+    /// because lowering asked for a `name` sub-field on `_catch_param`,
+    /// which the grammar doesn't declare; the hidden-rule inlining
+    /// also meant `child_by_field_name` returned the `(` token, not
+    /// the ident — so the binding ended up empty.
+    #[test]
+    fn catch_param_binds_in_catch_block() {
+        let src = "fn f() { try { } catch (ex) { throw ex; } }\n";
+        let (hir, res) = analyze(src);
+        let ex_uses: Vec<_> = hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.text == "ex")
+            .filter_map(|(idx, _)| res.uses.get(&idx))
+            .collect();
+        assert_eq!(
+            ex_uses.len(),
+            1,
+            "expected exactly one `ex` use, got {ex_uses:?}"
+        );
+        assert!(
+            matches!(ex_uses[0], Definition::Local(_)),
+            "expected Local binding for catch param, got {:?}",
+            ex_uses[0]
+        );
+        assert!(res.unresolved.is_empty(), "no idents should be unresolved");
+    }
+
     #[test]
     fn project_index_fallback_keeps_unit_project_for_runtime_types() {
         // `Array` / `Map` / `node` etc. are seeded into the project

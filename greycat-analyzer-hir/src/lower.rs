@@ -585,9 +585,19 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             let try_block = node
                 .child_by_field_name("try_block")
                 .and_then(|n| lower_stmt(cx, n))?;
+            // P17.3 — the grammar's `_catch_param` is a hidden rule
+            // (`seq("(", $.ident, ")")`), so tree-sitter inlines it
+            // and tags every child of the inlined rule with the
+            // `error_param` field. `child_by_field_name` returns the
+            // first such child — which is the `(` token, not the
+            // ident. Walk every field-tagged child and pick the
+            // `ident` instead. (Previous code asked for a `name`
+            // sub-field, which the grammar doesn't declare, so the
+            // catch binding was silently None.)
+            let mut field_cursor = node.walk();
             let error_param = node
-                .child_by_field_name("error_param")
-                .and_then(|n| n.child_by_field_name("name"))
+                .children_by_field_name("error_param", &mut field_cursor)
+                .find(|c| c.kind() == "ident")
                 .map(|n| cx.alloc_ident(n));
             let catch_block = node
                 .child_by_field_name("catch_block")
