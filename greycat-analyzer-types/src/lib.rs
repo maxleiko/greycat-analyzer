@@ -323,7 +323,19 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
         (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => na == nb,
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
-            na == nb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| x == y) // invariant
+            // P12.2: covariant in every generic parameter. Matches the TS
+            // reference's `GreycatGenericType.isAssignableTo` (this.generics[i]
+            // .isAssignableTo(other.generics[i]) for every i, after a name
+            // / arity check). Supertype-chain assignability across different
+            // generic names (`type Child<T> extends Parent<T>`) lives on a
+            // later phase — the analyzer doesn't yet thread declared
+            // supertypes into [`is_assignable_to`].
+            na == nb
+                && aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab)
+                    .all(|(x, y)| is_assignable_to(arena, *x, *y))
         }
         // P7.5 anonymous structural compat: a value of `{a: A, b: B}`
         // is assignable to `{a: A}` (width subtyping — source may have
@@ -584,16 +596,35 @@ mod tests {
     }
 
     #[test]
-    fn generic_invariant_in_args() {
+    fn generic_covariant_in_args() {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
         let float = a.primitive(Primitive::Float);
+        let str_t = a.primitive(Primitive::String);
         let arr_int = a.generic("Array", vec![int]);
         let arr_float = a.generic("Array", vec![float]);
-        // Even though int->float widens, Array<int> is NOT assignable to
-        // Array<float>. Invariance.
-        assert!(!is_assignable_to(&a, arr_int, arr_float));
+        let arr_str = a.generic("Array", vec![str_t]);
+        // P12.2: covariance in every generic param matches TS reference
+        // (`GreycatGenericType.isAssignableTo`). Array<int> → Array<float>
+        // because int widens to float, but the reverse stays asymmetric
+        // and unrelated element types still mismatch.
+        assert!(is_assignable_to(&a, arr_int, arr_float));
+        assert!(!is_assignable_to(&a, arr_float, arr_int));
+        assert!(!is_assignable_to(&a, arr_int, arr_str));
         assert!(is_assignable_to(&a, arr_int, arr_int));
+    }
+
+    #[test]
+    fn generic_name_mismatch_stays_unassignable() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let arr_int = a.generic("Array", vec![int]);
+        let set_int = a.generic("Set", vec![int]);
+        // Different generic names with the same args still mismatch —
+        // covariance doesn't paper over the head type. Inheritance-aware
+        // assignability (`type Child<T> extends Parent<T>`) is a later
+        // phase.
+        assert!(!is_assignable_to(&a, arr_int, set_int));
     }
 
     #[test]
