@@ -515,6 +515,59 @@ fn completion_after_at_emits_pragma_list() {
     );
 }
 
+/// P15.2.2 — typing `re` at a statement position emits keyword
+/// completions filtered by the typed prefix (`return`).
+#[test]
+fn completion_at_stmt_emits_filtered_keywords() {
+    let src = "fn body() {\n  re\n}\n";
+    let tree = parse(src);
+    // Cursor after `re` on line 1 col 4.
+    let list =
+        capabilities::completion(src, tree.root_node(), pos(1, 4), None).expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"return"),
+        "expected `return` keyword, got: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"if"),
+        "non-matching keyword leaked through prefix filter: {labels:?}"
+    );
+}
+
+/// P15.2.2 — keyword completion does not fire inside string literals.
+#[test]
+fn completion_inside_string_skips_keywords() {
+    let src = "fn f() { var s: String = \"return\"; }\n";
+    let tree = parse(src);
+    // Cursor inside the string body, between `e` and `t` of `return`.
+    let list = capabilities::completion(src, tree.root_node(), pos(0, 28), None);
+    if let Some(list) = list {
+        let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            !labels.contains(&"return"),
+            "keywords leaked into string body: {labels:?}"
+        );
+    }
+}
+
+/// P15.2.2 — keyword completion does not fire after `.` (member access
+/// RHS is owned by P15.2.4).
+#[test]
+fn completion_after_dot_skips_keywords() {
+    let src = "fn f(p: int) { p.r }\n";
+    let tree = parse(src);
+    // Cursor immediately after the `r` of `.r`.
+    let list = capabilities::completion(src, tree.root_node(), pos(0, 18), None);
+    if let Some(list) = list {
+        let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            !labels.contains(&"return"),
+            "keywords leaked into member-access RHS: {labels:?}"
+        );
+    }
+}
+
 /// P15.2.1 — typing `@li` filters the pragma list to entries whose name
 /// (post-`@`) starts with `li`.
 #[test]

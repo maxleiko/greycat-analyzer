@@ -2219,6 +2219,12 @@ pub fn completion(
             items,
         });
     }
+    if let Some(items) = keyword_completion(text, node, byte) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     None
 }
 
@@ -2475,6 +2481,127 @@ fn pragma_items() -> Vec<CompletionItem> {
         },
     ]
 }
+
+// =============================================================================
+// P15.2.2 — keyword completion at statement / expression positions
+// =============================================================================
+
+/// Emit keyword completion items when the cursor sits at a statement
+/// or expression position (not after `.` / `->` / `::` / `@`, not
+/// inside a string / comment / type-ident / annotation). Filters by
+/// the alphabetic prefix the user has already typed.
+///
+/// Type-position only emits the type keywords (`null` / type names);
+/// since dedicated type completion (P15.2.6) hasn't landed yet, we
+/// just bail when the cursor sits inside a `type_ident` so we don't
+/// pollute that slot with statement keywords.
+fn keyword_completion(
+    text: &str,
+    node: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+) -> Option<Vec<CompletionItem>> {
+    if !is_keyword_position(text, node, cursor_byte) {
+        return None;
+    }
+    let typed = ident_prefix_at_cursor(text, cursor_byte);
+    let prefix_lower = typed.to_lowercase();
+    let mut items: Vec<CompletionItem> = ALL_KEYWORDS
+        .iter()
+        .filter(|kw| prefix_lower.is_empty() || kw.starts_with(&prefix_lower))
+        .map(|kw| CompletionItem {
+            label: (*kw).into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some((*kw).into()),
+            ..Default::default()
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
+}
+
+/// `true` when the cursor is at a position where bare keywords make
+/// sense — i.e. not in a member/static/ref-access RHS, not inside an
+/// annotation (pragma completion handles that), not inside a string /
+/// comment, and not in a type-ident slot.
+fn is_keyword_position(text: &str, node: tree_sitter::Node<'_>, cursor_byte: usize) -> bool {
+    // Skip strings, comments, doc-comments. These ancestors short-
+    // circuit completely — completion has no business firing inside
+    // them at this layer.
+    for kind in [
+        "string",
+        "_string_fragment",
+        "line_comment",
+        "_block_comment",
+        "doc_comment",
+    ] {
+        if ancestor_with_kind(node, kind).is_some() {
+            return false;
+        }
+    }
+    // Annotation context is owned by `pragma_completion` (P15.2.1).
+    if ancestor_with_kind(node, "annotation").is_some() {
+        return false;
+    }
+    // Type-position is owned by P15.2.6 — defer instead of polluting.
+    if ancestor_with_kind(node, "type_ident").is_some() {
+        return false;
+    }
+    // Walk back from cursor over the typed prefix and inspect the
+    // separator byte. `.` / `:` / `>` / `@` mean we're on the RHS of
+    // a member / static / ref / annotation chain.
+    let bytes = text.as_bytes();
+    let cap = cursor_byte.min(bytes.len());
+    let mut i = cap;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i > 0 {
+        let sep = bytes[i - 1];
+        if matches!(sep, b'.' | b':' | b'>' | b'@') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Walk back from `cursor_byte` over `[A-Za-z0-9_]*` and return the
+/// typed run as an owned string. Used to prefix-filter keyword and
+/// (later) ident completion.
+fn ident_prefix_at_cursor(text: &str, cursor_byte: usize) -> String {
+    let bytes = text.as_bytes();
+    let cap = cursor_byte.min(bytes.len());
+    let mut i = cap;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    text.get(i..cap).unwrap_or("").to_string()
+}
+
+/// Every reserved word the user can type at a statement / expression
+/// position. Mirrors the keywords baked into the tree-sitter grammar
+/// (`grammar.js`): the modifiers (`private`, `static`, `abstract`,
+/// `native`), decl-level (`fn`, `type`, `enum`, `var`), control-flow
+/// (`if`, `else`, `for`, `while`, `do`, `return`, `throw`, `try`,
+/// `catch`, `at`, `in`), and expression-level (`is`, `as`, `null`,
+/// `true`, `false`, `this`).
+const ALL_KEYWORDS: &[&str] = &[
+    "abstract", "as", "at", "catch", "do", "else", "enum", "false", "fn", "for", "if", "in", "is",
+    "native", "null", "private", "return", "static", "this", "throw", "true", "try", "type", "var",
+    "while",
+];
 
 // =============================================================================
 // On-demand diagnostics for capabilities that don't sit on the publish path
