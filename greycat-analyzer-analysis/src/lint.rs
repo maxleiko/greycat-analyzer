@@ -284,10 +284,12 @@ impl LintRule for UnusedDecl {
 }
 
 fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
-    modifiers
-        .annotations
-        .iter()
-        .any(|a| a == "expose" || a == "permission" || a == "role" || a == "library")
+    modifiers.annotations.iter().any(|a| {
+        matches!(
+            a.name.as_str(),
+            "expose" | "permission" | "role" | "library"
+        )
+    })
 }
 
 #[cfg(test)]

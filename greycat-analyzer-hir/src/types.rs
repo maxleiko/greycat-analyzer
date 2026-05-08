@@ -31,11 +31,20 @@ pub struct Modifiers {
     pub static_: bool,
     pub abstract_: bool,
     pub native: bool,
-    /// Annotation names declared on this decl, drawn from grammar
-    /// `annotations` (e.g. `["expose", "permission"]`). Args are
-    /// dropped — the lint layer (P6.7) only needs the bare name to
-    /// detect `@expose` exposure.
-    pub annotations: Vec<String>,
+    /// Annotations declared on this decl, drawn from grammar
+    /// `annotations`. P13.4: each entry carries the annotation name
+    /// plus any string-literal arguments (e.g.
+    /// `@expose("renamed")` → `Annotation { name: "expose",
+    /// args: ["renamed"] }`). Non-string arguments are dropped —
+    /// the consumers we have today (`@expose` rename capture, the
+    /// `unused-decl` exposure check) only need string args.
+    pub annotations: Vec<Annotation>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    pub name: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

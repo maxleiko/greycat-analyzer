@@ -68,9 +68,26 @@ pub struct ProjectIndex {
     /// site via the importing module's lib/include closure (P11.2+).
     /// Pragma decls have no name and are excluded.
     pub decl_locations: HashMap<String, Vec<(Uri, Idx<Decl>)>>,
+    /// P13.4 — runtime-exposed names. Keyed by the rename string of
+    /// `@expose("renamed")` (or the decl's own name when `@expose` has
+    /// no arg) → every site that exposed under that key. Lets lints /
+    /// capabilities ask "is this name part of the runtime API?".
+    pub exposed: HashMap<String, Vec<ExposureSite>>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
+}
+
+/// P13.4 — a single `@expose`-annotated decl, recorded for the
+/// runtime-API surface. `local_name` is the source-level name in the
+/// declaring module; `rename` is what `@expose("renamed")` gave it
+/// (or `None` when `@expose` was used bare).
+#[derive(Debug, Clone)]
+pub struct ExposureSite {
+    pub uri: Uri,
+    pub decl: Idx<Decl>,
+    pub local_name: String,
+    pub rename: Option<String>,
 }
 
 impl ProjectIndex {
@@ -91,7 +108,7 @@ impl ProjectIndex {
             return;
         };
         for decl_id in &module.decls {
-            match &hir.decls[*decl_id] {
+            let modifiers = match &hir.decls[*decl_id] {
                 Decl::Type(td) => {
                     let name = hir.idents[td.name].text.clone();
                     if self.registry.lookup(&name).is_none() {
@@ -103,6 +120,7 @@ impl ProjectIndex {
                         self.registry.register(name.clone(), id);
                     }
                     self.record_decl_location(name, uri, *decl_id);
+                    Some(&td.modifiers)
                 }
                 Decl::Enum(ed) => {
                     let name = hir.idents[ed.name].text.clone();
@@ -122,6 +140,7 @@ impl ProjectIndex {
                         self.registry.register(name.clone(), id);
                     }
                     self.record_decl_location(name, uri, *decl_id);
+                    Some(&ed.modifiers)
                 }
                 Decl::Fn(fnd) => {
                     let name = hir.idents[fnd.name].text.clone();
@@ -132,13 +151,43 @@ impl ProjectIndex {
                         self.values.insert(name.clone());
                     }
                     self.record_decl_location(name, uri, *decl_id);
+                    Some(&fnd.modifiers)
                 }
                 Decl::Var(vd) => {
                     let name = hir.idents[vd.name].text.clone();
                     self.values.insert(name.clone());
                     self.record_decl_location(name, uri, *decl_id);
+                    Some(&vd.modifiers)
                 }
-                Decl::Pragma(_) => {}
+                Decl::Pragma(_) => None,
+            };
+            // P13.4: walk modifiers' annotations for `@expose("name")`
+            // and capture the rename target into the project-wide
+            // exposed map.
+            if let Some(modifiers) = modifiers {
+                let local_name = hir.decls[*decl_id]
+                    .name()
+                    .map(|n| hir.idents[n].text.clone())
+                    .unwrap_or_default();
+                for ann in &modifiers.annotations {
+                    if ann.name != "expose" {
+                        continue;
+                    }
+                    let rename = ann.args.first().cloned();
+                    let key = rename.clone().unwrap_or_else(|| local_name.clone());
+                    let entries = self.exposed.entry(key).or_default();
+                    let already = entries
+                        .iter()
+                        .any(|s| s.uri == *uri && s.decl == *decl_id && s.rename == rename);
+                    if !already {
+                        entries.push(ExposureSite {
+                            uri: uri.clone(),
+                            decl: *decl_id,
+                            local_name: local_name.clone(),
+                            rename,
+                        });
+                    }
+                }
             }
         }
         self.modules_ingested += 1;
@@ -419,6 +468,43 @@ private native fn now(): time;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, uri("/proj/a.gcl"));
         assert_eq!(hits[1].0, uri("/proj/b.gcl"));
+    }
+
+    #[test]
+    fn ingest_captures_expose_rename_into_exposed_map() {
+        // P13.4: `@expose("renamed")` keys into ProjectIndex::exposed by
+        // the renamed string; bare `@expose` keys by the decl's local
+        // name.
+        let hir = lower(
+            r#"
+@expose("public_alpha")
+fn alpha() {}
+
+@expose
+fn beta() {}
+
+@library("std", "1")
+fn ignored() {}
+"#,
+        );
+        let u = uri("/proj/api.gcl");
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&u, &hir);
+
+        let alpha_hits = idx.exposed.get("public_alpha").expect("public_alpha");
+        assert_eq!(alpha_hits.len(), 1);
+        assert_eq!(alpha_hits[0].rename.as_deref(), Some("public_alpha"));
+        assert_eq!(alpha_hits[0].local_name, "alpha");
+
+        let beta_hits = idx.exposed.get("beta").expect("beta");
+        assert_eq!(beta_hits.len(), 1);
+        assert_eq!(beta_hits[0].rename, None);
+
+        assert!(
+            !idx.exposed.contains_key("ignored"),
+            "@library annotation shouldn't add to exposed map: {:?}",
+            idx.exposed.keys().collect::<Vec<_>>(),
+        );
     }
 
     #[test]

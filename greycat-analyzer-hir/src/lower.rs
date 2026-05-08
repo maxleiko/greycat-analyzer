@@ -109,10 +109,12 @@ fn lower_modifiers(cx: &LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Modifi
     m
 }
 
-/// Collect annotation names (e.g. `["expose", "permission"]`) from the
-/// `annotations` named child of a decl-level node. Args are dropped —
-/// downstream consumers (P6.7 unused-decl lint) only need the bare name.
-fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<String> {
+/// Collect annotations (`@expose("renamed")`, `@permission`, …) from
+/// the `annotations` named child of a decl-level node. P13.4: returns
+/// `Annotation { name, args }` where `args` carries every
+/// string-literal argument the source provided (other arg shapes are
+/// dropped — call-site consumers we have today only read string args).
+fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<Annotation> {
     let mut cursor = decl_node.walk();
     let Some(annots_node) = decl_node
         .named_children(&mut cursor)
@@ -120,18 +122,43 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<Str
     else {
         return Vec::new();
     };
-    let mut names = Vec::new();
+    let mut out = Vec::new();
     let mut c2 = annots_node.walk();
     for ann in annots_node.named_children(&mut c2) {
         if ann.kind() != "annotation" {
             continue;
         }
         let mut c3 = ann.walk();
-        if let Some(ident) = ann.named_children(&mut c3).find(|n| n.kind() == "ident") {
-            names.push(cx.text(ident).to_string());
+        let Some(ident) = ann.named_children(&mut c3).find(|n| n.kind() == "ident") else {
+            continue;
+        };
+        let name = cx.text(ident).to_string();
+        let mut args: Vec<String> = Vec::new();
+        let mut c4 = ann.walk();
+        if let Some(args_node) = ann.named_children(&mut c4).find(|n| n.kind() == "args") {
+            let mut c5 = args_node.walk();
+            for a in args_node.named_children(&mut c5) {
+                if a.kind() == "string"
+                    && let Some(value) = string_literal_value(cx, a)
+                {
+                    args.push(value);
+                }
+            }
+        }
+        out.push(Annotation { name, args });
+    }
+    out
+}
+
+fn string_literal_value(cx: &LowerCtx, string_node: tree_sitter::Node<'_>) -> Option<String> {
+    let mut cursor = string_node.walk();
+    let mut value = String::new();
+    for piece in string_node.named_children(&mut cursor) {
+        if piece.kind() == "string_fragment" {
+            value.push_str(cx.text(piece));
         }
     }
-    names
+    Some(value)
 }
 
 fn doc_text(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Option<String> {
