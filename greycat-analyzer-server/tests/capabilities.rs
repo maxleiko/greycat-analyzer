@@ -261,6 +261,65 @@ fn inlay_hints_annotate_typeless_locals() {
     assert!(s.contains("int"), "expected int in hint, got `{s}`");
 }
 
+/// Anchors the architectural rule: LSP inlay hints MUST run through
+/// `inlay_hints_with_project` so the cross-module fixup passes
+/// (P15.7 / P16.3 / P16.4) flow into the inferred-type label.
+///
+/// Reproduces the bug we hit in the IDE on `var s = x.s.size();`
+/// where the LSP rendered `s: any` because the single-file
+/// `inlay_hints` shim re-ran `analyzer::analyze` without the
+/// project pipeline. After P16.3 + P16.4 landed, `dump-types` reported
+/// `core::int` correctly; this test prevents regressing the LSP path
+/// next to it.
+#[test]
+fn inlay_hints_with_project_use_cross_module_call_return_types() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    use std::str::FromStr;
+
+    // Two-module project: `Foo` lives in lib.gcl with a `size(): int`
+    // method; `main.gcl` calls `x.s.size()` and assigns to a typeless
+    // local. The LSP inlay hint must emit `: int`, not `: any`.
+    let lib_uri = Uri::from_str("file:///lib.gcl").unwrap();
+    let main_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        lib_uri,
+        "type Foo {\n    s: String;\n    fn size(): int { return 0; }\n}\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        main_uri.clone(),
+        "fn read(x: Foo) {\n    var n = x.size();\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_cell = mgr.get(&main_uri).expect("user doc");
+    let user_doc = user_cell.borrow();
+    let module = pa.module(&main_uri).expect("user module cached");
+
+    let range = lsp_types::Range {
+        start: pos(0, 0),
+        end: pos(99, 0),
+    };
+    let hints = capabilities::inlay_hints_with_project(module, &user_doc.text, &range);
+    assert_eq!(
+        hints.len(),
+        1,
+        "expected 1 inlay hint for `var n = x.size();`, got {}: {hints:?}",
+        hints.len()
+    );
+    let InlayHintLabel::String(s) = &hints[0].label else {
+        panic!("expected string label, got {:?}", hints[0].label)
+    };
+    assert_eq!(
+        s, ": int",
+        "method-call return type should propagate to the inlay hint, got `{s}`"
+    );
+}
+
 // =============================================================================
 // formatting
 // =============================================================================

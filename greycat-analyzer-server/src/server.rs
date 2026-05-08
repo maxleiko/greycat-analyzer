@@ -510,10 +510,14 @@ fn completion_handler(server: &Backend, params: CompletionParams) -> Option<Comp
 fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<InlayHint>> {
     let cell = server.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
-    Some(capabilities::inlay_hints(
+    // Read from the project cache so cross-module fixup passes
+    // (P15.7 / P16.3 / P16.4) are reflected in the inferred types.
+    // The single-file `capabilities::inlay_hints` shim would miss
+    // those — see the doc on `inlay_hints_with_project`.
+    let module = server.project_analysis.module(&params.text_document.uri)?;
+    Some(capabilities::inlay_hints_with_project(
+        module,
         &doc.text,
-        &doc.lib,
-        doc.root_node(),
         &params.range,
     ))
 }

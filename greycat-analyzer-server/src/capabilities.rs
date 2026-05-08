@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use greycat_analyzer_analysis::analyzer::Severity;
 use greycat_analyzer_analysis::lint::{LintSeverity, run_lints};
-use greycat_analyzer_analysis::project::ProjectAnalysis;
+use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_analysis::resolver::{Definition, resolve};
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_hir::Hir;
@@ -1689,17 +1689,29 @@ fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
 // P3.7 — inlay hints
 // =============================================================================
 
-pub fn inlay_hints(
+/// LSP entry point for inlay hints — consumes the cached
+/// [`ModuleAnalysis`] from [`ProjectAnalysis`] so the cross-module
+/// fixup passes (P16.3 cross-module member typing, P16.4 call-on-
+/// member return-type inference, P15.7 cross-module call return-type
+/// inference) all flow through. Capabilities that re-run a single-
+/// file [`analyzer::analyze`] would miss those — that's the bug we
+/// kept hitting whenever new project-level inference landed.
+///
+/// Convention: every LSP handler in [`crate::server`] reads from
+/// `Backend::project_analysis` and calls one of these `*_with_project`
+/// variants. The legacy `(text, lib, root)` shims below stay for
+/// unit tests / single-file CLI commands but they must never be
+/// reached from a live LSP session.
+pub fn inlay_hints_with_project(
+    module: &ModuleAnalysis,
     text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
     range: &lsp_types::Range,
 ) -> Vec<InlayHint> {
-    let hir = lower_module(text, "module", lib, root);
-    let resolutions = resolve(&hir);
-    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let hir = &module.hir;
+    let resolutions = &module.resolutions;
+    let analysis = &module.analysis;
 
-    let module = match hir.module.as_ref() {
+    let hir_module = match hir.module.as_ref() {
         Some(m) => m,
         None => return Vec::new(),
     };
@@ -1710,13 +1722,13 @@ pub fn inlay_hints(
     );
 
     let mut out = Vec::new();
-    for decl_id in &module.decls {
+    for decl_id in &hir_module.decls {
         if let Decl::Fn(fnd) = &hir.decls[*decl_id] {
             // P13.7: return-type hint when the fn has no declared
             // return type but the analyzer inferred one from the body.
             if fnd.return_type.is_none()
                 && let Some(body) = fnd.body
-                && let Some(ty) = inferred_fn_return(&hir, &analysis, body)
+                && let Some(ty) = inferred_fn_return(hir, analysis, body)
             {
                 let name_range = &hir.idents[fnd.name].byte_range;
                 if name_range.start <= want.1 && name_range.end >= want.0 {
@@ -1736,13 +1748,38 @@ pub fn inlay_hints(
             }
             // Walk the body for `var name = expr;` shapes (no declared type).
             if let Some(body) = fnd.body {
-                emit_var_hints(&hir, &analysis, body, want, text, &mut out);
+                emit_var_hints(hir, analysis, body, want, text, &mut out);
                 // P13.7: argument-name hints inside the body.
-                emit_call_arg_hints(&hir, &resolutions, body, want, text, &mut out);
+                emit_call_arg_hints(hir, resolutions, body, want, text, &mut out);
             }
         }
     }
     out
+}
+
+/// Single-file shim — only used by unit tests / single-file CLI
+/// commands. **The LSP server never calls this directly**; it goes
+/// through [`inlay_hints_with_project`] so the cross-module fixup
+/// passes apply. Marked `#[doc(hidden)]` to keep external consumers
+/// pointed at the project-aware path.
+#[doc(hidden)]
+pub fn inlay_hints(
+    text: &str,
+    lib: &str,
+    root: tree_sitter::Node<'_>,
+    range: &lsp_types::Range,
+) -> Vec<InlayHint> {
+    let hir = lower_module(text, "module", lib, root);
+    let resolutions = resolve(&hir);
+    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let module = ModuleAnalysis {
+        hir,
+        resolutions,
+        analysis,
+        lints: Vec::new(),
+        timings: Default::default(),
+    };
+    inlay_hints_with_project(&module, text, range)
 }
 
 /// P13.7 — peek at the last expression-shaped statement of a fn body
