@@ -1,6 +1,6 @@
 use std::{
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
     time::{Duration, Instant},
@@ -99,15 +99,24 @@ impl Lint {
         // for GreyCat's project model, where the entrypoint's pragmas
         // are the source of truth.
         let total_start = Instant::now();
-        let ctx = FsContext::new().unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
-        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let ctx_for_diags =
+            FsContext::new().unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
+        let mut mgr = SourceManager::with_context(Arc::new(ctx_for_diags));
         let report = mgr.load_project(&project_filepath);
-        for lib in &report.unresolved_libraries {
-            eprintln!("warning: unresolved @library('{lib}')");
-        }
+        // P15.5 — `unresolved_libraries` is now surfaced as typed
+        // `unresolved-library` diagnostics by `pragma_diagnostics`,
+        // emitted alongside parse / semantic / lint diagnostics below.
+        // Only loader-internal `errors` (file read failures, etc.)
+        // remain free-form here.
         for err in &report.errors {
             eprintln!("warning: {err}");
         }
+        // P15.5 — separate FsContext for pragma_diagnostics so the
+        // manager keeps owning its `Arc<dyn Context>`. Both reads from
+        // the same `FsContext::new()` shape.
+        let pragma_ctx =
+            FsContext::new().unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
+        let pragma_root = project_filepath.parent().map(Path::to_path_buf);
 
         // One project-level analyzer pipeline over every reachable doc.
         let analysis = ProjectAnalysis::analyze(&mgr);
@@ -130,6 +139,19 @@ impl Lint {
             let load = load_by_uri.get(uri).copied().unwrap_or_default();
             let timings = analysis.module(uri).map(|m| m.timings).unwrap_or_default();
             let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
+            if let Some(root) = pragma_root.as_ref() {
+                let desc = greycat_analyzer_core::module_desc::parse_module_desc(
+                    uri.clone(),
+                    &doc.text,
+                    doc.root_node(),
+                );
+                diagnostics.extend(greycat_analyzer_core::diagnostics::pragma_diagnostics(
+                    &doc.text,
+                    &desc,
+                    root,
+                    &pragma_ctx,
+                ));
+            }
             if let Some(module) = analysis.module(uri) {
                 for d in &module.analysis.diagnostics {
                     diagnostics.push(Diagnostic {
@@ -243,6 +265,19 @@ impl Lint {
                         .map(|m| m.timings)
                         .unwrap_or_default();
                     let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
+                    if let Some(root) = pragma_root.as_ref() {
+                        let desc = greycat_analyzer_core::module_desc::parse_module_desc(
+                            uri.clone(),
+                            &doc.text,
+                            doc.root_node(),
+                        );
+                        diagnostics.extend(greycat_analyzer_core::diagnostics::pragma_diagnostics(
+                            &doc.text,
+                            &desc,
+                            root,
+                            &pragma_ctx,
+                        ));
+                    }
                     if let Some(module) = new_analysis.module(uri) {
                         for d in &module.analysis.diagnostics {
                             diagnostics.push(Diagnostic {

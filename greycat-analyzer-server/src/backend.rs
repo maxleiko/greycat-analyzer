@@ -4,7 +4,12 @@ use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::analyzer::Severity;
 use greycat_analyzer_analysis::lint::LintSeverity;
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
-use greycat_analyzer_core::{Document, SourceManager, diagnostics::parse_diagnostics};
+use greycat_analyzer_core::module_desc::parse_module_desc;
+use greycat_analyzer_core::resolver::FsContext;
+use greycat_analyzer_core::{
+    Document, SourceManager,
+    diagnostics::{parse_diagnostics, pragma_diagnostics},
+};
 use log::{debug, warn};
 use lsp_server::*;
 use lsp_types::{NumberOrString, Position, Range};
@@ -19,6 +24,10 @@ pub struct Backend {
     pub client: Sender<Message>,
     pub manager: SourceManager,
     pub project_analysis: ProjectAnalysis,
+    /// Project root (parent of `project.gcl`) captured at workspace
+    /// load time. P15.5 uses it to anchor `@include` / `@library`
+    /// pragma diagnostics on every publish.
+    pub project_root: Option<PathBuf>,
 }
 
 impl Backend {
@@ -43,6 +52,16 @@ impl Backend {
         let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
         if let Some(module) = self.project_analysis.module(uri) {
             diags.extend(diagnostics_from_module(&doc.text, module));
+        }
+        // P15.5 — pragma resolution diagnostics. Recomputed on every
+        // publish so edits to `@include` / `@library` pragmas reflect
+        // immediately. Skipped when no project root is known (single-
+        // file mode).
+        if let Some(root) = self.project_root.as_ref() {
+            let desc = parse_module_desc(uri.clone(), &doc.text, doc.root_node());
+            if let Ok(ctx) = FsContext::new() {
+                diags.extend(pragma_diagnostics(&doc.text, &desc, root, &ctx));
+            }
         }
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
@@ -76,6 +95,7 @@ impl Backend {
             );
             return;
         }
+        self.project_root = Some(ws_root.clone());
         let report = self.manager.load_project(&project_file);
         debug!(
             "[load_project] {} files loaded from {}",

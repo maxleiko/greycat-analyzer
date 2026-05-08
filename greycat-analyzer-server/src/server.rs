@@ -107,6 +107,7 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
         client: conn.sender.clone(),
         manager: Default::default(),
         project_analysis: Default::default(),
+        project_root: None,
     };
 
     server.initialized(&init)?;

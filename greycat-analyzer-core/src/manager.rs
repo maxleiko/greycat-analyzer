@@ -164,11 +164,9 @@ impl SourceManager {
         for inc in &desc.includes {
             let dir = project_dir.join(&inc.value);
             if !self.ctx.is_dir(&dir) {
-                report.errors.push(format!(
-                    "@include('{}'): directory not found at {}",
-                    inc.value,
-                    dir.display()
-                ));
+                // P15.5 — surfaced as a typed `unresolved-include`
+                // diagnostic via `core::diagnostics::pragma_diagnostics`.
+                // Leave the loader silent so consumers don't see it twice.
                 continue;
             }
             for path in self.ctx.iter_gcl(&dir) {
