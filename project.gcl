@@ -1,2 +1,5 @@
 @library("std", "8.0.269-dev");
 
+fn main() {
+    var arr = ["aaa", "bbb"];
+}

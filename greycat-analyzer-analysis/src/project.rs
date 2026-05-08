@@ -143,32 +143,15 @@ impl ProjectAnalysis {
         // global decl table.
         self.resolve_cross_module_members();
 
-        // Pass 3.4 (P16.3): cross-module member-expr typing. After
-        // pass 3 binds `foreign_member_uses`, walk every module's
-        // `Expr::Member` / `Expr::Arrow` and write back the foreign
-        // attr / method's translated type so `var s = recv.attr` /
-        // method-ref shapes carry the right type instead of `any`.
-        self.infer_cross_module_member_types();
-
+        // Pass 3.4 (P16.3): cross-module member-expr typing.
+        let _ = self.infer_cross_module_member_types();
         // Pass 3.5 (P15.7 + P16.4): cross-module call return-type
-        // inference. Walks every module's `Expr::Call` whose callee is
-        // `Expr::Static`, `Expr::QualifiedStatic`, or `Expr::Member` /
-        // `Expr::Arrow` bound to a method, looks up the method's
-        // declared return type, translates it into the current
-        // module's type arena, and updates
-        // `analysis.expr_types[call_id]`.
-        self.infer_cross_module_call_types();
-
-        // Pass 3.6 (P15.10): call-site arg-type validation. Runs after
-        // Architectural assertion: nothing earlier in the pipeline
-        // may emit type-relation diagnostics — those would compare
-        // against pre-fixup `expr_types` and surface false-positives
-        // for cross-module Calls. `validate_type_relations` is the
-        // sole producer; it covers var-init / assign / return /
-        // condition / call-arg checks in one walk.
-        #[cfg(debug_assertions)]
-        self.assert_no_type_relation_diags_yet();
-        self.validate_type_relations();
+        // inference (Static / QualifiedStatic / Member / Arrow / Ident
+        // callees).
+        let _ = self.infer_cross_module_call_types();
+        // Pass 3.6: type-relation validation. Full project re-validate
+        // because `rebuild` started from an empty cache.
+        self.validate_type_relations(None);
 
         // Pass 4 (P14.9): bump `references_to` for every decl that's
         // referenced from another module via a qualified-name access
@@ -253,10 +236,11 @@ impl ProjectAnalysis {
     /// `var x = recv.attr` and method-ref shapes carry the right type
     /// instead of the placeholder `any`. Mirrors the
     /// `read_type_shape` + `mint_type_shape` pattern from pass 3.5.
-    fn infer_cross_module_member_types(&mut self) {
+    fn infer_cross_module_member_types(&mut self) -> HashSet<String> {
         use crate::analyzer::MemberDef;
         use greycat_analyzer_hir::types::{Expr, Stmt};
 
+        let mut touched_uris: HashSet<String> = HashSet::new();
         #[allow(clippy::mutable_key_type)]
         let mut expr_updates: HashMap<Uri, Vec<(Idx<Expr>, TypeShape)>> = HashMap::new();
         for (cur_uri, cur_module) in &self.modules {
@@ -302,6 +286,7 @@ impl ProjectAnalysis {
             let Some(m) = self.modules.get_mut(&uri) else {
                 continue;
             };
+            touched_uris.insert(uri.as_str().to_string());
             let mut touched: HashMap<Idx<Expr>, greycat_analyzer_types::TypeId> = HashMap::new();
             for (expr_id, shape) in entries {
                 let ty = mint_type_shape(&shape, &mut m.analysis.types);
@@ -324,6 +309,7 @@ impl ProjectAnalysis {
                 m.analysis.def_types.insert(local.name, new_ty);
             }
         }
+        touched_uris
     }
 
     /// P15.7 — cross-module call return-type inference. After
@@ -341,10 +327,11 @@ impl ProjectAnalysis {
     /// keeps the generic shape (e.g. `Array<T>`) without binding `T`.
     /// Concrete returns (`Identity`, `String`, `Array<Permission>`)
     /// flow through cleanly.
-    fn infer_cross_module_call_types(&mut self) {
+    fn infer_cross_module_call_types(&mut self) -> HashSet<String> {
         use crate::analyzer::{ForeignDecl, ForeignMember};
         use greycat_analyzer_hir::types::{Expr, Stmt};
 
+        let mut touched_uris: HashSet<String> = HashSet::new();
         // Phase 1 — read-only: collect the type-shape that each
         // affected expr should carry, plus a list of Stmt::Var whose
         // init expr feeds into one of those updates so we can re-link
@@ -515,6 +502,7 @@ impl ProjectAnalysis {
             let Some(m) = self.modules.get_mut(&uri) else {
                 continue;
             };
+            touched_uris.insert(uri.as_str().to_string());
             // Build a small index of which exprs we touched.
             let mut touched: HashMap<Idx<Expr>, greycat_analyzer_types::TypeId> = HashMap::new();
             for (expr_id, shape) in entries {
@@ -558,9 +546,10 @@ impl ProjectAnalysis {
                 }
             }
         }
+        touched_uris
     }
 
-    /// P15.10 — call-site arg-type validation across the project.
+    /// Walk every module's `Expr::Call` and emit a diagnostic for
     /// Walks every module's `Expr::Call`, resolves the callee to its
     /// declared `FnDecl` (in-module via `Resolutions::uses` + `member_uses`,
     /// cross-module via `foreign_member_uses` + `QualifiedStatic`),
@@ -658,32 +647,58 @@ impl ProjectAnalysis {
     /// false positives — the rubber-banding we kept hitting.
     ///
     /// Covers:
-    ///   - `if`/`while`/`do-while`/`for`-mid bool conditions
-    ///   - `var x: T = init` / top-level + local + type-attr inits
-    ///   - `target = value` assignments
-    ///   - `return value;` value vs declared return type
-    #[cfg(debug_assertions)]
-    fn assert_no_type_relation_diags_yet(&self) {
-        for (uri, m) in &self.modules {
-            for d in &m.analysis.diagnostics {
-                debug_assert!(
-                    d.category != crate::analyzer::DiagCategory::TypeRelation,
-                    "type-relation diagnostic emitted before validate_type_relations \
-                     in {uri:?}: {msg}. \
-                     Producer must defer to the validation post-pass — see DiagCategory.",
-                    uri = uri.as_str(),
-                    msg = d.message,
-                );
-            }
-        }
-    }
+    ///
+    /// - `if` / `while` / `do-while` / `for`-mid bool conditions
+    /// - `var x: T = init` (top-level + local + type-attr inits)
+    /// - `target = value` assignments
+    /// - `return value;` value vs declared return type
+    /// - call-site arg vs declared param type
+    ///
+    /// Modes:
+    /// - `restrict = None` revalidates every cached module (used by
+    ///   `rebuild`).
+    /// - `restrict = Some(set)` only revalidates the listed URIs —
+    ///   the changed URI plus any module whose `expr_types` were
+    ///   touched by the cross-module fixup passes. Used by
+    ///   `invalidate` to keep per-keystroke cost bounded.
+    fn validate_type_relations(&mut self, restrict: Option<&HashSet<String>>) {
+        use crate::analyzer::{DiagCategory, SemanticDiagnostic};
 
-    fn validate_type_relations(&mut self) {
-        use crate::analyzer::SemanticDiagnostic;
+        let in_scope = |uri: &Uri| -> bool {
+            match restrict {
+                None => true,
+                Some(set) => set.contains(uri.as_str()),
+            }
+        };
+
+        // Idempotent: drop this pass's previous output for the URIs
+        // we're about to revalidate. Modules outside `restrict` keep
+        // their last-validated diagnostics — that's the whole point
+        // of the incremental flow.
+        for (uri, m) in self.modules.iter_mut() {
+            if !in_scope(uri) {
+                continue;
+            }
+            m.analysis
+                .diagnostics
+                .retain(|d| d.category != DiagCategory::TypeRelation);
+        }
+
+        // Architectural invariant — no producer outside this pass
+        // may emit type-relation diagnostics. After the per-URI
+        // clear above, every remaining TypeRelation diagnostic in
+        // the cache is either from a prior validation run on an
+        // out-of-scope module (correct) or from a buggy pre-pass
+        // emitter (assertion catches it for in-scope modules).
+        #[cfg(debug_assertions)]
+        self.assert_no_in_scope_type_relation_diags(restrict);
 
         #[allow(clippy::mutable_key_type)]
         let mut diag_updates: HashMap<Uri, Vec<SemanticDiagnostic>> = HashMap::new();
         for (cur_uri, cur_module) in &self.modules {
+            if !in_scope(cur_uri) {
+                continue;
+            }
             let mut diags: Vec<SemanticDiagnostic> = Vec::new();
             validate_module_type_relations(cur_module, &mut diags);
             // Call-arg validation needs cross-module access (foreign
@@ -697,6 +712,30 @@ impl ProjectAnalysis {
         for (uri, diags) in diag_updates {
             if let Some(m) = self.modules.get_mut(&uri) {
                 m.analysis.diagnostics.extend(diags);
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_no_in_scope_type_relation_diags(&self, restrict: Option<&HashSet<String>>) {
+        use crate::analyzer::DiagCategory;
+        for (uri, m) in &self.modules {
+            let in_scope = match restrict {
+                None => true,
+                Some(set) => set.contains(uri.as_str()),
+            };
+            if !in_scope {
+                continue;
+            }
+            for d in &m.analysis.diagnostics {
+                debug_assert!(
+                    d.category != DiagCategory::TypeRelation,
+                    "type-relation diagnostic emitted before validate_type_relations \
+                     in {uri:?}: {msg}. Producer must defer to the validation post-pass — \
+                     see DiagCategory.",
+                    uri = uri.as_str(),
+                    msg = d.message,
+                );
             }
         }
     }
@@ -895,19 +934,17 @@ impl ProjectAnalysis {
         // is invalidated. Cheap because `deferred_member_uses` is small
         // per module and the work is purely table-lookup.
         self.resolve_cross_module_members();
-        // P16.3: cross-module member-expr typing.
-        self.infer_cross_module_member_types();
-        // P15.7 + P16.4: cross-module call return-type inference +
-        // bare-ident and qualified-static type fixups.
-        self.infer_cross_module_call_types();
-        // Architectural assertion: nothing earlier in the pipeline
-        // may emit type-relation diagnostics. `validate_type_relations`
-        // is the sole producer; it covers var-init / assign / return /
-        // condition / call-arg checks in one walk.
-        #[cfg(debug_assertions)]
-        self.assert_no_type_relation_diags_yet();
-        self.validate_type_relations();
-        // P14.9: re-derive qualified-name reference counts.
+        // P16.3 / P15.7 / P16.4 — cross-module type fixups. Each
+        // returns the set of URIs whose `expr_types` were touched;
+        // those are the modules whose validation results may have
+        // changed and that we therefore need to revalidate.
+        let mut touched: HashSet<String> = HashSet::new();
+        touched.insert(uri.as_str().to_string()); // changed doc itself
+        touched.extend(self.infer_cross_module_member_types());
+        touched.extend(self.infer_cross_module_call_types());
+        // Incremental validation — only the changed URI plus any
+        // module whose types were updated by the post-passes.
+        self.validate_type_relations(Some(&touched));
         self.compute_qualified_refs(manager);
     }
 
