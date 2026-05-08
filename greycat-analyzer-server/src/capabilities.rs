@@ -2268,6 +2268,12 @@ pub fn completion_with_project(
             items,
         });
     }
+    if let Some(items) = type_position_completion(text, node, byte, uri, project) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     if let Some(items) = ident_or_keyword_completion(text, node, byte, uri, project) {
         return Some(CompletionList {
             is_incomplete: false,
@@ -3478,6 +3484,123 @@ fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<(String, usize, 
     }
     let recv = text.get(i..sep_start)?.to_string();
     Some((recv, sep_start, typed))
+}
+
+// =============================================================================
+// P15.2.6 — type-position completion
+// =============================================================================
+
+/// Type-position completion: when the cursor sits inside a
+/// `type_ident` slot — `var x: |`, `<|`, `extends |`, fn param /
+/// return type, etc. — emit only type-shaped names (in-module type /
+/// enum decls + every type registered in the project's
+/// [`ProjectIndex`] + runtime types + primitives) prefix-filtered.
+fn type_position_completion(
+    text: &str,
+    node: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+    uri: &Uri,
+    project: &greycat_analyzer_analysis::project::ProjectAnalysis,
+) -> Option<Vec<CompletionItem>> {
+    ancestor_with_kind(node, "type_ident")?;
+    // Bail if we're on the RHS of a member / static / annotation chain.
+    let bytes = text.as_bytes();
+    let cap = cursor_byte.min(bytes.len());
+    let mut i = cap;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i > 0 && matches!(bytes[i - 1], b'.' | b'>' | b'@') {
+        return None;
+    }
+    // Allow `module::|Type` — the static branch already handles that.
+    if i >= 2 && bytes[i - 1] == b':' && bytes[i - 2] == b':' {
+        return None;
+    }
+    let typed = ident_prefix_at_cursor(text, cursor_byte);
+    let prefix_lower = typed.to_lowercase();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let push = |items: &mut Vec<CompletionItem>,
+                seen: &mut std::collections::HashSet<String>,
+                name: &str,
+                kind: CompletionItemKind| {
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            return;
+        }
+        if seen.insert(name.into()) {
+            items.push(CompletionItem {
+                label: name.into(),
+                kind: Some(kind),
+                insert_text: Some(name.into()),
+                ..Default::default()
+            });
+        }
+    };
+
+    // In-module decls (always visible at top level).
+    if let Some(module) = project.module(uri)
+        && let Some(m) = module.hir.module.as_ref()
+    {
+        for decl_id in &m.decls {
+            let kind = match &module.hir.decls[*decl_id] {
+                Decl::Type(_) => CompletionItemKind::CLASS,
+                Decl::Enum(_) => CompletionItemKind::ENUM,
+                _ => continue,
+            };
+            if let Some(name_id) = module.hir.decls[*decl_id].name() {
+                let name = module.hir.idents[name_id].text.clone();
+                push(&mut items, &mut seen, &name, kind);
+            }
+        }
+    }
+    // In-scope generic type-params from the enclosing fn / type.
+    if let Some(module) = project.module(uri) {
+        for (name, kind, _) in scope_names_at(&module.hir, cursor_byte) {
+            if matches!(kind, CompletionItemKind::TYPE_PARAMETER) {
+                push(&mut items, &mut seen, &name, kind);
+            }
+        }
+    }
+    // Project-level type / enum decls.
+    for (name, locs) in &project.index.decl_locations {
+        if let Some((u, d)) = locs.first()
+            && let Some(m) = project.module(u)
+        {
+            let kind = match &m.hir.decls[*d] {
+                Decl::Type(_) => CompletionItemKind::CLASS,
+                Decl::Enum(_) => CompletionItemKind::ENUM,
+                _ => continue,
+            };
+            push(&mut items, &mut seen, name, kind);
+        }
+    }
+    // Runtime types.
+    for &name in greycat_analyzer_analysis::stdlib::BUILTIN_RUNTIME_TYPES {
+        push(&mut items, &mut seen, name, CompletionItemKind::CLASS);
+    }
+    // Primitives.
+    for &p in &[
+        "int", "float", "bool", "char", "String", "time", "duration", "geo", "any",
+    ] {
+        push(&mut items, &mut seen, p, CompletionItemKind::CLASS);
+    }
+    // Module names — type slots can read `module::Foo`, so module
+    // names are valid here as the leading segment.
+    for name in project.index.module_names.keys() {
+        push(&mut items, &mut seen, name, CompletionItemKind::MODULE);
+    }
+
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
 }
 
 // =============================================================================

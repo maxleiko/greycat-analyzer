@@ -717,6 +717,49 @@ fn completion_after_dot_prefix_filters() {
     );
 }
 
+/// P15.2.6 — type-position completion at `var x: |` lists in-module
+/// type decls and runtime types, but not values like fn names.
+#[test]
+fn completion_at_type_position_lists_types_only() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type MyShape { x: int; }\nfn helper() {}\nfn use_() { var v: M = nil; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor on the partial type ident `M` after `var v: ` (line 2 col 20).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 20),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"MyShape"), "type missing: {labels:?}");
+    assert!(
+        labels.contains(&"Map"),
+        "Map runtime type missing: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"helper"),
+        "fn leaked into type position: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"return"),
+        "keyword leaked into type position: {labels:?}"
+    );
+}
+
 /// P15.2.5 — `Type::|` static completion lists the type's static
 /// methods.
 #[test]
