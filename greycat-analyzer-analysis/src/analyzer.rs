@@ -1289,6 +1289,13 @@ impl<'a> Cx<'a> {
                 if let Some(ret) = self.try_generic_call_inference(callee, &arg_tys, call_range) {
                     return ret;
                 }
+                // P15.10: pairwise arg-type validation runs in
+                // `ProjectAnalysis` pass 3.6 (after pass 3.5 settles
+                // static-expr call return types) so outer calls whose
+                // args contain inner static-expr calls validate
+                // against the *post-pass-3.5* arg types. Doing it here
+                // would surface false positives for arg shapes whose
+                // type isn't known until pass 3.5 fixes them up.
                 let _ = callee_ty;
                 self.any()
             }

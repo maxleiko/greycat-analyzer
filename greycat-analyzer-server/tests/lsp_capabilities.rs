@@ -405,6 +405,63 @@ fn cross_module_static_call_infers_return_type() {
     );
 }
 
+/// P15.10 — call-site arg-type validation. The user's baseline:
+/// passing `42` (int) where `Identity` is expected should produce a
+/// typed diagnostic at the offending arg's range.
+#[test]
+fn call_arg_type_mismatch_emits_diagnostic() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(runtime_uri, "type Identity {}\n", "p", false);
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn expect_Identity(_: Identity) {}\nfn main() { expect_Identity(42); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let has_mismatch = user_module
+        .analysis
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("`int`") && d.message.contains("Identity"));
+    assert!(
+        has_mismatch,
+        "expected an arg-type mismatch diagnostic; got: {:?}",
+        user_module.analysis.diagnostics
+    );
+}
+
+/// P15.10 — bare ident references to a type/fn flow through pass 3.5
+/// to the right runtime type. `expect_ty(Identity)` (where
+/// `expect_ty(_: type)` and Identity is a type) should *not* error.
+#[test]
+fn bare_type_ident_used_as_value_is_type() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(runtime_uri, "type Identity {}\n", "p", false);
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn expect_ty(_: type) {}\nfn main() { expect_ty(Identity); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    assert!(
+        user_module.analysis.diagnostics.is_empty(),
+        "bare Identity should pass `expect_ty(_: type)`; got: {:?}",
+        user_module.analysis.diagnostics
+    );
+}
+
 /// P15.8 — `var x = runtime::Identity::create("a", "b");` (chained
 /// `module::Type::method(...)` call) infers `x: Identity`.
 #[test]

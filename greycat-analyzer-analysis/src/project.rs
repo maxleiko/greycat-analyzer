@@ -150,6 +150,13 @@ impl ProjectAnalysis {
         // type arena, and updates `analysis.expr_types[call_id]`.
         self.infer_cross_module_call_types();
 
+        // Pass 3.6 (P15.10): call-site arg-type validation. Runs after
+        // pass 3.5 so outer calls whose args contain inner static-expr
+        // calls (e.g. `expect_Identity(Identity::create(...))`) see the
+        // post-pass-3.5 inner-call return type instead of the
+        // placeholder `any` the analyzer first-pass left behind.
+        self.validate_call_arg_types();
+
         // Pass 4 (P14.9): bump `references_to` for every decl that's
         // referenced from another module via a qualified-name access
         // (`<module>::<name>`, `<module>::<type>::<name>`, etc.). Lets
@@ -270,6 +277,24 @@ impl ProjectAnalysis {
                     .or_default()
                     .push((static_id, shape));
             }
+            // 1a-tris) Bare ident references to a top-level decl
+            // (`Identity`, `someFn` used as a value). Type decls
+            // become `type`, fn decls become `function`. Both
+            // intra- and cross-module shapes are covered.
+            for (ident_expr_id, ident_expr) in cur_module.hir.exprs.iter() {
+                let Expr::Ident(name_idx) = ident_expr else {
+                    continue;
+                };
+                let shape =
+                    match resolve_bare_ident_decl_shape(&self.modules, cur_module, *name_idx) {
+                        Some(sh) => sh,
+                        None => continue,
+                    };
+                expr_updates
+                    .entry(cur_uri.clone())
+                    .or_default()
+                    .push((ident_expr_id, shape));
+            }
             // 1a-bis) QualifiedStatic standalone shapes (P15.8 chained).
             for (qstatic_id, qstatic_expr) in cur_module.hir.exprs.iter() {
                 let Expr::QualifiedStatic { chain, .. } = qstatic_expr else {
@@ -348,6 +373,103 @@ impl ProjectAnalysis {
                     continue;
                 };
                 m.analysis.def_types.insert(local.name, new_ty);
+            }
+        }
+    }
+
+    /// P15.10 — call-site arg-type validation across the project.
+    /// Walks every module's `Expr::Call`, resolves the callee to its
+    /// declared `FnDecl` (in-module via `Resolutions::uses` + `member_uses`,
+    /// cross-module via `foreign_member_uses` + `QualifiedStatic`),
+    /// and emits a `value of type X is not assignable to parameter Y`
+    /// diagnostic for each mismatched arg.
+    ///
+    /// Runs after pass 3.5 so the arg-side `expr_types` reflect any
+    /// cross-module return-type inferences (otherwise outer calls
+    /// whose args are inner static-expr calls would all surface
+    /// "value of type `any`" false positives).
+    fn validate_call_arg_types(&mut self) {
+        use crate::analyzer::{SemanticDiagnostic, Severity};
+        use greycat_analyzer_hir::types::Expr;
+
+        #[allow(clippy::mutable_key_type)]
+        let mut diag_updates: HashMap<Uri, Vec<SemanticDiagnostic>> = HashMap::new();
+        for (cur_uri, cur_module) in &self.modules {
+            for (_call_id, call_expr) in cur_module.hir.exprs.iter() {
+                let Expr::Call(call) = call_expr else {
+                    continue;
+                };
+                let Some((foreign_uri_opt, fn_decl_id)) =
+                    resolve_call_target(&self.modules, &self.index, cur_module, call.callee)
+                else {
+                    continue;
+                };
+                let foreign_module = match &foreign_uri_opt {
+                    Some(u) => self.modules.get(u),
+                    None => Some(cur_module),
+                };
+                let Some(fn_module) = foreign_module else {
+                    continue;
+                };
+                let Decl::Fn(fnd) = &fn_module.hir.decls[fn_decl_id] else {
+                    continue;
+                };
+                if !fnd.generics.is_empty() {
+                    continue;
+                }
+                let pair_count = fnd.params.len().min(call.args.len());
+                for i in 0..pair_count {
+                    let p = &fn_module.hir.fn_params[fnd.params[i]];
+                    let Some(declared_ref) = p.ty else {
+                        continue;
+                    };
+                    // Translate the declared param type from the foreign
+                    // (or in-module) HIR into the *caller's* arena.
+                    let declared_shape = read_type_shape(&fn_module.hir, declared_ref);
+                    let arg_ty = match cur_module.analysis.expr_types.get(&call.args[i]).copied() {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    // We need a TypeId for the declared shape in the
+                    // caller's arena to compare. Mint it via a temp
+                    // arena clone — we don't want to mutate
+                    // `cur_module.analysis.types` from this read-only
+                    // pass, so we work with a clone.
+                    let mut tmp_arena = cur_module.analysis.types.clone();
+                    let declared_ty = mint_type_shape(&declared_shape, &mut tmp_arena);
+                    if !greycat_analyzer_types::is_assignable_to(&tmp_arena, arg_ty, declared_ty) {
+                        let p_name = fn_module.hir.idents[p.name].text.clone();
+                        let arg_display =
+                            greycat_analyzer_types::display(&cur_module.analysis.types, arg_ty);
+                        let declared_display =
+                            greycat_analyzer_types::display(&tmp_arena, declared_ty);
+                        let msg = format!(
+                            "value of type `{}` is not assignable to parameter `{}: {}`",
+                            arg_display, p_name, declared_display
+                        );
+                        // `Expr::Ident` returns 0..0 from `byte_range()`;
+                        // grab the ident's actual byte_range from the
+                        // arena so the diagnostic anchors at the call-
+                        // site arg, not at line 1 col 1.
+                        let r = match &cur_module.hir.exprs[call.args[i]] {
+                            Expr::Ident(idx) => cur_module.hir.idents[*idx].byte_range.clone(),
+                            other => other.byte_range(),
+                        };
+                        diag_updates
+                            .entry(cur_uri.clone())
+                            .or_default()
+                            .push(SemanticDiagnostic {
+                                severity: Severity::Error,
+                                message: msg,
+                                byte_range: r,
+                            });
+                    }
+                }
+            }
+        }
+        for (uri, diags) in diag_updates {
+            if let Some(m) = self.modules.get_mut(&uri) {
+                m.analysis.diagnostics.extend(diags);
             }
         }
     }
@@ -605,6 +727,109 @@ fn collect_chain(
         && let Some(s) = text.get(name.byte_range())
     {
         out.push(s.to_string());
+    }
+}
+
+/// P15.x — bare-ident decl reference. `Identity` (without
+/// `::name`) used as a value evaluates to a `type` runtime
+/// reflection value; `someFn` evaluates to a `function`. Returns
+/// `None` for idents that aren't decl-bound (locals / params /
+/// generics / unresolved).
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_bare_ident_decl_shape(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    cur: &ModuleAnalysis,
+    ident_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
+) -> Option<TypeShape> {
+    use crate::resolver::Definition;
+    let def = cur.resolutions.lookup(ident_idx)?;
+    let (host_hir, decl_id) = match def {
+        Definition::Decl(decl_id) => (&cur.hir, decl_id),
+        Definition::ProjectDecl { uri, decl } => {
+            let m = modules.get(&uri)?;
+            (&m.hir, decl)
+        }
+        _ => return None,
+    };
+    Some(match &host_hir.decls[decl_id] {
+        Decl::Type(_) | Decl::Enum(_) => TypeShape::Named {
+            name: "type".to_string(),
+            params: Vec::new(),
+        },
+        Decl::Fn(_) => TypeShape::Named {
+            name: "function".to_string(),
+            params: Vec::new(),
+        },
+        Decl::Var(vd) => match vd.ty {
+            Some(t) => read_type_shape(host_hir, t),
+            None => return None,
+        },
+        Decl::Pragma(_) => return None,
+    })
+}
+
+/// P15.10 — resolve a call's callee to its declaring `Decl::Fn`.
+/// Returns `(Some(foreign_uri), decl_id)` for cross-module callees
+/// and `(None, decl_id)` for in-module callees.
+///
+/// Covers four callee shapes:
+///   * `Expr::Ident` -> `Definition::Decl(Decl::Fn)` (in-module top-level).
+///   * `Expr::Ident` -> `Definition::ProjectDecl { uri, decl }` where decl is `Decl::Fn`.
+///   * `Expr::Static` -> `member_uses` -> `MemberDef::Method(decl_id)` (intra-module).
+///   * `Expr::Static` -> `foreign_member_uses` -> `MemberDef::Method(decl_id)` (cross-module).
+///   * `Expr::QualifiedStatic` -> `resolve_qualified_chain` -> `MemberDef::Method`.
+///
+/// Other shapes (`Expr::Member` / lambda / etc.) return `None`.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_call_target(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    cur: &ModuleAnalysis,
+    callee: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
+) -> Option<(Option<Uri>, Idx<Decl>)> {
+    use crate::analyzer::MemberDef;
+    use crate::resolver::Definition;
+    use greycat_analyzer_hir::types::Expr;
+
+    let callee_expr = &cur.hir.exprs[callee];
+    match callee_expr {
+        Expr::Ident(name_idx) => match cur.resolutions.lookup(*name_idx)? {
+            Definition::Decl(decl_id) => {
+                if matches!(cur.hir.decls[decl_id], Decl::Fn(_)) {
+                    Some((None, decl_id))
+                } else {
+                    None
+                }
+            }
+            Definition::ProjectDecl { uri, decl } => {
+                let m = modules.get(&uri)?;
+                if matches!(m.hir.decls[decl], Decl::Fn(_)) {
+                    Some((Some(uri), decl))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        Expr::Static(s) => {
+            if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(s.property) {
+                return Some((None, decl_id));
+            }
+            if let Some(foreign) = cur.analysis.foreign_member_lookup(s.property)
+                && let MemberDef::Method(decl_id) = foreign.member
+            {
+                return Some((Some(foreign.uri.clone()), decl_id));
+            }
+            None
+        }
+        Expr::QualifiedStatic { chain, .. } => {
+            let (uri, _type_decl_id, target) = resolve_qualified_chain(modules, index, cur, chain)?;
+            match target {
+                QualifiedTarget::Member(MemberDef::Method(decl_id)) => Some((Some(uri), decl_id)),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

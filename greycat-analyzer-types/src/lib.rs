@@ -131,7 +131,7 @@ pub enum GenericOwner {
 /// Append-only interning arena for `Type`. Two equal `Type` values get
 /// the same [`TypeId`]; comparing for equality is then just an integer
 /// comparison.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TypeArena {
     items: Vec<Type>,
     intern: HashMap<Type, TypeId>,
