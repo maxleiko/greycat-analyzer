@@ -143,6 +143,13 @@ impl ProjectAnalysis {
         // global decl table.
         self.resolve_cross_module_members();
 
+        // Pass 3.5 (P15.7): cross-module call return-type inference.
+        // Walks every module's `Expr::Call` whose callee is `Expr::Static`
+        // bound to a foreign method, looks up the foreign method's
+        // declared return type, translates it into the current module's
+        // type arena, and updates `analysis.expr_types[call_id]`.
+        self.infer_cross_module_call_types();
+
         // Pass 4 (P14.9): bump `references_to` for every decl that's
         // referenced from another module via a qualified-name access
         // (`<module>::<name>`, `<module>::<type>::<name>`, etc.). Lets
@@ -214,6 +221,107 @@ impl ProjectAnalysis {
                 for (prop_idx, fm) in entries {
                     m.analysis.foreign_member_uses.insert(prop_idx, fm);
                 }
+            }
+        }
+    }
+
+    /// P15.7 — cross-module call return-type inference. After
+    /// [`Self::resolve_cross_module_members`] populates
+    /// `foreign_member_uses`, walk every module's HIR `Expr::Call`s
+    /// whose callee is `Expr::Static` and whose property binds to a
+    /// foreign `Method`. Look up the foreign method's declared
+    /// return type, translate it into the *current module's*
+    /// `analysis.types` arena, and overwrite the placeholder `any`
+    /// in `analysis.expr_types[call_id]` so inlay hints / hover /
+    /// downstream inference see the right type.
+    ///
+    /// Generic substitution across modules is deferred: when the
+    /// foreign method's return type depends on a generic, this pass
+    /// keeps the generic shape (e.g. `Array<T>`) without binding `T`.
+    /// Concrete returns (`Identity`, `String`, `Array<Permission>`)
+    /// flow through cleanly.
+    fn infer_cross_module_call_types(&mut self) {
+        use greycat_analyzer_hir::types::{Expr, Stmt};
+
+        // Phase 1 — read-only: collect the type-shape that each
+        // affected expr should carry, plus a list of Stmt::Var whose
+        // init expr feeds into one of those updates so we can re-link
+        // their `def_types` afterwards.
+        #[allow(clippy::mutable_key_type)]
+        let mut expr_updates: HashMap<Uri, Vec<(Idx<Expr>, TypeShape)>> = HashMap::new();
+        // For each module, find every Expr::Static and decide what
+        // its expr_type should be (method-ref → function,
+        // attr-ref → field, etc.). Then for any Expr::Call whose
+        // callee is one of those Static exprs, override with the
+        // method's return type.
+        for (cur_uri, cur_module) in &self.modules {
+            // 1a) Static-expr standalone shapes (`Type::create`, `Type::id`).
+            for (static_id, static_expr) in cur_module.hir.exprs.iter() {
+                let Expr::Static(s) = static_expr else {
+                    continue;
+                };
+                let shape = match resolve_static_member_shape(&self.modules, cur_module, s) {
+                    Some(sh) => sh,
+                    None => continue,
+                };
+                expr_updates
+                    .entry(cur_uri.clone())
+                    .or_default()
+                    .push((static_id, shape));
+            }
+            // 1b) Call(Static) — overrides the static expr_type and
+            // also drives the call's return-type inference.
+            for (call_id, call_expr) in cur_module.hir.exprs.iter() {
+                let Expr::Call(call) = call_expr else {
+                    continue;
+                };
+                let Expr::Static(s) = &cur_module.hir.exprs[call.callee] else {
+                    continue;
+                };
+                let Some(shape) = resolve_static_call_return_shape(&self.modules, cur_module, s)
+                else {
+                    continue;
+                };
+                expr_updates
+                    .entry(cur_uri.clone())
+                    .or_default()
+                    .push((call_id, shape));
+            }
+        }
+
+        // Phase 2 — mutable: mint the snapshotted shapes into each
+        // module's TypeArena and update `expr_types`. Then walk
+        // `Stmt::Var` to re-link `def_types` for locals whose init
+        // expr we just updated.
+        for (uri, entries) in expr_updates {
+            let Some(m) = self.modules.get_mut(&uri) else {
+                continue;
+            };
+            // Build a small index of which exprs we touched.
+            let mut touched: HashMap<Idx<Expr>, greycat_analyzer_types::TypeId> = HashMap::new();
+            for (expr_id, shape) in entries {
+                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                m.analysis.expr_types.insert(expr_id, ty);
+                touched.insert(expr_id, ty);
+            }
+            // Re-link `def_types` for `var x = <touched_expr>;` shapes.
+            // The analyzer's first pass set `def_types[name] = init_ty`
+            // where `init_ty` was the placeholder `any` for these.
+            for (_stmt_id, stmt) in m.hir.stmts.iter() {
+                let Stmt::Var(local) = stmt else {
+                    continue;
+                };
+                let Some(init) = local.init else {
+                    continue;
+                };
+                if local.ty.is_some() {
+                    // Declared type wins; the analyzer already stored it.
+                    continue;
+                }
+                let Some(new_ty) = touched.get(&init).copied() else {
+                    continue;
+                };
+                m.analysis.def_types.insert(local.name, new_ty);
             }
         }
     }
@@ -471,6 +579,146 @@ fn collect_chain(
         && let Some(s) = text.get(name.byte_range())
     {
         out.push(s.to_string());
+    }
+}
+
+/// P15.7 — figure out what type a standalone `Expr::Static`
+/// (`Type::name` *not* immediately followed by a call) should carry.
+/// Method references are `function`; attr references are `field`. This
+/// matches GreyCat's reflection model where `Type::method` yields a
+/// callable function value and `Type::attr` yields a field handle.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_static_member_shape(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    cur: &ModuleAnalysis,
+    s: &greycat_analyzer_hir::types::StaticExpr,
+) -> Option<TypeShape> {
+    if let Some(local) = cur.analysis.member_lookup(s.property) {
+        return Some(static_shape_from_member(&local));
+    }
+    if let Some(foreign) = cur.analysis.foreign_member_lookup(s.property) {
+        // Sanity check the foreign module is still cached.
+        if modules.contains_key(&foreign.uri) {
+            return Some(static_shape_from_member(&foreign.member));
+        }
+    }
+    None
+}
+
+fn static_shape_from_member(member: &crate::analyzer::MemberDef) -> TypeShape {
+    use crate::analyzer::MemberDef;
+    match member {
+        MemberDef::Method(_) => TypeShape::Named {
+            name: "function".to_string(),
+            params: Vec::new(),
+        },
+        MemberDef::Attr(_) => TypeShape::Named {
+            name: "field".to_string(),
+            params: Vec::new(),
+        },
+    }
+}
+
+/// P15.7 — figure out what return type a `Call(callee=Static)` should
+/// carry. For Method bindings, that's the foreign / in-module method's
+/// declared `return_type`. Returns `None` for attr bindings (calling
+/// a `field` is nonsense) or unbound statics.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_static_call_return_shape(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    cur: &ModuleAnalysis,
+    s: &greycat_analyzer_hir::types::StaticExpr,
+) -> Option<TypeShape> {
+    use crate::analyzer::MemberDef;
+    if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(s.property) {
+        let Decl::Fn(fnd) = &cur.hir.decls[decl_id] else {
+            return None;
+        };
+        let ret = fnd.return_type?;
+        return Some(read_type_shape(&cur.hir, ret));
+    }
+    if let Some(foreign) = cur.analysis.foreign_member_lookup(s.property)
+        && let MemberDef::Method(decl_id) = foreign.member
+        && let Some(foreign_module) = modules.get(&foreign.uri)
+        && let Decl::Fn(fnd) = &foreign_module.hir.decls[decl_id]
+        && let Some(ret) = fnd.return_type
+    {
+        return Some(read_type_shape(&foreign_module.hir, ret));
+    }
+    None
+}
+
+/// P15.7 — arena-free intermediate for translating a foreign HIR
+/// `TypeRef` into the destination module's `TypeArena`. Captures the
+/// shape (primitive / named / generic / nullable) so phase 2 of
+/// `infer_cross_module_call_types` can mint it without holding a
+/// borrow on the foreign module.
+#[derive(Debug, Clone)]
+enum TypeShape {
+    Primitive(greycat_analyzer_types::Primitive),
+    Any,
+    Null,
+    Named {
+        name: String,
+        params: Vec<TypeShape>,
+    },
+    Optional(Box<TypeShape>),
+}
+
+fn read_type_shape(
+    hir: &Hir,
+    type_ref_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
+) -> TypeShape {
+    use greycat_analyzer_types::Primitive;
+    let tr = &hir.type_refs[type_ref_id];
+    let name = hir.idents[tr.name].text.as_str();
+    let base = match name {
+        "bool" => TypeShape::Primitive(Primitive::Bool),
+        "int" => TypeShape::Primitive(Primitive::Int),
+        "float" => TypeShape::Primitive(Primitive::Float),
+        "char" => TypeShape::Primitive(Primitive::Char),
+        "String" => TypeShape::Primitive(Primitive::String),
+        "time" => TypeShape::Primitive(Primitive::Time),
+        "duration" => TypeShape::Primitive(Primitive::Duration),
+        "geo" => TypeShape::Primitive(Primitive::Geo),
+        "any" => TypeShape::Any,
+        "null" => TypeShape::Null,
+        _ => {
+            let params: Vec<TypeShape> =
+                tr.params.iter().map(|p| read_type_shape(hir, *p)).collect();
+            TypeShape::Named {
+                name: name.to_string(),
+                params,
+            }
+        }
+    };
+    if tr.optional {
+        TypeShape::Optional(Box::new(base))
+    } else {
+        base
+    }
+}
+
+fn mint_type_shape(
+    shape: &TypeShape,
+    arena: &mut greycat_analyzer_types::TypeArena,
+) -> greycat_analyzer_types::TypeId {
+    match shape {
+        TypeShape::Primitive(p) => arena.primitive(*p),
+        TypeShape::Any => arena.any(),
+        TypeShape::Null => arena.null(),
+        TypeShape::Named { name, params } => {
+            if params.is_empty() {
+                arena.named(name.clone())
+            } else {
+                let args: Vec<_> = params.iter().map(|p| mint_type_shape(p, arena)).collect();
+                arena.generic(name.clone(), args)
+            }
+        }
+        TypeShape::Optional(inner) => {
+            let id = mint_type_shape(inner, arena);
+            arena.nullable(id)
+        }
     }
 }
 

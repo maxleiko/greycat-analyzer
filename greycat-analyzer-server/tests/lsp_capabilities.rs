@@ -272,6 +272,132 @@ fn cross_module_rename_aggregates_text_edits_per_uri() {
     }
 }
 
+/// P15.7 — `var x = Identity::create(...)` should infer x as
+/// `Identity`, not `any`. The call's expr_type is the foreign
+/// method's `return_type`, and the local var's `def_types` entry
+/// gets re-linked to it after Pass 3.5 lands.
+#[test]
+fn cross_module_static_call_infers_return_type() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri.clone(),
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var x = Identity::create(\"a\", \"b\"); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let x_local = user_module
+        .hir
+        .idents
+        .iter()
+        .find(|(_, i)| i.text == "x")
+        .map(|(idx, _)| idx)
+        .expect("`x` ident");
+    let ty = user_module
+        .analysis
+        .def_types
+        .get(&x_local)
+        .copied()
+        .expect("def_type for x");
+    let display = greycat_analyzer_types::display(&user_module.analysis.types, ty);
+    assert_eq!(
+        display, "Identity",
+        "x should infer as `Identity`, got `{display}`"
+    );
+}
+
+/// P15.7 — `var y = Identity::create;` (method reference, no call)
+/// infers as `function` (a runtime native type).
+#[test]
+fn cross_module_static_method_ref_infers_function() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        runtime_uri,
+        "type Identity { static native fn create(name: String, role: String): Identity; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var y = Identity::create; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let y_local = user_module
+        .hir
+        .idents
+        .iter()
+        .find(|(_, i)| i.text == "y")
+        .map(|(idx, _)| idx)
+        .expect("`y` ident");
+    let ty = user_module
+        .analysis
+        .def_types
+        .get(&y_local)
+        .copied()
+        .expect("def_type for y");
+    let display = greycat_analyzer_types::display(&user_module.analysis.types, ty);
+    assert_eq!(
+        display, "function",
+        "y should infer as `function`, got `{display}`"
+    );
+}
+
+/// P15.7 — `var z = Identity::id;` (attr reference, no call) infers
+/// as `field` (a runtime native type).
+#[test]
+fn cross_module_static_attr_ref_infers_field() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(runtime_uri, "type Identity { id: int; }\n", "p", false);
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() { var z = Identity::id; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let z_local = user_module
+        .hir
+        .idents
+        .iter()
+        .find(|(_, i)| i.text == "z")
+        .map(|(idx, _)| idx)
+        .expect("`z` ident");
+    let ty = user_module
+        .analysis
+        .def_types
+        .get(&z_local)
+        .copied()
+        .expect("def_type for z");
+    let display = greycat_analyzer_types::display(&user_module.analysis.types, ty);
+    assert_eq!(
+        display, "field",
+        "z should infer as `field`, got `{display}`"
+    );
+}
+
 /// P15.6 — `Identity::create` (`static_expr` against a cross-module
 /// type) should bind the property ident to the foreign method via
 /// `foreign_member_uses`, just like `.` member access does for attrs.
