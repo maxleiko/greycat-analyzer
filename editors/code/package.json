@@ -53,7 +53,12 @@
         "command": "greycat-analyzer.restart",
         "title": "greycat-analyzer: restart"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "[greycat]": {
+        "editor.defaultFormatter": "maxleiko.greycat-analyzer"
+      }
+    }
   },
   "engines": {
     "vscode": "^1.75.0"
