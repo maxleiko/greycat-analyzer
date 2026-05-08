@@ -337,33 +337,18 @@ fn document_symbols_handler(
 }
 
 fn references_handler(server: &Backend, params: ReferenceParams) -> Option<Vec<Location>> {
+    // P11.4: scope-aware project-wide references via cached resolutions.
+    // Walks every cached `ModuleAnalysis::resolutions.uses` and matches
+    // by `Definition::Decl` (home module) / `Definition::ProjectDecl`
+    // (importers) — replaces the prior text-equality fallback.
     let uri = params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
-    let cell = server.manager.get(&uri)?;
-    let doc = cell.borrow();
-    let mut out = capabilities::references(&doc.text, &doc.lib, doc.root_node(), &uri, pos);
-    // P8.2: extend across the manager — for any other doc, walk its
-    // CST for ident matches with the cursor's text. Pragmatic but
-    // naive: doesn't filter by Definition cross-module since we
-    // don't yet have a global decl table. Good enough for the common
-    // "rename a stdlib symbol, see hits across project files" UX.
-    let cursor_text = capabilities::cursor_text_at(&doc.text, doc.root_node(), pos);
-    if let Some(needle) = cursor_text {
-        drop(doc);
-        for (other_uri, other_cell) in server.manager.iter() {
-            if other_uri == &uri {
-                continue;
-            }
-            let other = other_cell.borrow();
-            out.extend(capabilities::text_matches(
-                &other.text,
-                other.root_node(),
-                other_uri,
-                &needle,
-            ));
-        }
-    }
-    Some(out)
+    Some(capabilities::references_across_project(
+        &server.project_analysis,
+        &server.manager,
+        &uri,
+        pos,
+    ))
 }
 
 fn prepare_rename_handler(
@@ -376,35 +361,16 @@ fn prepare_rename_handler(
 }
 
 fn rename_handler(server: &Backend, params: RenameParams) -> Option<WorkspaceEdit> {
+    // P11.4: scope-aware project-wide rename via cached resolutions.
     let uri = params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
-    let cell = server.manager.get(&uri)?;
-    let doc = cell.borrow();
-    let mut workspace_edit =
-        capabilities::rename(&doc.text, doc.root_node(), &uri, pos, &params.new_name)?;
-    // P8.2: extend rename to other docs by text equality (same caveat
-    // as `references_handler` — pragmatic, not scope-aware across
-    // modules until we have a global decl table).
-    let cursor_text = capabilities::cursor_text_at(&doc.text, doc.root_node(), pos);
-    if let (Some(needle), Some(changes)) = (cursor_text, workspace_edit.changes.as_mut()) {
-        drop(doc);
-        for (other_uri, other_cell) in server.manager.iter() {
-            if other_uri == &uri {
-                continue;
-            }
-            let other = other_cell.borrow();
-            let extra = capabilities::text_matches_as_edits(
-                &other.text,
-                other.root_node(),
-                &needle,
-                &params.new_name,
-            );
-            if !extra.is_empty() {
-                changes.insert(other_uri.clone(), extra);
-            }
-        }
-    }
-    Some(workspace_edit)
+    capabilities::rename_across_project(
+        &server.project_analysis,
+        &server.manager,
+        &uri,
+        pos,
+        &params.new_name,
+    )
 }
 
 fn document_highlight_handler(

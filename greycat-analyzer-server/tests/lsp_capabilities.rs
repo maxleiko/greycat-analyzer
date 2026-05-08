@@ -119,6 +119,53 @@ fn goto_definition_param_lands_on_decl() {
 }
 
 #[test]
+fn cross_module_references_aggregates_across_docs() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let home_uri = Uri::from_str("file:///home.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///user.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(home_uri.clone(), "type Helper {}\n", "p", false);
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn first(h: Helper) {}\nfn second(): Helper { return Helper {}; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    // Cursor on the `Helper` decl name in home.gcl (col 5).
+    let refs = capabilities::references_across_project(&pa, &mgr, &home_uri, pos(0, 5));
+    let user_hits = refs.iter().filter(|l| l.uri == user_uri).count();
+    let home_hits = refs.iter().filter(|l| l.uri == home_uri).count();
+    assert_eq!(home_hits, 1, "binding site in home.gcl: {refs:?}");
+    assert_eq!(user_hits, 3, "three Helper uses in user.gcl: {refs:?}");
+}
+
+#[test]
+fn cross_module_rename_aggregates_text_edits_per_uri() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let home_uri = Uri::from_str("file:///home.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///user.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(home_uri.clone(), "type Helper {}\n", "p", false);
+    mgr.add_simple(user_uri.clone(), "fn use_h(h: Helper) {}\n", "p", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let edit =
+        capabilities::rename_across_project(&pa, &mgr, &home_uri, pos(0, 5), "Renamed").unwrap();
+    #[allow(clippy::mutable_key_type)]
+    let changes = edit.changes.unwrap();
+    assert_eq!(changes.len(), 2, "edits across two URIs: {changes:?}");
+    let home_edits = changes.get(&home_uri).expect("home edits");
+    let user_edits = changes.get(&user_uri).expect("user edits");
+    assert_eq!(home_edits.len(), 1);
+    assert_eq!(user_edits.len(), 1);
+    for e in home_edits.iter().chain(user_edits.iter()) {
+        assert_eq!(e.new_text, "Renamed");
+    }
+}
+
+#[test]
 fn cross_module_decl_location_points_at_foreign_name() {
     use greycat_analyzer_hir::lower_module;
     let foreign_text = "type Helper {}\n";
