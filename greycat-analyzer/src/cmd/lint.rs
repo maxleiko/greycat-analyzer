@@ -73,13 +73,22 @@ impl Lint {
     pub fn run(self) -> Result<ExitCode, AnyError> {
         env_logger::init();
 
-        let project_filepath = self.project.canonicalize()?;
+        // Convenience: when given a directory, look for `project.gcl`
+        // at its root and use that as the entrypoint. Matches what
+        // `greycat run` does and what the LSP's workspace-folder load
+        // does — the CLI shouldn't be the odd one out.
+        let mut project_filepath = self.project.canonicalize()?;
         if project_filepath.is_dir() {
-            eprintln!(
-                "error: expected a path to project.gcl (or any .gcl entrypoint), got directory {}",
-                project_filepath.display()
-            );
-            return Ok(ExitCode::FAILURE);
+            let candidate = project_filepath.join("project.gcl");
+            if candidate.is_file() {
+                project_filepath = candidate;
+            } else {
+                eprintln!(
+                    "error: no project.gcl found in {}; pass a .gcl entrypoint or a directory containing project.gcl",
+                    project_filepath.display(),
+                );
+                return Ok(ExitCode::FAILURE);
+            }
         }
 
         // Load the project graph properly: parse the entrypoint, walk
