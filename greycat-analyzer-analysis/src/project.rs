@@ -173,7 +173,14 @@ impl ProjectAnalysis {
         // first-pass would have surfaced false positives for
         // cross-module Call / Member-call conditions whose return
         // type wasn't yet inferred.
-        self.validate_condition_types();
+        // Architectural assertion: nothing earlier in the pipeline
+        // may emit type-relation diagnostics — those would compare
+        // against pre-fixup `expr_types` and surface false-positives
+        // for cross-module Calls. `validate_type_relations` is the
+        // sole producer.
+        #[cfg(debug_assertions)]
+        self.assert_no_type_relation_diags_yet();
+        self.validate_type_relations();
 
         // Pass 4 (P14.9): bump `references_to` for every decl that's
         // referenced from another module via a qualified-name access
@@ -650,6 +657,7 @@ impl ProjectAnalysis {
                                 severity: Severity::Error,
                                 message: msg,
                                 byte_range: r,
+                                category: crate::analyzer::DiagCategory::TypeRelation,
                             });
                     }
                 }
@@ -662,47 +670,50 @@ impl ProjectAnalysis {
         }
     }
 
-    /// Pass 3.7 — drain every module's `bool_check_conditions`
-    /// queue and emit `"<label> must be \`bool\`, got \`T\`"` for
-    /// any condition whose post-pass-3.5 type isn't bool-assignable.
-    /// Same rationale as `validate_call_arg_types`: doing this in
-    /// the analyzer's first pass surfaced false positives for
-    /// `if (cross_module_fn()) {}` because the call's return type
-    /// hadn't been inferred yet.
-    fn validate_condition_types(&mut self) {
-        use crate::analyzer::{SemanticDiagnostic, Severity};
-        use greycat_analyzer_hir::types::Expr;
-        use greycat_analyzer_types::{Primitive, is_assignable_to};
+    /// Pass 3.7 — unified type-relation validation. Walks every
+    /// module's HIR fresh AFTER all cross-module typing fixups have
+    /// settled, re-runs each `is_assignable_to` check using the
+    /// final `expr_types` / `def_types`, and emits diagnostics.
+    ///
+    /// Architectural invariant: NO type-relation diagnostic should
+    /// be emitted earlier in the pipeline. The analyzer's
+    /// per-module pass populates types but doesn't compare them;
+    /// every `must be \`T\`, got \`U\`` flavor of error fires from
+    /// this pass and only this pass. Otherwise the first-pass would
+    /// see un-settled `any`s for cross-module Calls and surface
+    /// false positives — the rubber-banding we kept hitting.
+    ///
+    /// Covers:
+    ///   - `if`/`while`/`do-while`/`for`-mid bool conditions
+    ///   - `var x: T = init` / top-level + local + type-attr inits
+    ///   - `target = value` assignments
+    ///   - `return value;` value vs declared return type
+    #[cfg(debug_assertions)]
+    fn assert_no_type_relation_diags_yet(&self) {
+        for (uri, m) in &self.modules {
+            for d in &m.analysis.diagnostics {
+                debug_assert!(
+                    d.category != crate::analyzer::DiagCategory::TypeRelation,
+                    "type-relation diagnostic emitted before validate_type_relations \
+                     in {uri:?}: {msg}. \
+                     Producer must defer to the validation post-pass — see DiagCategory.",
+                    uri = uri.as_str(),
+                    msg = d.message,
+                );
+            }
+        }
+    }
+
+    fn validate_type_relations(&mut self) {
+        use crate::analyzer::SemanticDiagnostic;
 
         #[allow(clippy::mutable_key_type)]
         let mut diag_updates: HashMap<Uri, Vec<SemanticDiagnostic>> = HashMap::new();
         for (cur_uri, cur_module) in &self.modules {
-            // Mint a `bool` TypeId in a temp arena clone — we only
-            // need it to compare via `is_assignable_to` and don't
-            // want to mutate the module's arena from a read-only pass.
-            let mut tmp_arena = cur_module.analysis.types.clone();
-            let bool_t = tmp_arena.primitive(Primitive::Bool);
-
-            for (expr_id, label) in &cur_module.analysis.bool_check_conditions {
-                let Some(ty) = cur_module.analysis.expr_types.get(expr_id).copied() else {
-                    continue;
-                };
-                if is_assignable_to(&tmp_arena, ty, bool_t) {
-                    continue;
-                }
-                let display = greycat_analyzer_types::display(&cur_module.analysis.types, ty);
-                let r = match &cur_module.hir.exprs[*expr_id] {
-                    Expr::Ident(name_idx) => cur_module.hir.idents[*name_idx].byte_range.clone(),
-                    other => other.byte_range(),
-                };
-                diag_updates
-                    .entry(cur_uri.clone())
-                    .or_default()
-                    .push(SemanticDiagnostic {
-                        severity: Severity::Error,
-                        message: format!("{label} must be `bool`, got `{display}`"),
-                        byte_range: r,
-                    });
+            let mut diags: Vec<SemanticDiagnostic> = Vec::new();
+            validate_module_type_relations(cur_module, &mut diags);
+            if !diags.is_empty() {
+                diag_updates.insert(cur_uri.clone(), diags);
             }
         }
         for (uri, diags) in diag_updates {
@@ -915,7 +926,14 @@ impl ProjectAnalysis {
         // having settled inner static-expr return types).
         self.validate_call_arg_types();
         // Pass 3.7: condition-type validation.
-        self.validate_condition_types();
+        // Architectural assertion: nothing earlier in the pipeline
+        // may emit type-relation diagnostics — those would compare
+        // against pre-fixup `expr_types` and surface false-positives
+        // for cross-module Calls. `validate_type_relations` is the
+        // sole producer.
+        #[cfg(debug_assertions)]
+        self.assert_no_type_relation_diags_yet();
+        self.validate_type_relations();
         // P14.9: re-derive qualified-name reference counts.
         self.compute_qualified_refs(manager);
     }
@@ -1391,6 +1409,349 @@ fn resolve_member_call_return_shape(
         return Some(read_type_shape(&foreign_module.hir, ret));
     }
     None
+}
+
+/// Walk one module's HIR and emit every type-relation diagnostic
+/// the analyzer's per-module pass deferred. Reads only — never
+/// mutates `module`. The arena it operates against is a clone of
+/// `module.analysis.types` so newly-minted TypeIds for declared-side
+/// type refs land in the same numeric space as the cached
+/// `expr_types` entries (cloning preserves `intern`).
+fn validate_module_type_relations(
+    module: &ModuleAnalysis,
+    diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
+) {
+    use crate::analyzer::{SemanticDiagnostic, Severity};
+    use greycat_analyzer_hir::types::Decl;
+    use greycat_analyzer_types::Primitive;
+
+    let hir = &module.hir;
+    let analysis = &module.analysis;
+    let mut arena = analysis.types.clone();
+    let bool_t = arena.primitive(Primitive::Bool);
+
+    let Some(top) = hir.module.as_ref() else {
+        return;
+    };
+    for d_id in &top.decls {
+        validate_decl(hir, analysis, &mut arena, bool_t, &hir.decls[*d_id], diags);
+    }
+
+    fn validate_decl(
+        hir: &greycat_analyzer_hir::Hir,
+        analysis: &crate::analyzer::AnalysisResult,
+        arena: &mut greycat_analyzer_types::TypeArena,
+        bool_t: greycat_analyzer_types::TypeId,
+        decl: &Decl,
+        diags: &mut Vec<SemanticDiagnostic>,
+    ) {
+        match decl {
+            Decl::Fn(fnd) => {
+                let return_ty = fnd
+                    .return_type
+                    .and_then(|t| lower_type_ref_id(hir, t, &analysis.registry, arena));
+                if let Some(body) = fnd.body {
+                    validate_stmt(hir, analysis, arena, bool_t, body, return_ty, diags);
+                }
+            }
+            Decl::Type(td) => {
+                for attr_id in &td.attrs {
+                    let attr = &hir.type_attrs[*attr_id];
+                    if let (Some(decl_ref), Some(init)) = (attr.ty, attr.init)
+                        && let Some(declared_ty) =
+                            lower_type_ref_id(hir, decl_ref, &analysis.registry, arena)
+                    {
+                        check_assign(
+                            analysis,
+                            arena,
+                            init,
+                            declared_ty,
+                            "attribute initializer",
+                            "declared type",
+                            attr.byte_range.clone(),
+                            diags,
+                        );
+                    }
+                }
+                for m in &td.methods {
+                    validate_decl(hir, analysis, arena, bool_t, &hir.decls[*m], diags);
+                }
+            }
+            Decl::Var(vd) => {
+                if let (Some(decl_ref), Some(init)) = (vd.ty, vd.init)
+                    && let Some(declared_ty) =
+                        lower_type_ref_id(hir, decl_ref, &analysis.registry, arena)
+                {
+                    check_assign(
+                        analysis,
+                        arena,
+                        init,
+                        declared_ty,
+                        "initializer",
+                        "declared type",
+                        vd.byte_range.clone(),
+                        diags,
+                    );
+                }
+            }
+            Decl::Enum(_) | Decl::Pragma(_) => {}
+        }
+    }
+
+    fn validate_stmt(
+        hir: &greycat_analyzer_hir::Hir,
+        analysis: &crate::analyzer::AnalysisResult,
+        arena: &mut greycat_analyzer_types::TypeArena,
+        bool_t: greycat_analyzer_types::TypeId,
+        stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
+        return_ty: Option<greycat_analyzer_types::TypeId>,
+        diags: &mut Vec<SemanticDiagnostic>,
+    ) {
+        use greycat_analyzer_hir::types::{
+            AssignStmt, AtStmt, DoWhileStmt, ForInStmt, ForStmt, IfStmt, LocalVar, Stmt, TryStmt,
+            WhileStmt,
+        };
+        match &hir.stmts[stmt_id] {
+            Stmt::Block(stmts) => {
+                for s in stmts {
+                    validate_stmt(hir, analysis, arena, bool_t, *s, return_ty, diags);
+                }
+            }
+            Stmt::Var(LocalVar { ty, init, .. }) => {
+                if let (Some(decl_ref), Some(init_id)) = (ty, init)
+                    && let Some(declared_ty) =
+                        lower_type_ref_id(hir, *decl_ref, &analysis.registry, arena)
+                {
+                    let r = expr_byte_range(hir, *init_id);
+                    check_assign(
+                        analysis,
+                        arena,
+                        *init_id,
+                        declared_ty,
+                        "var initializer",
+                        "declared type",
+                        r,
+                        diags,
+                    );
+                }
+            }
+            Stmt::Assign(AssignStmt {
+                target,
+                value,
+                byte_range,
+                ..
+            }) => {
+                if let Some(target_ty) = analysis.expr_types.get(target).copied() {
+                    check_assign(
+                        analysis,
+                        arena,
+                        *value,
+                        target_ty,
+                        "value",
+                        "target",
+                        byte_range.clone(),
+                        diags,
+                    );
+                }
+            }
+            Stmt::If(IfStmt {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            }) => {
+                check_bool(
+                    analysis,
+                    arena,
+                    *condition,
+                    bool_t,
+                    "if condition",
+                    hir,
+                    diags,
+                );
+                validate_stmt(hir, analysis, arena, bool_t, *then_branch, return_ty, diags);
+                if let Some(eb) = else_branch {
+                    validate_stmt(hir, analysis, arena, bool_t, *eb, return_ty, diags);
+                }
+            }
+            Stmt::While(WhileStmt {
+                condition, body, ..
+            }) => {
+                check_bool(
+                    analysis,
+                    arena,
+                    *condition,
+                    bool_t,
+                    "while condition",
+                    hir,
+                    diags,
+                );
+                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+            }
+            Stmt::DoWhile(DoWhileStmt {
+                condition, body, ..
+            }) => {
+                check_bool(
+                    analysis,
+                    arena,
+                    *condition,
+                    bool_t,
+                    "do-while condition",
+                    hir,
+                    diags,
+                );
+                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+            }
+            Stmt::For(ForStmt {
+                condition, body, ..
+            }) => {
+                if let Some(c) = condition {
+                    check_bool(analysis, arena, *c, bool_t, "for condition", hir, diags);
+                }
+                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+            }
+            Stmt::ForIn(ForInStmt { body, .. }) => {
+                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+            }
+            Stmt::Try(TryStmt {
+                try_block,
+                catch_block,
+                ..
+            }) => {
+                validate_stmt(hir, analysis, arena, bool_t, *try_block, return_ty, diags);
+                validate_stmt(hir, analysis, arena, bool_t, *catch_block, return_ty, diags);
+            }
+            Stmt::At(AtStmt { block, .. }) => {
+                validate_stmt(hir, analysis, arena, bool_t, *block, return_ty, diags);
+            }
+            Stmt::Return(Some(v)) => {
+                if let Some(rt) = return_ty {
+                    let r = expr_byte_range(hir, *v);
+                    check_assign(
+                        analysis,
+                        arena,
+                        *v,
+                        rt,
+                        "return value",
+                        "declared return type",
+                        r,
+                        diags,
+                    );
+                }
+            }
+            Stmt::Return(None) | Stmt::Expr(_) | Stmt::Break | Stmt::Continue | Stmt::Throw(_) => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_assign(
+        analysis: &crate::analyzer::AnalysisResult,
+        arena: &greycat_analyzer_types::TypeArena,
+        value_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
+        declared_ty: greycat_analyzer_types::TypeId,
+        value_label: &str,
+        target_label: &str,
+        range: std::ops::Range<usize>,
+        diags: &mut Vec<SemanticDiagnostic>,
+    ) {
+        let Some(value_ty) = analysis.expr_types.get(&value_id).copied() else {
+            return;
+        };
+        if greycat_analyzer_types::is_assignable_to(arena, value_ty, declared_ty) {
+            return;
+        }
+        let got = greycat_analyzer_types::display(arena, value_ty);
+        let want = greycat_analyzer_types::display(arena, declared_ty);
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            message: format!(
+                "{value_label} of type `{got}` is not assignable to {target_label} `{want}`"
+            ),
+            byte_range: range,
+            category: crate::analyzer::DiagCategory::TypeRelation,
+        });
+    }
+
+    fn check_bool(
+        analysis: &crate::analyzer::AnalysisResult,
+        arena: &greycat_analyzer_types::TypeArena,
+        expr_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
+        bool_t: greycat_analyzer_types::TypeId,
+        label: &'static str,
+        hir: &greycat_analyzer_hir::Hir,
+        diags: &mut Vec<SemanticDiagnostic>,
+    ) {
+        let Some(ty) = analysis.expr_types.get(&expr_id).copied() else {
+            return;
+        };
+        if greycat_analyzer_types::is_assignable_to(arena, ty, bool_t) {
+            return;
+        }
+        let got = greycat_analyzer_types::display(arena, ty);
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            message: format!("{label} must be `bool`, got `{got}`"),
+            byte_range: expr_byte_range(hir, expr_id),
+            category: crate::analyzer::DiagCategory::TypeRelation,
+        });
+    }
+
+    fn expr_byte_range(
+        hir: &greycat_analyzer_hir::Hir,
+        expr_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
+    ) -> std::ops::Range<usize> {
+        match &hir.exprs[expr_id] {
+            greycat_analyzer_hir::types::Expr::Ident(name_idx) => {
+                hir.idents[*name_idx].byte_range.clone()
+            }
+            other => other.byte_range(),
+        }
+    }
+}
+
+/// Look up a syntactic `TypeRef` and mint a corresponding `TypeId`
+/// into `arena`. `arena` is the validation-pass's working clone of
+/// `analysis.types`, so any new mints land where `is_assignable_to`
+/// can see them.
+fn lower_type_ref_id(
+    hir: &greycat_analyzer_hir::Hir,
+    type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
+    registry: &greycat_analyzer_types::TypeRegistry,
+    arena: &mut greycat_analyzer_types::TypeArena,
+) -> Option<greycat_analyzer_types::TypeId> {
+    use greycat_analyzer_types::Primitive;
+    let tr = &hir.type_refs[type_ref];
+    let name = hir.idents[tr.name].text.as_str();
+    let base = match name {
+        "bool" => arena.primitive(Primitive::Bool),
+        "int" => arena.primitive(Primitive::Int),
+        "float" => arena.primitive(Primitive::Float),
+        "char" => arena.primitive(Primitive::Char),
+        "String" => arena.primitive(Primitive::String),
+        "time" => arena.primitive(Primitive::Time),
+        "duration" => arena.primitive(Primitive::Duration),
+        "geo" => arena.primitive(Primitive::Geo),
+        "any" => arena.any(),
+        "null" => arena.null(),
+        _ => {
+            if !tr.params.is_empty() {
+                let mut args = Vec::with_capacity(tr.params.len());
+                for p in &tr.params {
+                    args.push(lower_type_ref_id(hir, *p, registry, arena)?);
+                }
+                arena.generic(name.to_string(), args)
+            } else if let Some(id) = registry.lookup(name) {
+                id
+            } else {
+                arena.named(name.to_string())
+            }
+        }
+    };
+    Some(if tr.optional {
+        arena.nullable(base)
+    } else {
+        base
+    })
 }
 
 /// P15.7 — arena-free intermediate for translating a foreign HIR

@@ -1,1 +1,7 @@
 @library("std", "8.0.269-dev");
+
+native fn do_something(): int;
+
+fn test(): int {
+    return do_something();
+}

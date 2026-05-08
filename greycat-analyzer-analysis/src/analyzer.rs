@@ -33,7 +33,7 @@ use greycat_analyzer_hir::types::{
 };
 use greycat_analyzer_types::{
     GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_assignable_to, is_castable,
+    is_castable,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -104,11 +104,47 @@ pub enum Severity {
     Hint,
 }
 
+/// Where in the pipeline a diagnostic was produced. Lets the
+/// `ProjectAnalysis` driver assert the architectural invariant
+/// described on `validate_type_relations`: nothing earlier in the
+/// pipeline may emit type-relation diagnostics — those see
+/// un-settled `any`s for cross-module Calls and surface false
+/// positives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagCategory {
+    /// Resolver-time / structural failures (unresolved name,
+    /// unsupported syntax, member-resolution dead-end). These can
+    /// fire from anywhere — they don't depend on settled types.
+    Structural,
+    /// Type-relation comparison ("must be `T`, got `U`",
+    /// "not assignable to"). MUST only be emitted by
+    /// [`crate::project::ProjectAnalysis::validate_type_relations`]
+    /// — every other pass would compare against pre-fixup `expr_types`
+    /// and surface false positives for cross-module calls.
+    TypeRelation,
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticDiagnostic {
     pub severity: Severity,
     pub message: String,
     pub byte_range: Range<usize>,
+    pub category: DiagCategory,
+}
+
+impl SemanticDiagnostic {
+    /// Default-constructor for callers in the analyzer / resolver
+    /// that emit non-type-relation diagnostics. Type-relation
+    /// callers (only the project pipeline's validation pass) must
+    /// build the struct literally so the category is explicit.
+    pub fn structural(severity: Severity, message: String, byte_range: Range<usize>) -> Self {
+        Self {
+            severity,
+            message,
+            byte_range,
+            category: DiagCategory::Structural,
+        }
+    }
 }
 
 /// Output of the analyzer for a single module.
@@ -152,16 +188,6 @@ pub struct AnalysisResult {
     /// hover / goto-def show the right content for each segment of
     /// `runtime::Identity::create`.
     pub foreign_decl_uses: HashMap<Idx<Ident>, ForeignDecl>,
-    /// Conditions whose type must be `bool` (`if`, `while`, `do-while`,
-    /// `for`-mid condition). Recorded by the analyzer's first pass
-    /// after `visit_expr` populates `expr_types`; the
-    /// [`crate::project::ProjectAnalysis`] post-pass that runs after
-    /// cross-module call return-type inference drains these and emits
-    /// the "X must be `bool`, got `T`" diagnostic. Doing the check at
-    /// first-pass time surfaces false positives whenever the condition
-    /// is a Call whose return type isn't resolved until the project
-    /// pipeline writes it back (e.g. `if (cross_module_fn()) {}`).
-    pub bool_check_conditions: Vec<(Idx<Expr>, &'static str)>,
     pub diagnostics: Vec<SemanticDiagnostic>,
 }
 
@@ -263,11 +289,11 @@ pub fn analyze_with_index(hir: &Hir, res: &Resolutions, index: &ProjectIndex) ->
     let unresolved = res.unresolved.clone();
     for ident_idx in unresolved {
         let ident = &hir.idents[ident_idx];
-        out.diagnostics.push(SemanticDiagnostic {
-            severity: Severity::Error,
-            message: format!("unresolved name `{}`", ident.text),
-            byte_range: ident.byte_range.clone(),
-        });
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            format!("unresolved name `{}`", ident.text),
+            ident.byte_range.clone(),
+        ));
     }
 
     out
@@ -401,11 +427,15 @@ impl<'a> Cx<'a> {
         self.out.expr_types.insert(expr, ty);
     }
     fn diag(&mut self, severity: Severity, message: impl Into<String>, range: Range<usize>) {
-        self.out.diagnostics.push(SemanticDiagnostic {
+        // The analyzer's first pass only emits structural diagnostics
+        // (unresolved names, member-resolution failures, exhaustiveness,
+        // …). Type-relation diagnostics live in the project pipeline's
+        // `validate_type_relations` post-pass — see `DiagCategory`.
+        self.out.diagnostics.push(SemanticDiagnostic::structural(
             severity,
-            message: message.into(),
-            byte_range: range,
-        });
+            message.into(),
+            range,
+        ));
     }
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
         &self.hir.idents[idx].text
@@ -750,36 +780,20 @@ impl<'a> Cx<'a> {
     }
 
     fn visit_type_attr(&mut self, a: &TypeAttr) {
-        let declared = a.ty.map(|t| self.lower_type_ref(t));
+        // Type relations are checked in `ProjectAnalysis::validate_type_relations`
+        // (post-pass). Doing them here surfaces false positives for
+        // any cross-module Call return whose type isn't settled until
+        // `infer_cross_module_call_types` runs.
+        let _ = a.ty.map(|t| self.lower_type_ref(t));
         if let Some(init) = a.init {
-            let init_ty = self.visit_expr(init);
-            if let Some(declared) = declared
-                && !is_assignable_to(&self.out.types, init_ty, declared)
-            {
-                let msg = format!(
-                    "attribute initializer of type `{}` is not assignable to declared type `{}`",
-                    greycat_analyzer_types::display(&self.out.types, init_ty),
-                    greycat_analyzer_types::display(&self.out.types, declared),
-                );
-                self.diag(Severity::Error, msg, a.byte_range.clone());
-            }
+            let _ = self.visit_expr(init);
         }
     }
 
     fn visit_top_var(&mut self, d: &VarDeclTop) {
-        let declared = d.ty.map(|t| self.lower_type_ref(t));
+        let _ = d.ty.map(|t| self.lower_type_ref(t));
         if let Some(init) = d.init {
-            let init_ty = self.visit_expr(init);
-            if let Some(declared) = declared
-                && !is_assignable_to(&self.out.types, init_ty, declared)
-            {
-                let msg = format!(
-                    "initializer of type `{}` is not assignable to declared type `{}`",
-                    greycat_analyzer_types::display(&self.out.types, init_ty),
-                    greycat_analyzer_types::display(&self.out.types, declared),
-                );
-                self.diag(Severity::Error, msg, d.byte_range.clone());
-            }
+            let _ = self.visit_expr(init);
         }
     }
 
@@ -805,36 +819,15 @@ impl<'a> Cx<'a> {
             Stmt::Var(LocalVar { name, ty, init, .. }) => {
                 let declared = ty.map(|t| self.lower_type_ref(t));
                 let init_ty = init.map(|i| self.visit_expr(i));
-                if let (Some(declared), Some(init_ty)) = (declared, init_ty)
-                    && !is_assignable_to(&self.out.types, init_ty, declared)
-                {
-                    let msg = format!(
-                        "var initializer of type `{}` is not assignable to declared type `{}`",
-                        greycat_analyzer_types::display(&self.out.types, init_ty),
-                        greycat_analyzer_types::display(&self.out.types, declared),
-                    );
-                    let r = self.hir.exprs[init.unwrap()].byte_range();
-                    self.diag(Severity::Error, msg, r);
-                }
+                // Type-relation diagnostic deferred to
+                // `ProjectAnalysis::validate_type_relations`.
                 let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any());
                 self.out.def_types.insert(name, var_ty);
             }
-            Stmt::Assign(AssignStmt {
-                target,
-                value,
-                byte_range,
-                ..
-            }) => {
-                let target_ty = self.visit_expr(target);
-                let value_ty = self.visit_expr(value);
-                if !is_assignable_to(&self.out.types, value_ty, target_ty) {
-                    let msg = format!(
-                        "value of type `{}` is not assignable to target of type `{}`",
-                        greycat_analyzer_types::display(&self.out.types, value_ty),
-                        greycat_analyzer_types::display(&self.out.types, target_ty),
-                    );
-                    self.diag(Severity::Error, msg, byte_range);
-                }
+            Stmt::Assign(AssignStmt { target, value, .. }) => {
+                let _ = self.visit_expr(target);
+                let _ = self.visit_expr(value);
+                // Diagnostic deferred to validate_type_relations.
             }
             Stmt::If(IfStmt {
                 condition,
@@ -988,17 +981,10 @@ impl<'a> Cx<'a> {
             }
             Stmt::Return(value) => {
                 if let Some(v) = value {
-                    let value_ty = self.visit_expr(v);
-                    if let Some(rt) = return_ty
-                        && !is_assignable_to(&self.out.types, value_ty, rt)
-                    {
-                        let msg = format!(
-                            "return value of type `{}` is not assignable to declared return type `{}`",
-                            greycat_analyzer_types::display(&self.out.types, value_ty),
-                            greycat_analyzer_types::display(&self.out.types, rt),
-                        );
-                        self.diag(Severity::Error, msg, self.hir.exprs[v].byte_range());
-                    }
+                    let _ = self.visit_expr(v);
+                    // Type-relation diagnostic deferred to
+                    // `ProjectAnalysis::validate_type_relations`.
+                    let _ = return_ty;
                 }
             }
             Stmt::Break | Stmt::Continue => {}
@@ -1245,30 +1231,12 @@ impl<'a> Cx<'a> {
         None
     }
 
-    fn expect_bool(&mut self, expr: Idx<Expr>, label: &'static str) {
-        let ty = self.visit_expr(expr);
-        let bool_t = self.primitive(Primitive::Bool);
-        if is_assignable_to(&self.out.types, ty, bool_t) {
-            return;
-        }
-        // The first pass returns `any` for cross-module / Member-call
-        // / bare-Ident-call shapes until `infer_cross_module_call_types`
-        // writes the real return type back. Defer the diagnostic for
-        // those — the project pipeline's `validate_condition_types`
-        // post-pass re-checks once the type has settled. Concrete
-        // non-bool types (`int`, `String`, …) still emit eagerly so
-        // single-file `analyze` calls (unit tests, the per-file LSP
-        // fallback) keep catching the obvious mistakes.
-        if matches!(self.out.types.get(ty).kind, TypeKind::Any) {
-            self.out.bool_check_conditions.push((expr, label));
-            return;
-        }
-        let msg = format!(
-            "{label} must be `bool`, got `{}`",
-            greycat_analyzer_types::display(&self.out.types, ty),
-        );
-        let r = self.hir.exprs[expr].byte_range();
-        self.diag(Severity::Error, msg, r);
+    fn expect_bool(&mut self, expr: Idx<Expr>, _label: &'static str) {
+        // Type-only: populate `expr_types` so the validation pass can
+        // re-check against settled types. The "must be `bool`"
+        // diagnostic emission lives in
+        // `ProjectAnalysis::validate_type_relations`.
+        let _ = self.visit_expr(expr);
     }
 
     fn visit_expr(&mut self, expr_id: Idx<Expr>) -> TypeId {
@@ -1554,6 +1522,21 @@ mod tests {
         analyze(&hir, &res)
     }
 
+    /// Project-aware variant — exercises the full pipeline including
+    /// `validate_type_relations`. Tests that assert type-relation
+    /// diagnostics MUST go through this path; the per-module
+    /// `analyze_src` no longer emits them (intentional, see
+    /// `DiagCategory`).
+    fn analyze_project_src(src: &str) -> Vec<crate::analyzer::SemanticDiagnostic> {
+        use greycat_analyzer_core::SourceManager;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(uri.clone(), src, "project", false);
+        let pa = crate::project::ProjectAnalysis::analyze(&mgr);
+        pa.module(&uri).unwrap().analysis.diagnostics.clone()
+    }
+
     #[test]
     fn clean_function_no_diagnostics() {
         let r = analyze_src("fn add(a: int, b: int): int { return a + b; }\n");
@@ -1562,28 +1545,28 @@ mod tests {
 
     #[test]
     fn return_type_mismatch_surfaces() {
-        let src = "fn bad(): int { return \"hi\"; }\n";
-        let r = analyze_src(src);
+        // Type-relation diagnostic — runs through the project
+        // pipeline's `validate_type_relations` post-pass.
+        let diags = analyze_project_src("fn bad(): int { return \"hi\"; }\n");
         assert!(
-            r.diagnostics
+            diags
                 .iter()
                 .any(|d| d.message.contains("not assignable to declared return type")),
-            "expected return-type error, got: {:?}",
-            r.diagnostics
+            "expected return-type error, got: {diags:?}"
         );
     }
 
     #[test]
     fn if_condition_must_be_bool() {
         // GreyCat's `if` requires parentheses (`if (cond) { ... }`).
-        let src = "fn f(x: int): int { if (x) { return 1; } else { return 0; } }\n";
-        let r = analyze_src(src);
+        // Type-relation diagnostic — runs through the project pipeline.
+        let diags =
+            analyze_project_src("fn f(x: int): int { if (x) { return 1; } else { return 0; } }\n");
         assert!(
-            r.diagnostics
+            diags
                 .iter()
                 .any(|d| d.message.contains("if condition must be `bool`")),
-            "expected condition error, got: {:?}",
-            r.diagnostics
+            "expected condition error, got: {diags:?}"
         );
     }
 
