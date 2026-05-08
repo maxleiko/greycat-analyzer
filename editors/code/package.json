@@ -58,6 +58,23 @@
       "[greycat]": {
         "editor.defaultFormatter": "maxleiko.greycat-analyzer"
       }
+    },
+    "configuration": {
+      "title": "GreyCat Analyzer",
+      "properties": {
+        "greycat-analyzer.trace.server": {
+          "type": "string",
+          "enum": ["off", "info", "debug", "trace"],
+          "default": "info",
+          "enumDescriptions": [
+            "No log output from the LSP server.",
+            "Lifecycle (start/stop), workspace-load summary, slow-rebuild warnings (default).",
+            "Everything `info` shows plus per-event traces (did_open / did_change / did_save / publish counts).",
+            "Everything `debug` shows plus full LSP request / response payloads."
+          ],
+          "markdownDescription": "Verbosity of the LSP server's log output (sets `RUST_LOG` for `greycat_analyzer_*` crates). Restart the server after changing — the extension will prompt."
+        }
+      }
     }
   },
   "engines": {

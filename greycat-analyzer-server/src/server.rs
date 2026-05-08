@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use log::debug;
+use log::{debug, info};
 use lsp_server::*;
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
@@ -107,12 +107,12 @@ pub fn start_server() -> Result<()> {
     main_loop(conn, init_params)?;
     io_threads.join()?;
 
-    debug!("shutting down greycat-analyzer");
+    info!("shutting down greycat-analyzer");
     Ok(())
 }
 
 fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
-    debug!("starting main loop");
+    info!("greycat-analyzer {VERSION} started");
 
     let mut server = Backend {
         client: conn.sender.clone(),

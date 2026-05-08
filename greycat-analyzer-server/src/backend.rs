@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::analyzer::Severity;
@@ -10,7 +11,7 @@ use greycat_analyzer_core::{
     Document, SourceManager,
     diagnostics::{parse_diagnostics, pragma_diagnostics},
 };
-use log::{debug, warn};
+use log::{debug, info, warn};
 use lsp_server::*;
 use lsp_types::{NumberOrString, Position, Range};
 use lsp_types::{
@@ -19,6 +20,12 @@ use lsp_types::{
 };
 
 use crate::Result;
+
+/// Threshold above which a per-edit rebuild is surfaced as a one-line
+/// `info!` so users see hot spots without flooding the log on healthy
+/// edits. Tuned by hand — typical stdlib rebuilds land at ~30-100ms,
+/// so 500ms catches genuine outliers.
+const SLOW_REBUILD_MS: u128 = 500;
 
 pub struct Backend {
     pub client: Sender<Message>,
@@ -96,12 +103,9 @@ impl Backend {
             return;
         }
         self.project_root = Some(ws_root.clone());
+        let load_start = Instant::now();
         let report = self.manager.load_project(&project_file);
-        debug!(
-            "[load_project] {} files loaded from {}",
-            report.loaded.len(),
-            project_file.display()
-        );
+        let load_took = load_start.elapsed();
         for lib in &report.unresolved_libraries {
             warn!("unresolved @library('{lib}') in {}", project_file.display());
         }
@@ -110,7 +114,14 @@ impl Backend {
         }
         // Single project-wide pipeline pass over everything we just
         // loaded — the per-doc analyses land in the cache.
+        let rebuild_start = Instant::now();
         self.project_analysis.rebuild(&self.manager);
+        let rebuild_took = rebuild_start.elapsed();
+        info!(
+            "[load_project] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
+            report.loaded.len(),
+            project_file.display()
+        );
         for (uri, _) in report.loaded {
             if let Err(e) = self.publish_for(&uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
@@ -123,7 +134,7 @@ impl Backend {
         let doc = Document::new(params.text_document);
         debug!("[did_open] {doc}");
         self.manager.add(doc);
-        self.project_analysis.invalidate(&self.manager, &uri);
+        self.invalidate_with_slow_warning(&uri, "did_open");
         self.publish_for(&uri)?;
         Ok(())
     }
@@ -135,9 +146,23 @@ impl Backend {
             .update(&uri, params.content_changes, params.text_document.version);
         debug!("[did_change] {doc}");
         drop(doc);
-        self.project_analysis.invalidate(&self.manager, &uri);
+        self.invalidate_with_slow_warning(&uri, "did_change");
         self.publish_for(&uri)?;
         Ok(())
+    }
+
+    /// Wrap [`ProjectAnalysis::invalidate`] with a wall-clock measure
+    /// and surface an `info!` line only when the rebuild exceeds
+    /// [`SLOW_REBUILD_MS`]. Healthy edits stay quiet at the default
+    /// log level; outliers show up so users can spot project-side hot
+    /// spots without flipping into `debug`.
+    fn invalidate_with_slow_warning(&mut self, uri: &Uri, source: &str) {
+        let start = Instant::now();
+        self.project_analysis.invalidate(&self.manager, uri);
+        let took = start.elapsed();
+        if took.as_millis() >= SLOW_REBUILD_MS {
+            info!("[slow-rebuild] {source} for {} took {took:?}", uri.as_str());
+        }
     }
 
     pub fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Result<()> {

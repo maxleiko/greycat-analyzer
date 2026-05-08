@@ -5,6 +5,7 @@ import {
   OutputChannel,
   StatusBarAlignment,
   window,
+  workspace,
 } from 'vscode';
 import { version } from '../package.json';
 
@@ -22,7 +23,20 @@ export function activate(ctx: ExtensionContext) {
 
   ctx.subscriptions.push(
     channel,
-    commands.registerCommand('greycat-analyzer.restart', restart)
+    commands.registerCommand('greycat-analyzer.restart', restart),
+    workspace.onDidChangeConfiguration(async (e) => {
+      if (!e.affectsConfiguration('greycat-analyzer.trace.server')) {
+        return;
+      }
+      const choice = await window.showInformationMessage(
+        'greycat-analyzer log level changed. Restart the server now?',
+        'Restart',
+        'Later'
+      );
+      if (choice === 'Restart') {
+        await restart();
+      }
+    })
   );
 
   statusBar(ctx);
@@ -54,8 +68,7 @@ function startClient() {
     options: {
       env: {
         ...process.env,
-        RUST_LOG:
-          'greycat_analyzer_ls=debug,greycat_analyzer_core=debug,greycat_analyzer_analysis=debug',
+        RUST_LOG: buildRustLog(),
       },
     },
   };
@@ -73,6 +86,25 @@ function startClient() {
   );
 
   return client.start();
+}
+
+/**
+ * Build the RUST_LOG value from the `greycat-analyzer.trace.server`
+ * setting. The setting is one of `off | info | debug | trace`; the
+ * corresponding log spec scopes the level to the analyzer's own
+ * crates so external dependencies stay quiet at every tier.
+ */
+function buildRustLog(): string {
+  const cfg = workspace.getConfiguration('greycat-analyzer');
+  const level = cfg.get<string>('trace.server', 'info');
+  if (level === 'off') {
+    return 'off';
+  }
+  return [
+    `greycat_analyzer_server=${level}`,
+    `greycat_analyzer_core=${level}`,
+    `greycat_analyzer_analysis=${level}`,
+  ].join(',');
 }
 
 function statusBar(ctx: ExtensionContext) {
