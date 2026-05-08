@@ -480,9 +480,19 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 - [ ] **16.6 `arrow on non-deref receiver` lint** (S) — new `LintRule` (rule code: `arrow-on-non-deref`) walks every `Expr::Arrow` and emits an error when the receiver's type is neither a node tag (`is_node_tag` from `greycat-analyzer-types`) nor carries `@deref(...)` in `ProjectIndex::type_flags`. Severity `Error` so it surfaces in cli `lint` and the LSP red-squiggle layer. Mirrors the runtime's "cannot deref" rejection — caught at edit time instead of run time.
 
+- [ ] **16.7 Null-safe access notations + `??` parity** (M) — the grammar already accepts the full nullable-fluent toolkit; the HIR / analyzer needs to propagate nullability through them so types flow correctly without false `not assignable` cascades:
+  - **`a?.b`** (null-safe member access) — when `a: T?`, the result is `(typeof a.b)?`. When `a: T` (non-nullable), the `?.` is a no-op syntactically but should still type-check. Grammar: `member_expr` carries `optional($.optional)` before / after the `.`.
+  - **`a?->b`** (null-safe arrow / deref access) — same nullability rule as above, on `Expr::Arrow`.
+  - **`a?[i]`** (null-safe offset / index access) — grammar allows `?` before / after the `[`. Receiver-nullable case lifts the result to nullable; non-nullable receiver is a no-op.
+  - **`a?.method()`** (null-safe call) — `Expr::Call` whose callee is a `?.`-tagged member: result is `(method_return)?`.
+  - **`a.b?`** (suffix `?` on a member access) — confirm semantics against the language reference + the `dump-types` oracle. Likely an explicit "treat as nullable" marker; type the expression as `(typeof a.b)?` regardless of `a.b`'s declared nullability. Validate.
+  - **`a ?? b`** (null-coalesce) — already implemented (`BinOp::Coalesce` strips nullable from the right operand). Audit: today the result type is `right.kind` with `nullable = false`; should be `widen(left_non_null, right)` so `T? ?? U` produces `T | U` precisely. Compare to TS's behavior; allow-list any intentional improvement.
+
+  HIR shape decision: extend `MemberExpr` with `pre_optional: bool, post_optional: bool` flags (or a single `optional_chain: bool` if the post-form turns out to be redundant). `OffsetExpr` similarly. Lowering reads the `optional` named children. Resolver / analyzer / completion read the flag when typing the parent expression. New tests cover all five shapes against the language reference.
+
   Out of scope: chained generic inference (`Array<int>::iter().next()`). The runtime doesn't currently support chained generic instantiation either, so we'd be inventing semantics.
 
-**M16:** `cargo run -- lint project.gcl` reports zero false `any` types in `var s = x.s.size()` (s infers `int`); LSP `textDocument/completion` on `x.|` where `x: node<Foo>` returns both node's own method list and `Foo`'s attrs with the `.→->` rewrite; cross-module `recv.attr.method()` chains type correctly through the cached `ProjectAnalysis`; `recv->prop` on a non-deref receiver fires an `arrow-on-non-deref` error.
+**M16:** `cargo run -- lint project.gcl` reports zero false `any` types in `var s = x.s.size()` (s infers `int`); LSP `textDocument/completion` on `x.|` where `x: node<Foo>` returns both node's own method list and `Foo`'s attrs with the `.→->` rewrite; cross-module `recv.attr.method()` chains type correctly through the cached `ProjectAnalysis`; `recv->prop` on a non-deref receiver fires an `arrow-on-non-deref` error; null-safe access notations (`a?.b`, `a?->b`, `a?[i]`, `a?.m()`) propagate nullability through the result and `a ?? b` lifts to the correct merged type.
 
 ---
 
@@ -506,12 +516,16 @@ shapes — when in doubt, run the TS dump and match it.
 - `--filter B` / `B-B` / `L:C` / `L:C-L:C` for narrowing.
 - Single-file mode walks up to find `project.gcl`, analyzes the whole project for cross-module resolutions, then scopes output to just that file.
 
-**Use it as a parity oracle, not a parity contract:** any analyzer / resolver change that affects `expr_types` / `member_uses` / `def_types` should be validated by running both `dump-types` outputs and comparing. **But the TS reference isn't always right** — it carries historical accommodations the Rust port doesn't need to inherit. The dump is the oracle for "what does TS produce here?"; the *correctness call* still lives with the type system / language reference.
+**Operating principle:** TS reference inference is *mostly good* — it's the oracle for compliance questions about the type system. But the Rust port doesn't have to inherit TS's historical accommodations: where the TS shape conflates two distinct concepts or under-specifies a type the language admits, we ship the more precise shape and allow-list the divergence.
+
+> Goal restated: **compliance at the type-system level, plus better features where we can do strictly better.**
+
+Validate every analyzer / resolver change against `dump-types` over the same fixture. When the diff is non-empty, the next question is "is this the Rust port being wrong, or is this an intentional improvement?" — answer in the allow-list (P18.3) rooted in the language reference, not in TS-inertia.
 
 **Implementation pointer (TS side):** `packages/cli/src/dump/` with a `RecordingAnalyzer` Proxy at `shared.ts:303` that wraps `GreycatAnalyzer.analyze()` to capture per-node `Value` returns.
 
-**Intentional divergences from TS (allow-list for the P18 parity gate):**
-- **Method-access without call (`x.s.method`) types as `function`, not the method's return type.** TS auto-evaluates the access to the call's return type, which conflates the *method-reference value* with the *call result*. Methods are first-class `function` values in gcl; the Rust port respects that distinction. (P16.1's `MemberDef::Method → Named("function")` is the correct shape.)
+**Intentional divergences from TS (allow-list seeds for the P18 parity gate):**
+- **Method-access without call (`x.s.method`) types as `function`, not the method's return type.** TS auto-evaluates the access to the call's return type, conflating the *method-reference value* with the *call result*. Methods are first-class `function` values in gcl; the Rust port respects that distinction so `var f = x.s.method;` types `f: function`, not `f: int`. (P16.1's `MemberDef::Method → Named("function")` is the correct shape.)
 - More entries land here as we discover them — each one needs a one-line justification rooted in the language reference, not TS-inertia.
 
 ---
