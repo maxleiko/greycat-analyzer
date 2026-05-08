@@ -668,6 +668,12 @@ impl ProjectAnalysis {
         // is invalidated. Cheap because `deferred_member_uses` is small
         // per module and the work is purely table-lookup.
         self.resolve_cross_module_members();
+        // P15.7: cross-module call return-type inference + bare-ident
+        // and qualified-static type fixups.
+        self.infer_cross_module_call_types();
+        // P15.10: call-site arg-type validation (depends on pass 3.5
+        // having settled inner static-expr return types).
+        self.validate_call_arg_types();
         // P14.9: re-derive qualified-name reference counts.
         self.compute_qualified_refs(manager);
     }
