@@ -263,7 +263,15 @@ fn hover_handler(server: &Backend, params: HoverParams) -> Option<Hover> {
     let pos = params.text_document_position_params.position;
     let cell = server.manager.get(&uri)?;
     let doc = cell.borrow();
-    capabilities::hover(&doc.text, &doc.lib, doc.root_node(), pos)
+    capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        pos,
+        &uri,
+        &server.project_analysis,
+        &server.manager,
+    )
 }
 
 fn signature_help_handler(server: &Backend, params: SignatureHelpParams) -> Option<SignatureHelp> {

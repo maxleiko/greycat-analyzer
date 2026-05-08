@@ -41,6 +41,113 @@ fn hover_renders_param_type() {
     );
 }
 
+/// P15.1 — fn hover renders the full signature, not just the return type.
+/// Cursor on the call-site `add` ident; expected content includes the
+/// param list `(a: int, b: int)` and the return-type annotation.
+#[test]
+fn hover_renders_full_fn_signature() {
+    let src = "fn add(a: int, b: int): int { return a + b; }\nfn main() { add(1, 2); }\n";
+    let tree = parse(src);
+    let h = capabilities::hover(src, "project", tree.root_node(), pos(1, 12));
+    let h = h.expect("hover present on call-site `add`");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("fn add(a: int, b: int): int"),
+        "hover should render full fn signature, got: {value}"
+    );
+}
+
+/// P15.1 — doc-comments above a decl appear in its hover.
+#[test]
+fn hover_includes_doc_comments() {
+    let src = "/// adds two ints.\nfn add(a: int, b: int): int { return a + b; }\nfn main() { add(1, 2); }\n";
+    let tree = parse(src);
+    let h = capabilities::hover(src, "project", tree.root_node(), pos(2, 12));
+    let h = h.expect("hover present on call-site `add`");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("adds two ints."),
+        "hover should include doc-comment, got: {value}"
+    );
+    assert!(
+        value.contains("fn add(a: int, b: int): int"),
+        "hover should still include signature, got: {value}"
+    );
+}
+
+/// P15.1 — generics + multi-param + return type all flow into the
+/// rendered signature.
+#[test]
+fn hover_renders_generics_and_return_type() {
+    let src = "fn pick<T>(xs: Array<T>, i: int): T { return xs[i]; }\nfn main() { pick(1, 2); }\n";
+    let tree = parse(src);
+    let h = capabilities::hover(src, "project", tree.root_node(), pos(1, 13));
+    let h = h.expect("hover present on call-site `pick`");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("fn pick<T>(xs: Array<T>, i: int): T"),
+        "hover should render generic + return type, got: {value}"
+    );
+}
+
+/// P15.1 — cross-module hover renders the foreign decl's signature,
+/// doc-comment, and a `defined in <module>` provenance footnote.
+#[test]
+fn hover_with_project_renders_cross_module_provenance() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let home_uri = Uri::from_str("file:///shapes.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        home_uri.clone(),
+        "/// a 2D point.\ntype Point { x: int; y: int; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn read(p: Point): int { return p.x; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_cell = mgr.get(&user_uri).expect("user doc");
+    let user_doc = user_cell.borrow();
+    // Cursor on the `Point` use site in main.gcl (param type, line 0 col 12).
+    let h = capabilities::hover_with_project(
+        &user_doc.text,
+        &user_doc.lib,
+        user_doc.root_node(),
+        pos(0, 12),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover present on cross-module Point");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("a 2D point."),
+        "hover should include foreign doc-comment, got: {value}"
+    );
+    assert!(
+        value.contains("type Point"),
+        "hover should render foreign type signature, got: {value}"
+    );
+    assert!(
+        value.contains("defined in `shapes`"),
+        "hover should render provenance footnote, got: {value}"
+    );
+}
+
 #[test]
 fn document_symbols_lists_top_level_decls() {
     let src = "fn one() {}\ntype Foo {}\nenum E { A, B }\n";

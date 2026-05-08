@@ -18,7 +18,7 @@ use greycat_analyzer_analysis::resolver::{Definition, resolve};
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Expr};
+use greycat_analyzer_hir::types::{Decl, Expr, FnDecl, TypeDecl};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset, walk_named};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::*;
@@ -79,16 +79,125 @@ pub(crate) fn byte_range_to_lsp(text: &str, range: &Range<usize>) -> lsp_types::
 }
 
 // =============================================================================
-// P3.1 — hover
+// P3.1 + P15.1 — hover
 // =============================================================================
 
 /// Hover info at `pos`. Three layers of lookup:
 /// 1. Cursor on an `ident` node — surface the resolver `Definition`'s
-///    binding info (param/local type, decl kind, builtin name).
+///    binding info (param/local type, decl signature, builtin name).
 /// 2. Cursor inside a non-ident HIR `Expr` — surface
 ///    `<short-label>: <inferred-type>`.
 /// 3. No HIR shape covers the cursor — return `None`.
+///
+/// In-module hover only — for cross-module provenance and richer cross-
+/// module signatures, callers thread a `ProjectAnalysis` + `SourceManager`
+/// through [`hover_with_project`].
 pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) -> Option<Hover> {
+    hover_inner(text, lib, root, pos)
+}
+
+/// P15.1 — hover with project context. Restores cross-module hover
+/// content lost in earlier phases:
+/// * doc-comments above the foreign decl,
+/// * full function signature / type-decl shape,
+/// * `defined in <module>` provenance footnote.
+///
+/// Consumes the cached `ModuleAnalysis` for `uri` directly (so cross-
+/// module name resolution flows through the project index). Falls back
+/// to the in-module-only [`hover`] when the cache is empty.
+pub fn hover_with_project(
+    text: &str,
+    lib: &str,
+    root: tree_sitter::Node<'_>,
+    pos: Position,
+    uri: &Uri,
+    project: &ProjectAnalysis,
+    manager: &SourceManager,
+) -> Option<Hover> {
+    if let Some(module) = project.module(uri) {
+        let byte = position_to_byte(text, pos);
+        let node = node_at_offset(root, byte)?;
+        if !node.is_named() {
+            return None;
+        }
+        // --- Layer 1: ident-based hover via cached resolutions.
+        if node.kind() == "ident"
+            && let Some((ident_idx, ident)) = module
+                .hir
+                .idents
+                .iter()
+                .find(|(_, i)| i.byte_range == node.byte_range())
+        {
+            if let Some(markdown) = ident_hover_markdown(
+                &module.hir,
+                &module.resolutions,
+                &module.analysis,
+                ident_idx,
+                ident,
+                Some(HoverProjectCtx { project, manager }),
+            ) {
+                return Some(hover_from_markdown(
+                    markdown,
+                    ident.byte_range.clone(),
+                    text,
+                ));
+            }
+            // Decl-defining ident.
+            if let Some(m) = module.hir.module.as_ref() {
+                for decl_id in &m.decls {
+                    let decl = &module.hir.decls[*decl_id];
+                    if let Some(name_id) = decl.name()
+                        && module.hir.idents[name_id].byte_range == node.byte_range()
+                    {
+                        let markdown = render_decl_hover_markdown(&module.hir, decl, None);
+                        return Some(hover_from_markdown(
+                            markdown,
+                            module.hir.idents[name_id].byte_range.clone(),
+                            text,
+                        ));
+                    }
+                }
+            }
+        }
+        // --- Layer 2: non-ident expression hover (cached analysis).
+        let target_range = node.byte_range();
+        for ancestor in ancestors(node) {
+            let r = ancestor.byte_range();
+            if r.start > target_range.start || r.end < target_range.end {
+                break;
+            }
+            if let Some((expr_id, expr)) = module
+                .hir
+                .exprs
+                .iter()
+                .filter(|(_, e)| !matches!(e, Expr::Ident(_)))
+                .find(|(_, e)| {
+                    let er = e.byte_range();
+                    !er.is_empty() && er == r
+                })
+                && let Some(ty) = module.analysis.expr_types.get(&expr_id)
+            {
+                let label = format!(
+                    "{}: {}",
+                    short_expr_label(&module.hir, expr),
+                    greycat_analyzer_types::display(&module.analysis.types, *ty),
+                );
+                return Some(hover_from_markdown(wrap_code(&label), r, text));
+            }
+        }
+        return None;
+    }
+    // Cache miss — fall back to in-module-only hover.
+    hover_inner(text, lib, root, pos)
+}
+
+#[derive(Copy, Clone)]
+struct HoverProjectCtx<'a> {
+    project: &'a ProjectAnalysis,
+    manager: &'a SourceManager,
+}
+
+fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) -> Option<Hover> {
     let byte = position_to_byte(text, pos);
     let node = node_at_offset(root, byte)?;
     if !node.is_named() {
@@ -106,8 +215,14 @@ pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) 
             .iter()
             .find(|(_, i)| i.byte_range == node.byte_range())
     {
-        if let Some(label) = ident_hover_label(&hir, &resolutions, &analysis, ident_idx, ident) {
-            return Some(hover_markup(label, ident.byte_range.clone(), text));
+        if let Some(markdown) =
+            ident_hover_markdown(&hir, &resolutions, &analysis, ident_idx, ident, None)
+        {
+            return Some(hover_from_markdown(
+                markdown,
+                ident.byte_range.clone(),
+                text,
+            ));
         }
         // Decl-defining ident (e.g. cursor on the `helper` in `fn helper()`).
         if let Some(module) = hir.module.as_ref() {
@@ -116,9 +231,9 @@ pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) 
                 if let Some(name_id) = decl.name()
                     && hir.idents[name_id].byte_range == node.byte_range()
                 {
-                    let label = format!("{} {}", decl_kind_word(decl), ident.text);
-                    return Some(hover_markup(
-                        label,
+                    let markdown = render_decl_hover_markdown(&hir, decl, None);
+                    return Some(hover_from_markdown(
+                        markdown,
                         hir.idents[name_id].byte_range.clone(),
                         text,
                     ));
@@ -149,64 +264,70 @@ pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) 
                 short_expr_label(&hir, expr),
                 greycat_analyzer_types::display(&analysis.types, *ty),
             );
-            return Some(hover_markup(label, r, text));
+            return Some(hover_from_markdown(wrap_code(&label), r, text));
         }
     }
 
     None
 }
 
-fn ident_hover_label(
+fn ident_hover_markdown(
     hir: &Hir,
     resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
     ident_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
     ident: &greycat_analyzer_hir::types::Ident,
+    project: Option<HoverProjectCtx<'_>>,
 ) -> Option<String> {
     // P6.3: property idents in `a.b` aren't in `Resolutions` — they
     // bind to a `TypeAttr` / method via the analyzer's member pass.
     // Check that first so member hovers render with the right shape.
     if let Some(member) = analysis.member_lookup(ident_idx) {
-        return Some(member_hover_label(hir, analysis, member, ident));
+        return Some(member_hover_markdown(hir, member, ident));
     }
     match resolutions.lookup(ident_idx)? {
         Definition::Param(name) | Definition::Local(name) => {
             analysis.def_types.get(&name).map(|ty| {
-                format!(
+                wrap_code(&format!(
                     "{}: {}",
                     ident.text,
                     greycat_analyzer_types::display(&analysis.types, *ty),
-                )
+                ))
             })
         }
-        Definition::Decl(decl_id) => Some(format!(
-            "{} {}",
-            decl_kind_word(&hir.decls[decl_id]),
-            ident.text
-        )),
-        Definition::Generic(_) => Some(format!("(type parameter) {}", ident.text)),
-        Definition::ProjectDecl { .. } | Definition::Project => {
-            Some(format!("(project) {}", ident.text))
+        Definition::Decl(decl_id) => {
+            Some(render_decl_hover_markdown(hir, &hir.decls[decl_id], None))
         }
+        Definition::Generic(_) => Some(wrap_code(&format!("(type parameter) {}", ident.text))),
+        Definition::ProjectDecl {
+            uri: foreign_uri,
+            decl,
+        } => {
+            // P15.1 — try to render the foreign decl's full signature
+            // + doc + provenance footnote when project context is
+            // available. Falls back to a minimal placeholder otherwise.
+            if let Some(ctx) = project
+                && let Some(fmod) = ctx.project.module(&foreign_uri)
+                && (decl.into_raw() as usize) < fmod.hir.decls.len()
+            {
+                let provenance = module_label_for_uri(&foreign_uri);
+                return Some(render_decl_hover_markdown(
+                    &fmod.hir,
+                    &fmod.hir.decls[decl],
+                    Some(&provenance),
+                ));
+            }
+            Some(wrap_code(&format!("(project) {}", ident.text)))
+        }
+        Definition::Project => Some(wrap_code(&format!("(runtime built-in) {}", ident.text))),
     }
 }
 
-fn decl_kind_word(decl: &Decl) -> &'static str {
-    match decl {
-        Decl::Fn(_) => "fn",
-        Decl::Type(_) => "type",
-        Decl::Enum(_) => "enum",
-        Decl::Var(_) => "var",
-        Decl::Pragma(_) => "@",
-    }
-}
-
-/// Hover label for a property ident bound by P6.3 member resolution
+/// Hover markdown for a property ident bound by P6.3 member resolution
 /// (`a.b` / `a->b`). Renders attribute / method shape with the
 /// declared / inferred return type when available.
-fn member_hover_label(
+fn member_hover_markdown(
     hir: &Hir,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
     member: greycat_analyzer_analysis::analyzer::MemberDef,
     ident: &greycat_analyzer_hir::types::Ident,
 ) -> String {
@@ -214,36 +335,199 @@ fn member_hover_label(
     match member {
         MemberDef::Attr(attr_id) => {
             let attr = &hir.type_attrs[attr_id];
-            if let Some(ty_ref) = attr.ty {
-                let name = &hir.idents[hir.type_refs[ty_ref].name].text;
-                format!("{}: {}", ident.text, name)
-            } else {
-                format!("attr {}", ident.text)
-            }
+            let ty_str = attr
+                .ty
+                .map(|t| render_type_ref(hir, t))
+                .unwrap_or_else(|| "any".into());
+            let mut out = String::new();
+            push_doc_section(&mut out, attr.doc.as_deref());
+            out.push_str(&wrap_code(&format!("{}: {}", ident.text, ty_str)));
+            out
         }
         MemberDef::Method(decl_id) => {
-            // Capture the function-shape: name + return type if declared.
-            let Decl::Fn(fnd) = &hir.decls[decl_id] else {
-                return format!("fn {}", ident.text);
-            };
-            let ret = fnd
-                .return_type
-                .map(|r| hir.idents[hir.type_refs[r].name].text.clone());
-            // Suppress unused-import-of-analysis warning by referencing it.
-            let _ = analysis;
-            match ret {
-                Some(rt) => format!("fn {}(): {}", ident.text, rt),
-                None => format!("fn {}()", ident.text),
-            }
+            let decl = &hir.decls[decl_id];
+            render_decl_hover_markdown(hir, decl, None)
         }
     }
 }
 
-fn hover_markup(label: String, range: Range<usize>, text: &str) -> Hover {
+/// P15.1 — render a top-level decl as hover markdown. Output layout:
+/// optional doc paragraph, then a ```greycat fenced code block with the
+/// signature, then (when `provenance` is `Some`) an italic
+/// "*defined in `<name>`*" footnote. `provenance` is supplied only for
+/// cross-module idents — intra-module uses pass `None`.
+fn render_decl_hover_markdown(hir: &Hir, decl: &Decl, provenance: Option<&str>) -> String {
+    let mut out = String::new();
+    push_doc_section(&mut out, decl_doc(decl));
+    let signature = render_decl_signature(hir, decl);
+    out.push_str(&wrap_code(&signature));
+    if let Some(prov) = provenance {
+        out.push_str("\n\n*defined in `");
+        out.push_str(prov);
+        out.push_str("`*");
+    }
+    out
+}
+
+fn decl_doc(decl: &Decl) -> Option<&str> {
+    match decl {
+        Decl::Fn(d) => d.doc.as_deref(),
+        Decl::Type(d) => d.doc.as_deref(),
+        Decl::Enum(d) => d.doc.as_deref(),
+        Decl::Var(_) => None,
+        Decl::Pragma(_) => None,
+    }
+}
+
+/// Render a decl as a single-line code-block-friendly signature.
+/// `fn` decls render the full `fn name<G>(p: T): R`; types render
+/// `type Name<G> extends Parent`; enums render `enum Name`; vars
+/// render `var name: T`.
+fn render_decl_signature(hir: &Hir, decl: &Decl) -> String {
+    match decl {
+        Decl::Fn(d) => render_fn_signature(hir, d),
+        Decl::Type(d) => render_type_signature(hir, d),
+        Decl::Enum(d) => format!("enum {}", hir.idents[d.name].text),
+        Decl::Var(d) => {
+            let ty =
+                d.ty.map(|t| render_type_ref(hir, t))
+                    .unwrap_or_else(|| "any".into());
+            format!("var {}: {}", hir.idents[d.name].text, ty)
+        }
+        Decl::Pragma(p) => format!("@{}", hir.idents[p.name].text),
+    }
+}
+
+fn render_fn_signature(hir: &Hir, fnd: &FnDecl) -> String {
+    let name = &hir.idents[fnd.name].text;
+    let mut out = String::new();
+    if fnd.modifiers.private {
+        out.push_str("private ");
+    }
+    if fnd.modifiers.static_ {
+        out.push_str("static ");
+    }
+    if fnd.modifiers.abstract_ {
+        out.push_str("abstract ");
+    }
+    if fnd.modifiers.native {
+        out.push_str("native ");
+    }
+    out.push_str("fn ");
+    out.push_str(name);
+    if !fnd.generics.is_empty() {
+        out.push('<');
+        for (i, g) in fnd.generics.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&hir.idents[*g].text);
+        }
+        out.push('>');
+    }
+    out.push('(');
+    for (i, param_id) in fnd.params.iter().enumerate() {
+        let p = &hir.fn_params[*param_id];
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&hir.idents[p.name].text);
+        out.push_str(": ");
+        match p.ty {
+            Some(t) => out.push_str(&render_type_ref(hir, t)),
+            None => out.push_str("any"),
+        }
+    }
+    out.push(')');
+    if let Some(ret) = fnd.return_type {
+        out.push_str(": ");
+        out.push_str(&render_type_ref(hir, ret));
+    }
+    out
+}
+
+fn render_type_signature(hir: &Hir, td: &TypeDecl) -> String {
+    let mut out = String::new();
+    if td.modifiers.private {
+        out.push_str("private ");
+    }
+    if td.modifiers.abstract_ {
+        out.push_str("abstract ");
+    }
+    if td.modifiers.native {
+        out.push_str("native ");
+    }
+    out.push_str("type ");
+    out.push_str(&hir.idents[td.name].text);
+    if !td.generics.is_empty() {
+        out.push('<');
+        for (i, g) in td.generics.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&hir.idents[*g].text);
+        }
+        out.push('>');
+    }
+    if let Some(parent) = td.supertype {
+        out.push_str(" extends ");
+        out.push_str(&render_type_ref(hir, parent));
+    }
+    out
+}
+
+fn render_type_ref(
+    hir: &Hir,
+    type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
+) -> String {
+    let tr = &hir.type_refs[type_ref];
+    let mut out = hir.idents[tr.name].text.clone();
+    if !tr.params.is_empty() {
+        out.push('<');
+        for (i, p) in tr.params.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&render_type_ref(hir, *p));
+        }
+        out.push('>');
+    }
+    if tr.optional {
+        out.push('?');
+    }
+    out
+}
+
+/// Best-effort module label for a foreign URI. Strips trailing `.gcl`
+/// off the file name so `file:///proj/lib/std/core.gcl` renders as
+/// `core` in the provenance footnote. Falls back to the URI string
+/// when path parsing fails.
+fn module_label_for_uri(uri: &Uri) -> String {
+    let s = uri.as_str();
+    let path_part = s.strip_prefix("file://").unwrap_or(s);
+    let last = path_part.rsplit(['/', '\\']).next().unwrap_or(path_part);
+    last.strip_suffix(".gcl").unwrap_or(last).to_string()
+}
+
+fn push_doc_section(out: &mut String, doc: Option<&str>) {
+    let Some(doc) = doc else { return };
+    let trimmed = doc.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    out.push_str(trimmed);
+    out.push_str("\n\n");
+}
+
+fn wrap_code(label: &str) -> String {
+    format!("```greycat\n{label}\n```")
+}
+
+fn hover_from_markdown(markdown: String, range: Range<usize>, text: &str) -> Hover {
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: format!("```greycat\n{label}\n```"),
+            value: markdown,
         }),
         range: Some(byte_range_to_lsp(text, &range)),
     }

@@ -373,6 +373,47 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 ---
 
+### Phase 15 — Interactive-LSP regression sweep (~3-4 weeks)
+
+**Goal:** close the LSP capability gaps that surfaced once attention shifted back to interactive editor behavior. The parity push (P11–P14) operated against the diagnostic corpus + fixture gauntlets and didn't catch capability-shape regressions: hover got thinner, completion was never wired in any phase, and `@include` / `@library` resolution failures go silent. P15 is the catch-up.
+
+**Chunks:**
+
+- [x] **15.1 Hover content restoration** (M) — three regressions restored on top of `capabilities::hover`:
+  - **Doc-comments** above the declaration. `Decl::{Fn,Type,Enum}` already carry `doc: Option<String>` (populated by `lower::doc_text`); the hover renderer now prepends the trimmed doc paragraph above the signature code-block.
+  - **Function signature.** New `render_fn_signature` walks `FnDecl.modifiers` / `generics` / `params` / `return_type` and emits `fn name<G>(p: T): R` (modifiers prefix when present); `render_type_signature` mirrors it for `type` decls. `Decl::{Var, Pragma}` get terse signatures too. Type-attr / method member hovers pick up the same shape.
+  - **Symbol provenance.** New `hover_with_project(text, lib, root, pos, uri, &ProjectAnalysis, &SourceManager)` consumes the cached `ModuleAnalysis` (so cross-module names actually resolve to `Definition::ProjectDecl`), looks up the foreign decl's HIR, and renders its full doc + signature followed by an italic `*defined in `<module>`*` footnote (`<module>` = foreign URI's file stem). Intra-module idents skip the line; the runtime `Definition::Project` placeholder renders as "(runtime built-in) name". `hover_handler` in `server.rs` now routes through `hover_with_project`. 4 new unit tests in `lsp_capabilities.rs` cover full-fn-signature rendering, doc-comment inclusion, generic-param rendering, and cross-module provenance.
+
+- [ ] **15.2 Completion capability — base implementation** (L) — LSP `textDocument/completion` is currently unimplemented and `completion_provider` is not advertised in `initialize`. Foundational `capabilities::completion` handler:
+  - **Scope-aware ident completion** — locals, params, and in-scope decl names from cached `Resolutions` + `ProjectIndex::values`/`type_decls`.
+  - **Member completion** after `.` / `->` — consult `AnalysisResult::type_decls`, `member_uses`, and `foreign_member_lookup` (P11.5) to enumerate attrs / methods on the receiver's declared type.
+  - **Keyword completion** at statement / expression positions (`fn`, `if`, `else`, `for`, `while`, `var`, `return`, `throw`, `is`, `as`, etc.).
+  - Trigger characters: `.`, `:`, `"`. TS reference at `packages/lang/src/lsp/completion.ts` is the parity target; port the *intent* per Decision E (don't try to match the TS API shape).
+
+- [ ] **15.3 `@library` version completion against the GreyCat registry** (M) — the regression the user surfaced. TS reference at [packages/server/src/registry.ts](https://hub.datathings.com/greycat/lang) does this as a *lazy* completion: the analyzer's `completion()` returns a single placeholder `LazyCompletionItem` carrying the lib name + the version-slot range; the LSP layer then fetches `https://get.greycat.io/files/<name>/` to enumerate branches, recurses into `<branch>/<major.minor>/<arch>/` (preferring `x64-linux` over `noarch`), collects every `*.zip` filename + last-modification date, and returns those as concrete completion items with the date in `labelDetails.description` and `sortText` preserving the registry's semver-descending order. Channel-aware: when the cursor's existing text already has a `-dev` / `-beta` prerelease tag, filter the registry results to that channel. Special case: `std` is aliased to `core` at the registry root. Mirror the same two-stage shape in the Rust port: detect the version slot in `capabilities::completion` (P15.2) and emit a placeholder; resolve the placeholder against the registry in a completion-resolve path.
+
+  **Architecture — must work in both LSP and WASM/Monaco.** The registry-walk algorithm lives in a shared crate (probably `greycat-analyzer-core::registry` or a new `greycat-analyzer-registry` crate) behind a `RegistryFetcher` trait that takes a URL and returns the JSON listing. Two backings:
+  - **Native** (LSP server, CLI). Sync HTTP client (`ureq` is the lightest option; `reqwest::blocking` is the fallback). Cache lives in-process behind a `RwLock<HashMap<String, (Instant, Vec<Version>)>>` with a TTL.
+  - **WASM** (playground / Monaco). The browser's `fetch` is the only HTTP available, and it's `Promise`-shaped. Two viable paths: (a) `web_sys::window().fetch_with_str(...)` returning a `JsFuture` — the WASM completion entry then has to be `async` (i.e. `wasm-bindgen` returns a `Promise` to JS); (b) a JS-side callback the playground passes in (`pass_registry_fetcher: js_sys::Function`) that the Rust code invokes — keeps the Rust API sync and lets the playground decide how to fetch (and cache via the browser's HTTP cache / a service worker). Path (b) is the lighter option and matches how the resolver `Context` already abstracts I/O for native vs. WASM (see P1.1).
+  Pick (b) unless there's a profiling reason not to — it keeps the WASM bundle from carrying `web_sys::Fetch` machinery, and the playground's existing `wasm.ts` initializer (P5.2) is the natural place to inject the JS fetcher.
+
+  **Better than the TS impl:** the TS version walks 4 nested `fetch` calls per request and re-fetches on every keystroke. Improvements that drop out of the trait-backed design: (a) cache the registry response per-`name` with a TTL so consecutive completions in the same session are free (works in both LSP and WASM via the JS-side fetcher's cache); (b) parallelize the per-major.minor fetches — TS awaits them serially in a `for` loop, which is most of the latency. (c) Worth checking with the registry maintainers whether `get.greycat.io` exposes a flatter endpoint that returns the full version listing in one round trip before porting the 4-fetch dance verbatim.
+
+  Out of scope here: `@library("<cursor>", ...)` *name* completion. Doesn't exist in the TS reference; follow-up chunk if wanted. `@include("<cursor>")` directory completion is **in scope as P15.4** since it's a clean filesystem walk.
+
+- [ ] **15.4 `@include("<cursor>")` directory completion** (S, opportunistic) — not in the TS reference; lands here because it's cheap on the native side and doesn't share the registry's HTTP machinery. Activated when the cursor sits inside a `string` child of a `mod_pragma` whose name is `@include`. Walks the project root (the `SourceManager` entrypoint's parent directory) and returns subdirectories — TS reference doesn't do this, so the matching algorithm is ours to define: case-insensitive prefix match against the cursor's already-typed text, sorted alphabetically. Backing is the resolver `Context` (P1.1) — same trait the project loader already uses, so native LSP gets this for free via `FsContext::iter_gcl`.
+
+  WASM caveat: in the playground today there's no project root because the playground edits a single in-memory buffer (P5.2). `@include` completion is therefore a no-op in WASM until P14.8 lands the multi-doc / project-from-disk loader; once that's wired, the same `Context` trait is consulted and it works automatically. Don't add a WASM-specific code path here — gate the completion on `Context::is_dir(project_root)` returning true and let it cleanly degrade.
+
+- [ ] **15.5 `@include` / `@library` resolution diagnostics** (S) — two silent failures in the project loader (greycat-analyzer-core/src/manager.rs `load_project`):
+  - **Non-existent target.** `@include("does_not_exist")` against a missing directory and `@library("typo", "1.0")` against an uninstalled library both no-op silently. Emit a `module-resolution` warning at the pragma's range, source `greycat-analyzer`, code `unresolved-include` / `unresolved-library`.
+  - **Duplicate pragma.** Two `@include("a")` (or two `@library("std", …)`) in the same module silently load the same closure twice. Emit a `duplicate-include` / `duplicate-library` warning at the second site.
+  Wires through `core::diagnostics` so the cli `lint` and LSP both surface them. The resolver already attempts the path math — thread the `Result` failure into the diagnostic pipeline instead of dropping it.
+
+**M15: hover restores doc / signature / provenance; basic completion lights up in the LSP and the WASM/Monaco playground (sharing the same algorithm via a `RegistryFetcher` trait — native HTTP for the LSP, JS-callback fetch for WASM); `@library` version completion hits `get.greycat.io` in both targets and matches TS-reference behavior; `@include` directory completion is wired where the project root is known; `@include` / `@library` typos and duplicates are surfaced as diagnostics in both `cli lint` and the LSP.**
+
+---
+
 ## 7. Test strategy
 
 Three layers, no "port every TS test" milestone (tarpit).
@@ -437,13 +478,14 @@ P11 [3-5w]   Cross-module identity ── M11   ← unblocks P12-P14 cross-modul
 P12 [4-6w]   Type system completion ─ M12
 P13 [3-4w]   Analyzer parity closeout ─ M13
 P14 [2-3w]   Final parity gate ────── M14   ← the "are we 1:1?" gate
+P15 [3-4w]   Interactive-LSP sweep ── M15   ← hover / completion / pragma diags
 ```
 
-Total realistic envelope: **12-18 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1.
+Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface.
 
 Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3 → P14.2) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
 
-P11 is on the critical path for P12–P14 because most cross-module capabilities (member resolution across modules, scope-aware rename / references / goto-def across modules, real `Definition::Project` data) blocks behind a global decl table. P12 and P13 can run in parallel after P11. P14 gates on all of P11/P12/P13.
+P11 is on the critical path for P12–P14 because most cross-module capabilities (member resolution across modules, scope-aware rename / references / goto-def across modules, real `Definition::Project` data) blocks behind a global decl table. P12 and P13 can run in parallel after P11. P14 gates on all of P11/P12/P13. P15 leans on P11 (provenance) and P11.5 (cross-module member completion) but is otherwise independent — it can run in parallel with P14's CI-gate work.
 
 ---
 
