@@ -119,6 +119,31 @@ fn goto_definition_param_lands_on_decl() {
 }
 
 #[test]
+fn cross_module_decl_location_points_at_foreign_name() {
+    use greycat_analyzer_hir::lower_module;
+    let foreign_text = "type Helper {}\n";
+    let foreign_tree = parse(foreign_text);
+    let foreign_hir = lower_module(foreign_text, "a", "p", foreign_tree.root_node());
+    let helper_decl = foreign_hir
+        .module
+        .as_ref()
+        .and_then(|m| m.decls.first().copied())
+        .expect("Helper decl present");
+    let foreign_uri = Uri::from_str("file:///other.gcl").unwrap();
+    let loc = capabilities::cross_module_decl_location(
+        &foreign_uri,
+        foreign_text,
+        &foreign_hir,
+        helper_decl,
+    )
+    .expect("location for foreign Helper");
+    assert_eq!(loc.uri, foreign_uri);
+    assert_eq!(loc.range.start.line, 0);
+    // `Helper` starts at column 5 (`type ` = 5 chars).
+    assert_eq!(loc.range.start.character, 5);
+}
+
+#[test]
 fn goto_implementation_finds_concrete_method() {
     let src = r#"
 type Foo {

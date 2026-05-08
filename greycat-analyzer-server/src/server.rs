@@ -278,11 +278,41 @@ fn goto_definition_handler(
     server: &Backend,
     params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
+    use greycat_analyzer_analysis::resolver::Definition;
+
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let cell = server.manager.get(&uri)?;
     let doc = cell.borrow();
-    capabilities::goto_definition(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
+    if let Some(loc) =
+        capabilities::goto_definition(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
+    {
+        return Some(loc);
+    }
+    // P11.3: cross-module fallback. Consult the cached resolutions —
+    // if the cursor binds to a `Definition::ProjectDecl`, resolve the
+    // foreign module's decl-name range out of the project analysis
+    // cache and source manager.
+    let module = server.project_analysis.module(&uri)?;
+    let cursor_idx = capabilities::cursor_ident_idx(&doc.text, doc.root_node(), pos, &module.hir)?;
+    let Definition::ProjectDecl {
+        uri: foreign_uri,
+        decl,
+    } = module.resolutions.lookup(cursor_idx)?
+    else {
+        return None;
+    };
+    drop(doc);
+    let foreign_module = server.project_analysis.module(&foreign_uri)?;
+    let foreign_cell = server.manager.get(&foreign_uri)?;
+    let foreign_doc = foreign_cell.borrow();
+    capabilities::cross_module_decl_location(
+        &foreign_uri,
+        &foreign_doc.text,
+        &foreign_module.hir,
+        decl,
+    )
+    .map(GotoDefinitionResponse::Scalar)
 }
 
 fn goto_implementation_handler(

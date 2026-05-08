@@ -412,6 +412,42 @@ pub fn goto_definition(
     }))
 }
 
+/// P11.3 — turn a `Definition::ProjectDecl { uri, decl }` into the
+/// concrete `Location` of the foreign module's decl-name range. Pure
+/// helper: caller fetches the foreign HIR + text from the project-
+/// analysis cache + source manager and passes them in.
+pub fn cross_module_decl_location(
+    foreign_uri: &Uri,
+    foreign_text: &str,
+    foreign_hir: &Hir,
+    decl_id: greycat_analyzer_hir::arena::Idx<Decl>,
+) -> Option<Location> {
+    let name_id = foreign_hir.decls[decl_id].name()?;
+    let range = byte_range_to_lsp(foreign_text, &foreign_hir.idents[name_id].byte_range);
+    Some(Location {
+        uri: foreign_uri.clone(),
+        range,
+    })
+}
+
+/// P11.3 helper — map a cursor position in `text` to its `Idx<Ident>`
+/// against the cached `hir`'s `idents` arena, by byte-range match.
+/// Returns `None` if the cursor isn't over an ident or no matching
+/// idx was allocated (e.g. lowering skipped this shape).
+pub fn cursor_ident_idx(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    pos: Position,
+    hir: &Hir,
+) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
+    let byte = position_to_byte(text, pos);
+    let node = node_at_offset(root, byte)?;
+    if node.kind() != "ident" {
+        return None;
+    }
+    idx_for_node(hir, node)
+}
+
 /// P8.6 — `textDocument/implementation`. For a method-name ident,
 /// returns every concrete (non-`abstract`, non-`native`) method with
 /// that name across all type decls in the module. For other idents,
