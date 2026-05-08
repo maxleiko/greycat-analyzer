@@ -148,6 +148,22 @@ pub fn pragma_diagnostics(
             ));
             continue;
         }
+        // P15.x — runtime rejects absolute paths in @include (it
+        // joins the path as `./<value>`), so flag them and don't run
+        // the dir-existence check.
+        if Path::new(&inc.value).is_absolute() {
+            out.push(make_pragma_diag(
+                text,
+                &inc.byte_range,
+                "absolute-include",
+                DiagnosticSeverity::WARNING,
+                format!(
+                    "@include('{}'): absolute paths are not supported (use a project-relative path)",
+                    inc.value
+                ),
+            ));
+            continue;
+        }
         let dir = project_dir.join(&inc.value);
         if !ctx.is_dir(&dir) {
             out.push(make_pragma_diag(
@@ -356,6 +372,24 @@ mod tests {
         assert_eq!(
             map["unresolved-include"].severity,
             Some(DiagnosticSeverity::WARNING)
+        );
+    }
+
+    /// P15.x — runtime rejects absolute paths in `@include`; the
+    /// analyzer mirrors that with an `absolute-include` warning.
+    #[test]
+    fn pragma_diagnostics_absolute_include() {
+        let src = "@include(\"/tmp/anything\");\n";
+        let map = pragma_diags(src, &["/tmp/anything"]);
+        assert!(
+            map.contains_key("absolute-include"),
+            "expected absolute-include warning, got: {map:?}"
+        );
+        // The dir-not-found check should be skipped — emitting both
+        // would be noisy.
+        assert!(
+            !map.contains_key("unresolved-include"),
+            "absolute path should not also fire unresolved-include: {map:?}"
         );
     }
 

@@ -162,6 +162,13 @@ impl SourceManager {
         report: &mut LoadReport,
     ) {
         for inc in &desc.includes {
+            // P15.x — runtime rejects absolute @include paths; mirror
+            // that here so we don't analyze files that won't actually
+            // be loaded at runtime. The `absolute-include` warning is
+            // surfaced by `core::diagnostics::pragma_diagnostics`.
+            if Path::new(&inc.value).is_absolute() {
+                continue;
+            }
             let dir = project_dir.join(&inc.value);
             if !self.ctx.is_dir(&dir) {
                 // P15.5 — surfaced as a typed `unresolved-include`
