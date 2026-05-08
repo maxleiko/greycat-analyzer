@@ -432,6 +432,33 @@ pub fn cross_module_decl_location(
     })
 }
 
+/// P11.5 — turn a `ForeignMember` (cross-module attr / method
+/// binding) into a `Location` pointing at the foreign attr / method's
+/// name range. Mirrors [`cross_module_decl_location`] but indexes
+/// `type_attrs` for `MemberDef::Attr` and `decls` for `Method`.
+pub fn cross_module_member_location(
+    foreign_uri: &Uri,
+    foreign_text: &str,
+    foreign_hir: &Hir,
+    member: &greycat_analyzer_analysis::analyzer::MemberDef,
+) -> Option<Location> {
+    use greycat_analyzer_analysis::analyzer::MemberDef;
+    let range = match *member {
+        MemberDef::Attr(attr_id) => {
+            let name_id = foreign_hir.type_attrs[attr_id].name;
+            foreign_hir.idents[name_id].byte_range.clone()
+        }
+        MemberDef::Method(decl_id) => {
+            let name_id = foreign_hir.decls[decl_id].name()?;
+            foreign_hir.idents[name_id].byte_range.clone()
+        }
+    };
+    Some(Location {
+        uri: foreign_uri.clone(),
+        range: byte_range_to_lsp(foreign_text, &range),
+    })
+}
+
 /// P11.3 helper — map a cursor position in `text` to its `Idx<Ident>`
 /// against the cached `hir`'s `idents` arena, by byte-range match.
 /// Returns `None` if the cursor isn't over an ident or no matching

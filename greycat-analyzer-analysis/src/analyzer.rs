@@ -36,6 +36,7 @@ use greycat_analyzer_types::{
 };
 
 use crate::resolver::{Definition, Resolutions};
+use crate::stdlib::ProjectIndex;
 
 /// Severity sketch for analyzer diagnostics. Maps onto `lsp_types::DiagnosticSeverity`
 /// at the LSP boundary (P2.7).
@@ -76,6 +77,17 @@ pub struct AnalysisResult {
     /// Capabilities consult this in addition to [`Resolutions`] so
     /// goto-definition / hover work on member access.
     pub member_uses: HashMap<Idx<Ident>, MemberDef>,
+    /// P11.5 cross-module member bindings — same keying as `member_uses`
+    /// but the resolved attr / method lives in another module's HIR.
+    /// Populated by [`crate::project::ProjectAnalysis::rebuild`] after
+    /// every module's analyzer pass runs, by walking each module's
+    /// [`Self::deferred_member_uses`] against the global decl table.
+    pub foreign_member_uses: HashMap<Idx<Ident>, ForeignMember>,
+    /// P11.5 — `(property_ident, receiver_type_name)` pairs the analyzer
+    /// couldn't bind locally because the receiver's type isn't declared
+    /// in this module. The project pipeline drains these in a post-pass
+    /// against [`crate::stdlib::ProjectIndex::decl_locations`].
+    pub deferred_member_uses: Vec<(Idx<Ident>, String)>,
     pub diagnostics: Vec<SemanticDiagnostic>,
 }
 
@@ -90,6 +102,16 @@ pub enum MemberDef {
     Method(Idx<Decl>),
 }
 
+/// P11.5 — a member-access binding that resolves into another module.
+/// `uri` names the home module of the foreign type's declaration; the
+/// `member` indices reference that module's HIR arenas, not the
+/// analyzed module's.
+#[derive(Debug, Clone)]
+pub struct ForeignMember {
+    pub uri: greycat_analyzer_core::lsp_types::Uri,
+    pub member: MemberDef,
+}
+
 impl AnalysisResult {
     pub fn type_of(&self, expr: Idx<Expr>) -> Option<TypeId> {
         self.expr_types.get(&expr).copied()
@@ -101,10 +123,32 @@ impl AnalysisResult {
     pub fn member_lookup(&self, ident: Idx<Ident>) -> Option<MemberDef> {
         self.member_uses.get(&ident).copied()
     }
+
+    /// P11.5 — look up a cross-module member-access binding for `ident`.
+    /// Falls back to `None` for members that are intra-module
+    /// ([`Self::member_lookup`]) or unresolved.
+    pub fn foreign_member_lookup(&self, ident: Idx<Ident>) -> Option<&ForeignMember> {
+        self.foreign_member_uses.get(&ident)
+    }
 }
 
-/// Run the analyzer.
+/// Run the analyzer with no cross-module project context. Falls back
+/// to an empty [`ProjectIndex`]; cross-module type names lower to
+/// `any` and `deferred_member_uses` gets nothing the project pipeline
+/// can resolve. Used by per-file capabilities and unit tests.
 pub fn analyze(hir: &Hir, res: &Resolutions) -> AnalysisResult {
+    let index = ProjectIndex::new();
+    analyze_with_index(hir, res, &index)
+}
+
+/// Run the analyzer with a shared project index. The index is read-
+/// only — it's only consulted when `lower_type_ref` doesn't find a
+/// name in the per-module registry, so cross-module type references
+/// (`p: Point` where `Point` is declared in another module) lower to
+/// the right `Named` shape and `resolve_member` can defer
+/// `(property, type_name)` for the project's cross-module member
+/// post-pass (P11.5).
+pub fn analyze_with_index(hir: &Hir, res: &Resolutions, index: &ProjectIndex) -> AnalysisResult {
     let mut out = AnalysisResult::default();
     seed_builtins(&mut out.types);
     register_module_types(hir, &mut out);
@@ -116,6 +160,7 @@ pub fn analyze(hir: &Hir, res: &Resolutions) -> AnalysisResult {
         hir,
         res,
         out: &mut out,
+        index,
         narrows: Vec::new(),
         chain_member_ifs: HashSet::new(),
     };
@@ -227,6 +272,11 @@ struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
     out: &'a mut AnalysisResult,
+    /// P11.5: cross-module project index. Per-file callers pass an
+    /// empty [`ProjectIndex::new`]; the project pipeline passes the
+    /// index it just rebuilt. Used by `lower_type_ref` to recognize
+    /// type names that aren't declared in this module.
+    index: &'a ProjectIndex,
     /// Null-flow narrowing stack (P6.4). Each frame is a binding ident
     /// → temporary `TypeId` override. Frames are pushed on block /
     /// then-branch / else-branch entry and popped on exit, so a
@@ -297,9 +347,9 @@ impl<'a> Cx<'a> {
     /// P6.3 member resolution: bind the property ident in `a.b` /
     /// `a->b` to the matching `TypeAttr` or method `Decl` whenever the
     /// receiver's type names a `TypeDecl` declared in this module.
-    /// Anonymous types, primitives, and cross-module receivers are
-    /// out of scope here — `Definition::Project` plus P8.x cross-
-    /// module work covers those later.
+    /// Anonymous types and primitives stay no-binding; cross-module
+    /// receivers (P11.5) are recorded into `deferred_member_uses` so
+    /// the project pipeline can resolve them in a post-pass.
     fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
         let ty = self.out.types.get(recv_ty);
         let type_name = match &ty.kind {
@@ -321,6 +371,9 @@ impl<'a> Cx<'a> {
             return;
         };
         let Some(decl_id) = self.out.type_decls.get(&name).copied() else {
+            // P11.5: type isn't declared in this module. Defer to the
+            // project pipeline's cross-module post-pass.
+            self.out.deferred_member_uses.push((property, name));
             return;
         };
         let Decl::Type(type_decl) = self.hir.decls[decl_id].clone() else {
@@ -372,6 +425,13 @@ impl<'a> Cx<'a> {
                     self.out.types.generic(name.clone(), args)
                 } else if let Some(id) = self.out.registry.lookup(&name) {
                     id
+                } else if self.index.has_name(&name) {
+                    // P11.5: name is known to the project but not to
+                    // this module's registry — i.e. a type declared
+                    // elsewhere. Lower to `Named(name)` so receivers
+                    // typed against it carry a name `resolve_member`
+                    // can defer for the cross-module post-pass.
+                    self.out.types.named(name.clone())
                 } else {
                     // Unknown type — fall back to Any so downstream rules don't
                     // mass-cascade. Resolver already emitted "unresolved name".

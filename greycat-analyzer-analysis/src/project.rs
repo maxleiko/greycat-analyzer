@@ -16,9 +16,11 @@ use std::collections::{HashMap, HashSet};
 
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
+use greycat_analyzer_hir::arena::Idx;
+use greycat_analyzer_hir::types::{Decl, Ident};
 use greycat_analyzer_hir::{Hir, lower_module};
 
-use crate::analyzer::{AnalysisResult, analyze};
+use crate::analyzer::{AnalysisResult, ForeignMember, MemberDef, analyze_with_index};
 use crate::lint::{LintDiagnostic, run_lints};
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::ProjectIndex;
@@ -82,7 +84,7 @@ impl ProjectAnalysis {
         // analyzer still owns its own arena; P6.2 reroutes the lookups.
         for (uri, hir) in hirs {
             let resolutions = resolve_with_index(&hir, &self.index);
-            let analysis = analyze(&hir, &resolutions);
+            let analysis = analyze_with_index(&hir, &resolutions, &self.index);
             let lints = run_lints(&hir, &resolutions);
             self.modules.insert(
                 uri,
@@ -93,6 +95,79 @@ impl ProjectAnalysis {
                     lints,
                 },
             );
+        }
+
+        // Pass 3 (P11.5): cross-module member resolution. Drain each
+        // module's `deferred_member_uses` — `(property_ident, type_name)`
+        // pairs the analyzer couldn't bind because the receiver's type
+        // wasn't declared in that module — and resolve them through the
+        // global decl table.
+        self.resolve_cross_module_members();
+    }
+
+    /// Walk each module's `deferred_member_uses` and bind the foreign
+    /// attr / method via [`ProjectIndex::locate_decl`]. Idempotent —
+    /// re-running drains an already-empty list. (P11.5.)
+    fn resolve_cross_module_members(&mut self) {
+        #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+        let mut updates: HashMap<Uri, Vec<(Idx<Ident>, ForeignMember)>> = HashMap::new();
+        for (cur_uri, cur_module) in &self.modules {
+            for (property_idx, type_name) in &cur_module.analysis.deferred_member_uses {
+                let prop_text = cur_module.hir.idents[*property_idx].text.clone();
+                let Some((foreign_uri, foreign_decl_id)) =
+                    self.index.locate_decl(type_name).first()
+                else {
+                    continue;
+                };
+                let Some(foreign_module) = self.modules.get(foreign_uri) else {
+                    continue;
+                };
+                let Decl::Type(ftd) = &foreign_module.hir.decls[*foreign_decl_id] else {
+                    continue;
+                };
+                let mut bound = false;
+                for attr_id in &ftd.attrs {
+                    let attr_name = &foreign_module.hir.idents
+                        [foreign_module.hir.type_attrs[*attr_id].name]
+                        .text;
+                    if *attr_name == prop_text {
+                        updates.entry(cur_uri.clone()).or_default().push((
+                            *property_idx,
+                            ForeignMember {
+                                uri: foreign_uri.clone(),
+                                member: MemberDef::Attr(*attr_id),
+                            },
+                        ));
+                        bound = true;
+                        break;
+                    }
+                }
+                if bound {
+                    continue;
+                }
+                for method_id in &ftd.methods {
+                    let Decl::Fn(m) = &foreign_module.hir.decls[*method_id] else {
+                        continue;
+                    };
+                    if foreign_module.hir.idents[m.name].text == prop_text {
+                        updates.entry(cur_uri.clone()).or_default().push((
+                            *property_idx,
+                            ForeignMember {
+                                uri: foreign_uri.clone(),
+                                member: MemberDef::Method(*method_id),
+                            },
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        for (uri, entries) in updates {
+            if let Some(m) = self.modules.get_mut(&uri) {
+                for (prop_idx, fm) in entries {
+                    m.analysis.foreign_member_uses.insert(prop_idx, fm);
+                }
+            }
         }
     }
 
@@ -152,7 +227,7 @@ impl ProjectAnalysis {
             return;
         };
         let resolutions = resolve_with_index(&hir, &self.index);
-        let analysis = analyze(&hir, &resolutions);
+        let analysis = analyze_with_index(&hir, &resolutions, &self.index);
         let lints = run_lints(&hir, &resolutions);
         self.modules.insert(
             uri.clone(),
@@ -163,6 +238,10 @@ impl ProjectAnalysis {
                 lints,
             },
         );
+        // P11.5: re-resolve cross-module member bindings whenever a doc
+        // is invalidated. Cheap because `deferred_member_uses` is small
+        // per module and the work is purely table-lookup.
+        self.resolve_cross_module_members();
     }
 
     pub fn module(&self, uri: &Uri) -> Option<&ModuleAnalysis> {

@@ -295,22 +295,37 @@ fn goto_definition_handler(
     // cache and source manager.
     let module = server.project_analysis.module(&uri)?;
     let cursor_idx = capabilities::cursor_ident_idx(&doc.text, doc.root_node(), pos, &module.hir)?;
-    let Definition::ProjectDecl {
+    if let Some(Definition::ProjectDecl {
         uri: foreign_uri,
         decl,
-    } = module.resolutions.lookup(cursor_idx)?
-    else {
-        return None;
-    };
+    }) = module.resolutions.lookup(cursor_idx)
+    {
+        drop(doc);
+        let foreign_module = server.project_analysis.module(&foreign_uri)?;
+        let foreign_cell = server.manager.get(&foreign_uri)?;
+        let foreign_doc = foreign_cell.borrow();
+        return capabilities::cross_module_decl_location(
+            &foreign_uri,
+            &foreign_doc.text,
+            &foreign_module.hir,
+            decl,
+        )
+        .map(GotoDefinitionResponse::Scalar);
+    }
+    // P11.5: cross-module member access (`a.b` where the receiver type
+    // lives in another module). Consult the cached `foreign_member_uses`.
+    let foreign = module.analysis.foreign_member_lookup(cursor_idx)?;
+    let foreign_uri = foreign.uri.clone();
+    let member = foreign.member;
     drop(doc);
     let foreign_module = server.project_analysis.module(&foreign_uri)?;
     let foreign_cell = server.manager.get(&foreign_uri)?;
     let foreign_doc = foreign_cell.borrow();
-    capabilities::cross_module_decl_location(
+    capabilities::cross_module_member_location(
         &foreign_uri,
         &foreign_doc.text,
         &foreign_module.hir,
-        decl,
+        &member,
     )
     .map(GotoDefinitionResponse::Scalar)
 }

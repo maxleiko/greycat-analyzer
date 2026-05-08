@@ -166,6 +166,44 @@ fn cross_module_rename_aggregates_text_edits_per_uri() {
 }
 
 #[test]
+fn cross_module_member_resolution_binds_foreign_attr() {
+    use greycat_analyzer_analysis::analyzer::MemberDef;
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let home_uri = Uri::from_str("file:///shapes.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        home_uri.clone(),
+        "type Point { x: int; y: int; }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn read_x(p: Point): int { return p.x; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let user_module = pa.module(&user_uri).expect("user module");
+    let x_uses: Vec<_> = user_module
+        .hir
+        .idents
+        .iter()
+        .filter(|(_, i)| i.text == "x")
+        .map(|(idx, _)| idx)
+        .collect();
+    assert_eq!(x_uses.len(), 1, "one `x` ident in user.gcl");
+    let foreign = user_module
+        .analysis
+        .foreign_member_lookup(x_uses[0])
+        .expect("foreign attr binding for `p.x`");
+    assert_eq!(foreign.uri, home_uri);
+    assert!(matches!(foreign.member, MemberDef::Attr(_)));
+}
+
+#[test]
 fn cross_module_decl_location_points_at_foreign_name() {
     use greycat_analyzer_hir::lower_module;
     let foreign_text = "type Helper {}\n";
