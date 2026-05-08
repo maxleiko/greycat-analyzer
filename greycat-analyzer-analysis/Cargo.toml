@@ -10,10 +10,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-greycat-analyzer-types = { path = "../greycat-analyzer-types", version = "0.1.0" }
-greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }
-greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
-greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
+greycat-analyzer-types.workspace = true
+greycat-analyzer-hir.workspace = true
+greycat-analyzer-core.workspace = true
+greycat-analyzer-syntax.workspace = true
 
 [dev-dependencies]
-greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
+greycat-analyzer-syntax.workspace = true

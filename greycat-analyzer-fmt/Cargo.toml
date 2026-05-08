@@ -10,4 +10,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
+greycat-analyzer-syntax.workspace = true

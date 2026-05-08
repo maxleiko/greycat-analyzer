@@ -10,18 +10,18 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
-greycat-analyzer-server = { path = "../greycat-analyzer-server", version = "0.1.0" }
-greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
-greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt", version = "0.1.0" }
-greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }
-greycat-analyzer-analysis = { path = "../greycat-analyzer-analysis", version = "0.1.0" }
+greycat-analyzer-analysis.workspace = true
+greycat-analyzer-core.workspace = true
+greycat-analyzer-fmt.workspace = true
+greycat-analyzer-hir.workspace = true
+greycat-analyzer-server.workspace = true
+greycat-analyzer-syntax.workspace = true
 
-clap = { version = "4.5.38", features = ["derive"] }
-env_logger = "0.11.8"
-miette = { version = "7", features = ["fancy"] }
-serde = "1.0.219"
-serde_json = "1.0.140"
+clap.workspace = true
+env_logger.workspace = true
+miette.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json = "1.0.140"
+serde_json.workspace = true

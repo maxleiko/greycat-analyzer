@@ -27,6 +27,47 @@ description = "Static analyzer, LSP server, formatter, and linter for the GreyCa
 keywords = ["greycat", "lsp", "language-server", "static-analysis", "tree-sitter"]
 categories = ["development-tools", "compilers", "parsing"]
 
+# Single source of truth for every dependency version. Each crate
+# inherits via `<name>.workspace = true` (with `features = [...]`
+# overrides where needed). Bumping a version here updates the whole
+# tree consistently — Cargo.lock resolves once, not once-per-crate.
+[workspace.dependencies]
+# Internal crates — kept as path-deps with versions so the workspace
+# is publishable to crates.io once the path-dep / version dance is set
+# up (see `scripts/publish.sh`).
+greycat-analyzer-analysis = { path = "greycat-analyzer-analysis", version = "0.1.0" }
+greycat-analyzer-core = { path = "greycat-analyzer-core", version = "0.1.0" }
+greycat-analyzer-fmt = { path = "greycat-analyzer-fmt", version = "0.1.0" }
+greycat-analyzer-hir = { path = "greycat-analyzer-hir", version = "0.1.0" }
+greycat-analyzer-server = { path = "greycat-analyzer-server", version = "0.1.0" }
+greycat-analyzer-syntax = { path = "greycat-analyzer-syntax", version = "0.1.0" }
+greycat-analyzer-types = { path = "greycat-analyzer-types", version = "0.1.0" }
+tree-sitter-greycat = { path = "tree-sitter-greycat" }
+
+# Third-party. Features chosen here are the union of what crates
+# actually use; per-crate overrides are still possible via
+# `<name> = { workspace = true, features = [...] }`. Since Cargo
+# features are additive, an extra feature is harmless when a given
+# crate doesn't reach the corresponding code path.
+clap = { version = "4.5.38", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+ctrlc = "3.4.7"
+dashmap = "6.1.0"
+env_logger = "0.11.8"
+insta = "1"
+line-index = "0.1.2"
+log = "0.4.27"
+lsp-server = "0.7.8"
+lsp-types = "0.97.0"
+md5 = "0.8.0"
+miette = { version = "7", features = ["fancy"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+serde_json = "1.0.140"
+thiserror = "2"
+tree-sitter = "0.26"
+wasm-bindgen = "0.2.100"
+
 [profile.release]
 strip = true
 lto = "thin"

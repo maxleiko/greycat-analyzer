@@ -13,16 +13,17 @@ categories.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
-greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
-greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }
-greycat-analyzer-types = { path = "../greycat-analyzer-types", version = "0.1.0" }
-greycat-analyzer-analysis = { path = "../greycat-analyzer-analysis", version = "0.1.0" }
-greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt", version = "0.1.0" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde-wasm-bindgen = "0.6"
-wasm-bindgen = { version = "0.2.100" }
+greycat-analyzer-analysis.workspace = true
+greycat-analyzer-core.workspace = true
+greycat-analyzer-fmt.workspace = true
+greycat-analyzer-hir.workspace = true
+greycat-analyzer-syntax.workspace = true
+greycat-analyzer-types.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen.workspace = true
+wasm-bindgen.workspace = true
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

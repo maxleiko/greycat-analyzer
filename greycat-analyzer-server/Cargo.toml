@@ -10,18 +10,18 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
-greycat-analyzer-syntax = { path = "../greycat-analyzer-syntax", version = "0.1.0" }
-greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }
-greycat-analyzer-analysis = { path = "../greycat-analyzer-analysis", version = "0.1.0" }
-greycat-analyzer-types = { path = "../greycat-analyzer-types", version = "0.1.0" }
-greycat-analyzer-fmt = { path = "../greycat-analyzer-fmt", version = "0.1.0" }
+greycat-analyzer-analysis.workspace = true
+greycat-analyzer-core.workspace = true
+greycat-analyzer-fmt.workspace = true
+greycat-analyzer-hir.workspace = true
+greycat-analyzer-syntax.workspace = true
+greycat-analyzer-types.workspace = true
 
-dashmap = "6.1.0"
-log = "0.4.27"
-lsp-server = "0.7.8"
-lsp-types = "0.97.0"
-serde = "1.0.219"
-serde_json = "1.0.140"
-ctrlc = "3.4.7"
-crossbeam-channel = "0.5.15"
+crossbeam-channel.workspace = true
+ctrlc.workspace = true
+dashmap.workspace = true
+log.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true

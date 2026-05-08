@@ -10,5 +10,5 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-greycat-analyzer-hir = { path = "../greycat-analyzer-hir", version = "0.1.0" }
-greycat-analyzer-core = { path = "../greycat-analyzer-core", version = "0.1.0" }
+greycat-analyzer-hir.workspace = true
+greycat-analyzer-core.workspace = true
