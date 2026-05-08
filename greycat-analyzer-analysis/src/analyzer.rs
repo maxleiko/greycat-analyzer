@@ -443,6 +443,12 @@ impl<'a> Cx<'a> {
         let type_name = match &ty.kind {
             TypeKind::Named { name } => Some(name.clone()),
             TypeKind::Generic { name, .. } => Some(name.clone()),
+            // P16.2 — primitives (`String`, `int`, ...) carry methods
+            // declared as `native type String { ... }` in stdlib.
+            // Map the primitive back to its name and fall through to
+            // the same `type_decls` / `decl_locations` lookup path so
+            // `"hello".size()` and friends bind correctly.
+            TypeKind::Primitive(p) => Some(p.name().to_string()),
             TypeKind::Anonymous { fields } => {
                 // Anonymous types don't have a backing TypeDecl, so we
                 // resolve their fields directly from the type shape.
@@ -1270,6 +1276,33 @@ impl<'a> Cx<'a> {
             }) => {
                 let recv_ty = self.visit_expr(receiver);
                 self.resolve_member(recv_ty, property);
+                // P16.1 — once `resolve_member` has bound the property
+                // (intra-module case populates `member_uses`), the
+                // expression's own inferred type is whatever the bound
+                // attr / method gives us:
+                //   `Attr(id)`   -> attr's lowered declared type
+                //   `Method(_)`  -> `function` (gcl's first-class type;
+                //                   the rich signature view comes from
+                //                   `member_uses` at hover time, not
+                //                   from the expr's `TypeId`).
+                // Cross-module bindings live in `foreign_member_uses`,
+                // which the project pipeline writes back later (P16.3).
+                // Anonymous-type / primitive cases stay `any` here —
+                // primitives are extended in P16.2.
+                if let Some(member) = self.out.member_uses.get(&property).copied() {
+                    match member {
+                        MemberDef::Attr(attr_id) => {
+                            let attr = self.hir.type_attrs[attr_id].clone();
+                            if let Some(ty) = attr.ty {
+                                return self.lower_type_ref(ty);
+                            }
+                            return self.any();
+                        }
+                        MemberDef::Method(_) => {
+                            return self.out.types.named("function");
+                        }
+                    }
+                }
                 self.any()
             }
             Expr::Static(s) => {
@@ -1887,6 +1920,40 @@ fn pick(c: Color): int {
                 .iter()
                 .any(|d| d.message.contains("non-exhaustive")),
             "expected final-else to suppress diag, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// P16.1 — `Expr::Member` resolving to an `Attr` reports the
+    /// attr's declared type as the expression type, not `any`. Closes
+    /// the project.gcl bug where `var s = x.s.size();` typed `x.s` as
+    /// `any` even though `s: String` was bound.
+    #[test]
+    fn member_attr_typing_matches_attr_decl_type() {
+        let src = r#"
+type Foo { s: String; }
+fn f(x: Foo): String { return x.s; }
+"#;
+        let r = analyze_src(src);
+        assert!(
+            r.diagnostics.is_empty(),
+            "x.s should type as String matching the return type, got diagnostics: {:?}",
+            r.diagnostics
+        );
+    }
+
+    /// P16.1 — `Expr::Member` resolving to a `Method` reports
+    /// `function`-typed (gcl's first-class function type).
+    #[test]
+    fn member_method_ref_types_as_function() {
+        let src = r#"
+type Foo { fn run(): int { return 0; } }
+fn caller(x: Foo): function { return x.run; }
+"#;
+        let r = analyze_src(src);
+        assert!(
+            r.diagnostics.is_empty(),
+            "x.run (no call) should type as `function`, got diagnostics: {:?}",
             r.diagnostics
         );
     }

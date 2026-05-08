@@ -5,15 +5,20 @@ Comparison run on 2026-05-08 against `~/dev/datathings/greycat/apps/registry`
 
 ## Headline
 
-| | TS reference (`greycat-lang lint`) | Rust port (`greycat-analyzer lint`) |
-|---|---:|---:|
-| Errors | 0 | 121 |
-| Warnings | 0 | 103 |
-| Total diagnostics | 0 | 224 |
+| | TS ref | Rust (initial) | Rust (after P17.2/3/4 + P16.1/2) |
+|---|---:|---:|---:|
+| Errors | 0 | 121 | 180 |
+| Warnings | 0 | 103 | 31 |
+| Total | 0 | 224 | 211 |
 
-Every diagnostic the Rust port emits is a **false positive** relative to the
-TS reference (TS reports the project as clean). Captured outputs:
-[ts.txt](ts.txt), [rust.txt](rust.txt).
+Captured outputs: [ts.txt](ts.txt), [rust.txt](rust.txt) (current state).
+
+The error count went **up** because the for-in lowering fix (P17.2) finally
+lets the analyzer visit the for-in body — content that was previously dropped
+silently. Those bodies surface more `any`-typed receiver mismatches (Bucket A
+territory). The warning count went **down** sharply (103 → 31, –70%) because
+the same for-in fix + the catch-param fix (P17.3) bind names that were
+previously unbound.
 
 ## Bucketed root causes
 
@@ -88,19 +93,32 @@ The cascade affects:
 
 After Buckets B + C land, this bucket should shrink to whichever entries remain genuine.
 
-## Proposed Phase 17 chunking
+## Phase 17 progress
 
-If you sign off, I'd structure Phase 17 as:
+| Chunk | Status | Result |
+|---|---|---|
+| **17.1** Capture baseline | ✅ done | this REPORT |
+| **17.2** for-in lowering + tuple form | ✅ done | warnings -70% |
+| **17.3** catch-param binding | ✅ done | "unresolved name `ex`" gone |
+| **17.4** @library webroot/installed fallback | ✅ done | `explorer` warning gone |
+| **17.5** string-interp `${expr}` lowering | ⏳ pending | unblocks ~half of remaining warnings |
+| **17.6** gate unused lints behind `--lint-unused` | ⏳ pending | matches TS default |
+| **17.7** re-baseline + ratchet CI | ⏳ pending | live floor when above land |
 
-- **17.1** Capture baseline + bucketing (this report). **Done** — committed under [tests/parity/registry_baseline/](.).
-- **17.2** Bucket C: fix `for-in` lowering (S, but high impact). Probably eliminates 12+ false positives just by visiting the for-in bodies.
-- **17.3** Bucket D: fix `catch (ex)` lowering (S, one-liner).
-- **17.4** Bucket E: fix `@library` resolution to accept webroot locations (S).
-- **17.5** Bucket B1: lower string-interpolation `${expr}` parts as real HIR expressions (M). Big-deal fix — affects type inference too, not just unused checks.
-- **17.6** Bucket B2: gate `unused-local` / `unused-param` behind `--lint-unused`, default off, to match TS (S).
-- **17.7** Re-run baseline; ratchet down. Target: ≤ 5 residual diagnostics, all genuine. Add a CI job to assert the diff size doesn't regress.
+## Phase 16 progress (Bucket A, in parallel)
 
-P16 (already planned) handles Bucket A separately. P17.2/17.3 should land before P16.4 (cross-module call return type) so the for-in fix doesn't surface additional `any` types after P16's call-on-member typing.
+| Chunk | Status |
+|---|---|
+| **16.1** Member-expr typing (intra-module) | ✅ done — fixes the `project.gcl` baseline bug, modest dent on registry |
+| **16.2** Primitive receiver `resolve_member` | ✅ done — closes `"hello".size()` shape |
+| **16.3** Member-expr typing (cross-module pass 3.7) | ⏳ pending — most of the remaining 180 errors are this |
+| **16.4** Call-on-member return-type | ⏳ pending |
+| **16.5** node-tag / @deref auto-deref | ⏳ pending |
+| **16.6** `arrow-on-non-deref` lint | ⏳ pending |
+
+Cross-module typing (16.3 / 16.4) is the heaviest remaining lift and
+benefits most from a TS-side `dump-types` subcommand to validate
+inferred-type shapes against the oracle. Held until that lands.
 
 ## How to refresh this baseline
 
