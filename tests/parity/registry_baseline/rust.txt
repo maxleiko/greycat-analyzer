@@ -1,0 +1,225 @@
+lib/std/runtime.gcl:100:13: warning: unused private var `usages`
+lib/std/runtime.gcl:762:14: warning: unused private enum `ResponseCode`
+lib/std/runtime.gcl:810:14: warning: unused private enum `SchemaType`
+project.gcl:2:1: warning: @library('explorer'): library not found
+project.gcl:21:12: error: return value of type `any` is not assignable to declared return type `int`
+project.gcl:80:17: warning: unused parameter `filepath`
+src/app.gcl:178:41: error: value of type `any` is not assignable to parameter `major: int`
+src/app.gcl:178:51: error: value of type `any` is not assignable to parameter `minor: int`
+src/app.gcl:178:61: error: value of type `any` is not assignable to parameter `patch: int`
+src/app.gcl:36:9: warning: unused local `owned`
+src/app.gcl:70:9: warning: unused local `pkgs`
+src/app.gcl:71:9: warning: unused local `total_packages`
+src/app.gcl:72:9: warning: unused local `total_versions`
+src/app.gcl:73:9: warning: unused local `stats`
+src/app.gcl:126:9: warning: unused local `branches`
+src/app.gcl:127:9: warning: unused local `total_versions`
+src/app.gcl:183:9: warning: unused local `arts`
+src/migrate.gcl:212:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:215:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:218:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:221:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:293:12: error: return value of type `any` is not assignable to declared return type `Array<File>`
+src/migrate.gcl:297:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:306:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:311:12: error: return value of type `any` is not assignable to declared return type `String`
+src/migrate.gcl:317:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:321:12: error: return value of type `any` is not assignable to declared return type `String`
+src/migrate.gcl:329:12: error: return value of type `any` is not assignable to declared return type `String`
+src/migrate.gcl:336:9: error: if condition must be `bool`, got `any`
+src/migrate.gcl:105:70: error: value of type `any` is not assignable to parameter `target_dirs: Array<File>`
+src/migrate.gcl:107:72: error: value of type `any` is not assignable to parameter `files: Array<File>`
+src/migrate.gcl:242:13: error: value of type `any` is not assignable to parameter `target: Target`
+src/migrate.gcl:26:9: warning: unused local `base_url`
+src/migrate.gcl:27:9: warning: unused local `entries`
+src/migrate.gcl:53:9: warning: unused local `base_url`
+src/migrate.gcl:54:9: warning: unused local `branch_dirs`
+src/migrate.gcl:70:9: warning: unused local `major_dirs`
+src/migrate.gcl:120:9: warning: unused local `by_version`
+src/migrate.gcl:175:9: warning: unused local `urls`
+src/migrate.gcl:176:9: warning: unused local `ranks`
+src/migrate.gcl:250:9: warning: unused local `base`
+src/migrate.gcl:251:9: warning: unused local `tmp_prefix`
+src/migrate.gcl:21:5: warning: unused parameter `src_prefix`
+src/migrate.gcl:22:5: warning: unused parameter `dest_group`
+src/migrate.gcl:23:5: warning: unused parameter `branches`
+src/migrate.gcl:24:5: warning: unused parameter `majors`
+src/migrate.gcl:45:5: warning: unused parameter `src_name`
+src/migrate.gcl:48:5: warning: unused parameter `branches`
+src/migrate.gcl:49:5: warning: unused parameter `majors`
+src/migrate.gcl:68:5: warning: unused parameter `base_url`
+src/migrate.gcl:68:23: warning: unused parameter `src_name`
+src/migrate.gcl:68:41: warning: unused parameter `dest_group`
+src/migrate.gcl:68:61: warning: unused parameter `dest_name`
+src/migrate.gcl:68:80: warning: unused parameter `branch`
+src/migrate.gcl:68:96: warning: unused parameter `majors`
+src/migrate.gcl:87:5: warning: unused parameter `base_url`
+src/migrate.gcl:88:5: warning: unused parameter `src_name`
+src/migrate.gcl:92:5: warning: unused parameter `mm`
+src/migrate.gcl:114:5: warning: unused parameter `dest_group`
+src/migrate.gcl:115:5: warning: unused parameter `dest_name`
+src/migrate.gcl:116:5: warning: unused parameter `branch`
+src/migrate.gcl:117:5: warning: unused parameter `major_url`
+src/migrate.gcl:118:5: warning: unused parameter `target_dirs`
+src/migrate.gcl:168:5: warning: unused parameter `dest_group`
+src/migrate.gcl:169:5: warning: unused parameter `dest_name`
+src/migrate.gcl:170:5: warning: unused parameter `branch`
+src/migrate.gcl:171:5: warning: unused parameter `major_url`
+src/migrate.gcl:172:5: warning: unused parameter `files`
+src/migrate.gcl:335:50: warning: unused parameter `branch`
+src/migrate.gcl:342:25: warning: unused parameter `arr`
+src/migrate.gcl:342:45: warning: unused parameter `needle`
+src/migrate.gcl:351:25: warning: unused parameter `m`
+src/migrate.gcl:67:12: warning: unused private fn `migrate_branch`
+src/migrate.gcl:86:12: warning: unused private fn `migrate_major`
+src/migrate.gcl:211:12: warning: unused private fn `split_archive`
+src/migrate.gcl:227:12: warning: unused private fn `migrate_version`
+src/migrate.gcl:305:12: warning: unused private fn `basename`
+src/migrate.gcl:316:12: warning: unused private fn `basename_file`
+src/migrate.gcl:324:12: warning: unused private fn `extension_from_url`
+src/migrate.gcl:335:12: warning: unused private fn `ensure_branch_suffix`
+src/migrate.gcl:342:12: warning: unused private fn `contains_str`
+src/model.gcl:78:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:81:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:84:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:87:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:90:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:93:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:96:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:99:16: error: return value of type `any` is not assignable to declared return type `Target?`
+src/model.gcl:114:12: error: return value of type `any` is not assignable to declared return type `String`
+src/model.gcl:118:9: warning: unused local `allowlist`
+src/registry.gcl:1:1: error: return value of type `any` is not assignable to declared return type `node<Group>`
+src/registry.gcl:1:1: error: return value of type `any` is not assignable to declared return type `node<Package>`
+src/registry.gcl:1:1: error: return value of type `any` is not assignable to declared return type `node<Branch>`
+src/registry.gcl:1:1: error: return value of type `any` is not assignable to declared return type `node<Version>`
+src/registry.gcl:330:12: error: return value of type `any` is not assignable to declared return type `PackageView?`
+src/registry.gcl:370:12: error: return value of type `any` is not assignable to declared return type `VersionView?`
+src/registry.gcl:376:12: error: return value of type `any` is not assignable to declared return type `VersionView?`
+src/registry.gcl:388:12: error: return value of type `any` is not assignable to declared return type `VersionView?`
+src/registry.gcl:394:12: error: return value of type `any` is not assignable to declared return type `VersionView?`
+src/registry.gcl:417:12: error: return value of type `any` is not assignable to declared return type `ArtifactView?`
+src/registry.gcl:1:1: error: return value of type `any` is not assignable to declared return type `node<Branch>`
+src/registry.gcl:493:12: error: return value of type `any` is not assignable to declared return type `Array<OwnerView>`
+src/registry.gcl:625:16: error: return value of type `any` is not assignable to declared return type `node<Version>`
+src/registry.gcl:628:15: error: unresolved name `ex`
+src/registry.gcl:163:34: error: value of type `any` is not assignable to parameter `v: node<Version>`
+src/registry.gcl:164:32: error: value of type `any` is not assignable to parameter `v: node<Version>`
+src/registry.gcl:330:30: error: value of type `any` is not assignable to parameter `p: node<Package>`
+src/registry.gcl:353:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:365:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:370:30: error: value of type `any` is not assignable to parameter `v: node<Version>`
+src/registry.gcl:383:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:388:30: error: value of type `any` is not assignable to parameter `v: node<Version>`
+src/registry.gcl:401:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:409:41: error: value of type `any` is not assignable to parameter `major: int`
+src/registry.gcl:409:51: error: value of type `any` is not assignable to parameter `minor: int`
+src/registry.gcl:409:61: error: value of type `any` is not assignable to parameter `patch: int`
+src/registry.gcl:417:31: error: value of type `any` is not assignable to parameter `a: node<Artifact>`
+src/registry.gcl:424:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:429:41: error: value of type `any` is not assignable to parameter `major: int`
+src/registry.gcl:429:51: error: value of type `any` is not assignable to parameter `minor: int`
+src/registry.gcl:429:61: error: value of type `any` is not assignable to parameter `patch: int`
+src/registry.gcl:436:36: error: value of type `any` is not assignable to parameter `a: node<Artifact>`
+src/registry.gcl:441:40: error: value of type `any` is not assignable to parameter `a: node<Artifact>`
+src/registry.gcl:493:24: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:501:18: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:515:18: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:530:18: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:531:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:536:44: error: value of type `any` is not assignable to parameter `major: int`
+src/registry.gcl:536:54: error: value of type `any` is not assignable to parameter `minor: int`
+src/registry.gcl:536:64: error: value of type `any` is not assignable to parameter `patch: int`
+src/registry.gcl:536:29: error: value of type `any` is not assignable to parameter `br: node<Branch>`
+src/registry.gcl:539:24: error: value of type `any` is not assignable to parameter `br: node<Branch>`
+src/registry.gcl:546:18: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:547:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:552:44: error: value of type `any` is not assignable to parameter `major: int`
+src/registry.gcl:552:54: error: value of type `any` is not assignable to parameter `minor: int`
+src/registry.gcl:552:64: error: value of type `any` is not assignable to parameter `patch: int`
+src/registry.gcl:552:29: error: value of type `any` is not assignable to parameter `br: node<Branch>`
+src/registry.gcl:555:24: error: value of type `any` is not assignable to parameter `br: node<Branch>`
+src/registry.gcl:580:18: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:581:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:586:28: error: value of type `any` is not assignable to parameter `major: int`
+src/registry.gcl:586:38: error: value of type `any` is not assignable to parameter `minor: int`
+src/registry.gcl:586:48: error: value of type `any` is not assignable to parameter `patch: int`
+src/registry.gcl:587:29: error: value of type `any` is not assignable to parameter `br: node<Branch>`
+src/registry.gcl:587:32: error: value of type `any` is not assignable to parameter `key: String`
+src/registry.gcl:588:26: error: value of type `any` is not assignable to parameter `v: node<Version>`
+src/registry.gcl:590:20: error: value of type `any` is not assignable to parameter `br: node<Branch>`
+src/registry.gcl:598:18: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:599:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:625:74: error: value of type `any` is not assignable to parameter `base: String`
+src/registry.gcl:627:27: error: value of type `any` is not assignable to parameter `base: String`
+src/registry.gcl:645:18: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:655:27: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/registry.gcl:657:28: error: value of type `any` is not assignable to parameter `major: int`
+src/registry.gcl:657:38: error: value of type `any` is not assignable to parameter `minor: int`
+src/registry.gcl:657:48: error: value of type `any` is not assignable to parameter `patch: int`
+src/registry.gcl:709:24: error: value of type `any` is not assignable to parameter `br: node<Branch>`
+src/registry.gcl:96:9: warning: unused local `user_id`
+src/registry.gcl:120:9: warning: unused local `targets`
+src/registry.gcl:176:9: warning: unused local `best_by_major`
+src/registry.gcl:224:9: warning: unused local `g`
+src/registry.gcl:233:9: warning: unused local `branches`
+src/registry.gcl:235:9: warning: unused local `default_branch`
+src/registry.gcl:297:9: warning: unused local `g`
+src/registry.gcl:306:9: warning: unused local `branch_names`
+src/registry.gcl:336:9: warning: unused local `p`
+src/registry.gcl:353:9: warning: unused local `b`
+src/registry.gcl:563:9: warning: unused local `base`
+src/registry.gcl:599:9: warning: unused local `b`
+src/registry.gcl:617:9: warning: unused local `required_prefix`
+src/registry.gcl:662:9: warning: unused local `artifacts`
+src/registry.gcl:663:9: warning: unused local `now`
+src/registry.gcl:664:9: warning: unused local `dest_prefix`
+src/registry.gcl:94:25: warning: unused parameter `pkg`
+src/registry.gcl:119:22: warning: unused parameter `v`
+src/registry.gcl:132:23: warning: unused parameter `a`
+src/registry.gcl:158:19: warning: unused parameter `bn`
+src/registry.gcl:232:20: warning: unused parameter `p`
+src/registry.gcl:305:30: warning: unused parameter `p`
+src/registry.gcl:465:52: warning: unused parameter `owners`
+src/registry.gcl:562:33: warning: unused parameter `v`
+src/registry.gcl:606:30: warning: unused parameter `base`
+src/registry.gcl:606:44: warning: unused parameter `target_paths`
+src/registry.gcl:638:5: warning: unused parameter `base`
+src/rehydrate.gcl:1:1: error: return value of type `any` is not assignable to declared return type `node<Branch>?`
+src/rehydrate.gcl:197:9: error: if condition must be `bool`, got `any`
+src/rehydrate.gcl:200:12: error: return value of type `any` is not assignable to declared return type `String?`
+src/rehydrate.gcl:39:26: error: value of type `any` is not assignable to parameter `total_expected_steps: int`
+src/rehydrate.gcl:84:20: error: value of type `any` is not assignable to parameter `group: String`
+src/rehydrate.gcl:84:29: error: value of type `any` is not assignable to parameter `name: String`
+src/rehydrate.gcl:93:28: error: value of type `any` is not assignable to parameter `pkg: node<Package>`
+src/rehydrate.gcl:93:31: error: value of type `any` is not assignable to parameter `branch: String`
+src/rehydrate.gcl:106:29: error: value of type `any` is not assignable to parameter `value: String`
+src/rehydrate.gcl:107:29: error: value of type `any` is not assignable to parameter `value: String`
+src/rehydrate.gcl:108:29: error: value of type `any` is not assignable to parameter `value: String`
+src/rehydrate.gcl:171:31: error: value of type `any` is not assignable to parameter `s: String`
+src/rehydrate.gcl:180:21: error: value of type `any` is not assignable to parameter `value: String`
+src/rehydrate.gcl:181:21: error: value of type `any` is not assignable to parameter `value: String`
+src/rehydrate.gcl:182:21: error: value of type `any` is not assignable to parameter `value: String`
+src/rehydrate.gcl:3:9: warning: unused local `base`
+src/rehydrate.gcl:5:9: warning: unused local `all`
+src/rehydrate.gcl:42:9: warning: unused local `branches_touched`
+src/rehydrate.gcl:114:9: warning: unused local `earliest`
+src/rehydrate.gcl:83:12: warning: unused private fn `rehydrate_version`
+src/rehydrate.gcl:154:12: warning: unused private fn `parse_artifact_path`
+src/rehydrate.gcl:196:12: warning: unused private fn `strip_prefix`
+src/semver.gcl:14:13: warning: unused local `branch`
+test/registry_test.gcl:9:21: error: value of type `any` is not assignable to parameter `path: String`
+test/registry_test.gcl:32:26: error: value of type `any` is not assignable to parameter `branch: String`
+test/registry_test.gcl:62:64: error: value of type `any` is not assignable to parameter `target: Target`
+test/registry_test.gcl:71:68: error: value of type `any` is not assignable to parameter `target: Target`
+test/registry_test.gcl:73:64: error: value of type `any` is not assignable to parameter `target: Target`
+test/registry_test.gcl:103:65: error: value of type `any` is not assignable to parameter `target: Target`
+test/registry_test.gcl:158:34: error: value of type `any` is not assignable to parameter `user_id: int`
+test/registry_test.gcl:170:40: error: value of type `any` is not assignable to parameter `user_id: int`
+test/registry_test.gcl:193:65: error: value of type `any` is not assignable to parameter `target: Target`
+test/registry_test.gcl:18:9: warning: unused local `id`
+test/registry_test.gcl:25:9: warning: unused local `me`
+test/registry_test.gcl:193:9: warning: unused local `art`
+test/registry_test.gcl:22:69: warning: unused parameter `targets`
+test/registry_test.gcl:5:12: warning: unused private fn `make_tmp_file`
+224 diagnostic(s) across 12 file(s) in 140.221798ms
