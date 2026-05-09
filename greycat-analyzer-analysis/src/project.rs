@@ -120,10 +120,25 @@ struct ModuleSigCache {
     /// the post-ingest project state — otherwise a previously-`any()`
     /// reference to a now-known type would silently stay `any()`.
     name_set_hash: u64,
-    attrs: Vec<(String, String, greycat_analyzer_types::TypeId)>,
-    methods: Vec<(String, String, greycat_analyzer_types::TypeId)>,
-    fns: Vec<(String, FnSignature)>,
-    enums: Vec<(String, greycat_analyzer_types::TypeId)>,
+    /// **P19.9** — `(type_sym, attr_sym, ty)`.
+    attrs: Vec<(
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::TypeId,
+    )>,
+    /// **P19.9** — `(type_sym, method_sym, ty)`.
+    methods: Vec<(
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::TypeId,
+    )>,
+    /// **P19.9** — `(fn_sym, signature)`.
+    fns: Vec<(greycat_analyzer_types::Symbol, FnSignature)>,
+    /// **P19.9** — `(enum_sym, ty)`.
+    enums: Vec<(
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::TypeId,
+    )>,
 }
 
 impl ProjectAnalysis {
@@ -308,11 +323,17 @@ fn project_name_set_hash(index: &ProjectIndex) -> u64 {
     for n in index.registry.iter_names() {
         names.insert(n);
     }
-    for n in index.natives.signatures.keys() {
-        names.insert(n.as_str());
+    // P19.9 — natives + values are Symbol-keyed; resolve back to text
+    // through the project's symbol table for stable string hashing.
+    for sym in index.natives.signatures.keys() {
+        if let Some(s) = index.symbols.resolve(*sym) {
+            names.insert(s);
+        }
     }
-    for n in &index.values {
-        names.insert(n.as_str());
+    for sym in &index.values {
+        if let Some(s) = index.symbols.resolve(*sym) {
+            names.insert(s);
+        }
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for n in &names {
@@ -463,18 +484,24 @@ fn lower_signatures_into(
 }
 
 /// **P19.6** — walk a single module's signatures and return the
-/// contributions it would write into the project index. Pure with
-/// respect to `index` (only reads it), so the caller decides when /
-/// how to apply.
+/// contributions it would write into the project index. Mutates
+/// `index.symbols` in passing (every contributed name is interned
+/// so cache entries can use `Symbol` keys).
+///
+/// **P19.9** — `generics_in_scope` is keyed by [`Symbol`] now, not
+/// `String`; `GenericOwner::{Type,Function}` still carry the source
+/// text since they're stored on `TypeKind::GenericParam` in the
+/// shared arena. The interner makes the *map* lookup cheap; the
+/// owner still needs the text for display.
 fn lower_module_signatures(
     arena_mut: &mut greycat_analyzer_types::TypeArena,
-    index: &ProjectIndex,
+    index: &mut ProjectIndex,
     uri: &Uri,
     hir: &Hir,
     sig_hash: u64,
     name_set_hash: u64,
 ) -> ModuleSigCache {
-    use greycat_analyzer_types::GenericOwner;
+    use greycat_analyzer_types::{GenericOwner, Symbol};
 
     let mut entry = ModuleSigCache {
         sig_hash,
@@ -487,40 +514,46 @@ fn lower_module_signatures(
     for d_id in &module.decls {
         match &hir.decls[*d_id] {
             Decl::Type(td) => {
-                let type_name = hir.idents[td.name].text.clone();
-                let owner = GenericOwner::Type(type_name.clone());
-                let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                let type_name_text = hir.idents[td.name].text.as_str();
+                let type_sym = index.symbols.intern(type_name_text);
+                let owner = GenericOwner::Type(type_name_text.to_string());
+                let mut generics_in_scope: HashMap<Symbol, GenericOwner> = HashMap::new();
                 for g in &td.generics {
-                    generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
+                    let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
+                    generics_in_scope.insert(g_sym, owner.clone());
                 }
                 for attr_id in &td.attrs {
                     let attr = &hir.type_attrs[*attr_id];
-                    let attr_name = hir.idents[attr.name].text.clone();
+                    let attr_sym = index.symbols.intern(hir.idents[attr.name].text.as_str());
                     let Some(tr) = attr.ty else {
                         continue;
                     };
-                    let ty = lower_type_ref_project(hir, tr, arena_mut, index, &generics_in_scope);
-                    entry.attrs.push((type_name.clone(), attr_name, ty));
+                    let ty =
+                        lower_type_ref_project(hir, tr, arena_mut, &*index, &generics_in_scope);
+                    entry.attrs.push((type_sym, attr_sym, ty));
                 }
                 for method_id in &td.methods {
                     let Decl::Fn(fnd) = &hir.decls[*method_id] else {
                         continue;
                     };
-                    let method_name = hir.idents[fnd.name].text.clone();
+                    let method_text = hir.idents[fnd.name].text.as_str();
+                    let method_sym = index.symbols.intern(method_text);
                     let Some(ret) = fnd.return_type else {
                         continue;
                     };
                     let mut method_generics = generics_in_scope.clone();
-                    let method_owner = GenericOwner::Function(method_name.clone());
+                    let method_owner = GenericOwner::Function(method_text.to_string());
                     for g in &fnd.generics {
-                        method_generics.insert(hir.idents[*g].text.clone(), method_owner.clone());
+                        let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
+                        method_generics.insert(g_sym, method_owner.clone());
                     }
-                    let ty = lower_type_ref_project(hir, ret, arena_mut, index, &method_generics);
-                    entry.methods.push((type_name.clone(), method_name, ty));
+                    let ty = lower_type_ref_project(hir, ret, arena_mut, &*index, &method_generics);
+                    entry.methods.push((type_sym, method_sym, ty));
                 }
             }
             Decl::Enum(ed) => {
-                let name = hir.idents[ed.name].text.clone();
+                let name_text = hir.idents[ed.name].text.as_str();
+                let name_sym = index.symbols.intern(name_text);
                 let variants: Vec<String> = ed
                     .fields
                     .iter()
@@ -528,31 +561,31 @@ fn lower_module_signatures(
                     .collect();
                 let enum_id = arena_mut.alloc(greycat_analyzer_types::Type {
                     kind: greycat_analyzer_types::TypeKind::Enum {
-                        name: name.clone(),
+                        name: name_text.to_string(),
                         variants,
                     },
                     nullable: false,
                 });
-                entry.enums.push((name, enum_id));
+                entry.enums.push((name_sym, enum_id));
             }
             Decl::Fn(fnd) => {
-                let fn_name = hir.idents[fnd.name].text.clone();
+                let fn_text = hir.idents[fnd.name].text.as_str();
+                let fn_sym = index.symbols.intern(fn_text);
                 let Some(ret) = fnd.return_type else {
                     continue;
                 };
-                let owner = GenericOwner::Function(fn_name.clone());
-                let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                let owner = GenericOwner::Function(fn_text.to_string());
+                let mut generics_in_scope: HashMap<Symbol, GenericOwner> = HashMap::new();
+                let mut generics: Vec<Symbol> = Vec::with_capacity(fnd.generics.len());
                 for g in &fnd.generics {
-                    generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
+                    let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
+                    generics_in_scope.insert(g_sym, owner.clone());
+                    generics.push(g_sym);
                 }
-                let ret_ty = lower_type_ref_project(hir, ret, arena_mut, index, &generics_in_scope);
-                let generics: Vec<String> = fnd
-                    .generics
-                    .iter()
-                    .map(|g| hir.idents[*g].text.clone())
-                    .collect();
+                let ret_ty =
+                    lower_type_ref_project(hir, ret, arena_mut, &*index, &generics_in_scope);
                 entry.fns.push((
-                    fn_name,
+                    fn_sym,
                     FnSignature {
                         home_uri: uri.clone(),
                         return_ty: ret_ty,
@@ -572,24 +605,24 @@ fn lower_module_signatures(
 /// preserve the "first decl wins" collision rule that the rest of
 /// the pipeline assumes.
 fn apply_module_contributions(index: &mut ProjectIndex, c: &ModuleSigCache) {
-    for (type_name, attr_name, ty) in &c.attrs {
-        if let Some(tm) = index.type_members.get_mut(type_name) {
-            tm.attr_types.insert(attr_name.clone(), *ty);
+    for (type_sym, attr_sym, ty) in &c.attrs {
+        if let Some(tm) = index.type_members.get_mut(type_sym) {
+            tm.attr_types.insert(*attr_sym, *ty);
         }
     }
-    for (type_name, method_name, ty) in &c.methods {
-        if let Some(tm) = index.type_members.get_mut(type_name) {
-            tm.method_returns.insert(method_name.clone(), *ty);
+    for (type_sym, method_sym, ty) in &c.methods {
+        if let Some(tm) = index.type_members.get_mut(type_sym) {
+            tm.method_returns.insert(*method_sym, *ty);
         }
     }
-    for (fn_name, sig) in &c.fns {
+    for (fn_sym, sig) in &c.fns {
         index
             .fn_signatures
-            .entry(fn_name.clone())
+            .entry(*fn_sym)
             .or_insert_with(|| sig.clone());
     }
-    for (name, ty) in &c.enums {
-        index.enum_types.entry(name.clone()).or_insert(*ty);
+    for (sym, ty) in &c.enums {
+        index.enum_types.entry(*sym).or_insert(*ty);
     }
 }
 
@@ -1083,8 +1116,12 @@ impl ProjectAnalysis {
 
         // Rebuild `ProjectIndex` from scratch — `ingest` is additive
         // (no removal), so starting empty is what makes the changed
-        // doc's deletions visible.
-        let mut new_index = ProjectIndex::new();
+        // doc's deletions visible. **P19.9** — preserve the
+        // [`SymbolTable`] so previously-issued [`Symbol`]s (e.g.
+        // inside `sig_cache`) remain valid; only the per-module
+        // index data gets wiped.
+        let preserved_symbols = std::mem::take(&mut self.index.symbols);
+        let mut new_index = ProjectIndex::with_symbols(preserved_symbols);
         if let Some(hir) = &changed_hir {
             new_index.ingest(uri, hir);
         }
@@ -1713,12 +1750,15 @@ fn lower_type_ref_project(
     type_ref: Idx<greycat_analyzer_hir::types::TypeRef>,
     arena: &mut greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
-    generics_in_scope: &HashMap<String, greycat_analyzer_types::GenericOwner>,
+    generics_in_scope: &HashMap<
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::GenericOwner,
+    >,
 ) -> greycat_analyzer_types::TypeId {
     use greycat_analyzer_types::Primitive;
     let tr = hir.type_refs[type_ref].clone();
-    let name = hir.idents[tr.name].text.clone();
-    let mut base = match name.as_str() {
+    let name = hir.idents[tr.name].text.as_str();
+    let mut base = match name {
         "bool" => arena.primitive(Primitive::Bool),
         "int" => arena.primitive(Primitive::Int),
         "float" => arena.primitive(Primitive::Float),
@@ -1736,11 +1776,13 @@ fn lower_type_ref_project(
                     .iter()
                     .map(|p| lower_type_ref_project(hir, *p, arena, index, generics_in_scope))
                     .collect();
-                arena.generic(name.clone(), args)
-            } else if let Some(owner) = generics_in_scope.get(&name) {
-                arena.generic_param(name.clone(), owner.clone())
-            } else if index.has_name(&name) {
-                arena.named(name.clone())
+                arena.generic(name.to_string(), args)
+            } else if let Some(sym) = index.symbol(name)
+                && let Some(owner) = generics_in_scope.get(&sym)
+            {
+                arena.generic_param(name.to_string(), owner.clone())
+            } else if index.has_name(name) {
+                arena.named(name.to_string())
             } else {
                 arena.any()
             }
@@ -2089,8 +2131,7 @@ mod tests {
         assert_eq!(pa.sig_cache_len(), 2, "both modules cached after rebuild");
         let cached_attrs_before = pa
             .index
-            .type_members
-            .get("Pair")
+            .type_members_for("Pair")
             .map(|tm| tm.attr_types.len())
             .unwrap_or(0);
 
@@ -2109,8 +2150,7 @@ mod tests {
         );
         let cached_attrs_after = pa
             .index
-            .type_members
-            .get("Pair")
+            .type_members_for("Pair")
             .map(|tm| tm.attr_types.len())
             .unwrap_or(0);
         assert_eq!(
@@ -2133,7 +2173,7 @@ mod tests {
             false,
         );
         let mut pa = ProjectAnalysis::analyze(&mgr);
-        assert!(pa.index.fn_signatures.contains_key("a"));
+        assert!(pa.index.contains_fn_signature("a"));
 
         // Change the return type — signature hash must differ.
         mgr.add_simple(
@@ -2145,8 +2185,7 @@ mod tests {
         pa.invalidate(&mgr, &uri("/proj/a.gcl"));
         let sig = pa
             .index
-            .fn_signatures
-            .get("a")
+            .fn_signature_for("a")
             .expect("a sig present after invalidate");
         let display = greycat_analyzer_types::display(&pa.arena, sig.return_ty);
         assert!(

@@ -2916,22 +2916,25 @@ fn ident_or_keyword_completion(
         })
         .unwrap_or_default();
 
-    for (name, locs) in &project.index.decl_locations {
+    for (name_sym, locs) in &project.index.decl_locations {
+        let Some(name) = project.index.symbols.resolve(*name_sym) else {
+            continue;
+        };
         if in_module.contains(name) {
             continue;
         }
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
-        if !seen.insert(name.clone()) {
+        if !seen.insert(name.to_string()) {
             continue;
         }
         let kind = decl_locs_kind(project, locs);
         let (detail, documentation, description) = foreign_decl_completion_meta(project, locs);
         items.push(CompletionItem {
-            label: name.clone(),
+            label: name.to_string(),
             kind: Some(kind),
-            insert_text: Some(name.clone()),
+            insert_text: Some(name.to_string()),
             sort_text: Some(format!("y_{name}")),
             detail,
             documentation,
@@ -2942,32 +2945,38 @@ fn ident_or_keyword_completion(
             ..Default::default()
         });
     }
-    for name in project.index.values.iter() {
+    for name_sym in project.index.values.iter() {
+        let Some(name) = project.index.symbols.resolve(*name_sym) else {
+            continue;
+        };
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
-        if !seen.insert(name.clone()) {
+        if !seen.insert(name.to_string()) {
             continue;
         }
         items.push(CompletionItem {
-            label: name.clone(),
+            label: name.to_string(),
             kind: Some(CompletionItemKind::FUNCTION),
-            insert_text: Some(name.clone()),
+            insert_text: Some(name.to_string()),
             sort_text: Some(format!("y_{name}")),
             ..Default::default()
         });
     }
-    for name in project.index.module_names.keys() {
+    for name_sym in project.index.module_names.keys() {
+        let Some(name) = project.index.symbols.resolve(*name_sym) else {
+            continue;
+        };
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
-        if !seen.insert(name.clone()) {
+        if !seen.insert(name.to_string()) {
             continue;
         }
         items.push(CompletionItem {
-            label: name.clone(),
+            label: name.to_string(),
             kind: Some(CompletionItemKind::MODULE),
-            insert_text: Some(name.clone()),
+            insert_text: Some(name.to_string()),
             sort_text: Some(format!("x_{name}")),
             ..Default::default()
         });
@@ -3920,7 +3929,7 @@ fn static_completion(
     }
 
     // Module-receiver branch: enumerate the module's top-level decls.
-    if let Some(mod_uri) = project.index.module_names.get(&ctx.recv).cloned()
+    if let Some(mod_uri) = project.index.module_uri(&ctx.recv).cloned()
         && let Some(mod_analysis) = project.module(&mod_uri)
         && let Some(module_hir) = mod_analysis.hir.module.as_ref()
     {
@@ -4154,7 +4163,10 @@ fn type_position_completion(
         }
     }
     // Project-level type / enum decls.
-    for (name, locs) in &project.index.decl_locations {
+    for (name_sym, locs) in &project.index.decl_locations {
+        let Some(name) = project.index.symbols.resolve(*name_sym) else {
+            continue;
+        };
         if let Some((u, d)) = locs.first()
             && let Some(m) = project.module(u)
         {
@@ -4178,7 +4190,10 @@ fn type_position_completion(
     }
     // Module names — type slots can read `module::Foo`, so module
     // names are valid here as the leading segment.
-    for name in project.index.module_names.keys() {
+    for name_sym in project.index.module_names.keys() {
+        let Some(name) = project.index.symbols.resolve(*name_sym) else {
+            continue;
+        };
         push(&mut items, &mut seen, name, CompletionItemKind::MODULE);
     }
 

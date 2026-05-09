@@ -630,8 +630,8 @@ impl<'a> Cx<'a> {
         // structure index built in S2-S6, write directly to
         // `foreign_member_uses`. Replaces the old `deferred_member_uses`
         // → pass-3 drain (which is now deleted).
-        if let Some(members) = self.index.type_members.get(&name) {
-            if let Some(attr_id) = members.attrs.get(prop_text).copied() {
+        if let Some(members) = self.index.type_members_for(&name) {
+            if let Some(attr_id) = members.attr_id(&self.index.symbols, prop_text) {
                 self.out.foreign_member_uses.insert(
                     property,
                     ForeignMember {
@@ -641,7 +641,7 @@ impl<'a> Cx<'a> {
                 );
                 return;
             }
-            if let Some(method_id) = members.methods.get(prop_text).copied() {
+            if let Some(method_id) = members.method_id(&self.index.symbols, prop_text) {
                 self.out.foreign_member_uses.insert(
                     property,
                     ForeignMember {
@@ -712,7 +712,7 @@ impl<'a> Cx<'a> {
         let fn_name = self.ident_text(name_idx);
         // Project signatures index covers local + cross-module + native
         // fns (P23 includes natives in `stage_lower_signatures`).
-        if let Some(sig) = self.index.fn_signatures.get(fn_name) {
+        if let Some(sig) = self.index.fn_signature_for(fn_name) {
             return Some(sig.return_ty);
         }
         match def {
@@ -740,14 +740,14 @@ impl<'a> Cx<'a> {
         match chain.len() {
             2 => {
                 let fn_name = self.ident_text(chain[1]);
-                let sig = self.index.fn_signatures.get(fn_name)?;
+                let sig = self.index.fn_signature_for(fn_name)?;
                 Some(sig.return_ty)
             }
             3 => {
                 let type_name = self.ident_text(chain[1]);
                 let method_name = self.ident_text(chain[2]);
-                let members = self.index.type_members.get(type_name)?;
-                members.method_returns.get(method_name).copied()
+                let members = self.index.type_members_for(type_name)?;
+                members.method_return(&self.index.symbols, method_name)
             }
             _ => None,
         }
@@ -777,13 +777,15 @@ impl<'a> Cx<'a> {
             TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
             _ => return None,
         };
-        let members = self.index.type_members.get(&type_name)?;
+        let members = self.index.type_members_for(&type_name)?;
         let property_text = self.ident_text(property);
-        let ret_ty = members.method_returns.get(property_text).copied()?;
+        let ret_ty = members.method_return(&self.index.symbols, property_text)?;
         let mut subst: HashMap<String, TypeId> = HashMap::new();
-        for (i, gp_name) in members.generics.iter().enumerate() {
-            if let Some(arg) = instantiation.get(i) {
-                subst.insert(gp_name.clone(), *arg);
+        for (i, gp_sym) in members.generics.iter().enumerate() {
+            if let Some(arg) = instantiation.get(i)
+                && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
+            {
+                subst.insert(gp_name.to_string(), *arg);
             }
         }
         Some(self.arena.substitute(ret_ty, &subst))
@@ -818,20 +820,19 @@ impl<'a> Cx<'a> {
         if chain.len() == 3 {
             // Resolve the (uri, member) pair without holding an
             // `&self.index` borrow across the `&mut self.out` insert.
-            let resolved =
-                self.index
-                    .type_members
-                    .get(self.ident_text(chain[1]))
-                    .and_then(|members| {
-                        let prop = self.hir.idents[chain[2]].text.as_str();
-                        if let Some(&attr_id) = members.attrs.get(prop) {
-                            Some((members.home_uri.clone(), MemberDef::Attr(attr_id)))
-                        } else {
-                            members.methods.get(prop).map(|&decl_id| {
-                                (members.home_uri.clone(), MemberDef::Method(decl_id))
-                            })
-                        }
-                    });
+            let resolved = self
+                .index
+                .type_members_for(self.ident_text(chain[1]))
+                .and_then(|members| {
+                    let prop = self.hir.idents[chain[2]].text.as_str();
+                    if let Some(attr_id) = members.attr_id(&self.index.symbols, prop) {
+                        Some((members.home_uri.clone(), MemberDef::Attr(attr_id)))
+                    } else {
+                        members
+                            .method_id(&self.index.symbols, prop)
+                            .map(|decl_id| (members.home_uri.clone(), MemberDef::Method(decl_id)))
+                    }
+                });
             if let Some((uri, member)) = resolved {
                 self.out
                     .foreign_member_uses
@@ -869,9 +870,9 @@ impl<'a> Cx<'a> {
         match chain.len() {
             2 => {
                 let name = self.ident_text(chain[1]);
-                if self.index.fn_signatures.contains_key(name) {
+                if self.index.contains_fn_signature(name) {
                     Some(self.arena.named("function"))
-                } else if self.index.type_members.contains_key(name) || self.index.has_name(name) {
+                } else if self.index.contains_type_member(name) || self.index.has_name(name) {
                     Some(self.arena.named("type"))
                 } else {
                     None
@@ -883,16 +884,19 @@ impl<'a> Cx<'a> {
                 // Enum variant: `module::Foo::a` types as `Foo` (the
                 // enum), matching the analyzer's `Static` enum-variant
                 // arm so call-arg validation against `_: Foo` passes.
-                if let Some(&ty_id) = self.index.enum_types.get(&type_name)
+                if let Some(ty_id) = self.index.enum_type_for(&type_name)
                     && let TypeKind::Enum { variants, .. } = &self.arena.get(ty_id).kind
                     && variants.iter().any(|v| v == &member_name)
                 {
                     return Some(ty_id);
                 }
-                let members = self.index.type_members.get(&type_name)?;
-                if members.methods.contains_key(&member_name) {
+                let members = self.index.type_members_for(&type_name)?;
+                if members
+                    .method_id(&self.index.symbols, &member_name)
+                    .is_some()
+                {
                     Some(self.arena.named("function"))
-                } else if members.attrs.contains_key(&member_name) {
+                } else if members.attr_id(&self.index.symbols, &member_name).is_some() {
                     Some(self.arena.named("field"))
                 } else {
                     None
@@ -931,12 +935,14 @@ impl<'a> Cx<'a> {
         // arena (substitute) — `members` borrows `self.index`.
         let property_text = self.hir.idents[property].text.as_str();
         let (attr_ty, subst) = {
-            let members = self.index.type_members.get(&type_name)?;
-            let attr_ty = members.attr_types.get(property_text).copied()?;
+            let members = self.index.type_members_for(&type_name)?;
+            let attr_ty = members.attr_ty(&self.index.symbols, property_text)?;
             let mut subst: HashMap<String, TypeId> = HashMap::new();
-            for (i, gp_name) in members.generics.iter().enumerate() {
-                if let Some(arg) = instantiation.get(i) {
-                    subst.insert(gp_name.clone(), *arg);
+            for (i, gp_sym) in members.generics.iter().enumerate() {
+                if let Some(arg) = instantiation.get(i)
+                    && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
+                {
+                    subst.insert(gp_name.to_string(), *arg);
                 }
             }
             (attr_ty, subst)
@@ -1722,12 +1728,10 @@ impl<'a> Cx<'a> {
                 Some(Definition::ProjectDecl { .. }) => {
                     // P23 — cross-module bare ident value typing via
                     // the project signatures index.
-                    let name = self.ident_text(idx).to_string();
-                    if self.index.fn_signatures.contains_key(&name) {
+                    let name = self.ident_text(idx);
+                    if self.index.contains_fn_signature(name) {
                         self.arena.named("function")
-                    } else if self.index.type_members.contains_key(&name)
-                        || self.index.has_name(&name)
-                    {
+                    } else if self.index.contains_type_member(name) || self.index.has_name(name) {
                         self.arena.named("type")
                     } else {
                         self.any()

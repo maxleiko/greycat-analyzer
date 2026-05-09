@@ -38,6 +38,76 @@ impl TypeId {
     }
 }
 
+/// **P19.9** — a project-wide interned identifier. `Copy`-able 32-bit
+/// handle into a [`SymbolTable`]; comparing two `Symbol`s is one
+/// integer compare regardless of source string length.
+///
+/// `Symbol`s are *not* comparable across `SymbolTable` instances —
+/// each table assigns its own dense numbering. The
+/// [`crate::SymbolTable`] that issued a symbol must be the one used
+/// to resolve it back to text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Symbol(u32);
+
+impl Symbol {
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// **P19.9** — append-only string interner. One allocation per unique
+/// name across the project lifetime. Hot lookup paths (analyzer body
+/// walker, project orchestrator) use `lookup` for read-only checks
+/// and `intern` only when extending the index.
+#[derive(Debug, Default, Clone)]
+pub struct SymbolTable {
+    map: HashMap<String, Symbol>,
+    rev: Vec<String>,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Intern `name`. Idempotent — the second call with the same
+    /// `name` returns the same [`Symbol`] without allocating.
+    pub fn intern(&mut self, name: &str) -> Symbol {
+        if let Some(&sym) = self.map.get(name) {
+            return sym;
+        }
+        let sym = Symbol(self.rev.len() as u32);
+        let owned = name.to_string();
+        self.rev.push(owned.clone());
+        self.map.insert(owned, sym);
+        sym
+    }
+
+    /// Read-only lookup: returns the existing [`Symbol`] for `name`
+    /// or `None` if no one has interned it yet. Use this in hot
+    /// lookup paths where adding a stale entry would be incorrect.
+    pub fn lookup(&self, name: &str) -> Option<Symbol> {
+        self.map.get(name).copied()
+    }
+
+    /// Resolve `sym` back to its text. Returns `None` if `sym` came
+    /// from a different table (or is otherwise out of bounds).
+    pub fn resolve(&self, sym: Symbol) -> Option<&str> {
+        self.rev.get(sym.0 as usize).map(|s| s.as_str())
+    }
+
+    pub fn len(&self) -> usize {
+        self.rev.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rev.is_empty()
+    }
+}
+
 /// The central type representation.
 ///
 /// The TS reference uses a class hierarchy with `nullable` flags per type
@@ -985,6 +1055,20 @@ mod tests {
         reg.register("Foo", foo);
         assert_eq!(reg.lookup("Foo"), Some(foo));
         assert!(reg.lookup("Bar").is_none());
+    }
+
+    #[test]
+    fn symbol_table_intern_is_idempotent() {
+        let mut t = SymbolTable::new();
+        let a1 = t.intern("alpha");
+        let a2 = t.intern("alpha");
+        let b = t.intern("beta");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_eq!(t.resolve(a1), Some("alpha"));
+        assert_eq!(t.resolve(b), Some("beta"));
+        assert_eq!(t.lookup("alpha"), Some(a1));
+        assert!(t.lookup("gamma").is_none());
     }
 
     #[test]

@@ -398,8 +398,7 @@ pub fn lint_arrow_on_non_deref(
             continue;
         }
         if index
-            .type_flags
-            .get(&name)
+            .type_flags_for(&name)
             .is_some_and(|f| f.deref.is_some())
         {
             continue;

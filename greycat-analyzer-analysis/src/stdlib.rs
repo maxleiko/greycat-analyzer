@@ -18,14 +18,20 @@ use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as HirTypeRef};
-use greycat_analyzer_types::{Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry};
+use greycat_analyzer_types::{
+    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
+};
 
 /// Cross-module registry of native-bound function signatures. Keyed by
 /// canonical name (`<lib>::<module>::<fn>` once we wire fully-qualified
 /// resolution; just `<fn>` for now until P2.7 multi-module work).
+///
+/// **P19.9** — keys are project-wide [`Symbol`]s. Lookup helpers that
+/// take `&str` translate via the project's [`SymbolTable`] (held on
+/// [`ProjectIndex`]); see [`ProjectIndex::native_for`].
 #[derive(Debug, Default)]
 pub struct NativeRegistry {
-    pub signatures: HashMap<String, NativeSignature>,
+    pub signatures: HashMap<Symbol, NativeSignature>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,20 +45,41 @@ impl NativeRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, name: impl Into<String>, sig: NativeSignature) {
-        self.signatures.insert(name.into(), sig);
+    /// **P19.9** — register by an already-interned [`Symbol`]. Callers
+    /// that hold a `&str` should go through [`ProjectIndex::ingest`]
+    /// (which interns into `index.symbols` and forwards here).
+    pub fn register(&mut self, sym: Symbol, sig: NativeSignature) {
+        self.signatures.insert(sym, sig);
     }
 
-    pub fn lookup(&self, name: &str) -> Option<&NativeSignature> {
-        self.signatures.get(name)
+    /// **P19.9** — lookup by a previously-interned [`Symbol`].
+    /// `&str` callers should use [`ProjectIndex::native_for`].
+    pub fn lookup_sym(&self, sym: Symbol) -> Option<&NativeSignature> {
+        self.signatures.get(&sym)
     }
 }
 
 /// Cross-module project context: the shared arena / registry / native
 /// table that survives across module ingestion. Distinct from
 /// [`crate::analyzer::AnalysisResult`], which is per-module.
+///
+/// **P19.9** — every project-wide map keys on [`Symbol`] instead of
+/// `String`. The names live once in [`Self::symbols`]; map keys are
+/// 32-bit handles. Public lookup helpers ([`Self::has_name`],
+/// [`Self::locate_decl`], [`Self::type_members_for`],
+/// [`Self::fn_signature_for`], [`Self::enum_type_for`],
+/// [`Self::native_for`], [`Self::type_flags_for`], …) keep the
+/// historical `&str` API surface — they translate via `symbols`
+/// internally. The `registry: TypeRegistry` *deliberately* stays
+/// String-keyed because the same struct is also used per-module on
+/// [`crate::analyzer::AnalysisResult`], where there is no
+/// project-wide interner to share.
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
+    /// **P19.9** — project-wide string interner. Owns the canonical
+    /// storage for every type / fn / attr / method / enum-variant /
+    /// global / module name the analyzer looks up across modules.
+    pub symbols: SymbolTable,
     pub types: TypeArena,
     pub registry: TypeRegistry,
     pub natives: NativeRegistry,
@@ -61,32 +88,32 @@ pub struct ProjectIndex {
     /// Lets the resolver answer "is this name known anywhere in the
     /// project?" without needing the cross-module decl pointer (a
     /// later P6.x deliverable).
-    pub values: HashSet<String>,
+    pub values: HashSet<Symbol>,
     /// Cross-module decl table (P11.1): name → every `(Uri, Idx<Decl>)`
     /// pair that introduces a top-level decl with this name across the
     /// project. Collisions are kept; disambiguation happens at the use
     /// site via the importing module's lib/include closure (P11.2+).
     /// Pragma decls have no name and are excluded.
-    pub decl_locations: HashMap<String, Vec<(Uri, Idx<Decl>)>>,
+    pub decl_locations: HashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
     /// P13.4 — runtime-exposed names. Keyed by the rename string of
     /// `@expose("renamed")` (or the decl's own name when `@expose` has
     /// no arg) → every site that exposed under that key. Lets lints /
     /// capabilities ask "is this name part of the runtime API?".
-    pub exposed: HashMap<String, Vec<ExposureSite>>,
+    pub exposed: HashMap<Symbol, Vec<ExposureSite>>,
     /// P13.5 — per-type flag bits drawn from `@iterable` / `@deref` /
     /// `@primitive` annotations on a `type` decl. Keyed by the
     /// declared type name (`Array`, `nodeTime`, …).
-    pub type_flags: HashMap<String, TypeFlags>,
+    pub type_flags: HashMap<Symbol, TypeFlags>,
     /// P13.6 — per-module `@permission("name")` pragmas. Lets later
     /// chunks light up "is this module allowed to call X?" checks the
     /// TS reference declarator threads through `mod.permissions`.
-    pub module_permissions: HashMap<Uri, HashSet<String>>,
+    pub module_permissions: HashMap<Uri, HashSet<Symbol>>,
     /// P15.x — module-name → URI. Populated from each ingested doc's
     /// filename stem (i.e. `Document::name()`). Lets the resolver
     /// recognize `runtime` in `runtime::Identity::create` as a known
     /// module name (rather than flagging it as unresolved), and lets
     /// pass 3.5 infer types for `module::Decl` static expressions.
-    pub module_names: HashMap<String, Uri>,
+    pub module_names: HashMap<Symbol, Uri>,
     /// P21 — pre-computed cross-module structure index. Keyed by type
     /// name (as it appears in source). For each type, records the
     /// home module URI and a (property name → HIR `Idx`) lookup for
@@ -101,7 +128,7 @@ pub struct ProjectIndex {
     /// per-module analyzer pass; with this index the analyzer's
     /// `resolve_member` resolves cross-module hits inline at body-walk
     /// time, removing the deferral.
-    pub type_members: HashMap<String, TypeMembers>,
+    pub type_members: HashMap<Symbol, TypeMembers>,
     /// **P23** — pre-lowered top-level fn signatures, keyed by fn
     /// name. First-decl-wins, matching `type_members` collision
     /// semantics. `home_uri` lets the analyzer's call-typing path
@@ -110,12 +137,12 @@ pub struct ProjectIndex {
     /// `arena.substitute` at the call site for generic fns. Built
     /// by `ProjectAnalysis::stage_lower_signatures` after every
     /// module is loaded but before any body walks.
-    pub fn_signatures: HashMap<String, FnSignature>,
+    pub fn_signatures: HashMap<Symbol, FnSignature>,
     /// **P23** — enum types pre-registered in the shared project
     /// arena, keyed by enum name. Lets the analyzer's
     /// `QualifiedStatic` value-position typing recognise
     /// `other_module::Foo::a` as the enum `Foo` (not `any`).
-    pub enum_types: HashMap<String, TypeId>,
+    pub enum_types: HashMap<Symbol, TypeId>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -130,7 +157,9 @@ pub struct ProjectIndex {
 pub struct FnSignature {
     pub home_uri: Uri,
     pub return_ty: TypeId,
-    pub generics: Vec<String>,
+    /// **P19.9** — interned generic param names. Resolve back to text
+    /// via the owning [`ProjectIndex::symbols`].
+    pub generics: Vec<Symbol>,
 }
 
 /// P21 — per-type cross-module member index. `home_uri` names the
@@ -148,25 +177,61 @@ pub struct FnSignature {
 #[derive(Debug, Clone)]
 pub struct TypeMembers {
     pub home_uri: Uri,
-    pub attrs: HashMap<String, Idx<TypeAttr>>,
-    pub methods: HashMap<String, Idx<Decl>>,
+    /// **P19.9** — attr name → HIR index. Symbol-keyed; resolve to
+    /// text via [`ProjectIndex::symbols`].
+    pub attrs: HashMap<Symbol, Idx<TypeAttr>>,
+    /// **P19.9** — method name → HIR index. Symbol-keyed.
+    pub methods: HashMap<Symbol, Idx<Decl>>,
     /// P22 — ordered list of generic parameter names declared on the
-    /// type (`type Map<K, V> {}` → `["K", "V"]`). Empty for
+    /// type (`type Map<K, V> {}` → `[Sym("K"), Sym("V")]`). Empty for
     /// non-generic types. Used by the analyzer to build a
     /// `name → TypeId` substitution map from the receiver's
     /// instantiation args at member-access / call sites.
-    pub generics: Vec<String>,
-    /// P22 — pre-lowered attr declared types, keyed by attr name.
-    /// `TypeId`s reference the shared project arena
+    pub generics: Vec<Symbol>,
+    /// P22 — pre-lowered attr declared types, keyed by attr-name
+    /// [`Symbol`]. `TypeId`s reference the shared project arena
     /// ([`crate::project::ProjectAnalysis::arena`]). For generic
     /// types, attr TypeIds may reference `GenericParam(T, owner=this)`
     /// — call-site substitution is the consumer's job.
-    pub attr_types: HashMap<String, TypeId>,
+    pub attr_types: HashMap<Symbol, TypeId>,
     /// P22 — pre-lowered method declared return types. Same arena +
     /// substitution semantics as `attr_types`. Methods without an
     /// explicit return type are absent (the analyzer's call-typing
     /// falls through to the existing inference path).
-    pub method_returns: HashMap<String, TypeId>,
+    pub method_returns: HashMap<Symbol, TypeId>,
+}
+
+impl TypeMembers {
+    /// **P19.9** — `&str` lookup of an attr's HIR index. Returns
+    /// `None` if `name` isn't interned in `symbols` or if no attr
+    /// of that name exists on this type.
+    pub fn attr_id(&self, symbols: &SymbolTable, name: &str) -> Option<Idx<TypeAttr>> {
+        symbols
+            .lookup(name)
+            .and_then(|s| self.attrs.get(&s))
+            .copied()
+    }
+    /// **P19.9** — `&str` lookup of a method's HIR index.
+    pub fn method_id(&self, symbols: &SymbolTable, name: &str) -> Option<Idx<Decl>> {
+        symbols
+            .lookup(name)
+            .and_then(|s| self.methods.get(&s))
+            .copied()
+    }
+    /// **P19.9** — `&str` lookup of an attr's pre-lowered type.
+    pub fn attr_ty(&self, symbols: &SymbolTable, name: &str) -> Option<TypeId> {
+        symbols
+            .lookup(name)
+            .and_then(|s| self.attr_types.get(&s))
+            .copied()
+    }
+    /// **P19.9** — `&str` lookup of a method's pre-lowered return type.
+    pub fn method_return(&self, symbols: &SymbolTable, name: &str) -> Option<TypeId> {
+        symbols
+            .lookup(name)
+            .and_then(|s| self.method_returns.get(&s))
+            .copied()
+    }
 }
 
 /// P13.5 — annotation-derived flag bits on a type declaration.
@@ -204,10 +269,76 @@ pub struct ExposureSite {
 
 impl ProjectIndex {
     pub fn new() -> Self {
-        let mut idx = Self::default();
+        Self::with_symbols(SymbolTable::new())
+    }
+
+    /// **P19.9** — construct a fresh index that reuses an existing
+    /// [`SymbolTable`]. Lets `ProjectAnalysis::invalidate` rebuild
+    /// the per-module index without invalidating the `Symbol`s held
+    /// elsewhere (notably the per-stage signature cache).
+    /// `seed_builtin_names` is idempotent against the symbol table —
+    /// the builtin names are already interned after the first call.
+    pub fn with_symbols(symbols: SymbolTable) -> Self {
+        let mut idx = Self {
+            symbols,
+            ..Self::default()
+        };
         seed_builtin_primitives(&mut idx.types);
-        seed_builtin_names(&mut idx.types, &mut idx.registry);
+        seed_builtin_names(&mut idx.types, &mut idx.registry, &mut idx.symbols);
         idx
+    }
+
+    /// **P19.9** — read-only `&str` → [`Symbol`] lookup. Returns
+    /// `None` if `name` was never interned. Hot lookup paths use
+    /// this to avoid mutating the symbol table from a `&self`
+    /// borrow.
+    pub fn symbol(&self, name: &str) -> Option<Symbol> {
+        self.symbols.lookup(name)
+    }
+
+    /// **P19.9** — `&str`-keyed lookup helpers preserved for
+    /// callers that don't (yet) hold a [`Symbol`]. Each does one
+    /// `symbols.lookup` then a Symbol-keyed map probe.
+    pub fn type_members_for(&self, name: &str) -> Option<&TypeMembers> {
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.type_members.get(&s))
+    }
+    pub fn fn_signature_for(&self, name: &str) -> Option<&FnSignature> {
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.fn_signatures.get(&s))
+    }
+    pub fn enum_type_for(&self, name: &str) -> Option<TypeId> {
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.enum_types.get(&s))
+            .copied()
+    }
+    pub fn native_for(&self, name: &str) -> Option<&NativeSignature> {
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.natives.lookup_sym(s))
+    }
+    pub fn type_flags_for(&self, name: &str) -> Option<&TypeFlags> {
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.type_flags.get(&s))
+    }
+    pub fn contains_value(&self, name: &str) -> bool {
+        self.symbols
+            .lookup(name)
+            .is_some_and(|s| self.values.contains(&s))
+    }
+    pub fn contains_type_member(&self, name: &str) -> bool {
+        self.symbols
+            .lookup(name)
+            .is_some_and(|s| self.type_members.contains_key(&s))
+    }
+    pub fn contains_fn_signature(&self, name: &str) -> bool {
+        self.symbols
+            .lookup(name)
+            .is_some_and(|s| self.fn_signatures.contains_key(&s))
     }
 
     /// Walk a HIR module's top-level decls and register everything that's
@@ -223,25 +354,27 @@ impl ProjectIndex {
         // without `.gcl`) so resolver / pass 3.5 can recognize
         // `module::Decl` chains.
         if let Some(name) = module_name_from_uri(uri) {
-            self.module_names.insert(name, uri.clone());
+            let sym = self.symbols.intern(&name);
+            self.module_names.insert(sym, uri.clone());
         }
         for decl_id in &module.decls {
             let modifiers = match &hir.decls[*decl_id] {
                 Decl::Type(td) => {
-                    let name = hir.idents[td.name].text.clone();
-                    if self.registry.lookup(&name).is_none() {
+                    let name_str = hir.idents[td.name].text.as_str();
+                    let name_sym = self.symbols.intern(name_str);
+                    if self.registry.lookup(name_str).is_none() {
                         // If the type has generic params, we register a
                         // GenericParam-shaped entry pre-instantiated as
                         // Named(name); P2.4's generic instantiation logic
                         // takes over at use sites.
-                        let id = self.types.named(&name);
-                        self.registry.register(name.clone(), id);
+                        let id = self.types.named(name_str);
+                        self.registry.register(name_str, id);
                     }
                     // P13.5: capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
                     let flags = derive_type_flags(&td.modifiers.annotations);
                     if flags.iterable || flags.deref.is_some() || flags.primitive {
-                        self.type_flags.entry(name.clone()).or_insert(flags);
+                        self.type_flags.entry(name_sym).or_insert(flags);
                     }
                     // P21 — populate the cross-module member index.
                     // First-decl-wins (matches `decl_locations`'s
@@ -249,11 +382,11 @@ impl ProjectIndex {
                     // analyzer's `resolve_member` bind foreign attrs /
                     // methods inline instead of deferring to a post
                     // pass.
-                    self.type_members.entry(name.clone()).or_insert_with(|| {
-                        let generics: Vec<String> = td
+                    if !self.type_members.contains_key(&name_sym) {
+                        let generics: Vec<Symbol> = td
                             .generics
                             .iter()
-                            .map(|g| hir.idents[*g].text.clone())
+                            .map(|g| self.symbols.intern(hir.idents[*g].text.as_str()))
                             .collect();
                         let mut m = TypeMembers {
                             home_uri: uri.clone(),
@@ -268,23 +401,28 @@ impl ProjectIndex {
                             method_returns: HashMap::new(),
                         };
                         for attr_id in &td.attrs {
-                            let attr_name = hir.idents[hir.type_attrs[*attr_id].name].text.clone();
-                            m.attrs.insert(attr_name, *attr_id);
+                            let attr_sym = self
+                                .symbols
+                                .intern(hir.idents[hir.type_attrs[*attr_id].name].text.as_str());
+                            m.attrs.insert(attr_sym, *attr_id);
                         }
                         for method_id in &td.methods {
                             if let Decl::Fn(fnd) = &hir.decls[*method_id] {
-                                let method_name = hir.idents[fnd.name].text.clone();
-                                m.methods.insert(method_name, *method_id);
+                                let method_sym =
+                                    self.symbols.intern(hir.idents[fnd.name].text.as_str());
+                                m.methods.insert(method_sym, *method_id);
                             }
                         }
-                        m
-                    });
-                    self.record_decl_location(name, uri, *decl_id);
+                        self.type_members.insert(name_sym, m);
+                    }
+                    self.record_decl_location(name_sym, uri, *decl_id);
                     Some(&td.modifiers)
                 }
                 Decl::Enum(ed) => {
-                    let name = hir.idents[ed.name].text.clone();
-                    if self.registry.lookup(&name).is_none() {
+                    let name_str = hir.idents[ed.name].text.as_str();
+                    let name_sym = self.symbols.intern(name_str);
+                    if self.registry.lookup(name_str).is_none() {
+                        let name_owned = name_str.to_string();
                         let variants: Vec<String> = ed
                             .fields
                             .iter()
@@ -292,31 +430,32 @@ impl ProjectIndex {
                             .collect();
                         let id = self.types.alloc(Type {
                             kind: TypeKind::Enum {
-                                name: name.clone(),
+                                name: name_owned.clone(),
                                 variants,
                             },
                             nullable: false,
                         });
-                        self.registry.register(name.clone(), id);
+                        self.registry.register(name_owned, id);
                     }
-                    self.record_decl_location(name, uri, *decl_id);
+                    self.record_decl_location(name_sym, uri, *decl_id);
                     Some(&ed.modifiers)
                 }
                 Decl::Fn(fnd) => {
-                    let name = hir.idents[fnd.name].text.clone();
+                    let name_str = hir.idents[fnd.name].text.as_str();
+                    let name_sym = self.symbols.intern(name_str);
                     if fnd.modifiers.native {
                         let sig = native_signature_for(hir, fnd, &mut self.types);
-                        self.natives.register(name.clone(), sig);
+                        self.natives.register(name_sym, sig);
                     } else {
-                        self.values.insert(name.clone());
+                        self.values.insert(name_sym);
                     }
-                    self.record_decl_location(name, uri, *decl_id);
+                    self.record_decl_location(name_sym, uri, *decl_id);
                     Some(&fnd.modifiers)
                 }
                 Decl::Var(vd) => {
-                    let name = hir.idents[vd.name].text.clone();
-                    self.values.insert(name.clone());
-                    self.record_decl_location(name, uri, *decl_id);
+                    let name_sym = self.symbols.intern(hir.idents[vd.name].text.as_str());
+                    self.values.insert(name_sym);
+                    self.record_decl_location(name_sym, uri, *decl_id);
                     Some(&vd.modifiers)
                 }
                 Decl::Pragma(p) => {
@@ -326,10 +465,11 @@ impl ProjectIndex {
                         && let Some(arg_expr) = p.args.first()
                         && let greycat_analyzer_hir::types::Expr::String(s) = &hir.exprs[*arg_expr]
                     {
+                        let perm_sym = self.symbols.intern(&s.raw_value());
                         self.module_permissions
                             .entry(uri.clone())
                             .or_default()
-                            .insert(s.raw_value());
+                            .insert(perm_sym);
                     }
                     None
                 }
@@ -347,8 +487,9 @@ impl ProjectIndex {
                         continue;
                     }
                     let rename = ann.args.first().cloned();
-                    let key = rename.clone().unwrap_or_else(|| local_name.clone());
-                    let entries = self.exposed.entry(key).or_default();
+                    let key_str = rename.as_deref().unwrap_or(local_name.as_str());
+                    let key_sym = self.symbols.intern(key_str);
+                    let entries = self.exposed.entry(key_sym).or_default();
                     let already = entries
                         .iter()
                         .any(|s| s.uri == *uri && s.decl == *decl_id && s.rename == rename);
@@ -366,8 +507,10 @@ impl ProjectIndex {
         self.modules_ingested += 1;
     }
 
-    fn record_decl_location(&mut self, name: String, uri: &Uri, decl_id: Idx<Decl>) {
-        let entry = self.decl_locations.entry(name).or_default();
+    /// **P19.9** — `Symbol`-keyed location index. Caller must have
+    /// already interned `name_sym` through `self.symbols`.
+    fn record_decl_location(&mut self, name_sym: Symbol, uri: &Uri, decl_id: Idx<Decl>) {
+        let entry = self.decl_locations.entry(name_sym).or_default();
         if !entry.iter().any(|(u, d)| u == uri && *d == decl_id) {
             entry.push((uri.clone(), decl_id));
         }
@@ -380,10 +523,14 @@ impl ProjectIndex {
     /// [`Self::has_name`] to ask the broader "is this name known?"
     /// question.
     pub fn locate_decl(&self, name: &str) -> &[(Uri, Idx<Decl>)] {
-        self.decl_locations
-            .get(name)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        match self.symbols.lookup(name) {
+            Some(s) => self
+                .decl_locations
+                .get(&s)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            None => &[],
+        }
     }
 
     /// `true` iff `name` resolves against any name the project knows:
@@ -391,22 +538,30 @@ impl ProjectIndex {
     /// non-native fn / var. Resolver uses this as the post-local-scope
     /// fallback (P6.2).
     pub fn has_name(&self, name: &str) -> bool {
-        self.registry.lookup(name).is_some()
-            || self.natives.lookup(name).is_some()
-            || self.values.contains(name)
+        if self.registry.lookup(name).is_some() {
+            return true;
+        }
+        let Some(sym) = self.symbols.lookup(name) else {
+            return false;
+        };
+        self.natives.signatures.contains_key(&sym) || self.values.contains(&sym)
     }
 
     /// P15.x — `true` iff `name` matches a known module (any ingested
     /// doc whose filename stem equals `name`). Lets the resolver
     /// recognize `runtime` in `runtime::Identity::create` as a module.
     pub fn has_module(&self, name: &str) -> bool {
-        self.module_names.contains_key(name)
+        self.symbols
+            .lookup(name)
+            .is_some_and(|s| self.module_names.contains_key(&s))
     }
 
     /// P15.x — return the URI of the module whose filename stem
     /// matches `name`, if any.
     pub fn module_uri(&self, name: &str) -> Option<&Uri> {
-        self.module_names.get(name)
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.module_names.get(&s))
     }
 }
 
@@ -449,26 +604,42 @@ fn seed_builtin_primitives(arena: &mut TypeArena) {
 /// them here is what lets the resolver retire its hard-coded
 /// `BUILTIN_TYPES` allowlist (P6.2) — every name a user can write
 /// resolves through one path now.
-fn seed_builtin_names(arena: &mut TypeArena, registry: &mut TypeRegistry) {
+///
+/// **P19.9** — the project-wide [`SymbolTable`] is also seeded here
+/// so `index.symbols.lookup("int")` answers `Some(_)` from the
+/// moment `ProjectIndex::new()` returns. `TypeRegistry` itself stays
+/// String-keyed (it's reused per-module on `AnalysisResult` where no
+/// project-wide interner is in scope).
+fn seed_builtin_names(
+    arena: &mut TypeArena,
+    registry: &mut TypeRegistry,
+    symbols: &mut SymbolTable,
+) {
     // Primitives — registered by name so the resolver's project-index
     // fallback finds them. The TypeIds returned here are the same ones
     // `arena.primitive(...)` allocated in seed_builtin_primitives.
-    registry.register("bool", arena.primitive(Primitive::Bool));
-    registry.register("int", arena.primitive(Primitive::Int));
-    registry.register("float", arena.primitive(Primitive::Float));
-    registry.register("char", arena.primitive(Primitive::Char));
-    registry.register("String", arena.primitive(Primitive::String));
-    registry.register("time", arena.primitive(Primitive::Time));
-    registry.register("duration", arena.primitive(Primitive::Duration));
-    registry.register("geo", arena.primitive(Primitive::Geo));
-    registry.register("any", arena.any());
-    registry.register("null", arena.null());
+    for (name, id) in [
+        ("bool", arena.primitive(Primitive::Bool)),
+        ("int", arena.primitive(Primitive::Int)),
+        ("float", arena.primitive(Primitive::Float)),
+        ("char", arena.primitive(Primitive::Char)),
+        ("String", arena.primitive(Primitive::String)),
+        ("time", arena.primitive(Primitive::Time)),
+        ("duration", arena.primitive(Primitive::Duration)),
+        ("geo", arena.primitive(Primitive::Geo)),
+        ("any", arena.any()),
+        ("null", arena.null()),
+    ] {
+        registry.register(name, id);
+        symbols.intern(name);
+    }
 
     // Runtime-implemented named types — no `.gcl` decl. Drawn from the
     // TS `StdCoreTypes` interface plus the t<n> / t<n>f tuple shapes.
     for &name in BUILTIN_RUNTIME_TYPES {
         let id = arena.named(name);
         registry.register(name, id);
+        symbols.intern(name);
     }
 }
 
@@ -626,9 +797,9 @@ private native fn now(): time;
         );
         let mut idx = ProjectIndex::new();
         idx.ingest(&uri("/proj/io.gcl"), &hir);
-        let read = idx.natives.lookup("read_file").expect("read_file present");
+        let read = idx.native_for("read_file").expect("read_file present");
         assert_eq!(read.params.len(), 1);
-        let now = idx.natives.lookup("now").expect("now present");
+        let now = idx.native_for("now").expect("now present");
         assert!(now.params.is_empty());
     }
 
@@ -670,6 +841,48 @@ private native fn now(): time;
         assert!(matches!(&hir.decls[*decl_id], Decl::Type(_)));
     }
 
+    /// **P19.9** — every name `ingest` records into the project
+    /// index also lands in the [`SymbolTable`]. This anchors the
+    /// invariant the new `&str` accessors (`type_members_for`,
+    /// `fn_signature_for`, etc.) rely on: a successful `ingest` of
+    /// "Foo" → `idx.symbol("Foo")` answers `Some(_)` and the
+    /// returned [`Symbol`] keys every map that holds a "Foo" entry.
+    #[test]
+    fn ingest_interns_names_into_symbol_table() {
+        let hir = lower(
+            r#"
+type Bag {
+    weight: int;
+    fn lift(): int;
+}
+
+enum Color { Red, Green }
+
+fn helper(): int { return 1; }
+"#,
+        );
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&uri("/proj/m.gcl"), &hir);
+
+        // Each top-level decl name is interned.
+        for n in ["Bag", "Color", "helper"] {
+            let sym = idx
+                .symbol(n)
+                .unwrap_or_else(|| panic!("{n} not interned after ingest"));
+            assert_eq!(idx.symbols.resolve(sym), Some(n));
+        }
+
+        // The new `&str` accessors hit through the symbol table.
+        let bag = idx.type_members_for("Bag").expect("Bag in type_members");
+        assert!(bag.attr_id(&idx.symbols, "weight").is_some());
+        assert!(bag.method_id(&idx.symbols, "lift").is_some());
+
+        // Same Symbol is shared between the outer index and the
+        // inner TypeMembers — interning preserves identity.
+        let weight_sym = idx.symbol("weight").expect("weight interned via ingest");
+        assert!(bag.attrs.contains_key(&weight_sym));
+    }
+
     #[test]
     fn locate_decl_keeps_collisions_across_modules() {
         // Same name in two modules should produce two entries — P11.2
@@ -707,19 +920,21 @@ fn ignored() {}
         let mut idx = ProjectIndex::new();
         idx.ingest(&u, &hir);
 
-        let alpha_hits = idx.exposed.get("public_alpha").expect("public_alpha");
+        let alpha_sym = idx.symbol("public_alpha").expect("public_alpha interned");
+        let alpha_hits = idx.exposed.get(&alpha_sym).expect("public_alpha");
         assert_eq!(alpha_hits.len(), 1);
         assert_eq!(alpha_hits[0].rename.as_deref(), Some("public_alpha"));
         assert_eq!(alpha_hits[0].local_name, "alpha");
 
-        let beta_hits = idx.exposed.get("beta").expect("beta");
+        let beta_sym = idx.symbol("beta").expect("beta interned");
+        let beta_hits = idx.exposed.get(&beta_sym).expect("beta");
         assert_eq!(beta_hits.len(), 1);
         assert_eq!(beta_hits[0].rename, None);
 
         assert!(
-            !idx.exposed.contains_key("ignored"),
-            "@library annotation shouldn't add to exposed map: {:?}",
-            idx.exposed.keys().collect::<Vec<_>>(),
+            idx.symbol("ignored")
+                .is_none_or(|s| !idx.exposed.contains_key(&s)),
+            "@library annotation shouldn't add to exposed map",
         );
     }
 
@@ -743,17 +958,17 @@ type Plain {}
         let mut idx = ProjectIndex::new();
         idx.ingest(&u, &hir);
 
-        let bag = idx.type_flags.get("Bag").expect("Bag flags");
+        let bag = idx.type_flags_for("Bag").expect("Bag flags");
         assert!(bag.iterable);
         assert_eq!(bag.deref.as_deref(), Some("resolve"));
         assert!(!bag.primitive);
 
-        let marker = idx.type_flags.get("Marker").expect("Marker flags");
+        let marker = idx.type_flags_for("Marker").expect("Marker flags");
         assert!(marker.primitive);
         assert!(!marker.iterable);
 
         // Plain has no annotations — kept out of the map.
-        assert!(!idx.type_flags.contains_key("Plain"));
+        assert!(idx.type_flags_for("Plain").is_none());
     }
 
     #[test]
@@ -766,8 +981,10 @@ type Plain {}
         idx.ingest(&u, &hir);
 
         let perms = idx.module_permissions.get(&u).expect("permissions tracked");
-        assert!(perms.contains("admin"));
-        assert!(perms.contains("user"));
+        let admin_sym = idx.symbol("admin").expect("admin interned");
+        let user_sym = idx.symbol("user").expect("user interned");
+        assert!(perms.contains(&admin_sym));
+        assert!(perms.contains(&user_sym));
         assert_eq!(perms.len(), 2);
     }
 
