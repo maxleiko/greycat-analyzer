@@ -1867,6 +1867,121 @@ fn completion_skips_call_parens_when_already_present() {
     );
 }
 
+/// Member completion (`.` / `->`) populates each item's `detail`
+/// (full method signature, attribute type) and `documentation`
+/// (decl's doc-comment) so the popup tooltip lights up the same way
+/// VS Code's TS reference does.
+#[test]
+fn completion_member_items_carry_detail_and_documentation() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Box {\n  /// item count\n  count: int;\n  /// gives back the inner String\n  fn get(): String { return \"\"; }\n}\nfn caller(b: Box) {\n  b.\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(7, 4),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let count = list
+        .items
+        .iter()
+        .find(|i| i.label == "count")
+        .expect("`count` attr should appear");
+    assert_eq!(count.detail.as_deref(), Some("count: int"));
+    let count_doc = match count.documentation.as_ref() {
+        Some(Documentation::MarkupContent(c)) => c.value.clone(),
+        Some(Documentation::String(s)) => s.clone(),
+        None => panic!("expected attr documentation, got None"),
+    };
+    assert!(
+        count_doc.contains("item count"),
+        "attr doc-comment should pass through; got {count_doc:?}"
+    );
+
+    let get = list
+        .items
+        .iter()
+        .find(|i| i.label == "get")
+        .expect("`get` method should appear");
+    assert_eq!(
+        get.detail.as_deref(),
+        Some("fn get(): String"),
+        "expected the rendered method signature"
+    );
+    let get_doc = match get.documentation.as_ref() {
+        Some(Documentation::MarkupContent(c)) => c.value.clone(),
+        Some(Documentation::String(s)) => s.clone(),
+        None => panic!("expected method documentation, got None"),
+    };
+    assert!(
+        get_doc.contains("inner String"),
+        "method doc-comment should pass through; got {get_doc:?}"
+    );
+}
+
+/// Static completion (`Type::|`, `module::|`) populates `detail` /
+/// `documentation` for static methods and module-level decls, so the
+/// quick-detail popup matches the instance-access path.
+#[test]
+fn completion_static_items_carry_detail_and_documentation() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Box {\n  /// builds a fresh box\n  static fn make(): Box { return Box {}; }\n}\nfn caller() {\n  Box::\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(5, 7),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let make = list
+        .items
+        .iter()
+        .find(|i| i.label == "make")
+        .expect("`make` static method should appear");
+    assert!(
+        make.detail
+            .as_deref()
+            .is_some_and(|d| d.contains("static fn make()") && d.contains(": Box")),
+        "expected static method signature in detail; got {:?}",
+        make.detail
+    );
+    let make_doc = match make.documentation.as_ref() {
+        Some(Documentation::MarkupContent(c)) => c.value.clone(),
+        Some(Documentation::String(s)) => s.clone(),
+        None => panic!("expected static-method documentation, got None"),
+    };
+    assert!(
+        make_doc.contains("fresh box"),
+        "static-method doc-comment should pass through; got {make_doc:?}"
+    );
+}
+
 /// Regression: when the cursor sits mid-identifier (`x.|chars()`),
 /// accepting a different completion (`endsWith`) must replace the
 /// existing word and not concatenate with it. Without the

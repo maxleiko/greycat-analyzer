@@ -2760,10 +2760,16 @@ fn enum_variant_completion_item(
 /// decl reached through `Recv::|`. Same `text_edit`-based
 /// replace-range plumbing as [`enum_variant_completion_item`] so
 /// mid-ident invocation doesn't duplicate the typed prefix.
+///
+/// `detail` and `documentation` carry the signature + doc-comment of
+/// the resolved decl so the popup's right-rail tooltip lights up the
+/// same way it does for instance access (P15.2.4 / member completion).
 fn static_completion_item(
     name: String,
     kind: CompletionItemKind,
     replace_range: lsp_types::Range,
+    detail: Option<String>,
+    documentation: Option<Documentation>,
 ) -> CompletionItem {
     CompletionItem {
         label: name.clone(),
@@ -2772,6 +2778,8 @@ fn static_completion_item(
             range: replace_range,
             new_text: name,
         })),
+        detail,
+        documentation,
         ..Default::default()
     }
 }
@@ -2840,13 +2848,14 @@ fn ident_or_keyword_completion(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let detail = scope_name_detail(module, &source);
+            let (detail, documentation) = scope_name_meta(module, &source);
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(kind),
                 insert_text: Some(name),
                 sort_text: Some(sort_pri.to_string()),
                 detail,
+                documentation,
                 ..Default::default()
             });
         }
@@ -2883,13 +2892,14 @@ fn ident_or_keyword_completion(
             continue;
         }
         let kind = decl_locs_kind(project, locs);
-        let (detail, description) = foreign_decl_completion_meta(project, locs);
+        let (detail, documentation, description) = foreign_decl_completion_meta(project, locs);
         items.push(CompletionItem {
             label: name.clone(),
             kind: Some(kind),
             insert_text: Some(name.clone()),
             sort_text: Some(format!("y_{name}")),
             detail,
+            documentation,
             label_details: description.map(|d| CompletionItemLabelDetails {
                 description: Some(d),
                 ..Default::default()
@@ -2985,7 +2995,11 @@ fn apply_call_paren_snippet(items: &mut [CompletionItem], text: &str, cursor_byt
 
     for item in items.iter_mut() {
         // 1) Append `($0)` to FUNCTION / METHOD items unless the
-        //    surrounding source already opens the call.
+        //    surrounding source already opens the call. When the item
+        //    already carries an explicit `text_edit` (e.g. enum-variant
+        //    or static-completion shapes that bake in a replace-range),
+        //    we mutate `text_edit.new_text` so the editor honors it;
+        //    otherwise we mutate `insert_text`.
         if !parens_already_there
             && matches!(
                 item.kind,
@@ -2993,11 +3007,15 @@ fn apply_call_paren_snippet(items: &mut [CompletionItem], text: &str, cursor_byt
             )
             && !matches!(item.insert_text_format, Some(InsertTextFormat::SNIPPET))
         {
-            let base = item
-                .insert_text
-                .clone()
-                .unwrap_or_else(|| item.label.clone());
-            item.insert_text = Some(format!("{base}($0)"));
+            if let Some(CompletionTextEdit::Edit(te)) = item.text_edit.as_mut() {
+                te.new_text = format!("{}($0)", te.new_text);
+            } else {
+                let base = item
+                    .insert_text
+                    .clone()
+                    .unwrap_or_else(|| item.label.clone());
+                item.insert_text = Some(format!("{base}($0)"));
+            }
             item.insert_text_format = Some(InsertTextFormat::SNIPPET);
         }
 
@@ -3037,44 +3055,55 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
     i < bytes.len() && bytes[i] == b'('
 }
 
-/// Render the right-side `detail` string for a scope-visible name —
-/// matches the TS reference's `(<module>) name: T` quick-detail.
-/// Module-level decls show their full signature (`fn f(p: T): R`,
-/// `var x: T`, …); locals / params surface their inferred type from
-/// `def_types`; generics carry no detail.
-fn scope_name_detail(module: &ModuleAnalysis, source: &NameSource) -> Option<String> {
+/// Render `(detail, documentation)` for a scope-visible name.
+/// Module-level decls show their full signature plus their doc-comment;
+/// locals / params surface their inferred type from `def_types` (no
+/// docs, since locals carry none); generics return both as `None`.
+fn scope_name_meta(
+    module: &ModuleAnalysis,
+    source: &NameSource,
+) -> (Option<String>, Option<Documentation>) {
     match source {
-        NameSource::ModuleDecl(decl_id) => Some(render_decl_signature(
-            &module.hir,
-            &module.hir.decls[*decl_id],
-        )),
-        NameSource::Local(name_idx) | NameSource::Param(name_idx) => module
-            .analysis
-            .def_types
-            .get(name_idx)
-            .map(|ty| greycat_analyzer_types::display(&module.analysis.types, *ty)),
-        NameSource::Generic => None,
+        NameSource::ModuleDecl(decl_id) => {
+            let decl = &module.hir.decls[*decl_id];
+            (
+                Some(render_decl_signature(&module.hir, decl)),
+                doc_to_markup(decl_doc(decl)),
+            )
+        }
+        NameSource::Local(name_idx) | NameSource::Param(name_idx) => {
+            let detail = module
+                .analysis
+                .def_types
+                .get(name_idx)
+                .map(|ty| greycat_analyzer_types::display(&module.analysis.types, *ty));
+            (detail, None)
+        }
+        NameSource::Generic => (None, None),
     }
 }
 
-/// Render the `(detail, description)` pair for a cross-module decl
-/// surfaced via [`ProjectIndex::decl_locations`]. `detail` is the
-/// foreign decl's signature; `description` is the home module's stem
-/// (e.g. `model` for `file:///proj/src/model.gcl`). Falls through to
-/// `(None, None)` when the decl's home module isn't cached.
+/// Render `(detail, documentation, description)` for a cross-module
+/// decl surfaced via [`ProjectIndex::decl_locations`]. `detail` is
+/// the foreign decl's signature; `description` is the home module's
+/// stem (`model` for `file:///proj/src/model.gcl`); `documentation`
+/// is the foreign decl's doc-comment. All three fall through to
+/// `None` when the decl's home module isn't cached.
 fn foreign_decl_completion_meta(
     project: &ProjectAnalysis,
     locs: &[(Uri, greycat_analyzer_hir::arena::Idx<Decl>)],
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<Documentation>, Option<String>) {
     let Some((uri, decl_id)) = locs.first() else {
-        return (None, None);
+        return (None, None, None);
     };
     let Some(m) = project.module(uri) else {
-        return (None, None);
+        return (None, None, None);
     };
-    let detail = render_decl_signature(&m.hir, &m.hir.decls[*decl_id]);
+    let decl = &m.hir.decls[*decl_id];
+    let detail = render_decl_signature(&m.hir, decl);
+    let documentation = doc_to_markup(decl_doc(decl));
     let description = module_label_for_uri(uri);
-    (Some(detail), Some(description))
+    (Some(detail), documentation, Some(description))
 }
 
 /// Pick the `CompletionItemKind` for a name resolving through the
@@ -3666,10 +3695,15 @@ fn collect_type_members(
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
+        let ty =
+            a.ty.map(|t| render_type_ref(hir, t))
+                .unwrap_or_else(|| "any".into());
         items.push(CompletionItem {
             label: name.clone(),
             kind: Some(CompletionItemKind::FIELD),
-            insert_text: Some(name),
+            insert_text: Some(name.clone()),
+            detail: Some(format!("{name}: {ty}")),
+            documentation: doc_to_markup(a.doc.as_deref()),
             ..Default::default()
         });
     }
@@ -3690,9 +3724,25 @@ fn collect_type_members(
             label: name.clone(),
             kind: Some(CompletionItemKind::METHOD),
             insert_text: Some(name),
+            detail: Some(render_fn_signature(hir, m)),
+            documentation: doc_to_markup(m.doc.as_deref()),
             ..Default::default()
         });
     }
+}
+
+/// Wrap a doc-comment paragraph as LSP markup so completion-item
+/// tooltips render it correctly. Returns `None` for missing / blank
+/// docs so the field stays absent on the wire.
+fn doc_to_markup(doc: Option<&str>) -> Option<Documentation> {
+    let trimmed = doc?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: trimmed.to_string(),
+    }))
 }
 
 // =============================================================================
@@ -3746,10 +3796,14 @@ fn static_completion(
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
+                    let detail = Some(render_fn_signature(&fmod.hir, m));
+                    let documentation = doc_to_markup(m.doc.as_deref());
                     items.push(static_completion_item(
                         name,
                         CompletionItemKind::METHOD,
                         replace_range,
+                        detail,
+                        documentation,
                     ));
                 }
             }
@@ -3788,14 +3842,23 @@ fn static_completion(
             if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                 continue;
             }
-            let kind = match &mod_analysis.hir.decls[decl_id] {
+            let decl = &mod_analysis.hir.decls[decl_id];
+            let kind = match decl {
                 Decl::Fn(_) => CompletionItemKind::FUNCTION,
                 Decl::Type(_) => CompletionItemKind::CLASS,
                 Decl::Enum(_) => CompletionItemKind::ENUM,
                 Decl::Var(_) => CompletionItemKind::VARIABLE,
                 Decl::Pragma(_) => continue,
             };
-            items.push(static_completion_item(name, kind, replace_range));
+            let detail = Some(render_decl_signature(&mod_analysis.hir, decl));
+            let documentation = doc_to_markup(decl_doc(decl));
+            items.push(static_completion_item(
+                name,
+                kind,
+                replace_range,
+                detail,
+                documentation,
+            ));
         }
     }
 
