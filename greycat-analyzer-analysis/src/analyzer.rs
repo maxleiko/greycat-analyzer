@@ -633,6 +633,43 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// **P22** — type a `foreign_member_uses`-bound `recv.attr` /
+    /// `recv.method()` shape inline by looking up the project
+    /// signatures index. `recv_ty` is the resolution-side receiver
+    /// (post-arrow-deref); the returned type already has the
+    /// receiver's generic instantiation substituted in. Methods
+    /// resolve to the `function` named-type the rest of the analyzer
+    /// expects for method references.
+    fn foreign_member_type(&mut self, recv_ty: TypeId, property: Idx<Ident>) -> Option<TypeId> {
+        let foreign = self.out.foreign_member_uses.get(&property)?.clone();
+        // Always model method references as `function` — the actual
+        // return-type substitution happens at the call site (P22's
+        // call-typing path consults `method_returns` directly).
+        if matches!(foreign.member, MemberDef::Method(_)) {
+            return Some(self.arena.named("function"));
+        }
+        // Attr — pull the lowered attr type from the project index
+        // and apply receiver-driven substitution.
+        let recv = self.arena.get(recv_ty).clone();
+        let (type_name, instantiation) = match recv.kind {
+            TypeKind::Named { name } => (name, Vec::new()),
+            TypeKind::Generic { name, args } => (name, args),
+            TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
+            _ => return None,
+        };
+        let members = self.index.type_members.get(&type_name)?;
+        let property_text = self.ident_text(property).to_string();
+        let attr_ty = members.attr_types.get(&property_text).copied()?;
+        // Build generic substitution from receiver's instantiation.
+        let mut subst: HashMap<String, TypeId> = HashMap::new();
+        for (i, gp_name) in members.generics.iter().enumerate() {
+            if let Some(arg) = instantiation.get(i) {
+                subst.insert(gp_name.clone(), *arg);
+            }
+        }
+        Some(self.arena.substitute(attr_ty, &subst))
+    }
+
     // Lower a syntactic TypeRef to a TypeId.
     fn lower_type_ref(&mut self, idx: Idx<TypeRef>) -> TypeId {
         let tr = self.hir.type_refs[idx].clone();
@@ -1519,6 +1556,13 @@ impl<'a> Cx<'a> {
                         }
                         MemberDef::Method(_) => self.arena.named("function"),
                     }
+                } else if self.out.foreign_member_uses.contains_key(&property) {
+                    // P22 — cross-module attr / method typing inline.
+                    // Reads the project signatures index built in S7
+                    // (`stage_lower_signatures`) and applies generic
+                    // substitution from the receiver's instantiation.
+                    self.foreign_member_type(resolution_ty, property)
+                        .unwrap_or_else(|| self.any())
                 } else {
                     self.any()
                 };

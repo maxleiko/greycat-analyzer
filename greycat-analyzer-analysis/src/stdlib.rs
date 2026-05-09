@@ -108,15 +108,39 @@ pub struct ProjectIndex {
 }
 
 /// P21 — per-type cross-module member index. `home_uri` names the
-/// module that declared the type so the analyzer can fish the right
-/// `Hir` out of `ProjectAnalysis::modules` when it needs the attr's
-/// declared `TypeRef` (P22's S7 absorbs that lookup into the staged
-/// arena).
+/// module that declared the type so the analyzer / staged orchestrator
+/// can fish the right `Hir` out of `ProjectAnalysis::modules`.
+///
+/// **P22 extension:** `generics`, `attr_types`, and `method_returns`
+/// hold the *project-wide-lowered* signature data. Built by
+/// `ProjectAnalysis::stage_lower_signatures` after every module is
+/// loaded but before any body walks. With these, the analyzer can
+/// type a foreign `recv.attr` / `recv.method()` inline by looking up
+/// the relevant TypeId in the shared arena and applying
+/// `arena.substitute` against the receiver's instantiation — no
+/// post-pass round-trip via `TypeShape`.
 #[derive(Debug, Clone)]
 pub struct TypeMembers {
     pub home_uri: Uri,
     pub attrs: HashMap<String, Idx<TypeAttr>>,
     pub methods: HashMap<String, Idx<Decl>>,
+    /// P22 — ordered list of generic parameter names declared on the
+    /// type (`type Map<K, V> {}` → `["K", "V"]`). Empty for
+    /// non-generic types. Used by the analyzer to build a
+    /// `name → TypeId` substitution map from the receiver's
+    /// instantiation args at member-access / call sites.
+    pub generics: Vec<String>,
+    /// P22 — pre-lowered attr declared types, keyed by attr name.
+    /// `TypeId`s reference the shared project arena
+    /// ([`crate::project::ProjectAnalysis::arena`]). For generic
+    /// types, attr TypeIds may reference `GenericParam(T, owner=this)`
+    /// — call-site substitution is the consumer's job.
+    pub attr_types: HashMap<String, TypeId>,
+    /// P22 — pre-lowered method declared return types. Same arena +
+    /// substitution semantics as `attr_types`. Methods without an
+    /// explicit return type are absent (the analyzer's call-typing
+    /// falls through to the existing inference path).
+    pub method_returns: HashMap<String, TypeId>,
 }
 
 /// P13.5 — annotation-derived flag bits on a type declaration.
@@ -200,10 +224,22 @@ impl ProjectIndex {
                     // methods inline instead of deferring to a post
                     // pass.
                     self.type_members.entry(name.clone()).or_insert_with(|| {
+                        let generics: Vec<String> = td
+                            .generics
+                            .iter()
+                            .map(|g| hir.idents[*g].text.clone())
+                            .collect();
                         let mut m = TypeMembers {
                             home_uri: uri.clone(),
                             attrs: HashMap::new(),
                             methods: HashMap::new(),
+                            generics,
+                            // P22 — `attr_types` / `method_returns`
+                            // get filled in by
+                            // `ProjectAnalysis::stage_lower_signatures`
+                            // after every module is loaded.
+                            attr_types: HashMap::new(),
+                            method_returns: HashMap::new(),
                         };
                         for attr_id in &td.attrs {
                             let attr_name = hir.idents[hir.type_attrs[*attr_id].name].text.clone();

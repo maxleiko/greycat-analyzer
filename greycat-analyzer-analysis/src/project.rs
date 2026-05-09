@@ -175,11 +175,18 @@ impl ProjectAnalysis {
         // forward pass, no per-module dependency.
         let lowered = self.stage_lower(manager);
 
-        // S2-S11 + S12 (per-module slice) — currently bundled inside
+        // S7-S11 (signatures) — lower every type's attr `TypeRef`s and
+        // method return-`TypeRef`s into the shared arena project-wide,
+        // populating `ProjectIndex::type_members.{attr_types,
+        // method_returns}`. With this index in place the analyzer can
+        // type a foreign `recv.attr` / `recv.method()` call inline at
+        // body-walk time — no post-pass `mint_type_shape` round-trip.
+        self.stage_lower_signatures(&lowered);
+
+        // S2-S6 + S12 (per-module slice) — currently bundled inside
         // `analyze_with_index_into`, which threads name declaration,
-        // structure declaration, signature completion, and body
-        // walking in one pass. P21+ peels the earlier stages off so
-        // they run project-wide before any body walks.
+        // structure declaration, and body walking in one pass. P23
+        // peels S12 off into a project-wide body walker.
         self.stage_per_module_analysis(lowered);
 
         // S12 (cross-module suffix) — post-passes the per-module
@@ -219,6 +226,100 @@ impl ProjectAnalysis {
             hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took));
         }
         hirs
+    }
+
+    /// **Stages S7-S11** (P22) — lower every type's attr `TypeRef`s
+    /// and method return-`TypeRef`s into the shared arena
+    /// project-wide, then store the resulting `TypeId`s on each
+    /// type's [`crate::stdlib::TypeMembers`] entry.
+    ///
+    /// With these populated, the analyzer's per-module body walker
+    /// can type cross-module `recv.attr` / `recv.method()` shapes
+    /// inline by looking up `index.type_members[name].attr_types[prop]`
+    /// and applying `arena.substitute(ty, &subst)` against the
+    /// receiver's instantiation args (the type's own generics live in
+    /// `TypeMembers::generics`).
+    ///
+    /// The lowering uses `ProjectIndex` for cross-module name
+    /// resolution, so a foreign `Foo` resolves to `Named { name: "Foo" }`
+    /// in the shared arena — directly comparable to anything else
+    /// minted into the same arena. Generic params owned by the type
+    /// being walked resolve to `GenericParam(T, owner=Type(name))`.
+    fn stage_lower_signatures(&mut self, lowered: &[(Uri, Hir, String, Duration)]) {
+        use greycat_analyzer_hir::types::Decl;
+        use greycat_analyzer_types::GenericOwner;
+
+        // Split borrow: arena + index.type_members are both fields of
+        // `self`, but distinct, so direct field access lets us hold
+        // both mutably while reading `index` immutably elsewhere.
+        let arena_mut = &mut self.arena;
+        let index_ref = &self.index;
+        // Buffer the writes; we need `&self.index` for cross-module
+        // name lookup *during* lowering, then apply the writes after.
+        type AttrUpdate = (String, String, greycat_analyzer_types::TypeId);
+        type MethodUpdate = (String, String, greycat_analyzer_types::TypeId);
+        let mut attr_updates: Vec<AttrUpdate> = Vec::new();
+        let mut method_updates: Vec<MethodUpdate> = Vec::new();
+
+        for (_uri, hir, _lib, _) in lowered {
+            let Some(module) = hir.module.as_ref() else {
+                continue;
+            };
+            for d_id in &module.decls {
+                let Decl::Type(td) = &hir.decls[*d_id] else {
+                    continue;
+                };
+                let type_name = hir.idents[td.name].text.clone();
+                // Build the generics scope for this type.
+                let owner = GenericOwner::Type(type_name.clone());
+                let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                for g in &td.generics {
+                    generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
+                }
+                // Lower attrs.
+                for attr_id in &td.attrs {
+                    let attr = &hir.type_attrs[*attr_id];
+                    let attr_name = hir.idents[attr.name].text.clone();
+                    let Some(tr) = attr.ty else {
+                        continue;
+                    };
+                    let ty =
+                        lower_type_ref_project(hir, tr, arena_mut, index_ref, &generics_in_scope);
+                    attr_updates.push((type_name.clone(), attr_name, ty));
+                }
+                // Lower method returns.
+                for method_id in &td.methods {
+                    let Decl::Fn(fnd) = &hir.decls[*method_id] else {
+                        continue;
+                    };
+                    let method_name = hir.idents[fnd.name].text.clone();
+                    let Some(ret) = fnd.return_type else {
+                        continue;
+                    };
+                    // Method bodies see *both* the type's generics and
+                    // any of the method's own (`fn<U>(...)`).
+                    let mut method_generics = generics_in_scope.clone();
+                    let method_owner = GenericOwner::Function(method_name.clone());
+                    for g in &fnd.generics {
+                        method_generics.insert(hir.idents[*g].text.clone(), method_owner.clone());
+                    }
+                    let ty =
+                        lower_type_ref_project(hir, ret, arena_mut, index_ref, &method_generics);
+                    method_updates.push((type_name.clone(), method_name, ty));
+                }
+            }
+        }
+        // Apply writes — `index_ref` and `arena_mut` borrows end here.
+        for (type_name, attr_name, ty) in attr_updates {
+            if let Some(tm) = self.index.type_members.get_mut(&type_name) {
+                tm.attr_types.insert(attr_name, ty);
+            }
+        }
+        for (type_name, method_name, ty) in method_updates {
+            if let Some(tm) = self.index.type_members.get_mut(&type_name) {
+                tm.method_returns.insert(method_name, ty);
+            }
+        }
     }
 
     /// **Stages S2-S11 + S12 (per-module slice).** Currently delegates
@@ -280,15 +381,36 @@ impl ProjectAnalysis {
     /// signatures, so call-site monomorphization and member typing
     /// happen inline rather than in a fix-up sweep).
     fn stage_cross_module_post_passes(&mut self) {
-        let _ = self.infer_cross_module_member_types();
+        // P22 — passes 3.4 / 3.45 are gone: the analyzer's
+        // Member/Arrow typing consults `index.type_members.attr_types`
+        // inline via `Cx::foreign_member_type` during the body walk.
+        //
+        // Pass 3.5 (`infer_cross_module_call_types`) survives until P23
+        // — it patches cross-module *call* return types, which the
+        // analyzer's per-module body walker can't compute today
+        // (foreign fn signatures aren't yet in `ProjectIndex`). When
+        // P23 absorbs call typing into the staged S12, this falls.
+        //
+        // Pass 3.52 (`rebind_for_in_iter_types`) also survives until
+        // P23 — it covers `for (g in foo())` where `foo()` returns a
+        // foreign type and the analyzer's first pass typed the call
+        // as `any`.
         let _ = self.infer_cross_module_call_types();
         self.rebind_for_in_iter_types();
-        for _ in 0..5 {
-            let mut changed = false;
-            changed |= self.propagate_member_types_from_current();
+        for _ in 0..3 {
+            let prev_len = self
+                .modules
+                .values()
+                .map(|m| m.analysis.expr_types.len())
+                .sum::<usize>();
             let _ = self.infer_cross_module_call_types();
             self.rebind_for_in_iter_types();
-            if !changed {
+            let new_len = self
+                .modules
+                .values()
+                .map(|m| m.analysis.expr_types.len())
+                .sum::<usize>();
+            if new_len == prev_len {
                 break;
             }
         }
@@ -305,237 +427,9 @@ impl ProjectAnalysis {
         self.compute_qualified_refs(manager);
     }
 
-    /// P16.3 — cross-module member-expr typing. After pass 3 binds
-    /// `foreign_member_uses` (the property idents in `recv.attr` /
-    /// `recv->method` whose receiver type lives in another module),
-    /// walk every module's `Expr::Member` / `Expr::Arrow` and write
-    /// back the foreign attr / method's translated declared type so
-    /// `var x = recv.attr` and method-ref shapes carry the right type
-    /// instead of the placeholder `any`. Mirrors the
-    /// `read_type_shape` + `mint_type_shape` pattern from pass 3.5.
-    /// Pass 3.45 — propagate Member/Arrow expression types from the
-    /// receiver's current type. The original cross-module member
-    /// pass (3.4) only fired when pass 2 had already classified the
-    /// property as a foreign member; for cascades (`g->packages`
-    /// where `g`'s type wasn't settled until 3.52) that machinery
-    /// never engaged. This pass walks every `Expr::Member`/`Expr::Arrow`
-    /// and tries to resolve its property against the receiver's
-    /// *current* `expr_types`, applying generic substitution from the
-    /// receiver's instantiation. Returns `true` when any `expr_types`
-    /// entry was updated — the caller loops until stable.
-    fn propagate_member_types_from_current(&mut self) -> bool {
-        use crate::analyzer::MemberDef;
-        use greycat_analyzer_hir::types::{Decl, Expr};
-        use greycat_analyzer_types::TypeKind;
-
-        type Update = (Idx<Expr>, TypeShape, Option<MemberDef>);
-        #[allow(clippy::mutable_key_type)]
-        let mut updates: HashMap<Uri, Vec<Update>> = HashMap::new();
-
-        // P19 — pre-bind the shared arena so split borrows don't
-        // collide with `&self.modules` iteration.
-        let arena = &self.arena;
-        for (cur_uri, cur_module) in &self.modules {
-            for (expr_id, expr) in cur_module.hir.exprs.iter() {
-                let (property_idx, is_arrow) = match expr {
-                    Expr::Member(m) => (m.property, false),
-                    Expr::Arrow(m) => (m.property, true),
-                    _ => continue,
-                };
-                let receiver = match expr {
-                    Expr::Member(m) | Expr::Arrow(m) => m.receiver,
-                    _ => unreachable!(),
-                };
-                // Skip exprs already typed to something concrete — the
-                // analyzer's first pass / 3.4 already settled them.
-                let already_typed = cur_module
-                    .analysis
-                    .expr_types
-                    .get(&expr_id)
-                    .map(|t| !matches!(arena.get(*t).kind, TypeKind::Any))
-                    .unwrap_or(false);
-                if already_typed {
-                    continue;
-                }
-                let Some(receiver_ty) = cur_module.analysis.expr_types.get(&receiver).copied()
-                else {
-                    continue;
-                };
-                if matches!(arena.get(receiver_ty).kind, TypeKind::Any) {
-                    continue;
-                }
-                // For arrow expressions on a node-tag receiver
-                // (`node<T>` etc.) deref to inner T. Mirror of the
-                // analyzer's `arrow_deref_receiver`.
-                let lookup_ty = if is_arrow {
-                    match arena.get(receiver_ty).kind.clone() {
-                        TypeKind::Generic { name, args }
-                            if greycat_analyzer_types::is_node_tag(&name) && args.len() == 1 =>
-                        {
-                            args[0]
-                        }
-                        _ => receiver_ty,
-                    }
-                } else {
-                    receiver_ty
-                };
-                let (type_name, instantiation) = match arena.get(lookup_ty).kind.clone() {
-                    TypeKind::Named { name } => (name, Vec::new()),
-                    TypeKind::Generic { name, args } => (name, args),
-                    TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
-                    _ => continue,
-                };
-                let property_text = cur_module.hir.idents[property_idx].text.clone();
-
-                // Look up the type decl: own module first, then via
-                // the project index for cross-module hits.
-                let (host_module, host_decl_id) = if let Some(decl_id) =
-                    cur_module.analysis.type_decls.get(&type_name).copied()
-                {
-                    (cur_module, decl_id)
-                } else if let Some((host_uri, host_decl_id)) =
-                    self.index.locate_decl(&type_name).iter().next()
-                {
-                    let Some(m) = self.modules.get(host_uri) else {
-                        continue;
-                    };
-                    (m, *host_decl_id)
-                } else {
-                    continue;
-                };
-                let Decl::Type(td) = &host_module.hir.decls[host_decl_id] else {
-                    continue;
-                };
-                // Build the substitution map from the type's generic
-                // params to the receiver's instantiation args.
-                let mut subst: HashMap<String, TypeShape> = HashMap::new();
-                for (gp_idx, name_idx) in td.generics.iter().enumerate() {
-                    let gp_name = host_module.hir.idents[*name_idx].text.clone();
-                    let arg_shape = instantiation
-                        .get(gp_idx)
-                        .map(|a| read_type_id_shape(arena, *a))
-                        .unwrap_or(TypeShape::Any);
-                    subst.insert(gp_name, arg_shape);
-                }
-                // Find property among attrs / methods.
-                let mut match_shape: Option<TypeShape> = None;
-                let mut match_member: Option<MemberDef> = None;
-                for attr_id in &td.attrs {
-                    let attr = &host_module.hir.type_attrs[*attr_id];
-                    if host_module.hir.idents[attr.name].text == property_text {
-                        let shape = match attr.ty {
-                            Some(t) => read_type_shape_subst(&host_module.hir, t, &subst),
-                            None => TypeShape::Any,
-                        };
-                        match_shape = Some(shape);
-                        match_member = Some(MemberDef::Attr(*attr_id));
-                        break;
-                    }
-                }
-                if match_shape.is_none() {
-                    for method_id in &td.methods {
-                        let Decl::Fn(fnd) = &host_module.hir.decls[*method_id] else {
-                            continue;
-                        };
-                        if host_module.hir.idents[fnd.name].text == property_text {
-                            match_shape = Some(TypeShape::Named {
-                                name: "function".to_string(),
-                                params: vec![],
-                            });
-                            match_member = Some(MemberDef::Method(*method_id));
-                            break;
-                        }
-                    }
-                }
-                if let (Some(shape), Some(_member)) = (match_shape, match_member) {
-                    updates
-                        .entry(cur_uri.clone())
-                        .or_default()
-                        .push((expr_id, shape, None));
-                }
-            }
-        }
-
-        // Phase 2 — apply Member/Arrow updates. Split borrow:
-        // `&mut self.arena` is disjoint from `&mut self.modules`.
-        let mut changed = false;
-        let arena_mut = &mut self.arena;
-        for (uri, entries) in updates {
-            let Some(m) = self.modules.get_mut(&uri) else {
-                continue;
-            };
-            for (expr_id, shape, _member) in entries {
-                let ty = mint_type_shape(&shape, arena_mut);
-                let prev = m.analysis.expr_types.insert(expr_id, ty);
-                if prev != Some(ty) {
-                    changed = true;
-                }
-            }
-        }
-
-        // Phase 3 — refresh `expr_types` for every `Expr::Ident` whose
-        // resolved binding has a settled type in `def_types`. The
-        // analyzer's first pass already populated this for in-body
-        // visits, but every pass that mutates `def_types` (3.5 var-init
-        // relink, 3.52 for-in rebind) leaves Ident *uses* stale at
-        // `any`. Closing that gap here is what lets the next loop
-        // iteration's Member/Arrow propagation see the right receiver
-        // type.
-        use crate::resolver::Definition;
-        use greycat_analyzer_hir::types::Decl as HirDecl;
-        let arena_mut = &mut self.arena;
-        for m in self.modules.values_mut() {
-            for (expr_id, expr) in m.hir.exprs.iter() {
-                let Expr::Ident(use_idx) = expr else {
-                    continue;
-                };
-                // Only refresh from def_types when the current
-                // `expr_types` is `any` (or absent). The analyzer's
-                // narrowing frames may have stamped a narrower type
-                // at this specific use site (e.g. `if (x != null &&
-                // f(x))` narrows `x` to non-null inside the `&&`
-                // right operand), and we must not overwrite that
-                // with the binding's declared type.
-                let current_is_any = match m.analysis.expr_types.get(&expr_id) {
-                    Some(t) => matches!(arena_mut.get(*t).kind, TypeKind::Any),
-                    None => true,
-                };
-                if !current_is_any {
-                    continue;
-                }
-                let Some(def) = m.resolutions.lookup(*use_idx) else {
-                    continue;
-                };
-                let new_ty = match def {
-                    Definition::Param(name) | Definition::Local(name) => {
-                        m.analysis.def_types.get(&name).copied()
-                    }
-                    Definition::Decl(decl_id) => match &m.hir.decls[decl_id] {
-                        HirDecl::Var(vd) => vd.ty.and_then(|t| {
-                            lower_type_ref_id(&m.hir, t, &m.analysis.registry, arena_mut)
-                        }),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                let Some(new_ty) = new_ty else {
-                    continue;
-                };
-                if matches!(arena_mut.get(new_ty).kind, TypeKind::Any) {
-                    continue;
-                }
-                let prev = m.analysis.expr_types.insert(expr_id, new_ty);
-                if prev != Some(new_ty) {
-                    changed = true;
-                }
-            }
-        }
-        changed
-    }
-
-    /// Pass 3.52 — after `infer_cross_module_member_types` and
-    /// `infer_cross_module_call_types` have settled the iterable's
-    /// type, re-derive the iteration variables' types. The analyzer's
+    /// Pass 3.52 — after the cross-module type fixups have settled
+    /// the iterable's type, re-derive the iteration variables' types.
+    /// The analyzer's
     /// first pass binds them eagerly from `range_ty` at the visit-stmt
     /// site, but `range_ty` is `any` for foreign member-access / call
     /// iterables until 3.4 / 3.5 land. Mirrors the analyzer's
@@ -679,83 +573,6 @@ impl ProjectAnalysis {
                 m.analysis.expr_types.insert(expr_id, ty);
             }
         }
-    }
-
-    fn infer_cross_module_member_types(&mut self) -> HashSet<String> {
-        use crate::analyzer::MemberDef;
-        use greycat_analyzer_hir::types::{Expr, Stmt};
-
-        let mut touched_uris: HashSet<String> = HashSet::new();
-        #[allow(clippy::mutable_key_type)]
-        let mut expr_updates: HashMap<Uri, Vec<(Idx<Expr>, TypeShape)>> = HashMap::new();
-        for (cur_uri, cur_module) in &self.modules {
-            for (expr_id, expr) in cur_module.hir.exprs.iter() {
-                let property_idx = match expr {
-                    Expr::Member(m) | Expr::Arrow(m) => m.property,
-                    _ => continue,
-                };
-                // Cross-module bindings only — intra-module Member
-                // typing already lands in the analyzer's first pass
-                // (P16.1).
-                let Some(foreign) = cur_module.analysis.foreign_member_uses.get(&property_idx)
-                else {
-                    continue;
-                };
-                let shape = match foreign.member {
-                    MemberDef::Attr(attr_id) => {
-                        let foreign_module = match self.modules.get(&foreign.uri) {
-                            Some(m) => m,
-                            None => continue,
-                        };
-                        let attr = &foreign_module.hir.type_attrs[attr_id];
-                        match attr.ty {
-                            Some(declared_ref) => {
-                                read_type_shape(&foreign_module.hir, declared_ref)
-                            }
-                            None => TypeShape::Any,
-                        }
-                    }
-                    MemberDef::Method(_) => TypeShape::Named {
-                        name: "function".to_string(),
-                        params: vec![],
-                    },
-                };
-                expr_updates
-                    .entry(cur_uri.clone())
-                    .or_default()
-                    .push((expr_id, shape));
-            }
-        }
-
-        let arena_mut = &mut self.arena;
-        for (uri, entries) in expr_updates {
-            let Some(m) = self.modules.get_mut(&uri) else {
-                continue;
-            };
-            touched_uris.insert(uri.as_str().to_string());
-            let mut touched: HashMap<Idx<Expr>, greycat_analyzer_types::TypeId> = HashMap::new();
-            for (expr_id, shape) in entries {
-                let ty = mint_type_shape(&shape, arena_mut);
-                m.analysis.expr_types.insert(expr_id, ty);
-                touched.insert(expr_id, ty);
-            }
-            for (_stmt_id, stmt) in m.hir.stmts.iter() {
-                let Stmt::Var(local) = stmt else {
-                    continue;
-                };
-                let Some(init) = local.init else {
-                    continue;
-                };
-                if local.ty.is_some() {
-                    continue;
-                }
-                let Some(new_ty) = touched.get(&init).copied() else {
-                    continue;
-                };
-                m.analysis.def_types.insert(local.name, new_ty);
-            }
-        }
-        touched_uris
     }
 
     /// P15.7 — cross-module call return-type inference. After the
@@ -1457,16 +1274,13 @@ impl ProjectAnalysis {
         // `type_members` index directly during the per-module body
         // walk, so cross-module bindings land in `foreign_member_uses`
         // inline.
-        // P16.3 / P15.7 / P16.4 — cross-module type fixups. Each
-        // returns the set of URIs whose `expr_types` were touched;
-        // those are the modules whose validation results may have
-        // changed and that we therefore need to revalidate.
+        // P22 — cross-module member typing happens inline in the
+        // analyzer (via `Cx::foreign_member_type`), so no pass 3.4
+        // call here. Pass 3.5 (call returns) and pass 3.52 (for-in
+        // rebind) survive until P23.
         let mut touched: HashSet<String> = HashSet::new();
         touched.insert(uri.as_str().to_string()); // changed doc itself
-        touched.extend(self.infer_cross_module_member_types());
         touched.extend(self.infer_cross_module_call_types());
-        // Pass 3.52 — re-bind for-in iter var types from now-settled
-        // iterable types. Mirrors what `rebuild` does at the same step.
         self.rebind_for_in_iter_types();
         // Typed lint pass (P16.6). Same scope as `validate_type_relations`
         // — only the modules whose types changed need re-linting.
@@ -2365,6 +2179,58 @@ fn validate_module_type_relations(
             other => other.byte_range(),
         }
     }
+}
+
+/// **P22** — project-wide TypeRef lowerer used by
+/// [`ProjectAnalysis::stage_lower_signatures`]. Mirrors
+/// `Cx::lower_type_ref` but uses the project index instead of a
+/// per-module registry, so foreign type names resolve directly to
+/// `Named { name }` in the shared arena. `generics_in_scope` maps
+/// the names of the generic params owned by the current type / fn to
+/// their `GenericOwner`, so `T` lowers to `GenericParam(T, owner=…)`
+/// instead of `Named { name: "T" }`.
+fn lower_type_ref_project(
+    hir: &Hir,
+    type_ref: Idx<greycat_analyzer_hir::types::TypeRef>,
+    arena: &mut greycat_analyzer_types::TypeArena,
+    index: &ProjectIndex,
+    generics_in_scope: &HashMap<String, greycat_analyzer_types::GenericOwner>,
+) -> greycat_analyzer_types::TypeId {
+    use greycat_analyzer_types::Primitive;
+    let tr = hir.type_refs[type_ref].clone();
+    let name = hir.idents[tr.name].text.clone();
+    let mut base = match name.as_str() {
+        "bool" => arena.primitive(Primitive::Bool),
+        "int" => arena.primitive(Primitive::Int),
+        "float" => arena.primitive(Primitive::Float),
+        "char" => arena.primitive(Primitive::Char),
+        "String" => arena.primitive(Primitive::String),
+        "time" => arena.primitive(Primitive::Time),
+        "duration" => arena.primitive(Primitive::Duration),
+        "geo" => arena.primitive(Primitive::Geo),
+        "any" => arena.any(),
+        "null" => arena.null(),
+        _ => {
+            if !tr.params.is_empty() {
+                let args: Vec<greycat_analyzer_types::TypeId> = tr
+                    .params
+                    .iter()
+                    .map(|p| lower_type_ref_project(hir, *p, arena, index, generics_in_scope))
+                    .collect();
+                arena.generic(name.clone(), args)
+            } else if let Some(owner) = generics_in_scope.get(&name) {
+                arena.generic_param(name.clone(), owner.clone())
+            } else if index.has_name(&name) {
+                arena.named(name.clone())
+            } else {
+                arena.any()
+            }
+        }
+    };
+    if tr.optional {
+        base = arena.nullable(base);
+    }
+    base
 }
 
 /// Look up a syntactic `TypeRef` and mint a corresponding `TypeId`
