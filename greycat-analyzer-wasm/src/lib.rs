@@ -266,7 +266,11 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
     let range: ByteRange = e.byte_range().into();
     let (kind, label, children) = match e {
         Expr::Ident(name) => ("expr:ident", Some(ident_text(hir, *name)), Vec::new()),
-        Expr::Literal(l) => ("expr:literal", Some(format!("{:?} {:?}", l.kind, l.text)), Vec::new()),
+        Expr::Literal(l) => (
+            "expr:literal",
+            Some(format!("{:?} {:?}", l.kind, l.text)),
+            Vec::new(),
+        ),
         Expr::String(s) => {
             let mut kids = Vec::new();
             for part in &s.parts {
@@ -297,13 +301,11 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
                 kids.push(type_ref_node(hir, t));
             }
             for f in &o.fields {
-                let mut field_kids = Vec::new();
-                field_kids.push(expr_node(hir, f.value));
                 kids.push(HirNode {
                     kind: "expr:object-field".into(),
                     label: f.name.map(|n| ident_text(hir, n)),
                     range: f.byte_range.clone().into(),
-                    children: field_kids,
+                    children: vec![expr_node(hir, f.value)],
                 });
             }
             ("expr:object", None, kids)

@@ -999,8 +999,23 @@ impl<'a> Cx<'a> {
                 //                    type (if any) or `any`.
                 let any_id = self.any();
                 let int_id = self.primitive(Primitive::Int);
-                let inferred: Vec<TypeId> = match self.out.types.get(range_ty).kind.clone() {
-                    TypeKind::Generic { name, args } if name == "Array" || name == "Set" => {
+                let time_id = self.primitive(Primitive::Time);
+                let geo_id = self.primitive(Primitive::Geo);
+                // Receiver is nullable iterables propagate through here too —
+                // `for (i, v in arr?)` is valid GreyCat. Strip the optional
+                // before pattern-matching the kind so the binding logic is
+                // the same shape with or without the `?` marker.
+                let underlying_ty = if self.out.types.get(range_ty).nullable {
+                    let mut t = self.out.types.get(range_ty).clone();
+                    t.nullable = false;
+                    self.out.types.alloc(t)
+                } else {
+                    range_ty
+                };
+                let inferred: Vec<TypeId> = match self.out.types.get(underlying_ty).kind.clone() {
+                    TypeKind::Generic { name, args }
+                        if name == "Array" || name == "Set" || name == "nodeList" =>
+                    {
                         let elem = args.first().copied().unwrap_or(any_id);
                         if params.len() == 2 {
                             vec![int_id, elem]
@@ -1008,9 +1023,25 @@ impl<'a> Cx<'a> {
                             vec![any_id; params.len()]
                         }
                     }
-                    TypeKind::Generic { name, args } if name == "Map" => {
+                    TypeKind::Generic { name, args } if name == "Map" || name == "nodeIndex" => {
                         if args.len() >= 2 && params.len() == 2 {
                             vec![args[0], args[1]]
+                        } else {
+                            vec![any_id; params.len()]
+                        }
+                    }
+                    TypeKind::Generic { name, args } if name == "nodeTime" => {
+                        let elem = args.first().copied().unwrap_or(any_id);
+                        if params.len() == 2 {
+                            vec![time_id, elem]
+                        } else {
+                            vec![any_id; params.len()]
+                        }
+                    }
+                    TypeKind::Generic { name, args } if name == "nodeGeo" => {
+                        let elem = args.first().copied().unwrap_or(any_id);
+                        if params.len() == 2 {
+                            vec![geo_id, elem]
                         } else {
                             vec![any_id; params.len()]
                         }
@@ -1299,8 +1330,21 @@ impl<'a> Cx<'a> {
                 Some(Definition::Param(def)) | Some(Definition::Local(def)) => {
                     self.lookup_def_type(def).unwrap_or_else(|| self.any())
                 }
-                Some(Definition::Decl(_))
-                | Some(Definition::Generic(_))
+                Some(Definition::Decl(decl_id)) => {
+                    // Module-level `var x: T;` references type as `T`.
+                    // Type / enum / fn decls used as bare values get
+                    // their `type` / `function` shape from pass 3.5
+                    // (`resolve_bare_ident_decl_shape`); leaving them
+                    // `any` here lets that override land cleanly.
+                    if let Decl::Var(vd) = &self.hir.decls[decl_id]
+                        && let Some(ty_ref) = vd.ty
+                    {
+                        self.lower_type_ref(ty_ref)
+                    } else {
+                        self.any()
+                    }
+                }
+                Some(Definition::Generic(_))
                 | Some(Definition::ProjectDecl { .. })
                 | Some(Definition::Project)
                 | None => self.any(),

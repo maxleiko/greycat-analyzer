@@ -157,6 +157,12 @@ impl ProjectAnalysis {
         // inference (Static / QualifiedStatic / Member / Arrow / Ident
         // callees).
         let _ = self.infer_cross_module_call_types();
+        // Pass 3.52 (P16.4 follow-up): re-bind for-in iteration var
+        // types from the iterable's now-up-to-date type. The analyzer's
+        // first pass binds them eagerly from `range_ty`, but for foreign
+        // member-access / call iterables that's `any` until 3.4 / 3.5
+        // settle.
+        self.rebind_for_in_iter_types();
         // Pass 3.55 (P16.6): typed lint — `arrow-on-non-deref`. Runs
         // after the cross-module type fixups so receiver types reflect
         // foreign decls. Idempotent on re-entry: clear the rule's prior
@@ -249,6 +255,153 @@ impl ProjectAnalysis {
     /// `var x = recv.attr` and method-ref shapes carry the right type
     /// instead of the placeholder `any`. Mirrors the
     /// `read_type_shape` + `mint_type_shape` pattern from pass 3.5.
+    /// Pass 3.52 — after `infer_cross_module_member_types` and
+    /// `infer_cross_module_call_types` have settled the iterable's
+    /// type, re-derive the iteration variables' types. The analyzer's
+    /// first pass binds them eagerly from `range_ty` at the visit-stmt
+    /// site, but `range_ty` is `any` for foreign member-access / call
+    /// iterables until 3.4 / 3.5 land. Mirrors the analyzer's
+    /// generic-iterable unpacking so the binding logic stays in lockstep
+    /// (`Array<T>` / `Set<T>` / `nodeList<T>` → `(int, T)`,
+    /// `Map<K, V>` / `nodeIndex<K, V>` → `(K, V)`, `nodeTime<T>` →
+    /// `(time, T)`, `nodeGeo<T>` → `(geo, T)`). Params with a declared
+    /// type are not overridden.
+    fn rebind_for_in_iter_types(&mut self) {
+        use greycat_analyzer_hir::types::Stmt;
+        use greycat_analyzer_types::{Primitive, TypeKind};
+
+        type ParamUpdate = (Idx<greycat_analyzer_hir::types::Ident>, TypeShape);
+        let mut updates: Vec<(Uri, Vec<ParamUpdate>)> = Vec::new();
+        for (uri, m) in &self.modules {
+            let mut entries: Vec<ParamUpdate> = Vec::new();
+            for (_stmt_id, stmt) in m.hir.stmts.iter() {
+                let Stmt::ForIn(f) = stmt else {
+                    continue;
+                };
+                let Some(range_ty) = m.analysis.expr_types.get(&f.range).copied() else {
+                    continue;
+                };
+                let arena = &m.analysis.types;
+                // Strip nullable so `for (i, v in arr?)` works the same
+                // shape as the non-null case.
+                let underlying = if arena.get(range_ty).nullable {
+                    let mut t = arena.get(range_ty).clone();
+                    t.nullable = false;
+                    // Need a clone of the arena to mint into, because we
+                    // can't borrow it mutably while iterating modules —
+                    // we're already passing `TypeShape`s back through
+                    // `mint_type_shape` so just translate the inner kind
+                    // via `read_type_id_shape` below.
+                    Some(t.kind)
+                } else {
+                    Some(arena.get(range_ty).kind.clone())
+                };
+                let Some(kind) = underlying else { continue };
+                let int_shape = TypeShape::Primitive(Primitive::Int);
+                let time_shape = TypeShape::Primitive(Primitive::Time);
+                let geo_shape = TypeShape::Primitive(Primitive::Geo);
+                let inferred: Vec<TypeShape> = match kind {
+                    TypeKind::Generic { name, args }
+                        if name == "Array" || name == "Set" || name == "nodeList" =>
+                    {
+                        let elem = args
+                            .first()
+                            .map(|id| read_type_id_shape(arena, *id))
+                            .unwrap_or(TypeShape::Any);
+                        if f.params.len() == 2 {
+                            vec![int_shape, elem]
+                        } else {
+                            continue;
+                        }
+                    }
+                    TypeKind::Generic { name, args } if name == "Map" || name == "nodeIndex" => {
+                        if args.len() >= 2 && f.params.len() == 2 {
+                            vec![
+                                read_type_id_shape(arena, args[0]),
+                                read_type_id_shape(arena, args[1]),
+                            ]
+                        } else {
+                            continue;
+                        }
+                    }
+                    TypeKind::Generic { name, args } if name == "nodeTime" => {
+                        let elem = args
+                            .first()
+                            .map(|id| read_type_id_shape(arena, *id))
+                            .unwrap_or(TypeShape::Any);
+                        if f.params.len() == 2 {
+                            vec![time_shape, elem]
+                        } else {
+                            continue;
+                        }
+                    }
+                    TypeKind::Generic { name, args } if name == "nodeGeo" => {
+                        let elem = args
+                            .first()
+                            .map(|id| read_type_id_shape(arena, *id))
+                            .unwrap_or(TypeShape::Any);
+                        if f.params.len() == 2 {
+                            vec![geo_shape, elem]
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                };
+                for (param, shape) in f.params.iter().zip(inferred) {
+                    if param.ty.is_some() {
+                        // Declared type wins.
+                        continue;
+                    }
+                    entries.push((param.name, shape));
+                }
+            }
+            if !entries.is_empty() {
+                updates.push((uri.clone(), entries));
+            }
+        }
+        for (uri, entries) in updates {
+            let Some(m) = self.modules.get_mut(&uri) else {
+                continue;
+            };
+            // Mint each shape once, then write `def_types` AND every
+            // `Expr::Ident` use that resolves to that binding through
+            // `expr_types` so 3.6's call-arg validation sees the
+            // settled type at boundaries. Member-of / call-of chains
+            // off the rebound binding stay `any` for now (pass 2's
+            // bottom-up evaluation already typed them); closing that
+            // cascade is a follow-up.
+            let mut name_to_ty: HashMap<Idx<greycat_analyzer_hir::types::Ident>, _> =
+                HashMap::new();
+            for (name_idx, shape) in entries {
+                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                m.analysis.def_types.insert(name_idx, ty);
+                name_to_ty.insert(name_idx, ty);
+            }
+            // Ident-use expr_types fixup. Walks every Expr::Ident in
+            // the module and overwrites entries that resolve to a
+            // freshly-rebound for-in iter param.
+            use crate::resolver::Definition;
+            use greycat_analyzer_hir::types::Expr;
+            for (expr_id, expr) in m.hir.exprs.iter() {
+                let Expr::Ident(use_idx) = expr else {
+                    continue;
+                };
+                let Some(def) = m.resolutions.lookup(*use_idx) else {
+                    continue;
+                };
+                let target_name = match def {
+                    Definition::Param(n) | Definition::Local(n) => n,
+                    _ => continue,
+                };
+                let Some(ty) = name_to_ty.get(&target_name).copied() else {
+                    continue;
+                };
+                m.analysis.expr_types.insert(expr_id, ty);
+            }
+        }
+    }
+
     fn infer_cross_module_member_types(&mut self) -> HashSet<String> {
         use crate::analyzer::MemberDef;
         use greycat_analyzer_hir::types::{Expr, Stmt};
@@ -988,6 +1141,9 @@ impl ProjectAnalysis {
         touched.insert(uri.as_str().to_string()); // changed doc itself
         touched.extend(self.infer_cross_module_member_types());
         touched.extend(self.infer_cross_module_call_types());
+        // Pass 3.52 — re-bind for-in iter var types from now-settled
+        // iterable types. Mirrors what `rebuild` does at the same step.
+        self.rebind_for_in_iter_types();
         // Typed lint pass (P16.6). Same scope as `validate_type_relations`
         // — only the modules whose types changed need re-linting.
         self.run_typed_lints(Some(&touched));
@@ -1838,6 +1994,41 @@ enum TypeShape {
         params: Vec<TypeShape>,
     },
     Optional(Box<TypeShape>),
+}
+
+/// Translate an existing `TypeId` in an arena back into a `TypeShape`.
+/// Inverse of `mint_type_shape`. Used by 3.52 to harvest a foreign
+/// iterable's generic args (already in the local arena thanks to 3.4)
+/// without having to track the foreign HIR location.
+fn read_type_id_shape(
+    arena: &greycat_analyzer_types::TypeArena,
+    type_id: greycat_analyzer_types::TypeId,
+) -> TypeShape {
+    let t = arena.get(type_id);
+    let base = match &t.kind {
+        greycat_analyzer_types::TypeKind::Primitive(p) => TypeShape::Primitive(*p),
+        greycat_analyzer_types::TypeKind::Any => TypeShape::Any,
+        greycat_analyzer_types::TypeKind::Null => TypeShape::Null,
+        greycat_analyzer_types::TypeKind::Named { name } => TypeShape::Named {
+            name: name.clone(),
+            params: vec![],
+        },
+        greycat_analyzer_types::TypeKind::Generic { name, args } => TypeShape::Named {
+            name: name.clone(),
+            params: args.iter().map(|a| read_type_id_shape(arena, *a)).collect(),
+        },
+        // Falls through to `Any` for shapes that don't have a faithful
+        // cross-arena `TypeShape` mapping yet (lambdas, unions, anonymous
+        // structs). 3.52's caller drops `_` matches anyway, so this only
+        // matters for *element* types of an iterable, where `any` is the
+        // honest answer.
+        _ => TypeShape::Any,
+    };
+    if t.nullable {
+        TypeShape::Optional(Box::new(base))
+    } else {
+        base
+    }
 }
 
 fn read_type_shape(
