@@ -323,6 +323,7 @@ pub fn analyze_with_index_into(
         narrows: Vec::new(),
         chain_member_ifs: HashSet::new(),
         generics_in_scope: Vec::new(),
+        this_stack: Vec::new(),
     };
     for d in &module.decls {
         cx.visit_decl(*d);
@@ -481,6 +482,14 @@ struct Cx<'a> {
     /// `Vec<HashMap>` so nested fns inside a generic type see both
     /// outer and inner names.
     generics_in_scope: Vec<HashMap<String, GenericOwner>>,
+    /// **P19.11** — `this` typing stack. Pushed on entry to a
+    /// type's method body (in `visit_type_decl`), popped on exit.
+    /// `LiteralKind::This` returns the top of the stack so a
+    /// reference to `this` inside `type Foo<T> { fn m() { this } }`
+    /// types as `Generic { name: "Foo", args: [GenericParam(T)] }`
+    /// — matches what an external `node<Foo<int>>` deref would see.
+    /// Empty outside method bodies (top-level fns / lambdas).
+    this_stack: Vec<TypeId>,
 }
 
 impl<'a> Cx<'a> {
@@ -1176,8 +1185,29 @@ impl<'a> Cx<'a> {
     fn visit_type_decl(&mut self, d: &TypeDecl) {
         // P12.1: type-level generics are visible in attrs + method
         // signatures.
-        let owner = GenericOwner::Type(self.hir.idents[d.name].text.clone());
-        self.push_generic_scope(&d.generics, owner);
+        let type_name = self.hir.idents[d.name].text.clone();
+        let owner = GenericOwner::Type(type_name.clone());
+        self.push_generic_scope(&d.generics, owner.clone());
+        // **P19.11** — build the `this` TypeId. For non-generic
+        // types it's `Named { name }`; for generic types it's
+        // `Generic { name, args: [GenericParam(g0), GenericParam(g1), ...] }`.
+        // Push it on `this_stack` so `LiteralKind::This` inside
+        // method bodies returns the right thing. Done *after* the
+        // generic scope is pushed so generics resolve.
+        let this_ty = if d.generics.is_empty() {
+            self.arena.named(type_name)
+        } else {
+            let args: Vec<TypeId> = d
+                .generics
+                .iter()
+                .map(|g| {
+                    let g_name = self.hir.idents[*g].text.clone();
+                    self.arena.generic_param(g_name, owner.clone())
+                })
+                .collect();
+            self.arena.generic(type_name, args)
+        };
+        self.this_stack.push(this_ty);
         for attr_id in &d.attrs {
             let a = self.hir.type_attrs[*attr_id].clone();
             self.visit_type_attr(&a);
@@ -1187,6 +1217,7 @@ impl<'a> Cx<'a> {
                 self.visit_fn_decl(&fnd);
             }
         }
+        self.this_stack.pop();
         self.pop_generic_scope();
     }
 
@@ -1783,7 +1814,11 @@ impl<'a> Cx<'a> {
                 }
                 LiteralKind::Char => self.primitive(Primitive::Char),
                 LiteralKind::Null => self.null(),
-                LiteralKind::This => self.any(),
+                LiteralKind::This => self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| self.any()),
                 LiteralKind::Duration => self.primitive(Primitive::Duration),
                 LiteralKind::Time | LiteralKind::Iso8601 => self.primitive(Primitive::Time),
             },
@@ -1952,16 +1987,37 @@ impl<'a> Cx<'a> {
             }) => {
                 let recv_ty = self.visit_expr(receiver);
                 let _ = self.visit_expr(index);
-                // P16.7 — element-type inference for offset access is
-                // out of scope here; the result type stays `any` for
-                // now (nullable by virtue of `any()` being nullable).
-                // Even so, fold the null-safe markers in for parity
-                // with member access: `a?[i]` lifts when receiver is
-                // nullable; `a[i]?` lifts unconditionally. Once
-                // element typing lands, `any` will be replaced with
-                // the per-collection element type and these lifts
-                // continue to do the right thing.
-                let base = self.any();
+                // **P19.11** — element-type inference for offset
+                // access. `arr[i]` on `Array<T>` / `Set<T>` /
+                // `nodeList<T>` yields `T`; `m[k]` on `Map<K, V>`
+                // / `nodeIndex<K, V>` yields `V`. The receiver's
+                // optional marker propagates through `pre_optional`
+                // (`a?[i]` lifts the result to nullable when `a`
+                // is nullable); `post_optional` (`a[i]?`) lifts
+                // unconditionally. Strip the optional from the
+                // receiver before pattern-matching so the binding
+                // logic is the same with or without `?`.
+                let underlying = if self.arena.get(recv_ty).nullable {
+                    let mut t = self.arena.get(recv_ty).clone();
+                    t.nullable = false;
+                    self.arena.alloc(t)
+                } else {
+                    recv_ty
+                };
+                let base = match &self.arena.get(underlying).kind {
+                    TypeKind::Generic { name, args }
+                        if (name == "Array" || name == "Set" || name == "nodeList")
+                            && !args.is_empty() =>
+                    {
+                        args[0]
+                    }
+                    TypeKind::Generic { name, args }
+                        if (name == "Map" || name == "nodeIndex") && args.len() >= 2 =>
+                    {
+                        args[1]
+                    }
+                    _ => self.any(),
+                };
                 let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
                 if lift_pre || post_optional {
                     self.arena.nullable(base)
