@@ -22,8 +22,9 @@ use crate::utils::AnyError;
              reachable files are analyzed.")]
 pub struct Lint {
     #[clap(help = "Path to a project.gcl entrypoint (or any single .gcl \
-                file to lint in isolation).")]
-    project: PathBuf,
+                file to lint in isolation). When omitted, looks for \
+                `project.gcl` in the current working directory.")]
+    project: Option<PathBuf>,
     #[clap(
         long,
         help = "CSV per-file timing summary instead of human-readable diagnostics"
@@ -86,8 +87,14 @@ impl Lint {
         // Convenience: when given a directory, look for `project.gcl`
         // at its root and use that as the entrypoint. Matches what
         // `greycat run` does and what the LSP's workspace-folder load
-        // does — the CLI shouldn't be the odd one out.
-        let mut project_filepath = self.project.canonicalize()?;
+        // does — the CLI shouldn't be the odd one out. When omitted
+        // entirely, default to `./project.gcl` in the current working
+        // directory (the most common case from inside a project).
+        let initial = match self.project {
+            Some(p) => p,
+            None => std::env::current_dir()?,
+        };
+        let mut project_filepath = initial.canonicalize()?;
         if project_filepath.is_dir() {
             let candidate = project_filepath.join("project.gcl");
             if candidate.is_file() {
