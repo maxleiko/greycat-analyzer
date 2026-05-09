@@ -458,6 +458,13 @@ pub struct ObjectField {
 pub struct MemberExpr {
     pub receiver: Idx<Expr>,
     pub property: Idx<Ident>,
+    /// `a?.b` / `a?->b` — null-safe access. When `a: T?`, the result
+    /// lifts to `(typeof a.b)?`; when `a: T`, the marker is a no-op.
+    pub pre_optional: bool,
+    /// `a.b?` / `a->b?` — explicit "treat as nullable" suffix on the
+    /// access result. Lifts the result to nullable regardless of the
+    /// declared field type.
+    pub post_optional: bool,
     pub byte_range: Span,
 }
 
@@ -472,6 +479,12 @@ pub struct StaticExpr {
 pub struct OffsetExpr {
     pub receiver: Idx<Expr>,
     pub index: Idx<Expr>,
+    /// `a?[i]` — null-safe index access. When `a: T?`, the result
+    /// lifts to nullable; when `a: T`, the marker is a no-op.
+    pub pre_optional: bool,
+    /// `a[i]?` — explicit "treat as nullable" suffix on the indexer.
+    /// Lifts the result to nullable regardless.
+    pub post_optional: bool,
     pub byte_range: Span,
 }
 

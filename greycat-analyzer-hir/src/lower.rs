@@ -792,9 +792,12 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_ident(prop);
+            let (pre_optional, post_optional) = optional_flags_around(node, prop.id());
             Expr::Member(MemberExpr {
                 receiver,
                 property,
+                pre_optional,
+                post_optional,
                 byte_range: node.byte_range(),
             })
         }
@@ -803,9 +806,12 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_ident(prop);
+            let (pre_optional, post_optional) = optional_flags_around(node, prop.id());
             Expr::Arrow(MemberExpr {
                 receiver,
                 property,
+                pre_optional,
+                post_optional,
                 byte_range: node.byte_range(),
             })
         }
@@ -841,14 +847,41 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             }
         }
         "offset_expr" => {
-            // `recv[index]` — two named children (recv, index).
+            // `recv[index]` — two `_expr` children. The grammar also
+            // emits `optional` tokens (`?`) before / after the indexer
+            // for the null-safe forms `a?[i]` / `a[i]?`. We classify
+            // each `optional` named child by whether it precedes the
+            // first `_expr` (no — it's always between the receiver and
+            // `[`) or follows the index expression.
             let mut cursor = node.walk();
-            let mut iter = node.named_children(&mut cursor);
-            let recv = iter.next().and_then(|n| lower_expr(cx, n))?;
-            let idx = iter.next().and_then(|n| lower_expr(cx, n))?;
+            let mut recv: Option<Idx<Expr>> = None;
+            let mut idx: Option<Idx<Expr>> = None;
+            let mut pre_optional = false;
+            let mut post_optional = false;
+            for c in node.named_children(&mut cursor) {
+                match c.kind() {
+                    "optional" => {
+                        if recv.is_some() && idx.is_some() {
+                            post_optional = true;
+                        } else if recv.is_some() {
+                            // Between receiver and `[` — but the index
+                            // hasn't been seen yet. This is the
+                            // `a?[i]` shape.
+                            pre_optional = true;
+                        }
+                    }
+                    _ if recv.is_none() => recv = lower_expr(cx, c),
+                    _ if idx.is_none() => idx = lower_expr(cx, c),
+                    _ => {}
+                }
+            }
+            let recv = recv?;
+            let idx = idx?;
             Expr::Offset(OffsetExpr {
                 receiver: recv,
                 index: idx,
+                pre_optional,
+                post_optional,
                 byte_range: node.byte_range(),
             })
         }
@@ -1053,6 +1086,32 @@ fn first_named_child_excluding<'tree>(
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|c| c.id() != excluded_id)
+}
+
+/// Walk `node`'s named children for `optional` siblings of the
+/// property at `prop_id`. Returns `(pre_optional, post_optional)`:
+/// `pre` is true when an `optional` token sits before the property
+/// (`a?.b` / `a?->b`); `post` is true when one sits after
+/// (`a.b?` / `a->b?`).
+fn optional_flags_around(node: tree_sitter::Node<'_>, prop_id: usize) -> (bool, bool) {
+    let mut cursor = node.walk();
+    let mut pre = false;
+    let mut post = false;
+    let mut seen_prop = false;
+    for c in node.named_children(&mut cursor) {
+        if c.id() == prop_id {
+            seen_prop = true;
+            continue;
+        }
+        if c.kind() == "optional" {
+            if seen_prop {
+                post = true;
+            } else {
+                pre = true;
+            }
+        }
+    }
+    (pre, post)
 }
 
 /// P15.8 — walk a chained `static_expr` node left-to-right and

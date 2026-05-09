@@ -1359,10 +1359,18 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Member(MemberExpr {
-                receiver, property, ..
+                receiver,
+                property,
+                pre_optional,
+                post_optional,
+                ..
             })
             | Expr::Arrow(MemberExpr {
-                receiver, property, ..
+                receiver,
+                property,
+                pre_optional,
+                post_optional,
+                ..
             }) => {
                 let recv_ty = self.visit_expr(receiver);
                 // P16.5 — `n->field` where `n: node<T>` (or any node-tag
@@ -1392,21 +1400,34 @@ impl<'a> Cx<'a> {
                 // which the project pipeline writes back later (P16.3).
                 // Anonymous-type / primitive cases stay `any` here —
                 // primitives are extended in P16.2.
-                if let Some(member) = self.out.member_uses.get(&property).copied() {
+                let base_ty = if let Some(member) = self.out.member_uses.get(&property).copied() {
                     match member {
                         MemberDef::Attr(attr_id) => {
                             let attr = self.hir.type_attrs[attr_id].clone();
-                            if let Some(ty) = attr.ty {
-                                return self.lower_type_ref(ty);
-                            }
-                            return self.any();
+                            attr.ty
+                                .map(|ty| self.lower_type_ref(ty))
+                                .unwrap_or_else(|| self.any())
                         }
-                        MemberDef::Method(_) => {
-                            return self.out.types.named("function");
-                        }
+                        MemberDef::Method(_) => self.out.types.named("function"),
                     }
+                } else {
+                    self.any()
+                };
+                // P16.7 — null-safe access notations propagate
+                // nullability through the access:
+                //   `a?.b` / `a?->b` — when receiver is `T?`, lift the
+                //                      result to `(typeof a.b)?`. When
+                //                      receiver isn't nullable, the
+                //                      marker is a no-op.
+                //   `a.b?` / `a->b?` — explicit "treat as nullable"
+                //                      suffix: lift unconditionally.
+                let lift_pre = pre_optional && self.out.types.get(recv_ty).nullable;
+                let lift_post = post_optional;
+                if lift_pre || lift_post {
+                    self.out.types.nullable(base_ty)
+                } else {
+                    base_ty
                 }
-                self.any()
             }
             Expr::Static(s) => {
                 // P15.6 — `Type::method` resolution. Lower the receiver
@@ -1442,11 +1463,30 @@ impl<'a> Cx<'a> {
                 self.any()
             }
             Expr::Offset(OffsetExpr {
-                receiver, index, ..
+                receiver,
+                index,
+                pre_optional,
+                post_optional,
+                ..
             }) => {
-                let _ = self.visit_expr(receiver);
+                let recv_ty = self.visit_expr(receiver);
                 let _ = self.visit_expr(index);
-                self.any()
+                // P16.7 — element-type inference for offset access is
+                // out of scope here; the result type stays `any` for
+                // now (nullable by virtue of `any()` being nullable).
+                // Even so, fold the null-safe markers in for parity
+                // with member access: `a?[i]` lifts when receiver is
+                // nullable; `a[i]?` lifts unconditionally. Once
+                // element typing lands, `any` will be replaced with
+                // the per-collection element type and these lifts
+                // continue to do the right thing.
+                let base = self.any();
+                let lift_pre = pre_optional && self.out.types.get(recv_ty).nullable;
+                if lift_pre || post_optional {
+                    self.out.types.nullable(base)
+                } else {
+                    base
+                }
             }
             Expr::Call(CallExpr { callee, args, .. }) => {
                 let callee_ty = self.visit_expr(callee);
@@ -1558,10 +1598,31 @@ impl<'a> Cx<'a> {
             }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => int,
             BinOp::Coalesce => {
-                // T? ?? T -> T (drop nullable)
-                let mut ty = self.out.types.get(rt).clone();
-                ty.nullable = false;
-                self.out.types.alloc(ty)
+                // P16.7 — `a ?? b`: returns `a` when not-null, else
+                // `b`. Type: `(typeof a stripped of null) | (typeof b
+                // stripped of null)`, then re-wrapped nullable when
+                // `b` itself is nullable (because the fallback can
+                // still be null in that case). Same-shape collapse
+                // keeps `T? ?? T → T` clean for the assignability
+                // checker.
+                let lt_stripped = self.strip_nullable(lt);
+                let rt_nullable = self.out.types.get(rt).nullable;
+                let rt_stripped = self.strip_nullable(rt);
+                let merged = if lt_stripped == rt_stripped {
+                    lt_stripped
+                } else {
+                    self.out.types.alloc(Type {
+                        kind: TypeKind::Union {
+                            alts: vec![lt_stripped, rt_stripped],
+                        },
+                        nullable: false,
+                    })
+                };
+                if rt_nullable {
+                    self.out.types.nullable(merged)
+                } else {
+                    merged
+                }
             }
             BinOp::Other(_) => self.any(),
         }
@@ -2108,5 +2169,126 @@ fn f(p: Point): int { return p.bogus; }
             .map(|(idx, _)| idx)
             .expect("bogus ident exists");
         assert!(analysis.member_lookup(bogus).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // P16.7 — null-safe access notations + `??` widening
+    // -------------------------------------------------------------------
+
+    /// Resolve the inferred type for the `init` of `var <name> = …`.
+    fn local_init_ty(src: &str, name: &str) -> Option<String> {
+        let tree = parse(src);
+        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let res = resolve(&hir);
+        let analysis = analyze(&hir, &res);
+        for (stmt_id, stmt) in hir.stmts.iter() {
+            if let Stmt::Var(v) = stmt
+                && hir.idents[v.name].text == name
+                && let Some(init) = v.init
+            {
+                let _ = stmt_id;
+                let ty = analysis.expr_types.get(&init).copied()?;
+                return Some(greycat_analyzer_types::display(&analysis.types, ty));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn p16_7_question_dot_on_nullable_lifts_result() {
+        // `f?.name` where `f: Foo?` — result is `String?`. The receiver
+        // is nullable so the null-safe access propagates.
+        let src = r#"
+type Foo { name: String; }
+fn caller(f: Foo?) {
+    var s = f?.name;
+}
+"#;
+        assert_eq!(local_init_ty(src, "s").as_deref(), Some("String?"));
+    }
+
+    #[test]
+    fn p16_7_question_dot_on_non_nullable_is_noop() {
+        // `f?.name` where `f: Foo` (non-nullable) — the marker is
+        // syntactic sugar; result stays `String`.
+        let src = r#"
+type Foo { name: String; }
+fn caller(f: Foo) {
+    var s = f?.name;
+}
+"#;
+        assert_eq!(local_init_ty(src, "s").as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn p16_7_post_question_lifts_unconditionally() {
+        // `f.name?` — explicit "treat as nullable" suffix. Even though
+        // `name: String` is non-null, the suffix lifts the result.
+        let src = r#"
+type Foo { name: String; }
+fn caller(f: Foo) {
+    var s = f.name?;
+}
+"#;
+        assert_eq!(local_init_ty(src, "s").as_deref(), Some("String?"));
+    }
+
+    #[test]
+    fn p16_7_question_arrow_on_nullable_node_lifts() {
+        // `n?->name` for `n: node<Foo>?` — null-safe access through
+        // the deref. Result lifts to `String?` because the receiver
+        // is nullable.
+        let src = r#"
+type Foo { name: String; }
+fn caller(n: node<Foo>?) {
+    var s = n?->name;
+}
+"#;
+        assert_eq!(local_init_ty(src, "s").as_deref(), Some("String?"));
+    }
+
+    #[test]
+    fn p16_7_coalesce_same_shape_collapses() {
+        // `T? ?? T → T`. `int? ?? int` collapses to `int` (no union).
+        let src = r#"
+fn caller(x: int?) {
+    var y = x ?? 7;
+}
+"#;
+        assert_eq!(local_init_ty(src, "y").as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn p16_7_coalesce_distinct_shapes_widen_to_union() {
+        // `T? ?? U → T | U`. Different shapes on each side widen to
+        // a 2-alt union (formerly the analyzer dropped the left and
+        // returned `U` only — false-precision in the assignability
+        // checker).
+        let src = r#"
+type Foo {}
+type Bar {}
+fn caller(f: Foo?, b: Bar) {
+    var x = f ?? b;
+}
+"#;
+        let display = local_init_ty(src, "x").expect("init type");
+        // Order is left-then-right; `display` joins union alts with
+        // ` | `.
+        assert_eq!(display, "Foo | Bar");
+    }
+
+    #[test]
+    fn p16_7_coalesce_with_nullable_right_stays_nullable() {
+        // `T? ?? U?` — fallback can still be null, so the whole
+        // expression stays nullable.
+        let src = r#"
+type Foo {}
+type Bar {}
+fn caller(f: Foo?, b: Bar?) {
+    var x = f ?? b;
+}
+"#;
+        let display = local_init_ty(src, "x").expect("init type");
+        assert_eq!(display, "Foo | Bar?");
     }
 }
