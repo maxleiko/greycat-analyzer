@@ -8,6 +8,86 @@
       const dark = matchMedia("(prefers-color-scheme: dark)").matches;
       document.documentElement.classList.add(dark ? "wa-dark" : "wa-light");
     </script>
+    <!--
+      Critical-path splash CSS. Inlined so the splash lays out correctly
+      on the very first frame — `style.css` is loaded by main.ts (via
+      Vite's transformed module graph) and isn't ready before the body
+      paints, which left the SVG rendering at its default 300×150
+      intrinsic size for a noticeable beat. These rules duplicate the
+      splash block in `style.css`; keep them in sync.
+    -->
+    <style>
+      .splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: grid;
+        place-items: center;
+        align-content: center;
+        gap: 1rem;
+        background: #1e1e1e;
+        color: #ddd;
+        transition: opacity 200ms ease-out;
+        visibility: visible !important;
+      }
+      :root.wa-light .splash {
+        background: #f6f6f6;
+        color: #555;
+      }
+      .splash-hide {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .splash-logo {
+        width: 64px;
+        height: 64px;
+      }
+      .splash-label {
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          sans-serif;
+        font-size: 0.85rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .splash-spinner {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: 2px solid #444;
+        border-top-color: #6cb6ff;
+        animation: splash-spin 0.85s linear infinite;
+      }
+      :root.wa-light .splash-spinner {
+        border-color: #ccc;
+        border-top-color: #1f6feb;
+      }
+      @keyframes splash-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .splash-spinner {
+          animation: none;
+        }
+        .splash-logo {
+          animation: splash-pulse 1.6s ease-in-out infinite;
+        }
+        @keyframes splash-pulse {
+          0%,
+          100% {
+            opacity: 0.6;
+          }
+          50% {
+            opacity: 1;
+          }
+        }
+      }
+    </style>
   </head>
   <body class="wa-cloak">
     <!--
@@ -25,6 +105,8 @@
         class="splash-logo"
         xmlns="http://www.w3.org/2000/svg"
         viewBox="0 0 16.05836 16.99748"
+        width="64"
+        height="64"
         aria-hidden="true"
       >
         <path
