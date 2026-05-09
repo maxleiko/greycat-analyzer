@@ -633,32 +633,37 @@ impl<'a> Cx<'a> {
                     return;
                 }
             }
-            return;
+            // **P19.14** — fall through to the project index so an
+            // inherited attr / method (declared on a parent type
+            // that may live in another module) still resolves. The
+            // foreign-binding form is correct even when the parent
+            // is in *this* module — `foreign_member_uses` is read
+            // by the same downstream codepaths as `member_uses`.
         }
         // P21 — type lives in another module. Consult the cross-module
         // structure index built in S2-S6, write directly to
         // `foreign_member_uses`. Replaces the old `deferred_member_uses`
         // → pass-3 drain (which is now deleted).
-        if let Some(members) = self.index.type_members_for(&name) {
-            if let Some(attr_id) = members.attr_id(&self.index.symbols, prop_text) {
-                self.out.foreign_member_uses.insert(
-                    property,
-                    ForeignMember {
-                        uri: members.home_uri.clone(),
-                        member: MemberDef::Attr(attr_id),
-                    },
-                );
-                return;
-            }
-            if let Some(method_id) = members.method_id(&self.index.symbols, prop_text) {
-                self.out.foreign_member_uses.insert(
-                    property,
-                    ForeignMember {
-                        uri: members.home_uri.clone(),
-                        member: MemberDef::Method(method_id),
-                    },
-                );
-            }
+        // **P19.14** — chain-walking lookup so attrs / methods
+        // declared on a parent type resolve through a `Sub` receiver.
+        if let Some((uri, attr_id)) = self.index.type_attr_id_chain(&name, prop_text) {
+            self.out.foreign_member_uses.insert(
+                property,
+                ForeignMember {
+                    uri,
+                    member: MemberDef::Attr(attr_id),
+                },
+            );
+            return;
+        }
+        if let Some((uri, method_id)) = self.index.type_method_id_chain(&name, prop_text) {
+            self.out.foreign_member_uses.insert(
+                property,
+                ForeignMember {
+                    uri,
+                    member: MemberDef::Method(method_id),
+                },
+            );
         }
     }
 
@@ -755,8 +760,8 @@ impl<'a> Cx<'a> {
             3 => {
                 let type_name = self.ident_text(chain[1]);
                 let method_name = self.ident_text(chain[2]);
-                let members = self.index.type_members_for(type_name)?;
-                members.method_return(&self.index.symbols, method_name)
+                // P19.14 — chain-walking lookup.
+                self.index.type_method_return_chain(type_name, method_name)
             }
             _ => None,
         }
@@ -786,9 +791,13 @@ impl<'a> Cx<'a> {
             TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
             _ => return None,
         };
-        let members = self.index.type_members_for(&type_name)?;
+        // **P19.14** — chain-walking lookup so methods declared on
+        // a parent type resolve through a `Sub` receiver.
         let property_text = self.ident_text(property);
-        let ret_ty = members.method_return(&self.index.symbols, property_text)?;
+        let ret_ty = self
+            .index
+            .type_method_return_chain(&type_name, property_text)?;
+        let members = self.index.type_members_for(&type_name)?;
         let mut subst: HashMap<String, TypeId> = HashMap::new();
         for (i, gp_sym) in members.generics.iter().enumerate() {
             if let Some(arg) = instantiation.get(i)
@@ -1002,10 +1011,16 @@ impl<'a> Cx<'a> {
         };
         // Build the substitution map *before* mutably borrowing the
         // arena (substitute) — `members` borrows `self.index`.
+        // **P19.14** — chain-walking lookup so attrs declared on a
+        // parent type (`type Sub extends Super { ... }`) resolve
+        // when accessed through a `Sub` receiver.
         let property_text = self.hir.idents[property].text.as_str();
         let (attr_ty, subst) = {
+            let attr_ty = self.index.type_attr_ty_chain(&type_name, property_text)?;
+            // Generic substitution is driven by the *receiver type*'s
+            // own generic params, not the parent's — `node<Foo<int>>`
+            // accessing a `Foo`-declared attr substitutes `T → int`.
             let members = self.index.type_members_for(&type_name)?;
-            let attr_ty = members.attr_ty(&self.index.symbols, property_text)?;
             let mut subst: HashMap<String, TypeId> = HashMap::new();
             for (i, gp_sym) in members.generics.iter().enumerate() {
                 if let Some(arg) = instantiation.get(i)
@@ -1458,14 +1473,29 @@ impl<'a> Cx<'a> {
                 self.expect_bool(condition, "do-while condition");
             }
             Stmt::For(ForStmt {
+                init_name,
+                init_ty,
                 init_value,
                 condition,
                 increment,
                 body,
                 ..
             }) => {
-                if let Some(v) = init_value {
-                    let _ = self.visit_expr(v);
+                // **P19.14** — bind the C-style for loop's
+                // `init_name` to its declared / inferred type so
+                // uses of the loop var inside `condition` /
+                // `increment` / `body` get a real type instead of
+                // falling back to `any`. Order matters: visit the
+                // init value FIRST (so its type is known), bind
+                // `init_name` to declared-or-inferred, *then*
+                // visit the rest.
+                let init_value_ty = init_value.map(|v| self.visit_expr(v));
+                if let Some(name) = init_name {
+                    let bound_ty = init_ty
+                        .map(|t| self.lower_type_ref(t))
+                        .or(init_value_ty)
+                        .unwrap_or_else(|| self.any());
+                    self.out.def_types.insert(name, bound_ty);
                 }
                 if let Some(c) = condition {
                     self.expect_bool(c, "for condition");
@@ -2165,6 +2195,15 @@ impl<'a> Cx<'a> {
                 match op {
                     UnaryOp::Not => self.primitive(Primitive::Bool),
                     UnaryOp::Neg | UnaryOp::BitNot => inner,
+                    // **P19.14** — `*n` deref. For
+                    // `Generic { name: "node", args: [T] }` (and
+                    // similar tag shapes) returns `T`; otherwise
+                    // returns `inner` so non-node uses still get
+                    // a usable type. Strips a nullable on the
+                    // receiver so `*n?` returns `T?` (handled by
+                    // the `nullable` flag on the inner TypeId
+                    // when lifted).
+                    UnaryOp::Deref => self.arrow_deref_receiver(inner).unwrap_or(inner),
                     UnaryOp::NonNullAssert => {
                         // `x!!` strips nullable from the result and (P6.4)
                         // narrows the operand binding for the rest of the
@@ -2206,7 +2245,30 @@ impl<'a> Cx<'a> {
                 // casts as a diagnostic; the resulting expression
                 // type is still `to_ty` so downstream inference
                 // doesn't cascade.
-                if !is_castable(self.arena, from_ty, to_ty) {
+                // **P19.14** — inheritance-aware cast: allow up- /
+                // down-cast within a supertype chain (e.g.
+                // `pvEntity as PVInstallation` where `PVInstallation
+                // extends PVEntity`). Both directions are runtime-
+                // permitted (downcast may fail at runtime, upcast
+                // is widening). Strip nullability so `T?` casts the
+                // same way as `T`.
+                let inheritance_ok = {
+                    let from_kind = &self.arena.get(from_ty).kind;
+                    let to_kind = &self.arena.get(to_ty).kind;
+                    let extract_name = |k: &TypeKind| match k {
+                        TypeKind::Named { name } => Some(name.clone()),
+                        TypeKind::Generic { name, .. } => Some(name.clone()),
+                        _ => None,
+                    };
+                    match (extract_name(from_kind), extract_name(to_kind)) {
+                        (Some(fn_), Some(tn)) => {
+                            self.index.is_subtype_of(&fn_, &tn)
+                                || self.index.is_subtype_of(&tn, &fn_)
+                        }
+                        _ => false,
+                    }
+                };
+                if !inheritance_ok && !is_castable(self.arena, from_ty, to_ty) {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",
@@ -2236,8 +2298,15 @@ impl<'a> Cx<'a> {
                 // overloads on String — the other arithmetic ops
                 // stay numeric.
                 let string_t = self.primitive(Primitive::String);
+                let time_t = self.primitive(Primitive::Time);
+                let dur_t = self.primitive(Primitive::Duration);
                 if lt == string_t || rt == string_t {
                     string_t
+                } else if (lt == time_t && rt == dur_t) || (lt == dur_t && rt == time_t) {
+                    // **P19.14** — time arithmetic.
+                    time_t
+                } else if lt == dur_t && rt == dur_t {
+                    dur_t
                 } else if lt == float || rt == float {
                     float
                 } else if lt == int && rt == int {
@@ -2246,7 +2315,42 @@ impl<'a> Cx<'a> {
                     self.any()
                 }
             }
-            BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            BinOp::Sub => {
+                // **P19.14** — `time - time → duration`,
+                // `time - duration → time`,
+                // `duration - duration → duration`.
+                let time_t = self.primitive(Primitive::Time);
+                let dur_t = self.primitive(Primitive::Duration);
+                if lt == time_t && rt == time_t {
+                    dur_t
+                } else if lt == time_t && rt == dur_t {
+                    time_t
+                } else if lt == dur_t && rt == dur_t {
+                    dur_t
+                } else if lt == float || rt == float {
+                    float
+                } else if lt == int && rt == int {
+                    int
+                } else {
+                    self.any()
+                }
+            }
+            BinOp::Mul => {
+                // **P19.14** — `duration * int / float → duration`.
+                let dur_t = self.primitive(Primitive::Duration);
+                if (lt == dur_t && (rt == int || rt == float))
+                    || ((lt == int || lt == float) && rt == dur_t)
+                {
+                    dur_t
+                } else if lt == float || rt == float {
+                    float
+                } else if lt == int && rt == int {
+                    int
+                } else {
+                    self.any()
+                }
+            }
+            BinOp::Div | BinOp::Mod => {
                 if lt == float || rt == float {
                     float
                 } else if lt == int && rt == int {

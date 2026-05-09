@@ -499,7 +499,7 @@ fn expr_kind_and_range(hir: &Hir, expr: &Expr) -> Option<(&'static str, std::ops
         Expr::Binary(_) => "BinOpExpr",
         Expr::Unary(u) => match u.op {
             UnaryOp::NonNullAssert => "NonNullAssertExpr",
-            UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot => "PrefixExpr",
+            UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot | UnaryOp::Deref => "PrefixExpr",
         },
         Expr::Paren(..) => return None,
         Expr::Lambda(_) => "LambdaExpr",

@@ -217,6 +217,14 @@ pub struct TypeMembers {
     /// a runtime `field` handle). Empty for types with no static
     /// attrs.
     pub static_attrs: HashSet<Symbol>,
+    /// **P19.14** — direct supertype name (the `Super` in
+    /// `type Sub extends Super`). Drives inheritance: member
+    /// lookup walks `supertype` chains to find inherited
+    /// attrs / methods, and assignability recognises
+    /// `Named(Sub)` → `Named(Super)` (and `node<Sub>` →
+    /// `node<Super>`) when `Sub` is a descendant of `Super`.
+    /// `None` for types without an explicit `extends` clause.
+    pub supertype: Option<Symbol>,
 }
 
 impl TypeMembers {
@@ -340,6 +348,108 @@ impl ProjectIndex {
             .and_then(|s| self.var_types.get(&s))
             .copied()
     }
+
+    /// **P19.14** — walk the supertype chain starting at `type_name`,
+    /// returning the first `TypeMembers` entry that contains the
+    /// member matched by `pred`. Used to find inherited attrs /
+    /// methods (`pvInstallation->timezone` resolves through
+    /// `PVInstallation extends PVEntity`'s `timezone: TimeZone`).
+    /// Bounded at 32 hops to defend against accidental cycles in
+    /// in-progress source.
+    fn walk_member_chain<P>(&self, type_name: &str, mut pred: P) -> Option<&TypeMembers>
+    where
+        P: FnMut(&TypeMembers) -> bool,
+    {
+        let mut cur = self.symbols.lookup(type_name)?;
+        for _ in 0..32 {
+            let members = self.type_members.get(&cur)?;
+            if pred(members) {
+                return Some(members);
+            }
+            cur = members.supertype?;
+        }
+        None
+    }
+
+    /// **P19.14** — `&str` lookup of an attr's HIR index, walking
+    /// the supertype chain. Returns the `(home_uri, attr_id)` of
+    /// the type that owns the attr (which may be the type itself
+    /// or a parent), so cross-module hover / goto-def points at
+    /// the right module.
+    pub fn type_attr_id_chain(
+        &self,
+        type_name: &str,
+        attr_name: &str,
+    ) -> Option<(Uri, Idx<TypeAttr>)> {
+        let attr_sym = self.symbols.lookup(attr_name)?;
+        let members = self.walk_member_chain(type_name, |m| m.attrs.contains_key(&attr_sym))?;
+        members
+            .attrs
+            .get(&attr_sym)
+            .map(|id| (members.home_uri.clone(), *id))
+    }
+
+    /// **P19.14** — `&str` lookup of a method's HIR index, walking
+    /// the supertype chain.
+    pub fn type_method_id_chain(
+        &self,
+        type_name: &str,
+        method_name: &str,
+    ) -> Option<(Uri, Idx<Decl>)> {
+        let method_sym = self.symbols.lookup(method_name)?;
+        let members = self.walk_member_chain(type_name, |m| m.methods.contains_key(&method_sym))?;
+        members
+            .methods
+            .get(&method_sym)
+            .map(|id| (members.home_uri.clone(), *id))
+    }
+
+    /// **P19.14** — pre-lowered attr type, walking the supertype
+    /// chain. The `TypeId` lives in the project arena and may
+    /// reference `GenericParam(T, owner=parent_type)` if the attr
+    /// is declared on a generic parent.
+    pub fn type_attr_ty_chain(&self, type_name: &str, attr_name: &str) -> Option<TypeId> {
+        let attr_sym = self.symbols.lookup(attr_name)?;
+        let members =
+            self.walk_member_chain(type_name, |m| m.attr_types.contains_key(&attr_sym))?;
+        members.attr_types.get(&attr_sym).copied()
+    }
+
+    /// **P19.14** — pre-lowered method return type, walking the
+    /// supertype chain.
+    pub fn type_method_return_chain(&self, type_name: &str, method_name: &str) -> Option<TypeId> {
+        let method_sym = self.symbols.lookup(method_name)?;
+        let members =
+            self.walk_member_chain(type_name, |m| m.method_returns.contains_key(&method_sym))?;
+        members.method_returns.get(&method_sym).copied()
+    }
+
+    /// **P19.14** — `true` iff `sub` is `sup` or any of its
+    /// transitive supertypes is `sup`. Bounded at 32 hops.
+    pub fn is_subtype_of(&self, sub: &str, sup: &str) -> bool {
+        if sub == sup {
+            return true;
+        }
+        let Some(target) = self.symbols.lookup(sup) else {
+            return false;
+        };
+        let Some(mut cur) = self.symbols.lookup(sub) else {
+            return false;
+        };
+        for _ in 0..32 {
+            let Some(members) = self.type_members.get(&cur) else {
+                return false;
+            };
+            let Some(parent) = members.supertype else {
+                return false;
+            };
+            if parent == target {
+                return true;
+            }
+            cur = parent;
+        }
+        false
+    }
     pub fn native_for(&self, name: &str) -> Option<&NativeSignature> {
         self.symbols
             .lookup(name)
@@ -413,6 +523,38 @@ impl ProjectIndex {
                             .iter()
                             .map(|g| self.symbols.intern(hir.idents[*g].text.as_str()))
                             .collect();
+                        // **P19.14** — capture the direct supertype
+                        // name (the `Super` in `type Sub extends
+                        // Super`). Resolved as a Symbol now (without
+                        // looking up the supertype's TypeMembers,
+                        // which may not be ingested yet — order is
+                        // module-dependent). Lookup walks the chain
+                        // lazily on access.
+                        let supertype = td.supertype.and_then(|tr| {
+                            let parent_text = hir.idents[hir.type_refs[tr].name].text.as_str();
+                            // Skip the trivial primitives that can
+                            // never be a user type's supertype —
+                            // they'd never resolve to a TypeMembers
+                            // entry anyway and the noise pollutes
+                            // the symbol table only marginally.
+                            if matches!(
+                                parent_text,
+                                "bool"
+                                    | "int"
+                                    | "float"
+                                    | "char"
+                                    | "String"
+                                    | "time"
+                                    | "duration"
+                                    | "geo"
+                                    | "any"
+                                    | "null"
+                            ) {
+                                None
+                            } else {
+                                Some(self.symbols.intern(parent_text))
+                            }
+                        });
                         let mut m = TypeMembers {
                             home_uri: uri.clone(),
                             attrs: HashMap::new(),
@@ -425,6 +567,7 @@ impl ProjectIndex {
                             attr_types: HashMap::new(),
                             method_returns: HashMap::new(),
                             static_attrs: HashSet::new(),
+                            supertype,
                         };
                         for attr_id in &td.attrs {
                             let attr = &hir.type_attrs[*attr_id];

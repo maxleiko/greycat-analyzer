@@ -1237,6 +1237,7 @@ fn unary_op_for(text: &str) -> UnaryOp {
         "!" => UnaryOp::Not,
         "~" => UnaryOp::BitNot,
         "!!" => UnaryOp::NonNullAssert,
+        "*" => UnaryOp::Deref,
         _ => UnaryOp::Not,
     }
 }

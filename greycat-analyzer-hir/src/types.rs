@@ -541,7 +541,13 @@ pub enum UnaryOp {
     Neg,
     Not,
     BitNot,
-    NonNullAssert, // !!
+    /// `!!x` — non-null assertion (P6.4 narrowing).
+    NonNullAssert,
+    /// `*n` — node deref. Returns the inner `T` of a
+    /// `node<T>` / `nodeTime<T>` / similar tag-shaped receiver.
+    /// Equivalent to `n.resolve()` for typing purposes but keeps
+    /// the receiver non-null (the dot form returns `T?`).
+    Deref,
 }
 
 #[derive(Debug, Clone)]

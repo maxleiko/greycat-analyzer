@@ -719,6 +719,11 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     if matches!(to_t.kind, TypeKind::Any) && !from_t.nullable {
         return true;
     }
+    // **P19.14** — casting *to* a generic-param target also passes;
+    // runtime checks at instantiation time.
+    if matches!(to_t.kind, TypeKind::GenericParam { .. }) {
+        return true;
+    }
 
     // Union: cast iff any alt casts. Source nullability is otherwise
     // ignored — the TS reference's `from = from.nn()` strip is purely
@@ -734,6 +739,10 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     let to_head = generic_or_named_name(to_t);
     match &from_t.kind {
         TypeKind::Any => true,
+        // **P19.14** — `T as Foo` (where `T` is a generic param)
+        // is allowed: the runtime decides at instantiation time.
+        // Same for the symmetric `Foo as T` direction.
+        TypeKind::GenericParam { .. } => true,
         TypeKind::Primitive(Primitive::Int) => {
             matches!(
                 to_head.as_deref(),
