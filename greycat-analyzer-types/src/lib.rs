@@ -373,6 +373,13 @@ impl TypeRegistry {
     pub fn lookup(&self, name: &str) -> Option<TypeId> {
         self.named.get(name).copied()
     }
+
+    /// **P19.6** — iterate every registered name. Used by the
+    /// signature-cache invalidation path to fingerprint the
+    /// project-wide name set.
+    pub fn iter_names(&self) -> impl Iterator<Item = &str> {
+        self.named.keys().map(|s| s.as_str())
+    }
 }
 
 // =============================================================================

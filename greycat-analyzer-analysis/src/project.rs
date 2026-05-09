@@ -13,6 +13,7 @@
 //! gives that work the cache-shaped seam to plug into.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use greycat_analyzer_core::SourceManager;
@@ -24,7 +25,7 @@ use greycat_analyzer_hir::{Hir, lower_module};
 use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
 use crate::lint::{LintDiagnostic, lint_arrow_on_non_deref, run_lints};
 use crate::resolver::{Resolutions, resolve_with_index};
-use crate::stdlib::ProjectIndex;
+use crate::stdlib::{FnSignature, ProjectIndex};
 
 /// Per-document outputs of the analyzer pipeline. Held by
 /// [`ProjectAnalysis`] so LSP / CLI consumers can pull diagnostics
@@ -90,6 +91,39 @@ pub struct ProjectAnalysis {
     /// no-op.
     pub arena: greycat_analyzer_types::TypeArena,
     modules: HashMap<Uri, ModuleAnalysis>,
+    /// P19.6 — per-module signature-stage cache. Records what each
+    /// module contributed to the project signature index
+    /// (`attr_types`, `method_returns`, `fn_signatures`, `enum_types`)
+    /// during the last [`lower_signatures_into`] call, plus the hash
+    /// of the bytes that produced it. The arena is append-only across
+    /// `invalidate` (only `reset_state` clears it), so cached
+    /// `TypeId`s remain valid as long as the cache is dropped on
+    /// reset. The stored `name_set_hash` reflects the project-wide
+    /// name set used during lowering — when a module's
+    /// `lower_type_ref_project` outcome depends on which names exist
+    /// in `index`, both hashes must match the new state to reuse the
+    /// cached contributions.
+    sig_cache: HashMap<Uri, ModuleSigCache>,
+}
+
+/// P19.6 — what one module contributed to the project signature index.
+#[derive(Debug, Clone, Default)]
+struct ModuleSigCache {
+    /// Hash of every byte the lowering pass reads out of this module's
+    /// HIR (decl names, generics, attr / method / fn / enum
+    /// signatures + every TypeRef structure they reach). Body
+    /// statements / expressions are intentionally excluded.
+    sig_hash: u64,
+    /// Hash of the project-wide name set captured during the lowering
+    /// (the set of names that `index.has_name` would return `true`
+    /// for). Cached contributions are only reusable when this matches
+    /// the post-ingest project state — otherwise a previously-`any()`
+    /// reference to a now-known type would silently stay `any()`.
+    name_set_hash: u64,
+    attrs: Vec<(String, String, greycat_analyzer_types::TypeId)>,
+    methods: Vec<(String, String, greycat_analyzer_types::TypeId)>,
+    fns: Vec<(String, FnSignature)>,
+    enums: Vec<(String, greycat_analyzer_types::TypeId)>,
 }
 
 impl ProjectAnalysis {
@@ -100,6 +134,7 @@ impl ProjectAnalysis {
             index: ProjectIndex::new(),
             arena,
             modules: HashMap::new(),
+            sig_cache: HashMap::new(),
         }
     }
 
@@ -209,6 +244,10 @@ impl ProjectAnalysis {
         self.modules.clear();
         self.arena = greycat_analyzer_types::TypeArena::new();
         seed_builtins(&mut self.arena);
+        // P19.6 — cached `TypeId`s reference the old arena, which
+        // we just replaced. Drop the cache so the next
+        // `lower_signatures_into` rebuilds against the fresh arena.
+        self.sig_cache.clear();
     }
 
     /// **Stage S1** — parse + lower every module to HIR, ingest into
@@ -247,8 +286,134 @@ impl ProjectAnalysis {
     /// being walked resolve to `GenericParam(T, owner=Type(name))`.
     fn stage_lower_signatures(&mut self, lowered: &[(Uri, Hir, String, Duration)]) {
         let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _)| (u, h)).collect();
-        lower_signatures_into(&mut self.arena, &mut self.index, &pairs);
+        lower_signatures_into(
+            &mut self.arena,
+            &mut self.index,
+            &pairs,
+            &mut self.sig_cache,
+        );
     }
+}
+
+/// **P19.6** — fingerprint of the project-wide name set used by
+/// [`lower_type_ref_project`]. `lower_type_ref_project` checks
+/// `index.has_name(...)` for every non-primitive, non-generic-param
+/// TypeRef name; the answer flips between `Named(name)` and `any()`.
+/// We hash the names that *exist* (sorted, so the answer is order-
+/// independent) so cached contributions can be reused only when the
+/// flip outcome is identical to last time.
+fn project_name_set_hash(index: &ProjectIndex) -> u64 {
+    use std::collections::BTreeSet;
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for n in index.registry.iter_names() {
+        names.insert(n);
+    }
+    for n in index.natives.signatures.keys() {
+        names.insert(n.as_str());
+    }
+    for n in &index.values {
+        names.insert(n.as_str());
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for n in &names {
+        n.hash(&mut hasher);
+        // Field separator — defends against
+        // `["ab", "c"]` vs `["a", "bc"]` colliding.
+        0u8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// **P19.6** — fingerprint of every byte
+/// [`lower_module_signatures_walk`] would read out of `hir`. Walks
+/// each top-level type / fn / enum decl name, generic ident text,
+/// every reachable [`TypeRef`] (recursively), and the optional
+/// marker on each ref. Body statements / expressions are skipped —
+/// they don't contribute to the project signature index.
+fn module_signature_hash(hir: &Hir) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let Some(module) = hir.module.as_ref() else {
+        0u8.hash(&mut hasher);
+        return hasher.finish();
+    };
+    for d_id in &module.decls {
+        match &hir.decls[*d_id] {
+            Decl::Type(td) => {
+                1u8.hash(&mut hasher);
+                hir.idents[td.name].text.as_str().hash(&mut hasher);
+                for g in &td.generics {
+                    hir.idents[*g].text.as_str().hash(&mut hasher);
+                }
+                0u8.hash(&mut hasher);
+                for attr_id in &td.attrs {
+                    let attr = &hir.type_attrs[*attr_id];
+                    hir.idents[attr.name].text.as_str().hash(&mut hasher);
+                    if let Some(tr) = attr.ty {
+                        hash_type_ref(&mut hasher, hir, tr);
+                    } else {
+                        0u8.hash(&mut hasher);
+                    }
+                }
+                0u8.hash(&mut hasher);
+                for method_id in &td.methods {
+                    let Decl::Fn(fnd) = &hir.decls[*method_id] else {
+                        continue;
+                    };
+                    hir.idents[fnd.name].text.as_str().hash(&mut hasher);
+                    for g in &fnd.generics {
+                        hir.idents[*g].text.as_str().hash(&mut hasher);
+                    }
+                    0u8.hash(&mut hasher);
+                    if let Some(ret) = fnd.return_type {
+                        hash_type_ref(&mut hasher, hir, ret);
+                    } else {
+                        0u8.hash(&mut hasher);
+                    }
+                }
+                0u8.hash(&mut hasher);
+            }
+            Decl::Enum(ed) => {
+                2u8.hash(&mut hasher);
+                hir.idents[ed.name].text.as_str().hash(&mut hasher);
+                for f in &ed.fields {
+                    hir.idents[hir.enum_fields[*f].name]
+                        .text
+                        .as_str()
+                        .hash(&mut hasher);
+                }
+                0u8.hash(&mut hasher);
+            }
+            Decl::Fn(fnd) => {
+                3u8.hash(&mut hasher);
+                hir.idents[fnd.name].text.as_str().hash(&mut hasher);
+                for g in &fnd.generics {
+                    hir.idents[*g].text.as_str().hash(&mut hasher);
+                }
+                0u8.hash(&mut hasher);
+                if let Some(ret) = fnd.return_type {
+                    hash_type_ref(&mut hasher, hir, ret);
+                } else {
+                    0u8.hash(&mut hasher);
+                }
+            }
+            _ => {}
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_type_ref(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    hir: &Hir,
+    tr: Idx<greycat_analyzer_hir::types::TypeRef>,
+) {
+    let r = &hir.type_refs[tr];
+    hir.idents[r.name].text.as_str().hash(hasher);
+    r.optional.hash(hasher);
+    for p in &r.params {
+        hash_type_ref(hasher, hir, *p);
+    }
+    0u8.hash(hasher);
 }
 
 /// **P24** — free-function variant of [`ProjectAnalysis::stage_lower_signatures`]
@@ -256,158 +421,175 @@ impl ProjectAnalysis {
 /// `invalidate` path build the `(Uri, &Hir)` slice from references
 /// into `self.modules` without colliding with the `&mut self` recv
 /// the method form would require.
+///
+/// **P19.6** — when `cache` already has an entry for a module whose
+/// `(sig_hash, name_set_hash)` pair matches the current state, the
+/// cached contributions are reapplied verbatim instead of re-walking
+/// the module. The arena is append-only across `invalidate`, so the
+/// cached `TypeId`s remain comparable to anything minted in this
+/// pass; on `analyze_staged` the cache is cleared by `reset_state`
+/// so the rebuild walks every module fresh.
+#[allow(clippy::mutable_key_type)]
 fn lower_signatures_into(
     arena_mut: &mut greycat_analyzer_types::TypeArena,
     index: &mut ProjectIndex,
     lowered: &[(&Uri, &Hir)],
+    cache: &mut HashMap<Uri, ModuleSigCache>,
 ) {
-    use crate::stdlib::FnSignature;
-    use greycat_analyzer_hir::types::Decl;
+    let name_set_hash = project_name_set_hash(index);
+
+    // First pass: drop cache entries for Uris that are no longer
+    // present (a module was removed). Rebuilding ProjectIndex
+    // from scratch in `invalidate` already drops their structural
+    // entries, but the contributions cache needs explicit cleanup.
+    let live_uris: HashSet<&Uri> = lowered.iter().map(|(u, _)| *u).collect();
+    cache.retain(|u, _| live_uris.contains(u));
+
+    // Second pass: per-module — reuse cache if hashes match,
+    // otherwise re-walk and refresh the cache entry.
+    for (uri, hir) in lowered {
+        let sig_hash = module_signature_hash(hir);
+        if let Some(c) = cache.get(*uri)
+            && c.sig_hash == sig_hash
+            && c.name_set_hash == name_set_hash
+        {
+            apply_module_contributions(index, c);
+            continue;
+        }
+        let entry = lower_module_signatures(arena_mut, index, uri, hir, sig_hash, name_set_hash);
+        apply_module_contributions(index, &entry);
+        cache.insert((*uri).clone(), entry);
+    }
+}
+
+/// **P19.6** — walk a single module's signatures and return the
+/// contributions it would write into the project index. Pure with
+/// respect to `index` (only reads it), so the caller decides when /
+/// how to apply.
+fn lower_module_signatures(
+    arena_mut: &mut greycat_analyzer_types::TypeArena,
+    index: &ProjectIndex,
+    uri: &Uri,
+    hir: &Hir,
+    sig_hash: u64,
+    name_set_hash: u64,
+) -> ModuleSigCache {
     use greycat_analyzer_types::GenericOwner;
 
-    // Buffer the writes — `index` serves as `&ProjectIndex` for
-    // cross-module name lookup during lowering, then we apply the
-    // writes via `&mut index` afterwards.
-    let index_ref: &ProjectIndex = &*index;
-    type AttrUpdate = (String, String, greycat_analyzer_types::TypeId);
-    type MethodUpdate = (String, String, greycat_analyzer_types::TypeId);
-    type FnUpdate = (String, FnSignature);
-    type EnumUpdate = (String, greycat_analyzer_types::TypeId);
-    let mut attr_updates: Vec<AttrUpdate> = Vec::new();
-    let mut method_updates: Vec<MethodUpdate> = Vec::new();
-    let mut fn_updates: Vec<FnUpdate> = Vec::new();
-    let mut enum_updates: Vec<EnumUpdate> = Vec::new();
-
-    for (uri, hir) in lowered {
-        let Some(module) = hir.module.as_ref() else {
-            continue;
-        };
-        for d_id in &module.decls {
-            match &hir.decls[*d_id] {
-                Decl::Type(td) => {
-                    let type_name = hir.idents[td.name].text.clone();
-                    // Build the generics scope for this type.
-                    let owner = GenericOwner::Type(type_name.clone());
-                    let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
-                    for g in &td.generics {
-                        generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
-                    }
-                    // Lower attrs.
-                    for attr_id in &td.attrs {
-                        let attr = &hir.type_attrs[*attr_id];
-                        let attr_name = hir.idents[attr.name].text.clone();
-                        let Some(tr) = attr.ty else {
-                            continue;
-                        };
-                        let ty = lower_type_ref_project(
-                            hir,
-                            tr,
-                            arena_mut,
-                            index_ref,
-                            &generics_in_scope,
-                        );
-                        attr_updates.push((type_name.clone(), attr_name, ty));
-                    }
-                    // Lower method returns.
-                    for method_id in &td.methods {
-                        let Decl::Fn(fnd) = &hir.decls[*method_id] else {
-                            continue;
-                        };
-                        let method_name = hir.idents[fnd.name].text.clone();
-                        let Some(ret) = fnd.return_type else {
-                            continue;
-                        };
-                        // Method bodies see *both* the type's generics
-                        // and any of the method's own (`fn<U>(...)`).
-                        let mut method_generics = generics_in_scope.clone();
-                        let method_owner = GenericOwner::Function(method_name.clone());
-                        for g in &fnd.generics {
-                            method_generics
-                                .insert(hir.idents[*g].text.clone(), method_owner.clone());
-                        }
-                        let ty = lower_type_ref_project(
-                            hir,
-                            ret,
-                            arena_mut,
-                            index_ref,
-                            &method_generics,
-                        );
-                        method_updates.push((type_name.clone(), method_name, ty));
-                    }
+    let mut entry = ModuleSigCache {
+        sig_hash,
+        name_set_hash,
+        ..Default::default()
+    };
+    let Some(module) = hir.module.as_ref() else {
+        return entry;
+    };
+    for d_id in &module.decls {
+        match &hir.decls[*d_id] {
+            Decl::Type(td) => {
+                let type_name = hir.idents[td.name].text.clone();
+                let owner = GenericOwner::Type(type_name.clone());
+                let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                for g in &td.generics {
+                    generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
                 }
-                Decl::Enum(ed) => {
-                    // P23 — pre-register the enum type in the
-                    // *shared* project arena and record the TypeId
-                    // in `index.enum_types` so cross-module variant
-                    // typing (`other_module::Foo::a` → `Foo`) can
-                    // resolve inline.
-                    let name = hir.idents[ed.name].text.clone();
-                    let variants: Vec<String> = ed
-                        .fields
-                        .iter()
-                        .map(|f| hir.idents[hir.enum_fields[*f].name].text.clone())
-                        .collect();
-                    let enum_id = arena_mut.alloc(greycat_analyzer_types::Type {
-                        kind: greycat_analyzer_types::TypeKind::Enum {
-                            name: name.clone(),
-                            variants,
-                        },
-                        nullable: false,
-                    });
-                    enum_updates.push((name, enum_id));
+                for attr_id in &td.attrs {
+                    let attr = &hir.type_attrs[*attr_id];
+                    let attr_name = hir.idents[attr.name].text.clone();
+                    let Some(tr) = attr.ty else {
+                        continue;
+                    };
+                    let ty = lower_type_ref_project(hir, tr, arena_mut, index, &generics_in_scope);
+                    entry.attrs.push((type_name.clone(), attr_name, ty));
                 }
-                Decl::Fn(fnd) => {
-                    // P23 — top-level fn signatures. Native fns are
-                    // included so the analyzer's call-typing path
-                    // can resolve them inline through the shared
-                    // arena (`NativeRegistry` mints into a
-                    // *different* arena and predates P19).
-                    let fn_name = hir.idents[fnd.name].text.clone();
+                for method_id in &td.methods {
+                    let Decl::Fn(fnd) = &hir.decls[*method_id] else {
+                        continue;
+                    };
+                    let method_name = hir.idents[fnd.name].text.clone();
                     let Some(ret) = fnd.return_type else {
                         continue;
                     };
-                    let owner = GenericOwner::Function(fn_name.clone());
-                    let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                    let mut method_generics = generics_in_scope.clone();
+                    let method_owner = GenericOwner::Function(method_name.clone());
                     for g in &fnd.generics {
-                        generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
+                        method_generics.insert(hir.idents[*g].text.clone(), method_owner.clone());
                     }
-                    let ret_ty =
-                        lower_type_ref_project(hir, ret, arena_mut, index_ref, &generics_in_scope);
-                    let generics: Vec<String> = fnd
-                        .generics
-                        .iter()
-                        .map(|g| hir.idents[*g].text.clone())
-                        .collect();
-                    fn_updates.push((
-                        fn_name,
-                        FnSignature {
-                            home_uri: (*uri).clone(),
-                            return_ty: ret_ty,
-                            generics,
-                        },
-                    ));
+                    let ty = lower_type_ref_project(hir, ret, arena_mut, index, &method_generics);
+                    entry.methods.push((type_name.clone(), method_name, ty));
                 }
-                _ => {}
             }
+            Decl::Enum(ed) => {
+                let name = hir.idents[ed.name].text.clone();
+                let variants: Vec<String> = ed
+                    .fields
+                    .iter()
+                    .map(|f| hir.idents[hir.enum_fields[*f].name].text.clone())
+                    .collect();
+                let enum_id = arena_mut.alloc(greycat_analyzer_types::Type {
+                    kind: greycat_analyzer_types::TypeKind::Enum {
+                        name: name.clone(),
+                        variants,
+                    },
+                    nullable: false,
+                });
+                entry.enums.push((name, enum_id));
+            }
+            Decl::Fn(fnd) => {
+                let fn_name = hir.idents[fnd.name].text.clone();
+                let Some(ret) = fnd.return_type else {
+                    continue;
+                };
+                let owner = GenericOwner::Function(fn_name.clone());
+                let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                for g in &fnd.generics {
+                    generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
+                }
+                let ret_ty = lower_type_ref_project(hir, ret, arena_mut, index, &generics_in_scope);
+                let generics: Vec<String> = fnd
+                    .generics
+                    .iter()
+                    .map(|g| hir.idents[*g].text.clone())
+                    .collect();
+                entry.fns.push((
+                    fn_name,
+                    FnSignature {
+                        home_uri: uri.clone(),
+                        return_ty: ret_ty,
+                        generics,
+                    },
+                ));
+            }
+            _ => {}
         }
     }
-    // Apply writes — `index_ref` borrow ends here, switch to `&mut index`.
-    let _ = index_ref;
-    for (type_name, attr_name, ty) in attr_updates {
-        if let Some(tm) = index.type_members.get_mut(&type_name) {
-            tm.attr_types.insert(attr_name, ty);
+    entry
+}
+
+/// **P19.6** — apply a cached / freshly-built module contribution to
+/// the project index. Mirrors the apply-loop the original
+/// `lower_signatures_into` ran at end-of-pass: `or_insert` semantics
+/// preserve the "first decl wins" collision rule that the rest of
+/// the pipeline assumes.
+fn apply_module_contributions(index: &mut ProjectIndex, c: &ModuleSigCache) {
+    for (type_name, attr_name, ty) in &c.attrs {
+        if let Some(tm) = index.type_members.get_mut(type_name) {
+            tm.attr_types.insert(attr_name.clone(), *ty);
         }
     }
-    for (type_name, method_name, ty) in method_updates {
-        if let Some(tm) = index.type_members.get_mut(&type_name) {
-            tm.method_returns.insert(method_name, ty);
+    for (type_name, method_name, ty) in &c.methods {
+        if let Some(tm) = index.type_members.get_mut(type_name) {
+            tm.method_returns.insert(method_name.clone(), *ty);
         }
     }
-    for (fn_name, sig) in fn_updates {
-        index.fn_signatures.entry(fn_name).or_insert(sig);
+    for (fn_name, sig) in &c.fns {
+        index
+            .fn_signatures
+            .entry(fn_name.clone())
+            .or_insert_with(|| sig.clone());
     }
-    for (name, ty) in enum_updates {
-        index.enum_types.entry(name).or_insert(ty);
+    for (name, ty) in &c.enums {
+        index.enum_types.entry(name.clone()).or_insert(*ty);
     }
 }
 
@@ -951,7 +1133,12 @@ impl ProjectAnalysis {
                 }
                 pairs.push((other_uri, &ma.hir));
             }
-            lower_signatures_into(&mut self.arena, &mut self.index, &pairs);
+            lower_signatures_into(
+                &mut self.arena,
+                &mut self.index,
+                &pairs,
+                &mut self.sig_cache,
+            );
         }
 
         let mut timings = ModuleTimings {
@@ -991,6 +1178,16 @@ impl ProjectAnalysis {
 
     pub fn module(&self, uri: &Uri) -> Option<&ModuleAnalysis> {
         self.modules.get(uri)
+    }
+
+    /// **P19.6** — number of modules currently held in the
+    /// signature-stage cache. Exposed for the test that asserts the
+    /// cache is populated after a build / partially refreshed after
+    /// a body-only edit. Production callers shouldn't depend on the
+    /// exact value.
+    #[doc(hidden)]
+    pub fn sig_cache_len(&self) -> usize {
+        self.sig_cache.len()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Uri, &ModuleAnalysis)> {
@@ -1865,6 +2062,97 @@ mod tests {
         pa.invalidate(&mgr, &uri("/proj/a.gcl"));
         assert_eq!(pa.len(), 0);
         assert!(pa.module(&uri("/proj/a.gcl")).is_none());
+    }
+
+    /// **P19.6** — body-only edits skip the per-module signature
+    /// re-walk by reusing the cached contributions. The cache is
+    /// populated after the initial build and stays the same size
+    /// after an unrelated body edit; the changed module's hash is
+    /// re-validated but its cached contributions are reused
+    /// (sig_hash unchanged).
+    #[test]
+    fn invalidate_body_only_edit_reuses_sig_cache() {
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/a.gcl"),
+            "fn a(x: int): int { return x; }\n",
+            "p",
+            false,
+        );
+        mgr.add_simple(
+            uri("/proj/b.gcl"),
+            "type Pair { left: int; right: int; }\nfn b(): int { return 0; }\n",
+            "p",
+            false,
+        );
+        let mut pa = ProjectAnalysis::analyze(&mgr);
+        assert_eq!(pa.sig_cache_len(), 2, "both modules cached after rebuild");
+        let cached_attrs_before = pa
+            .index
+            .type_members
+            .get("Pair")
+            .map(|tm| tm.attr_types.len())
+            .unwrap_or(0);
+
+        // Body-only edit on a.gcl — `a`'s signature is identical.
+        mgr.add_simple(
+            uri("/proj/a.gcl"),
+            "fn a(x: int): int { return x + 1; }\n",
+            "p",
+            false,
+        );
+        pa.invalidate(&mgr, &uri("/proj/a.gcl"));
+        assert_eq!(
+            pa.sig_cache_len(),
+            2,
+            "cache size stable after body-only edit"
+        );
+        let cached_attrs_after = pa
+            .index
+            .type_members
+            .get("Pair")
+            .map(|tm| tm.attr_types.len())
+            .unwrap_or(0);
+        assert_eq!(
+            cached_attrs_before, cached_attrs_after,
+            "Pair's attr_types reapplied verbatim from the cache"
+        );
+    }
+
+    /// **P19.6** — signature edits invalidate the cache entry for
+    /// the changed module. The new contributions overwrite the old
+    /// in `index.fn_signatures`, so callers querying the new return
+    /// type see it on the very next `module()` lookup.
+    #[test]
+    fn invalidate_signature_edit_refreshes_sig_cache() {
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/a.gcl"),
+            "fn a(): int { return 1; }\n",
+            "p",
+            false,
+        );
+        let mut pa = ProjectAnalysis::analyze(&mgr);
+        assert!(pa.index.fn_signatures.contains_key("a"));
+
+        // Change the return type — signature hash must differ.
+        mgr.add_simple(
+            uri("/proj/a.gcl"),
+            "fn a(): String { return \"x\"; }\n",
+            "p",
+            false,
+        );
+        pa.invalidate(&mgr, &uri("/proj/a.gcl"));
+        let sig = pa
+            .index
+            .fn_signatures
+            .get("a")
+            .expect("a sig present after invalidate");
+        let display = greycat_analyzer_types::display(&pa.arena, sig.return_ty);
+        assert!(
+            display.contains("String"),
+            "expected refreshed return type to be String, got {display:?}"
+        );
     }
 
     /// Anchors the rule that cross-module / bare-Ident-call
