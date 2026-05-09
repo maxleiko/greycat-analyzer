@@ -73,6 +73,11 @@
             "Everything `debug` shows plus full LSP request / response payloads."
           ],
           "markdownDescription": "Verbosity of the LSP server's log output (sets `RUST_LOG` for `greycat_analyzer_*` crates). Restart the server after changing — the extension will prompt."
+        },
+        "greycat-analyzer.lintLibs": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Surface lint warnings (`unused-decl`, `unused-local`, `unused-param`, `arrow-on-non-deref`) for vendored library modules under `lib/<name>/`. Off by default — those modules aren't yours and the warnings tend to drown out signal in your own code. Type-relation diagnostics always surface regardless of this setting. Restart the server after changing — the extension will prompt."
         }
       }
     }

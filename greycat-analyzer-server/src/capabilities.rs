@@ -1597,7 +1597,9 @@ pub fn code_actions_with_project(
     uri: &Uri,
     range: lsp_types::Range,
 ) -> Vec<CodeActionOrCommand> {
-    let semantic = diagnostics_from_module(text, module);
+    // Code actions don't differentiate lib vs project — the user's
+    // already pointing at a specific diagnostic when invoking them.
+    let semantic = diagnostics_from_module(text, module, true);
     code_actions_from_diagnostics(text, uri, range, semantic)
 }
 
@@ -4342,7 +4344,20 @@ pub(crate) fn current_diagnostics(
 /// finding to an `lsp_types::Diagnostic`. Mirrors the body of the cli
 /// `lint` command's per-module conversion (P14.5) so the LSP and the
 /// CLI surface the same diagnostic shape.
-pub fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagnostic> {
+///
+/// `lint_libs` opts into emitting lint diagnostics for non-project
+/// modules (anything under `lib/<name>/`). Default for the LSP is
+/// `false` — most users don't want warnings about vendored libraries
+/// they don't own. The VS Code extension exposes this via the
+/// `greycat-analyzer.lintLibs` setting; the CLI uses `--lint-libs`.
+/// Type-relation / semantic diagnostics are unaffected — those always
+/// surface regardless of the module's home library, so cross-module
+/// shape mismatches can't hide behind a library boundary.
+pub fn diagnostics_from_module(
+    text: &str,
+    module: &ModuleAnalysis,
+    lint_libs: bool,
+) -> Vec<Diagnostic> {
     let mut out: Vec<Diagnostic> = module
         .analysis
         .diagnostics
@@ -4360,13 +4375,7 @@ pub fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagn
             ..Default::default()
         })
         .collect();
-    // Lib-owned modules don't surface lints in the editor — those are
-    // about library authors' code, not the user's project. Type-relation
-    // diagnostics above stay regardless so cross-module shape mismatches
-    // can't hide behind a library boundary. CLI users who want lib lints
-    // pass `lint --lint-libs`; there's no LSP equivalent today (no
-    // user-supplied LSP-settings story yet).
-    if module.lib == "project" {
+    if lint_libs || module.lib == "project" {
         for lint in &module.lints {
             out.push(Diagnostic {
                 range: byte_range_to_lsp_range(text, &lint.byte_range),

@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crossbeam_channel::Sender;
-use greycat_analyzer_analysis::analyzer::Severity;
-use greycat_analyzer_analysis::lint::LintSeverity;
-use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
+use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::module_desc::parse_module_desc;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
@@ -13,13 +11,13 @@ use greycat_analyzer_core::{
 };
 use log::{debug, info, warn};
 use lsp_server::*;
-use lsp_types::{NumberOrString, Position, Range};
 use lsp_types::{
     notification::{Notification as _, PublishDiagnostics},
     *,
 };
 
 use crate::Result;
+use crate::capabilities::diagnostics_from_module;
 
 /// Threshold above which a per-edit rebuild is surfaced as a one-line
 /// `info!` so users see hot spots without flooding the log on healthy
@@ -35,6 +33,12 @@ pub struct Backend {
     /// load time. P15.5 uses it to anchor `@include` / `@library`
     /// pragma diagnostics on every publish.
     pub project_root: Option<PathBuf>,
+    /// When `true`, lint diagnostics from non-project modules
+    /// (`lib/<name>/...`) are surfaced in the editor too. Driven by
+    /// the `greycat-analyzer.lintLibs` extension setting via the
+    /// LSP's `initializationOptions`. Default `false` — most users
+    /// don't want warnings about vendored library code.
+    pub lint_libs: bool,
 }
 
 impl Backend {
@@ -58,7 +62,7 @@ impl Backend {
         let doc = cell.borrow();
         let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
         if let Some(module) = self.project_analysis.module(uri) {
-            diags.extend(diagnostics_from_module(&doc.text, module));
+            diags.extend(diagnostics_from_module(&doc.text, module, self.lint_libs));
         }
         // P15.5 — pragma resolution diagnostics. Recomputed on every
         // publish so edits to `@include` / `@library` pragmas reflect
@@ -74,6 +78,18 @@ impl Backend {
     }
 
     pub fn initialized(&mut self, init: &InitializeParams) -> Result<()> {
+        // Pull `lintLibs` (and any future settings) out of
+        // `initializationOptions` before walking workspace folders so
+        // the very first round of `publish_for` already honors the
+        // user's preference. Missing / malformed payload silently
+        // falls back to the default (`false`) — no need to fail the
+        // handshake over an absent option.
+        if let Some(opts) = init.initialization_options.as_ref()
+            && let Some(b) = opts.get("lintLibs").and_then(|v| v.as_bool())
+        {
+            self.lint_libs = b;
+            debug!("[init] lintLibs={b}");
+        }
         if let Some(workspaces) = init.workspace_folders.as_ref() {
             debug!("workspaces:");
             for ws in workspaces {
@@ -192,72 +208,6 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let s = uri.as_str();
     let stripped = s.strip_prefix("file://")?;
     Some(Path::new(stripped).to_path_buf())
-}
-
-/// Render a cached [`ModuleAnalysis`] as `lsp_types::Diagnostic`s.
-/// Pulls semantic diagnostics out of `analysis.diagnostics` and lint
-/// findings out of `lints` so the LSP publish list looks the same as
-/// it did before P6.1 — only the path through the pipeline changed.
-fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagnostic> {
-    let mut out: Vec<Diagnostic> = module
-        .analysis
-        .diagnostics
-        .iter()
-        .map(|d| Diagnostic {
-            range: byte_range_to_lsp_range(text, &d.byte_range),
-            severity: Some(match d.severity {
-                Severity::Error => DiagnosticSeverity::ERROR,
-                Severity::Warning => DiagnosticSeverity::WARNING,
-                Severity::Hint => DiagnosticSeverity::HINT,
-            }),
-            code: Some(NumberOrString::String("semantic".into())),
-            source: Some("greycat-analyzer".into()),
-            message: d.message.clone(),
-            ..Default::default()
-        })
-        .collect();
-
-    for lint in &module.lints {
-        out.push(Diagnostic {
-            range: byte_range_to_lsp_range(text, &lint.byte_range),
-            severity: Some(match lint.severity {
-                LintSeverity::Error => DiagnosticSeverity::ERROR,
-                LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                LintSeverity::Hint => DiagnosticSeverity::HINT,
-            }),
-            code: Some(NumberOrString::String(lint.rule.into())),
-            source: Some("lint".into()),
-            message: lint.message.clone(),
-            ..Default::default()
-        });
-    }
-    out
-}
-
-/// Convert a byte range against `text` to an LSP `Range`. The mapping
-/// uses byte columns for now (consistent with the rest of the codebase).
-fn byte_range_to_lsp_range(text: &str, range: &std::ops::Range<usize>) -> Range {
-    fn position_at(text: &str, byte: usize) -> Position {
-        let mut line = 0u32;
-        let mut col = 0u32;
-        let prefix = &text[..byte.min(text.len())];
-        for c in prefix.chars() {
-            if c == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += c.len_utf8() as u32;
-            }
-        }
-        Position {
-            line,
-            character: col,
-        }
-    }
-    Range {
-        start: position_at(text, range.start),
-        end: position_at(text, range.end),
-    }
 }
 
 pub(crate) fn publish_diagnostics(

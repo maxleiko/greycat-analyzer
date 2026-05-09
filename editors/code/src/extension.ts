@@ -25,11 +25,21 @@ export function activate(ctx: ExtensionContext) {
     channel,
     commands.registerCommand('greycat-analyzer.restart', restart),
     workspace.onDidChangeConfiguration(async (e) => {
-      if (!e.affectsConfiguration('greycat-analyzer.trace.server')) {
+      // Both settings require an LSP restart: trace.server changes
+      // RUST_LOG (only read at startup) and lintLibs is sent via
+      // initializationOptions (only consumed on `initialize`).
+      const traceChanged = e.affectsConfiguration(
+        'greycat-analyzer.trace.server'
+      );
+      const lintLibsChanged = e.affectsConfiguration(
+        'greycat-analyzer.lintLibs'
+      );
+      if (!traceChanged && !lintLibsChanged) {
         return;
       }
+      const what = traceChanged ? 'log level' : 'lintLibs';
       const choice = await window.showInformationMessage(
-        'greycat-analyzer log level changed. Restart the server now?',
+        `greycat-analyzer ${what} changed. Restart the server now?`,
         'Restart',
         'Later'
       );
@@ -82,10 +92,24 @@ function startClient() {
     {
       outputChannel: channel,
       documentSelector: [{ scheme: 'file', language: 'greycat' }],
+      initializationOptions: buildInitializationOptions(),
     }
   );
 
   return client.start();
+}
+
+/**
+ * Build the JSON object sent to the server via `initializationOptions`.
+ * Mirror every Rust-side `Backend` field that's user-configurable here
+ * so the server can read them once on `initialize` rather than running
+ * a stream of `workspace/configuration` requests.
+ */
+function buildInitializationOptions(): Record<string, unknown> {
+  const cfg = workspace.getConfiguration('greycat-analyzer');
+  return {
+    lintLibs: cfg.get<boolean>('lintLibs', false),
+  };
 }
 
 /**

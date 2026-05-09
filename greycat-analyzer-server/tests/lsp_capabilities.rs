@@ -1722,7 +1722,7 @@ fn diagnostics_skip_non_project_lib_lints() {
 
     let project_module = pa.module(&project_uri).unwrap();
     let project_diags =
-        capabilities::diagnostics_from_module("private fn unused() {}\n", project_module);
+        capabilities::diagnostics_from_module("private fn unused() {}\n", project_module, false);
     assert!(
         project_diags
             .iter()
@@ -1731,12 +1731,24 @@ fn diagnostics_skip_non_project_lib_lints() {
     );
 
     let lib_module = pa.module(&lib_uri).unwrap();
-    let lib_diags = capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module);
+    let lib_diags =
+        capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module, false);
     assert!(
         !lib_diags
             .iter()
             .any(|d| d.message.contains("unused private fn")),
-        "lib-owned (`std`) lints must NOT surface in the editor; got: {lib_diags:?}"
+        "lib-owned (`std`) lints must NOT surface with lint_libs=false; got: {lib_diags:?}"
+    );
+
+    // …but `lint_libs=true` (the `greycat-analyzer.lintLibs` extension
+    // setting / `--lint-libs` CLI flag) lifts the suppression.
+    let lib_diags_opted_in =
+        capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module, true);
+    assert!(
+        lib_diags_opted_in
+            .iter()
+            .any(|d| d.message.contains("unused private fn")),
+        "lib-owned lints SHOULD surface when lint_libs=true; got: {lib_diags_opted_in:?}"
     );
 }
 

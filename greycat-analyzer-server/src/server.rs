@@ -119,6 +119,7 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
         manager: Default::default(),
         project_analysis: Default::default(),
         project_root: None,
+        lint_libs: false,
     };
 
     server.initialized(&init)?;
