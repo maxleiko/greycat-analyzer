@@ -851,10 +851,56 @@ impl<'a> Cx<'a> {
     }
 
     /// **P23** — type a `Type::name` / `Type::method` value-position
-    /// Static expr. Looks at the property's `member_uses` /
-    /// `foreign_member_uses` binding (already populated by
-    /// `resolve_member`) and maps Attr → `field`, Method → `function`.
-    fn static_value_type(&mut self, property: Idx<Ident>) -> Option<TypeId> {
+    /// Static expr. **P19.13** — distinguishes static-attr value
+    /// access (`type Foo { static path: String }` then `Foo::path`
+    /// → `String`) from a non-static `Type::attr` reference (which
+    /// is a runtime `field` handle). For methods, returns the
+    /// runtime `function` named-type.
+    ///
+    /// In-module attrs read the `static_` modifier directly off
+    /// the HIR's `TypeAttr`; cross-module attrs consult the
+    /// project-wide `static_attrs` set populated at `ingest` time
+    /// (the analyzer never crosses module boundaries during the
+    /// body walk).
+    fn static_value_type(&mut self, recv_ty: TypeId, property: Idx<Ident>) -> Option<TypeId> {
+        let prop_text = self.hir.idents[property].text.as_str();
+        if let Some(MemberDef::Attr(attr_id)) = self.out.member_uses.get(&property).copied() {
+            let attr = &self.hir.type_attrs[attr_id];
+            if attr.modifiers.static_ {
+                if let Some(tr) = attr.ty {
+                    return Some(self.lower_type_ref(tr));
+                }
+                return Some(self.any());
+            }
+            return Some(self.arena.named("field"));
+        }
+        if let Some(foreign) = self.out.foreign_member_uses.get(&property)
+            && matches!(foreign.member, MemberDef::Attr(_))
+        {
+            // Cross-module attr — consult `static_attrs` for the
+            // receiver's type. The receiver is the `Type::` part
+            // of the static expr; we have its lowered TypeId.
+            let owner_name = match &self.arena.get(recv_ty).kind {
+                TypeKind::Named { name } => Some(name.clone()),
+                TypeKind::Generic { name, .. } => Some(name.clone()),
+                TypeKind::Enum { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(name) = owner_name
+                && let Some(members) = self.index.type_members_for(&name)
+            {
+                let prop_sym = self.index.symbol(prop_text);
+                let is_static = prop_sym.is_some_and(|s| members.static_attrs.contains(&s));
+                if is_static {
+                    if let Some(ty) = members.attr_ty(&self.index.symbols, prop_text) {
+                        return Some(ty);
+                    }
+                    return Some(self.any());
+                }
+            }
+            return Some(self.arena.named("field"));
+        }
+        // Method reference (in-module or cross-module).
         let kind = self.out.member_uses.get(&property).copied().or_else(|| {
             self.out
                 .foreign_member_uses
@@ -906,7 +952,21 @@ impl<'a> Cx<'a> {
                 {
                     Some(self.arena.named("function"))
                 } else if members.attr_id(&self.index.symbols, &member_name).is_some() {
-                    Some(self.arena.named("field"))
+                    // P19.13 — static-attr value access from a
+                    // `module::Type::name` chain. Returns the
+                    // attr's declared type for static attrs;
+                    // `field` handle otherwise.
+                    let prop_sym = self.index.symbol(&member_name);
+                    let is_static = prop_sym.is_some_and(|s| members.static_attrs.contains(&s));
+                    if is_static {
+                        Some(
+                            members
+                                .attr_ty(&self.index.symbols, &member_name)
+                                .unwrap_or_else(|| self.any()),
+                        )
+                    } else {
+                        Some(self.arena.named("field"))
+                    }
                 } else {
                     None
                 }
@@ -1952,8 +2012,13 @@ impl<'a> Cx<'a> {
                 }
                 // P23 — `Type::attr` (no parens) → `field`,
                 // `Type::method` (no parens) → `function`. Replaces
-                // pass 3.5's static-as-value typing.
-                if let Some(ty) = self.static_value_type(s.property) {
+                // pass 3.5's static-as-value typing. **P19.13** —
+                // pass `recv_ty` so `static_value_type` can resolve
+                // cross-module static-attr value access through the
+                // project index (`Programs::python3` typed as
+                // `String` instead of `field` when `python3` is
+                // declared `static`).
+                if let Some(ty) = self.static_value_type(recv_ty, s.property) {
                     return ty;
                 }
                 // P23 — `module::Name` shapes parse as `Static` with
@@ -2164,7 +2229,24 @@ impl<'a> Cx<'a> {
         match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => bool_t,
             BinOp::And | BinOp::Or => bool_t,
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            BinOp::Add => {
+                // **P19.13** — String concat: `String + X` /
+                // `X + String` → `String`. The runtime coerces the
+                // non-string side via `to_string()`. Only `+`
+                // overloads on String — the other arithmetic ops
+                // stay numeric.
+                let string_t = self.primitive(Primitive::String);
+                if lt == string_t || rt == string_t {
+                    string_t
+                } else if lt == float || rt == float {
+                    float
+                } else if lt == int && rt == int {
+                    int
+                } else {
+                    self.any()
+                }
+            }
+            BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 if lt == float || rt == float {
                     float
                 } else if lt == int && rt == int {

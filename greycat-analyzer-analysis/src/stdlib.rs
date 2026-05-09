@@ -209,6 +209,14 @@ pub struct TypeMembers {
     /// explicit return type are absent (the analyzer's call-typing
     /// falls through to the existing inference path).
     pub method_returns: HashMap<Symbol, TypeId>,
+    /// **P19.13** — names of attrs declared with the `static`
+    /// modifier (`type Foo { static path: String = "..." }`).
+    /// Lets the analyzer's `Expr::Static` value-typing
+    /// distinguish `Foo::path` (which is the value, typed as
+    /// `String`) from a non-static `Foo::path` reference (which is
+    /// a runtime `field` handle). Empty for types with no static
+    /// attrs.
+    pub static_attrs: HashSet<Symbol>,
 }
 
 impl TypeMembers {
@@ -416,12 +424,20 @@ impl ProjectIndex {
                             // after every module is loaded.
                             attr_types: HashMap::new(),
                             method_returns: HashMap::new(),
+                            static_attrs: HashSet::new(),
                         };
                         for attr_id in &td.attrs {
-                            let attr_sym = self
-                                .symbols
-                                .intern(hir.idents[hir.type_attrs[*attr_id].name].text.as_str());
+                            let attr = &hir.type_attrs[*attr_id];
+                            let attr_sym = self.symbols.intern(hir.idents[attr.name].text.as_str());
                             m.attrs.insert(attr_sym, *attr_id);
+                            // P19.13 — capture `static` flag at
+                            // ingest time so `Expr::Static` value
+                            // typing can distinguish static-attr
+                            // value access from a runtime `field`
+                            // handle, even for cross-module attrs.
+                            if attr.modifiers.static_ {
+                                m.static_attrs.insert(attr_sym);
+                            }
                         }
                         for method_id in &td.methods {
                             if let Decl::Fn(fnd) = &hir.decls[*method_id] {
