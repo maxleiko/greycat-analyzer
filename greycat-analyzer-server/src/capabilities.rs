@@ -1764,6 +1764,32 @@ fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
                 new_text: String::new(),
             }]
         }
+        "modvar-node-cannot-be-nullable" => {
+            // Lint range = the type ref (e.g. `node<float?>?`). Drop the
+            // trailing `?` byte.
+            let end = position_to_byte(text, diag.range.end);
+            if end == 0 || text.as_bytes().get(end - 1) != Some(&b'?') {
+                return Vec::new();
+            }
+            vec![TextEdit {
+                range: lsp_types::Range {
+                    start: byte_to_position(text, end - 1),
+                    end: byte_to_position(text, end),
+                },
+                new_text: String::new(),
+            }]
+        }
+        "modvar-node-inner-must-be-nullable" => {
+            // Lint range = the inner type ref (e.g. `int` in `node<int>`).
+            // Append `?` at its end.
+            vec![TextEdit {
+                range: lsp_types::Range {
+                    start: diag.range.end,
+                    end: diag.range.end,
+                },
+                new_text: "?".into(),
+            }]
+        }
         _ => Vec::new(),
     }
 }

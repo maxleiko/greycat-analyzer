@@ -541,6 +541,18 @@ fn diag_to_edit(text: &str, diag: &Diagnostic) -> Option<(std::ops::Range<usize>
                 None
             }
         }
+        "modvar-node-cannot-be-nullable" => {
+            // Range covers the type ref ending in `?`. Drop the last byte.
+            if end > 0 && end <= text.len() && text.as_bytes()[end - 1] == b'?' {
+                Some(((end - 1)..end, String::new()))
+            } else {
+                None
+            }
+        }
+        "modvar-node-inner-must-be-nullable" => {
+            // Append `?` at the end of the inner type ref's range.
+            Some((end..end, "?".into()))
+        }
         _ => None,
     }
 }
