@@ -2080,6 +2080,19 @@ impl<'a> Cx<'a> {
         if chain.has_final_else {
             return;
         }
+        // **P20.3** — a lone `if (x == E::V) { ... }` (no `else if`,
+        // no final `else`) is *not* a match-like dispatch: the user
+        // is checking a single variant, not enumerating all of them.
+        // Flagging it as "non-exhaustive" against every other variant
+        // is a false positive; the canonical pattern in the wild is
+        // sequential `if (x == E::A) { return ...; } if (x == E::B)
+        // { return ...; } ... return fallback;` where each `if` stands
+        // alone. Only fire when the chain has at least one `else if`
+        // arm (`arms.len() >= 2`) — that's when the user is using the
+        // chain as a switch and we can meaningfully assert coverage.
+        if chain.arms.len() < 2 {
+            return;
+        }
         let Some(enum_id) = self.out.registry.lookup(&chain.enum_name) else {
             return;
         };
@@ -3397,6 +3410,38 @@ fn pick(c: Color): int {
                 .any(|d| d.message.contains("non-exhaustive match over `Color`")
                     && d.message.contains("Blue")),
             "expected non-exhaustive diag mentioning Blue, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn lone_if_enum_eq_is_silent() {
+        // **P20.3** — a lone `if (x == E::V) { ... }` (no `else if`,
+        // no final `else`) is not a match-like dispatch and should
+        // not flag exhaustiveness. The canonical pattern is sequential
+        // `if (x == E::A) { return ...; } if (x == E::B) { return
+        // ...; } ... return fallback;` where each `if` stands alone.
+        let src = r#"
+enum Color { Red, Green, Blue }
+fn pick(c: Color): int {
+    if (c == Color::Red) {
+        return 1;
+    }
+    if (c == Color::Green) {
+        return 2;
+    }
+    if (c == Color::Blue) {
+        return 3;
+    }
+    return 0;
+}
+"#;
+        let r = analyze_src_only(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("non-exhaustive")),
+            "lone `if (x == E::V)` should not flag exhaustiveness, got: {:?}",
             r.diagnostics
         );
     }
