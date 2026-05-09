@@ -885,6 +885,33 @@ impl ProjectAnalysis {
             let Decl::Fn(fnd) = &fn_module.hir.decls[fn_decl_id] else {
                 continue;
             };
+            // **P19.19** — arity check (independent of generics; a
+            // generic fn `<T>(x: T)` still has arity 1). Mirrors the TS
+            // reference's "Function 'foo' expects N arguments, but got
+            // M" diagnostic. Highlight range = the arg-list parens
+            // (callee_end..call_end), matching the reference's span.
+            let expected = fnd.params.len();
+            let actual = call.args.len();
+            if expected != actual {
+                let fn_name = fn_module.hir.idents[fnd.name].text.clone();
+                let callee_end = match &cur_module.hir.exprs[call.callee] {
+                    Expr::Ident(idx) => cur_module.hir.idents[*idx].byte_range.end,
+                    other => other.byte_range().end,
+                };
+                let plural = if expected == 1 { "" } else { "s" };
+                out.push(SemanticDiagnostic {
+                    severity: Severity::Error,
+                    message: format!(
+                        "function `{fn_name}` expects {expected} argument{plural}, but got {actual}"
+                    ),
+                    byte_range: callee_end..call.byte_range.end,
+                    category: DiagCategory::TypeRelation,
+                });
+                // Skip the per-arg type validation: the pair-mapping is
+                // ambiguous when arity is wrong, so further diagnostics
+                // would be noise.
+                continue;
+            }
             if !fnd.generics.is_empty() {
                 continue;
             }
