@@ -36,6 +36,7 @@ import editorWorkerUrl from "monaco-editor/esm/vs/editor/editor.worker?worker&ur
 
 import { SAMPLE_SOURCE } from "./sample.ts";
 import { registerGcl } from "./gcl-language.ts";
+import { getAnalyzer } from "./analyzer-client.ts";
 
 self.MonacoEnvironment = {
   getWorkerUrl() {
@@ -156,6 +157,23 @@ function mountEditor() {
     editor.setValue(SAMPLE_SOURCE);
     editor.focus();
   });
+
+  // Splash dismissal — wait for the wasm worker to ack a first call
+  // (this both warms the wasm cache and proves it loaded). The
+  // editor mounted synchronously above, so by the time the analyzer
+  // resolves we're ready to show the layout. On error we still
+  // remove the splash; the in-panel error UI takes over.
+  void getAnalyzer()
+    .diagnostics(initial)
+    .catch(() => undefined)
+    .finally(() => {
+      const splash = document.getElementById("splash");
+      if (!splash) return;
+      splash.classList.add("splash-hide");
+      // Match the CSS opacity transition (200ms) before removing
+      // from the DOM so the fade actually plays.
+      setTimeout(() => splash.remove(), 250);
+    });
 }
 
 mountEditor();

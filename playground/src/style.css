@@ -63,6 +63,81 @@ body {
   background: var(--wa-color-surface-default);
 }
 
+/* Splash screen — paints on the first frame, lives above the
+   wa-cloak-hidden layout while WebAwesome upgrades / Monaco mounts /
+   wasm initializes. main.ts removes the element once everything's
+   ready. `visibility: visible !important` overrides wa-cloak's blanket
+   hide so the splash itself isn't cloaked along with its parent. */
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 1rem;
+  background: var(--wa-color-surface-default);
+  color: var(--wa-color-text-quiet);
+  /* fade out via main.ts: `splash.classList.add('splash-hide')` */
+  transition: opacity 200ms ease-out;
+  visibility: visible !important;
+}
+
+.splash-hide {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.splash-logo {
+  width: 64px;
+  height: 64px;
+  color: var(--wa-color-text-normal);
+}
+
+.splash-label {
+  font-family: var(--wa-font-family-body);
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.splash-spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid var(--wa-color-surface-border);
+  border-top-color: var(--wa-color-brand-fill-loud);
+  animation: splash-spin 0.85s linear infinite;
+}
+
+@keyframes splash-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Respect reduced-motion preferences — replace the spinner with a
+   gentle pulse on the logo. */
+@media (prefers-reduced-motion: reduce) {
+  .splash-spinner {
+    animation: none;
+    border-top-color: var(--wa-color-surface-border);
+  }
+  .splash-logo {
+    animation: splash-pulse 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes splash-pulse {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .layout {
   width: 100%;
   height: 100%;
