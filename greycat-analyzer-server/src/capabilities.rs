@@ -2307,49 +2307,26 @@ pub fn completion_with_project(
 ) -> Option<CompletionList> {
     let byte = position_to_byte(text, pos);
     let node = node_at_offset(root, byte)?;
-    if let Some(items) = include_dir_completion(text, node, byte, project_root) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = pragma_completion(text, byte) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = member_completion(text, root, byte, uri, project) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = static_completion(text, byte, project) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = type_position_completion(text, node, byte, uri, project) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = object_field_completion(text, node, byte, uri, project) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = ident_or_keyword_completion(text, node, byte, uri, project) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    None
+    let mut items = if let Some(items) = include_dir_completion(text, node, byte, project_root) {
+        items
+    } else if let Some(items) = pragma_completion(text, byte) {
+        items
+    } else if let Some(items) = member_completion(text, root, byte, uri, project) {
+        items
+    } else if let Some(items) = static_completion(text, byte, project) {
+        items
+    } else if let Some(items) = type_position_completion(text, node, byte, uri, project) {
+        items
+    } else if let Some(items) = object_field_completion(text, node, byte, uri, project) {
+        items
+    } else {
+        ident_or_keyword_completion(text, node, byte, uri, project)?
+    };
+    apply_call_paren_snippet(&mut items, text, byte);
+    Some(CompletionList {
+        is_incomplete: false,
+        items,
+    })
 }
 
 /// P15.4 — `@include("<cursor>")` directory completion. Activated when
@@ -2970,6 +2947,94 @@ fn ident_or_keyword_completion(
         return None;
     }
     Some(items)
+}
+
+/// Post-process completion items so the LSP edit honors what the user
+/// already typed:
+///
+/// 1. **Replace-range** — when the cursor sits mid-identifier
+///    (`x.cha|rs()`), convert each item's `insert_text` into an
+///    explicit `TextEdit` that spans the whole word
+///    (`[ident_start..ident_end]`). Without this, editors that follow
+///    the LSP literally insert at the cursor and leave the suffix
+///    behind (`x.endsWith()chars()`). When there's no identifier under
+///    the cursor (`x.|`), we leave `insert_text` alone — editors apply
+///    their own prefix-deletion heuristic and the existing shape is
+///    correct.
+///
+/// 2. **Call-parens** — for FUNCTION / METHOD items whose `(...)` isn't
+///    already present immediately after the identifier, append `($0)`
+///    and switch to `InsertTextFormat::SNIPPET` so the cursor lands
+///    between the parens. The "parens already there" check probes the
+///    byte right after `ident_end`, *not* the cursor — so on
+///    `x.|chars()` (cursor before `chars`, parens after `chars`) the
+///    snippet is suppressed because the user already opened the call.
+///
+/// Skips items already carrying a `SNIPPET` body (e.g. pragma
+/// templates like `@library("$1", "$2")`) for the call-paren rewrite,
+/// and skips items already carrying their own `text_edit` for the
+/// replace-range conversion.
+fn apply_call_paren_snippet(items: &mut [CompletionItem], text: &str, cursor_byte: usize) {
+    let prefix_len = ident_prefix_at_cursor(text, cursor_byte).len();
+    let suffix_len = ident_suffix_at_cursor(text, cursor_byte).len();
+    let ident_start = cursor_byte.saturating_sub(prefix_len);
+    let ident_end = cursor_byte + suffix_len;
+    let parens_already_there = next_non_ws_is_open_paren(text.as_bytes(), ident_end);
+    let replace_range =
+        (suffix_len > 0).then(|| byte_range_to_lsp_range(text, &(ident_start..ident_end)));
+
+    for item in items.iter_mut() {
+        // 1) Append `($0)` to FUNCTION / METHOD items unless the
+        //    surrounding source already opens the call.
+        if !parens_already_there
+            && matches!(
+                item.kind,
+                Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::METHOD)
+            )
+            && !matches!(item.insert_text_format, Some(InsertTextFormat::SNIPPET))
+        {
+            let base = item
+                .insert_text
+                .clone()
+                .unwrap_or_else(|| item.label.clone());
+            item.insert_text = Some(format!("{base}($0)"));
+            item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+        }
+
+        // 2) When the cursor is mid-identifier, lift `insert_text` into
+        //    a `TextEdit` covering the full word so the editor replaces
+        //    `chars` (rather than inserting between `.` and `chars`).
+        //    `text_edit` already set by an upstream emitter wins.
+        if let Some(range) = replace_range
+            && item.text_edit.is_none()
+        {
+            let new_text = item
+                .insert_text
+                .clone()
+                .unwrap_or_else(|| item.label.clone());
+            item.text_edit = Some(CompletionTextEdit::Edit(TextEdit { range, new_text }));
+        }
+    }
+}
+
+/// Word characters appearing immediately after `cursor_byte`. Mirrors
+/// [`ident_prefix_at_cursor`]'s walk but goes forward instead of
+/// backward.
+fn ident_suffix_at_cursor(text: &str, cursor_byte: usize) -> &str {
+    let bytes = text.as_bytes();
+    let mut end = cursor_byte;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+    &text[cursor_byte..end]
+}
+
+fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
+    let mut i = cursor_byte;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    i < bytes.len() && bytes[i] == b'('
 }
 
 /// Render the right-side `detail` string for a scope-visible name —

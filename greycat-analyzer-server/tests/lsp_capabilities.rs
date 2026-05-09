@@ -1736,6 +1736,237 @@ fn completion_in_module_local_carries_inferred_type_detail() {
     );
 }
 
+/// FUNCTION completion items auto-append `($0)` (snippet format) so
+/// accepting `helper` rewrites to `helper(<cursor>)`. Skipped when the
+/// next non-whitespace byte after the cursor is already `(` — in
+/// `helper|()` the user already opened the call.
+#[test]
+fn completion_function_item_appends_call_parens() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn helper(x: int): int { return x; }\nfn main() {\n  h\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let helper = list
+        .items
+        .iter()
+        .find(|i| i.label == "helper")
+        .expect("`helper` should appear");
+    assert_eq!(
+        helper.insert_text.as_deref(),
+        Some("helper($0)"),
+        "expected snippet body with `($0)` placeholder; got {:?}",
+        helper.insert_text
+    );
+    assert_eq!(
+        helper.insert_text_format,
+        Some(InsertTextFormat::SNIPPET),
+        "expected SNIPPET insert_text_format so the editor honors `$0`"
+    );
+}
+
+/// Variables / types must NOT be rewritten — only FUNCTION / METHOD
+/// items get the call-parens.
+#[test]
+fn completion_variable_item_does_not_append_parens() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() {\n  var counter = 0;\n  c\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let counter = list
+        .items
+        .iter()
+        .find(|i| i.label == "counter")
+        .expect("`counter` should appear");
+    assert_eq!(
+        counter.insert_text.as_deref(),
+        Some("counter"),
+        "VARIABLE items must keep their bare name; got {:?}",
+        counter.insert_text
+    );
+    assert_ne!(
+        counter.insert_text_format,
+        Some(InsertTextFormat::SNIPPET),
+        "VARIABLE items must not become SNIPPETs"
+    );
+}
+
+/// When the cursor is followed by an open-paren (e.g. user backspaced
+/// inside `helper(...)`), the snippet rewrite is skipped to avoid
+/// `helper($0)()`.
+#[test]
+fn completion_skips_call_parens_when_already_present() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn helper(x: int): int { return x; }\nfn main() {\n  h(1)\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor is after `h`, just before `(`.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let helper = list
+        .items
+        .iter()
+        .find(|i| i.label == "helper")
+        .expect("`helper` should appear");
+    assert_eq!(
+        helper.insert_text.as_deref(),
+        Some("helper"),
+        "should not append `($0)` when cursor is followed by `(`; got {:?}",
+        helper.insert_text
+    );
+}
+
+/// Regression: when the cursor sits mid-identifier (`x.|chars()`),
+/// accepting a different completion (`endsWith`) must replace the
+/// existing word and not concatenate with it. Without the
+/// `text_edit` replace-range, editors that follow the LSP literally
+/// produce `x.endsWith()chars()`. With it, the result is
+/// `x.endsWith()` — the existing `()` after `chars` is preserved AND
+/// the call-paren rewrite is suppressed (parens already there).
+#[test]
+fn completion_mid_identifier_replaces_whole_word() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Wrapped {\n  fn chars(): int { return 0; }\n  fn endsWith(s: String): bool { return true; }\n}\nfn test(x: Wrapped) {\n  x.chars()\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // `  x.chars()` → cursor between `.` and `c` of `chars` (col 4).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(5, 4),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let ends_with = list
+        .items
+        .iter()
+        .find(|i| i.label == "endsWith")
+        .expect("`endsWith` should appear in member completion");
+
+    // Item must carry an explicit replace-range covering `chars`.
+    let CompletionTextEdit::Edit(edit) = ends_with.text_edit.as_ref().expect(
+        "expected an explicit text_edit so the editor replaces `chars` rather than \
+             inserting next to it",
+    ) else {
+        panic!(
+            "expected a plain TextEdit (not InsertReplaceEdit); got {:?}",
+            ends_with.text_edit
+        );
+    };
+    assert_eq!(
+        edit.range,
+        lsp_types::Range {
+            start: pos(5, 4),
+            end: pos(5, 9),
+        },
+        "TextEdit range should cover the existing `chars` identifier",
+    );
+    // Existing `()` after `chars` means we skip the auto-paren snippet.
+    assert_eq!(
+        edit.new_text, "endsWith",
+        "should not append `($0)` when parens follow the replaced ident; got {:?}",
+        edit.new_text,
+    );
+}
+
+/// Pragma completion items already use SNIPPET bodies (e.g.
+/// `@library("$1", "$2")`); the call-paren rewrite must leave those
+/// untouched.
+#[test]
+fn completion_pragma_snippet_not_clobbered_by_call_parens() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(user_uri.clone(), "@li\n", "project", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(0, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let lib = list
+        .items
+        .iter()
+        .find(|i| i.label == "@library")
+        .expect("`@library` pragma should appear");
+    assert!(
+        lib.insert_text
+            .as_deref()
+            .is_some_and(|t| !t.ends_with("($0)")),
+        "pragma snippet body should be preserved, not appended-to; got {:?}",
+        lib.insert_text
+    );
+}
+
 /// In-module module-level decls surface their full signature in
 /// `CompletionItem.detail`. No `label_details.description` because the
 /// decl is intra-module — the foreign-provenance footnote only applies
