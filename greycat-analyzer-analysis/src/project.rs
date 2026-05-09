@@ -163,6 +163,22 @@ impl ProjectAnalysis {
         // member-access / call iterables that's `any` until 3.4 / 3.5
         // settle.
         self.rebind_for_in_iter_types();
+        // Fixed-point loop (P16.4 cascade closure): each pass propagates
+        // type information one hop. For nested for-ins like
+        // `for (g in groups) { for (p in g->packages) { ... } }` the
+        // outer rebind types `g`, then the next iteration re-resolves
+        // `g->packages` against the now-typed receiver, and so on.
+        // Bound at 5 iterations so a degenerate/cyclic case doesn't hang;
+        // the typical chain depth in real corpora is 2-3.
+        for _ in 0..5 {
+            let mut changed = false;
+            changed |= self.propagate_member_types_from_current();
+            let _ = self.infer_cross_module_call_types();
+            self.rebind_for_in_iter_types();
+            if !changed {
+                break;
+            }
+        }
         // Pass 3.55 (P16.6): typed lint — `arrow-on-non-deref`. Runs
         // after the cross-module type fixups so receiver types reflect
         // foreign decls. Idempotent on re-entry: clear the rule's prior
@@ -255,6 +271,170 @@ impl ProjectAnalysis {
     /// `var x = recv.attr` and method-ref shapes carry the right type
     /// instead of the placeholder `any`. Mirrors the
     /// `read_type_shape` + `mint_type_shape` pattern from pass 3.5.
+    /// Pass 3.45 — propagate Member/Arrow expression types from the
+    /// receiver's current type. The original cross-module member
+    /// pass (3.4) only fired when pass 2 had already classified the
+    /// property as a foreign member; for cascades (`g->packages`
+    /// where `g`'s type wasn't settled until 3.52) that machinery
+    /// never engaged. This pass walks every `Expr::Member`/`Expr::Arrow`
+    /// and tries to resolve its property against the receiver's
+    /// *current* `expr_types`, applying generic substitution from the
+    /// receiver's instantiation. Returns `true` when any `expr_types`
+    /// entry was updated — the caller loops until stable.
+    fn propagate_member_types_from_current(&mut self) -> bool {
+        use crate::analyzer::MemberDef;
+        use greycat_analyzer_hir::types::{Decl, Expr};
+        use greycat_analyzer_types::TypeKind;
+
+        type Update = (Idx<Expr>, TypeShape, Option<MemberDef>);
+        #[allow(clippy::mutable_key_type)]
+        let mut updates: HashMap<Uri, Vec<Update>> = HashMap::new();
+
+        for (cur_uri, cur_module) in &self.modules {
+            for (expr_id, expr) in cur_module.hir.exprs.iter() {
+                let (property_idx, is_arrow) = match expr {
+                    Expr::Member(m) => (m.property, false),
+                    Expr::Arrow(m) => (m.property, true),
+                    _ => continue,
+                };
+                let receiver = match expr {
+                    Expr::Member(m) | Expr::Arrow(m) => m.receiver,
+                    _ => unreachable!(),
+                };
+                // Skip exprs already typed to something concrete — the
+                // analyzer's first pass / 3.4 already settled them.
+                let already_typed = cur_module
+                    .analysis
+                    .expr_types
+                    .get(&expr_id)
+                    .map(|t| !matches!(cur_module.analysis.types.get(*t).kind, TypeKind::Any))
+                    .unwrap_or(false);
+                if already_typed {
+                    continue;
+                }
+                let Some(receiver_ty) = cur_module.analysis.expr_types.get(&receiver).copied()
+                else {
+                    continue;
+                };
+                if matches!(
+                    cur_module.analysis.types.get(receiver_ty).kind,
+                    TypeKind::Any
+                ) {
+                    continue;
+                }
+                // For arrow expressions on a node-tag receiver
+                // (`node<T>` etc.) deref to inner T. Mirror of the
+                // analyzer's `arrow_deref_receiver`.
+                let lookup_ty = if is_arrow {
+                    match cur_module.analysis.types.get(receiver_ty).kind.clone() {
+                        TypeKind::Generic { name, args }
+                            if greycat_analyzer_types::is_node_tag(&name) && args.len() == 1 =>
+                        {
+                            args[0]
+                        }
+                        _ => receiver_ty,
+                    }
+                } else {
+                    receiver_ty
+                };
+                let (type_name, instantiation) =
+                    match cur_module.analysis.types.get(lookup_ty).kind.clone() {
+                        TypeKind::Named { name } => (name, Vec::new()),
+                        TypeKind::Generic { name, args } => (name, args),
+                        TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
+                        _ => continue,
+                    };
+                let property_text = cur_module.hir.idents[property_idx].text.clone();
+
+                // Look up the type decl: own module first, then via
+                // the project index for cross-module hits.
+                let (host_module, host_decl_id) = if let Some(decl_id) =
+                    cur_module.analysis.type_decls.get(&type_name).copied()
+                {
+                    (cur_module, decl_id)
+                } else if let Some((host_uri, host_decl_id)) =
+                    self.index.locate_decl(&type_name).iter().next()
+                {
+                    let Some(m) = self.modules.get(host_uri) else {
+                        continue;
+                    };
+                    (m, *host_decl_id)
+                } else {
+                    continue;
+                };
+                let Decl::Type(td) = &host_module.hir.decls[host_decl_id] else {
+                    continue;
+                };
+                // Build the substitution map from the type's generic
+                // params to the receiver's instantiation args.
+                let mut subst: HashMap<String, TypeShape> = HashMap::new();
+                for (gp_idx, name_idx) in td.generics.iter().enumerate() {
+                    let gp_name = host_module.hir.idents[*name_idx].text.clone();
+                    let arg_shape = instantiation
+                        .get(gp_idx)
+                        .map(|a| read_type_id_shape(&cur_module.analysis.types, *a))
+                        .unwrap_or(TypeShape::Any);
+                    subst.insert(gp_name, arg_shape);
+                }
+                // Find property among attrs / methods.
+                let mut match_shape: Option<TypeShape> = None;
+                let mut match_member: Option<MemberDef> = None;
+                for attr_id in &td.attrs {
+                    let attr = &host_module.hir.type_attrs[*attr_id];
+                    if host_module.hir.idents[attr.name].text == property_text {
+                        let shape = match attr.ty {
+                            Some(t) => read_type_shape_subst(&host_module.hir, t, &subst),
+                            None => TypeShape::Any,
+                        };
+                        match_shape = Some(shape);
+                        match_member = Some(MemberDef::Attr(*attr_id));
+                        break;
+                    }
+                }
+                if match_shape.is_none() {
+                    for method_id in &td.methods {
+                        let Decl::Fn(fnd) = &host_module.hir.decls[*method_id] else {
+                            continue;
+                        };
+                        if host_module.hir.idents[fnd.name].text == property_text {
+                            match_shape = Some(TypeShape::Named {
+                                name: "function".to_string(),
+                                params: vec![],
+                            });
+                            match_member = Some(MemberDef::Method(*method_id));
+                            break;
+                        }
+                    }
+                }
+                if let (Some(shape), Some(_member)) = (match_shape, match_member) {
+                    updates
+                        .entry(cur_uri.clone())
+                        .or_default()
+                        .push((expr_id, shape, None));
+                }
+            }
+        }
+
+        // Phase 2 — apply.
+        let mut changed = false;
+        for (uri, entries) in updates {
+            let Some(m) = self.modules.get_mut(&uri) else {
+                continue;
+            };
+            for (expr_id, shape, _member) in entries {
+                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                let prev = m.analysis.expr_types.insert(expr_id, ty);
+                if prev != Some(ty) {
+                    changed = true;
+                }
+            }
+            // Refresh Ident expr_types from updated def_types — pure
+            // pass-through, but matches what 3.52 does for for-in
+            // params and keeps the loop's invariant tidy.
+        }
+        changed
+    }
+
     /// Pass 3.52 — after `infer_cross_module_member_types` and
     /// `infer_cross_module_call_types` have settled the iterable's
     /// type, re-derive the iteration variables' types. The analyzer's
@@ -2035,9 +2215,36 @@ fn read_type_shape(
     hir: &Hir,
     type_ref_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
 ) -> TypeShape {
+    read_type_shape_subst(hir, type_ref_id, &HashMap::new())
+}
+
+/// `read_type_shape` extended with a generic-param substitution map.
+/// When a `TypeRef`'s name matches a key in `subst`, the corresponding
+/// `TypeShape` (already in the *caller's* arena namespace via
+/// `read_type_id_shape`) replaces it. Powers cross-module generic
+/// method-return / attr-type substitution: e.g. `nodeIndex<K, V>::get`
+/// declared as `fn get(key: K): V?` resolves with `subst = {K → String,
+/// V → node<Pkg>}` to `Optional(Named { name: "node", params: [Named "Pkg"] })`.
+fn read_type_shape_subst(
+    hir: &Hir,
+    type_ref_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
+    subst: &HashMap<String, TypeShape>,
+) -> TypeShape {
     use greycat_analyzer_types::Primitive;
     let tr = &hir.type_refs[type_ref_id];
     let name = hir.idents[tr.name].text.as_str();
+    if let Some(replacement) = subst.get(name) {
+        // Generic-param substitution wins, including over the optional
+        // marker — the substituted TypeShape may itself already be
+        // optional. Wrap nullable when the *use site's* TypeRef was
+        // `T?` (only if not already optional).
+        let r = replacement.clone();
+        return if tr.optional && !matches!(&r, TypeShape::Optional(_)) {
+            TypeShape::Optional(Box::new(r))
+        } else {
+            r
+        };
+    }
     let base = match name {
         "bool" => TypeShape::Primitive(Primitive::Bool),
         "int" => TypeShape::Primitive(Primitive::Int),
@@ -2050,8 +2257,11 @@ fn read_type_shape(
         "any" => TypeShape::Any,
         "null" => TypeShape::Null,
         _ => {
-            let params: Vec<TypeShape> =
-                tr.params.iter().map(|p| read_type_shape(hir, *p)).collect();
+            let params: Vec<TypeShape> = tr
+                .params
+                .iter()
+                .map(|p| read_type_shape_subst(hir, *p, subst))
+                .collect();
             TypeShape::Named {
                 name: name.to_string(),
                 params,
