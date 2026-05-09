@@ -237,7 +237,10 @@ impl SourceManager {
         // the disk read so we don't clobber unsaved in-editor edits.
         // Closed-and-externally-edited files are refreshed via the
         // explicit `did_change_watched_files` path, not here.
+        // **P19.23** — record in `reachable` regardless of whether we
+        // re-read or skipped, so eviction can compute the full closure.
         if self.documents.contains_key(&uri) {
+            report.reachable.push(uri.clone());
             return Some(uri);
         }
         // P14.5: split the read and parse phases so cli `lint --csv`
@@ -261,7 +264,38 @@ impl SourceManager {
         report
             .loaded
             .push((uri.clone(), LoadTimings { read, parse }));
+        report.reachable.push(uri.clone());
         Some(uri)
+    }
+
+    /// **P19.23** — drop every document NOT in `reachable` (and not
+    /// currently opened by the editor). Returns the URIs evicted, so
+    /// the LSP layer can publish empty diagnostics for them.
+    ///
+    /// Opened documents are preserved unconditionally: the editor owns
+    /// their live state, and a transient pragma edit shouldn't yank a
+    /// buffer the user is typing into. They'll fall out naturally on
+    /// `did_close` or when the user removes the pragma AND closes the
+    /// buffer.
+    #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a HashMap/Set key in practice.
+    pub fn evict_unreachable(&mut self, reachable: &HashSet<Uri>) -> Vec<Uri> {
+        let to_remove: Vec<Uri> = self
+            .documents
+            .iter()
+            .filter_map(|(uri, cell)| {
+                if reachable.contains(uri) {
+                    return None;
+                }
+                if cell.borrow().opened {
+                    return None;
+                }
+                Some(uri.clone())
+            })
+            .collect();
+        for uri in &to_remove {
+            self.documents.remove(uri);
+        }
+        to_remove
     }
 }
 
@@ -295,6 +329,13 @@ pub struct LoadReport {
     /// P14.5 restored and enriched the per-file timing the flat
     /// `iter_gcl` walk used to surface in cli `lint --csv`.
     pub loaded: Vec<(Uri, LoadTimings)>,
+    /// **P19.23** — every URI reachable from the entrypoint through
+    /// `@library` / `@include` traversal, *including* files that were
+    /// already in the manager (and therefore absent from `loaded`
+    /// after the P19.22 idempotency change). Consumers that need to
+    /// evict no-longer-reachable docs (LSP `reload_project_closure`)
+    /// take the difference between `manager.iter()` and this set.
+    pub reachable: Vec<Uri>,
     /// `@library` declarations that couldn't be resolved to a directory.
     /// Surface these as diagnostics in P1.4.
     pub unresolved_libraries: Vec<String>,

@@ -264,24 +264,66 @@ impl Backend {
         let load_start = Instant::now();
         let report = self.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
-        let new_files = report.loaded.len();
         for lib in &report.unresolved_libraries {
             warn!("unresolved @library('{lib}') in {}", project_file.display());
         }
         for err in &report.errors {
             warn!("[reload_project] {err}");
         }
+        // **P19.23** — evict modules that are no longer in the
+        // project's reachable closure (e.g., the user commented out an
+        // `@library` line). Without this, types the lib exposed would
+        // still resolve and the editor would silently miss the
+        // resulting "unknown type" errors. `evict_unreachable` skips
+        // opened buffers — those stay until `did_close` / explicit
+        // user action.
+        #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
+        let reachable: std::collections::HashSet<Uri> = report.reachable.iter().cloned().collect();
+        let evicted = self.manager.evict_unreachable(&reachable);
+        if !evicted.is_empty() {
+            info!(
+                "[reload_project] evicted {} unreachable file(s):",
+                evicted.len()
+            );
+            for uri in &evicted {
+                info!("[reload_project]   - {}", uri.as_str());
+            }
+        }
+        // Log additions explicitly too — symmetric with eviction so the
+        // user can see project-closure changes in the LSP output.
+        if !report.loaded.is_empty() {
+            info!(
+                "[reload_project] loaded {} new file(s):",
+                report.loaded.len()
+            );
+            for (uri, _) in &report.loaded {
+                info!("[reload_project]   + {}", uri.as_str());
+            }
+        }
         let rebuild_start = Instant::now();
         self.project_analysis.rebuild(&self.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
-            "[reload_project] {new_files} new file(s) in {load_took:?} (parse+load) + {rebuild_took:?} (analyze)"
+            "[reload_project] {load_took:?} (parse+load) + {rebuild_took:?} (analyze) — closure: {} reachable, {} added, {} evicted",
+            report.reachable.len(),
+            report.loaded.len(),
+            evicted.len(),
         );
+        // Clear diagnostics for evicted URIs so the editor's stale
+        // entries disappear.
+        for uri in &evicted {
+            if let Err(e) = self.publish_diagnostics(uri.clone(), Vec::new(), None) {
+                warn!("clear-diagnostics({}) failed: {e}", uri.as_str());
+            }
+        }
         // Republish for every newly-loaded module so the editor sees
-        // their diagnostics immediately. The entrypoint itself is
-        // republished by the caller's `publish_for`.
-        for (uri, _) in report.loaded {
-            if let Err(e) = self.publish_for(&uri) {
+        // their diagnostics immediately. Also republish for the rest of
+        // the reachable closure since the rebuild may have changed
+        // diagnostics on files that were already loaded (e.g., the
+        // project entrypoint goes from "all good" to "unknown library"
+        // when an `@library` line is commented out).
+        for uri in &report.reachable {
+            if let Err(e) = self.publish_for(uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
             }
         }
