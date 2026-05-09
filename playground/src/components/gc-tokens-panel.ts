@@ -3,6 +3,7 @@
 import { html, css, type TemplateResult } from "lit";
 import { customElement } from "lit/decorators.js";
 import { GcBasePanel } from "./gc-base-panel.ts";
+import type { Analyzer } from "../analyzer-client.ts";
 
 interface Token {
   kind: string;
@@ -47,8 +48,8 @@ export class GcTokensPanel extends GcBasePanel {
     `,
   ];
 
-  protected compute(wasm: any, source: string): TemplateResult {
-    const tokens = wasm.tokens(source) as Token[];
+  protected async compute(analyzer: Analyzer, source: string): Promise<TemplateResult> {
+    const tokens = (await analyzer.tokens(source)) as Token[];
     return html`
       <table>
         <thead>

@@ -5,6 +5,7 @@
 import { html, css, type TemplateResult } from "lit";
 import { customElement } from "lit/decorators.js";
 import { GcBasePanel } from "./gc-base-panel.ts";
+import type { Analyzer } from "../analyzer-client.ts";
 
 interface HirSummary {
   module_name: string;
@@ -67,8 +68,8 @@ export class GcHirPanel extends GcBasePanel {
     `,
   ];
 
-  protected compute(wasm: any, source: string): TemplateResult {
-    const hir = wasm.lower_hir(source) as HirSummary;
+  protected async compute(analyzer: Analyzer, source: string): Promise<TemplateResult> {
+    const hir = (await analyzer.lower_hir(source)) as HirSummary;
     return html`
       <h3>${hir.module_name}</h3>
       <div class="meta">lib = <code>${hir.lib}</code></div>

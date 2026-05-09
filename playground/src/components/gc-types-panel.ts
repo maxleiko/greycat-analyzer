@@ -4,6 +4,7 @@
 import { html, css, type TemplateResult } from "lit";
 import { customElement } from "lit/decorators.js";
 import { GcBasePanel } from "./gc-base-panel.ts";
+import type { Analyzer } from "../analyzer-client.ts";
 
 interface ExprType {
   range: { start: number; end: number };
@@ -45,10 +46,9 @@ export class GcTypesPanel extends GcBasePanel {
     `,
   ];
 
-  protected compute(wasm: any, source: string): TemplateResult {
-    const list = (wasm.infer_types(source) as ExprType[])
-      .slice()
-      .sort((a, b) => a.range.start - b.range.start);
+  protected async compute(analyzer: Analyzer, source: string): Promise<TemplateResult> {
+    const raw = (await analyzer.infer_types(source)) as ExprType[];
+    const list = raw.slice().sort((a, b) => a.range.start - b.range.start);
     return html`
       <table>
         <thead>

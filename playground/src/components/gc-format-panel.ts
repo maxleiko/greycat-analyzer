@@ -4,6 +4,7 @@
 import { html, css, type TemplateResult } from "lit";
 import { customElement } from "lit/decorators.js";
 import { GcBasePanel } from "./gc-base-panel.ts";
+import type { Analyzer } from "../analyzer-client.ts";
 
 @customElement("gc-format-panel")
 export class GcFormatPanel extends GcBasePanel {
@@ -51,8 +52,8 @@ export class GcFormatPanel extends GcBasePanel {
     `,
   ];
 
-  protected compute(wasm: any, source: string): TemplateResult {
-    const formatted = wasm.format(source) as string;
+  protected async compute(analyzer: Analyzer, source: string): Promise<TemplateResult> {
+    const formatted = await analyzer.format(source);
     const clean = formatted === source;
     return html`
       <div class="badges">

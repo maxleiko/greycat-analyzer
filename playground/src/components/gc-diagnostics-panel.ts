@@ -4,6 +4,7 @@
 import { html, css, type TemplateResult } from "lit";
 import { customElement } from "lit/decorators.js";
 import { GcBasePanel } from "./gc-base-panel.ts";
+import type { Analyzer } from "../analyzer-client.ts";
 
 interface Diagnostic {
   severity: "error" | "warning" | "hint";
@@ -72,8 +73,9 @@ export class GcDiagnosticsPanel extends GcBasePanel {
     `,
   ];
 
-  protected compute(wasm: any, source: string): TemplateResult {
-    const diags = (wasm.diagnostics(source) as Diagnostic[])
+  protected async compute(analyzer: Analyzer, source: string): Promise<TemplateResult> {
+    const raw = (await analyzer.diagnostics(source)) as Diagnostic[];
+    const diags = raw
       .slice()
       .sort((a, b) => a.start.line - b.start.line || a.start.column - b.start.column);
 

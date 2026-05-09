@@ -5,6 +5,7 @@
 import { html, css, type TemplateResult } from "lit";
 import { customElement } from "lit/decorators.js";
 import { GcBasePanel } from "./gc-base-panel.ts";
+import type { Analyzer } from "../analyzer-client.ts";
 
 interface CstNode {
   kind: string;
@@ -65,8 +66,8 @@ export class GcCstPanel extends GcBasePanel {
     `,
   ];
 
-  protected compute(wasm: any, source: string): TemplateResult {
-    const root = wasm.parse_tree(source) as CstNode;
+  protected async compute(analyzer: Analyzer, source: string): Promise<TemplateResult> {
+    const root = (await analyzer.parse_tree(source)) as CstNode;
     return html`<div>${this.renderNode(root)}</div>`;
   }
 
