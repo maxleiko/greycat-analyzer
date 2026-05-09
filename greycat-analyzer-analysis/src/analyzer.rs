@@ -2686,12 +2686,29 @@ impl<'a> Cx<'a> {
                         // narrows the operand binding for the rest of the
                         // enclosing block when the operand is an Ident
                         // bound to a Param/Local.
+                        //
+                        // **P20.2** — when the operand is a stable
+                        // member-access path (`x.y`, `this.foo.bar`,
+                        // `x->y`), record the path on the
+                        // `member_narrows` stack so subsequent reads of
+                        // the same path strip the nullable bit at the
+                        // bottom of the `Expr::Member` / `Expr::Arrow`
+                        // arm (the same site P19.16 / P19.21 use for
+                        // `!= null` / `?=` narrows). The narrow
+                        // correctly drops on assignment to the path
+                        // (existing `record_assign_narrow` clears it
+                        // when the RHS is nullable).
                         let result = self.strip_nullable(inner);
                         if let Expr::Ident(name_idx) = self.hir.exprs[operand].clone()
                             && let Some(Definition::Param(def) | Definition::Local(def)) =
                                 self.res.lookup(name_idx)
                         {
                             self.write_narrow(def, result);
+                        }
+                        if matches!(self.hir.exprs[operand], Expr::Member(_) | Expr::Arrow(_))
+                            && let Some(path) = self.member_path(operand)
+                        {
+                            self.write_member_non_null(path);
                         }
                         result
                     }

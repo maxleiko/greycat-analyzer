@@ -1463,6 +1463,75 @@ fn f(x: node<Outer>) {
     }
 
     #[test]
+    fn member_path_bang_bang_narrows_subsequent_reads() {
+        // **P20.2** — `x.y!!` should narrow subsequent reads of the
+        // same path (`x.y[0]`, `x.y.size()`) to non-null. Without the
+        // narrow, every following access re-fires `possibly-null` on
+        // the same field the user just asserted.
+        let diags = project_lints(
+            r#"
+type Channel { name: String?; }
+type Meta { channels: Array<Channel>?; }
+fn f(meta: Meta) {
+    var _ = meta.channels!!.size();
+    var _ = meta.channels[0];
+    var _ = meta.channels[1];
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "subsequent reads of a `!!`-asserted member path should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_path_bang_bang_narrows_subsequent_reads() {
+        // **P20.2** — same shape as the dot case but for `->`. Path
+        // keys carry the operator, so dot-narrows and arrow-narrows
+        // don't share state.
+        let diags = project_lints(
+            r#"
+type Inner { items: Array<int>?; }
+type Outer { inner: Inner?; }
+fn f(x: node<Outer>) {
+    var _ = x->inner!!.items;
+    var _ = x->inner.items;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "subsequent reads of an `x->y!!`-asserted arrow path should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn member_path_bang_bang_narrow_drops_after_reassignment() {
+        // **P20.2** — after `x.y!!` records the path as non-null,
+        // a later `x.y = some_nullable` must drop the narrow so the
+        // post-assign read sees the (re-introduced) nullable type.
+        // This rides on the existing `record_assign_narrow` clear
+        // path; the test pins the integration.
+        let diags = project_lints(
+            r#"
+type Inner { name: String?; }
+type Outer { y: Inner?; }
+fn maybe(): Inner? { return null; }
+fn f(x: Outer) {
+    var _ = x.y!!.name;
+    x.y = maybe();
+    var _ = x.y.name;
+}
+"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "possibly-null"),
+            "post-reassignment read should re-flag possibly-null: {diags:?}"
+        );
+    }
+
+    #[test]
     fn nullability_lints_skip_any_receiver() {
         // `any` carries `nullable: true` in the arena, so a naive
         // `is_nullable` check would over-fire on every untyped value.
