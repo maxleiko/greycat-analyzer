@@ -228,7 +228,17 @@ impl SourceManager {
     ) -> Option<Uri> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if !visited.insert(canonical.clone()) {
-            return None; // already loaded — cycle-safe
+            return None; // already loaded in this call — cycle-safe
+        }
+        let uri = path_to_uri(&canonical);
+        // **P19.22** — idempotent across `load_project` calls. If the
+        // document is already in the manager (because the LSP did_open
+        // landed first, or a prior `load_project` populated it), skip
+        // the disk read so we don't clobber unsaved in-editor edits.
+        // Closed-and-externally-edited files are refreshed via the
+        // explicit `did_change_watched_files` path, not here.
+        if self.documents.contains_key(&uri) {
+            return Some(uri);
         }
         // P14.5: split the read and parse phases so cli `lint --csv`
         // can surface them separately. `add_simple` triggers the
@@ -245,7 +255,6 @@ impl SourceManager {
             }
         };
         let read = read_start.elapsed();
-        let uri = path_to_uri(&canonical);
         let parse_start = Instant::now();
         self.add_simple(uri.clone(), text, lib, false);
         let parse = parse_start.elapsed();
@@ -472,6 +481,57 @@ mod tests {
         let report = mgr.load_project(Path::new("/proj/project.gcl"));
         assert_eq!(report.loaded.len(), 1); // just the project.gcl
         assert_eq!(report.unresolved_libraries, vec!["missing".to_string()]);
+    }
+
+    /// **P19.22** — `load_project` must be idempotent across calls so
+    /// the LSP can re-walk pragmas after an in-editor edit without
+    /// clobbering unsaved buffers (the editor owns the live state via
+    /// `did_change`). Concretely: pre-populate the entrypoint with a
+    /// fresh in-memory text, then call `load_project` against a
+    /// *different* on-disk version; the in-memory text must survive
+    /// and only the newly-referenced files should be loaded.
+    #[test]
+    fn load_project_preserves_in_memory_documents() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        // On-disk version has no `@include`. The in-memory edit
+        // we'll seed below adds one — this simulates the user
+        // typing `@include("src");` in the editor.
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "fn main() {}\n");
+        ctx.add_file(PathBuf::from("/proj/src/a.gcl"), "fn a() {}\n");
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        // Seed the manager with the in-editor (newer) content. `opened
+        // = true` mirrors what `Backend::did_open` does.
+        mgr.add_simple(
+            uri("/proj/project.gcl"),
+            "@include(\"src\");\nfn main() {}\n",
+            "project",
+            true,
+        );
+
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+
+        // Only `src/a.gcl` should appear in `loaded` — project.gcl was
+        // already in the manager and must NOT be re-read from disk.
+        assert_eq!(
+            report.loaded.len(),
+            1,
+            "expected only src/a.gcl as new; got: {:?}",
+            report.loaded
+        );
+        assert_eq!(report.loaded[0].0.as_str(), "file:///proj/src/a.gcl");
+
+        // The in-editor version must survive the re-walk.
+        let entry = mgr.get(&uri("/proj/project.gcl")).unwrap().borrow();
+        assert!(entry.opened, "opened flag must be preserved");
+        assert!(
+            entry.text.contains("@include"),
+            "in-editor pragma must survive: text={:?}",
+            entry.text
+        );
     }
 
     #[test]

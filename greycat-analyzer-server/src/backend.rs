@@ -13,6 +13,7 @@ use log::{debug, info, warn};
 use lsp_server::*;
 use lsp_types::{
     notification::{Notification as _, PublishDiagnostics},
+    request::{RegisterCapability, Request as _},
     *,
 };
 
@@ -97,6 +98,59 @@ impl Backend {
                 self.load_workspace(&ws.uri);
             }
         }
+        // **P19.22** — register a workspace file watcher so external
+        // tools (notably `greycat install` populating `lib/installed`
+        // and `lib/<name>/...`) trigger a project reload. Mirrors the
+        // TS reference's index.ts:294 registration. Gated on the
+        // client supporting dynamic registration of watched files.
+        let supports_watch = init
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false);
+        if supports_watch {
+            self.register_file_watchers()?;
+        } else {
+            debug!("[init] client does not support didChangeWatchedFiles dynamic registration");
+        }
+        Ok(())
+    }
+
+    /// Send `client/registerCapability` to ask the editor to forward
+    /// filesystem create/change/delete events for `*.gcl` files and
+    /// `lib/installed` manifests. The response handler in `server.rs`
+    /// just logs it — registration is fire-and-forget from our side.
+    fn register_file_watchers(&self) -> Result<()> {
+        let watchers = vec![
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/*.gcl".into()),
+                kind: None, // default = create | change | delete
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/lib/installed".into()),
+                kind: None,
+            },
+        ];
+        let registration = Registration {
+            id: "greycat-analyzer-file-watch".into(),
+            method: "workspace/didChangeWatchedFiles".into(),
+            register_options: Some(serde_json::to_value(
+                DidChangeWatchedFilesRegistrationOptions { watchers },
+            )?),
+        };
+        let params = RegistrationParams {
+            registrations: vec![registration],
+        };
+        // Use a deterministic id so we can recognize the response in
+        // the main loop's debug log even if multiple registrations land.
+        let req = Request {
+            id: RequestId::from("register-file-watch".to_string()),
+            method: RegisterCapability::METHOD.into(),
+            params: serde_json::to_value(params)?,
+        };
+        self.client.send(Message::Request(req))?;
         Ok(())
     }
 
@@ -162,9 +216,75 @@ impl Backend {
             .update(&uri, params.content_changes, params.text_document.version);
         debug!("[did_change] {doc}");
         drop(doc);
-        self.invalidate_with_slow_warning(&uri, "did_change");
+        // **P19.22** — pragma edits to the project entrypoint can add /
+        // remove `@library` / `@include`, which changes the closure of
+        // reachable modules. The text update above only refreshes
+        // `project.gcl`'s own bytes; the resolver doesn't notice the
+        // new modules until we re-walk. Detect entrypoint edits and
+        // re-walk before invalidating so the rebuild sees the full
+        // closure.
+        if self.is_project_entrypoint(&uri) {
+            self.reload_project_closure();
+        } else {
+            self.invalidate_with_slow_warning(&uri, "did_change");
+        }
         self.publish_for(&uri)?;
         Ok(())
+    }
+
+    /// True when `uri` resolves to `<project_root>/project.gcl`. Used
+    /// to gate the re-walk on `did_change` and to dispatch `lib/installed`
+    /// / `*.gcl` events from the workspace watcher to the right project.
+    fn is_project_entrypoint(&self, uri: &Uri) -> bool {
+        let Some(root) = self.project_root.as_ref() else {
+            return false;
+        };
+        let entrypoint = root.join("project.gcl");
+        let Ok(canonical) = entrypoint.canonicalize() else {
+            return false;
+        };
+        let Some(path) = uri_to_path(uri) else {
+            return false;
+        };
+        path.canonicalize().map(|p| p == canonical).unwrap_or(false)
+    }
+
+    /// Re-walk the project entrypoint's `@library` / `@include`
+    /// closure against the current in-memory `project.gcl` and rebuild
+    /// the analysis. Idempotent: `SourceManager::load_file` skips
+    /// already-loaded files (including the in-editor entrypoint), so
+    /// only newly-referenced modules get parsed. Triggered from
+    /// `did_change` on the entrypoint and from the `lib/installed`
+    /// branch of the workspace watcher.
+    fn reload_project_closure(&mut self) {
+        let Some(root) = self.project_root.as_ref() else {
+            return;
+        };
+        let project_file = root.join("project.gcl");
+        let load_start = Instant::now();
+        let report = self.manager.load_project(&project_file);
+        let load_took = load_start.elapsed();
+        let new_files = report.loaded.len();
+        for lib in &report.unresolved_libraries {
+            warn!("unresolved @library('{lib}') in {}", project_file.display());
+        }
+        for err in &report.errors {
+            warn!("[reload_project] {err}");
+        }
+        let rebuild_start = Instant::now();
+        self.project_analysis.rebuild(&self.manager);
+        let rebuild_took = rebuild_start.elapsed();
+        info!(
+            "[reload_project] {new_files} new file(s) in {load_took:?} (parse+load) + {rebuild_took:?} (analyze)"
+        );
+        // Republish for every newly-loaded module so the editor sees
+        // their diagnostics immediately. The entrypoint itself is
+        // republished by the caller's `publish_for`.
+        for (uri, _) in report.loaded {
+            if let Err(e) = self.publish_for(&uri) {
+                warn!("publish_for({}) failed: {e}", uri.as_str());
+            }
+        }
     }
 
     /// Wrap [`ProjectAnalysis::invalidate`] with a wall-clock measure
@@ -198,6 +318,92 @@ impl Backend {
         debug!("[did_close] {}", params.text_document.uri.as_str());
         // Clear diagnostics on close so the editor's stale list goes away.
         self.publish_diagnostics(params.text_document.uri, Vec::new(), None)?;
+        Ok(())
+    }
+
+    /// **P19.22** — workspace file watcher events. Two flavors of
+    /// trigger matter to us:
+    ///
+    /// - `lib/installed` — written by `greycat install` after it
+    ///   downloads a library into `lib/<name>/`. We can't know in
+    ///   advance which files appeared; the simplest correct response
+    ///   is to re-walk the project closure (which `load_project` does
+    ///   idempotently — already-loaded files are preserved).
+    ///
+    /// - `*.gcl` outside the editor — files created or deleted by
+    ///   external tools (a `git pull` adding modules, `greycat install`
+    ///   replacing a stdlib version, etc.). Created → load + reload
+    ///   the project closure (in case it's reachable through a
+    ///   pragma); deleted → drop from the manager + reload.
+    ///
+    /// In-editor edits (`did_change`) are NOT routed through this path
+    /// — they go through the textDocument flow.
+    pub fn did_change_watched_files(&mut self, params: DidChangeWatchedFilesParams) -> Result<()> {
+        if params.changes.is_empty() {
+            return Ok(());
+        }
+        let mut needs_reload = false;
+        for ev in &params.changes {
+            let uri = &ev.uri;
+            let path = match uri_to_path(uri) {
+                Some(p) => p,
+                None => continue,
+            };
+            let is_installed = path.file_name().and_then(|n| n.to_str()) == Some("installed")
+                && path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some("lib");
+            let is_gcl = path.extension().and_then(|e| e.to_str()) == Some("gcl");
+            if is_installed {
+                debug!("[watch] {:?} on lib/installed -> reload", ev.typ);
+                needs_reload = true;
+                continue;
+            }
+            if !is_gcl {
+                continue;
+            }
+            // Skip files the editor owns the live state of — `did_change`
+            // already keeps those fresh. Only refresh closed sources.
+            let opened = self
+                .manager
+                .get(uri)
+                .map(|cell| cell.borrow().opened)
+                .unwrap_or(false);
+            if opened {
+                debug!("[watch] {:?} on opened {} -> skip", ev.typ, uri.as_str());
+                continue;
+            }
+            match ev.typ {
+                FileChangeType::CREATED => {
+                    debug!("[watch] created {}", uri.as_str());
+                    needs_reload = true;
+                }
+                FileChangeType::CHANGED => {
+                    // Refresh the closed source from disk. A change to a
+                    // non-pragma module doesn't need a project re-walk;
+                    // an `invalidate` is enough.
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        self.manager.add_simple(uri.clone(), text, "project", false);
+                        self.invalidate_with_slow_warning(uri, "watch");
+                        if let Err(e) = self.publish_for(uri) {
+                            warn!("publish_for({}) failed: {e}", uri.as_str());
+                        }
+                    }
+                }
+                FileChangeType::DELETED => {
+                    debug!("[watch] deleted {}", uri.as_str());
+                    let _ = self.manager.remove(uri);
+                    self.publish_diagnostics(uri.clone(), Vec::new(), None)?;
+                    needs_reload = true;
+                }
+                _ => {}
+            }
+        }
+        if needs_reload {
+            self.reload_project_closure();
+        }
         Ok(())
     }
 }

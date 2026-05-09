@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, info};
 use lsp_server::*;
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as _,
+    DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+    DidSaveTextDocument, Notification as _,
 };
 use lsp_types::request::{
     CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest,
@@ -148,6 +148,9 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
                 }
                 DidCloseTextDocument::METHOD => {
                     server.did_close(not.extract(DidCloseTextDocument::METHOD)?)?
+                }
+                DidChangeWatchedFiles::METHOD => {
+                    server.did_change_watched_files(not.extract(DidChangeWatchedFiles::METHOD)?)?
                 }
                 _ => debug!("got notification: {not:#?}"),
             },
