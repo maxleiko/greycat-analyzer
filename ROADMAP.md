@@ -59,13 +59,7 @@ These decisions were made during planning and are not revisited without explicit
 
 Resolved as we hit them; fold the answer into §3 when locked.
 
-- **Q1:** How do we expose runtime-only built-in functions (those whose body is in the GreyCat runtime, not in `.gcl`) so the analyzer type-checks calls to them? Probable shape: a hand-written Rust table keyed by canonical name, with signatures parsed from a stub `.gcl` file. To resolve in P2.6.
-- ~~**Q2:** Where does the conformance corpus live?~~ **Resolved (P0.5).** Two-tier:
-  1. **TS reference parser/project fixtures** — vendored at `tests/corpus/{parser,project}_fixtures/` (analyzer-port artifact, committed).
-  2. **Stdlib (`lib/std/*.gcl`)** — *not* vendored. Repo-root `project.gcl` pins the version via `@library("std", "<release>")`, and `greycat install` populates `lib/`. The coverage gauntlet checks stdlib if present, skips with a notice if not.
-  No `STDLIB_VERSION` file — the pin lives in `project.gcl`.
-- **Q3:** Version-pinning policy with upstream `lang/` — when does the Rust port chase a new TS reference release vs. lock to a known-good commit? To resolve before M3.
-- **Q4:** Tree-sitter grammar gaps — fix upstream in `tree-sitter-greycat` or work around in the syntax wrapper? Decide per-gap. **Mechanism (resolved P0.5):** the coverage gauntlet keeps a `KNOWN_GRAMMAR_GAPS` allowlist in `greycat-analyzer-syntax/tests/coverage.rs`. Each entry pins a workspace-relative file path with a comment describing the rule that needs upstream relaxation. Drop entries from the list as the grammar is fixed. **Current backlog:** 1 entry — `tests/corpus/parser_fixtures/inline_type/in.gcl` (last `type_attr` should not require trailing `;`).
+- **Q3:** Version-pinning policy with upstream `lang/` — when does the Rust port chase a new TS reference release vs. lock to a known-good commit?
 - **Q5:** WASM bundle size budget. Splitting `analysis` from `core` (Decision D) helps; quantify in P5.1.
 
 ---
@@ -101,11 +95,10 @@ Each phase ends on a milestone. Effort signals: **S** < 1 week, **M** ~1-2 weeks
 - [x] **0.1 Workspace re-shape** (S) — add `greycat-analyzer-syntax` crate; demote `greycat-analyzer-core` to "semantic glue" (will later host HIR/types).
 - [x] **0.2 Tree-sitter integration** (M) — vendor or git-dep `tree-sitter-greycat`; expose `Language`, parse function. Generate a typed-node wrapper layer in `build.rs` from `node-types.json`. (Decision A.)
 - [x] **0.3 Document/Manager port** (M) — replace bumpalo-CST inside `Document` with tree-sitter `Tree`; keep `LineIndex` and `apply_changes`, but call `tree.edit()` + `parser.parse(&new_text, Some(&old_tree))` for incremental reparse.
-- [x] **0.4 Retire old code** (S) — see §9 for the explicit deletion list.
+- [x] **0.4 Retire old code** (S) — drained the hand-rolled `cst/` / `ast/` / `lexer/` directories from `greycat-analyzer-core` and the `lex` / old `cst` CLI subcommands once tree-sitter took over scanning. Net deletion ~3.4k Rust LoC.
 - [x] **0.5 Coverage gauntlet** (S) — bulk-parse `lib/std/*.gcl` + every `.gcl` under TS reference fixtures. Assert zero `ERROR`/`MISSING` nodes. File grammar gaps upstream against `tree-sitter-greycat`.
 - [x] **0.6 Snapshot harness** (S) — `insta` wired over `tests/corpus/` with an indented s-expression printer (`greycat-analyzer-syntax/tests/snapshot.rs`). The TS-vs-Rust *diff* half of the parity oracle (§7-A) lands at the layers where both sides produce comparable artifacts — diagnostics JSON (P1.4) and formatter output (P4.1). Tree-sitter's CST has no TS-side analogue, so raw-CST cross-port diffing is intentionally not in scope here; the Rust-side snapshots still catch grammar bumps, `tree.edit()` glitches, and accidental whitespace changes.
 
-**Files retired:** see §9.
 **Files added:** `greycat-analyzer-syntax/` crate, `tests/corpus/` (vendored TS reference parser/project fixtures), `project.gcl` (repo-root, pins stdlib via `@library`).
 
 **M1: tree-sitter parses 100% of `lib/std/*.gcl` and the TS reference test fixtures with zero error nodes; LSP stays alive on edits, diagnostics still empty; snapshot harness green.**
@@ -185,9 +178,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 - [x] **5.1 WASM API surface** (M) — `greycat-analyzer-wasm` exports `parse_sexp` (string), `parse_tree` (full serialized CST with kind / range / field / text / nesting), `tokens` (flat leaf stream with start/end positions + text), `lower_hir` (module name + decl list + per-arena counts), `infer_types` (per-expression byte range + display string), `diagnostics` (parse + semantic + lint, all merged with severity / source / code / position info), and `format` (formatted source). Each export runs its own pipeline pass — caching across exports waits on real profiling data from the playground.
 - [x] **5.2 Playground as analyzer testbed** (M) — fresh playground at [playground/](../playground/), scaffolded via `vp create vite:application` with a TypeScript + Lit + WebAwesome + Monaco stack. `<gc-playground>` lays out a `<wa-split-panel>` with the Monaco editor on the left and a `<wa-tab-group>` of inspection panels on the right: Diagnostics, CST (nested expandable tree), Tokens (table), HIR (decl list + arena counts), Types (per-expression inferred types), Format (side-by-side input vs. fmt output with idempotency badge). Each panel re-runs its own wasm export on every keystroke through a shared lazy-loaded `wasm.ts` initializer. `playground/scripts/build-wasm.sh` wraps `wasm-pack build --target web` with the Emscripten sysroot needed by tree-sitter-greycat's parser.c when compiling for `wasm32-unknown-unknown`. The previous gitignored `greycat-analyzer-playground/` is gone; the new `playground/` is committed.
-- [ ] ~~**5.3 crates.io publish** (S) — see **P10.1**.~~ → **moved to P14.1** (publish unblock; the path-dep on `tree-sitter-greycat` is the actual blocker).
 - [x] **5.4 VS Code extension** (S) — `editors/code/src/extension.ts` already used the rust LSP via the `lang-server` subcommand; updated to the canonical `server` subcommand (P4.3) and broadened the default `RUST_LOG` to include `greycat_analyzer_analysis`. The extension package itself (`package.json`, manifest, scripts/build) was already in place.
-- [ ] ~~**5.5 Salsa retrofit** (M) — see **P10.4**.~~ → **moved to P14.6** (still profiling-driven; tracked there alongside the other production gates).
 - [x] **5.6 Stdlib parity + version pinning** (S) — pin lives in repo-root [project.gcl](../project.gcl) (`@library("std", "8.0.269-dev")`). [scripts/check-stdlib.sh](../scripts/check-stdlib.sh) reads the pin, checks that `lib/std/` is populated, and runs the coverage gauntlet (which already covers stdlib when present). New [.github/workflows/ci.yml](../.github/workflows/ci.yml) provides the CI gate: build, clippy with `-D warnings`, `cargo test --workspace`, the coverage gauntlet, and the snapshot harness — every push and PR.
 
 ---
@@ -252,7 +243,6 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 **Chunks:**
 
-- [ ] ~~**9.1 Port `cst_format.ts`** (XL) — ~1,354 LoC of TS. Per-construct reflow rules (line-break heuristics for long argument lists, alignment of consecutive type attrs, doc-comment placement, blank-line preservation between top-level items, etc.). The foundational printer in `greycat-analyzer-fmt` already handles the trivial cases; this is the long tail. **Honest first-pass status (this chunk):** parity gauntlet (P9.2) and idempotency tester (P9.3) shipped as the measurement infrastructure. Current parity floor: **0/8 fixtures byte-for-byte**; current idempotency floor: **0/8 idempotent on `out.gcl` re-format** (string-literal whitespace handling has a known bug). The actual port of `cst_format.ts` per-construct rules remains the long tail and is left for follow-up commits.~~ → **moved to P14.3** (formatter parity floor ratchets to 8/8 — bundles the `cst_format.ts` port + the string-literal whitespace bug fix).
 - [x] **9.2 Per-fixture parity gauntlet** (S) — `greycat-analyzer-fmt/tests/parity_gauntlet.rs::formatter_parity_against_corpus` walks every `tests/corpus/parser_fixtures/<n>/{in.gcl,out.gcl}` pair, formats `in.gcl`, compares to `out.gcl`, and asserts `matches >= MATCH_FLOOR` (a regression budget that ratchets up as P9.1 rules land). Fixture mismatches are logged via `eprintln` so CI surfaces the per-name list.
 - [x] **9.3 Idempotency invariant** (S) — `parity_gauntlet.rs::formatter_idempotent_on_corpus` checks `fmt(fmt(x)) == fmt(x)` over every fixture's `out.gcl` and tracks an `idempotent` counter against an `IDEMPOTENT_FLOOR` regression budget. Honest baseline noted above; the test won't fail CI on the existing string-whitespace bug but will catch any *further* regressions while P9.1 is in progress.
 
@@ -269,8 +259,6 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 - [x] **10.1 crates.io publish prep** (S, no actual publish) — `LICENSE-MIT` + `LICENSE-APACHE` at workspace root. `[workspace.package]` metadata (`license = "MIT OR Apache-2.0"`, `repository`, `authors`, `description`, `keywords`, `categories`) inherited via `*.workspace = true` on every crate. Path deps gained explicit `version = "0.1.0"` guards so cargo can resolve to crates.io versions at publish time. New `scripts/publish.sh` walks the dep order (`syntax → core → hir → types → fmt → analysis → ls → wasm → bin`) with `--dry-run` support. **Not yet runnable end-to-end** — `greycat-analyzer-syntax` still uses a path dep on the vendored `tree-sitter-greycat` submodule, which isn't on crates.io; the actual publish is gated on either publishing the grammar crate first or vendoring its `parser.c` into the syntax crate. Documented in the script's pre-flight.
 - [x] **10.2 cargo-fuzz on parser/HIR boundary** (S) — `fuzz/` directory (excluded from the workspace) with three targets: `parser` (UTF-8 → `parse`), `hir_lower` (UTF-8 → `parse → lower_module`), `format_round_trip` (`parse → format_tree → parse` re-parse cleanliness). README covers running with `cargo +nightly fuzz run`. Closes ROADMAP §7-C.
 - [x] **10.3 TS-vs-Rust diagnostic parity oracle** (M, harness only) — `scripts/parity-oracle.sh` runs the Rust port + TS reference (when available locally) over the same corpus, normalizes both into `path:line:col:` shape, and emits a `diff -u`. The CI gate that closes §7-A waits on P6 / P7 fully landing so the diff is small enough to be useful as a regression budget; the harness ships now so the snapshot can be taken at any time during the parity push.
-- [ ] ~~**10.4 Salsa retrofit** (M, profiling-driven) — explicitly deferred. The acceptance criterion is "profiling shows quadratic blow-up on multi-file edits"; until that signal arrives, retrofitting salsa is premature optimization. The pure-function design from P6.1 keeps the retrofit cheap when it does become necessary. (Subsumes P5.5.)~~ → **moved to P14.6.**
-- [ ] ~~**10.5 Playground UI maturation** (M, deferred) — large frontend scope (click-to-jump from CST / HIR / diagnostic rows back to Monaco; LSP-in-web-worker for in-editor completion / hover / diagnostics; `localStorage` persistence). Deferred as a discrete frontend project rather than rolled into this roadmap pass; the playground exists today (see `playground/`) and serves as the analyzer testbed (P5.2).~~ → **moved to P14.7.**
 - [x] **10.6 Documentation pass** (S) — crate-level rustdoc paragraphs added to `greycat-analyzer-syntax`, `greycat-analyzer-core`, `greycat-analyzer-server`, and `greycat-analyzer-analysis` lib.rs heads (the others — `-hir`, `-types`, `-fmt`, `-wasm` — already had real doc paragraphs). New `docs/porting-from-ts.md` maps every TS subsystem under `packages/lang/src/` to its target Rust crate plus called-out divergences (no hand-rolled lexer, no general visitor framework, etc.). Playground README is left for the P10.5 follow-up since it's part of the playground UI maturation work.
 - [x] **10.7 CLI diagnostic UX (miette)** (S) — `cli lint` defaults to `pretty` (miette: source snippet + caret + color) when stdout is a TTY, and to `compact` (`path:line:col: severity: message`) when piped — so the P10.3 parity oracle and grep-style consumers keep a stable diffable shape. `--format={compact,pretty}` overrides explicitly. The `--format` field is `Option<OutputFormat>`; `OutputFormat::auto()` consults `std::io::IsTerminal` at run time to pick the default. New `print_pretty_diagnostic` helper maps `Diagnostic.severity` / `code` / `range` onto a `MietteDiagnostic` with a `LabeledSpan`. `miette = { version = "7", features = ["fancy"] }` added to the cli crate.
 
@@ -634,71 +622,16 @@ Three layers, no "port every TS test" milestone (tarpit).
 
 The 3.3k LoC of `.gcl` standard library at `lib/std/` is the canonical correctness corpus.
 
-- Mirror `lib/std/*.gcl` into the Rust repo (already partially present at `lib/installed/`).
-- Pin the upstream commit in a top-level `STDLIB_VERSION` file.
-- Stdlib files load through `SourceManager` as ordinary modules, under a synthetic root URI (`@library/std/...`).
+- Stdlib is **not** vendored. Repo-root `project.gcl` pins the version via `@library("std", "<release>")`; `greycat install` materialises `lib/std/` from that pin.
+- Stdlib files load through `SourceManager` as ordinary modules.
 - They are parsed and type-checked like any other module — that *is* the analyzer's job.
 - Where the TS reference has built-in/native functions (bodies implemented in the runtime, not in `.gcl`), port the binding metadata as a small Rust table — signatures only, no implementations.
-- CI gate: `cargo run -- check lib/std/` must report zero diagnostics. The fastest end-to-end signal during Phase 2.
+- CI gate: `cargo run -p greycat-analyzer -- lint project.gcl` reports zero diagnostics on the stdlib closure.
 - Do **not** translate `.gcl` to Rust. The whole point of the analyzer is that it understands `.gcl` directly.
 
 ---
 
-## 9. Retirement list
-
-When tree-sitter lands in Phase 0, the following code is deleted:
-
-- `greycat-analyzer-core/src/cst/` — entire directory (`combi.rs`, `cursor.rs`, `display.rs`, `info.rs`, `mod.rs`, `node.rs`, `node_query.rs`, `parser.rs` ~1,936 lines, `visitor.rs`, `visitor/`).
-- `greycat-analyzer-core/src/ast/` — orphaned old layer (`mod.rs`, `parser.rs`, `pretty.rs`).
-- `greycat-analyzer-core/src/lexer/` — entire directory (`mod.rs`, `test.rs`, `tokenizer.rs`, `token.rs`).
-- `greycat-analyzer-core/src/lib.rs::parse()` — `todo!()` stub with the comment "TODO move this to HIR".
-- `greycat-analyzer/src/cmd/lex.rs` — subcommand removed; tree-sitter has its own scanner.
-- `greycat-analyzer/src/cmd/cst.rs` — subcommand kept, body rewritten over tree-sitter.
-
-Net deletion: ~3.4k Rust LoC.
-
-Survives, internals replaced:
-
-- `greycat-analyzer-core/src/{doc.rs, manager.rs, span.rs}` — public shape preserved.
-- `greycat-analyzer-server/src/{server.rs, backend.rs, project.rs}` — lifecycle plumbing kept; capability handlers added in P3.
-- `greycat-analyzer/src/{main.rs, cmd.rs, cmd/lint.rs, cmd/lang_server.rs, utils.rs}` — CLI structure kept; subcommand bodies rewritten as features land.
-
----
-
-## 10. Sequencing & timeline
-
-```
-P0  [4-6w]   Foundation reset ──────── M1
-P1  [2-3w]   Project + parse diags ─── M2
-P2  [10-16w] Semantic layer ────────── M3   ← dominates the original push
-P3  [4-6w]   LSP capabilities ──────── M4
-P4  [3-4w]   Formatter + linter ────── M5
-P5  [2-3w]   Distribution
-P6  [8-12w]  Analyzer 1:1 with TS ──── M6   ← dominates the parity push
-P7  [3-5w]   Grammar + HIR completion ─ M7
-P8  [4-6w]   LSP 1:1 with TS ───────── M8
-P9  [4-6w]   Formatter byte-parity ─── M9
-P10 [4-6w]   Distribution + quality ── M10
-P11 [3-5w]   Cross-module identity ── M11   ← unblocks P12-P14 cross-module work
-P12 [4-6w]   Type system completion ─ M12
-P13 [3-4w]   Analyzer parity closeout ─ M13
-P14 [2-3w]   Final parity gate ────── M14   ← the "are we 1:1?" gate
-P15 [3-4w]   Interactive-LSP sweep ── M15   ← hover / completion / pragma diags
-P16 [2-3w]   Member-flow + node-deref M16   ← member-call typing, auto-deref completion
-P17 [1-2w]   Real-corpus parity ratch M17   ← lowering bugs surfaced by greycat/apps/registry
-P18 [1-2w]   Typed-AST parity oracle  M18   ← dump-types CI gate, residual-diff ratchet
-P19 [4-6w]   Staged-pipeline rewrite  M19   ← shared TypeArena, S1-S12 stages, Q1-Q5 invalidation
-```
-
-Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface; P16 (~2-3 weeks) tightens up the member-access type chain that pass 3.5 left at `any`; P17 (~1-2 weeks) drains the lowering / lint-policy bucket surfaced by running against a real project; P18 (~1-2 weeks) wires the TS dump-types subcommand into a CI parity gate.
-
-Front-load the snapshot harness (P0.6) — it pays off across the entire project, especially through P2 and P9. The cross-port diagnostic parity oracle (P10.3 → P14.2) is the ultimate "are we 1:1?" answer; everything before it is a steppingstone.
-
-P11 is on the critical path for P12–P14 because most cross-module capabilities (member resolution across modules, scope-aware rename / references / goto-def across modules, real `Definition::Project` data) blocks behind a global decl table. P12 and P13 can run in parallel after P11. P14 gates on all of P11/P12/P13. P15 leans on P11 (provenance) and P11.5 (cross-module member completion) but is otherwise independent — it can run in parallel with P14's CI-gate work.
-
----
-
-## 11. How to update this doc
+## 9. How to update this doc
 
 The roadmap moves with the work.
 
