@@ -186,15 +186,15 @@ pub struct AnalysisResult {
     pub member_uses: HashMap<Idx<Ident>, MemberDef>,
     /// P11.5 cross-module member bindings — same keying as `member_uses`
     /// but the resolved attr / method lives in another module's HIR.
-    /// Populated by [`crate::project::ProjectAnalysis::rebuild`] after
-    /// every module's analyzer pass runs, by walking each module's
-    /// [`Self::deferred_member_uses`] against the global decl table.
+    ///
+    /// **P21:** populated directly by `Cx::resolve_member` against
+    /// [`crate::stdlib::ProjectIndex::type_members`] when the
+    /// receiver's type isn't declared in this module. Pass 3
+    /// (`resolve_cross_module_members`) and the per-module
+    /// `deferred_member_uses` deferral list are gone — S2-S6 build
+    /// the structure index up front, so the body walker resolves
+    /// inline.
     pub foreign_member_uses: HashMap<Idx<Ident>, ForeignMember>,
-    /// P11.5 — `(property_ident, receiver_type_name)` pairs the analyzer
-    /// couldn't bind locally because the receiver's type isn't declared
-    /// in this module. The project pipeline drains these in a post-pass
-    /// against [`crate::stdlib::ProjectIndex::decl_locations`].
-    pub deferred_member_uses: Vec<(Idx<Ident>, String)>,
     /// P15.x — chain-segment bindings populated by `ProjectAnalysis`
     /// pass 3.5 for `Expr::QualifiedStatic` shapes. Each segment ident
     /// (chain[1] = the type, chain[2] = the member when length is 3)
@@ -263,8 +263,8 @@ impl AnalysisResult {
 
 /// Run the analyzer with no cross-module project context. Falls back
 /// to an empty [`ProjectIndex`]; cross-module type names lower to
-/// `any` and `deferred_member_uses` gets nothing the project pipeline
-/// can resolve. Used by per-file capabilities and unit tests.
+/// `any` and cross-module member access can't bind. Used by per-file
+/// capabilities and unit tests.
 ///
 /// **P19:** allocates a fresh [`TypeArena`] internally and discards it
 /// — callers that need to inspect `TypeId`s after the call must use
@@ -548,8 +548,9 @@ impl<'a> Cx<'a> {
     /// `a->b` to the matching `TypeAttr` or method `Decl` whenever the
     /// receiver's type names a `TypeDecl` declared in this module.
     /// Anonymous types and primitives stay no-binding; cross-module
-    /// receivers (P11.5) are recorded into `deferred_member_uses` so
-    /// the project pipeline can resolve them in a post-pass.
+    /// receivers (P11.5) consult [`crate::stdlib::ProjectIndex::type_members`]
+    /// directly (P21) and write into `foreign_member_uses` inline —
+    /// no `deferred_member_uses` deferral.
     fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
         let ty = self.arena.get(recv_ty);
         let type_name = match &ty.kind {
@@ -576,35 +577,58 @@ impl<'a> Cx<'a> {
         let Some(name) = type_name else {
             return;
         };
-        let Some(decl_id) = self.out.type_decls.get(&name).copied() else {
-            // P11.5: type isn't declared in this module. Defer to the
-            // project pipeline's cross-module post-pass.
-            self.out.deferred_member_uses.push((property, name));
-            return;
-        };
-        let Decl::Type(type_decl) = self.hir.decls[decl_id].clone() else {
-            return;
-        };
         let prop_text = self.ident_text(property).to_string();
 
-        for attr_id in &type_decl.attrs {
-            let attr = &self.hir.type_attrs[*attr_id];
-            if self.hir.idents[attr.name].text == prop_text {
-                self.out
-                    .member_uses
-                    .insert(property, MemberDef::Attr(*attr_id));
+        if let Some(decl_id) = self.out.type_decls.get(&name).copied() {
+            // Local: type declared in this module.
+            let Decl::Type(type_decl) = self.hir.decls[decl_id].clone() else {
+                return;
+            };
+            for attr_id in &type_decl.attrs {
+                let attr = &self.hir.type_attrs[*attr_id];
+                if self.hir.idents[attr.name].text == prop_text {
+                    self.out
+                        .member_uses
+                        .insert(property, MemberDef::Attr(*attr_id));
+                    return;
+                }
+            }
+            for method_id in &type_decl.methods {
+                let Decl::Fn(m) = &self.hir.decls[*method_id] else {
+                    continue;
+                };
+                if self.hir.idents[m.name].text == prop_text {
+                    self.out
+                        .member_uses
+                        .insert(property, MemberDef::Method(*method_id));
+                    return;
+                }
+            }
+            return;
+        }
+        // P21 — type lives in another module. Consult the cross-module
+        // structure index built in S2-S6, write directly to
+        // `foreign_member_uses`. Replaces the old `deferred_member_uses`
+        // → pass-3 drain (which is now deleted).
+        if let Some(members) = self.index.type_members.get(&name) {
+            if let Some(attr_id) = members.attrs.get(&prop_text).copied() {
+                self.out.foreign_member_uses.insert(
+                    property,
+                    ForeignMember {
+                        uri: members.home_uri.clone(),
+                        member: MemberDef::Attr(attr_id),
+                    },
+                );
                 return;
             }
-        }
-        for method_id in &type_decl.methods {
-            let Decl::Fn(m) = &self.hir.decls[*method_id] else {
-                continue;
-            };
-            if self.hir.idents[m.name].text == prop_text {
-                self.out
-                    .member_uses
-                    .insert(property, MemberDef::Method(*method_id));
-                return;
+            if let Some(method_id) = members.methods.get(&prop_text).copied() {
+                self.out.foreign_member_uses.insert(
+                    property,
+                    ForeignMember {
+                        uri: members.home_uri.clone(),
+                        member: MemberDef::Method(method_id),
+                    },
+                );
             }
         }
     }
@@ -1519,9 +1543,9 @@ impl<'a> Cx<'a> {
                 // type so cross-module receivers land as `Named(name)`
                 // (via `lower_type_ref`'s `index.has_name(&name)` arm),
                 // then run `resolve_member` on the property: in-module
-                // hits land in `member_uses`; cross-module hits get
-                // deferred to the project pipeline's pass 3 via
-                // `deferred_member_uses` (P11.5).
+                // hits land in `member_uses`; cross-module hits land
+                // directly in `foreign_member_uses` via P21's structure
+                // index (no more pass-3 deferral).
                 let recv_ty = self.lower_type_ref(s.ty);
                 self.resolve_member(recv_ty, s.property);
                 // Enum-variant access: `Foo::a` where `Foo` is an enum

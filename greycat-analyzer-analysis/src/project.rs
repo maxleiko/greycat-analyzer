@@ -18,12 +18,10 @@ use std::time::{Duration, Instant};
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, Ident};
+use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_hir::{Hir, lower_module};
 
-use crate::analyzer::{
-    AnalysisResult, ForeignMember, MemberDef, analyze_with_index_into, seed_builtins,
-};
+use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
 use crate::lint::{LintDiagnostic, lint_arrow_on_non_deref, run_lints};
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::ProjectIndex;
@@ -259,10 +257,9 @@ impl ProjectAnalysis {
         }
     }
 
-    /// **Stage S12 cross-module suffix.** All of the post-passes:
+    /// **Stage S12 cross-module suffix.** Remaining post-passes (P21
+    /// deleted pass 3, P22+ will keep deleting):
     ///
-    /// - Pass 3 (P11.5): cross-module member resolution — drains each
-    ///   module's `deferred_member_uses` against the global decl table.
     /// - Pass 3.4 (P16.3): cross-module member-expr typing.
     /// - Pass 3.5 (P15.7 + P16.4): cross-module call return-type
     ///   inference for Static / QualifiedStatic / Member / Arrow /
@@ -283,7 +280,6 @@ impl ProjectAnalysis {
     /// signatures, so call-site monomorphization and member typing
     /// happen inline rather than in a fix-up sweep).
     fn stage_cross_module_post_passes(&mut self) {
-        self.resolve_cross_module_members();
         let _ = self.infer_cross_module_member_types();
         let _ = self.infer_cross_module_call_types();
         self.rebind_for_in_iter_types();
@@ -307,72 +303,6 @@ impl ProjectAnalysis {
     /// through their fully-qualified name from elsewhere.
     fn stage_compute_qualified_refs(&mut self, manager: &SourceManager) {
         self.compute_qualified_refs(manager);
-    }
-
-    /// Walk each module's `deferred_member_uses` and bind the foreign
-    /// attr / method via [`ProjectIndex::locate_decl`]. Idempotent —
-    /// re-running drains an already-empty list. (P11.5.)
-    fn resolve_cross_module_members(&mut self) {
-        #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
-        let mut updates: HashMap<Uri, Vec<(Idx<Ident>, ForeignMember)>> = HashMap::new();
-        for (cur_uri, cur_module) in &self.modules {
-            for (property_idx, type_name) in &cur_module.analysis.deferred_member_uses {
-                let prop_text = cur_module.hir.idents[*property_idx].text.clone();
-                let Some((foreign_uri, foreign_decl_id)) =
-                    self.index.locate_decl(type_name).first()
-                else {
-                    continue;
-                };
-                let Some(foreign_module) = self.modules.get(foreign_uri) else {
-                    continue;
-                };
-                let Decl::Type(ftd) = &foreign_module.hir.decls[*foreign_decl_id] else {
-                    continue;
-                };
-                let mut bound = false;
-                for attr_id in &ftd.attrs {
-                    let attr_name = &foreign_module.hir.idents
-                        [foreign_module.hir.type_attrs[*attr_id].name]
-                        .text;
-                    if *attr_name == prop_text {
-                        updates.entry(cur_uri.clone()).or_default().push((
-                            *property_idx,
-                            ForeignMember {
-                                uri: foreign_uri.clone(),
-                                member: MemberDef::Attr(*attr_id),
-                            },
-                        ));
-                        bound = true;
-                        break;
-                    }
-                }
-                if bound {
-                    continue;
-                }
-                for method_id in &ftd.methods {
-                    let Decl::Fn(m) = &foreign_module.hir.decls[*method_id] else {
-                        continue;
-                    };
-                    if foreign_module.hir.idents[m.name].text == prop_text {
-                        updates.entry(cur_uri.clone()).or_default().push((
-                            *property_idx,
-                            ForeignMember {
-                                uri: foreign_uri.clone(),
-                                member: MemberDef::Method(*method_id),
-                            },
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-        for (uri, entries) in updates {
-            if let Some(m) = self.modules.get_mut(&uri) {
-                for (prop_idx, fm) in entries {
-                    m.analysis.foreign_member_uses.insert(prop_idx, fm);
-                }
-            }
-        }
     }
 
     /// P16.3 — cross-module member-expr typing. After pass 3 binds
@@ -828,9 +758,9 @@ impl ProjectAnalysis {
         touched_uris
     }
 
-    /// P15.7 — cross-module call return-type inference. After
-    /// [`Self::resolve_cross_module_members`] populates
-    /// `foreign_member_uses`, walk every module's HIR `Expr::Call`s
+    /// P15.7 — cross-module call return-type inference. After the
+    /// analyzer's per-module pass has populated `foreign_member_uses`
+    /// (via P21's structure index), walk every module's HIR `Expr::Call`s
     /// whose callee is `Expr::Static` and whose property binds to a
     /// foreign `Method`. Look up the foreign method's declared
     /// return type, translate it into the *current module's*
@@ -1522,10 +1452,11 @@ impl ProjectAnalysis {
                 timings,
             },
         );
-        // P11.5: re-resolve cross-module member bindings whenever a doc
-        // is invalidated. Cheap because `deferred_member_uses` is small
-        // per module and the work is purely table-lookup.
-        self.resolve_cross_module_members();
+        // P21 — pass 3 (`resolve_cross_module_members`) is gone; the
+        // analyzer's `resolve_member` now consults the project-wide
+        // `type_members` index directly during the per-module body
+        // walk, so cross-module bindings land in `foreign_member_uses`
+        // inline.
         // P16.3 / P15.7 / P16.4 — cross-module type fixups. Each
         // returns the set of URIs whose `expr_types` were touched;
         // those are the modules whose validation results may have

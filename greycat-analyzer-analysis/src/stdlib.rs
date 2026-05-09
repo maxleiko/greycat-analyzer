@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeRef as HirTypeRef};
+use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as HirTypeRef};
 use greycat_analyzer_types::{Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry};
 
 /// Cross-module registry of native-bound function signatures. Keyed by
@@ -87,9 +87,36 @@ pub struct ProjectIndex {
     /// module name (rather than flagging it as unresolved), and lets
     /// pass 3.5 infer types for `module::Decl` static expressions.
     pub module_names: HashMap<String, Uri>,
+    /// P21 — pre-computed cross-module structure index. Keyed by type
+    /// name (as it appears in source). For each type, records the
+    /// home module URI and a (property name → HIR `Idx`) lookup for
+    /// both attrs and methods. Built incrementally by [`Self::ingest`].
+    ///
+    /// The first ingested decl for a given name wins (matches the
+    /// existing `decl_locations` collision semantics — disambiguation
+    /// across libs happens at the use site via the importing module's
+    /// lib/include closure, P11.2+). Pass 3
+    /// (`resolve_cross_module_members`) used to drain a per-module
+    /// `deferred_member_uses` against `decl_locations` after the
+    /// per-module analyzer pass; with this index the analyzer's
+    /// `resolve_member` resolves cross-module hits inline at body-walk
+    /// time, removing the deferral.
+    pub type_members: HashMap<String, TypeMembers>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
+}
+
+/// P21 — per-type cross-module member index. `home_uri` names the
+/// module that declared the type so the analyzer can fish the right
+/// `Hir` out of `ProjectAnalysis::modules` when it needs the attr's
+/// declared `TypeRef` (P22's S7 absorbs that lookup into the staged
+/// arena).
+#[derive(Debug, Clone)]
+pub struct TypeMembers {
+    pub home_uri: Uri,
+    pub attrs: HashMap<String, Idx<TypeAttr>>,
+    pub methods: HashMap<String, Idx<Decl>>,
 }
 
 /// P13.5 — annotation-derived flag bits on a type declaration.
@@ -166,6 +193,30 @@ impl ProjectIndex {
                     if flags.iterable || flags.deref.is_some() || flags.primitive {
                         self.type_flags.entry(name.clone()).or_insert(flags);
                     }
+                    // P21 — populate the cross-module member index.
+                    // First-decl-wins (matches `decl_locations`'s
+                    // collision semantics). Lets the per-module
+                    // analyzer's `resolve_member` bind foreign attrs /
+                    // methods inline instead of deferring to a post
+                    // pass.
+                    self.type_members.entry(name.clone()).or_insert_with(|| {
+                        let mut m = TypeMembers {
+                            home_uri: uri.clone(),
+                            attrs: HashMap::new(),
+                            methods: HashMap::new(),
+                        };
+                        for attr_id in &td.attrs {
+                            let attr_name = hir.idents[hir.type_attrs[*attr_id].name].text.clone();
+                            m.attrs.insert(attr_name, *attr_id);
+                        }
+                        for method_id in &td.methods {
+                            if let Decl::Fn(fnd) = &hir.decls[*method_id] {
+                                let method_name = hir.idents[fnd.name].text.clone();
+                                m.methods.insert(method_name, *method_id);
+                            }
+                        }
+                        m
+                    });
                     self.record_decl_location(name, uri, *decl_id);
                     Some(&td.modifiers)
                 }
