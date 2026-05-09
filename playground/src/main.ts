@@ -29,7 +29,6 @@ import "./components/gc-hir-panel.ts";
 import "./components/gc-tokens-panel.ts";
 import "./components/gc-types-panel.ts";
 import "./components/gc-diagnostics-panel.ts";
-import "./components/gc-format-panel.ts";
 
 import * as monaco from "monaco-editor";
 import editorWorkerUrl from "monaco-editor/esm/vs/editor/editor.worker?worker&url";
@@ -50,7 +49,6 @@ const PANEL_TAGS = [
   "gc-tokens-panel",
   "gc-hir-panel",
   "gc-types-panel",
-  "gc-format-panel",
 ] as const;
 
 function broadcastSource(src: string) {

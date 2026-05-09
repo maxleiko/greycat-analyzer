@@ -23,16 +23,22 @@
 //! is microseconds for typical sources). Add caching when profiling
 //! shows the playground is bottlenecked here.
 
+use std::str::FromStr;
+
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 use greycat_analyzer_analysis::{
     analyzer::{Severity, analyze},
     lint::{LintSeverity, run_lints},
+    project::ProjectAnalysis,
     resolver::resolve,
 };
+use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::diagnostics::parse_diagnostics;
+use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
+use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_syntax::tree_sitter;
 
@@ -201,19 +207,26 @@ fn is_significant_anon(kind: &str) -> bool {
 // lower_hir
 // =============================================================================
 
+/// HIR node serialized for the playground. Same shape regardless of
+/// whether the source variant is a decl, statement, expression, or
+/// type-ref — the panel renders them uniformly as a foldable tree.
+/// `kind` is human-readable (`"fn"`, `"stmt:var"`, `"expr:ident"`,
+/// `"type-ref"`); `label` is the name / variant tag / ident text /
+/// primitive name when relevant; `range` mirrors the source span.
 #[derive(Serialize)]
-struct HirSummary {
-    module_name: String,
-    lib: String,
-    decls: Vec<HirDecl>,
-    counts: HirCounts,
+struct HirNode {
+    kind: String,
+    label: Option<String>,
+    range: ByteRange,
+    children: Vec<HirNode>,
 }
 
 #[derive(Serialize)]
-struct HirDecl {
-    kind: &'static str,
-    name: String,
-    range: ByteRange,
+struct HirRoot {
+    module_name: String,
+    lib: String,
+    counts: HirCounts,
+    decls: Vec<HirNode>,
 }
 
 #[derive(Serialize)]
@@ -225,7 +238,464 @@ struct HirCounts {
     idents: usize,
 }
 
-fn summarize_hir(hir: &Hir) -> HirSummary {
+fn ident_text(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Ident>) -> String {
+    hir.idents[idx].text.clone()
+}
+
+fn type_ref_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::TypeRef>) -> HirNode {
+    let tr = &hir.type_refs[idx];
+    let mut children = Vec::new();
+    for &p in &tr.params {
+        children.push(type_ref_node(hir, p));
+    }
+    let mut label = ident_text(hir, tr.name);
+    if tr.optional {
+        label.push('?');
+    }
+    HirNode {
+        kind: "type-ref".into(),
+        label: Some(label),
+        range: tr.byte_range.clone().into(),
+        children,
+    }
+}
+
+fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode {
+    use greycat_analyzer_hir::types::Expr;
+    let e = &hir.exprs[idx];
+    let range: ByteRange = e.byte_range().into();
+    let (kind, label, children) = match e {
+        Expr::Ident(name) => ("expr:ident", Some(ident_text(hir, *name)), Vec::new()),
+        Expr::Literal(l) => ("expr:literal", Some(format!("{:?} {:?}", l.kind, l.text)), Vec::new()),
+        Expr::String(s) => {
+            let mut kids = Vec::new();
+            for part in &s.parts {
+                if let greycat_analyzer_hir::types::StringPart::Interp { expr, byte_range } = part {
+                    kids.push(HirNode {
+                        kind: "expr:string-interp".into(),
+                        label: None,
+                        range: byte_range.clone().into(),
+                        children: vec![expr_node(hir, *expr)],
+                    });
+                }
+            }
+            ("expr:string", None, kids)
+        }
+        Expr::Tuple(items, _) => (
+            "expr:tuple",
+            None,
+            items.iter().map(|i| expr_node(hir, *i)).collect(),
+        ),
+        Expr::Array(items, _) => (
+            "expr:array",
+            None,
+            items.iter().map(|i| expr_node(hir, *i)).collect(),
+        ),
+        Expr::Object(o) => {
+            let mut kids = Vec::new();
+            if let Some(t) = o.ty {
+                kids.push(type_ref_node(hir, t));
+            }
+            for f in &o.fields {
+                let mut field_kids = Vec::new();
+                field_kids.push(expr_node(hir, f.value));
+                kids.push(HirNode {
+                    kind: "expr:object-field".into(),
+                    label: f.name.map(|n| ident_text(hir, n)),
+                    range: f.byte_range.clone().into(),
+                    children: field_kids,
+                });
+            }
+            ("expr:object", None, kids)
+        }
+        Expr::Member(m) | Expr::Arrow(m) => {
+            let kind = if matches!(e, Expr::Arrow(_)) {
+                "expr:arrow"
+            } else {
+                "expr:member"
+            };
+            (
+                kind,
+                Some(ident_text(hir, m.property)),
+                vec![expr_node(hir, m.receiver)],
+            )
+        }
+        Expr::Static(s) => (
+            "expr:static",
+            Some(ident_text(hir, s.property)),
+            vec![type_ref_node(hir, s.ty)],
+        ),
+        Expr::QualifiedStatic { chain, .. } => (
+            "expr:qualified-static",
+            Some(
+                chain
+                    .iter()
+                    .map(|n| ident_text(hir, *n))
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            ),
+            Vec::new(),
+        ),
+        Expr::Offset(o) => (
+            "expr:offset",
+            None,
+            vec![expr_node(hir, o.receiver), expr_node(hir, o.index)],
+        ),
+        Expr::Call(c) => {
+            let mut kids = vec![expr_node(hir, c.callee)];
+            for &a in &c.args {
+                kids.push(expr_node(hir, a));
+            }
+            ("expr:call", None, kids)
+        }
+        Expr::Binary(b) => (
+            "expr:binary",
+            Some(format!("{:?}", b.op)),
+            vec![expr_node(hir, b.left), expr_node(hir, b.right)],
+        ),
+        Expr::Unary(u) => (
+            "expr:unary",
+            Some(format!("{:?}", u.op)),
+            vec![expr_node(hir, u.operand)],
+        ),
+        Expr::Paren(inner, _) => ("expr:paren", None, vec![expr_node(hir, *inner)]),
+        Expr::Lambda(l) => {
+            let mut kids = Vec::new();
+            for &p in &l.params {
+                let pp = &hir.fn_params[p];
+                let mut pk = Vec::new();
+                if let Some(t) = pp.ty {
+                    pk.push(type_ref_node(hir, t));
+                }
+                kids.push(HirNode {
+                    kind: "fn-param".into(),
+                    label: Some(ident_text(hir, pp.name)),
+                    range: hir.idents[pp.name].byte_range.clone().into(),
+                    children: pk,
+                });
+            }
+            kids.push(expr_node(hir, l.body));
+            ("expr:lambda", None, kids)
+        }
+        Expr::Is { value, ty, .. } => (
+            "expr:is",
+            None,
+            vec![expr_node(hir, *value), type_ref_node(hir, *ty)],
+        ),
+        Expr::Cast { value, ty, .. } => (
+            "expr:cast",
+            None,
+            vec![expr_node(hir, *value), type_ref_node(hir, *ty)],
+        ),
+        Expr::Unsupported { kind, .. } => ("expr:unsupported", Some((*kind).into()), Vec::new()),
+    };
+    HirNode {
+        kind: kind.into(),
+        label,
+        range,
+        children,
+    }
+}
+
+fn block_node(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -> HirNode {
+    HirNode {
+        kind: "stmt:block".into(),
+        label: None,
+        range: block.byte_range.clone().into(),
+        children: block.stmts.iter().map(|s| stmt_node(hir, *s)).collect(),
+    }
+}
+
+fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode {
+    use greycat_analyzer_hir::types::Stmt;
+    let s = &hir.stmts[idx];
+    match s {
+        Stmt::Block(b) => block_node(hir, b),
+        Stmt::Expr(e) => HirNode {
+            kind: "stmt:expr".into(),
+            label: None,
+            range: hir.exprs[*e].byte_range().into(),
+            children: vec![expr_node(hir, *e)],
+        },
+        Stmt::Var(v) => {
+            let mut kids = Vec::new();
+            if let Some(t) = v.ty {
+                kids.push(type_ref_node(hir, t));
+            }
+            if let Some(i) = v.init {
+                kids.push(expr_node(hir, i));
+            }
+            HirNode {
+                kind: "stmt:var".into(),
+                label: Some(ident_text(hir, v.name)),
+                range: v.byte_range.clone().into(),
+                children: kids,
+            }
+        }
+        Stmt::Assign(a) => HirNode {
+            kind: "stmt:assign".into(),
+            label: Some(format!("{:?}", a.op)),
+            range: a.byte_range.clone().into(),
+            children: vec![expr_node(hir, a.target), expr_node(hir, a.value)],
+        },
+        Stmt::If(i) => {
+            let mut kids = vec![expr_node(hir, i.condition), block_node(hir, &i.then_branch)];
+            if let Some(eb) = i.else_branch {
+                kids.push(stmt_node(hir, eb));
+            }
+            HirNode {
+                kind: "stmt:if".into(),
+                label: None,
+                range: i.byte_range.clone().into(),
+                children: kids,
+            }
+        }
+        Stmt::While(w) => HirNode {
+            kind: "stmt:while".into(),
+            label: None,
+            range: w.byte_range.clone().into(),
+            children: vec![expr_node(hir, w.condition), block_node(hir, &w.body)],
+        },
+        Stmt::DoWhile(w) => HirNode {
+            kind: "stmt:do-while".into(),
+            label: None,
+            range: w.byte_range.clone().into(),
+            children: vec![block_node(hir, &w.body), expr_node(hir, w.condition)],
+        },
+        Stmt::For(f) => {
+            let mut kids = Vec::new();
+            if let Some(v) = f.init_value {
+                kids.push(expr_node(hir, v));
+            }
+            if let Some(c) = f.condition {
+                kids.push(expr_node(hir, c));
+            }
+            if let Some(i) = f.increment {
+                kids.push(expr_node(hir, i));
+            }
+            kids.push(block_node(hir, &f.body));
+            HirNode {
+                kind: "stmt:for".into(),
+                label: f.init_name.map(|n| ident_text(hir, n)),
+                range: f.byte_range.clone().into(),
+                children: kids,
+            }
+        }
+        Stmt::ForIn(f) => {
+            let mut kids = Vec::new();
+            for p in &f.params {
+                let mut pk = Vec::new();
+                if let Some(t) = p.ty {
+                    pk.push(type_ref_node(hir, t));
+                }
+                kids.push(HirNode {
+                    kind: "for-in-param".into(),
+                    label: Some(ident_text(hir, p.name)),
+                    range: hir.idents[p.name].byte_range.clone().into(),
+                    children: pk,
+                });
+            }
+            kids.push(expr_node(hir, f.range));
+            kids.push(block_node(hir, &f.body));
+            HirNode {
+                kind: "stmt:for-in".into(),
+                label: None,
+                range: f.byte_range.clone().into(),
+                children: kids,
+            }
+        }
+        Stmt::Return(v) => HirNode {
+            kind: "stmt:return".into(),
+            label: None,
+            range: v.map(|e| hir.exprs[e].byte_range()).unwrap_or(0..0).into(),
+            children: v.map(|e| vec![expr_node(hir, e)]).unwrap_or_default(),
+        },
+        Stmt::Throw(e) => HirNode {
+            kind: "stmt:throw".into(),
+            label: None,
+            range: hir.exprs[*e].byte_range().into(),
+            children: vec![expr_node(hir, *e)],
+        },
+        Stmt::Break => HirNode {
+            kind: "stmt:break".into(),
+            label: None,
+            range: (0..0).into(),
+            children: Vec::new(),
+        },
+        Stmt::Continue => HirNode {
+            kind: "stmt:continue".into(),
+            label: None,
+            range: (0..0).into(),
+            children: Vec::new(),
+        },
+        Stmt::Try(t) => {
+            let mut kids = vec![block_node(hir, &t.try_block)];
+            kids.push(HirNode {
+                kind: "catch".into(),
+                label: t.error_param.map(|n| ident_text(hir, n)),
+                range: t.catch_block.byte_range.clone().into(),
+                children: vec![block_node(hir, &t.catch_block)],
+            });
+            HirNode {
+                kind: "stmt:try".into(),
+                label: None,
+                range: t.byte_range.clone().into(),
+                children: kids,
+            }
+        }
+        Stmt::At(a) => HirNode {
+            kind: "stmt:at".into(),
+            label: None,
+            range: a.byte_range.clone().into(),
+            children: vec![expr_node(hir, a.expr), block_node(hir, &a.block)],
+        },
+    }
+}
+
+fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode {
+    use greycat_analyzer_hir::types::Decl;
+    let d = &hir.decls[idx];
+    let range: ByteRange = d.byte_range().clone().into();
+    let name = d.name().map(|n| ident_text(hir, n));
+    match d {
+        Decl::Fn(f) => {
+            let mut kids = Vec::new();
+            for &g in &f.generics {
+                kids.push(HirNode {
+                    kind: "generic".into(),
+                    label: Some(ident_text(hir, g)),
+                    range: hir.idents[g].byte_range.clone().into(),
+                    children: Vec::new(),
+                });
+            }
+            for &p in &f.params {
+                let pp = &hir.fn_params[p];
+                let mut pk = Vec::new();
+                if let Some(t) = pp.ty {
+                    pk.push(type_ref_node(hir, t));
+                }
+                kids.push(HirNode {
+                    kind: "fn-param".into(),
+                    label: Some(ident_text(hir, pp.name)),
+                    range: hir.idents[pp.name].byte_range.clone().into(),
+                    children: pk,
+                });
+            }
+            if let Some(rt) = f.return_type {
+                kids.push(HirNode {
+                    kind: "fn-return-type".into(),
+                    label: None,
+                    range: hir.type_refs[rt].byte_range.clone().into(),
+                    children: vec![type_ref_node(hir, rt)],
+                });
+            }
+            if let Some(body) = f.body {
+                kids.push(stmt_node(hir, body));
+            }
+            HirNode {
+                kind: "fn".into(),
+                label: name,
+                range,
+                children: kids,
+            }
+        }
+        Decl::Type(t) => {
+            let mut kids = Vec::new();
+            for &g in &t.generics {
+                kids.push(HirNode {
+                    kind: "generic".into(),
+                    label: Some(ident_text(hir, g)),
+                    range: hir.idents[g].byte_range.clone().into(),
+                    children: Vec::new(),
+                });
+            }
+            if let Some(parent) = t.supertype {
+                kids.push(HirNode {
+                    kind: "extends".into(),
+                    label: None,
+                    range: hir.type_refs[parent].byte_range.clone().into(),
+                    children: vec![type_ref_node(hir, parent)],
+                });
+            }
+            for &a in &t.attrs {
+                let attr = &hir.type_attrs[a];
+                let mut ak = Vec::new();
+                if let Some(ty) = attr.ty {
+                    ak.push(type_ref_node(hir, ty));
+                }
+                if let Some(init) = attr.init {
+                    ak.push(expr_node(hir, init));
+                }
+                kids.push(HirNode {
+                    kind: "type-attr".into(),
+                    label: Some(ident_text(hir, attr.name)),
+                    range: attr.byte_range.clone().into(),
+                    children: ak,
+                });
+            }
+            for &m in &t.methods {
+                kids.push(decl_node(hir, m));
+            }
+            HirNode {
+                kind: "type".into(),
+                label: name,
+                range,
+                children: kids,
+            }
+        }
+        Decl::Enum(e) => {
+            let kids = e
+                .fields
+                .iter()
+                .map(|&f| {
+                    let ef = &hir.enum_fields[f];
+                    let mut fk = Vec::new();
+                    if let Some(v) = ef.value {
+                        fk.push(expr_node(hir, v));
+                    }
+                    HirNode {
+                        kind: "enum-variant".into(),
+                        label: Some(ident_text(hir, ef.name)),
+                        range: hir.idents[ef.name].byte_range.clone().into(),
+                        children: fk,
+                    }
+                })
+                .collect();
+            HirNode {
+                kind: "enum".into(),
+                label: name,
+                range,
+                children: kids,
+            }
+        }
+        Decl::Var(v) => {
+            let mut kids = Vec::new();
+            if let Some(t) = v.ty {
+                kids.push(type_ref_node(hir, t));
+            }
+            if let Some(i) = v.init {
+                kids.push(expr_node(hir, i));
+            }
+            HirNode {
+                kind: "var".into(),
+                label: name,
+                range,
+                children: kids,
+            }
+        }
+        Decl::Pragma(p) => {
+            let kids = p.args.iter().map(|&a| expr_node(hir, a)).collect();
+            HirNode {
+                kind: "pragma".into(),
+                label: Some(ident_text(hir, p.name)),
+                range,
+                children: kids,
+            }
+        }
+    }
+}
+
+fn full_hir(hir: &Hir) -> HirRoot {
     let module = hir
         .module
         .clone()
@@ -235,33 +705,10 @@ fn summarize_hir(hir: &Hir) -> HirSummary {
             decls: Vec::new(),
             byte_range: 0..0,
         });
-    let decls = module
-        .decls
-        .iter()
-        .map(|d_id| {
-            let d = &hir.decls[*d_id];
-            let kind = match d {
-                greycat_analyzer_hir::types::Decl::Fn(_) => "fn",
-                greycat_analyzer_hir::types::Decl::Type(_) => "type",
-                greycat_analyzer_hir::types::Decl::Enum(_) => "enum",
-                greycat_analyzer_hir::types::Decl::Var(_) => "var",
-                greycat_analyzer_hir::types::Decl::Pragma(_) => "pragma",
-            };
-            let name = d
-                .name()
-                .map(|n| hir.idents[n].text.clone())
-                .unwrap_or_default();
-            HirDecl {
-                kind,
-                name,
-                range: d.byte_range().clone().into(),
-            }
-        })
-        .collect();
-    HirSummary {
+    let decls = module.decls.iter().map(|&d| decl_node(hir, d)).collect();
+    HirRoot {
         module_name: module.name,
         lib: module.lib,
-        decls,
         counts: HirCounts {
             decls: hir.decls.len(),
             stmts: hir.stmts.len(),
@@ -269,6 +716,7 @@ fn summarize_hir(hir: &Hir) -> HirSummary {
             type_refs: hir.type_refs.len(),
             idents: hir.idents.len(),
         },
+        decls,
     }
 }
 
@@ -276,7 +724,7 @@ fn summarize_hir(hir: &Hir) -> HirSummary {
 pub fn lower_hir(source: &str) -> Result<JsValue, JsValue> {
     let tree = greycat_analyzer_syntax::parse(source);
     let hir = lower_module(source, "module", "project", tree.root_node());
-    to_js(&summarize_hir(&hir))
+    to_js(&full_hir(&hir))
 }
 
 // =============================================================================
@@ -291,17 +739,30 @@ struct ExprType {
 
 #[wasm_bindgen]
 pub fn infer_types(source: &str) -> Result<JsValue, JsValue> {
-    let tree = greycat_analyzer_syntax::parse(source);
-    let hir = lower_module(source, "module", "project", tree.root_node());
-    let resolutions = resolve(&hir);
-    let analysis = analyze(&hir, &resolutions);
-
-    let mut out = Vec::with_capacity(analysis.expr_types.len());
-    for (idx, ty) in &analysis.expr_types {
-        let range = hir.exprs[*idx].byte_range();
+    // Route through `ProjectAnalysis` so the cross-module type fixups
+    // (P16.3 / P16.4) and `validate_type_relations` post-pass settle
+    // before we read `expr_types`. The earlier per-module
+    // `analyze(&hir, &res)` path returned every cross-module call's
+    // result as `any` (the post-pass writes those back) — so the
+    // playground's Types panel only ever showed `any`. The single-doc
+    // SourceManager still goes through the same pipeline; cross-module
+    // fixups are no-ops with one module but `validate_type_relations`
+    // and the typed-lint pass run normally.
+    let mut mgr = SourceManager::new();
+    let uri = Uri::from_str("file:///playground.gcl")
+        .map_err(|e| JsValue::from_str(&format!("uri: {e}")))?;
+    mgr.add_simple(uri.clone(), source, "project", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let module = match pa.module(&uri) {
+        Some(m) => m,
+        None => return to_js(&Vec::<ExprType>::new()),
+    };
+    let mut out = Vec::with_capacity(module.analysis.expr_types.len());
+    for (idx, ty) in &module.analysis.expr_types {
+        let range = module.hir.exprs[*idx].byte_range();
         out.push(ExprType {
             range: range.into(),
-            ty: greycat_analyzer_types::display(&analysis.types, *ty),
+            ty: greycat_analyzer_types::display(&module.analysis.types, *ty),
         });
     }
     to_js(&out)

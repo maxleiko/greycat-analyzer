@@ -1,9 +1,15 @@
 // Monarch tokenizer + language configuration for `.gcl`.
 // Yoinked from the TS reference playground (packages/playground/src/xp-editor/greycat-language)
-// and reduced to the syntax-highlighting bits — semantic providers (completion,
-// hover, etc.) are out of scope until the wasm crate exposes the equivalent APIs.
+// and reduced to the syntax-highlighting bits.
+//
+// Plus a `DocumentFormattingEditProvider` that runs the wasm formatter
+// from the worker. Monaco wires the standard `editor.action.formatDocument`
+// command (Shift+Alt+F / right-click → Format Document) through this
+// provider. Replaces the old "Format" side-panel: the formatter belongs
+// inside the editor itself, not as a separate read-only diff.
 
 import * as monaco from "monaco-editor";
+import { getAnalyzer } from "./analyzer-client.ts";
 
 const language: monaco.languages.IMonarchLanguage = {
   defaultToken: "",
@@ -188,4 +194,26 @@ export function registerGcl() {
   });
   monaco.languages.setMonarchTokensProvider("gcl", language);
   monaco.languages.setLanguageConfiguration("gcl", configuration);
+
+  // Format-document provider. Returns a single full-document replace
+  // edit when the formatter's output differs from the input, or no
+  // edits when the doc is already clean (matches Monaco's "no changes
+  // needed" notification). The diff is the whole buffer because the
+  // wasm formatter is whole-file; a per-region edit would need
+  // greycat_analyzer_fmt to support partial formatting.
+  monaco.languages.registerDocumentFormattingEditProvider("gcl", {
+    async provideDocumentFormattingEdits(model) {
+      const text = model.getValue();
+      const formatted = await getAnalyzer().format(text);
+      if (formatted === text) {
+        return [];
+      }
+      return [
+        {
+          range: model.getFullModelRange(),
+          text: formatted,
+        },
+      ];
+    },
+  });
 }

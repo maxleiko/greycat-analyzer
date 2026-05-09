@@ -59,9 +59,33 @@ export class GcCstPanel extends GcBasePanel {
       details {
         padding-left: 1rem;
       }
+      /* Hide the native disclosure marker — we render our own
+         clickable arrow so ONLY the arrow toggles the tree. The
+         rest of the summary acts as a "select node" affordance
+         (jumps Monaco to the source span). */
       summary {
         cursor: pointer;
-        list-style: revert;
+        list-style: none;
+      }
+      summary::-webkit-details-marker {
+        display: none;
+      }
+      .marker {
+        display: inline-block;
+        width: 1em;
+        text-align: center;
+        cursor: pointer;
+        opacity: 0.6;
+        user-select: none;
+      }
+      .marker:hover {
+        opacity: 1;
+      }
+      details[open] > summary > .marker {
+        transform: rotate(90deg);
+      }
+      .marker {
+        transition: transform 0.12s ease-out;
       }
     `,
   ];
@@ -73,11 +97,19 @@ export class GcCstPanel extends GcBasePanel {
 
   private renderNode(node: CstNode): TemplateResult {
     const fieldLabel = node.field ? html`<span class="field">${node.field}:</span> ` : null;
+    // Anonymous tokens (`(type)` whose text is also `"type"`,
+    // punctuation like `(()` whose text is `"("`) duplicate
+    // information. Drop the parenthesized kind chip when it would
+    // restate the literal text, but keep field labels so
+    // `field: "("` stays unambiguous.
+    const showKindChip = !(!node.is_named && node.text && node.text === node.kind);
     const tag = node.is_error
       ? html`<span class="error">ERROR</span>`
       : node.is_missing
         ? html`<span class="missing">MISSING ${node.kind}</span>`
-        : html`<span class="kind ${node.is_named ? "" : "anon"}">(${node.kind})</span>`;
+        : showKindChip
+          ? html`<span class="kind ${node.is_named ? "" : "anon"}">(${node.kind})</span>`
+          : null;
     const range = html`<span class="range">[${node.range.start}–${node.range.end}]</span>`;
     const jump = (e: Event) => {
       e.stopPropagation();
@@ -92,9 +124,27 @@ export class GcCstPanel extends GcBasePanel {
       return html`<div class="row" @click=${jump}>${fieldLabel}${tag}${text}${range}</div>`;
     }
 
+    // The marker is the ONLY part that toggles `<details>`. Clicking
+    // anywhere else on the summary jumps to the source span without
+    // collapsing/expanding the subtree. `preventDefault()` on the
+    // summary's own click suppresses the browser's default toggle;
+    // the marker's click handler then runs `details.open = !open`.
+    const onSummaryClick = (e: MouseEvent) => {
+      e.preventDefault();
+      this.jump(node.range.start, node.range.end);
+    };
+    const onMarkerClick = (e: MouseEvent) => {
+      e.stopPropagation();
+      const target = e.currentTarget as HTMLElement;
+      const det = target.closest("details");
+      if (det) det.open = !det.open;
+    };
+
     return html`
       <details open>
-        <summary @click=${jump}>${fieldLabel}${tag}${range}</summary>
+        <summary @click=${onSummaryClick}>
+          <span class="marker" @click=${onMarkerClick}>▸</span>${fieldLabel}${tag}${range}
+        </summary>
         ${node.children.map((c) => this.renderNode(c))}
       </details>
     `;
