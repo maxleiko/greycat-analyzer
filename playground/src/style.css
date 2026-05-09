@@ -101,6 +101,21 @@ body {
   flex-direction: column;
 }
 
+/* WebAwesome's wa-tab-group renders its content inside a shadow DOM
+   tree shaped as `<div part="base"> <div part="nav"/> <div part="body"
+   /> </div>`. Setting `display: flex` on the host (above) only flexes
+   the host's slotted children — it doesn't reach the shadow root.
+   Style `::part(base)` directly so the body part can take the
+   remaining height, and `::part(body)`'s `overflow: auto` actually
+   clips long panels (the tokens / CST tables grow well past the
+   viewport otherwise — clicked rows below the fold are unreachable). */
+.panel-tabs::part(base) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
 .panel-tabs::part(body) {
   flex: 1 1 auto;
   min-height: 0;
