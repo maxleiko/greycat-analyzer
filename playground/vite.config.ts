@@ -14,4 +14,16 @@ export default defineConfig({
       allow: [".."],
     },
   },
+
+  resolve: {
+    alias: [
+      // wasm-bindgen emits `import * as __wbg_star0 from 'env'` on top
+      // of the JS glue when the wasm binary references libc symbols
+      // expected on the wasm host (tree-sitter's C scanner uses
+      // `iswalpha` for unicode-aware ident classification). 'env'
+      // isn't a real npm package — alias it to a JS stub that
+      // satisfies the ABI.
+      { find: "env", replacement: "/src/env-stub.ts" },
+    ],
+  },
 });
