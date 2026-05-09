@@ -532,12 +532,29 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             // `Generic` and surface false-positive
             // "value of `Map<Target, V>` not assignable to parameter
             // `_: Map<Target, V>`" diagnostics.
+            //
+            // **P19.14** — `any` in the *target* arg slot is a
+            // wildcard: `Foo<T>` assigns to `Foo<any>` covariantly
+            // (the usual "anything → any" rule applied per arg).
+            // Matches what `nodeTime<float>` parameters declared
+            // as `nodeTime<any>` accept at the runtime.
             na == nb
                 && aa.len() == ab.len()
                 && aa.iter().zip(ab).all(|(x, y)| {
-                    *x == *y || (is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x))
+                    if *x == *y {
+                        return true;
+                    }
+                    if matches!(arena.get(*y).kind, TypeKind::Any) {
+                        return true;
+                    }
+                    is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)
                 })
         }
+        // **P19.14** — `Generic<N, args>` assigns to `Named<N>` (raw
+        // type form). Captures `nodeTime<float>` → `nodeTime` (no
+        // generic args declared) which appears in stdlib / library
+        // signatures as a wildcard receiver.
+        (TypeKind::Generic { name: na, .. }, TypeKind::Named { name: nb }) if na == nb => true,
         // P7.5 anonymous structural compat: a value of `{a: A, b: B}`
         // is assignable to `{a: A}` (width subtyping — source may have
         // *extra* fields). Each shared field's source type must be

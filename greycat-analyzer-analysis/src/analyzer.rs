@@ -893,6 +893,11 @@ impl<'a> Cx<'a> {
                 TypeKind::Named { name } => Some(name.clone()),
                 TypeKind::Generic { name, .. } => Some(name.clone()),
                 TypeKind::Enum { name, .. } => Some(name.clone()),
+                // **P19.14** — primitives carry static methods /
+                // attrs in stdlib (`time::max`, `int::max`, etc.);
+                // map them to the stdlib type name so the
+                // static-attr lookup hits.
+                TypeKind::Primitive(p) => Some(p.name().to_string()),
                 _ => None,
             };
             if let Some(name) = owner_name
