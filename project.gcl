@@ -1,8 +1,1 @@
 @library("std", "8.0.269-dev");
-
-// fn test(idx: nodeIndex<String, int>) {
-//     for (key, val in idx) {
-//         var k = key;
-//         var v = val;
-//     }
-// }
