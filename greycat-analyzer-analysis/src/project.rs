@@ -127,17 +127,90 @@ impl ProjectAnalysis {
 
     /// Rebuild from scratch over the current `manager` state. Existing
     /// cache entries are dropped.
+    ///
+    /// **P20:** routes through [`Self::analyze_staged`], the staged-
+    /// pipeline orchestrator that future phases (P21-P23) will fill in
+    /// stage-by-stage. For now, every stage delegates to the existing
+    /// per-module + post-pass machinery — same shape, named seam.
     pub fn rebuild(&mut self, manager: &SourceManager) {
+        self.analyze_staged(manager);
+    }
+
+    /// **P20** — staged-pipeline entry point. The 12-stage design from
+    /// the plan:
+    ///
+    /// ```text
+    /// S1   declare type/enum names         → type_id stable
+    /// S2   declare fn names                → fn_id stable
+    /// S3   declare modvar names            → modvar_id stable
+    /// ─── all IDs stable ───
+    /// S4   define type static-fields       (no types yet)
+    /// S5   define type fields              (no types yet)
+    /// S6   define type methods             (no params/return)
+    /// ─── all type structure stable ───
+    /// S7   complete type fields            (full TypeIds — monomorphize-ready)
+    /// S8   complete type static-fields
+    /// S9   complete type methods
+    /// S10  complete fns
+    /// S11  complete modvars
+    /// ─── full structural typing knowledge ───
+    /// S12  walk all bodies (CFG + narrowing + per-expr typing,
+    ///                       monomorphize at call sites)
+    /// ```
+    ///
+    /// **P20 status:** the staged interface exists but each stage
+    /// delegates to the existing per-module + post-pass machinery.
+    /// Stages get filled in incrementally:
+    /// - **P21** extracts S1-S6 (deletes pass 3 `resolve_cross_module_members`)
+    /// - **P22** extracts S7-S11 (deletes passes 3.4 / 3.45 / 3.52 +
+    ///   the receiver-driven substitution shim)
+    /// - **P23** rewrites S12 (deletes passes 3.5 / 3.55 / 3.6 +
+    ///   the propagate / fixed-point cascade)
+    /// - **P24** wires the Q1-Q5 query DAG so `invalidate(uri)` only
+    ///   replays Q5(uri) (and Q4 / Q5(others) when signatures change)
+    pub fn analyze_staged(&mut self, manager: &SourceManager) {
+        self.reset_state();
+
+        // S1 (lower) — parse + lower every module to HIR. Also primes
+        // the `ProjectIndex` with each module's top-level decl table so
+        // downstream stages can resolve cross-module names. Single
+        // forward pass, no per-module dependency.
+        let lowered = self.stage_lower(manager);
+
+        // S2-S11 + S12 (per-module slice) — currently bundled inside
+        // `analyze_with_index_into`, which threads name declaration,
+        // structure declaration, signature completion, and body
+        // walking in one pass. P21+ peels the earlier stages off so
+        // they run project-wide before any body walks.
+        self.stage_per_module_analysis(lowered);
+
+        // S12 (cross-module suffix) — post-passes the per-module
+        // analyzer can't run because they need every module's
+        // signatures to be settled first. P22-P23 absorbs them into
+        // the staged S7-S12 work.
+        self.stage_cross_module_post_passes();
+
+        // Post-S12 — qualified-ref bookkeeping for the unused-decl
+        // lint. Lives outside the 12 stages because it mutates the
+        // project index, not the type table.
+        self.stage_compute_qualified_refs(manager);
+    }
+
+    /// Reset every cached field so a `rebuild` / `analyze_staged`
+    /// run starts from a known-empty state. Re-seeding builtins is
+    /// idempotent (the arena interns them on the second insert).
+    fn reset_state(&mut self) {
         self.index = ProjectIndex::new();
         self.modules.clear();
-        // P19 — reset the shared arena so a stale build doesn't leak
-        // dead `TypeId`s across rebuilds (the arena is append-only;
-        // re-seeding builtins is idempotent).
         self.arena = greycat_analyzer_types::TypeArena::new();
         seed_builtins(&mut self.arena);
+    }
 
-        // Pass 1: lower every doc to HIR and ingest into the project
-        // index so types declared in one module are visible to peers.
+    /// **Stage S1** — parse + lower every module to HIR, ingest into
+    /// the project index. Returns the lowered modules in document-order
+    /// so [`Self::stage_per_module_analysis`] can move them into the
+    /// per-module cache without re-lowering.
+    fn stage_lower(&mut self, manager: &SourceManager) -> Vec<(Uri, Hir, String, Duration)> {
         let mut hirs: Vec<(Uri, Hir, String, Duration)> = Vec::with_capacity(manager.len());
         for (uri, cell) in manager.iter() {
             let doc = cell.borrow();
@@ -147,9 +220,16 @@ impl ProjectAnalysis {
             self.index.ingest(uri, &hir);
             hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took));
         }
+        hirs
+    }
 
-        // Pass 2: per-module resolver + analyzer + lints. The per-module
-        // analyzer still owns its own arena; P6.2 reroutes the lookups.
+    /// **Stages S2-S11 + S12 (per-module slice).** Currently delegates
+    /// to `analyze_with_index_into`, which combines name declaration,
+    /// structure declaration, signature lowering, and body walking
+    /// inside `Cx::visit_decl`. P21 extracts S2-S6, P22 extracts
+    /// S7-S11, P23 rewrites S12 — at which point this stage shrinks
+    /// to a thin "wire it all together" call.
+    fn stage_per_module_analysis(&mut self, hirs: Vec<(Uri, Hir, String, Duration)>) {
         for (uri, hir, lib, lower_took) in hirs {
             let mut timings = ModuleTimings {
                 lower: lower_took,
@@ -177,33 +257,36 @@ impl ProjectAnalysis {
                 },
             );
         }
+    }
 
-        // Pass 3 (P11.5): cross-module member resolution. Drain each
-        // module's `deferred_member_uses` — `(property_ident, type_name)`
-        // pairs the analyzer couldn't bind because the receiver's type
-        // wasn't declared in that module — and resolve them through the
-        // global decl table.
+    /// **Stage S12 cross-module suffix.** All of the post-passes:
+    ///
+    /// - Pass 3 (P11.5): cross-module member resolution — drains each
+    ///   module's `deferred_member_uses` against the global decl table.
+    /// - Pass 3.4 (P16.3): cross-module member-expr typing.
+    /// - Pass 3.5 (P15.7 + P16.4): cross-module call return-type
+    ///   inference for Static / QualifiedStatic / Member / Arrow /
+    ///   Ident callees.
+    /// - Pass 3.52 (P16.4 follow-up): re-bind for-in iteration vars
+    ///   from now-settled iterable types.
+    /// - Fixed-point loop (P16.4 cascade closure): each pass propagates
+    ///   type information one hop; bound at 5 iterations so a
+    ///   degenerate/cyclic case can't hang.
+    /// - Pass 3.55 (P16.6): typed lint — `arrow-on-non-deref`.
+    /// - Pass 3.6: type-relation validation.
+    ///
+    /// **P22-P23 deletes most of these.** The work each pass does is
+    /// subsumed by the staged S7-S11 (which lowers TypeRefs into the
+    /// shared arena against the *complete* project name set, so
+    /// cross-module attr / method types are resolved at signature
+    /// time) and S12 (which walks bodies against fully-resolved
+    /// signatures, so call-site monomorphization and member typing
+    /// happen inline rather than in a fix-up sweep).
+    fn stage_cross_module_post_passes(&mut self) {
         self.resolve_cross_module_members();
-
-        // Pass 3.4 (P16.3): cross-module member-expr typing.
         let _ = self.infer_cross_module_member_types();
-        // Pass 3.5 (P15.7 + P16.4): cross-module call return-type
-        // inference (Static / QualifiedStatic / Member / Arrow / Ident
-        // callees).
         let _ = self.infer_cross_module_call_types();
-        // Pass 3.52 (P16.4 follow-up): re-bind for-in iteration var
-        // types from the iterable's now-up-to-date type. The analyzer's
-        // first pass binds them eagerly from `range_ty`, but for foreign
-        // member-access / call iterables that's `any` until 3.4 / 3.5
-        // settle.
         self.rebind_for_in_iter_types();
-        // Fixed-point loop (P16.4 cascade closure): each pass propagates
-        // type information one hop. For nested for-ins like
-        // `for (g in groups) { for (p in g->packages) { ... } }` the
-        // outer rebind types `g`, then the next iteration re-resolves
-        // `g->packages` against the now-typed receiver, and so on.
-        // Bound at 5 iterations so a degenerate/cyclic case doesn't hang;
-        // the typical chain depth in real corpora is 2-3.
         for _ in 0..5 {
             let mut changed = false;
             changed |= self.propagate_member_types_from_current();
@@ -213,21 +296,16 @@ impl ProjectAnalysis {
                 break;
             }
         }
-        // Pass 3.55 (P16.6): typed lint — `arrow-on-non-deref`. Runs
-        // after the cross-module type fixups so receiver types reflect
-        // foreign decls. Idempotent on re-entry: clear the rule's prior
-        // findings before re-emitting.
         self.run_typed_lints(None);
-        // Pass 3.6: type-relation validation. Full project re-validate
-        // because `rebuild` started from an empty cache.
         self.validate_type_relations(None);
+    }
 
-        // Pass 4 (P14.9): bump `references_to` for every decl that's
-        // referenced from another module via a qualified-name access
-        // (`<module>::<name>`, `<module>::<type>::<name>`, etc.). Lets
-        // the unused-decl lint correctly skip `private` decls that
-        // are referenced through their fully-qualified name from
-        // elsewhere in the project.
+    /// **Post-S12** — bump `references_to` for every decl that's
+    /// referenced from another module via a qualified-name access
+    /// (`<module>::<name>`, `<module>::<type>::<name>`, etc.). Lets
+    /// the unused-decl lint correctly skip `private` decls referenced
+    /// through their fully-qualified name from elsewhere.
+    fn stage_compute_qualified_refs(&mut self, manager: &SourceManager) {
         self.compute_qualified_refs(manager);
     }
 
