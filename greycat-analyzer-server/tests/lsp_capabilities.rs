@@ -1644,3 +1644,140 @@ fn code_actions_for_unused_local_emits_remove_edit() {
         "expected an unused-local fix action with non-empty edits, got: {actions:?}"
     );
 }
+
+/// Completion-detail parity: cross-module decls surface their full
+/// signature in `CompletionItem.detail` and the home module's stem in
+/// `CompletionItem.label_details.description`. Mirrors the TS
+/// reference's quick-detail layout (`(<module>) name: T`).
+#[test]
+fn completion_cross_module_decl_carries_signature_and_module_label() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let mut mgr = SourceManager::new();
+    let model_uri = Uri::from_str("file:///proj/model.gcl").unwrap();
+    let main_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    mgr.add_simple(
+        model_uri.clone(),
+        "type Group {}\nvar groups: nodeIndex<String, node<Group>>;\n",
+        "project",
+        false,
+    );
+    mgr.add_simple(main_uri.clone(), "fn main() {\n  g\n}\n", "project", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&main_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 3),
+        &main_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let groups = list
+        .items
+        .iter()
+        .find(|i| i.label == "groups")
+        .expect("`groups` should appear");
+    assert_eq!(
+        groups.detail.as_deref(),
+        Some("var groups: nodeIndex<String, node<Group>>"),
+        "expected the foreign var's full signature in detail; got {:?}",
+        groups.detail
+    );
+    assert_eq!(
+        groups
+            .label_details
+            .as_ref()
+            .and_then(|d| d.description.as_deref()),
+        Some("model"),
+        "expected the home module's stem in label_details.description; got {:?}",
+        groups.label_details
+    );
+}
+
+/// In-module locals surface their inferred type in
+/// `CompletionItem.detail` (so `var counter = 0; c|` shows `int`).
+#[test]
+fn completion_in_module_local_carries_inferred_type_detail() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() {\n  var counter = 0;\n  c\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let counter = list
+        .items
+        .iter()
+        .find(|i| i.label == "counter")
+        .expect("`counter` should appear");
+    assert_eq!(
+        counter.detail.as_deref(),
+        Some("int"),
+        "expected the local's inferred type in detail; got {:?}",
+        counter.detail
+    );
+}
+
+/// In-module module-level decls surface their full signature in
+/// `CompletionItem.detail`. No `label_details.description` because the
+/// decl is intra-module — the foreign-provenance footnote only applies
+/// to cross-module surfaces.
+#[test]
+fn completion_in_module_decl_carries_signature_detail() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn helper(x: int): String { return \"\"; }\nfn main() {\n  h\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let helper = list
+        .items
+        .iter()
+        .find(|i| i.label == "helper")
+        .expect("`helper` should appear");
+    assert_eq!(
+        helper.detail.as_deref(),
+        Some("fn helper(x: int): String"),
+        "expected the in-module fn's full signature in detail; got {:?}",
+        helper.detail
+    );
+    assert!(
+        helper.label_details.is_none(),
+        "intra-module decl should not carry a foreign-module description; got {:?}",
+        helper.label_details
+    );
+}

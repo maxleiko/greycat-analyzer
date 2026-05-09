@@ -2856,18 +2856,20 @@ fn ident_or_keyword_completion(
     // Scope-visible names — this module's HIR walked top-to-cursor.
     if let Some(module) = project.module(uri) {
         let names = scope_names_at(&module.hir, cursor_byte);
-        for (name, kind, sort_pri) in names {
+        for (name, kind, sort_pri, source) in names {
             if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                 continue;
             }
             if !seen.insert(name.clone()) {
                 continue;
             }
+            let detail = scope_name_detail(module, &source);
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(kind),
                 insert_text: Some(name),
                 sort_text: Some(sort_pri.to_string()),
+                detail,
                 ..Default::default()
             });
         }
@@ -2904,11 +2906,17 @@ fn ident_or_keyword_completion(
             continue;
         }
         let kind = decl_locs_kind(project, locs);
+        let (detail, description) = foreign_decl_completion_meta(project, locs);
         items.push(CompletionItem {
             label: name.clone(),
             kind: Some(kind),
             insert_text: Some(name.clone()),
             sort_text: Some(format!("y_{name}")),
+            detail,
+            label_details: description.map(|d| CompletionItemLabelDetails {
+                description: Some(d),
+                ..Default::default()
+            }),
             ..Default::default()
         });
     }
@@ -2964,6 +2972,46 @@ fn ident_or_keyword_completion(
     Some(items)
 }
 
+/// Render the right-side `detail` string for a scope-visible name —
+/// matches the TS reference's `(<module>) name: T` quick-detail.
+/// Module-level decls show their full signature (`fn f(p: T): R`,
+/// `var x: T`, …); locals / params surface their inferred type from
+/// `def_types`; generics carry no detail.
+fn scope_name_detail(module: &ModuleAnalysis, source: &NameSource) -> Option<String> {
+    match source {
+        NameSource::ModuleDecl(decl_id) => Some(render_decl_signature(
+            &module.hir,
+            &module.hir.decls[*decl_id],
+        )),
+        NameSource::Local(name_idx) | NameSource::Param(name_idx) => module
+            .analysis
+            .def_types
+            .get(name_idx)
+            .map(|ty| greycat_analyzer_types::display(&module.analysis.types, *ty)),
+        NameSource::Generic => None,
+    }
+}
+
+/// Render the `(detail, description)` pair for a cross-module decl
+/// surfaced via [`ProjectIndex::decl_locations`]. `detail` is the
+/// foreign decl's signature; `description` is the home module's stem
+/// (e.g. `model` for `file:///proj/src/model.gcl`). Falls through to
+/// `(None, None)` when the decl's home module isn't cached.
+fn foreign_decl_completion_meta(
+    project: &ProjectAnalysis,
+    locs: &[(Uri, greycat_analyzer_hir::arena::Idx<Decl>)],
+) -> (Option<String>, Option<String>) {
+    let Some((uri, decl_id)) = locs.first() else {
+        return (None, None);
+    };
+    let Some(m) = project.module(uri) else {
+        return (None, None);
+    };
+    let detail = render_decl_signature(&m.hir, &m.hir.decls[*decl_id]);
+    let description = module_label_for_uri(uri);
+    (Some(detail), Some(description))
+}
+
 /// Pick the `CompletionItemKind` for a name resolving through the
 /// project index's decl table. When the name has multiple home
 /// locations we pick the first; that's the same disambiguation policy
@@ -2987,9 +3035,29 @@ fn decl_locs_kind(
     }
 }
 
+/// Where a [`scope_names_at`] entry came from. Lets the completion
+/// emitter reach back to the underlying decl / binding so it can
+/// render a proper `detail` string for the popup (matches the TS
+/// reference's `(<module>) name: T` quick-detail layout).
+#[derive(Debug, Clone, Copy)]
+enum NameSource {
+    /// Top-level decl in the current module (`fn` / `type` / `enum` /
+    /// `var`).
+    ModuleDecl(greycat_analyzer_hir::arena::Idx<Decl>),
+    /// Local `var x = …` binding. Carries the *binding* name idx so
+    /// `def_types` resolves the inferred type.
+    Local(greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>),
+    /// Function parameter. Same payload as `Local` — capabilities
+    /// disambiguate via `CompletionItemKind`.
+    Param(greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>),
+    /// Generic type parameter (`fn<T>` / `type Foo<T>`). No type to
+    /// surface — kind alone tells the user enough.
+    Generic,
+}
+
 /// Walk the HIR to collect every name visible at `cursor_byte`. Returns
-/// `(name, completion_kind, sort_priority)` triples. Lower sort_priority
-/// strings sort earlier — locals win over module decls.
+/// `(name, completion_kind, sort_priority, source)` quadruples. Lower
+/// sort_priority strings sort earlier — locals win over module decls.
 ///
 /// This is a stand-alone walker that doesn't share state with the
 /// resolver. The duplication is intentional — the resolver's `Cx`
@@ -2999,9 +3067,9 @@ fn decl_locs_kind(
 fn scope_names_at(
     hir: &greycat_analyzer_hir::Hir,
     cursor_byte: usize,
-) -> Vec<(String, CompletionItemKind, &'static str)> {
+) -> Vec<(String, CompletionItemKind, &'static str, NameSource)> {
     use greycat_analyzer_hir::types::Decl as HD;
-    let mut out: Vec<(String, CompletionItemKind, &'static str)> = Vec::new();
+    let mut out: Vec<(String, CompletionItemKind, &'static str, NameSource)> = Vec::new();
     let Some(module) = hir.module.as_ref() else {
         return out;
     };
@@ -3016,7 +3084,7 @@ fn scope_names_at(
                 HD::Var(_) => CompletionItemKind::VARIABLE,
                 HD::Pragma(_) => continue,
             };
-            out.push((name, kind, "n_"));
+            out.push((name, kind, "n_", NameSource::ModuleDecl(decl_id)));
         }
     }
     // Descend into the declaration that contains the cursor.
@@ -3030,7 +3098,12 @@ fn scope_names_at(
             HD::Type(d) => {
                 for g in &d.generics {
                     let n = hir.idents[*g].text.clone();
-                    out.push((n, CompletionItemKind::TYPE_PARAMETER, "g_"));
+                    out.push((
+                        n,
+                        CompletionItemKind::TYPE_PARAMETER,
+                        "g_",
+                        NameSource::Generic,
+                    ));
                 }
                 for &m_id in &d.methods {
                     let mr = hir.decls[m_id].byte_range();
@@ -3052,16 +3125,26 @@ fn collect_fn_scope(
     hir: &greycat_analyzer_hir::Hir,
     fnd: &greycat_analyzer_hir::types::FnDecl,
     cursor_byte: usize,
-    out: &mut Vec<(String, CompletionItemKind, &'static str)>,
+    out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
 ) {
     for g in &fnd.generics {
         let n = hir.idents[*g].text.clone();
-        out.push((n, CompletionItemKind::TYPE_PARAMETER, "g_"));
+        out.push((
+            n,
+            CompletionItemKind::TYPE_PARAMETER,
+            "g_",
+            NameSource::Generic,
+        ));
     }
     for p in &fnd.params {
         let p = &hir.fn_params[*p];
         let n = hir.idents[p.name].text.clone();
-        out.push((n, CompletionItemKind::VARIABLE, "a_"));
+        out.push((
+            n,
+            CompletionItemKind::VARIABLE,
+            "a_",
+            NameSource::Param(p.name),
+        ));
     }
     if let Some(body) = fnd.body {
         collect_stmt_scope(hir, body, cursor_byte, out);
@@ -3072,7 +3155,7 @@ fn collect_stmt_scope(
     hir: &greycat_analyzer_hir::Hir,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     cursor_byte: usize,
-    out: &mut Vec<(String, CompletionItemKind, &'static str)>,
+    out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
 ) {
     use greycat_analyzer_hir::types::Stmt as HS;
     match &hir.stmts[stmt_id] {
@@ -3083,7 +3166,12 @@ fn collect_stmt_scope(
                 if r.end <= cursor_byte {
                     if let HS::Var(lv) = &hir.stmts[*s] {
                         let n = hir.idents[lv.name].text.clone();
-                        out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                        out.push((
+                            n,
+                            CompletionItemKind::VARIABLE,
+                            "b_",
+                            NameSource::Local(lv.name),
+                        ));
                     }
                 } else if r.start <= cursor_byte && cursor_byte <= r.end {
                     collect_stmt_scope(hir, *s, cursor_byte, out);
@@ -3119,7 +3207,12 @@ fn collect_stmt_scope(
             if br.start <= cursor_byte && cursor_byte <= br.end {
                 if let Some(name_id) = s.init_name {
                     let n = hir.idents[name_id].text.clone();
-                    out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                    out.push((
+                        n,
+                        CompletionItemKind::VARIABLE,
+                        "b_",
+                        NameSource::Local(name_id),
+                    ));
                 }
                 collect_stmt_scope(hir, s.body, cursor_byte, out);
             }
@@ -3129,7 +3222,12 @@ fn collect_stmt_scope(
             if br.start <= cursor_byte && cursor_byte <= br.end {
                 for p in &s.params {
                     let n = hir.idents[p.name].text.clone();
-                    out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                    out.push((
+                        n,
+                        CompletionItemKind::VARIABLE,
+                        "b_",
+                        NameSource::Local(p.name),
+                    ));
                 }
                 collect_stmt_scope(hir, s.body, cursor_byte, out);
             }
@@ -3143,7 +3241,12 @@ fn collect_stmt_scope(
             if cr.start <= cursor_byte && cursor_byte <= cr.end {
                 if let Some(err_id) = s.error_param {
                     let n = hir.idents[err_id].text.clone();
-                    out.push((n, CompletionItemKind::VARIABLE, "b_"));
+                    out.push((
+                        n,
+                        CompletionItemKind::VARIABLE,
+                        "b_",
+                        NameSource::Local(err_id),
+                    ));
                 }
                 collect_stmt_scope(hir, s.catch_block, cursor_byte, out);
             }
@@ -3826,7 +3929,7 @@ fn type_position_completion(
     }
     // In-scope generic type-params from the enclosing fn / type.
     if let Some(module) = project.module(uri) {
-        for (name, kind, _) in scope_names_at(&module.hir, cursor_byte) {
+        for (name, kind, _, _) in scope_names_at(&module.hir, cursor_byte) {
             if matches!(kind, CompletionItemKind::TYPE_PARAMETER) {
                 push(&mut items, &mut seen, &name, kind);
             }
