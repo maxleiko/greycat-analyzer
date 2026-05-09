@@ -504,6 +504,43 @@ fn diag_to_edit(text: &str, diag: &Diagnostic) -> Option<(std::ops::Range<usize>
                 None
             }
         }
+        "possibly-null" => {
+            // Range = the receiver. Insert `?` at the access op.
+            let bytes = text.as_bytes();
+            let mut i = end;
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+                i += 1;
+            }
+            let is_op = bytes
+                .get(i)
+                .map(|b| matches!(b, b'.' | b'[' | b'?'))
+                .unwrap_or(false)
+                || (bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'>'));
+            if !is_op || bytes.get(i) == Some(&b'?') {
+                return None;
+            }
+            Some((i..i, "?".into()))
+        }
+        "redundant-nullable-access" => {
+            // Range covers the operator slice. Drop the lone `?` byte.
+            if end > start
+                && end <= text.len()
+                && let Some(q) = text.as_bytes()[start..end]
+                    .iter()
+                    .position(|b| *b == b'?')
+                    .map(|off| start + off)
+            {
+                return Some((q..q + 1, String::new()));
+            }
+            None
+        }
+        "redundant-non-null-assertion" | "redundant-coalesce" => {
+            if end > start && end <= text.len() {
+                Some((start..end, String::new()))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }

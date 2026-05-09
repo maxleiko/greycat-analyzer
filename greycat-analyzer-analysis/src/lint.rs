@@ -16,7 +16,10 @@ use std::ops::Range;
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, Expr, FnDecl, Ident, MemberExpr, Stmt, TypeDecl};
+use greycat_analyzer_hir::types::{
+    BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, Stmt, TypeDecl,
+    UnaryExpr, UnaryOp,
+};
 use greycat_analyzer_types::{TypeKind, is_node_tag};
 
 use crate::analyzer::AnalysisResult;
@@ -439,6 +442,263 @@ fn receiver_head_name(
     }
 }
 
+// =============================================================================
+// Rule family: nullability hygiene  (P19.17 — typed lint)
+// =============================================================================
+//
+// Four sibling rules fueled by the analyzer's `expr_types` table:
+//
+//   - `possibly-null` — Member / Arrow / Offset access on a still-
+//     nullable receiver without an opt-in marker (`?.` / `?->` / `?[`).
+//     Mirrors the TS reference's `'x' is possibly 'null'` warning.
+//   - `redundant-nullable-access` — `?.` / `?->` / `?[` written when the
+//     receiver is already known non-null. The marker is dead weight.
+//   - `redundant-non-null-assertion` — `!!x` where `x` is already
+//     non-null. The assertion is dead weight.
+//   - `redundant-coalesce` — `lhs ?? rhs` where `lhs` is already
+//     non-null. The fallback can never fire, drop the `??` clause.
+//
+// All four read the *narrowed* receiver/operand type from
+// `analysis.expr_types` (the analyzer writes narrows in-line during S12
+// body walking, so a binding under `if (x != null) { … }` already has
+// its stripped type recorded for that visit). They skip `Any` and
+// `Null` — those are too noisy to warn on (every untyped expression
+// would flag) and degenerate, respectively.
+
+/// True when `expr_id` is downstream of a `?.` / `?->` / `?[` somewhere
+/// in its receiver chain. Such positions are *runtime-safe* even when
+/// the expression's type is nullable: optional chaining short-circuits
+/// the entire suffix when the upstream marker shorts, so `.x` on a
+/// chain-nullable receiver isn't evaluated when the upstream `?.` did
+/// fire. The typing pipeline still propagates nullability for these
+/// (the *expression* really is nullable), but the `possibly-null` lint
+/// must skip them — the user already opted into the safe form upstream.
+///
+/// Walks Member / Arrow / Offset / Call / Paren receivers; everything
+/// else terminates the walk (we hit the chain root).
+pub fn chain_has_upstream_nullsafe(hir: &Hir, expr_id: Idx<Expr>) -> bool {
+    let mut cur = expr_id;
+    loop {
+        match &hir.exprs[cur] {
+            Expr::Member(m) | Expr::Arrow(m) => {
+                if m.pre_optional || m.post_optional {
+                    return true;
+                }
+                cur = m.receiver;
+            }
+            Expr::Offset(o) => {
+                if o.pre_optional || o.post_optional {
+                    return true;
+                }
+                cur = o.receiver;
+            }
+            Expr::Call(c) => {
+                cur = c.callee;
+            }
+            Expr::Paren(inner, _) => {
+                cur = *inner;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Drives the four nullability-hygiene rules in a single expression
+/// walk. Wired into the project pipeline next to
+/// [`lint_arrow_on_non_deref`] so it sees the same post-S12 typing
+/// state. Per-rule emission is short-circuited when the receiver type
+/// is `Any` / `Null` (conservative skip) or absent from `expr_types`
+/// (the visit didn't reach this expression — usually because it's
+/// inside dead code or an `Unsupported` lowering).
+pub fn lint_nullability(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    for (expr_id, expr) in hir.exprs.iter() {
+        match expr {
+            Expr::Member(MemberExpr {
+                receiver,
+                property,
+                pre_optional,
+                byte_range,
+                ..
+            })
+            | Expr::Arrow(MemberExpr {
+                receiver,
+                property,
+                pre_optional,
+                byte_range,
+                ..
+            }) => {
+                let Some(recv_ty) = analysis.expr_types.get(receiver).copied() else {
+                    continue;
+                };
+                let recv = arena.get(recv_ty);
+                if matches!(recv.kind, TypeKind::Any | TypeKind::Null) {
+                    continue;
+                }
+                let recv_range = receiver_byte_range(hir, *receiver);
+                if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
+                    let display = display_receiver(hir, *receiver);
+                    out.push(LintDiagnostic {
+                        rule: "possibly-null",
+                        severity: LintSeverity::Warning,
+                        message: format!("`{display}` is possibly `null`"),
+                        byte_range: recv_range.clone(),
+                    });
+                } else if !recv.nullable && *pre_optional {
+                    // Display range = receiver_end..property_start covers
+                    // `?.` / `?->` and any whitespace; the fix scans this
+                    // slice for the lone `?` byte to drop.
+                    let prop_start = hir.idents[*property].byte_range.start;
+                    let _ = expr_id;
+                    let _ = byte_range;
+                    out.push(LintDiagnostic {
+                        rule: "redundant-nullable-access",
+                        severity: LintSeverity::Warning,
+                        message: "redundant `?` — receiver is non-nullable".into(),
+                        byte_range: recv_range.end..prop_start,
+                    });
+                }
+            }
+            Expr::Offset(OffsetExpr {
+                receiver,
+                pre_optional,
+                byte_range,
+                ..
+            }) => {
+                let Some(recv_ty) = analysis.expr_types.get(receiver).copied() else {
+                    continue;
+                };
+                let recv = arena.get(recv_ty);
+                if matches!(recv.kind, TypeKind::Any | TypeKind::Null) {
+                    continue;
+                }
+                let recv_range = receiver_byte_range(hir, *receiver);
+                if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
+                    let display = display_receiver(hir, *receiver);
+                    out.push(LintDiagnostic {
+                        rule: "possibly-null",
+                        severity: LintSeverity::Warning,
+                        message: format!("`{display}` is possibly `null`"),
+                        byte_range: recv_range.clone(),
+                    });
+                } else if !recv.nullable && *pre_optional {
+                    // Display range = receiver_end..whole_expr_end covers
+                    // `?[…]` (the indexer span); the fix scans for the
+                    // `?` byte to drop.
+                    out.push(LintDiagnostic {
+                        rule: "redundant-nullable-access",
+                        severity: LintSeverity::Warning,
+                        message: "redundant `?` — receiver is non-nullable".into(),
+                        byte_range: recv_range.end..byte_range.end,
+                    });
+                }
+            }
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::NonNullAssert,
+                operand,
+                byte_range,
+            }) => {
+                let Some(op_ty) = analysis.expr_types.get(operand).copied() else {
+                    continue;
+                };
+                let opnd = arena.get(op_ty);
+                if matches!(opnd.kind, TypeKind::Any | TypeKind::Null) {
+                    continue;
+                }
+                if !opnd.nullable {
+                    let opnd_range = receiver_byte_range(hir, *operand);
+                    // `!!` is *postfix* in GreyCat (`$._expr, "!!"`),
+                    // so the operator slice is `[operand_end, unary_end)`.
+                    // Display + fix range covers exactly the `!!`.
+                    out.push(LintDiagnostic {
+                        rule: "redundant-non-null-assertion",
+                        severity: LintSeverity::Warning,
+                        message: "redundant `!!` — expression is already non-nullable".into(),
+                        byte_range: opnd_range.end..byte_range.end,
+                    });
+                }
+            }
+            Expr::Binary(BinaryExpr {
+                op: BinOp::Coalesce,
+                left,
+                byte_range,
+                ..
+            }) => {
+                let Some(lt) = analysis.expr_types.get(left).copied() else {
+                    continue;
+                };
+                let l = arena.get(lt);
+                if matches!(l.kind, TypeKind::Any | TypeKind::Null) {
+                    continue;
+                }
+                if !l.nullable {
+                    let left_range = receiver_byte_range(hir, *left);
+                    // Display + fix range = `?? rhs` (everything after
+                    // the lhs). Fix deletes this slice, leaving just
+                    // the lhs.
+                    out.push(LintDiagnostic {
+                        rule: "redundant-coalesce",
+                        severity: LintSeverity::Warning,
+                        message: "redundant `??` — left operand is already non-nullable".into(),
+                        byte_range: left_range.end..byte_range.end,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Byte range of an arbitrary expression. `Expr::byte_range()` returns
+/// `0..0` for `Ident` (it lives in the `Ident` arena), so we resolve
+/// that one shape ourselves before delegating to the enum accessor.
+fn receiver_byte_range(hir: &Hir, expr_id: Idx<Expr>) -> Range<usize> {
+    match &hir.exprs[expr_id] {
+        Expr::Ident(name_idx) => hir.idents[*name_idx].byte_range.clone(),
+        other => other.byte_range(),
+    }
+}
+
+/// Render a receiver expression as quoted source-like text for the
+/// `possibly-null` message. Walks Ident / Member / Arrow / Static
+/// chains directly. Falls back to `expression` for shapes that don't
+/// have a clean textual form (calls, lambdas, casts, …).
+fn display_receiver(hir: &Hir, expr_id: Idx<Expr>) -> String {
+    match &hir.exprs[expr_id] {
+        Expr::Ident(name_idx) => hir.idents[*name_idx].text.to_string(),
+        Expr::Literal(l) => match l.kind {
+            greycat_analyzer_hir::types::LiteralKind::This => "this".into(),
+            _ => "expression".into(),
+        },
+        Expr::Member(m) => {
+            let recv = display_receiver(hir, m.receiver);
+            let prop = &hir.idents[m.property].text;
+            let q = if m.pre_optional { "?." } else { "." };
+            let post = if m.post_optional { "?" } else { "" };
+            format!("{recv}{q}{prop}{post}")
+        }
+        Expr::Arrow(m) => {
+            let recv = display_receiver(hir, m.receiver);
+            let prop = &hir.idents[m.property].text;
+            let q = if m.pre_optional { "?->" } else { "->" };
+            let post = if m.post_optional { "?" } else { "" };
+            format!("{recv}{q}{prop}{post}")
+        }
+        Expr::Static(s) => {
+            let ty = &hir.type_refs[s.ty];
+            let prop = &hir.idents[s.property].text;
+            let ty_name = &hir.idents[ty.name].text;
+            format!("{ty_name}::{prop}")
+        }
+        Expr::Paren(inner, _) => display_receiver(hir, *inner),
+        _ => "expression".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +1011,212 @@ fn f() {
         assert!(
             !diags.iter().any(|d| d.rule == "arrow-on-non-deref"),
             "any-typed receivers should not flag: {diags:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // nullability hygiene (P19.17): possibly-null + redundant null-safe ops
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn possibly_null_on_nullable_member_access() {
+        let diags = project_lints(
+            r#"
+fn f(x: String?) {
+    var _ = x.size();
+}
+"#,
+        );
+        let hits: Vec<&LintDiagnostic> =
+            diags.iter().filter(|d| d.rule == "possibly-null").collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected one possibly-null hit, got {diags:?}"
+        );
+        assert!(
+            hits[0].message.contains("`x`"),
+            "expected ident in message: {}",
+            hits[0].message
+        );
+    }
+
+    #[test]
+    fn upstream_null_safe_protects_downstream_chain() {
+        // `x?.y.z` types as `int?` (chain propagation), but optional
+        // chaining short-circuits at `?.y` — if `x` is null, `.z` is
+        // never evaluated. So `possibly-null` must NOT fire on `.z`,
+        // even though `x?.y`'s recorded type is nullable.
+        let diags = project_lints(
+            r#"
+type Inner { z: int; }
+type Outer { y: Inner; }
+fn f(x: Outer?) {
+    var _ = x?.y.z;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "downstream `.z` is protected by upstream `?.`; should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_null_safe_through_call_protects_chain() {
+        // `n?.resolve().chars()` — `?.` upstream of `.chars()` (going
+        // through a call). The Call walks to its callee Member which
+        // carries `pre_optional`; the chain helper must follow that
+        // path to recognize the safe-suffix and suppress the lint.
+        let diags = project_lints(
+            r#"
+fn f(n: node<String>?) {
+    var _ = n?.resolve().chars();
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "`.chars()` after `n?.resolve()` is short-circuit-safe: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn null_safe_access_suppresses_possibly_null() {
+        let diags = project_lints(
+            r#"
+fn f(x: String?) {
+    var _ = x?.size();
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "?. on nullable receiver should not flag possibly-null: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn narrowed_receiver_suppresses_possibly_null() {
+        // P19.16's narrows fold into `expr_types`, so the second `x`
+        // visit is non-null. The lint reads the narrowed type — no
+        // diagnostic should fire.
+        let diags = project_lints(
+            r#"
+fn f(x: String?) {
+    if (x != null) {
+        var _ = x.size();
+    }
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "narrowed receiver should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn redundant_nullable_access_on_non_null_receiver() {
+        let diags = project_lints(
+            r#"
+fn f(x: String) {
+    var _ = x?.size();
+}
+"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "redundant-nullable-access"),
+            "expected redundant-nullable-access on non-null receiver: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn redundant_non_null_assertion_on_non_null_operand() {
+        let diags = project_lints(
+            r#"
+fn f(x: String) {
+    var _ = x!!;
+}
+"#,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "redundant-non-null-assertion"),
+            "expected redundant-non-null-assertion on non-null operand: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn redundant_non_null_assertion_silent_on_nullable() {
+        let diags = project_lints(
+            r#"
+fn f(x: String?) {
+    var _ = x!!;
+}
+"#,
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.rule == "redundant-non-null-assertion"),
+            "!! on a nullable operand is the canonical use — should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn redundant_coalesce_on_non_null_lhs() {
+        let diags = project_lints(
+            r#"
+fn f(x: String) {
+    var _ = x ?? "fallback";
+}
+"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "redundant-coalesce"),
+            "expected redundant-coalesce on non-null lhs: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn coalesce_silent_on_nullable_lhs() {
+        let diags = project_lints(
+            r#"
+fn f(x: String?) {
+    var _ = x ?? "fallback";
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "redundant-coalesce"),
+            "?? on nullable lhs is the canonical use — should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nullability_lints_skip_any_receiver() {
+        // `any` carries `nullable: true` in the arena, so a naive
+        // `is_nullable` check would over-fire on every untyped value.
+        // The lint family must skip `Any` and `Null` kinds explicitly.
+        let diags = project_lints(
+            r#"
+fn pick(): any { return 1; }
+fn f() {
+    var x = pick();
+    var _ = x.size();
+    var _ = x ?? 0;
+    var _ = x!!;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| matches!(
+                d.rule,
+                "possibly-null" | "redundant-coalesce" | "redundant-non-null-assertion"
+            )),
+            "any-typed receivers/operands should not flag the nullability family: {diags:?}"
         );
     }
 }

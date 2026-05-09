@@ -802,7 +802,19 @@ impl<'a> Cx<'a> {
                 is_arrow,
             } => {
                 let recv_ty = self.out.expr_types.get(&receiver).copied()?;
-                self.method_return_for(recv_ty, property, is_arrow)
+                let ret = self.method_return_for(recv_ty, property, is_arrow)?;
+                // P19.17 — propagate receiver nullability. `x?.foo()`
+                // and `x.foo()` where `x: T?` both yield `Ret?` at
+                // runtime: the call shorts (or NPEs) when the receiver
+                // is null. The Member arm of `infer_expr` does the
+                // same lift for value access; here we mirror it for
+                // calls so chains like `x?.foo().bar` carry the
+                // nullability through.
+                if self.arena.get(recv_ty).nullable {
+                    Some(self.arena.nullable(ret))
+                } else {
+                    Some(ret)
+                }
             }
             CalleeShape::Static { ty, property } => {
                 let recv_ty = self.lower_type_ref(ty);
@@ -2379,17 +2391,19 @@ impl<'a> Cx<'a> {
                 } else {
                     self.any()
                 };
-                // P16.7 — null-safe access notations propagate
-                // nullability through the access:
-                //   `a?.b` / `a?->b` — when receiver is `T?`, lift the
-                //                      result to `(typeof a.b)?`. When
-                //                      receiver isn't nullable, the
-                //                      marker is a no-op.
-                //   `a.b?` / `a->b?` — explicit "treat as nullable"
-                //                      suffix: lift unconditionally.
-                let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
-                let lift_post = post_optional;
-                let result_ty = if lift_pre || lift_post {
+                // P16.7 + P19.17 — nullability propagates *up the chain*
+                // whenever the receiver is nullable, regardless of
+                // whether the user wrote `?.` at this segment. The
+                // runtime evaluates the whole chain to null when any
+                // prior `?.` shorts, so `x?.y.z` types as `Z?`. The
+                // `pre_optional` flag is what the lint reads to decide
+                // whether to flag the dereference as "possibly null"
+                // (no flag → flag fires), but it doesn't change typing.
+                // `a.b?` / `a->b?` still lifts unconditionally as a
+                // user-asserted "treat as nullable" override.
+                let _ = pre_optional;
+                let recv_nullable = self.arena.get(recv_ty).nullable;
+                let result_ty = if recv_nullable || post_optional {
                     self.arena.nullable(base_ty)
                 } else {
                     base_ty

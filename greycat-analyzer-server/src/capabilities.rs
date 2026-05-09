@@ -1710,8 +1710,80 @@ fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
                 new_text: format!("_{name}"),
             }]
         }
+        "possibly-null" => {
+            // Lint range = the receiver. Find the access operator that
+            // follows (`.`, `->`, `[`) and insert `?` immediately
+            // before it, mirroring the TS reference's "fix available".
+            let recv_end = position_to_byte(text, diag.range.end);
+            let Some(op_pos) = find_access_op_after(text, recv_end) else {
+                return Vec::new();
+            };
+            // Already null-safe — no fix to offer (defensive guard;
+            // the lint shouldn't have fired in the first place).
+            if text.as_bytes().get(op_pos) == Some(&b'?') {
+                return Vec::new();
+            }
+            let pos = byte_to_position(text, op_pos);
+            vec![TextEdit {
+                range: lsp_types::Range {
+                    start: pos,
+                    end: pos,
+                },
+                new_text: "?".into(),
+            }]
+        }
+        "redundant-nullable-access" => {
+            // Lint range covers the operator slice (`?.` / `?->` / `?[`
+            // plus any whitespace). Drop the lone `?` byte inside it.
+            let start = position_to_byte(text, diag.range.start);
+            let end = position_to_byte(text, diag.range.end);
+            if end <= start || end > text.len() {
+                return Vec::new();
+            }
+            let bytes = text.as_bytes();
+            let Some(q) = bytes[start..end]
+                .iter()
+                .position(|b| *b == b'?')
+                .map(|off| start + off)
+            else {
+                return Vec::new();
+            };
+            vec![TextEdit {
+                range: lsp_types::Range {
+                    start: byte_to_position(text, q),
+                    end: byte_to_position(text, q + 1),
+                },
+                new_text: String::new(),
+            }]
+        }
+        "redundant-non-null-assertion" | "redundant-coalesce" => {
+            // Lint range = the dead-weight slice (`!!` for the unary,
+            // `?? rhs` for the coalesce). Delete it.
+            vec![TextEdit {
+                range: diag.range,
+                new_text: String::new(),
+            }]
+        }
         _ => Vec::new(),
     }
+}
+
+/// Scan forward from `from` over whitespace until we hit an access
+/// operator (`.`, `->`, `[`, or an existing `?`). Returns the operator's
+/// starting byte index, or `None` if the next non-whitespace byte isn't
+/// one of those.
+fn find_access_op_after(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b'.' | b'[' | b'?' => return Some(i),
+            b'-' if bytes.get(i + 1) == Some(&b'>') => return Some(i),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
@@ -3531,6 +3603,55 @@ fn member_completion(
             }
         }
         items.extend(inner_items);
+    }
+
+    // P19.17 — when the receiver is nullable and the user typed `.` /
+    // `->` (not `?.` / `?->`), each accepted item should land as the
+    // null-safe form: insert a `?` immediately before the separator
+    // via `additional_text_edits`. The label is rewritten to `?.size`
+    // so the user *sees* what they're inserting before they accept;
+    // `filter_text` and `sort_text` keep the bare name so typing `s`
+    // still filters to `size` and the list ordering is unchanged from
+    // the non-null case.
+    //
+    // **Skip when the receiver chain has an upstream `?.`** — optional
+    // chaining short-circuits the whole suffix, so `n?.resolve().|`
+    // is runtime-safe even though `n?.resolve()`'s type is `String?`.
+    // Only the leading `?.` is needed; pushing more would be noise.
+    let receiver_nullable = arena.get(recv_ty).nullable;
+    let already_nullsafe = recv_end > 0 && bytes[recv_end - 1] == b'?';
+    let chain_protected = module
+        .hir
+        .exprs
+        .iter()
+        .filter(|(_, e)| e.byte_range().end == recv_end)
+        .max_by_key(|(_, e)| e.byte_range().end - e.byte_range().start)
+        .map(|(id, _)| {
+            greycat_analyzer_analysis::lint::chain_has_upstream_nullsafe(&module.hir, id)
+        })
+        .unwrap_or(false);
+    if receiver_nullable && !already_nullsafe && !chain_protected {
+        let insert_at = lsp_types::Range {
+            start: byte_to_position(text, sep_start),
+            end: byte_to_position(text, sep_start),
+        };
+        let prefix = if is_arrow { "?->" } else { "?." };
+        for item in &mut items {
+            let bare = item.label.clone();
+            let mut edits = item.additional_text_edits.take().unwrap_or_default();
+            edits.push(TextEdit {
+                range: insert_at,
+                new_text: "?".into(),
+            });
+            item.additional_text_edits = Some(edits);
+            item.label = format!("{prefix}{bare}");
+            if item.filter_text.is_none() {
+                item.filter_text = Some(bare.clone());
+            }
+            if item.sort_text.is_none() {
+                item.sort_text = Some(bare);
+            }
+        }
     }
 
     if items.is_empty() {

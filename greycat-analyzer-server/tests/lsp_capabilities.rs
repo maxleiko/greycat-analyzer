@@ -683,6 +683,156 @@ fn completion_after_dot_lists_attrs_and_methods() {
     assert!(!labels.contains(&"return"), "got: {labels:?}");
 }
 
+/// P19.17 — when the receiver is nullable, completions on `.` / `->`
+/// attach an `additional_text_edits` that inserts `?` immediately
+/// before the separator and surface the rewrite via `label_details`,
+/// so accepting `size` on `var x: String?` lands as `x?.size`.
+#[test]
+fn completion_on_nullable_receiver_offers_null_safe_rewrite() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    // Mirror the existing `completion_after_dot_lists_attrs_and_methods`
+    // shape (line 1 holds the body so the parser sees a clean fn) and
+    // make the receiver nullable.
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Point { x: int; y: int; fn norm(): int { return 0; } }\nfn use_(p: Point?) { p. }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after the `.` (line 1 col 23).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 23),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let item = list
+        .items
+        .iter()
+        .find(|i| i.label == "?.x")
+        .unwrap_or_else(|| panic!("`?.x` attr missing from list: {:?}", list.items));
+    let edits = item
+        .additional_text_edits
+        .as_ref()
+        .expect("nullable receiver should attach a `?` insertion edit");
+    assert!(
+        edits.iter().any(|e| e.new_text == "?"),
+        "expected `?` insertion edit, got: {edits:?}"
+    );
+    assert_eq!(
+        item.filter_text.as_deref(),
+        Some("x"),
+        "filter_text should stay as the bare name so typing `x` still matches",
+    );
+}
+
+#[test]
+fn completion_on_non_null_receiver_no_null_safe_rewrite() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Point { x: int; y: int; fn norm(): int { return 0; } }\nfn use_(p: Point) { p. }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 22),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let item = list
+        .items
+        .iter()
+        .find(|i| i.label == "x")
+        .unwrap_or_else(|| panic!("`x` missing: {:?}", list.items));
+    assert!(
+        item.additional_text_edits.is_none()
+            || !item
+                .additional_text_edits
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.new_text == "?"),
+        "non-nullable receiver should not propose `?.` rewrite"
+    );
+    // Label stays bare — no `?.` prefix.
+    assert!(
+        !item.label.starts_with("?."),
+        "non-nullable receiver should not prefix label with `?.`, got {:?}",
+        item.label
+    );
+}
+
+#[test]
+fn completion_after_upstream_null_safe_no_rewrite() {
+    // `x?.y.|` — the chain already has `?.` upstream, so further
+    // `.foo` access is runtime-safe (optional chaining short-circuits
+    // the whole suffix). Completion must NOT push more `?.`.
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Inner { z: int; fn norm(): int { return 0; } }\ntype Outer { y: Inner; }\nfn use_(x: Outer?) { x?.y.z; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Line 2: `fn use_(x: Outer?) { x?.y.z; }` — second `.` at col 25,
+    // cursor right after `.` (between `.` and `z`) at col 26.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 26),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let z = list
+        .items
+        .iter()
+        .find(|i| i.label == "z" || i.label == "?.z")
+        .unwrap_or_else(|| panic!("`z` missing: {:?}", list.items));
+    assert_eq!(
+        z.label, "z",
+        "downstream of `?.`, completion should NOT prefix `?.` (got {:?})",
+        z.label
+    );
+    assert!(
+        z.additional_text_edits.is_none()
+            || !z
+                .additional_text_edits
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.new_text == "?"),
+        "should not insert `?` when chain has upstream `?.`"
+    );
+}
+
 /// P15.2.4 — typed prefix filters the member completion list.
 #[test]
 fn completion_after_dot_prefix_filters() {
