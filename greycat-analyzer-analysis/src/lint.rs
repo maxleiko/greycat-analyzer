@@ -136,13 +136,20 @@ fn visit_for_locals(
     match stmt {
         Stmt::Block(b) => visit_block_for_locals(hir, res, b, out, rule),
         Stmt::Var(v) => {
+            // Convention (matches `unused-param` and Rust): a leading
+            // `_` opts out of the unused warning. Lets users keep
+            // `var _x = expr;` for typing / side-effect reasons
+            // without the linter complaining.
+            let ident = &hir.idents[v.name];
+            if ident.text.starts_with('_') {
+                return;
+            }
             // Was `v.name` referenced anywhere as a Local?
             let used = res.uses.values().any(|d| match d {
                 Definition::Local(name) => *name == v.name,
                 _ => false,
             });
             if !used {
-                let ident = &hir.idents[v.name];
                 out.push(LintDiagnostic {
                     rule,
                     severity: LintSeverity::Warning,
@@ -509,6 +516,26 @@ fn f(_unused: int): int {
         assert!(
             !diags.iter().any(|d| d.rule == "unused-param"),
             "underscore-prefixed params should not warn: {diags:?}"
+        );
+    }
+
+    /// **P19.10 follow-up** — `var _name = expr;` opts out of the
+    /// unused-local warning, matching `unused-param`'s behavior and
+    /// the Rust convention. Lets users keep a binding for typing /
+    /// side-effect reasons without the linter complaining.
+    #[test]
+    fn underscore_local_skipped() {
+        let diags = lint(
+            r#"
+fn f(): int {
+    var _ignored: int = 0;
+    return 42;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-local"),
+            "underscore-prefixed locals should not warn: {diags:?}"
         );
     }
 
