@@ -372,6 +372,7 @@ fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
 pub fn lint_arrow_on_non_deref(
     hir: &Hir,
     analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
 ) {
@@ -387,7 +388,7 @@ pub fn lint_arrow_on_non_deref(
         let Some(recv_ty) = analysis.expr_types.get(receiver).copied() else {
             continue;
         };
-        let head = receiver_head_name(&analysis.types, recv_ty);
+        let head = receiver_head_name(arena, recv_ty);
         let Some(name) = head else {
             // Conservative: receiver is `any` / lambda / tuple / etc. —
             // no head name to classify. Skip.
@@ -404,7 +405,7 @@ pub fn lint_arrow_on_non_deref(
             continue;
         }
         let _ = expr_id;
-        let display = greycat_analyzer_types::display(&analysis.types, recv_ty);
+        let display = greycat_analyzer_types::display(arena, recv_ty);
         out.push(LintDiagnostic {
             rule: "arrow-on-non-deref",
             severity: LintSeverity::Error,

@@ -242,6 +242,112 @@ impl TypeArena {
             nullable: false,
         })
     }
+
+    /// P19 — substitute `GenericParam(name)` occurrences inside `ty`
+    /// with the matching entry in `subst`, allocating fresh interned
+    /// types for any container that changed shape. Idempotent: calling
+    /// twice produces the same TypeId. Mirrors
+    /// [`InferenceTable::substitute`] but takes a plain `&HashMap` so
+    /// callers (e.g. the staged-pipeline body walker) don't have to
+    /// route witnesses through an `InferenceTable`.
+    ///
+    /// Recurses through `Generic`, `Tuple`, `Lambda`, `Anonymous`, and
+    /// `Union` shapes. Non-substitutable kinds (`Named`, `Primitive`,
+    /// `Null`, `Any`, `Never`, `Enum`) return `ty` unchanged.
+    pub fn substitute(&mut self, ty: TypeId, subst: &HashMap<String, TypeId>) -> TypeId {
+        if subst.is_empty() {
+            return ty;
+        }
+        let t = self.get(ty).clone();
+        match &t.kind {
+            TypeKind::GenericParam { name, .. } => match subst.get(name) {
+                Some(&witness) if t.nullable => self.nullable(witness),
+                Some(&witness) => witness,
+                None => ty,
+            },
+            TypeKind::Generic { name, args } => {
+                let new_args: Vec<TypeId> =
+                    args.iter().map(|a| self.substitute(*a, subst)).collect();
+                if new_args == *args {
+                    ty
+                } else {
+                    let name = name.clone();
+                    let mut new_t = self.generic(name, new_args);
+                    if t.nullable {
+                        new_t = self.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            TypeKind::Tuple { elements } => {
+                let new_els: Vec<TypeId> = elements
+                    .iter()
+                    .map(|e| self.substitute(*e, subst))
+                    .collect();
+                if new_els == *elements {
+                    ty
+                } else {
+                    let mut new_t = self.tuple(new_els);
+                    if t.nullable {
+                        new_t = self.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            TypeKind::Lambda(l) => {
+                let new_params: Vec<TypeId> = l
+                    .params
+                    .iter()
+                    .map(|p| self.substitute(*p, subst))
+                    .collect();
+                let new_ret = self.substitute(l.ret, subst);
+                if new_params == l.params && new_ret == l.ret {
+                    ty
+                } else {
+                    let mut new_t = self.lambda(new_params, new_ret);
+                    if t.nullable {
+                        new_t = self.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            TypeKind::Anonymous { fields } => {
+                let new_fields: Vec<(String, TypeId)> = fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), self.substitute(*t, subst)))
+                    .collect();
+                if new_fields == *fields {
+                    ty
+                } else {
+                    let mut new_t = self.alloc(Type {
+                        kind: TypeKind::Anonymous { fields: new_fields },
+                        nullable: false,
+                    });
+                    if t.nullable {
+                        new_t = self.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            TypeKind::Union { alts } => {
+                let new_alts: Vec<TypeId> =
+                    alts.iter().map(|a| self.substitute(*a, subst)).collect();
+                if new_alts == *alts {
+                    ty
+                } else {
+                    let mut new_t = self.alloc(Type {
+                        kind: TypeKind::Union { alts: new_alts },
+                        nullable: false,
+                    });
+                    if t.nullable {
+                        new_t = self.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            _ => ty,
+        }
+    }
 }
 
 // =============================================================================
@@ -919,6 +1025,61 @@ mod tests {
         };
         assert_eq!(name, "Array");
         assert_eq!(args, &vec![int]);
+    }
+
+    #[test]
+    fn arena_substitute_replaces_generic_params() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let str_t = a.primitive(Primitive::String);
+        let t_param = a.alloc(Type {
+            kind: TypeKind::GenericParam {
+                name: "T".into(),
+                owner: GenericOwner::Type("Foo".into()),
+            },
+            nullable: false,
+        });
+        let u_param = a.alloc(Type {
+            kind: TypeKind::GenericParam {
+                name: "U".into(),
+                owner: GenericOwner::Type("Foo".into()),
+            },
+            nullable: false,
+        });
+        let map_tu = a.generic("Map", vec![t_param, u_param]);
+
+        let mut subst: HashMap<String, TypeId> = HashMap::new();
+        subst.insert("T".into(), int);
+        subst.insert("U".into(), str_t);
+
+        let resolved = a.substitute(map_tu, &subst);
+        let TypeKind::Generic { name, args } = &a.get(resolved).kind else {
+            panic!("expected Map<int, String>");
+        };
+        assert_eq!(name, "Map");
+        assert_eq!(args, &vec![int, str_t]);
+
+        // Idempotent: re-applying yields the same TypeId.
+        let resolved2 = a.substitute(resolved, &subst);
+        assert_eq!(resolved, resolved2);
+
+        // Nullability preserved: Array<T?> with T → int gives Array<int?>.
+        let t_param_q = a.nullable(t_param);
+        let arr_t_q = a.generic("Array", vec![t_param_q]);
+        let resolved_q = a.substitute(arr_t_q, &subst);
+        let TypeKind::Generic { args: q_args, .. } = &a.get(resolved_q).kind else {
+            panic!();
+        };
+        assert!(a.get(q_args[0]).nullable);
+    }
+
+    #[test]
+    fn arena_substitute_no_op_on_empty_subst() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        let arr = a.generic("Array", vec![int]);
+        let empty: HashMap<String, TypeId> = HashMap::new();
+        assert_eq!(a.substitute(arr, &empty), arr);
     }
 
     #[test]

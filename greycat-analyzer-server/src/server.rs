@@ -521,6 +521,7 @@ fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<
     let module = server.project_analysis.module(&params.text_document.uri)?;
     Some(capabilities::inlay_hints_with_project(
         module,
+        server.project_analysis.arena(),
         &doc.text,
         &params.range,
     ))

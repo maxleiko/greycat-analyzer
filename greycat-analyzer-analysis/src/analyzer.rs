@@ -158,9 +158,13 @@ impl SemanticDiagnostic {
 }
 
 /// Output of the analyzer for a single module.
+///
+/// **P19:** the [`TypeArena`] that backs every `TypeId` in this struct
+/// is owned by [`crate::project::ProjectAnalysis`], not here. Pass it
+/// alongside any `AnalysisResult` you want to inspect — call
+/// [`crate::project::ProjectAnalysis::arena`] to get a borrow.
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
-    pub types: TypeArena,
     pub registry: TypeRegistry,
     /// Per-expression inferred type (subset — entries only for expressions
     /// the analyzer actually visited).
@@ -261,22 +265,51 @@ impl AnalysisResult {
 /// to an empty [`ProjectIndex`]; cross-module type names lower to
 /// `any` and `deferred_member_uses` gets nothing the project pipeline
 /// can resolve. Used by per-file capabilities and unit tests.
-pub fn analyze(hir: &Hir, res: &Resolutions) -> AnalysisResult {
+///
+/// **P19:** allocates a fresh [`TypeArena`] internally and discards it
+/// — callers that need to inspect `TypeId`s after the call must use
+/// [`analyze_with_index_into`] instead so the arena outlives the call.
+pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
     let index = ProjectIndex::new();
-    analyze_with_index(hir, res, &index)
+    let mut arena = TypeArena::new();
+    let out = analyze_with_index_into(hir, res, &index, &mut arena);
+    (arena, out)
 }
 
-/// Run the analyzer with a shared project index. The index is read-
-/// only — it's only consulted when `lower_type_ref` doesn't find a
-/// name in the per-module registry, so cross-module type references
-/// (`p: Point` where `Point` is declared in another module) lower to
-/// the right `Named` shape and `resolve_member` can defer
-/// `(property, type_name)` for the project's cross-module member
-/// post-pass (P11.5).
-pub fn analyze_with_index(hir: &Hir, res: &Resolutions, index: &ProjectIndex) -> AnalysisResult {
+/// Convenience wrapper that allocates a private arena. Same caveat as
+/// [`analyze`]: the arena is returned to the caller alongside the
+/// result so any [`TypeId`] in the result can still be looked up.
+pub fn analyze_with_index(
+    hir: &Hir,
+    res: &Resolutions,
+    index: &ProjectIndex,
+) -> (TypeArena, AnalysisResult) {
+    let mut arena = TypeArena::new();
+    let out = analyze_with_index_into(hir, res, index, &mut arena);
+    (arena, out)
+}
+
+/// Run the analyzer with a shared project index *and* a caller-owned
+/// arena (P19). The arena is shared across every module the project
+/// pipeline analyzes so cross-module `TypeId`s point into the same
+/// storage — no `mint_type_shape` / `read_type_shape` translation
+/// needed at the boundary.
+///
+/// The index is read-only — it's only consulted when `lower_type_ref`
+/// doesn't find a name in the per-module registry, so cross-module
+/// type references (`p: Point` where `Point` is declared in another
+/// module) lower to the right `Named` shape and `resolve_member` can
+/// defer `(property, type_name)` for the project's cross-module
+/// member post-pass (P11.5).
+pub fn analyze_with_index_into(
+    hir: &Hir,
+    res: &Resolutions,
+    index: &ProjectIndex,
+    arena: &mut TypeArena,
+) -> AnalysisResult {
     let mut out = AnalysisResult::default();
-    seed_builtins(&mut out.types);
-    register_module_types(hir, &mut out);
+    seed_builtins(arena);
+    register_module_types(hir, arena, &mut out);
 
     let Some(module) = hir.module.as_ref() else {
         return out;
@@ -285,6 +318,7 @@ pub fn analyze_with_index(hir: &Hir, res: &Resolutions, index: &ProjectIndex) ->
         hir,
         res,
         out: &mut out,
+        arena,
         index,
         narrows: Vec::new(),
         chain_member_ifs: HashSet::new(),
@@ -310,7 +344,10 @@ pub fn analyze_with_index(hir: &Hir, res: &Resolutions, index: &ProjectIndex) ->
 }
 
 /// Seed primitive type ids in the arena so cx.{int, bool, ...} are cheap.
-fn seed_builtins(arena: &mut TypeArena) {
+/// Idempotent — `alloc` interns equal types so re-seeding is a no-op
+/// (the project pipeline calls this once per `analyze_with_index_into`,
+/// which all share the same arena).
+pub(crate) fn seed_builtins(arena: &mut TypeArena) {
     let _ = arena.primitive(Primitive::Bool);
     let _ = arena.primitive(Primitive::Int);
     let _ = arena.primitive(Primitive::Float);
@@ -331,7 +368,7 @@ fn seed_builtins(arena: &mut TypeArena) {
 /// Also populates [`AnalysisResult::type_decls`] (name → HIR
 /// `TypeDecl` index) so P6.3 member resolution can navigate from a
 /// receiver's `TypeId` back to the declaring node.
-fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
+fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisResult) {
     let Some(module) = hir.module.as_ref() else {
         return;
     };
@@ -340,7 +377,7 @@ fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
         match decl {
             Decl::Type(td) => {
                 let name = hir.idents[td.name].text.clone();
-                let id = out.types.named(&name);
+                let id = arena.named(&name);
                 out.registry.register(name.clone(), id);
                 out.type_decls.insert(name, *d);
             }
@@ -351,7 +388,7 @@ fn register_module_types(hir: &Hir, out: &mut AnalysisResult) {
                     .iter()
                     .map(|f| hir.idents[hir.enum_fields[*f].name].text.clone())
                     .collect();
-                let id = out.types.alloc(Type {
+                let id = arena.alloc(Type {
                     kind: TypeKind::Enum {
                         name: name.clone(),
                         variants,
@@ -398,6 +435,10 @@ struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
     out: &'a mut AnalysisResult,
+    /// P19: project-wide type arena. Owned by `ProjectAnalysis`, so
+    /// every module's analyzer mints into the same `TypeArena` and
+    /// `TypeId`s are comparable across module boundaries.
+    arena: &'a mut TypeArena,
     /// P11.5: cross-module project index. Per-file callers pass an
     /// empty [`ProjectIndex::new`]; the project pipeline passes the
     /// index it just rebuilt. Used by `lower_type_ref` to recognize
@@ -425,13 +466,13 @@ struct Cx<'a> {
 
 impl<'a> Cx<'a> {
     fn primitive(&mut self, p: Primitive) -> TypeId {
-        self.out.types.primitive(p)
+        self.arena.primitive(p)
     }
     fn any(&mut self) -> TypeId {
-        self.out.types.any()
+        self.arena.any()
     }
     fn null(&mut self) -> TypeId {
-        self.out.types.null()
+        self.arena.null()
     }
     fn record(&mut self, expr: Idx<Expr>, ty: TypeId) {
         self.out.expr_types.insert(expr, ty);
@@ -474,12 +515,12 @@ impl<'a> Cx<'a> {
         self.out.def_types.get(&name).copied()
     }
     fn strip_nullable(&mut self, ty: TypeId) -> TypeId {
-        let mut t = self.out.types.get(ty).clone();
+        let mut t = self.arena.get(ty).clone();
         if !t.nullable {
             return ty;
         }
         t.nullable = false;
-        self.out.types.alloc(t)
+        self.arena.alloc(t)
     }
 
     /// P16.5 — when an `Expr::Arrow` receiver is a single-arg node-tag
@@ -494,7 +535,7 @@ impl<'a> Cx<'a> {
     /// canonical `inner` to redirect to. Returns `None` for non-tag
     /// receivers so the caller resolves against the receiver itself.
     fn arrow_deref_receiver(&self, recv_ty: TypeId) -> Option<TypeId> {
-        let ty = self.out.types.get(recv_ty);
+        let ty = self.arena.get(recv_ty);
         match &ty.kind {
             TypeKind::Generic { name, args } if is_node_tag(name) && args.len() == 1 => {
                 Some(args[0])
@@ -510,7 +551,7 @@ impl<'a> Cx<'a> {
     /// receivers (P11.5) are recorded into `deferred_member_uses` so
     /// the project pipeline can resolve them in a post-pass.
     fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
-        let ty = self.out.types.get(recv_ty);
+        let ty = self.arena.get(recv_ty);
         let type_name = match &ty.kind {
             TypeKind::Named { name } => Some(name.clone()),
             TypeKind::Generic { name, .. } => Some(name.clone()),
@@ -587,13 +628,13 @@ impl<'a> Cx<'a> {
                 if !tr.params.is_empty() {
                     let args: Vec<TypeId> =
                         tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
-                    self.out.types.generic(name.clone(), args)
+                    self.arena.generic(name.clone(), args)
                 } else if let Some(owner) = self.lookup_generic(&name) {
                     // P12.1: name matches a fn / type generic param in
                     // scope — produce a `GenericParam` rather than a
                     // bare `Named`, so call-site inference can record
                     // witnesses for it.
-                    self.out.types.generic_param(name.clone(), owner)
+                    self.arena.generic_param(name.clone(), owner)
                 } else if let Some(id) = self.out.registry.lookup(&name) {
                     id
                 } else if self.index.has_name(&name) {
@@ -602,7 +643,7 @@ impl<'a> Cx<'a> {
                     // elsewhere. Lower to `Named(name)` so receivers
                     // typed against it carry a name `resolve_member`
                     // can defer for the cross-module post-pass.
-                    self.out.types.named(name.clone())
+                    self.arena.named(name.clone())
                 } else {
                     // Unknown type — fall back to Any so downstream rules don't
                     // mass-cascade. Resolver already emitted "unresolved name".
@@ -611,7 +652,7 @@ impl<'a> Cx<'a> {
             }
         };
         if tr.optional {
-            base = self.out.types.nullable(base);
+            base = self.arena.nullable(base);
         }
         base
     }
@@ -667,7 +708,7 @@ impl<'a> Cx<'a> {
         for i in 0..pair_count {
             self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
         }
-        Some(tbl.substitute(&mut self.out.types, declared_return))
+        Some(tbl.substitute(self.arena, declared_return))
     }
 
     /// Walk `param_ty` (declared) against `arg_ty` (witness). When
@@ -684,7 +725,7 @@ impl<'a> Cx<'a> {
         tbl: &mut InferenceTable,
         call_range: &Range<usize>,
     ) {
-        let pk = self.out.types.get(param_ty).clone();
+        let pk = self.arena.get(param_ty).clone();
         if let TypeKind::GenericParam { name, .. } = &pk.kind {
             // If the param is `T?`, the witness is whatever the arg
             // strips down to without nullable.
@@ -698,8 +739,8 @@ impl<'a> Cx<'a> {
                     let msg = format!(
                         "cannot infer `{}`: `{}` conflicts with `{}`",
                         name,
-                        greycat_analyzer_types::display(&self.out.types, prior),
-                        greycat_analyzer_types::display(&self.out.types, witness),
+                        greycat_analyzer_types::display(self.arena, prior),
+                        greycat_analyzer_types::display(self.arena, witness),
                     );
                     self.diag(Severity::Error, msg, call_range.clone());
                 }
@@ -708,7 +749,7 @@ impl<'a> Cx<'a> {
             tbl.bind(name.clone(), witness);
             return;
         }
-        let ak = self.out.types.get(arg_ty).clone();
+        let ak = self.arena.get(arg_ty).clone();
         if let (
             TypeKind::Generic { name: pn, args: pa },
             TypeKind::Generic { name: an, args: aa },
@@ -1005,14 +1046,14 @@ impl<'a> Cx<'a> {
                 // `for (i, v in arr?)` is valid GreyCat. Strip the optional
                 // before pattern-matching the kind so the binding logic is
                 // the same shape with or without the `?` marker.
-                let underlying_ty = if self.out.types.get(range_ty).nullable {
-                    let mut t = self.out.types.get(range_ty).clone();
+                let underlying_ty = if self.arena.get(range_ty).nullable {
+                    let mut t = self.arena.get(range_ty).clone();
                     t.nullable = false;
-                    self.out.types.alloc(t)
+                    self.arena.alloc(t)
                 } else {
                     range_ty
                 };
-                let inferred: Vec<TypeId> = match self.out.types.get(underlying_ty).kind.clone() {
+                let inferred: Vec<TypeId> = match self.arena.get(underlying_ty).kind.clone() {
                     TypeKind::Generic { name, args }
                         if name == "Array" || name == "Set" || name == "nodeList" =>
                     {
@@ -1170,7 +1211,7 @@ impl<'a> Cx<'a> {
         let Some(enum_id) = self.out.registry.lookup(&chain.enum_name) else {
             return;
         };
-        let enum_ty = self.out.types.get(enum_id);
+        let enum_ty = self.arena.get(enum_id);
         let TypeKind::Enum { variants, .. } = &enum_ty.kind else {
             return;
         };
@@ -1383,14 +1424,14 @@ impl<'a> Cx<'a> {
             }
             Expr::Tuple(items, _) => {
                 let elems: Vec<TypeId> = items.iter().map(|i| self.visit_expr(*i)).collect();
-                self.out.types.tuple(elems)
+                self.arena.tuple(elems)
             }
             Expr::Array(items, _) => {
                 for i in items.iter() {
                     let _ = self.visit_expr(*i);
                 }
                 let any = self.any();
-                self.out.types.generic("Array", vec![any])
+                self.arena.generic("Array", vec![any])
             }
             Expr::Object(ObjectExpr { ty, fields, .. }) => {
                 for f in &fields {
@@ -1452,7 +1493,7 @@ impl<'a> Cx<'a> {
                                 .map(|ty| self.lower_type_ref(ty))
                                 .unwrap_or_else(|| self.any())
                         }
-                        MemberDef::Method(_) => self.out.types.named("function"),
+                        MemberDef::Method(_) => self.arena.named("function"),
                     }
                 } else {
                     self.any()
@@ -1465,10 +1506,10 @@ impl<'a> Cx<'a> {
                 //                      marker is a no-op.
                 //   `a.b?` / `a->b?` — explicit "treat as nullable"
                 //                      suffix: lift unconditionally.
-                let lift_pre = pre_optional && self.out.types.get(recv_ty).nullable;
+                let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
                 let lift_post = post_optional;
                 if lift_pre || lift_post {
-                    self.out.types.nullable(base_ty)
+                    self.arena.nullable(base_ty)
                 } else {
                     base_ty
                 }
@@ -1491,7 +1532,7 @@ impl<'a> Cx<'a> {
                 // cascades into `value of type 'any' is not assignable
                 // to parameter '_: Foo'` false-positives at every call
                 // site that takes the enum as a parameter.
-                if let TypeKind::Enum { variants, .. } = &self.out.types.get(recv_ty).kind {
+                if let TypeKind::Enum { variants, .. } = &self.arena.get(recv_ty).kind {
                     let prop = self.hir.idents[s.property].text.as_str();
                     if variants.iter().any(|v| v == prop) {
                         return recv_ty;
@@ -1525,9 +1566,9 @@ impl<'a> Cx<'a> {
                 // the per-collection element type and these lifts
                 // continue to do the right thing.
                 let base = self.any();
-                let lift_pre = pre_optional && self.out.types.get(recv_ty).nullable;
+                let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
                 if lift_pre || post_optional {
-                    self.out.types.nullable(base)
+                    self.arena.nullable(base)
                 } else {
                     base
                 }
@@ -1630,7 +1671,7 @@ impl<'a> Cx<'a> {
                     param_tys.push(pt);
                 }
                 let body_ty = self.visit_expr(body);
-                self.out.types.lambda(param_tys, body_ty)
+                self.arena.lambda(param_tys, body_ty)
             }
             Expr::Is { value, .. } => {
                 let _ = self.visit_expr(value);
@@ -1644,12 +1685,12 @@ impl<'a> Cx<'a> {
                 // casts as a diagnostic; the resulting expression
                 // type is still `to_ty` so downstream inference
                 // doesn't cascade.
-                if !is_castable(&self.out.types, from_ty, to_ty) {
+                if !is_castable(self.arena, from_ty, to_ty) {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",
-                        greycat_analyzer_types::display(&self.out.types, from_ty),
-                        greycat_analyzer_types::display(&self.out.types, to_ty),
+                        greycat_analyzer_types::display(self.arena, from_ty),
+                        greycat_analyzer_types::display(self.arena, to_ty),
                     );
                     self.diag(Severity::Error, msg, r);
                 }
@@ -1686,12 +1727,12 @@ impl<'a> Cx<'a> {
                 // keeps `T? ?? T → T` clean for the assignability
                 // checker.
                 let lt_stripped = self.strip_nullable(lt);
-                let rt_nullable = self.out.types.get(rt).nullable;
+                let rt_nullable = self.arena.get(rt).nullable;
                 let rt_stripped = self.strip_nullable(rt);
                 let merged = if lt_stripped == rt_stripped {
                     lt_stripped
                 } else {
-                    self.out.types.alloc(Type {
+                    self.arena.alloc(Type {
                         kind: TypeKind::Union {
                             alts: vec![lt_stripped, rt_stripped],
                         },
@@ -1699,7 +1740,7 @@ impl<'a> Cx<'a> {
                     })
                 };
                 if rt_nullable {
-                    self.out.types.nullable(merged)
+                    self.arena.nullable(merged)
                 } else {
                     merged
                 }
@@ -1716,11 +1757,16 @@ mod tests {
     use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
 
-    fn analyze_src(src: &str) -> AnalysisResult {
+    fn analyze_src(src: &str) -> (TypeArena, AnalysisResult) {
         let tree = parse(src);
         let hir = lower_module(src, "mod", "project", tree.root_node());
         let res = resolve(&hir);
         analyze(&hir, &res)
+    }
+
+    /// Drop-in helper for tests that don't need to inspect the arena.
+    fn analyze_src_only(src: &str) -> AnalysisResult {
+        analyze_src(src).1
     }
 
     /// Project-aware variant — exercises the full pipeline including
@@ -1740,7 +1786,7 @@ mod tests {
 
     #[test]
     fn clean_function_no_diagnostics() {
-        let r = analyze_src("fn add(a: int, b: int): int { return a + b; }\n");
+        let r = analyze_src_only("fn add(a: int, b: int): int { return a + b; }\n");
         assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
     }
 
@@ -1773,7 +1819,7 @@ mod tests {
 
     #[test]
     fn unresolved_name_promoted_to_diagnostic() {
-        let r = analyze_src("fn f(): int { return missing; }\n");
+        let r = analyze_src_only("fn f(): int { return missing; }\n");
         assert!(
             r.diagnostics
                 .iter()
@@ -1791,7 +1837,7 @@ mod tests {
         let src = r#"
 fn f(s: String): int { return s as int; }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             r.diagnostics
                 .iter()
@@ -1808,7 +1854,7 @@ fn f(s: String): int { return s as int; }
         let src = r#"
 fn f(i: int): nodeTime { return i as nodeTime; }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             r.diagnostics
                 .iter()
@@ -1826,7 +1872,7 @@ fn f(i: int): nodeTime { return i as nodeTime; }
 fn id<T>(x: T): T { return x; }
 fn caller(): int { return id(1); }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             r.diagnostics.is_empty(),
             "unexpected diagnostics: {:?}",
@@ -1842,7 +1888,7 @@ fn caller(): int { return id(1); }
 fn pair<T>(a: T, b: T): T { return a; }
 fn caller() { pair(1, "s"); }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             r.diagnostics
                 .iter()
@@ -1855,7 +1901,7 @@ fn caller() { pair(1, "s"); }
     #[test]
     fn binary_arith_widens_to_float() {
         let src = "fn f(a: int, b: float): float { return a + b; }\n";
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
     }
 
@@ -1872,7 +1918,7 @@ fn first(p: Point): int { return p.x; }
         let tree = parse(src);
         let hir = lower_module(src, "mod", "project", tree.root_node());
         let res = resolve(&hir);
-        let analysis = analyze(&hir, &res);
+        let (_arena, analysis) = analyze(&hir, &res);
 
         // Find the property ident `x` inside `p.x` — the second `x`
         // ident in the source (the first is the attr decl name).
@@ -1907,7 +1953,7 @@ fn read(b: Box): int { return b->inner; }
         let tree = parse(src);
         let hir = lower_module(src, "mod", "project", tree.root_node());
         let res = resolve(&hir);
-        let analysis = analyze(&hir, &res);
+        let (_arena, analysis) = analyze(&hir, &res);
 
         let inner_uses: Vec<_> = hir
             .idents
@@ -1939,7 +1985,7 @@ fn f(x: int?) {
     }
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -1961,7 +2007,7 @@ fn f(x: int?) {
     }
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -1984,7 +2030,7 @@ fn f(x: int?, y: int?) {
     }
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2007,7 +2053,7 @@ fn f(x: int?) {
     if (x != null && use_int(x)) {}
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2028,7 +2074,7 @@ fn f(x: int?) {
     if (x == null || use_int(x)) {}
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2052,7 +2098,7 @@ fn f(x: int?, y: int?) {
     }
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2076,7 +2122,7 @@ fn f(x: int?) {
     use_int(x);
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2098,7 +2144,7 @@ fn f(x: int?) {
     use_int(x);
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2120,7 +2166,7 @@ fn f(x: int?) {
     use_int(x);
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2141,7 +2187,7 @@ fn dispatch(x: any) {
     }
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2160,7 +2206,7 @@ fn dispatch(x: any) {
     use_foo(x as Foo);
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2183,7 +2229,7 @@ fn pick(c: Color): int {
     return 0;
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             r.diagnostics
                 .iter()
@@ -2209,7 +2255,7 @@ fn pick(c: Color): int {
     return 0;
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2231,7 +2277,7 @@ fn pick(c: Color): int {
     }
 }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             !r.diagnostics
                 .iter()
@@ -2251,7 +2297,7 @@ fn pick(c: Color): int {
 type Foo { s: String; }
 fn f(x: Foo): String { return x.s; }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             r.diagnostics.is_empty(),
             "x.s should type as String matching the return type, got diagnostics: {:?}",
@@ -2267,7 +2313,7 @@ fn f(x: Foo): String { return x.s; }
 type Foo { fn run(): int { return 0; } }
 fn caller(x: Foo): function { return x.run; }
 "#;
-        let r = analyze_src(src);
+        let r = analyze_src_only(src);
         assert!(
             r.diagnostics.is_empty(),
             "x.run (no call) should type as `function`, got diagnostics: {:?}",
@@ -2284,7 +2330,7 @@ fn f(p: Point): int { return p.bogus; }
         let tree = parse(src);
         let hir = lower_module(src, "mod", "project", tree.root_node());
         let res = resolve(&hir);
-        let analysis = analyze(&hir, &res);
+        let (_arena, analysis) = analyze(&hir, &res);
 
         let bogus = hir
             .idents
@@ -2304,7 +2350,7 @@ fn f(p: Point): int { return p.bogus; }
         let tree = parse(src);
         let hir = lower_module(src, "mod", "project", tree.root_node());
         let res = resolve(&hir);
-        let analysis = analyze(&hir, &res);
+        let (arena, analysis) = analyze(&hir, &res);
         for (stmt_id, stmt) in hir.stmts.iter() {
             if let Stmt::Var(v) = stmt
                 && hir.idents[v.name].text == name
@@ -2312,7 +2358,7 @@ fn f(p: Point): int { return p.bogus; }
             {
                 let _ = stmt_id;
                 let ty = analysis.expr_types.get(&init).copied()?;
-                return Some(greycat_analyzer_types::display(&analysis.types, ty));
+                return Some(greycat_analyzer_types::display(&arena, ty));
             }
         }
         None

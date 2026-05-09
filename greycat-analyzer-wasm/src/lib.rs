@@ -764,7 +764,7 @@ pub fn infer_types(source: &str) -> Result<JsValue, JsValue> {
         let range = module.hir.exprs[*idx].byte_range();
         out.push(ExprType {
             range: range.into(),
-            ty: greycat_analyzer_types::display(&module.analysis.types, *ty),
+            ty: greycat_analyzer_types::display(pa.arena(), *ty),
         });
     }
     to_js(&out)
@@ -806,7 +806,7 @@ pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
 
     let hir = lower_module(source, "module", "project", tree.root_node());
     let resolutions = resolve(&hir);
-    let analysis = analyze(&hir, &resolutions);
+    let (_arena, analysis) = analyze(&hir, &resolutions);
     for d in &analysis.diagnostics {
         let sev = match d.severity {
             Severity::Error => "error",

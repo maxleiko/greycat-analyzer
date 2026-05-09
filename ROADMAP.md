@@ -576,6 +576,27 @@ P18 sits after P16/P17 — they fix the gross gaps; P18 ratchets the residual di
 
 ---
 
+### Phase 19 — Staged-pipeline analyzer rewrite (~4-6 weeks)
+
+**Goal:** replace the current per-module + post-pass analyzer with a strict 12-stage pipeline (S1-S12) that builds program-wide typing knowledge in monotonically-growing layers before any body is walked. The post-pass churn (3 → 3.4 → 3.45 → 3.5 → 3.52 → 3.55 → 3.6) is a symptom of the per-module arena + name-shape translation layer; the staged design eliminates both. The 12 stages: **S1-S3** declare type/fn/modvar names (IDs stable); **S4-S6** define type structure (no type lowering yet); **S7-S11** complete attr / method / static-fields / fn / modvar TypeRefs against the now-complete name set; **S12** body walker (CFG + narrowing + per-expr typing + monomorphization + diagnostics) runs against fully-resolved signatures.
+
+P19 lays the foundation: lift the [`TypeArena`](../greycat-analyzer-types/src/lib.rs) from per-module into project-wide, add an `arena.substitute(ty, &subst) → TypeId` primitive to replace the receiver-driven shim, and rewire every cross-module pass to mint into the shared arena instead of the per-module one. Mechanical change with no behavior delta — gated on the existing 80 + 46 + 21 + LSP-capability tests staying green and the registry parity baseline ≤ 48.
+
+**Chunks:**
+
+- [x] **19.1 Shared `TypeArena` (P19)** (L) — `TypeArena` lifts to [`ProjectAnalysis::arena`](../greycat-analyzer-analysis/src/project.rs); `analyze_with_index_into(hir, res, index, &mut arena)` is the new entry point, `analyze`/`analyze_with_index` keep their old signatures by allocating + returning a private arena. `AnalysisResult` no longer owns `types`. Every cross-module post-pass (3, 3.4, 3.45, 3.5, 3.52) now mints into `&mut self.arena` via split borrows. Capability handlers (hover, inlay hints, member completion, scope name meta) pull the arena via `project.arena()` rather than `module.analysis.types`. Adds `TypeArena::substitute(ty, &HashMap<String, TypeId>) → TypeId` primitive in [`greycat-analyzer-types`](../greycat-analyzer-types/src/lib.rs) — the algebra the upcoming S12 body walker (P23) consumes directly. **No behavior change** — all 80 analyzer tests + 46 analysis tests + 21 types tests + 17 LSP capability tests stay green.
+
+- [ ] **19.2 Staged orchestrator skeleton (P20)** (M) — new `ProjectAnalysis::analyze_staged` 12-stage orchestrator that initially delegates each stage to the existing per-module machinery. `analyze` / `rebuild` / `invalidate` reroute through it; the seam exists but no behavior changes yet.
+- [ ] **19.3 S1-S6 extraction (P21)** (L) — name + structure declaration moves out of `analyze_with_index` into the staged orchestrator. **Delete pass 3** (`resolve_cross_module_members`).
+- [ ] **19.4 S7-S11 extraction (P22)** (XL) — type / fn / modvar `TypeRef` lowering into the shared arena during S7-S11 against the *complete* project name set. **Delete passes 3.4, 3.45, 3.52** plus the receiver-driven substitution shim (replaced by `arena.substitute`).
+- [ ] **19.5 S12 body walker (P23)** (XL) — rewrite the body walker against fully-resolved signatures. Narrowing + generic-call inference port verbatim. **Delete passes 3.5, 3.55, 3.6**. Acceptance: registry baseline ≤ 5 (M17 criterion).
+- [ ] **19.6 Query-DAG invalidation (P24)** (L) — replace `ProjectAnalysis::invalidate(uri)` with the Q1-Q5 query graph. Hand-rolled, no salsa dep.
+- [ ] **19.7 Cleanup (P26)** (S) — delete legacy `analyze_with_index`, `TypeShape`, `mint_type_shape`, `read_type_shape`, `read_type_id_shape`, `read_type_shape_subst`. **Note: P25 parallelism is dropped per user decision** ("single-threaded forever, focus elsewhere") — LSP idle most of the time, busy ≤ 200ms; complexity budget goes into incremental invalidation (P24) instead.
+
+**M19:** registry parity baseline ≤ 5; `did_change` → `publish_diagnostics` round-trip < 50ms p99 on a 50-file synthetic project; `ProjectAnalysis::rebuild` walks bodies *once* with fully-resolved types instead of patching `expr_types` across 5+ post-passes.
+
+---
+
 ## 7. Test strategy
 
 Three layers, no "port every TS test" milestone (tarpit).
@@ -644,6 +665,7 @@ P15 [3-4w]   Interactive-LSP sweep ── M15   ← hover / completion / pragma 
 P16 [2-3w]   Member-flow + node-deref M16   ← member-call typing, auto-deref completion
 P17 [1-2w]   Real-corpus parity ratch M17   ← lowering bugs surfaced by greycat/apps/registry
 P18 [1-2w]   Typed-AST parity oracle  M18   ← dump-types CI gate, residual-diff ratchet
+P19 [4-6w]   Staged-pipeline rewrite  M19   ← shared TypeArena, S1-S12 stages, Q1-Q5 invalidation
 ```
 
 Total realistic envelope: **13-19 months full-time** end-to-end. P0–P5 (the original ~6 months) ships scaffolding plus enough behavior to be useful; P6–P10 (another ~6-12 months) closes the foundational gap to 1:1 parity with the TS reference and adds the harness infrastructure; P11–P14 (~3-5 months) are the parity-push closeout that turns harnesses into gates and the foundational passes into 1:1; P15 (~3-4 weeks) catches the interactive-LSP capability gaps the corpus-driven parity push doesn't surface; P16 (~2-3 weeks) tightens up the member-access type chain that pass 3.5 left at `any`; P17 (~1-2 weeks) drains the lowering / lint-policy bucket surfaced by running against a real project; P18 (~1-2 weeks) wires the TS dump-types subcommand into a CI parity gate.

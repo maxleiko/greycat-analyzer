@@ -132,6 +132,7 @@ pub fn hover_with_project(
                 &module.hir,
                 &module.resolutions,
                 &module.analysis,
+                project.arena(),
                 ident_idx,
                 ident,
                 Some(HoverProjectCtx { project, manager }),
@@ -180,7 +181,7 @@ pub fn hover_with_project(
                 let label = format!(
                     "{}: {}",
                     short_expr_label(&module.hir, expr),
-                    greycat_analyzer_types::display(&module.analysis.types, *ty),
+                    greycat_analyzer_types::display(project.arena(), *ty),
                 );
                 return Some(hover_from_markdown(wrap_code(&label), r, text));
             }
@@ -206,7 +207,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
 
     let hir = lower_module(text, "module", lib, root);
     let resolutions = resolve(&hir);
-    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
 
     // --- Layer 1: ident-based hover (params / locals / decls / builtins).
     if node.kind() == "ident"
@@ -215,9 +216,15 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
             .iter()
             .find(|(_, i)| i.byte_range == node.byte_range())
     {
-        if let Some(markdown) =
-            ident_hover_markdown(&hir, &resolutions, &analysis, ident_idx, ident, None)
-        {
+        if let Some(markdown) = ident_hover_markdown(
+            &hir,
+            &resolutions,
+            &analysis,
+            &arena,
+            ident_idx,
+            ident,
+            None,
+        ) {
             return Some(hover_from_markdown(
                 markdown,
                 ident.byte_range.clone(),
@@ -262,7 +269,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
             let label = format!(
                 "{}: {}",
                 short_expr_label(&hir, expr),
-                greycat_analyzer_types::display(&analysis.types, *ty),
+                greycat_analyzer_types::display(&arena, *ty),
             );
             return Some(hover_from_markdown(wrap_code(&label), r, text));
         }
@@ -275,6 +282,7 @@ fn ident_hover_markdown(
     hir: &Hir,
     resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
     ident_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
     ident: &greycat_analyzer_hir::types::Ident,
     project: Option<HoverProjectCtx<'_>>,
@@ -322,7 +330,7 @@ fn ident_hover_markdown(
                 wrap_code(&format!(
                     "{}: {}",
                     ident.text,
-                    greycat_analyzer_types::display(&analysis.types, *ty),
+                    greycat_analyzer_types::display(arena, *ty),
                 ))
             })
         }
@@ -744,7 +752,7 @@ pub fn goto_definition(
     // P6.3: the property side of `a.b` / `a->b` isn't in `Resolutions`
     // — bindings live in `AnalysisResult::member_uses`. Run the
     // analyzer to consult it before giving up.
-    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let (_arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
     let member = analysis.member_lookup(target)?;
     let target_range = match member {
         greycat_analyzer_analysis::analyzer::MemberDef::Attr(attr_id) => {
@@ -1730,6 +1738,7 @@ fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
 /// reached from a live LSP session.
 pub fn inlay_hints_with_project(
     module: &ModuleAnalysis,
+    arena: &greycat_analyzer_types::TypeArena,
     text: &str,
     range: &lsp_types::Range,
 ) -> Vec<InlayHint> {
@@ -1758,8 +1767,7 @@ pub fn inlay_hints_with_project(
             {
                 let name_range = &hir.idents[fnd.name].byte_range;
                 if name_range.start <= want.1 && name_range.end >= want.0 {
-                    let label =
-                        format!(": {}", greycat_analyzer_types::display(&analysis.types, ty));
+                    let label = format!(": {}", greycat_analyzer_types::display(arena, ty));
                     out.push(InlayHint {
                         position: byte_to_position(text, name_range.end),
                         label: InlayHintLabel::String(label),
@@ -1774,7 +1782,7 @@ pub fn inlay_hints_with_project(
             }
             // Walk the body for `var name = expr;` shapes (no declared type).
             if let Some(body) = fnd.body {
-                emit_var_hints(hir, analysis, body, want, text, &mut out);
+                emit_var_hints(hir, analysis, arena, body, want, text, &mut out);
                 // P13.7: argument-name hints inside the body.
                 emit_call_arg_hints(hir, resolutions, body, want, text, &mut out);
             }
@@ -1797,7 +1805,7 @@ pub fn inlay_hints(
 ) -> Vec<InlayHint> {
     let hir = lower_module(text, "module", lib, root);
     let resolutions = resolve(&hir);
-    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
     let module = ModuleAnalysis {
         hir,
         resolutions,
@@ -1806,7 +1814,7 @@ pub fn inlay_hints(
         lib: lib.to_string(),
         timings: Default::default(),
     };
-    inlay_hints_with_project(&module, text, range)
+    inlay_hints_with_project(&module, &arena, text, range)
 }
 
 /// P13.7 — peek at the last expression-shaped statement of a fn body
@@ -1992,19 +2000,21 @@ fn emit_call_arg_hints_expr(
 fn emit_var_hints_block(
     hir: &Hir,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
     block: &greycat_analyzer_hir::types::BlockStmt,
     want: (usize, usize),
     text: &str,
     out: &mut Vec<InlayHint>,
 ) {
     for s in &block.stmts {
-        emit_var_hints(hir, analysis, *s, want, text, out);
+        emit_var_hints(hir, analysis, arena, *s, want, text, out);
     }
 }
 
 fn emit_var_hints(
     hir: &Hir,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     want: (usize, usize),
     text: &str,
@@ -2013,7 +2023,7 @@ fn emit_var_hints(
     use greycat_analyzer_hir::types::Stmt;
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(b) => emit_var_hints_block(hir, analysis, b, want, text, out),
+        Stmt::Block(b) => emit_var_hints_block(hir, analysis, arena, b, want, text, out),
         Stmt::Var(v) if v.ty.is_none() && v.init.is_some() => {
             let r = &v.byte_range;
             if r.end < want.0 || r.start > want.1 {
@@ -2023,7 +2033,7 @@ fn emit_var_hints(
             let Some(ty) = analysis.expr_types.get(&init_id).copied() else {
                 return;
             };
-            let label = format!(": {}", greycat_analyzer_types::display(&analysis.types, ty));
+            let label = format!(": {}", greycat_analyzer_types::display(arena, ty));
             // Anchor right after the variable name.
             let name_range = &hir.idents[v.name].byte_range;
             out.push(InlayHint {
@@ -2038,20 +2048,20 @@ fn emit_var_hints(
             });
         }
         Stmt::If(i) => {
-            emit_var_hints_block(hir, analysis, &i.then_branch, want, text, out);
+            emit_var_hints_block(hir, analysis, arena, &i.then_branch, want, text, out);
             if let Some(eb) = i.else_branch {
-                emit_var_hints(hir, analysis, eb, want, text, out);
+                emit_var_hints(hir, analysis, arena, eb, want, text, out);
             }
         }
-        Stmt::While(w) => emit_var_hints_block(hir, analysis, &w.body, want, text, out),
-        Stmt::DoWhile(w) => emit_var_hints_block(hir, analysis, &w.body, want, text, out),
-        Stmt::For(f) => emit_var_hints_block(hir, analysis, &f.body, want, text, out),
-        Stmt::ForIn(f) => emit_var_hints_block(hir, analysis, &f.body, want, text, out),
+        Stmt::While(w) => emit_var_hints_block(hir, analysis, arena, &w.body, want, text, out),
+        Stmt::DoWhile(w) => emit_var_hints_block(hir, analysis, arena, &w.body, want, text, out),
+        Stmt::For(f) => emit_var_hints_block(hir, analysis, arena, &f.body, want, text, out),
+        Stmt::ForIn(f) => emit_var_hints_block(hir, analysis, arena, &f.body, want, text, out),
         Stmt::Try(t) => {
-            emit_var_hints_block(hir, analysis, &t.try_block, want, text, out);
-            emit_var_hints_block(hir, analysis, &t.catch_block, want, text, out);
+            emit_var_hints_block(hir, analysis, arena, &t.try_block, want, text, out);
+            emit_var_hints_block(hir, analysis, arena, &t.catch_block, want, text, out);
         }
-        Stmt::At(a) => emit_var_hints_block(hir, analysis, &a.block, want, text, out),
+        Stmt::At(a) => emit_var_hints_block(hir, analysis, arena, &a.block, want, text, out),
         _ => {}
     }
 }
@@ -2873,7 +2883,7 @@ fn ident_or_keyword_completion(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let (detail, documentation) = scope_name_meta(module, &source);
+            let (detail, documentation) = scope_name_meta(module, project.arena(), &source);
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(kind),
@@ -3086,6 +3096,7 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
 /// docs, since locals carry none); generics return both as `None`.
 fn scope_name_meta(
     module: &ModuleAnalysis,
+    arena: &greycat_analyzer_types::TypeArena,
     source: &NameSource,
 ) -> (Option<String>, Option<Documentation>) {
     match source {
@@ -3101,7 +3112,7 @@ fn scope_name_meta(
                 .analysis
                 .def_types
                 .get(name_idx)
-                .map(|ty| greycat_analyzer_types::display(&module.analysis.types, *ty));
+                .map(|ty| greycat_analyzer_types::display(arena, *ty));
             (detail, None)
         }
         NameSource::Generic => (None, None),
@@ -3439,19 +3450,20 @@ fn member_completion(
         };
 
     let module = project.module(uri)?;
+    let arena = project.arena();
     let recv_ty = receiver_type_at(text, root, module, recv_end)?;
-    let name = type_head_name(&module.analysis.types, recv_ty)?;
+    let name = type_head_name(arena, recv_ty)?;
 
     // P16.5 — node-tag receivers auto-deref through their inner type:
     //   `n.|`  → list node's own members PLUS the inner type's members
     //            with a `.` → `->` rewrite edit.
     //   `n->|` → list the inner type's members directly.
     // The criterion mirrors the analyzer: single-arg node-tag generic.
-    let inner_head: Option<String> = match (is_arrow, &module.analysis.types.get(recv_ty).kind) {
+    let inner_head: Option<String> = match (is_arrow, &arena.get(recv_ty).kind) {
         (_, greycat_analyzer_types::TypeKind::Generic { name: tag, args })
             if greycat_analyzer_types::is_node_tag(tag) && args.len() == 1 =>
         {
-            type_head_name(&module.analysis.types, args[0]).map(|s| s.to_string())
+            type_head_name(arena, args[0]).map(|s| s.to_string())
         }
         _ => None,
     };
@@ -4276,7 +4288,7 @@ pub(crate) fn current_diagnostics(
 ) -> Vec<Diagnostic> {
     let hir = lower_module(text, "module", lib, root);
     let resolutions = resolve(&hir);
-    let analysis = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let (_arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
     let mut out: Vec<Diagnostic> = analysis
         .diagnostics
         .iter()

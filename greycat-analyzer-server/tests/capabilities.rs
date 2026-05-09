@@ -304,7 +304,7 @@ fn inlay_hints_with_project_use_cross_module_call_return_types() {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints_with_project(module, &user_doc.text, &range);
+    let hints = capabilities::inlay_hints_with_project(module, pa.arena(), &user_doc.text, &range);
     assert_eq!(
         hints.len(),
         1,
@@ -368,7 +368,7 @@ fn enum_variant_access_types_as_enum_in_every_form() {
             .get(&idx)
             .copied()
             .unwrap_or_else(|| panic!("static expr at idx {idx:?} has no expr_types entry"));
-        let display = greycat_analyzer_types::display(&module.analysis.types, ty);
+        let display = greycat_analyzer_types::display(pa.arena(), ty);
         assert_eq!(
             display, "Foo",
             "static expression should type as `Foo` (enum), got `{display}`"
@@ -658,7 +658,7 @@ fn inlay_hints_with_project_use_bare_ident_call_return_types() {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints_with_project(module, &doc.text, &range);
+    let hints = capabilities::inlay_hints_with_project(module, pa.arena(), &doc.text, &range);
     let var_hint = hints
         .iter()
         .find(|h| {

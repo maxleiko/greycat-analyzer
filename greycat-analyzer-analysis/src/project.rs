@@ -21,7 +21,9 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Decl, Ident};
 use greycat_analyzer_hir::{Hir, lower_module};
 
-use crate::analyzer::{AnalysisResult, ForeignMember, MemberDef, analyze_with_index};
+use crate::analyzer::{
+    AnalysisResult, ForeignMember, MemberDef, analyze_with_index_into, seed_builtins,
+};
 use crate::lint::{LintDiagnostic, lint_arrow_on_non_deref, run_lints};
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::ProjectIndex;
@@ -73,21 +75,47 @@ impl ModuleTimings {
 ///
 /// `index` is rebuilt from every module's HIR each time the cache is
 /// (re)populated, so removed type / enum / native decls are reflected
-/// instead of lingering. The per-module [`AnalysisResult`] still owns
-/// its own [`greycat_analyzer_types::TypeArena`] for now — wiring the
-/// shared arena through the analyzer is **P6.2**.
+/// instead of lingering.
+///
+/// **P19:** the [`greycat_analyzer_types::TypeArena`] now lives on the
+/// project (not per [`AnalysisResult`]). Every module's analyzer mints
+/// into the same arena so cross-module `TypeId`s are directly
+/// comparable — no `mint_type_shape`/`read_type_shape` translation
+/// needed. Callers that previously wrote `module.analysis.types`
+/// should call [`Self::arena`] / [`Self::arena_mut`] instead.
 #[derive(Debug, Default)]
 pub struct ProjectAnalysis {
     pub index: ProjectIndex,
+    /// P19 — project-wide type arena. Populated alongside every
+    /// module's analyzer pass. Append-only and interned, so duplicate
+    /// `seed_builtins` calls per `analyze_with_index_into` are a
+    /// no-op.
+    pub arena: greycat_analyzer_types::TypeArena,
     modules: HashMap<Uri, ModuleAnalysis>,
 }
 
 impl ProjectAnalysis {
     pub fn new() -> Self {
+        let mut arena = greycat_analyzer_types::TypeArena::new();
+        seed_builtins(&mut arena);
         Self {
             index: ProjectIndex::new(),
+            arena,
             modules: HashMap::new(),
         }
+    }
+
+    /// Borrow the project-wide type arena — required for any
+    /// `TypeId` lookup (`arena.get(id)`, `display(arena, id)`, …).
+    pub fn arena(&self) -> &greycat_analyzer_types::TypeArena {
+        &self.arena
+    }
+
+    /// Mutable borrow of the project-wide type arena. Capability
+    /// handlers should not mint new types; this is reserved for the
+    /// orchestrator and the staged-pipeline body walker (P22+).
+    pub fn arena_mut(&mut self) -> &mut greycat_analyzer_types::TypeArena {
+        &mut self.arena
     }
 
     /// One-pass build over every document currently in `manager`.
@@ -102,6 +130,11 @@ impl ProjectAnalysis {
     pub fn rebuild(&mut self, manager: &SourceManager) {
         self.index = ProjectIndex::new();
         self.modules.clear();
+        // P19 — reset the shared arena so a stale build doesn't leak
+        // dead `TypeId`s across rebuilds (the arena is append-only;
+        // re-seeding builtins is idempotent).
+        self.arena = greycat_analyzer_types::TypeArena::new();
+        seed_builtins(&mut self.arena);
 
         // Pass 1: lower every doc to HIR and ingest into the project
         // index so types declared in one module are visible to peers.
@@ -126,7 +159,8 @@ impl ProjectAnalysis {
             let resolutions = resolve_with_index(&hir, &self.index);
             timings.resolve = t0.elapsed();
             let t1 = Instant::now();
-            let analysis = analyze_with_index(&hir, &resolutions, &self.index);
+            let analysis =
+                analyze_with_index_into(&hir, &resolutions, &self.index, &mut self.arena);
             timings.analyze = t1.elapsed();
             let t2 = Instant::now();
             let lints = run_lints(&hir, &resolutions);
@@ -290,6 +324,9 @@ impl ProjectAnalysis {
         #[allow(clippy::mutable_key_type)]
         let mut updates: HashMap<Uri, Vec<Update>> = HashMap::new();
 
+        // P19 — pre-bind the shared arena so split borrows don't
+        // collide with `&self.modules` iteration.
+        let arena = &self.arena;
         for (cur_uri, cur_module) in &self.modules {
             for (expr_id, expr) in cur_module.hir.exprs.iter() {
                 let (property_idx, is_arrow) = match expr {
@@ -307,7 +344,7 @@ impl ProjectAnalysis {
                     .analysis
                     .expr_types
                     .get(&expr_id)
-                    .map(|t| !matches!(cur_module.analysis.types.get(*t).kind, TypeKind::Any))
+                    .map(|t| !matches!(arena.get(*t).kind, TypeKind::Any))
                     .unwrap_or(false);
                 if already_typed {
                     continue;
@@ -316,17 +353,14 @@ impl ProjectAnalysis {
                 else {
                     continue;
                 };
-                if matches!(
-                    cur_module.analysis.types.get(receiver_ty).kind,
-                    TypeKind::Any
-                ) {
+                if matches!(arena.get(receiver_ty).kind, TypeKind::Any) {
                     continue;
                 }
                 // For arrow expressions on a node-tag receiver
                 // (`node<T>` etc.) deref to inner T. Mirror of the
                 // analyzer's `arrow_deref_receiver`.
                 let lookup_ty = if is_arrow {
-                    match cur_module.analysis.types.get(receiver_ty).kind.clone() {
+                    match arena.get(receiver_ty).kind.clone() {
                         TypeKind::Generic { name, args }
                             if greycat_analyzer_types::is_node_tag(&name) && args.len() == 1 =>
                         {
@@ -337,13 +371,12 @@ impl ProjectAnalysis {
                 } else {
                     receiver_ty
                 };
-                let (type_name, instantiation) =
-                    match cur_module.analysis.types.get(lookup_ty).kind.clone() {
-                        TypeKind::Named { name } => (name, Vec::new()),
-                        TypeKind::Generic { name, args } => (name, args),
-                        TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
-                        _ => continue,
-                    };
+                let (type_name, instantiation) = match arena.get(lookup_ty).kind.clone() {
+                    TypeKind::Named { name } => (name, Vec::new()),
+                    TypeKind::Generic { name, args } => (name, args),
+                    TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
+                    _ => continue,
+                };
                 let property_text = cur_module.hir.idents[property_idx].text.clone();
 
                 // Look up the type decl: own module first, then via
@@ -372,7 +405,7 @@ impl ProjectAnalysis {
                     let gp_name = host_module.hir.idents[*name_idx].text.clone();
                     let arg_shape = instantiation
                         .get(gp_idx)
-                        .map(|a| read_type_id_shape(&cur_module.analysis.types, *a))
+                        .map(|a| read_type_id_shape(arena, *a))
                         .unwrap_or(TypeShape::Any);
                     subst.insert(gp_name, arg_shape);
                 }
@@ -415,14 +448,16 @@ impl ProjectAnalysis {
             }
         }
 
-        // Phase 2 — apply Member/Arrow updates.
+        // Phase 2 — apply Member/Arrow updates. Split borrow:
+        // `&mut self.arena` is disjoint from `&mut self.modules`.
         let mut changed = false;
+        let arena_mut = &mut self.arena;
         for (uri, entries) in updates {
             let Some(m) = self.modules.get_mut(&uri) else {
                 continue;
             };
             for (expr_id, shape, _member) in entries {
-                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                let ty = mint_type_shape(&shape, arena_mut);
                 let prev = m.analysis.expr_types.insert(expr_id, ty);
                 if prev != Some(ty) {
                     changed = true;
@@ -440,6 +475,7 @@ impl ProjectAnalysis {
         // type.
         use crate::resolver::Definition;
         use greycat_analyzer_hir::types::Decl as HirDecl;
+        let arena_mut = &mut self.arena;
         for m in self.modules.values_mut() {
             for (expr_id, expr) in m.hir.exprs.iter() {
                 let Expr::Ident(use_idx) = expr else {
@@ -453,7 +489,7 @@ impl ProjectAnalysis {
                 // right operand), and we must not overwrite that
                 // with the binding's declared type.
                 let current_is_any = match m.analysis.expr_types.get(&expr_id) {
-                    Some(t) => matches!(m.analysis.types.get(*t).kind, TypeKind::Any),
+                    Some(t) => matches!(arena_mut.get(*t).kind, TypeKind::Any),
                     None => true,
                 };
                 if !current_is_any {
@@ -468,12 +504,7 @@ impl ProjectAnalysis {
                     }
                     Definition::Decl(decl_id) => match &m.hir.decls[decl_id] {
                         HirDecl::Var(vd) => vd.ty.and_then(|t| {
-                            lower_type_ref_id(
-                                &m.hir,
-                                t,
-                                &m.analysis.registry,
-                                &mut m.analysis.types,
-                            )
+                            lower_type_ref_id(&m.hir, t, &m.analysis.registry, arena_mut)
                         }),
                         _ => None,
                     },
@@ -482,7 +513,7 @@ impl ProjectAnalysis {
                 let Some(new_ty) = new_ty else {
                     continue;
                 };
-                if matches!(m.analysis.types.get(new_ty).kind, TypeKind::Any) {
+                if matches!(arena_mut.get(new_ty).kind, TypeKind::Any) {
                     continue;
                 }
                 let prev = m.analysis.expr_types.insert(expr_id, new_ty);
@@ -511,6 +542,7 @@ impl ProjectAnalysis {
 
         type ParamUpdate = (Idx<greycat_analyzer_hir::types::Ident>, TypeShape);
         let mut updates: Vec<(Uri, Vec<ParamUpdate>)> = Vec::new();
+        let arena = &self.arena;
         for (uri, m) in &self.modules {
             let mut entries: Vec<ParamUpdate> = Vec::new();
             for (_stmt_id, stmt) in m.hir.stmts.iter() {
@@ -520,7 +552,6 @@ impl ProjectAnalysis {
                 let Some(range_ty) = m.analysis.expr_types.get(&f.range).copied() else {
                     continue;
                 };
-                let arena = &m.analysis.types;
                 // Strip nullable so `for (i, v in arr?)` works the same
                 // shape as the non-null case.
                 let underlying = if arena.get(range_ty).nullable {
@@ -599,6 +630,7 @@ impl ProjectAnalysis {
                 updates.push((uri.clone(), entries));
             }
         }
+        let arena_mut = &mut self.arena;
         for (uri, entries) in updates {
             let Some(m) = self.modules.get_mut(&uri) else {
                 continue;
@@ -613,7 +645,7 @@ impl ProjectAnalysis {
             let mut name_to_ty: HashMap<Idx<greycat_analyzer_hir::types::Ident>, _> =
                 HashMap::new();
             for (name_idx, shape) in entries {
-                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                let ty = mint_type_shape(&shape, arena_mut);
                 m.analysis.def_types.insert(name_idx, ty);
                 name_to_ty.insert(name_idx, ty);
             }
@@ -687,6 +719,7 @@ impl ProjectAnalysis {
             }
         }
 
+        let arena_mut = &mut self.arena;
         for (uri, entries) in expr_updates {
             let Some(m) = self.modules.get_mut(&uri) else {
                 continue;
@@ -694,7 +727,7 @@ impl ProjectAnalysis {
             touched_uris.insert(uri.as_str().to_string());
             let mut touched: HashMap<Idx<Expr>, greycat_analyzer_types::TypeId> = HashMap::new();
             for (expr_id, shape) in entries {
-                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                let ty = mint_type_shape(&shape, arena_mut);
                 m.analysis.expr_types.insert(expr_id, ty);
                 touched.insert(expr_id, ty);
             }
@@ -888,6 +921,7 @@ impl ProjectAnalysis {
                         resolve_member_call_return_shape_subst(
                             &self.modules,
                             &self.index,
+                            &self.arena,
                             cur_module,
                             m.property,
                             recv_ty,
@@ -912,10 +946,11 @@ impl ProjectAnalysis {
             }
         }
 
-        // Phase 2 — mutable: mint the snapshotted shapes into each
-        // module's TypeArena and update `expr_types`. Then walk
-        // `Stmt::Var` to re-link `def_types` for locals whose init
-        // expr we just updated.
+        // Phase 2 — mutable: mint the snapshotted shapes into the
+        // shared project arena (P19) and update `expr_types`. Then
+        // walk `Stmt::Var` to re-link `def_types` for locals whose
+        // init expr we just updated.
+        let arena_mut = &mut self.arena;
         for (uri, entries) in expr_updates {
             let Some(m) = self.modules.get_mut(&uri) else {
                 continue;
@@ -924,7 +959,7 @@ impl ProjectAnalysis {
             // Build a small index of which exprs we touched.
             let mut touched: HashMap<Idx<Expr>, greycat_analyzer_types::TypeId> = HashMap::new();
             for (expr_id, shape) in entries {
-                let ty = mint_type_shape(&shape, &mut m.analysis.types);
+                let ty = mint_type_shape(&shape, arena_mut);
                 m.analysis.expr_types.insert(expr_id, ty);
                 touched.insert(expr_id, ty);
             }
@@ -983,11 +1018,22 @@ impl ProjectAnalysis {
     /// corresponding declared param. Folded into the unified
     /// validation phase so all type-relation diagnostics share one
     /// producer.
-    fn collect_call_arg_diags(&self, cur_uri: &Uri) -> Vec<crate::analyzer::SemanticDiagnostic> {
+    /// P19 split-borrow variant: takes `&modules`, `&index`, and a
+    /// mutable borrow on the shared arena. The validation loop holds
+    /// `&mut self.arena` during iteration over `&self.modules`, so the
+    /// `&self`-borrowing version can no longer be invoked directly
+    /// from the same scope.
+    #[allow(clippy::mutable_key_type)]
+    fn collect_call_arg_diags_split(
+        modules: &HashMap<Uri, ModuleAnalysis>,
+        index: &ProjectIndex,
+        cur_uri: &Uri,
+        arena: &mut greycat_analyzer_types::TypeArena,
+    ) -> Vec<crate::analyzer::SemanticDiagnostic> {
         use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
         use greycat_analyzer_hir::types::Expr;
 
-        let cur_module = match self.modules.get(cur_uri) {
+        let cur_module = match modules.get(cur_uri) {
             Some(m) => m,
             None => return Vec::new(),
         };
@@ -997,12 +1043,12 @@ impl ProjectAnalysis {
                 continue;
             };
             let Some((foreign_uri_opt, fn_decl_id)) =
-                resolve_call_target(&self.modules, &self.index, cur_module, call.callee)
+                resolve_call_target(modules, index, cur_module, call.callee)
             else {
                 continue;
             };
             let foreign_module = match &foreign_uri_opt {
-                Some(u) => self.modules.get(u),
+                Some(u) => modules.get(u),
                 None => Some(cur_module),
             };
             let Some(fn_module) = foreign_module else {
@@ -1025,13 +1071,15 @@ impl ProjectAnalysis {
                     Some(t) => t,
                     None => continue,
                 };
-                let mut tmp_arena = cur_module.analysis.types.clone();
-                let declared_ty = mint_type_shape(&declared_shape, &mut tmp_arena);
-                if !greycat_analyzer_types::is_assignable_to(&tmp_arena, arg_ty, declared_ty) {
+                // P19: mint declared types directly into the shared
+                // project arena. Append-only + interned, so re-mints
+                // collapse and `arg_ty` (already from this arena) is
+                // comparable head-on.
+                let declared_ty = mint_type_shape(&declared_shape, arena);
+                if !greycat_analyzer_types::is_assignable_to(arena, arg_ty, declared_ty) {
                     let p_name = fn_module.hir.idents[p.name].text.clone();
-                    let arg_display =
-                        greycat_analyzer_types::display(&cur_module.analysis.types, arg_ty);
-                    let declared_display = greycat_analyzer_types::display(&tmp_arena, declared_ty);
+                    let arg_display = greycat_analyzer_types::display(arena, arg_ty);
+                    let declared_display = greycat_analyzer_types::display(arena, declared_ty);
                     let r = match &cur_module.hir.exprs[call.args[i]] {
                         Expr::Ident(idx) => cur_module.hir.idents[*idx].byte_range.clone(),
                         other => other.byte_range(),
@@ -1095,6 +1143,10 @@ impl ProjectAnalysis {
                 Some(set) => set.contains(uri.as_str()),
             }
         };
+        // P19 — split borrows: read-only `&self.arena` + `&self.index`
+        // alongside `&mut self.modules`.
+        let arena = &self.arena;
+        let index = &self.index;
         for (uri, module) in self.modules.iter_mut() {
             if !in_scope(uri) {
                 continue;
@@ -1103,7 +1155,8 @@ impl ProjectAnalysis {
             lint_arrow_on_non_deref(
                 &module.hir,
                 &module.analysis,
-                &self.index,
+                arena,
+                index,
                 &mut module.lints,
             );
         }
@@ -1143,16 +1196,26 @@ impl ProjectAnalysis {
 
         #[allow(clippy::mutable_key_type)]
         let mut diag_updates: HashMap<Uri, Vec<SemanticDiagnostic>> = HashMap::new();
+        // P19 — split borrows: pass the shared arena alongside read-only
+        // module borrows.
+        let arena_mut = &mut self.arena;
         for (cur_uri, cur_module) in &self.modules {
             if !in_scope(cur_uri) {
                 continue;
             }
             let mut diags: Vec<SemanticDiagnostic> = Vec::new();
-            validate_module_type_relations(cur_module, &mut diags);
+            validate_module_type_relations(cur_module, arena_mut, &mut diags);
             // Call-arg validation needs cross-module access (foreign
             // fn signatures), so it lives on `&self` rather than the
-            // free walker.
-            diags.extend(self.collect_call_arg_diags(cur_uri));
+            // free walker. Note: we hold `arena_mut` here, so call into
+            // a helper that accepts `&self.modules` + `&self.index` +
+            // `arena` instead of borrowing `&self`.
+            diags.extend(Self::collect_call_arg_diags_split(
+                &self.modules,
+                &self.index,
+                cur_uri,
+                arena_mut,
+            ));
             if !diags.is_empty() {
                 diag_updates.insert(cur_uri.clone(), diags);
             }
@@ -1365,7 +1428,7 @@ impl ProjectAnalysis {
         let resolutions = resolve_with_index(&hir, &self.index);
         timings.resolve = t0.elapsed();
         let t1 = Instant::now();
-        let analysis = analyze_with_index(&hir, &resolutions, &self.index);
+        let analysis = analyze_with_index_into(&hir, &resolutions, &self.index, &mut self.arena);
         timings.analyze = t1.elapsed();
         let t2 = Instant::now();
         let lints = run_lints(&hir, &resolutions);
@@ -1895,6 +1958,7 @@ fn resolve_member_call_return_shape(
 fn resolve_member_call_return_shape_subst(
     modules: &HashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
+    arena: &greycat_analyzer_types::TypeArena,
     cur: &ModuleAnalysis,
     property_idx: Idx<greycat_analyzer_hir::types::Ident>,
     receiver_ty: Option<greycat_analyzer_types::TypeId>,
@@ -1936,7 +2000,7 @@ fn resolve_member_call_return_shape_subst(
     let mut subst: HashMap<String, TypeShape> = HashMap::new();
     if let Some(recv_ty) = receiver_ty {
         let lookup_ty = if is_arrow {
-            match cur.analysis.types.get(recv_ty).kind.clone() {
+            match arena.get(recv_ty).kind.clone() {
                 TypeKind::Generic { args, name }
                     if greycat_analyzer_types::is_node_tag(&name) && args.len() == 1 =>
                 {
@@ -1947,7 +2011,7 @@ fn resolve_member_call_return_shape_subst(
         } else {
             recv_ty
         };
-        let (type_name, instantiation) = match cur.analysis.types.get(lookup_ty).kind.clone() {
+        let (type_name, instantiation) = match arena.get(lookup_ty).kind.clone() {
             TypeKind::Named { name } => (name, Vec::new()),
             TypeKind::Generic { name, args } => (name, args),
             TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
@@ -1977,7 +2041,7 @@ fn resolve_member_call_return_shape_subst(
                 let gp_name = td_hir.idents[*name_idx].text.clone();
                 let arg_shape = instantiation
                     .get(gp_idx)
-                    .map(|a| read_type_id_shape(&cur.analysis.types, *a))
+                    .map(|a| read_type_id_shape(arena, *a))
                     .unwrap_or(TypeShape::Any);
                 subst.insert(gp_name, arg_shape);
             }
@@ -1988,12 +2052,13 @@ fn resolve_member_call_return_shape_subst(
 
 /// Walk one module's HIR and emit every type-relation diagnostic
 /// the analyzer's per-module pass deferred. Reads only — never
-/// mutates `module`. The arena it operates against is a clone of
-/// `module.analysis.types` so newly-minted TypeIds for declared-side
-/// type refs land in the same numeric space as the cached
-/// `expr_types` entries (cloning preserves `intern`).
+/// mutates `module`. The shared project arena is passed in (P19);
+/// any newly-needed declared-side TypeIds are minted into it
+/// alongside everything else, which is fine because the arena is
+/// append-only and intern-collapsed.
 fn validate_module_type_relations(
     module: &ModuleAnalysis,
+    arena: &mut greycat_analyzer_types::TypeArena,
     diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
 ) {
     use crate::analyzer::{SemanticDiagnostic, Severity};
@@ -2002,14 +2067,13 @@ fn validate_module_type_relations(
 
     let hir = &module.hir;
     let analysis = &module.analysis;
-    let mut arena = analysis.types.clone();
     let bool_t = arena.primitive(Primitive::Bool);
 
     let Some(top) = hir.module.as_ref() else {
         return;
     };
     for d_id in &top.decls {
-        validate_decl(hir, analysis, &mut arena, bool_t, &hir.decls[*d_id], diags);
+        validate_decl(hir, analysis, arena, bool_t, &hir.decls[*d_id], diags);
     }
 
     fn validate_decl(

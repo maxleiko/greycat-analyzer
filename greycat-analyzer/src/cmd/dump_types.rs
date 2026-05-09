@@ -144,7 +144,14 @@ fn run_dump(target: &Path, filter: Option<&str>, mode: Mode) -> Result<ExitCode,
         }
         match mode {
             Mode::Types => {
-                collect_type_records(&rel, &doc, module, &analysis.index, &mut records);
+                collect_type_records(
+                    &rel,
+                    &doc,
+                    module,
+                    analysis.arena(),
+                    &analysis.index,
+                    &mut records,
+                );
             }
             Mode::Resolutions => {
                 collect_resolution_records(
@@ -319,6 +326,7 @@ fn collect_type_records(
     rel: &Path,
     doc: &Ref<'_, Document>,
     module: &ModuleAnalysis,
+    project_arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<Record>,
 ) {
@@ -327,9 +335,11 @@ fn collect_type_records(
     let hir = &module.hir;
     let analysis = &module.analysis;
 
-    // Cloned arena lets us call `lower_type_ref_local` without
-    // mutating the analyzer's table.
-    let mut arena = analysis.types.clone();
+    // P19 — clone the project arena so `lower_type_ref_local` can
+    // mint without disturbing the cached project state. Cloning
+    // preserves intern keys, so TypeIds from `analysis.expr_types`
+    // remain valid in the local copy.
+    let mut arena = project_arena.clone();
     let any_id = arena.any();
     let home = |n: &str| home_lib_for(index, n);
 
