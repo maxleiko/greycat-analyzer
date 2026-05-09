@@ -1033,6 +1033,23 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 byte_range: node.byte_range(),
             })
         }
+        // **P19.15** — `from..to` (and `from..` / `..to`) plus the
+        // math-style `]from..to]` / `[from..to[` interval flatten
+        // into one HIR shape. Bracket inclusivity isn't load-bearing
+        // for typing.
+        "range_expr" | "interval_expr" => {
+            let from = node
+                .child_by_field_name("from")
+                .and_then(|n| lower_expr(cx, n));
+            let to = node
+                .child_by_field_name("to")
+                .and_then(|n| lower_expr(cx, n));
+            Expr::Range {
+                from,
+                to,
+                byte_range: node.byte_range(),
+            }
+        }
         _ => Expr::Unsupported {
             kind: kind_to_static(kind),
             byte_range: node.byte_range(),

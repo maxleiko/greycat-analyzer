@@ -170,6 +170,14 @@ pub struct FnSignature {
     /// **P19.9** — interned generic param names. Resolve back to text
     /// via the owning [`ProjectIndex::symbols`].
     pub generics: Vec<Symbol>,
+    /// **P19.15** — pre-lowered parameter types in declared order.
+    /// Lets the analyzer's generic-call inference (`try_generic_call_inference`)
+    /// run for cross-module `Definition::ProjectDecl` callees too —
+    /// without these the inference path could only fire for
+    /// in-module `Definition::Decl` because the foreign HIR isn't
+    /// reachable from the body walker. Empty for fns declared with
+    /// no params.
+    pub params: Vec<TypeId>,
 }
 
 /// P21 — per-type cross-module member index. `home_uri` names the

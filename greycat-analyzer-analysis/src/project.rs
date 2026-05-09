@@ -627,12 +627,27 @@ fn lower_module_signatures(
                 }
                 let ret_ty =
                     lower_type_ref_project(hir, ret, arena_mut, &*index, &generics_in_scope);
+                // **P19.15** — also pre-lower parameter types so the
+                // analyzer's generic-call inference can run on
+                // cross-module callees (`abs`, `min`, `max`, …).
+                let mut params: Vec<greycat_analyzer_types::TypeId> =
+                    Vec::with_capacity(fnd.params.len());
+                for p_id in &fnd.params {
+                    let p = &hir.fn_params[*p_id];
+                    let pt = if let Some(tr) = p.ty {
+                        lower_type_ref_project(hir, tr, arena_mut, &*index, &generics_in_scope)
+                    } else {
+                        arena_mut.any()
+                    };
+                    params.push(pt);
+                }
                 entry.fns.push((
                     fn_sym,
                     FnSignature {
                         home_uri: uri.clone(),
                         return_ty: ret_ty,
                         generics,
+                        params,
                     },
                 ));
             }

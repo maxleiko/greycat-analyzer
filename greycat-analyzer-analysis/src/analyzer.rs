@@ -1118,47 +1118,74 @@ impl<'a> Cx<'a> {
             Expr::Ident(idx) => *idx,
             _ => return None,
         };
-        let Definition::Decl(decl_id) = self.res.lookup(name_idx)? else {
-            // Cross-module / param-as-fn / lambda callees aren't
-            // handled in this pass — they fall back to `any`.
-            return None;
-        };
-        // Pre-bind the fields we need from the FnDecl so we can drop
-        // the `&self.hir.decls[..]` borrow before the `&mut self`
-        // calls below. `params` / `generics` are `Vec<Idx<_>>` —
-        // the clone copies indices, not the underlying nodes.
-        let (fn_name_idx, fn_generics, fn_params, fn_return_type) = match &self.hir.decls[decl_id] {
-            Decl::Fn(fnd) if !fnd.generics.is_empty() => (
-                fnd.name,
-                fnd.generics.clone(),
-                fnd.params.clone(),
-                fnd.return_type,
-            ),
-            _ => return None,
-        };
-        // Lower the declared signature with the fn's generics in scope.
-        let owner = GenericOwner::Function(self.hir.idents[fn_name_idx].text.clone());
-        self.push_generic_scope(&fn_generics, owner);
-        let declared_params: Vec<TypeId> = fn_params
-            .iter()
-            .map(|p_id| {
-                self.hir.fn_params[*p_id]
-                    .ty
+        let def = self.res.lookup(name_idx)?;
+        match def {
+            Definition::Decl(decl_id) => {
+                // Pre-bind the fields we need from the FnDecl so we
+                // can drop the `&self.hir.decls[..]` borrow before
+                // the `&mut self` calls below. `params` / `generics`
+                // are `Vec<Idx<_>>` — the clone copies indices, not
+                // the underlying nodes.
+                let (fn_name_idx, fn_generics, fn_params, fn_return_type) =
+                    match &self.hir.decls[decl_id] {
+                        Decl::Fn(fnd) if !fnd.generics.is_empty() => (
+                            fnd.name,
+                            fnd.generics.clone(),
+                            fnd.params.clone(),
+                            fnd.return_type,
+                        ),
+                        _ => return None,
+                    };
+                // Lower the declared signature with the fn's generics in scope.
+                let owner = GenericOwner::Function(self.hir.idents[fn_name_idx].text.clone());
+                self.push_generic_scope(&fn_generics, owner);
+                let declared_params: Vec<TypeId> = fn_params
+                    .iter()
+                    .map(|p_id| {
+                        self.hir.fn_params[*p_id]
+                            .ty
+                            .map(|t| self.lower_type_ref(t))
+                            .unwrap_or_else(|| self.any())
+                    })
+                    .collect();
+                let declared_return = fn_return_type
                     .map(|t| self.lower_type_ref(t))
-                    .unwrap_or_else(|| self.any())
-            })
-            .collect();
-        let declared_return = fn_return_type
-            .map(|t| self.lower_type_ref(t))
-            .unwrap_or_else(|| self.any());
-        self.pop_generic_scope();
+                    .unwrap_or_else(|| self.any());
+                self.pop_generic_scope();
 
-        let mut tbl = InferenceTable::new();
-        let pair_count = declared_params.len().min(arg_tys.len());
-        for i in 0..pair_count {
-            self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
+                let mut tbl = InferenceTable::new();
+                let pair_count = declared_params.len().min(arg_tys.len());
+                for i in 0..pair_count {
+                    self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
+                }
+                Some(tbl.substitute(self.arena, declared_return))
+            }
+            Definition::ProjectDecl { .. } => {
+                // **P19.15** — cross-module generic call inference.
+                // The S7-S11 stage pre-lowered every fn's params and
+                // return type into the shared arena (`FnSignature`);
+                // we can run the same witness-driven inference
+                // without crossing the module boundary at body-walk
+                // time. Without this, generic stdlib fns like
+                // `abs<T>(x: T): T` typed every call as `T`
+                // (GenericParam) and downstream arithmetic on the
+                // result fell through to `any`.
+                let fn_name = self.ident_text(name_idx);
+                let sig = self.index.fn_signature_for(fn_name)?;
+                if sig.generics.is_empty() {
+                    return None;
+                }
+                let declared_params = sig.params.clone();
+                let declared_return = sig.return_ty;
+                let mut tbl = InferenceTable::new();
+                let pair_count = declared_params.len().min(arg_tys.len());
+                for i in 0..pair_count {
+                    self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
+                }
+                Some(tbl.substitute(self.arena, declared_return))
+            }
+            _ => None,
         }
-        Some(tbl.substitute(self.arena, declared_return))
     }
 
     /// Walk `param_ty` (declared) against `arg_ty` (witness). When
@@ -1573,6 +1600,32 @@ impl<'a> Cx<'a> {
                         } else {
                             vec![any_id; params.len()]
                         }
+                    }
+                    // **P19.15** — bare-named (raw) collection
+                    // forms `nodeTime` / `nodeIndex` / `nodeList` /
+                    // `Array` / `Map` / `Set` / `nodeGeo` (no
+                    // generic args declared) bind keys but the
+                    // value type stays `any` because the element
+                    // type is unknown.
+                    TypeKind::Named { name }
+                        if matches!(
+                            name.as_str(),
+                            "Array" | "Set" | "nodeList" | "nodeTime" | "nodeGeo"
+                        ) =>
+                    {
+                        let key_ty = match name.as_str() {
+                            "nodeTime" => time_id,
+                            "nodeGeo" => geo_id,
+                            _ => int_id,
+                        };
+                        if params.len() == 2 {
+                            vec![key_ty, any_id]
+                        } else {
+                            vec![any_id; params.len()]
+                        }
+                    }
+                    TypeKind::Named { name } if matches!(name.as_str(), "Map" | "nodeIndex") => {
+                        vec![any_id; params.len()]
                     }
                     _ => vec![any_id; params.len()],
                 };
@@ -2104,19 +2157,34 @@ impl<'a> Cx<'a> {
                 } else {
                     recv_ty
                 };
-                let base = match &self.arena.get(underlying).kind {
-                    TypeKind::Generic { name, args }
-                        if (name == "Array" || name == "Set" || name == "nodeList")
-                            && !args.is_empty() =>
-                    {
-                        args[0]
+                // **P19.15** — when the index is an `Expr::Range`
+                // the offset is a "slice view" that returns the
+                // *receiver type* unchanged (still iterable in the
+                // same shape). Otherwise it's a single-element
+                // lookup that returns the element type.
+                let index_is_range = matches!(&self.hir.exprs[index], Expr::Range { .. });
+                let base = if index_is_range {
+                    underlying
+                } else {
+                    match &self.arena.get(underlying).kind {
+                        TypeKind::Generic { name, args }
+                            if (name == "Array" || name == "Set" || name == "nodeList")
+                                && !args.is_empty() =>
+                        {
+                            args[0]
+                        }
+                        TypeKind::Generic { name, args }
+                            if (name == "Map" || name == "nodeIndex") && args.len() >= 2 =>
+                        {
+                            args[1]
+                        }
+                        TypeKind::Generic { name, args }
+                            if name == "nodeTime" && !args.is_empty() =>
+                        {
+                            args[0]
+                        }
+                        _ => self.any(),
                     }
-                    TypeKind::Generic { name, args }
-                        if (name == "Map" || name == "nodeIndex") && args.len() >= 2 =>
-                    {
-                        args[1]
-                    }
-                    _ => self.any(),
                 };
                 let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
                 if lift_pre || post_optional {
@@ -2242,6 +2310,21 @@ impl<'a> Cx<'a> {
                 let _ = self.visit_expr(value);
                 self.primitive(Primitive::Bool)
             }
+            Expr::Range { from, to, .. } => {
+                // **P19.15** — visit both endpoints so their
+                // exprs get types in the table; the range itself
+                // doesn't have a useful TypeId on its own (it only
+                // appears as an offset index or a for-in iterator
+                // range, both of which look at the surrounding
+                // shape, not the range's own type).
+                if let Some(f) = from {
+                    let _ = self.visit_expr(f);
+                }
+                if let Some(t) = to {
+                    let _ = self.visit_expr(t);
+                }
+                self.any()
+            }
             Expr::Cast { value, ty, .. } => {
                 let from_ty = self.visit_expr(value);
                 let to_ty = self.lower_type_ref(ty);
@@ -2302,19 +2385,25 @@ impl<'a> Cx<'a> {
                 // non-string side via `to_string()`. Only `+`
                 // overloads on String — the other arithmetic ops
                 // stay numeric.
+                // **P19.15** — strip nullability for arithmetic
+                // dispatch only (Coalesce / comparisons read the
+                // original `nullable` flag, so we keep `lt` / `rt`
+                // intact at the function entry).
+                let lt_n = self.strip_nullable(lt);
+                let rt_n = self.strip_nullable(rt);
                 let string_t = self.primitive(Primitive::String);
                 let time_t = self.primitive(Primitive::Time);
                 let dur_t = self.primitive(Primitive::Duration);
-                if lt == string_t || rt == string_t {
+                if lt_n == string_t || rt_n == string_t {
                     string_t
-                } else if (lt == time_t && rt == dur_t) || (lt == dur_t && rt == time_t) {
+                } else if (lt_n == time_t && rt_n == dur_t) || (lt_n == dur_t && rt_n == time_t) {
                     // **P19.14** — time arithmetic.
                     time_t
-                } else if lt == dur_t && rt == dur_t {
+                } else if lt_n == dur_t && rt_n == dur_t {
                     dur_t
-                } else if lt == float || rt == float {
+                } else if lt_n == float || rt_n == float {
                     float
-                } else if lt == int && rt == int {
+                } else if lt_n == int && rt_n == int {
                     int
                 } else {
                     self.any()
@@ -2324,17 +2413,19 @@ impl<'a> Cx<'a> {
                 // **P19.14** — `time - time → duration`,
                 // `time - duration → time`,
                 // `duration - duration → duration`.
+                let lt_n = self.strip_nullable(lt);
+                let rt_n = self.strip_nullable(rt);
                 let time_t = self.primitive(Primitive::Time);
                 let dur_t = self.primitive(Primitive::Duration);
-                if lt == time_t && rt == time_t {
+                if lt_n == time_t && rt_n == time_t {
                     dur_t
-                } else if lt == time_t && rt == dur_t {
+                } else if lt_n == time_t && rt_n == dur_t {
                     time_t
-                } else if lt == dur_t && rt == dur_t {
+                } else if lt_n == dur_t && rt_n == dur_t {
                     dur_t
-                } else if lt == float || rt == float {
+                } else if lt_n == float || rt_n == float {
                     float
-                } else if lt == int && rt == int {
+                } else if lt_n == int && rt_n == int {
                     int
                 } else {
                     self.any()
@@ -2342,14 +2433,16 @@ impl<'a> Cx<'a> {
             }
             BinOp::Mul => {
                 // **P19.14** — `duration * int / float → duration`.
+                let lt_n = self.strip_nullable(lt);
+                let rt_n = self.strip_nullable(rt);
                 let dur_t = self.primitive(Primitive::Duration);
-                if (lt == dur_t && (rt == int || rt == float))
-                    || ((lt == int || lt == float) && rt == dur_t)
+                if (lt_n == dur_t && (rt_n == int || rt_n == float))
+                    || ((lt_n == int || lt_n == float) && rt_n == dur_t)
                 {
                     dur_t
-                } else if lt == float || rt == float {
+                } else if lt_n == float || rt_n == float {
                     float
-                } else if lt == int && rt == int {
+                } else if lt_n == int && rt_n == int {
                     int
                 } else {
                     self.any()

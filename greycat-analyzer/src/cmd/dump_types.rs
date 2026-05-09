@@ -505,6 +505,7 @@ fn expr_kind_and_range(hir: &Hir, expr: &Expr) -> Option<(&'static str, std::ops
         Expr::Lambda(_) => "LambdaExpr",
         Expr::Is { .. } => "IsExpr",
         Expr::Cast { .. } => "AsExpr",
+        Expr::Range { .. } => "RangeExpr",
         Expr::Unsupported { .. } => return None,
     };
     Some((kind, expr.byte_range()))
@@ -585,6 +586,14 @@ fn collect_expr_descendants(
         Expr::Lambda(_) => {}
         Expr::Is { value, .. } | Expr::Cast { value, .. } => {
             collect_expr_descendants(hir, *value, out);
+        }
+        Expr::Range { from, to, .. } => {
+            if let Some(f) = from {
+                collect_expr_descendants(hir, *f, out);
+            }
+            if let Some(t) = to {
+                collect_expr_descendants(hir, *t, out);
+            }
         }
         Expr::Unsupported { .. } => {}
     }

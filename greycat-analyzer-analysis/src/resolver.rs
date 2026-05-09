@@ -543,6 +543,14 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             visit_expr(cx, value);
             visit_type_ref(cx, ty);
         }
+        Expr::Range { from, to, .. } => {
+            if let Some(f) = from {
+                visit_expr(cx, f);
+            }
+            if let Some(t) = to {
+                visit_expr(cx, t);
+            }
+        }
         Expr::Unsupported { .. } => {
             // Lowering hasn't expanded this shape yet; nothing to bind.
         }

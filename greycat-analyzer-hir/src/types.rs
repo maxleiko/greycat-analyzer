@@ -320,6 +320,18 @@ pub enum Expr {
     Unary(UnaryExpr),
     Paren(Idx<Expr>, Span),
     Lambda(LambdaExpr),
+    /// **P19.15** — `from..to` (or `from..` / `..to`) range and the
+    /// math-style `]from..to]` / `[from..to[` interval. Both forms
+    /// flatten into the same HIR node since the bracket markers
+    /// don't change typing — they only matter at runtime for
+    /// inclusivity. Used as the index of an `Expr::Offset` to
+    /// signal a slice (`arr[1..10]` returns the same shape as `arr`)
+    /// or as a for-in iterator-range clause.
+    Range {
+        from: Option<Idx<Expr>>,
+        to: Option<Idx<Expr>>,
+        byte_range: Span,
+    },
     /// `value is Type` — runtime type guard, evaluates to `bool`.
     /// Recognized by the analyzer to narrow `value` in the matching
     /// branch when used inside an `if` condition (P6.5).
@@ -362,6 +374,7 @@ impl Expr {
             Expr::Unary(u) => u.byte_range.clone(),
             Expr::Lambda(l) => l.byte_range.clone(),
             Expr::Is { byte_range, .. } | Expr::Cast { byte_range, .. } => byte_range.clone(),
+            Expr::Range { byte_range, .. } => byte_range.clone(),
             Expr::Unsupported { byte_range, .. } => byte_range.clone(),
         }
     }

@@ -389,6 +389,16 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
             None,
             vec![expr_node(hir, *value), type_ref_node(hir, *ty)],
         ),
+        Expr::Range { from, to, .. } => {
+            let mut kids = Vec::new();
+            if let Some(f) = from {
+                kids.push(expr_node(hir, *f));
+            }
+            if let Some(t) = to {
+                kids.push(expr_node(hir, *t));
+            }
+            ("expr:range", None, kids)
+        }
         Expr::Unsupported { kind, .. } => ("expr:unsupported", Some((*kind).into()), Vec::new()),
     };
     HirNode {
