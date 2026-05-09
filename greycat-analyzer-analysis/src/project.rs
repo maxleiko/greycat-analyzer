@@ -415,7 +415,7 @@ impl ProjectAnalysis {
             }
         }
 
-        // Phase 2 — apply.
+        // Phase 2 — apply Member/Arrow updates.
         let mut changed = false;
         for (uri, entries) in updates {
             let Some(m) = self.modules.get_mut(&uri) else {
@@ -428,9 +428,68 @@ impl ProjectAnalysis {
                     changed = true;
                 }
             }
-            // Refresh Ident expr_types from updated def_types — pure
-            // pass-through, but matches what 3.52 does for for-in
-            // params and keeps the loop's invariant tidy.
+        }
+
+        // Phase 3 — refresh `expr_types` for every `Expr::Ident` whose
+        // resolved binding has a settled type in `def_types`. The
+        // analyzer's first pass already populated this for in-body
+        // visits, but every pass that mutates `def_types` (3.5 var-init
+        // relink, 3.52 for-in rebind) leaves Ident *uses* stale at
+        // `any`. Closing that gap here is what lets the next loop
+        // iteration's Member/Arrow propagation see the right receiver
+        // type.
+        use crate::resolver::Definition;
+        use greycat_analyzer_hir::types::Decl as HirDecl;
+        for m in self.modules.values_mut() {
+            for (expr_id, expr) in m.hir.exprs.iter() {
+                let Expr::Ident(use_idx) = expr else {
+                    continue;
+                };
+                // Only refresh from def_types when the current
+                // `expr_types` is `any` (or absent). The analyzer's
+                // narrowing frames may have stamped a narrower type
+                // at this specific use site (e.g. `if (x != null &&
+                // f(x))` narrows `x` to non-null inside the `&&`
+                // right operand), and we must not overwrite that
+                // with the binding's declared type.
+                let current_is_any = match m.analysis.expr_types.get(&expr_id) {
+                    Some(t) => matches!(m.analysis.types.get(*t).kind, TypeKind::Any),
+                    None => true,
+                };
+                if !current_is_any {
+                    continue;
+                }
+                let Some(def) = m.resolutions.lookup(*use_idx) else {
+                    continue;
+                };
+                let new_ty = match def {
+                    Definition::Param(name) | Definition::Local(name) => {
+                        m.analysis.def_types.get(&name).copied()
+                    }
+                    Definition::Decl(decl_id) => match &m.hir.decls[decl_id] {
+                        HirDecl::Var(vd) => vd.ty.and_then(|t| {
+                            lower_type_ref_id(
+                                &m.hir,
+                                t,
+                                &m.analysis.registry,
+                                &mut m.analysis.types,
+                            )
+                        }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(new_ty) = new_ty else {
+                    continue;
+                };
+                if matches!(m.analysis.types.get(new_ty).kind, TypeKind::Any) {
+                    continue;
+                }
+                let prev = m.analysis.expr_types.insert(expr_id, new_ty);
+                if prev != Some(new_ty) {
+                    changed = true;
+                }
+            }
         }
         changed
     }
@@ -820,7 +879,20 @@ impl ProjectAnalysis {
                         chain,
                     ),
                     Expr::Member(m) | Expr::Arrow(m) => {
-                        resolve_member_call_return_shape(&self.modules, cur_module, m.property)
+                        // P16.4 — substitute generic params on the
+                        // method's return type using the receiver's
+                        // instantiation. `nodeIndex<K, V>::get(K) → V?`
+                        // with `pkgs: nodeIndex<String, node<Pkg>>`
+                        // produces `node<Pkg>?` instead of `V?`.
+                        let recv_ty = cur_module.analysis.expr_types.get(&m.receiver).copied();
+                        resolve_member_call_return_shape_subst(
+                            &self.modules,
+                            &self.index,
+                            cur_module,
+                            m.property,
+                            recv_ty,
+                            matches!(callee_expr, Expr::Arrow(_)),
+                        )
                     }
                     Expr::Ident(_) => resolve_ident_call_return_shape(
                         &self.modules,
@@ -1804,6 +1876,114 @@ fn resolve_member_call_return_shape(
         return Some(read_type_shape(&foreign_module.hir, ret));
     }
     None
+}
+
+/// P16.4 — substitution-aware companion to `resolve_member_call_return_shape`.
+/// When the receiver's TypeKind exposes a generic instantiation
+/// (`nodeIndex<String, node<Pkg>>`), look up the method's host
+/// `TypeDecl` to pair its `generics` (e.g. `["K", "V"]`) with the
+/// instantiation args, build a substitution map, and read the return
+/// type's `TypeRef` through `read_type_shape_subst`. For arrow access
+/// (`n->m()`) the receiver is auto-derefed through node-tag generics
+/// (`node<T>` → `T`) before the lookup.
+///
+/// Falls back to plain `read_type_shape` (no substitution) when the
+/// receiver's TypeKind doesn't carry generic args, when the method's
+/// host type isn't reachable, or when the property isn't bound to a
+/// method in the per-module / cross-module member maps.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
+fn resolve_member_call_return_shape_subst(
+    modules: &HashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    cur: &ModuleAnalysis,
+    property_idx: Idx<greycat_analyzer_hir::types::Ident>,
+    receiver_ty: Option<greycat_analyzer_types::TypeId>,
+    is_arrow: bool,
+) -> Option<TypeShape> {
+    use crate::analyzer::MemberDef;
+    use greycat_analyzer_types::TypeKind;
+
+    // Resolve the property's host module + method decl. The two existing
+    // member-lookup tables (intra-module `member_uses` and cross-module
+    // `foreign_member_uses`) already point at the right `Decl::Fn`; we
+    // reuse them so the substitution path doesn't have to redo the
+    // member-resolution from scratch.
+    let (host_hir, decl_id): (&Hir, Idx<Decl>) =
+        if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(property_idx) {
+            (&cur.hir, decl_id)
+        } else if let Some(foreign) = cur.analysis.foreign_member_lookup(property_idx)
+            && let MemberDef::Method(decl_id) = foreign.member
+            && let Some(foreign_module) = modules.get(&foreign.uri)
+        {
+            (&foreign_module.hir, decl_id)
+        } else {
+            // Fall back to plain shape resolution when no binding has
+            // been recorded yet — the loop that calls us will see the
+            // result update on a later iteration once member resolution
+            // catches up.
+            return resolve_member_call_return_shape(modules, cur, property_idx);
+        };
+    let Decl::Fn(fnd) = &host_hir.decls[decl_id] else {
+        return None;
+    };
+    let ret = fnd.return_type?;
+
+    // Build the substitution map from the receiver's generic args.
+    // We need (a) the type decl whose generics name K, V, ... and
+    // (b) the receiver's instantiation supplying their values. For
+    // `recv->method()` we auto-deref through node-tag generics so
+    // `n->m()` on `n: node<T>` substitutes against `T`'s generics.
+    let mut subst: HashMap<String, TypeShape> = HashMap::new();
+    if let Some(recv_ty) = receiver_ty {
+        let lookup_ty = if is_arrow {
+            match cur.analysis.types.get(recv_ty).kind.clone() {
+                TypeKind::Generic { args, name }
+                    if greycat_analyzer_types::is_node_tag(&name) && args.len() == 1 =>
+                {
+                    args[0]
+                }
+                _ => recv_ty,
+            }
+        } else {
+            recv_ty
+        };
+        let (type_name, instantiation) = match cur.analysis.types.get(lookup_ty).kind.clone() {
+            TypeKind::Named { name } => (name, Vec::new()),
+            TypeKind::Generic { name, args } => (name, args),
+            TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
+            _ => (String::new(), Vec::new()),
+        };
+        // Look up the type decl: own module first, then cross-module
+        // via the project index. The lookup is for *the receiver's
+        // type*, which carries the generic params we need to match.
+        // Note this can be a different module than `host_hir` (the
+        // module owning the method's `Decl::Fn`) when a generic type
+        // is declared in one module and the method is in the same
+        // module. For native generic types like `nodeIndex` both live
+        // together in stdlib.
+        let lookup: Option<(&Hir, Idx<Decl>)> =
+            if let Some(decl_id) = cur.analysis.type_decls.get(&type_name).copied() {
+                Some((&cur.hir, decl_id))
+            } else {
+                index
+                    .locate_decl(&type_name)
+                    .first()
+                    .and_then(|(uri, decl_id)| modules.get(uri).map(|m| (&m.hir, *decl_id)))
+            };
+        if let Some((td_hir, td_decl_id)) = lookup
+            && let Decl::Type(td) = &td_hir.decls[td_decl_id]
+        {
+            for (gp_idx, name_idx) in td.generics.iter().enumerate() {
+                let gp_name = td_hir.idents[*name_idx].text.clone();
+                let arg_shape = instantiation
+                    .get(gp_idx)
+                    .map(|a| read_type_id_shape(&cur.analysis.types, *a))
+                    .unwrap_or(TypeShape::Any);
+                subst.insert(gp_name, arg_shape);
+            }
+        }
+    }
+    Some(read_type_shape_subst(host_hir, ret, &subst))
 }
 
 /// Walk one module's HIR and emit every type-relation diagnostic
