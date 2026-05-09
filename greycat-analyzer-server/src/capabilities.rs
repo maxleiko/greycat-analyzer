@@ -3422,37 +3422,91 @@ fn member_completion(
     if prefix_start > bytes.len() {
         return None;
     }
-    // Determine separator: `.` (member) or `->` (arrow). Position of
-    // the receiver's last byte (exclusive end) lives at `recv_end`.
-    let recv_end = if prefix_start >= 1 && bytes[prefix_start - 1] == b'.' {
-        prefix_start - 1
-    } else if prefix_start >= 2
-        && bytes[prefix_start - 2] == b'-'
-        && bytes[prefix_start - 1] == b'>'
-    {
-        prefix_start - 2
-    } else {
-        return None;
-    };
+    // Determine separator: `.` (member) or `->` (arrow). `sep_start`
+    // is the byte offset of the first separator char so we can build
+    // a `.` → `->` rewrite range for P16.5's auto-deref nudge.
+    let (recv_end, is_arrow, sep_start, sep_end) =
+        if prefix_start >= 1 && bytes[prefix_start - 1] == b'.' {
+            (prefix_start - 1, false, prefix_start - 1, prefix_start)
+        } else if prefix_start >= 2
+            && bytes[prefix_start - 2] == b'-'
+            && bytes[prefix_start - 1] == b'>'
+        {
+            (prefix_start - 2, true, prefix_start - 2, prefix_start)
+        } else {
+            return None;
+        };
 
     let module = project.module(uri)?;
     let recv_ty = receiver_type_at(text, root, module, recv_end)?;
     let name = type_head_name(&module.analysis.types, recv_ty)?;
 
+    // P16.5 — node-tag receivers auto-deref through their inner type:
+    //   `n.|`  → list node's own members PLUS the inner type's members
+    //            with a `.` → `->` rewrite edit.
+    //   `n->|` → list the inner type's members directly.
+    // The criterion mirrors the analyzer: single-arg node-tag generic.
+    let inner_head: Option<String> = match (is_arrow, &module.analysis.types.get(recv_ty).kind) {
+        (_, greycat_analyzer_types::TypeKind::Generic { name: tag, args })
+            if greycat_analyzer_types::is_node_tag(tag) && args.len() == 1 =>
+        {
+            type_head_name(&module.analysis.types, args[0]).map(|s| s.to_string())
+        }
+        _ => None,
+    };
+
     let mut items: Vec<CompletionItem> = Vec::new();
-    // Try in-module first.
-    if let Some(decl_id) = module.analysis.type_decls.get(name).copied()
-        && let Decl::Type(td) = &module.hir.decls[decl_id]
-    {
-        collect_type_members(&module.hir, td, &prefix_lower, &mut items);
+
+    // For `->` on a node-tag receiver, skip the tag's own members
+    // entirely — those are reachable via `.` only. The analyzer's
+    // `arrow_deref_receiver` mirrors this dispatch.
+    let list_tag_members = !(is_arrow && inner_head.is_some());
+    if list_tag_members {
+        if let Some(decl_id) = module.analysis.type_decls.get(name).copied()
+            && let Decl::Type(td) = &module.hir.decls[decl_id]
+        {
+            collect_type_members(&module.hir, td, &prefix_lower, &mut items);
+        }
+        if items.is_empty()
+            && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(name).first()
+            && let Some(fmod) = project.module(foreign_uri)
+            && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+        {
+            collect_type_members(&fmod.hir, td, &prefix_lower, &mut items);
+        }
     }
-    // Fall through to cross-module if in-module produced nothing.
-    if items.is_empty()
-        && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(name).first()
-        && let Some(fmod) = project.module(foreign_uri)
-        && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
-    {
-        collect_type_members(&fmod.hir, td, &prefix_lower, &mut items);
+
+    // Inner type's members. `.` rewrites to `->` via
+    // `additional_text_edits`; `->` lands the items verbatim.
+    if let Some(inner) = inner_head.as_deref() {
+        let mut inner_items: Vec<CompletionItem> = Vec::new();
+        if let Some(decl_id) = module.analysis.type_decls.get(inner).copied()
+            && let Decl::Type(td) = &module.hir.decls[decl_id]
+        {
+            collect_type_members(&module.hir, td, &prefix_lower, &mut inner_items);
+        }
+        if inner_items.is_empty()
+            && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(inner).first()
+            && let Some(fmod) = project.module(foreign_uri)
+            && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+        {
+            collect_type_members(&fmod.hir, td, &prefix_lower, &mut inner_items);
+        }
+        if !is_arrow && !inner_items.is_empty() {
+            // `.` → `->` rewrite. The edit replaces the `.` byte with
+            // `->` so the accepted item lands in the correct shape.
+            let edit_range = lsp_types::Range {
+                start: byte_to_position(text, sep_start),
+                end: byte_to_position(text, sep_end),
+            };
+            for item in &mut inner_items {
+                item.additional_text_edits = Some(vec![TextEdit {
+                    range: edit_range,
+                    new_text: "->".into(),
+                }]);
+            }
+        }
+        items.extend(inner_items);
     }
 
     if items.is_empty() {

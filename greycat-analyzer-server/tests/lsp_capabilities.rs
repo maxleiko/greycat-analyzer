@@ -1697,6 +1697,144 @@ fn completion_cross_module_decl_carries_signature_and_module_label() {
     );
 }
 
+/// P16.5 — `n.|` where `n: node<Foo>` lists `node`'s own methods AND
+/// `Foo`'s attrs/methods. The inner-type items carry an
+/// `additional_text_edits` that rewrites `.` → `->` so accepting one
+/// drops the user into the correct deref shape.
+#[test]
+fn completion_dot_on_node_tag_receiver_offers_inner_with_arrow_rewrite() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Foo {\n  name: String;\n}\nfn caller(n: node<Foo>) {\n  n.\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `n.` on line 4 col 4.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(4, 4),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let name = list
+        .items
+        .iter()
+        .find(|i| i.label == "name")
+        .expect("inner-type attr `name` should appear");
+    let edits = name
+        .additional_text_edits
+        .as_ref()
+        .expect("expected `.` → `->` rewrite on inner-type item");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, "->");
+    // `resolve` is `node`'s own native method — kept verbatim, no rewrite.
+    if let Some(resolve) = list.items.iter().find(|i| i.label == "resolve") {
+        assert!(
+            resolve.additional_text_edits.is_none(),
+            "tag's own method should not carry the `.→->` rewrite"
+        );
+    }
+}
+
+/// P16.5 — `n->|` where `n: node<Foo>` lists `Foo`'s members directly
+/// (already in the right shape, no rewrite). Tag-owned methods like
+/// `node::resolve` are reachable via `.`, not `->`, so they don't
+/// surface here.
+#[test]
+fn completion_arrow_on_node_tag_receiver_lists_inner_directly() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Foo {\n  name: String;\n}\nfn caller(n: node<Foo>) {\n  n->\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `n->` on line 4 col 5.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(4, 5),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"name"),
+        "inner-type attr should surface on `n->|`: {labels:?}"
+    );
+    let name = list.items.iter().find(|i| i.label == "name").unwrap();
+    assert!(
+        name.additional_text_edits.is_none(),
+        "`->` already in source — no `.→->` rewrite needed"
+    );
+    // `resolve` belongs to `node` (the tag), so it should NOT appear
+    // on the `->` path.
+    assert!(
+        !labels.contains(&"resolve"),
+        "tag's own methods should not surface on `n->|`: {labels:?}"
+    );
+}
+
+/// P16.5 analyzer side — `n->name` for `n: node<Foo>` records a
+/// `member_uses` binding pointing at `Foo`'s `name` attr (rather than
+/// resolving against `node` and finding nothing). Verified through the
+/// hover capability since hover surfaces the bound attr's signature.
+#[test]
+fn hover_arrow_on_node_tag_resolves_inner_member() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Foo {\n  /// the inner name\n  name: String;\n}\nfn caller(n: node<Foo>) {\n  var s = n->name;\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor on `name` of `n->name` (line 5 col 13).
+    let hover = capabilities::hover_with_project(
+        &doc.text,
+        "project",
+        doc.root_node(),
+        pos(5, 13),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover should resolve through the deref");
+    let body = match hover.contents {
+        HoverContents::Markup(m) => m.value,
+        HoverContents::Scalar(MarkedString::String(s)) => s,
+        HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+        HoverContents::Array(_) => panic!("unexpected array hover shape"),
+    };
+    assert!(
+        body.contains("name") && body.contains("String"),
+        "hover should describe `Foo.name: String`; got:\n{body}"
+    );
+}
+
 /// Regression: completion inside an *empty* `for-in` body must surface
 /// the iterator binders (`i`, `theNode`). Pre-fix the body's
 /// byte_range was derived from "first stmt..last stmt" which collapsed
