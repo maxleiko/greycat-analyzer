@@ -37,6 +37,10 @@ export class GcDiagnosticsPanel extends GcBasePanel {
       li {
         padding: 4px 0;
         border-bottom: 1px solid var(--wa-color-surface-border);
+        cursor: pointer;
+      }
+      li:hover {
+        background: var(--wa-color-surface-default);
       }
       .pos {
         opacity: 0.6;
@@ -81,7 +85,10 @@ export class GcDiagnosticsPanel extends GcBasePanel {
       <ul>
         ${diags.map(
           (d) => html`
-            <li>
+            <li
+              title="Jump to ${d.start.line + 1}:${d.start.column + 1}"
+              @click=${() => this.jump(d.range.start, d.range.end)}
+            >
               <span class="pos"> ${d.start.line + 1}:${d.start.column + 1} </span>
               <span class="badge ${d.severity}">${d.severity}</span>
               <span>${d.message}</span>
@@ -91,6 +98,16 @@ export class GcDiagnosticsPanel extends GcBasePanel {
         )}
       </ul>
     `;
+  }
+
+  private jump(start: number, end: number) {
+    this.dispatchEvent(
+      new CustomEvent("gc-jump", {
+        detail: { start, end },
+        bubbles: true,
+        composed: true,
+      }),
+    );
   }
 }
 

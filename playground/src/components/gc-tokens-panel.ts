@@ -38,6 +38,12 @@ export class GcTokensPanel extends GcBasePanel {
         opacity: 0.6;
         font-variant-numeric: tabular-nums;
       }
+      tbody tr {
+        cursor: pointer;
+      }
+      tbody tr:hover {
+        background: var(--wa-color-surface-default);
+      }
     `,
   ];
 
@@ -55,7 +61,7 @@ export class GcTokensPanel extends GcBasePanel {
         <tbody>
           ${tokens.map(
             (t) => html`
-              <tr>
+              <tr @click=${() => this.jump(t.range.start, t.range.end)}>
                 <td class="kind">${t.kind}</td>
                 <td class="range">
                   ${t.start.line + 1}:${t.start.column + 1}–${t.end.line + 1}:${t.end.column + 1}
@@ -67,6 +73,16 @@ export class GcTokensPanel extends GcBasePanel {
         </tbody>
       </table>
     `;
+  }
+
+  private jump(start: number, end: number) {
+    this.dispatchEvent(
+      new CustomEvent("gc-jump", {
+        detail: { start, end },
+        bubbles: true,
+        composed: true,
+      }),
+    );
   }
 }
 

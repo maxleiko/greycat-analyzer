@@ -40,6 +40,10 @@ export class GcHirPanel extends GcBasePanel {
       }
       li {
         padding: 2px 0;
+        cursor: pointer;
+      }
+      li:hover {
+        background: var(--wa-color-surface-default);
       }
       .kind {
         color: var(--wa-color-brand-on-normal);
@@ -71,7 +75,7 @@ export class GcHirPanel extends GcBasePanel {
       <ul>
         ${hir.decls.map(
           (d) => html`
-            <li>
+            <li @click=${() => this.jump(d.range.start, d.range.end)}>
               <span class="kind">${d.kind}</span>${d.name}
               <span class="range" style="opacity:.55">[${d.range.start}–${d.range.end}]</span>
             </li>
@@ -91,6 +95,16 @@ export class GcHirPanel extends GcBasePanel {
         <dd>${hir.counts.idents}</dd>
       </dl>
     `;
+  }
+
+  private jump(start: number, end: number) {
+    this.dispatchEvent(
+      new CustomEvent("gc-jump", {
+        detail: { start, end },
+        bubbles: true,
+        composed: true,
+      }),
+    );
   }
 }
 

@@ -62,12 +62,39 @@ function broadcastSource(src: string) {
   }
 }
 
+// P14.7 — persist the editor buffer across page refreshes. Uses
+// `localStorage` directly (no library). The key is namespaced so
+// other apps on the same origin don't clobber it.
+const STORAGE_KEY = "greycat-playground:source";
+const STORAGE_DEBOUNCE_MS = 250;
+
+function loadStoredSource(): string {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (typeof stored === "string" && stored.length > 0) {
+      return stored;
+    }
+  } catch {
+    // Storage unavailable (private mode / disabled) — fall through.
+  }
+  return SAMPLE_SOURCE;
+}
+
+function persistSource(src: string) {
+  try {
+    localStorage.setItem(STORAGE_KEY, src);
+  } catch {
+    // Quota exceeded / disabled — ignore. The editor still works.
+  }
+}
+
 function mountEditor() {
   const host = document.getElementById("editor-host");
   if (!host) throw new Error("missing #editor-host");
   registerGcl();
+  const initial = loadStoredSource();
   const editor = monaco.editor.create(host, {
-    value: SAMPLE_SOURCE,
+    value: initial,
     language: "gcl",
     theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
     automaticLayout: true,
@@ -79,11 +106,56 @@ function mountEditor() {
     scrollBeyondLastLine: false,
   });
 
+  let persistTimer: ReturnType<typeof setTimeout> | null = null;
   editor.onDidChangeModelContent(() => {
-    broadcastSource(editor.getValue());
+    const value = editor.getValue();
+    broadcastSource(value);
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => persistSource(value), STORAGE_DEBOUNCE_MS);
   });
 
-  broadcastSource(SAMPLE_SOURCE);
+  broadcastSource(initial);
+
+  // P14.7 — click-to-jump: panels dispatch `gc-jump` (CustomEvent)
+  // with `{ start, end }` byte offsets when a row is clicked. The
+  // main.ts listener converts byte → Monaco position and selects the
+  // range in the editor, scrolling it into view. Panels live in
+  // shadow DOM (their own roots), so we listen at `document` — Lit
+  // composed events bubble across boundaries.
+  document.addEventListener("gc-jump", (ev: Event) => {
+    const detail = (ev as CustomEvent<{ start: number; end: number }>).detail;
+    if (!detail || typeof detail.start !== "number") return;
+    const model = editor.getModel();
+    if (!model) return;
+    const startPos = model.getPositionAt(detail.start);
+    const endPos = model.getPositionAt(detail.end);
+    const range = new monaco.Range(
+      startPos.lineNumber,
+      startPos.column,
+      endPos.lineNumber,
+      endPos.column,
+    );
+    editor.revealRangeInCenterIfOutsideViewport(range);
+    editor.setSelection(range);
+    editor.focus();
+  });
+
+  // Reset-to-sample button: drop the persisted buffer and reload the
+  // bundled sample. Confirms first so accidental clicks don't nuke
+  // a session's worth of edits.
+  const resetBtn = document.getElementById("reset-source");
+  resetBtn?.addEventListener("click", () => {
+    if (!confirm("Discard the current buffer and reload the bundled sample?")) {
+      return;
+    }
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+    editor.setValue(SAMPLE_SOURCE);
+    editor.focus();
+  });
 }
 
 mountEditor();

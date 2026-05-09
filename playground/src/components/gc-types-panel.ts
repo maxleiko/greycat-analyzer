@@ -36,6 +36,12 @@ export class GcTypesPanel extends GcBasePanel {
       .src {
         opacity: 0.7;
       }
+      tbody tr {
+        cursor: pointer;
+      }
+      tbody tr:hover {
+        background: var(--wa-color-surface-default);
+      }
     `,
   ];
 
@@ -55,7 +61,7 @@ export class GcTypesPanel extends GcBasePanel {
         <tbody>
           ${list.map(
             (t) => html`
-              <tr>
+              <tr @click=${() => this.jump(t.range.start, t.range.end)}>
                 <td class="range">[${t.range.start}–${t.range.end}]</td>
                 <td class="ty">${t.ty}</td>
                 <td class="src">
@@ -67,6 +73,16 @@ export class GcTypesPanel extends GcBasePanel {
         </tbody>
       </table>
     `;
+  }
+
+  private jump(start: number, end: number) {
+    this.dispatchEvent(
+      new CustomEvent("gc-jump", {
+        detail: { start, end },
+        bubbles: true,
+        composed: true,
+      }),
+    );
   }
 }
 

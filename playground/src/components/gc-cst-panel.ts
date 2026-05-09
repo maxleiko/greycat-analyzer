@@ -24,6 +24,11 @@ export class GcCstPanel extends GcBasePanel {
     css`
       .row {
         padding: 1px 0;
+        cursor: pointer;
+      }
+      .row:hover,
+      summary:hover {
+        background: var(--wa-color-surface-default);
       }
       .anon {
         opacity: 0.55;
@@ -73,21 +78,35 @@ export class GcCstPanel extends GcBasePanel {
         ? html`<span class="missing">MISSING ${node.kind}</span>`
         : html`<span class="kind ${node.is_named ? "" : "anon"}">(${node.kind})</span>`;
     const range = html`<span class="range">[${node.range.start}–${node.range.end}]</span>`;
+    const jump = (e: Event) => {
+      e.stopPropagation();
+      this.jump(node.range.start, node.range.end);
+    };
 
     if (node.children.length === 0) {
       const text =
         node.text && node.text.length < 40
           ? html` <span class="text">${JSON.stringify(node.text)}</span>`
           : null;
-      return html`<div class="row">${fieldLabel}${tag}${text}${range}</div>`;
+      return html`<div class="row" @click=${jump}>${fieldLabel}${tag}${text}${range}</div>`;
     }
 
     return html`
       <details open>
-        <summary>${fieldLabel}${tag}${range}</summary>
+        <summary @click=${jump}>${fieldLabel}${tag}${range}</summary>
         ${node.children.map((c) => this.renderNode(c))}
       </details>
     `;
+  }
+
+  private jump(start: number, end: number) {
+    this.dispatchEvent(
+      new CustomEvent("gc-jump", {
+        detail: { start, end },
+        bubbles: true,
+        composed: true,
+      }),
+    );
   }
 }
 
