@@ -139,6 +139,15 @@ struct ModuleSigCache {
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::TypeId,
     )>,
+    /// **P19.10** — `(var_sym, ty)`. Top-level `var` declared types.
+    /// Lowered alongside the other signatures in
+    /// [`lower_module_signatures`] so the analyzer's bare-Ident path
+    /// can type a cross-module `Definition::ProjectDecl` pointing at
+    /// a var.
+    vars: Vec<(
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::TypeId,
+    )>,
 }
 
 impl ProjectAnalysis {
@@ -417,6 +426,19 @@ fn module_signature_hash(hir: &Hir) -> u64 {
                     0u8.hash(&mut hasher);
                 }
             }
+            Decl::Var(vd) => {
+                // P19.10 — top-level vars contribute their declared
+                // type to the project signature index, so the hash
+                // must change when the var name or its TypeRef
+                // shape changes.
+                4u8.hash(&mut hasher);
+                hir.idents[vd.name].text.as_str().hash(&mut hasher);
+                if let Some(tr) = vd.ty {
+                    hash_type_ref(&mut hasher, hir, tr);
+                } else {
+                    0u8.hash(&mut hasher);
+                }
+            }
             _ => {}
         }
     }
@@ -614,6 +636,25 @@ fn lower_module_signatures(
                     },
                 ));
             }
+            Decl::Var(vd) => {
+                // P19.10 — pre-lower top-level var declared types
+                // into the shared arena so a cross-module bare
+                // reference (`Definition::ProjectDecl` pointing at
+                // a `Decl::Var`) can pull the real type out of
+                // `index.var_types` instead of falling through to
+                // `Named("type")`. Vars without a declared type
+                // contribute nothing — the analyzer's local body
+                // walker types them from the initializer.
+                let var_text = hir.idents[vd.name].text.as_str();
+                let var_sym = index.symbols.intern(var_text);
+                let Some(tr) = vd.ty else {
+                    continue;
+                };
+                // Vars never declare generics, so no scope needed.
+                let empty: HashMap<Symbol, GenericOwner> = HashMap::new();
+                let var_ty = lower_type_ref_project(hir, tr, arena_mut, &*index, &empty);
+                entry.vars.push((var_sym, var_ty));
+            }
             _ => {}
         }
     }
@@ -644,6 +685,9 @@ fn apply_module_contributions(index: &mut ProjectIndex, c: &ModuleSigCache) {
     }
     for (sym, ty) in &c.enums {
         index.enum_types.entry(*sym).or_insert(*ty);
+    }
+    for (sym, ty) in &c.vars {
+        index.var_types.entry(*sym).or_insert(*ty);
     }
 }
 
@@ -1802,6 +1846,13 @@ fn lower_type_ref_project(
                 && let Some(owner) = generics_in_scope.get(&sym)
             {
                 arena.generic_param(name.to_string(), owner.clone())
+            } else if let Some(enum_id) = index.enum_type_for(name) {
+                // P19.10 — canonical enum TypeId from S7-S11.
+                // Without this, a cross-module enum reference would
+                // mint `Named(name)` (kind != Enum), which breaks
+                // the analyzer's `Static` enum-variant arm
+                // (`if let TypeKind::Enum { variants, .. } = ...`).
+                enum_id
             } else if index.has_name(name) {
                 arena.named(name.to_string())
             } else {

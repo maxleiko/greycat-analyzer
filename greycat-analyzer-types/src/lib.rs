@@ -514,7 +514,29 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             // We follow the runtime, not the TS checker. Supertype-
             // chain assignability across different generic names
             // (`type Child<T> extends Parent<T>`) is a later phase.
-            na == nb && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| x == y)
+            //
+            // **P19.10** — invariance is checked by *bidirectional*
+            // `is_assignable_to` rather than raw `TypeId ==`. The
+            // two are equivalent for primitives and Named-vs-Named
+            // (the only widening rule is `int <: float`, which is
+            // not symmetric, so primitives still test as distinct
+            // unless their `TypeId`s are identical). The bidirectional
+            // form is what lets `Map<Enum{Target,...}, V>` and
+            // `Map<Named{Target}, V>` count as the same outer type
+            // — the Named<->Enum identity at lines 565-566 returns
+            // `true` in both directions, so arg-equality recovers.
+            // Without this, two paths that lower the same enum-typed
+            // arg differently (analyzer's `lower_type_ref` produces
+            // `Enum{...}`, the validation pass's `mint_type_shape`
+            // produces `Named{...}`) would diverge in the containing
+            // `Generic` and surface false-positive
+            // "value of `Map<Target, V>` not assignable to parameter
+            // `_: Map<Target, V>`" diagnostics.
+            na == nb
+                && aa.len() == ab.len()
+                && aa.iter().zip(ab).all(|(x, y)| {
+                    *x == *y || (is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x))
+                })
         }
         // P7.5 anonymous structural compat: a value of `{a: A, b: B}`
         // is assignable to `{a: A}` (width subtyping — source may have

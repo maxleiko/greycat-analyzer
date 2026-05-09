@@ -143,6 +143,16 @@ pub struct ProjectIndex {
     /// `QualifiedStatic` value-position typing recognise
     /// `other_module::Foo::a` as the enum `Foo` (not `any`).
     pub enum_types: HashMap<Symbol, TypeId>,
+    /// **P19.10** — pre-lowered top-level `var` declared types,
+    /// keyed by var name. First-decl-wins (same collision rule as
+    /// the rest of the per-name indexes). Built by
+    /// `ProjectAnalysis::stage_lower_signatures`. Lets the analyzer
+    /// type a bare cross-module reference (`Definition::ProjectDecl`
+    /// pointing at a `Decl::Var`) inline at body-walk time —
+    /// without this, `for (k, v in foreign_groups)` over a
+    /// `nodeIndex<String, node<Group>>` declared in another module
+    /// would type the iterable as `type` and bind `v` to `any`.
+    pub var_types: HashMap<Symbol, TypeId>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -313,6 +323,13 @@ impl ProjectIndex {
         self.symbols
             .lookup(name)
             .and_then(|s| self.enum_types.get(&s))
+            .copied()
+    }
+    /// **P19.10** — `&str` lookup of a top-level var's declared type.
+    pub fn var_type_for(&self, name: &str) -> Option<TypeId> {
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.var_types.get(&s))
             .copied()
     }
     pub fn native_for(&self, name: &str) -> Option<&NativeSignature> {

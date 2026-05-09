@@ -978,6 +978,18 @@ impl<'a> Cx<'a> {
                     self.arena.generic_param(name.clone(), owner)
                 } else if let Some(id) = self.out.registry.lookup(&name) {
                     id
+                } else if let Some(enum_id) = self.index.enum_type_for(&name) {
+                    // P19.10 — canonical enum TypeId from the
+                    // project signature index. Same reason as
+                    // `lower_type_ref_project`: a cross-module enum
+                    // ref like `TimeZone` must lower to the
+                    // `TypeKind::Enum { ... }` that
+                    // `lower_module_signatures` minted in the shared
+                    // arena, so `Expr::Static`'s enum-variant arm
+                    // (and `arena.is_assignable_to` exact-match)
+                    // recognise it as the same type as the foreign
+                    // declaration site.
+                    enum_id
                 } else if self.index.has_name(&name) {
                     // P11.5: name is known to the project but not to
                     // this module's registry — i.e. a type declared
@@ -1735,9 +1747,18 @@ impl<'a> Cx<'a> {
                 },
                 Some(Definition::ProjectDecl { .. }) => {
                     // P23 — cross-module bare ident value typing via
-                    // the project signatures index.
+                    // the project signatures index. **P19.10** —
+                    // top-level vars get their declared type from
+                    // `var_types` (lowered in S7-S11). Without this,
+                    // `var groups: nodeIndex<String, node<Group>>`
+                    // referenced from another module would fall
+                    // through to `index.has_name` (vars are in
+                    // `values`) and type as `type`, breaking
+                    // for-in iteration over the foreign var.
                     let name = self.ident_text(idx);
-                    if self.index.contains_fn_signature(name) {
+                    if let Some(var_ty) = self.index.var_type_for(name) {
+                        var_ty
+                    } else if self.index.contains_fn_signature(name) {
                         self.arena.named("function")
                     } else if self.index.contains_type_member(name) || self.index.has_name(name) {
                         self.arena.named("type")
