@@ -1515,7 +1515,43 @@ impl<'a> Cx<'a> {
                 op, left, right, ..
             }) => {
                 let lt = self.visit_expr(left);
-                let rt = self.visit_expr(right);
+                // P13.2-followup — short-circuit operands narrow the
+                // *other* operand, not just the enclosing `if`. In
+                // `x != null && f(x)`, the right side only runs when
+                // the left held, so `f(x)` should see `x` non-null.
+                // Mirrored for `||`: right only runs when left failed,
+                // so `else_non_null` applies. Same `derive_cond_narrows`
+                // engine the if-condition path uses, just scoped to a
+                // single operand visit.
+                let rt = match op {
+                    BinOp::And | BinOp::Or => {
+                        let CondNarrows {
+                            then_non_null,
+                            else_non_null,
+                            then_typed,
+                        } = self.derive_cond_narrows(left);
+                        let (non_null, typed) = match op {
+                            BinOp::And => (then_non_null, then_typed),
+                            BinOp::Or => (else_non_null, Vec::new()),
+                            _ => unreachable!(),
+                        };
+                        self.push_narrow();
+                        for ident in &non_null {
+                            if let Some(cur) = self.lookup_def_type(*ident) {
+                                let stripped = self.strip_nullable(cur);
+                                self.write_narrow(*ident, stripped);
+                            }
+                        }
+                        for (ident, ty_ref) in &typed {
+                            let ty = self.lower_type_ref(*ty_ref);
+                            self.write_narrow(*ident, ty);
+                        }
+                        let rt = self.visit_expr(right);
+                        self.pop_narrow();
+                        rt
+                    }
+                    _ => self.visit_expr(right),
+                };
                 self.infer_binary(op, lt, rt)
             }
             Expr::Unary(UnaryExpr { op, operand, .. }) => {
@@ -1910,6 +1946,50 @@ fn f(x: int?, y: int?) {
                 .iter()
                 .any(|d| d.message.contains("not assignable")),
             "expected no nullability error in conjunctive then-branch, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn conjunctive_operand_narrows_inside_and() {
+        // P13.2-followup: `if (x != null && f(x))` — the second operand
+        // of `&&` runs only when the first held, so `f(x)` should see
+        // `x` narrowed to non-null. Without the followup the analyzer
+        // emitted `value of type \`int?\` is not assignable to parameter
+        // \`v: int\`` on the call inside the conjunction.
+        let src = r#"
+fn use_int(v: int): bool { return true; }
+fn f(x: int?) {
+    if (x != null && use_int(x)) {}
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error inside the && right operand, got: {:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn disjunctive_operand_narrows_inside_or() {
+        // P13.2-followup: `if (x == null || f(x))` — the second operand
+        // of `||` runs only when the first failed (i.e. `x` is non-null
+        // there). Mirror of the && case.
+        let src = r#"
+fn use_int(v: int): bool { return true; }
+fn f(x: int?) {
+    if (x == null || use_int(x)) {}
+}
+"#;
+        let r = analyze_src(src);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not assignable")),
+            "expected no nullability error inside the || right operand, got: {:?}",
             r.diagnostics
         );
     }
