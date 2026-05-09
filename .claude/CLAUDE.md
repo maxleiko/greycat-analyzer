@@ -86,6 +86,30 @@ Counter-examples (do not repeat):
 - Assuming typed-suffix literals require a leading `_` — they do not. `42time`, `42_time`, `1.79e+308_f` are all valid; the leading `_` is a formatter convention, not a grammar requirement.
 - Using `token.immediate` on `number_suffix` to fix the static-init parse: shifted the lexer balance and made `e` win over scientific-notation `"e"` in `1e3`. Lex-level changes here need to preserve the existing scientific / suffix tie-break.
 
+## Analysis stages — fix the source, not the symptom
+
+**Hard rule:** when a typing / inference / member-resolution diagnostic is wrong, fix it in the stage that *originates* the type, not by post-patching the result downstream.
+
+The analysis pipeline is layered: S1 lower → S2-S6 module-local prep → S7-S11 cross-module signature lowering → S12 body walker → post-S12 cross-module passes → `validate_type_relations`. Each stage builds on what earlier stages settled. A symptom in `validate_type_relations` (e.g. `T?` not assignable to `T`) is almost always a hint that an earlier stage failed to propagate a narrow / element-type / generic-arg / receiver-type that it should have known about.
+
+The temptation, especially under time pressure, is to add a "fix-up" pass that walks the diagnostic set and silences the cases that look like false positives. **That is monkey-patching.** It hides the real defect (an analysis stage not pulling its weight), grows complexity, and the next fix will need a fix-up of the fix-up. Symptoms it leaks:
+
+- a new pass with no clear stage number ("post-S12 cleanup", "pass 3.5") whose only job is to undo earlier diagnostics.
+- a special-case in `validate_type_relations` that swallows specific shapes ("if both sides Generic{name=Map}, allow…").
+- a `if expr_id in suppressed_set` early-return whose membership is decided by reading the AST again.
+- an `is_assignable_to` rule that asymmetrically allows X→Y because some downstream call expected it; if the runtime rejects the same shape, it's the wrong fix.
+
+When you see a wrong diagnostic, **first** ask: "which stage was supposed to know this, and why didn't it?" Then fix that stage. Examples of correct fixes from the recent ROADMAP work:
+
+- `for-in` element typing wasn't reaching the body — bind the iterator params' `def_types` in the `Stmt::ForIn` arm of the body walker (P18.x), not by special-casing the diagnostic in `validate_type_relations`.
+- C-style `for (var i = 0; …)` loop var was untyped inside the condition / body — bind `init_name` to declared-or-inferred type at the top of `Stmt::For` (P19.14), don't post-fix.
+- `var x = nodeFn(); if (x == null) { x = bar(); } use(x);` — `x` should be non-null after the if. The fix lives in the if-handler's narrow-frame join (P19.16) — *that* is the analysis stage responsible for narrows. A `validate_type_relations`-side suppression list would be monkey-patching.
+- post-S12 cross-module passes (`stage_cross_module_post_passes`) ARE legitimate when they fold in *foreign* information that S12 cannot know module-locally (e.g. resolving a Project-fallback ident's foreign decl). They are not legitimate when they re-walk the same module to second-guess what S12 already typed.
+
+If you genuinely cannot find the right stage and need a temporary monkey-patch, leave a `// FIXME(monkey-patch): <stage that should own this>` comment AND open a ROADMAP entry for the proper fix. Do not let "temporary" survive a release.
+
+A good gut-check: if your fix is in a *later* stage than where the type was introduced, justify the layering. The fix probably belongs earlier.
+
 ## Common commands
 
 ```sh

@@ -321,6 +321,7 @@ pub fn analyze_with_index_into(
         arena,
         index,
         narrows: Vec::new(),
+        member_narrows: Vec::new(),
         chain_member_ifs: HashSet::new(),
         generics_in_scope: Vec::new(),
         this_stack: Vec::new(),
@@ -415,6 +416,14 @@ struct CondNarrows {
     else_non_null: Vec<Idx<Ident>>,
     /// `(binding, type)` pairs from `x is T` — narrow x to T in then.
     then_typed: Vec<(Idx<Ident>, Idx<TypeRef>)>,
+    /// **P19.16** — non-null narrows for member-access *paths*
+    /// produced by `foo.bar != null` style guards. Same semantics as
+    /// `then_non_null` / `else_non_null`, just keyed by a string path
+    /// rather than an ident handle. The path is built from
+    /// `Cx::member_path` and only shapes that root in an Ident /
+    /// `this` literal participate.
+    then_member_non_null: Vec<String>,
+    else_member_non_null: Vec<String>,
 }
 
 /// One arm in an enum-equality chain (P6.6).
@@ -470,6 +479,17 @@ struct Cx<'a> {
     /// narrowing introduced inside a block stays alive for the rest
     /// of that block but doesn't leak to siblings.
     narrows: Vec<HashMap<Idx<Ident>, TypeId>>,
+    /// **P19.16** — parallel narrow stack keyed by member-access
+    /// *path* (e.g. `"this.matchingNormalisation"`,
+    /// `"foo.bar.baz"`). A path's presence in any frame means the
+    /// member access at that path is *guaranteed non-null* in the
+    /// current scope. Frames are pushed / popped in lockstep with
+    /// `narrows`. Lets `if (foo.bar != null) { use(foo.bar); }`
+    /// narrow the second `foo.bar` to its non-null form, mirroring
+    /// the ident-level narrow flow but across structural member
+    /// chains. Best-effort — `foo[i].bar` or `getThing().bar` have
+    /// no stable path and skip narrowing.
+    member_narrows: Vec<HashSet<String>>,
     /// `Stmt::If` ids already accounted for as nested members of an
     /// enclosing exhaustiveness chain (P6.6). Suppresses duplicate
     /// "non-exhaustive" diagnostics on inner `else if` arms.
@@ -522,14 +542,37 @@ impl<'a> Cx<'a> {
 
     fn push_narrow(&mut self) {
         self.narrows.push(HashMap::new());
+        self.member_narrows.push(HashSet::new());
     }
     fn pop_narrow(&mut self) {
         self.narrows.pop();
+        self.member_narrows.pop();
     }
     fn write_narrow(&mut self, name: Idx<Ident>, ty: TypeId) {
         if let Some(top) = self.narrows.last_mut() {
             top.insert(name, ty);
         }
+    }
+    /// **P19.16** — record `path` as guaranteed non-null in the current
+    /// scope. Subsequent `Expr::Member` evaluations at the same path
+    /// strip the result's nullable bit.
+    fn write_member_non_null(&mut self, path: String) {
+        if let Some(top) = self.member_narrows.last_mut() {
+            top.insert(path);
+        }
+    }
+    /// Drop any non-null narrow recorded for `path`. Call when the
+    /// path is reassigned to a value whose nullability is unknown,
+    /// so a stale narrow doesn't outlive the assignment.
+    fn drop_member_non_null(&mut self, path: &str) {
+        for frame in self.member_narrows.iter_mut().rev() {
+            frame.remove(path);
+        }
+    }
+    /// `true` iff `path` is guaranteed non-null in the current scope
+    /// (any frame on the member-narrow stack contains it).
+    fn member_path_is_non_null(&self, path: &str) -> bool {
+        self.member_narrows.iter().any(|f| f.contains(path))
     }
     /// Innermost-first lookup of a binding ident's current type:
     /// narrowing frames win over `def_types`, mirroring the way TS
@@ -542,6 +585,29 @@ impl<'a> Cx<'a> {
         }
         self.out.def_types.get(&name).copied()
     }
+    /// **P19.16** — build a string path key for an expression that's a
+    /// chain of `Expr::Member` rooted at an `Expr::Ident` (the binding
+    /// name) or `Expr::Literal(This)` (yielding `"this"` as the root).
+    /// Returns `None` for any other shape (offsets, calls, parens, etc.)
+    /// so we don't accidentally narrow paths whose receiver is a fresh
+    /// computed value rather than a stable reference.
+    fn member_path(&self, expr_id: Idx<Expr>) -> Option<String> {
+        match &self.hir.exprs[expr_id] {
+            Expr::Ident(name_idx) => Some(self.ident_text(*name_idx).to_string()),
+            Expr::Literal(LiteralExpr {
+                kind: LiteralKind::This,
+                ..
+            }) => Some("this".to_string()),
+            Expr::Member(MemberExpr {
+                receiver, property, ..
+            }) => {
+                let recv_path = self.member_path(*receiver)?;
+                let prop = self.ident_text(*property);
+                Some(format!("{recv_path}.{prop}"))
+            }
+            _ => None,
+        }
+    }
     fn strip_nullable(&mut self, ty: TypeId) -> TypeId {
         let t = self.arena.get(ty);
         if !t.nullable {
@@ -550,6 +616,38 @@ impl<'a> Cx<'a> {
         let mut t = t.clone();
         t.nullable = false;
         self.arena.alloc(t)
+    }
+
+    /// **P19.16** — when an assignment's LHS is an `Ident` resolving
+    /// to a Param/Local, narrow that binding to the RHS's type for
+    /// the rest of the enclosing block. The `Stmt::If` post-pass
+    /// then lifts narrows that hold along every path through the if.
+    /// When the LHS is a member-access path (e.g.
+    /// `this.matchingNormalisation = ...`), record / clear the
+    /// member-narrow for that path based on the RHS's nullability.
+    /// Other LHS shapes (offsets, calls, etc.) don't have a stable
+    /// identity and silently no-op.
+    fn record_assign_narrow(&mut self, target: Idx<Expr>, value_ty: TypeId) {
+        if let Expr::Ident(name_idx) = &self.hir.exprs[target] {
+            if let Some(Definition::Param(def) | Definition::Local(def)) =
+                self.res.lookup(*name_idx)
+            {
+                self.write_narrow(def, value_ty);
+            }
+            return;
+        }
+        if matches!(self.hir.exprs[target], Expr::Member(_))
+            && let Some(path) = self.member_path(target)
+        {
+            if self.arena.get(value_ty).nullable {
+                // RHS may be null → drop any prior non-null narrow
+                // so subsequent reads see the declared (nullable)
+                // type again.
+                self.drop_member_non_null(&path);
+            } else {
+                self.write_member_non_null(path);
+            }
+        }
     }
 
     /// P16.5 — when an `Expr::Arrow` receiver is a single-arg node-tag
@@ -1412,9 +1510,14 @@ impl<'a> Cx<'a> {
                 self.out.def_types.insert(name, var_ty);
             }
             Stmt::Assign(AssignStmt { target, value, .. }) => {
+                // Lowering currently produces `=` as `Expr::Binary`
+                // wrapped in `Stmt::Expr`, so this arm is effectively
+                // dead — kept for exhaustiveness and any future
+                // grammar shape that may revive it. Narrow logic
+                // lives in `Expr::Binary` (op = "=").
                 let _ = self.visit_expr(target);
-                let _ = self.visit_expr(value);
-                // Diagnostic deferred to validate_type_relations.
+                let value_ty = self.visit_expr(value);
+                self.record_assign_narrow(target, value_ty);
             }
             Stmt::If(IfStmt {
                 condition,
@@ -1433,6 +1536,8 @@ impl<'a> Cx<'a> {
                     then_non_null,
                     else_non_null,
                     then_typed,
+                    then_member_non_null,
+                    else_member_non_null,
                 } = self.derive_cond_narrows(condition);
 
                 self.push_narrow();
@@ -1446,24 +1551,58 @@ impl<'a> Cx<'a> {
                     let ty = self.lower_type_ref(*ty_ref);
                     self.write_narrow(*ident, ty);
                 }
-                self.visit_block(&then_branch, return_ty);
+                for path in &then_member_non_null {
+                    self.write_member_non_null(path.clone());
+                }
+                // **P19.16** — inline the then-branch's stmts (instead
+                // of `visit_block`) so the narrow frame we just pushed
+                // captures any assignments inside the branch. The
+                // post-if join then sees those narrows. `visit_block`
+                // would push+pop its own frame, discarding them.
+                for s in &then_branch.stmts {
+                    self.visit_stmt(*s, return_ty);
+                }
+                let then_branch_narrows: HashMap<Idx<Ident>, TypeId> =
+                    self.narrows.last().cloned().unwrap_or_default();
+                let then_branch_member_narrows: HashSet<String> =
+                    self.member_narrows.last().cloned().unwrap_or_default();
                 self.pop_narrow();
                 let then_terminates = block_terminates(self.hir, &then_branch);
 
-                let else_terminates = if let Some(eb) = else_branch {
-                    self.push_narrow();
-                    for ident in &else_non_null {
-                        if let Some(cur) = self.lookup_def_type(*ident) {
-                            let stripped = self.strip_nullable(cur);
-                            self.write_narrow(*ident, stripped);
+                let (else_terminates, else_branch_narrows, else_branch_member_narrows) =
+                    if let Some(eb) = else_branch {
+                        self.push_narrow();
+                        for ident in &else_non_null {
+                            if let Some(cur) = self.lookup_def_type(*ident) {
+                                let stripped = self.strip_nullable(cur);
+                                self.write_narrow(*ident, stripped);
+                            }
                         }
-                    }
-                    self.visit_stmt(eb, return_ty);
-                    self.pop_narrow();
-                    stmt_terminates(self.hir, eb)
-                } else {
-                    false
-                };
+                        for path in &else_member_non_null {
+                            self.write_member_non_null(path.clone());
+                        }
+                        // P19.16 — same inline pattern for the else
+                        // branch. `eb` may be a Block or a nested If
+                        // (`else if`); for the Block case we inline,
+                        // for the If case we still call visit_stmt
+                        // (an If handles its own narrows internally).
+                        if let Stmt::Block(eb_block) = &self.hir.stmts[eb] {
+                            let eb_block = eb_block.clone();
+                            for s in &eb_block.stmts {
+                                self.visit_stmt(*s, return_ty);
+                            }
+                        } else {
+                            self.visit_stmt(eb, return_ty);
+                        }
+                        let captured: HashMap<Idx<Ident>, TypeId> =
+                            self.narrows.last().cloned().unwrap_or_default();
+                        let captured_members: HashSet<String> =
+                            self.member_narrows.last().cloned().unwrap_or_default();
+                        self.pop_narrow();
+                        (stmt_terminates(self.hir, eb), captured, captured_members)
+                    } else {
+                        (false, HashMap::new(), HashSet::new())
+                    };
 
                 // P13.1 CFG-aware narrowing — early return / throw etc.
                 // If the then-branch always exits the surrounding flow
@@ -1478,6 +1617,9 @@ impl<'a> Cx<'a> {
                             self.write_narrow(*ident, stripped);
                         }
                     }
+                    for path in &else_member_non_null {
+                        self.write_member_non_null(path.clone());
+                    }
                 }
                 if else_terminates {
                     for ident in &then_non_null {
@@ -1489,6 +1631,127 @@ impl<'a> Cx<'a> {
                     for (ident, ty_ref) in &then_typed {
                         let ty = self.lower_type_ref(*ty_ref);
                         self.write_narrow(*ident, ty);
+                    }
+                    for path in &then_member_non_null {
+                        self.write_member_non_null(path.clone());
+                    }
+                }
+
+                // **P19.16** — post-if assignment-narrow lift. For
+                // each binding that's nullable before the if and
+                // is non-null along *every* path through the if,
+                // narrow the post-if scope to its non-null form.
+                //
+                // Two source paths to consider:
+                // - then path: non-null iff (condition implied non-null
+                //   on then-side, captured in `then_non_null`) OR
+                //   (the then-branch assigned a non-null value to it,
+                //   captured in `then_branch_narrows`) OR
+                //   (the then-branch terminates, in which case this
+                //   path "doesn't reach" the post-if).
+                // - else path (or implicit fall-through when no else):
+                //   non-null iff (condition implied non-null on
+                //   else-side, captured in `else_non_null`) OR
+                //   (else-branch assigned a non-null value, captured
+                //   in `else_branch_narrows`) OR (else terminates).
+                //
+                // The cleanest representation: for each candidate
+                // binding, look up its post-then and post-else
+                // effective type and check if both are non-null.
+                if !then_terminates && !else_terminates {
+                    let mut candidates: HashSet<Idx<Ident>> = HashSet::new();
+                    candidates.extend(then_branch_narrows.keys().copied());
+                    candidates.extend(else_branch_narrows.keys().copied());
+                    candidates.extend(then_non_null.iter().copied());
+                    candidates.extend(else_non_null.iter().copied());
+                    for ident in candidates {
+                        let pre = match self.lookup_def_type(ident) {
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        if !self.arena.get(pre).nullable {
+                            // Already non-null — nothing to lift.
+                            continue;
+                        }
+                        // Effective type at the end of the then-path.
+                        let then_eff = then_branch_narrows
+                            .get(&ident)
+                            .copied()
+                            .or_else(|| {
+                                if then_non_null.contains(&ident) {
+                                    Some(self.strip_nullable(pre))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(pre);
+                        // Effective type at the end of the else-path
+                        // (or implicit fall-through).
+                        let else_eff = else_branch_narrows
+                            .get(&ident)
+                            .copied()
+                            .or_else(|| {
+                                if else_non_null.contains(&ident) {
+                                    Some(self.strip_nullable(pre))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(pre);
+                        if !self.arena.get(then_eff).nullable && !self.arena.get(else_eff).nullable
+                        {
+                            // Use the non-null stripping of pre to
+                            // keep the narrow uniform — both paths
+                            // agreed the binding is non-null, so the
+                            // value's exact type at each branch end
+                            // doesn't load-bear here.
+                            let stripped = self.strip_nullable(pre);
+                            self.write_narrow(ident, stripped);
+                        }
+                    }
+                    // **P19.16** — same lift for member-access paths.
+                    // A path is non-null post-if iff every reaching
+                    // branch made it non-null. Reaching condition:
+                    // (in then_branch_member_narrows OR
+                    //  in then_member_non_null) AND
+                    // (in else_branch_member_narrows OR
+                    //  in else_member_non_null).
+                    // No "no else" implicit fall-through case here:
+                    // we don't track which paths *were* non-null
+                    // outside the if, so we conservatively require
+                    // the else side to either exist and narrow, or
+                    // the condition's else_member side to imply it.
+                    let mut member_candidates: HashSet<&String> = HashSet::new();
+                    member_candidates.extend(then_branch_member_narrows.iter());
+                    member_candidates.extend(else_branch_member_narrows.iter());
+                    for path in &then_member_non_null {
+                        member_candidates.insert(path);
+                    }
+                    for path in &else_member_non_null {
+                        member_candidates.insert(path);
+                    }
+                    let to_lift: Vec<String> = member_candidates
+                        .iter()
+                        .filter(|&&p| {
+                            let then_ok = then_branch_member_narrows.contains(p)
+                                || then_member_non_null.contains(p);
+                            let else_ok = if else_branch.is_some() {
+                                else_branch_member_narrows.contains(p)
+                                    || else_member_non_null.contains(p)
+                            } else {
+                                // No else branch — fall-through is
+                                // the implicit else. Only path-side
+                                // narrows from the *condition's*
+                                // else side (`x == null`) carry
+                                // through the implicit fall-through.
+                                else_member_non_null.contains(p)
+                            };
+                            then_ok && else_ok
+                        })
+                        .map(|s| (*s).clone())
+                        .collect();
+                    for path in to_lift {
+                        self.write_member_non_null(path);
                     }
                 }
             }
@@ -1686,6 +1949,8 @@ impl<'a> Cx<'a> {
                     out.then_non_null.extend(r.then_non_null);
                     out.then_typed.extend(l.then_typed);
                     out.then_typed.extend(r.then_typed);
+                    out.then_member_non_null.extend(l.then_member_non_null);
+                    out.then_member_non_null.extend(r.then_member_non_null);
                     // Else: at least one failed — can't narrow confidently.
                 }
                 BinOp::Or => {
@@ -1694,22 +1959,34 @@ impl<'a> Cx<'a> {
                     // Else: NOT(A || B) ≡ !A AND !B — union else narrows.
                     out.else_non_null.extend(l.else_non_null);
                     out.else_non_null.extend(r.else_non_null);
+                    out.else_member_non_null.extend(l.else_member_non_null);
+                    out.else_member_non_null.extend(r.else_member_non_null);
                     // Then: at least one held — can't narrow either.
                 }
                 BinOp::Eq | BinOp::Neq => {
-                    let Some(name_idx) = self.ident_compared_to_null(*left, *right) else {
+                    // Ident-vs-null path (P6.4).
+                    if let Some(name_idx) = self.ident_compared_to_null(*left, *right)
+                        && let Some(Definition::Param(def) | Definition::Local(def)) =
+                            self.res.lookup(name_idx)
+                    {
+                        match *op {
+                            BinOp::Neq => out.then_non_null.push(def),
+                            BinOp::Eq => out.else_non_null.push(def),
+                            _ => {}
+                        }
                         return out;
-                    };
-                    let Some(def) = (match self.res.lookup(name_idx) {
-                        Some(Definition::Param(d)) | Some(Definition::Local(d)) => Some(d),
-                        _ => None,
-                    }) else {
-                        return out;
-                    };
-                    match *op {
-                        BinOp::Neq => out.then_non_null.push(def),
-                        BinOp::Eq => out.else_non_null.push(def),
-                        _ => {}
+                    }
+                    // **P19.16** — member-access path null comparison.
+                    // `foo.bar != null` / `null != foo.bar` (and `==`)
+                    // narrow the path on the matching side. Skips
+                    // shapes that don't root in an Ident / `this` —
+                    // those have no stable identity.
+                    if let Some(path) = self.member_compared_to_null(*left, *right) {
+                        match *op {
+                            BinOp::Neq => out.then_member_non_null.push(path),
+                            BinOp::Eq => out.else_member_non_null.push(path),
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
@@ -1890,6 +2167,31 @@ impl<'a> Cx<'a> {
         None
     }
 
+    /// **P19.16** — `foo.bar != null` / `null != foo.bar` (and `==`)
+    /// shape detection. Returns the member-access path string when
+    /// one side is an `Expr::Member` rooted at an Ident / `this` and
+    /// the other side is the null literal. Returns `None` for any
+    /// other shape (so e.g. `foo.bar == baz.qux` or `f().x != null`
+    /// don't participate).
+    fn member_compared_to_null(&self, l: Idx<Expr>, r: Idx<Expr>) -> Option<String> {
+        let is_null_lit = |id: Idx<Expr>| {
+            matches!(
+                &self.hir.exprs[id],
+                Expr::Literal(LiteralExpr {
+                    kind: LiteralKind::Null,
+                    ..
+                })
+            )
+        };
+        if matches!(self.hir.exprs[l], Expr::Member(_)) && is_null_lit(r) {
+            return self.member_path(l);
+        }
+        if matches!(self.hir.exprs[r], Expr::Member(_)) && is_null_lit(l) {
+            return self.member_path(r);
+        }
+        None
+    }
+
     fn expect_bool(&mut self, expr: Idx<Expr>, _label: &'static str) {
         // Type-only: populate `expr_types` so the validation pass can
         // re-check against settled types. The "must be `bool`"
@@ -1945,7 +2247,18 @@ impl<'a> Cx<'a> {
                         self.any()
                     }
                 }
-                Some(Definition::Generic(_)) | Some(Definition::Project) | None => self.any(),
+                Some(Definition::Project) => {
+                    // **P19.16** — runtime-exposed value-position
+                    // globals (e.g. `Infinity`, `NaN`) carry a fixed
+                    // type the runtime owns; without this lookup the
+                    // body walker would type them as `any` and float
+                    // dispatch downstream would fail.
+                    let name = self.ident_text(idx);
+                    self.index
+                        .runtime_global_for(name)
+                        .unwrap_or_else(|| self.any())
+                }
+                Some(Definition::Generic(_)) | None => self.any(),
             },
             Expr::Literal(LiteralExpr { kind, text, .. }) => match kind {
                 LiteralKind::Bool => self.primitive(Primitive::Bool),
@@ -2076,10 +2389,25 @@ impl<'a> Cx<'a> {
                 //                      suffix: lift unconditionally.
                 let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
                 let lift_post = post_optional;
-                if lift_pre || lift_post {
+                let result_ty = if lift_pre || lift_post {
                     self.arena.nullable(base_ty)
                 } else {
                     base_ty
+                };
+                // **P19.16** — strip the result's nullability when
+                // the member-access path was guarded non-null in
+                // an enclosing scope (`if (foo.bar != null) { ... }`).
+                // Only applies to `Expr::Member` — for `Expr::Arrow`
+                // the result lives on the deref'd type and the
+                // receiver's narrow doesn't carry directly.
+                if matches!(self.hir.exprs[expr_id], Expr::Member(_))
+                    && self.arena.get(result_ty).nullable
+                    && let Some(path) = self.member_path(expr_id)
+                    && self.member_path_is_non_null(&path)
+                {
+                    self.strip_nullable(result_ty)
+                } else {
+                    result_ty
                 }
             }
             Expr::Static(s) => {
@@ -2238,10 +2566,12 @@ impl<'a> Cx<'a> {
                             then_non_null,
                             else_non_null,
                             then_typed,
+                            then_member_non_null,
+                            else_member_non_null,
                         } = self.derive_cond_narrows(left);
-                        let (non_null, typed) = match op {
-                            BinOp::And => (then_non_null, then_typed),
-                            BinOp::Or => (else_non_null, Vec::new()),
+                        let (non_null, typed, member_non_null) = match op {
+                            BinOp::And => (then_non_null, then_typed, then_member_non_null),
+                            BinOp::Or => (else_non_null, Vec::new(), else_member_non_null),
                             _ => unreachable!(),
                         };
                         self.push_narrow();
@@ -2255,12 +2585,24 @@ impl<'a> Cx<'a> {
                             let ty = self.lower_type_ref(*ty_ref);
                             self.write_narrow(*ident, ty);
                         }
+                        for path in member_non_null {
+                            self.write_member_non_null(path);
+                        }
                         let rt = self.visit_expr(right);
                         self.pop_narrow();
                         rt
                     }
                     _ => self.visit_expr(right),
                 };
+                // **P19.16** — GreyCat's `=` parses as a binary
+                // expression (not a Stmt::Assign). When the LHS is
+                // a Param/Local Ident, narrow its binding to the
+                // RHS's type for the rest of the enclosing block.
+                // The post-if join logic then lifts narrows that
+                // hold along every path.
+                if matches!(op, BinOp::Other("=")) {
+                    self.record_assign_narrow(left, rt);
+                }
                 self.infer_binary(op, lt, rt)
             }
             Expr::Unary(UnaryExpr { op, operand, .. }) => {

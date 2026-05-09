@@ -533,18 +533,32 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             // "value of `Map<Target, V>` not assignable to parameter
             // `_: Map<Target, V>`" diagnostics.
             //
-            // **P19.14** — `any` in the *target* arg slot is a
-            // wildcard: `Foo<T>` assigns to `Foo<any>` covariantly
-            // (the usual "anything → any" rule applied per arg).
-            // Matches what `nodeTime<float>` parameters declared
-            // as `nodeTime<any>` accept at the runtime.
+            // **P19.14** — when *every* target arg is `any`
+            // (`Foo<X,Y>` → `Foo<any,any>`), the target acts as a
+            // raw-form wildcard and accepts. This matches the
+            // runtime, which accepts `Array<int>` → `Array<any>`,
+            // `Map<S,int>` → `Map<any,any>`, etc.
+            //
+            // Per-arg `any` widening (e.g. `Map<S,int>` →
+            // `Map<S,any>`) is NOT generally accepted by the
+            // runtime — for user-defined `Pair<A,B>` and the
+            // V-slot of `Map<K,V>` the runtime rejects partial
+            // wildcards. We follow the runtime conservatively
+            // and only accept when *all* target args are `any`.
+            // Otherwise, args are invariant (P12.2).
+            if na == nb
+                && aa.len() == ab.len()
+                && !ab.is_empty()
+                && ab
+                    .iter()
+                    .all(|y| matches!(arena.get(*y).kind, TypeKind::Any))
+            {
+                return true;
+            }
             na == nb
                 && aa.len() == ab.len()
                 && aa.iter().zip(ab).all(|(x, y)| {
                     if *x == *y {
-                        return true;
-                    }
-                    if matches!(arena.get(*y).kind, TypeKind::Any) {
                         return true;
                     }
                     is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)

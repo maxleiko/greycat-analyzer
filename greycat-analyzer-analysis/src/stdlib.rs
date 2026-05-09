@@ -153,6 +153,16 @@ pub struct ProjectIndex {
     /// `nodeIndex<String, node<Group>>` declared in another module
     /// would type the iterable as `type` and bind `v` to `any`.
     pub var_types: HashMap<Symbol, TypeId>,
+    /// **P19.16** — runtime-implemented value-position globals
+    /// (`Infinity`, `NaN`, `-Infinity`) and their declared type.
+    /// These have no `.gcl` declaration but the runtime exposes them
+    /// at well-known names. Seeded once in `seed_builtin_names` and
+    /// consumed by the analyzer's `Expr::Ident` arm when the
+    /// resolver returns `Definition::Project`. Without this entry
+    /// the names would resolve through `has_name` (we register them
+    /// in `values` too) but the body-walker would type them as
+    /// `any`, masking float/int dispatch downstream.
+    pub runtime_globals: HashMap<Symbol, TypeId>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -319,6 +329,16 @@ impl ProjectIndex {
         };
         seed_builtin_primitives(&mut idx.types);
         seed_builtin_names(&mut idx.types, &mut idx.registry, &mut idx.symbols);
+        // **P19.16** — runtime-exposed value-position globals
+        // (`Infinity`, `NaN`). Registered here (not in
+        // `seed_builtin_names`) because they're values, not types,
+        // and they need a typed entry the body walker can consume.
+        for (name, prim) in BUILTIN_RUNTIME_GLOBALS {
+            let sym = idx.symbols.intern(name);
+            let ty = idx.types.primitive(*prim);
+            idx.runtime_globals.insert(sym, ty);
+            idx.values.insert(sym);
+        }
         idx
     }
 
@@ -354,6 +374,15 @@ impl ProjectIndex {
         self.symbols
             .lookup(name)
             .and_then(|s| self.var_types.get(&s))
+            .copied()
+    }
+    /// **P19.16** — `&str` lookup of a runtime-exposed value
+    /// global's type (e.g. `Infinity` → `float`). See
+    /// [`BUILTIN_RUNTIME_GLOBALS`].
+    pub fn runtime_global_for(&self, name: &str) -> Option<TypeId> {
+        self.symbols
+            .lookup(name)
+            .and_then(|s| self.runtime_globals.get(&s))
             .copied()
     }
 
@@ -826,6 +855,14 @@ fn seed_builtin_names(
         symbols.intern(name);
     }
 }
+
+/// **P19.16** — runtime-exposed value-position globals. The runtime
+/// makes these names available at value position with a fixed type;
+/// they have no `.gcl` declaration, so the resolver/analyzer must seed
+/// them. `(name, primitive)` pairs — extend as new runtime globals are
+/// confirmed against `greycat run`.
+pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
+    &[("Infinity", Primitive::Float), ("NaN", Primitive::Float)];
 
 /// Type names whose declaration lives in the GreyCat runtime, not in
 /// any `.gcl` file. The resolver treats a hit against this list (via
