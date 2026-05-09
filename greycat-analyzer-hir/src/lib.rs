@@ -121,11 +121,11 @@ type Point {
             panic!()
         };
         let body = fnd.body.unwrap();
-        let Stmt::Block(stmts) = &hir.stmts[body] else {
+        let Stmt::Block(block) = &hir.stmts[body] else {
             panic!()
         };
-        assert_eq!(stmts.len(), 1);
-        let Stmt::Return(Some(ret)) = &hir.stmts[stmts[0]] else {
+        assert_eq!(block.stmts.len(), 1);
+        let Stmt::Return(Some(ret)) = &hir.stmts[block.stmts[0]] else {
             panic!()
         };
         let Expr::Binary(top) = &hir.exprs[*ret] else {

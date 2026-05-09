@@ -159,7 +159,7 @@ pub struct Pragma {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Expr(Idx<Expr>),
-    Block(Vec<Idx<Stmt>>),
+    Block(BlockStmt),
     Var(LocalVar),
     Assign(AssignStmt),
     If(IfStmt),
@@ -173,6 +173,18 @@ pub enum Stmt {
     Throw(Idx<Expr>),
     Try(TryStmt),
     At(AtStmt),
+}
+
+/// `{ … }` block. Carries its own `byte_range` (the curly-brace
+/// span as parsed) so capabilities can bracket cursor-in-body
+/// without falling back to "first stmt..last stmt" — the latter
+/// returns `0..0` for an empty body, which silently broke
+/// scope-aware completion inside `for { }` / `try { }` / empty
+/// branches.
+#[derive(Debug, Clone)]
+pub struct BlockStmt {
+    pub stmts: Vec<Idx<Stmt>>,
+    pub byte_range: Span,
 }
 
 /// Local `var name: T = init;` inside a function body.
@@ -205,21 +217,29 @@ pub enum AssignOp {
 #[derive(Debug, Clone)]
 pub struct IfStmt {
     pub condition: Idx<Expr>,
-    pub then_branch: Idx<Stmt>,         // Block
-    pub else_branch: Option<Idx<Stmt>>, // Block or another IfStmt
+    /// `if (cond) { … }` body. Always a block per grammar — held
+    /// inline (rather than as `Idx<Stmt>` pointing at a `Stmt::Block`)
+    /// so callers reach the curly-brace span without an extra arena
+    /// lookup, and so the type system enforces the always-a-block
+    /// invariant.
+    pub then_branch: BlockStmt,
+    /// `else` branch. Either an `else { … }` block or a nested `if`
+    /// for else-if chains, hence the `Idx<Stmt>` polymorphism — the
+    /// only field that's *not* always a block.
+    pub else_branch: Option<Idx<Stmt>>,
     pub byte_range: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct WhileStmt {
     pub condition: Idx<Expr>,
-    pub body: Idx<Stmt>,
+    pub body: BlockStmt,
     pub byte_range: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct DoWhileStmt {
-    pub body: Idx<Stmt>,
+    pub body: BlockStmt,
     pub condition: Idx<Expr>,
     pub byte_range: Span,
 }
@@ -231,7 +251,7 @@ pub struct ForStmt {
     pub init_value: Option<Idx<Expr>>,
     pub condition: Option<Idx<Expr>>,
     pub increment: Option<Idx<Expr>>,
-    pub body: Idx<Stmt>,
+    pub body: BlockStmt,
     pub byte_range: Span,
 }
 
@@ -242,7 +262,7 @@ pub struct ForInStmt {
     /// `(key, value)`.
     pub params: Vec<ForInParam>,
     pub range: Idx<Expr>,
-    pub body: Idx<Stmt>,
+    pub body: BlockStmt,
     pub byte_range: Span,
 }
 
@@ -254,16 +274,16 @@ pub struct ForInParam {
 
 #[derive(Debug, Clone)]
 pub struct TryStmt {
-    pub try_block: Idx<Stmt>,
+    pub try_block: BlockStmt,
     pub error_param: Option<Idx<Ident>>,
-    pub catch_block: Idx<Stmt>,
+    pub catch_block: BlockStmt,
     pub byte_range: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct AtStmt {
     pub expr: Idx<Expr>,
-    pub block: Idx<Stmt>,
+    pub block: BlockStmt,
     pub byte_range: Span,
 }
 

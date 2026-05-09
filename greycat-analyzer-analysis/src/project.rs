@@ -1546,6 +1546,20 @@ fn validate_module_type_relations(
         }
     }
 
+    fn validate_block(
+        hir: &greycat_analyzer_hir::Hir,
+        analysis: &crate::analyzer::AnalysisResult,
+        arena: &mut greycat_analyzer_types::TypeArena,
+        bool_t: greycat_analyzer_types::TypeId,
+        block: &greycat_analyzer_hir::types::BlockStmt,
+        return_ty: Option<greycat_analyzer_types::TypeId>,
+        diags: &mut Vec<SemanticDiagnostic>,
+    ) {
+        for s in &block.stmts {
+            validate_stmt(hir, analysis, arena, bool_t, *s, return_ty, diags);
+        }
+    }
+
     fn validate_stmt(
         hir: &greycat_analyzer_hir::Hir,
         analysis: &crate::analyzer::AnalysisResult,
@@ -1560,11 +1574,7 @@ fn validate_module_type_relations(
             WhileStmt,
         };
         match &hir.stmts[stmt_id] {
-            Stmt::Block(stmts) => {
-                for s in stmts {
-                    validate_stmt(hir, analysis, arena, bool_t, *s, return_ty, diags);
-                }
-            }
+            Stmt::Block(b) => validate_block(hir, analysis, arena, bool_t, b, return_ty, diags),
             Stmt::Var(LocalVar { ty, init, .. }) => {
                 if let (Some(decl_ref), Some(init_id)) = (ty, init)
                     && let Some(declared_ty) =
@@ -1617,7 +1627,7 @@ fn validate_module_type_relations(
                     hir,
                     diags,
                 );
-                validate_stmt(hir, analysis, arena, bool_t, *then_branch, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, then_branch, return_ty, diags);
                 if let Some(eb) = else_branch {
                     validate_stmt(hir, analysis, arena, bool_t, *eb, return_ty, diags);
                 }
@@ -1634,7 +1644,7 @@ fn validate_module_type_relations(
                     hir,
                     diags,
                 );
-                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, body, return_ty, diags);
             }
             Stmt::DoWhile(DoWhileStmt {
                 condition, body, ..
@@ -1648,7 +1658,7 @@ fn validate_module_type_relations(
                     hir,
                     diags,
                 );
-                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, body, return_ty, diags);
             }
             Stmt::For(ForStmt {
                 condition, body, ..
@@ -1656,21 +1666,21 @@ fn validate_module_type_relations(
                 if let Some(c) = condition {
                     check_bool(analysis, arena, *c, bool_t, "for condition", hir, diags);
                 }
-                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, body, return_ty, diags);
             }
             Stmt::ForIn(ForInStmt { body, .. }) => {
-                validate_stmt(hir, analysis, arena, bool_t, *body, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, body, return_ty, diags);
             }
             Stmt::Try(TryStmt {
                 try_block,
                 catch_block,
                 ..
             }) => {
-                validate_stmt(hir, analysis, arena, bool_t, *try_block, return_ty, diags);
-                validate_stmt(hir, analysis, arena, bool_t, *catch_block, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, try_block, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, catch_block, return_ty, diags);
             }
             Stmt::At(AtStmt { block, .. }) => {
-                validate_stmt(hir, analysis, arena, bool_t, *block, return_ty, diags);
+                validate_block(hir, analysis, arena, bool_t, block, return_ty, diags);
             }
             Stmt::Return(Some(v)) => {
                 if let Some(rt) = return_ty {

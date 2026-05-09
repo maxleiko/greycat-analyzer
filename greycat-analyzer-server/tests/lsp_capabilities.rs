@@ -1697,6 +1697,47 @@ fn completion_cross_module_decl_carries_signature_and_module_label() {
     );
 }
 
+/// Regression: completion inside an *empty* `for-in` body must surface
+/// the iterator binders (`i`, `theNode`). Pre-fix the body's
+/// byte_range was derived from "first stmt..last stmt" which collapsed
+/// to `0..0` for empty blocks, so the cursor never matched the body
+/// bracket and the binders were dropped.
+#[test]
+fn completion_in_empty_for_in_body_surfaces_iterator_params() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn caller(arr: Array<int>) {\n  for (i, theNode in arr) {\n    \n  }\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Line 2 col 4 — inside the empty body of the for-in.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 4),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"i"),
+        "for-in index binder should surface in empty body: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"theNode"),
+        "for-in value binder should surface in empty body: {labels:?}"
+    );
+}
+
 /// In-module locals surface their inferred type in
 /// `CompletionItem.detail` (so `var counter = 0; c|` shows `int`).
 #[test]

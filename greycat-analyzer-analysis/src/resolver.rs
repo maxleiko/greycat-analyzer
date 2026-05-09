@@ -333,16 +333,22 @@ fn visit_pragma(cx: &mut Cx, p: &Pragma) {
     }
 }
 
+/// Walk a `BlockStmt` body in its own scope. Body-bearing statements
+/// (`If::then_branch`, `While::body`, `Try::try_block`, …) hold the
+/// `BlockStmt` directly post-refactor — calling [`visit_stmt`] on
+/// `Idx<Stmt>` no longer works for those bodies.
+fn visit_block(cx: &mut Cx, block: &greycat_analyzer_hir::types::BlockStmt) {
+    cx.push_scope();
+    for s in &block.stmts {
+        visit_stmt(cx, *s);
+    }
+    cx.pop_scope();
+}
+
 fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
     let stmt = cx.hir.stmts[stmt_id].clone();
     match stmt {
-        Stmt::Block(stmts) => {
-            cx.push_scope();
-            for s in stmts {
-                visit_stmt(cx, s);
-            }
-            cx.pop_scope();
-        }
+        Stmt::Block(b) => visit_block(cx, &b),
         Stmt::Expr(e) => visit_expr(cx, e),
         Stmt::Var(LocalVar { name, ty, init, .. }) => {
             if let Some(ty) = ty {
@@ -365,7 +371,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             ..
         }) => {
             visit_expr(cx, condition);
-            visit_stmt(cx, then_branch);
+            visit_block(cx, &then_branch);
             if let Some(eb) = else_branch {
                 visit_stmt(cx, eb);
             }
@@ -374,12 +380,12 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             condition, body, ..
         }) => {
             visit_expr(cx, condition);
-            visit_stmt(cx, body);
+            visit_block(cx, &body);
         }
         Stmt::DoWhile(DoWhileStmt {
             body, condition, ..
         }) => {
-            visit_stmt(cx, body);
+            visit_block(cx, &body);
             visit_expr(cx, condition);
         }
         Stmt::For(ForStmt {
@@ -408,7 +414,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             if let Some(i) = increment {
                 visit_expr(cx, i);
             }
-            visit_stmt(cx, body);
+            visit_block(cx, &body);
             cx.pop_scope();
         }
         Stmt::ForIn(ForInStmt {
@@ -426,7 +432,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 let n = cx.ident_text(p.name).to_string();
                 cx.current_mut().insert(n, Definition::Local(p.name));
             }
-            visit_stmt(cx, body);
+            visit_block(cx, &body);
             cx.pop_scope();
         }
         Stmt::Return(value) => {
@@ -442,18 +448,18 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             catch_block,
             ..
         }) => {
-            visit_stmt(cx, try_block);
+            visit_block(cx, &try_block);
             cx.push_scope();
             if let Some(name) = error_param {
                 let n = cx.ident_text(name).to_string();
                 cx.current_mut().insert(n, Definition::Local(name));
             }
-            visit_stmt(cx, catch_block);
+            visit_block(cx, &catch_block);
             cx.pop_scope();
         }
         Stmt::At(AtStmt { expr, block, .. }) => {
             visit_expr(cx, expr);
-            visit_stmt(cx, block);
+            visit_block(cx, &block);
         }
     }
 }

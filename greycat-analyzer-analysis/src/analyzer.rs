@@ -33,7 +33,7 @@ use greycat_analyzer_hir::types::{
 };
 use greycat_analyzer_types::{
     GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_castable,
+    is_castable, is_node_tag,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -49,17 +49,27 @@ use crate::stdlib::ProjectIndex;
 fn stmt_terminates(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
     match &hir.stmts[stmt_id] {
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break | Stmt::Continue => true,
-        Stmt::Block(stmts) => stmts.last().is_some_and(|s| stmt_terminates(hir, *s)),
+        Stmt::Block(b) => block_terminates(hir, b),
         Stmt::If(IfStmt {
             then_branch,
             else_branch,
             ..
         }) => {
-            stmt_terminates(hir, *then_branch)
+            block_terminates(hir, then_branch)
                 && else_branch.is_some_and(|e| stmt_terminates(hir, e))
         }
         _ => false,
     }
+}
+
+/// `true` iff every reachable path through `block` always exits the
+/// surrounding flow (return / throw / break / continue). Mirrors
+/// [`stmt_terminates`]'s `Block` arm but takes a borrowed
+/// [`BlockStmt`] — body-bearing fields hold the block inline now,
+/// so going through `Idx<Stmt>` would require an extra arena round
+/// trip just to re-pattern-match.
+fn block_terminates(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -> bool {
+    block.stmts.last().is_some_and(|s| stmt_terminates(hir, *s))
 }
 
 /// P12.4 — classify a numeric literal's source text as `int` or
@@ -472,6 +482,27 @@ impl<'a> Cx<'a> {
         self.out.types.alloc(t)
     }
 
+    /// P16.5 — when an `Expr::Arrow` receiver is a single-arg node-tag
+    /// generic (`node<T>`, `nodeTime<T>`, `nodeList<T>`, `nodeGeo<T>`),
+    /// `n->field` resolves against the inner type's members rather
+    /// than the tag's own. Mirrors the runtime's `*n.field` semantics:
+    /// `->` is sugar for "deref then access", so members are searched
+    /// on the deref'd type, not on the tag. Tag-owned methods stay
+    /// reachable via the dot syntax (`n.resolve()`, `n.size()`) — the
+    /// `Expr::Member` path in the caller is unchanged.
+    /// Multi-arg shapes (`nodeIndex<K, V>`) don't match — there's no
+    /// canonical `inner` to redirect to. Returns `None` for non-tag
+    /// receivers so the caller resolves against the receiver itself.
+    fn arrow_deref_receiver(&self, recv_ty: TypeId) -> Option<TypeId> {
+        let ty = self.out.types.get(recv_ty);
+        match &ty.kind {
+            TypeKind::Generic { name, args } if is_node_tag(name) && args.len() == 1 => {
+                Some(args[0])
+            }
+            _ => None,
+        }
+    }
+
     /// P6.3 member resolution: bind the property ident in `a.b` /
     /// `a->b` to the matching `TypeAttr` or method `Decl` whenever the
     /// receiver's type names a `TypeDecl` declared in this module.
@@ -803,12 +834,28 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Walk a `BlockStmt` body in its own narrow-frame. Body-bearing
+    /// statements (`If::then_branch`, `While::body`, `Try::try_block`,
+    /// …) hold their block inline post-refactor, so we can't go
+    /// through `visit_stmt(Idx<Stmt>)` for them.
+    fn visit_block(
+        &mut self,
+        block: &greycat_analyzer_hir::types::BlockStmt,
+        return_ty: Option<TypeId>,
+    ) {
+        self.push_narrow();
+        for s in &block.stmts {
+            self.visit_stmt(*s, return_ty);
+        }
+        self.pop_narrow();
+    }
+
     fn visit_stmt(&mut self, stmt_id: Idx<Stmt>, return_ty: Option<TypeId>) {
         let stmt = self.hir.stmts[stmt_id].clone();
         match stmt {
-            Stmt::Block(stmts) => {
+            Stmt::Block(b) => {
                 self.push_narrow();
-                for s in stmts {
+                for s in b.stmts {
                     self.visit_stmt(s, return_ty);
                 }
                 self.pop_narrow();
@@ -859,9 +906,9 @@ impl<'a> Cx<'a> {
                     let ty = self.lower_type_ref(*ty_ref);
                     self.write_narrow(*ident, ty);
                 }
-                self.visit_stmt(then_branch, return_ty);
+                self.visit_block(&then_branch, return_ty);
                 self.pop_narrow();
-                let then_terminates = stmt_terminates(self.hir, then_branch);
+                let then_terminates = block_terminates(self.hir, &then_branch);
 
                 let else_terminates = if let Some(eb) = else_branch {
                     self.push_narrow();
@@ -909,12 +956,12 @@ impl<'a> Cx<'a> {
                 condition, body, ..
             }) => {
                 self.expect_bool(condition, "while condition");
-                self.visit_stmt(body, return_ty);
+                self.visit_block(&body, return_ty);
             }
             Stmt::DoWhile(DoWhileStmt {
                 condition, body, ..
             }) => {
-                self.visit_stmt(body, return_ty);
+                self.visit_block(&body, return_ty);
                 self.expect_bool(condition, "do-while condition");
             }
             Stmt::For(ForStmt {
@@ -933,7 +980,7 @@ impl<'a> Cx<'a> {
                 if let Some(i) = increment {
                     let _ = self.visit_expr(i);
                 }
-                self.visit_stmt(body, return_ty);
+                self.visit_block(&body, return_ty);
             }
             Stmt::ForIn(ForInStmt {
                 params,
@@ -977,7 +1024,7 @@ impl<'a> Cx<'a> {
                     };
                     self.out.def_types.insert(p.name, bound_ty);
                 }
-                self.visit_stmt(body, return_ty);
+                self.visit_block(&body, return_ty);
             }
             Stmt::Return(value) => {
                 if let Some(v) = value {
@@ -996,12 +1043,12 @@ impl<'a> Cx<'a> {
                 catch_block,
                 ..
             }) => {
-                self.visit_stmt(try_block, return_ty);
-                self.visit_stmt(catch_block, return_ty);
+                self.visit_block(&try_block, return_ty);
+                self.visit_block(&catch_block, return_ty);
             }
             Stmt::At(AtStmt { expr, block, .. }) => {
                 let _ = self.visit_expr(expr);
-                self.visit_stmt(block, return_ty);
+                self.visit_block(&block, return_ty);
             }
         }
     }
@@ -1318,7 +1365,20 @@ impl<'a> Cx<'a> {
                 receiver, property, ..
             }) => {
                 let recv_ty = self.visit_expr(receiver);
-                self.resolve_member(recv_ty, property);
+                // P16.5 — `n->field` where `n: node<T>` (or any node-tag
+                // shape: `nodeTime<T>`, `nodeIndex<K, V>`, …) resolves
+                // `field` against the inner type's attrs / methods, not
+                // against the tag's. The auto-deref only applies on
+                // `Expr::Arrow` so `n.method()` still binds to `node`'s
+                // own method list (the `.` → `->` rewrite advice from
+                // completion is what nudges users toward the right
+                // shape; the analyzer doesn't silently auto-deref `.`).
+                let resolution_ty = if matches!(self.hir.exprs[expr_id], Expr::Arrow(_)) {
+                    self.arrow_deref_receiver(recv_ty).unwrap_or(recv_ty)
+                } else {
+                    recv_ty
+                };
+                self.resolve_member(resolution_ty, property);
                 // P16.1 — once `resolve_member` has bound the property
                 // (intra-module case populates `member_uses`), the
                 // expression's own inferred type is whatever the bound

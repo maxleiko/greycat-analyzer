@@ -19,7 +19,7 @@ fn first_var_init_kind(src: &str, idx: usize) -> LiteralKind {
         .expect("fn lowered");
     let body = hir.stmts[fn_decl.body.expect("body")].clone();
     let stmts = match body {
-        Stmt::Block(s) => s,
+        Stmt::Block(b) => b.stmts,
         _ => panic!("expected block body"),
     };
     let stmt = &hir.stmts[stmts[idx]];

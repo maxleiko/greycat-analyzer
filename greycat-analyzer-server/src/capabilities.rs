@@ -1817,16 +1817,32 @@ fn inferred_fn_return(
     body: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
 ) -> Option<greycat_analyzer_types::TypeId> {
     use greycat_analyzer_hir::types::Stmt;
-    let stmts = match &hir.stmts[body] {
-        Stmt::Block(s) => s,
+    let block = match &hir.stmts[body] {
+        Stmt::Block(b) => b,
         _ => return None,
     };
-    for s in stmts.iter().rev() {
+    for s in block.stmts.iter().rev() {
         if let Stmt::Return(Some(e)) = &hir.stmts[*s] {
             return analysis.expr_types.get(e).copied();
         }
     }
     None
+}
+
+/// Same as [`emit_call_arg_hints`] but recurses into a `BlockStmt`
+/// directly, since body-bearing fields (`If::then_branch`, …) hold
+/// the block inline now.
+fn emit_call_arg_hints_block(
+    hir: &Hir,
+    resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+    want: (usize, usize),
+    text: &str,
+    out: &mut Vec<InlayHint>,
+) {
+    for s in &block.stmts {
+        emit_call_arg_hints(hir, resolutions, *s, want, text, out);
+    }
 }
 
 /// P13.7 — walk the body for `Expr::Call` and emit one
@@ -1842,11 +1858,7 @@ fn emit_call_arg_hints(
     use greycat_analyzer_hir::types::Stmt;
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(stmts) => {
-            for s in stmts {
-                emit_call_arg_hints(hir, resolutions, *s, want, text, out);
-            }
-        }
+        Stmt::Block(b) => emit_call_arg_hints_block(hir, resolutions, b, want, text, out),
         Stmt::Expr(e)
         | Stmt::Return(Some(e))
         | Stmt::Throw(e)
@@ -1859,31 +1871,31 @@ fn emit_call_arg_hints(
         }
         Stmt::If(i) => {
             emit_call_arg_hints_expr(hir, resolutions, i.condition, want, text, out);
-            emit_call_arg_hints(hir, resolutions, i.then_branch, want, text, out);
+            emit_call_arg_hints_block(hir, resolutions, &i.then_branch, want, text, out);
             if let Some(eb) = i.else_branch {
                 emit_call_arg_hints(hir, resolutions, eb, want, text, out);
             }
         }
         Stmt::While(w) => {
             emit_call_arg_hints_expr(hir, resolutions, w.condition, want, text, out);
-            emit_call_arg_hints(hir, resolutions, w.body, want, text, out);
+            emit_call_arg_hints_block(hir, resolutions, &w.body, want, text, out);
         }
         Stmt::DoWhile(w) => {
-            emit_call_arg_hints(hir, resolutions, w.body, want, text, out);
+            emit_call_arg_hints_block(hir, resolutions, &w.body, want, text, out);
             emit_call_arg_hints_expr(hir, resolutions, w.condition, want, text, out);
         }
-        Stmt::For(f) => emit_call_arg_hints(hir, resolutions, f.body, want, text, out),
+        Stmt::For(f) => emit_call_arg_hints_block(hir, resolutions, &f.body, want, text, out),
         Stmt::ForIn(f) => {
             emit_call_arg_hints_expr(hir, resolutions, f.range, want, text, out);
-            emit_call_arg_hints(hir, resolutions, f.body, want, text, out);
+            emit_call_arg_hints_block(hir, resolutions, &f.body, want, text, out);
         }
         Stmt::Try(t) => {
-            emit_call_arg_hints(hir, resolutions, t.try_block, want, text, out);
-            emit_call_arg_hints(hir, resolutions, t.catch_block, want, text, out);
+            emit_call_arg_hints_block(hir, resolutions, &t.try_block, want, text, out);
+            emit_call_arg_hints_block(hir, resolutions, &t.catch_block, want, text, out);
         }
         Stmt::At(a) => {
             emit_call_arg_hints_expr(hir, resolutions, a.expr, want, text, out);
-            emit_call_arg_hints(hir, resolutions, a.block, want, text, out);
+            emit_call_arg_hints_block(hir, resolutions, &a.block, want, text, out);
         }
         _ => {}
     }
@@ -1973,6 +1985,22 @@ fn emit_call_arg_hints_expr(
     }
 }
 
+/// Walk a `BlockStmt` recursively for var-hint emission. Body-bearing
+/// statements hold the block inline post-refactor so we can't go via
+/// `Idx<Stmt>` for them.
+fn emit_var_hints_block(
+    hir: &Hir,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+    want: (usize, usize),
+    text: &str,
+    out: &mut Vec<InlayHint>,
+) {
+    for s in &block.stmts {
+        emit_var_hints(hir, analysis, *s, want, text, out);
+    }
+}
+
 fn emit_var_hints(
     hir: &Hir,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
@@ -1984,11 +2012,7 @@ fn emit_var_hints(
     use greycat_analyzer_hir::types::Stmt;
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(stmts) => {
-            for s in stmts {
-                emit_var_hints(hir, analysis, *s, want, text, out);
-            }
-        }
+        Stmt::Block(b) => emit_var_hints_block(hir, analysis, b, want, text, out),
         Stmt::Var(v) if v.ty.is_none() && v.init.is_some() => {
             let r = &v.byte_range;
             if r.end < want.0 || r.start > want.1 {
@@ -2013,20 +2037,20 @@ fn emit_var_hints(
             });
         }
         Stmt::If(i) => {
-            emit_var_hints(hir, analysis, i.then_branch, want, text, out);
+            emit_var_hints_block(hir, analysis, &i.then_branch, want, text, out);
             if let Some(eb) = i.else_branch {
                 emit_var_hints(hir, analysis, eb, want, text, out);
             }
         }
-        Stmt::While(w) => emit_var_hints(hir, analysis, w.body, want, text, out),
-        Stmt::DoWhile(w) => emit_var_hints(hir, analysis, w.body, want, text, out),
-        Stmt::For(f) => emit_var_hints(hir, analysis, f.body, want, text, out),
-        Stmt::ForIn(f) => emit_var_hints(hir, analysis, f.body, want, text, out),
+        Stmt::While(w) => emit_var_hints_block(hir, analysis, &w.body, want, text, out),
+        Stmt::DoWhile(w) => emit_var_hints_block(hir, analysis, &w.body, want, text, out),
+        Stmt::For(f) => emit_var_hints_block(hir, analysis, &f.body, want, text, out),
+        Stmt::ForIn(f) => emit_var_hints_block(hir, analysis, &f.body, want, text, out),
         Stmt::Try(t) => {
-            emit_var_hints(hir, analysis, t.try_block, want, text, out);
-            emit_var_hints(hir, analysis, t.catch_block, want, text, out);
+            emit_var_hints_block(hir, analysis, &t.try_block, want, text, out);
+            emit_var_hints_block(hir, analysis, &t.catch_block, want, text, out);
         }
-        Stmt::At(a) => emit_var_hints(hir, analysis, a.block, want, text, out),
+        Stmt::At(a) => emit_var_hints_block(hir, analysis, &a.block, want, text, out),
         _ => {}
     }
 }
@@ -3245,6 +3269,44 @@ fn collect_fn_scope(
     }
 }
 
+fn cursor_in_block(block: &greycat_analyzer_hir::types::BlockStmt, cursor_byte: usize) -> bool {
+    block.byte_range.start <= cursor_byte && cursor_byte <= block.byte_range.end
+}
+
+/// Walk a `BlockStmt` collecting cursor-visible names. Pre-cursor
+/// `var` bindings surface; in-cursor stmts recurse. Replaces the
+/// `HS::Block` arm of `collect_stmt_scope` since body-bearing
+/// statements hold the block inline now and the byte-range bracket
+/// comes from the block's own `byte_range` field (which is non-empty
+/// even for `{ }` empty bodies — fixing the for-in scope-walker bug).
+fn collect_block_scope(
+    hir: &greycat_analyzer_hir::Hir,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+    cursor_byte: usize,
+    out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
+) {
+    use greycat_analyzer_hir::types::Stmt as HS;
+    if !(block.byte_range.start <= cursor_byte && cursor_byte <= block.byte_range.end) {
+        return;
+    }
+    for s in &block.stmts {
+        let r = stmt_byte_range(hir, *s);
+        if r.end <= cursor_byte {
+            if let HS::Var(lv) = &hir.stmts[*s] {
+                let n = hir.idents[lv.name].text.clone();
+                out.push((
+                    n,
+                    CompletionItemKind::VARIABLE,
+                    "b_",
+                    NameSource::Local(lv.name),
+                ));
+            }
+        } else if r.start <= cursor_byte && cursor_byte <= r.end {
+            collect_stmt_scope(hir, *s, cursor_byte, out);
+        }
+    }
+}
+
 fn collect_stmt_scope(
     hir: &greycat_analyzer_hir::Hir,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
@@ -3253,30 +3315,9 @@ fn collect_stmt_scope(
 ) {
     use greycat_analyzer_hir::types::Stmt as HS;
     match &hir.stmts[stmt_id] {
-        HS::Block(stmts) => {
-            for s in stmts {
-                let r = stmt_byte_range(hir, *s);
-                // Var bindings introduced *before* the cursor.
-                if r.end <= cursor_byte {
-                    if let HS::Var(lv) = &hir.stmts[*s] {
-                        let n = hir.idents[lv.name].text.clone();
-                        out.push((
-                            n,
-                            CompletionItemKind::VARIABLE,
-                            "b_",
-                            NameSource::Local(lv.name),
-                        ));
-                    }
-                } else if r.start <= cursor_byte && cursor_byte <= r.end {
-                    collect_stmt_scope(hir, *s, cursor_byte, out);
-                }
-            }
-        }
+        HS::Block(b) => collect_block_scope(hir, b, cursor_byte, out),
         HS::If(s) => {
-            let r = stmt_byte_range(hir, s.then_branch);
-            if r.start <= cursor_byte && cursor_byte <= r.end {
-                collect_stmt_scope(hir, s.then_branch, cursor_byte, out);
-            }
+            collect_block_scope(hir, &s.then_branch, cursor_byte, out);
             if let Some(eb) = s.else_branch {
                 let er = stmt_byte_range(hir, eb);
                 if er.start <= cursor_byte && cursor_byte <= er.end {
@@ -3284,55 +3325,35 @@ fn collect_stmt_scope(
                 }
             }
         }
-        HS::While(s) => {
-            let br = stmt_byte_range(hir, s.body);
-            if br.start <= cursor_byte && cursor_byte <= br.end {
-                collect_stmt_scope(hir, s.body, cursor_byte, out);
+        HS::While(s) => collect_block_scope(hir, &s.body, cursor_byte, out),
+        HS::DoWhile(s) => collect_block_scope(hir, &s.body, cursor_byte, out),
+        HS::For(s) if cursor_in_block(&s.body, cursor_byte) => {
+            if let Some(name_id) = s.init_name {
+                let n = hir.idents[name_id].text.clone();
+                out.push((
+                    n,
+                    CompletionItemKind::VARIABLE,
+                    "b_",
+                    NameSource::Local(name_id),
+                ));
             }
+            collect_block_scope(hir, &s.body, cursor_byte, out);
         }
-        HS::DoWhile(s) => {
-            let br = stmt_byte_range(hir, s.body);
-            if br.start <= cursor_byte && cursor_byte <= br.end {
-                collect_stmt_scope(hir, s.body, cursor_byte, out);
+        HS::ForIn(s) if cursor_in_block(&s.body, cursor_byte) => {
+            for p in &s.params {
+                let n = hir.idents[p.name].text.clone();
+                out.push((
+                    n,
+                    CompletionItemKind::VARIABLE,
+                    "b_",
+                    NameSource::Local(p.name),
+                ));
             }
-        }
-        HS::For(s) => {
-            let br = stmt_byte_range(hir, s.body);
-            if br.start <= cursor_byte && cursor_byte <= br.end {
-                if let Some(name_id) = s.init_name {
-                    let n = hir.idents[name_id].text.clone();
-                    out.push((
-                        n,
-                        CompletionItemKind::VARIABLE,
-                        "b_",
-                        NameSource::Local(name_id),
-                    ));
-                }
-                collect_stmt_scope(hir, s.body, cursor_byte, out);
-            }
-        }
-        HS::ForIn(s) => {
-            let br = stmt_byte_range(hir, s.body);
-            if br.start <= cursor_byte && cursor_byte <= br.end {
-                for p in &s.params {
-                    let n = hir.idents[p.name].text.clone();
-                    out.push((
-                        n,
-                        CompletionItemKind::VARIABLE,
-                        "b_",
-                        NameSource::Local(p.name),
-                    ));
-                }
-                collect_stmt_scope(hir, s.body, cursor_byte, out);
-            }
+            collect_block_scope(hir, &s.body, cursor_byte, out);
         }
         HS::Try(s) => {
-            let tr = stmt_byte_range(hir, s.try_block);
-            if tr.start <= cursor_byte && cursor_byte <= tr.end {
-                collect_stmt_scope(hir, s.try_block, cursor_byte, out);
-            }
-            let cr = stmt_byte_range(hir, s.catch_block);
-            if cr.start <= cursor_byte && cursor_byte <= cr.end {
+            collect_block_scope(hir, &s.try_block, cursor_byte, out);
+            if cursor_in_block(&s.catch_block, cursor_byte) {
                 if let Some(err_id) = s.error_param {
                     let n = hir.idents[err_id].text.clone();
                     out.push((
@@ -3342,15 +3363,10 @@ fn collect_stmt_scope(
                         NameSource::Local(err_id),
                     ));
                 }
-                collect_stmt_scope(hir, s.catch_block, cursor_byte, out);
+                collect_block_scope(hir, &s.catch_block, cursor_byte, out);
             }
         }
-        HS::At(s) => {
-            let br = stmt_byte_range(hir, s.block);
-            if br.start <= cursor_byte && cursor_byte <= br.end {
-                collect_stmt_scope(hir, s.block, cursor_byte, out);
-            }
-        }
+        HS::At(s) => collect_block_scope(hir, &s.block, cursor_byte, out),
         _ => {}
     }
 }
@@ -3361,15 +3377,7 @@ fn stmt_byte_range(
 ) -> std::ops::Range<usize> {
     use greycat_analyzer_hir::types::Stmt as HS;
     match &hir.stmts[stmt_id] {
-        HS::Block(stmts) => {
-            if let (Some(first), Some(last)) = (stmts.first(), stmts.last()) {
-                let f = stmt_byte_range(hir, *first);
-                let l = stmt_byte_range(hir, *last);
-                f.start..l.end
-            } else {
-                0..0
-            }
-        }
+        HS::Block(b) => b.byte_range.clone(),
         HS::Var(s) => s.byte_range.clone(),
         HS::Assign(s) => s.byte_range.clone(),
         HS::If(s) => s.byte_range.clone(),
@@ -3584,6 +3592,35 @@ fn lookup_name_type_in_fn(
     None
 }
 
+fn lookup_name_type_in_block(
+    hir: &greycat_analyzer_hir::Hir,
+    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    cursor_byte: usize,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+    name: &str,
+) -> Option<greycat_analyzer_types::TypeId> {
+    use greycat_analyzer_hir::types::Stmt as HS;
+    if !(block.byte_range.start <= cursor_byte && cursor_byte <= block.byte_range.end) {
+        return None;
+    }
+    for s in &block.stmts {
+        let r = stmt_byte_range(hir, *s);
+        if r.end <= cursor_byte {
+            if let HS::Var(lv) = &hir.stmts[*s]
+                && hir.idents[lv.name].text == name
+            {
+                return analysis.def_types.get(&lv.name).copied();
+            }
+        } else if r.start <= cursor_byte
+            && cursor_byte <= r.end
+            && let Some(t) = lookup_name_type_in_stmt(hir, analysis, cursor_byte, *s, name)
+        {
+            return Some(t);
+        }
+    }
+    None
+}
+
 fn lookup_name_type_in_stmt(
     hir: &greycat_analyzer_hir::Hir,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
@@ -3593,28 +3630,12 @@ fn lookup_name_type_in_stmt(
 ) -> Option<greycat_analyzer_types::TypeId> {
     use greycat_analyzer_hir::types::Stmt as HS;
     match &hir.stmts[stmt_id] {
-        HS::Block(stmts) => {
-            for s in stmts {
-                let r = stmt_byte_range(hir, *s);
-                if r.end <= cursor_byte {
-                    if let HS::Var(lv) = &hir.stmts[*s]
-                        && hir.idents[lv.name].text == name
-                    {
-                        return analysis.def_types.get(&lv.name).copied();
-                    }
-                } else if r.start <= cursor_byte
-                    && cursor_byte <= r.end
-                    && let Some(t) = lookup_name_type_in_stmt(hir, analysis, cursor_byte, *s, name)
-                {
-                    return Some(t);
-                }
-            }
-            None
-        }
+        HS::Block(b) => lookup_name_type_in_block(hir, analysis, cursor_byte, b, name),
         HS::If(s) => {
-            let r = stmt_byte_range(hir, s.then_branch);
-            if r.start <= cursor_byte && cursor_byte <= r.end {
-                return lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.then_branch, name);
+            if let Some(t) =
+                lookup_name_type_in_block(hir, analysis, cursor_byte, &s.then_branch, name)
+            {
+                return Some(t);
             }
             if let Some(eb) = s.else_branch {
                 let er = stmt_byte_range(hir, eb);
@@ -3624,15 +3645,15 @@ fn lookup_name_type_in_stmt(
             }
             None
         }
-        HS::While(s) => lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name),
-        HS::DoWhile(s) => lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name),
+        HS::While(s) => lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name),
+        HS::DoWhile(s) => lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name),
         HS::For(s) => {
             if let Some(name_id) = s.init_name
                 && hir.idents[name_id].text == name
             {
                 return analysis.def_types.get(&name_id).copied();
             }
-            lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name)
+            lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name)
         }
         HS::ForIn(s) => {
             for p in &s.params {
@@ -3640,25 +3661,27 @@ fn lookup_name_type_in_stmt(
                     return analysis.def_types.get(&p.name).copied();
                 }
             }
-            lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.body, name)
+            lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name)
         }
         HS::Try(s) => {
-            let tr = stmt_byte_range(hir, s.try_block);
-            if tr.start <= cursor_byte && cursor_byte <= tr.end {
-                return lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.try_block, name);
+            if let Some(t) =
+                lookup_name_type_in_block(hir, analysis, cursor_byte, &s.try_block, name)
+            {
+                return Some(t);
             }
-            let cr = stmt_byte_range(hir, s.catch_block);
-            if cr.start <= cursor_byte && cursor_byte <= cr.end {
+            if s.catch_block.byte_range.start <= cursor_byte
+                && cursor_byte <= s.catch_block.byte_range.end
+            {
                 if let Some(err_id) = s.error_param
                     && hir.idents[err_id].text == name
                 {
                     return analysis.def_types.get(&err_id).copied();
                 }
-                return lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.catch_block, name);
+                return lookup_name_type_in_block(hir, analysis, cursor_byte, &s.catch_block, name);
             }
             None
         }
-        HS::At(s) => lookup_name_type_in_stmt(hir, analysis, cursor_byte, s.block, name),
+        HS::At(s) => lookup_name_type_in_block(hir, analysis, cursor_byte, &s.block, name),
         _ => None,
     }
 }

@@ -113,6 +113,18 @@ fn check_type(
     }
 }
 
+fn visit_block_for_locals(
+    hir: &Hir,
+    res: &Resolutions,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+    out: &mut Vec<LintDiagnostic>,
+    rule: &'static str,
+) {
+    for s in &block.stmts {
+        visit_for_locals(hir, res, *s, out, rule);
+    }
+}
+
 fn visit_for_locals(
     hir: &Hir,
     res: &Resolutions,
@@ -122,11 +134,7 @@ fn visit_for_locals(
 ) {
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(stmts) => {
-            for s in stmts {
-                visit_for_locals(hir, res, *s, out, rule);
-            }
-        }
+        Stmt::Block(b) => visit_block_for_locals(hir, res, b, out, rule),
         Stmt::Var(v) => {
             // Was `v.name` referenced anywhere as a Local?
             let used = res.uses.values().any(|d| match d {
@@ -144,20 +152,20 @@ fn visit_for_locals(
             }
         }
         Stmt::If(i) => {
-            visit_for_locals(hir, res, i.then_branch, out, rule);
+            visit_block_for_locals(hir, res, &i.then_branch, out, rule);
             if let Some(eb) = i.else_branch {
                 visit_for_locals(hir, res, eb, out, rule);
             }
         }
-        Stmt::While(w) => visit_for_locals(hir, res, w.body, out, rule),
-        Stmt::DoWhile(w) => visit_for_locals(hir, res, w.body, out, rule),
-        Stmt::For(f) => visit_for_locals(hir, res, f.body, out, rule),
-        Stmt::ForIn(f) => visit_for_locals(hir, res, f.body, out, rule),
+        Stmt::While(w) => visit_block_for_locals(hir, res, &w.body, out, rule),
+        Stmt::DoWhile(w) => visit_block_for_locals(hir, res, &w.body, out, rule),
+        Stmt::For(f) => visit_block_for_locals(hir, res, &f.body, out, rule),
+        Stmt::ForIn(f) => visit_block_for_locals(hir, res, &f.body, out, rule),
         Stmt::Try(t) => {
-            visit_for_locals(hir, res, t.try_block, out, rule);
-            visit_for_locals(hir, res, t.catch_block, out, rule);
+            visit_block_for_locals(hir, res, &t.try_block, out, rule);
+            visit_block_for_locals(hir, res, &t.catch_block, out, rule);
         }
-        Stmt::At(a) => visit_for_locals(hir, res, a.block, out, rule),
+        Stmt::At(a) => visit_block_for_locals(hir, res, &a.block, out, rule),
         _ => {}
     }
 }

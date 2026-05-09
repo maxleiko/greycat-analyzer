@@ -730,6 +730,20 @@ fn collect_decl_idents(
     out
 }
 
+fn collect_block_decl_idents(
+    hir: &Hir,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+    out: &mut Vec<(
+        Idx<greycat_analyzer_hir::types::Ident>,
+        &'static str,
+        &'static str,
+    )>,
+) {
+    for s in &block.stmts {
+        collect_stmt_decl_idents(hir, *s, out);
+    }
+}
+
 fn collect_stmt_decl_idents(
     hir: &Hir,
     stmt_idx: Idx<greycat_analyzer_hir::types::Stmt>,
@@ -741,44 +755,36 @@ fn collect_stmt_decl_idents(
 ) {
     use greycat_analyzer_hir::types::Stmt;
     match &hir.stmts[stmt_idx] {
-        Stmt::Block(stmts) => {
-            for s in stmts {
-                collect_stmt_decl_idents(hir, *s, out);
-            }
-        }
+        Stmt::Block(b) => collect_block_decl_idents(hir, b, out),
         Stmt::Var(v) => {
             out.push((v.name, "var", "VarDecl"));
         }
         Stmt::If(i) => {
-            collect_stmt_decl_idents(hir, i.then_branch, out);
+            collect_block_decl_idents(hir, &i.then_branch, out);
             if let Some(e) = i.else_branch {
                 collect_stmt_decl_idents(hir, e, out);
             }
         }
-        Stmt::While(w) => {
-            collect_stmt_decl_idents(hir, w.body, out);
-        }
-        Stmt::DoWhile(d) => {
-            collect_stmt_decl_idents(hir, d.body, out);
-        }
+        Stmt::While(w) => collect_block_decl_idents(hir, &w.body, out),
+        Stmt::DoWhile(d) => collect_block_decl_idents(hir, &d.body, out),
         Stmt::For(f) => {
             if let Some(name) = f.init_name {
                 out.push((name, "var", "VarDecl"));
             }
-            collect_stmt_decl_idents(hir, f.body, out);
+            collect_block_decl_idents(hir, &f.body, out);
         }
         Stmt::ForIn(fi) => {
             for p in &fi.params {
                 out.push((p.name, "var", "VarDecl"));
             }
-            collect_stmt_decl_idents(hir, fi.body, out);
+            collect_block_decl_idents(hir, &fi.body, out);
         }
         Stmt::Try(t) => {
-            collect_stmt_decl_idents(hir, t.try_block, out);
+            collect_block_decl_idents(hir, &t.try_block, out);
             if let Some(p) = t.error_param {
                 out.push((p, "var", "CatchParam"));
             }
-            collect_stmt_decl_idents(hir, t.catch_block, out);
+            collect_block_decl_idents(hir, &t.catch_block, out);
         }
         Stmt::Expr(_)
         | Stmt::Assign(_)

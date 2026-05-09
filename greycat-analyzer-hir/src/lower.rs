@@ -437,6 +437,19 @@ fn lower_pragma(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Pragma
 // =============================================================================
 
 fn lower_block(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt>> {
+    let block = lower_block_inline(cx, node)?;
+    Some(cx.hir.stmts.alloc(Stmt::Block(block)))
+}
+
+/// Same as [`lower_block`] but returns the [`BlockStmt`] directly
+/// without allocating into the `stmts` arena. Body-bearing statements
+/// (`If::then_branch`, `While::body`, …) embed the `BlockStmt` so
+/// callers reach the curly-brace `byte_range` without going through
+/// the arena.
+fn lower_block_inline(
+    cx: &mut LowerCtx,
+    node: tree_sitter::Node<'_>,
+) -> Option<crate::types::BlockStmt> {
     if node.kind() != "block" {
         return None;
     }
@@ -447,7 +460,10 @@ fn lower_block(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stm
             stmts.push(s);
         }
     }
-    Some(cx.hir.stmts.alloc(Stmt::Block(stmts)))
+    Some(crate::types::BlockStmt {
+        stmts,
+        byte_range: node.byte_range(),
+    })
 }
 
 fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt>> {
@@ -491,7 +507,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .and_then(|n| lower_expr(cx, n))?;
             let then_branch = node
                 .child_by_field_name("then_branch")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             // The grammar's `_else_branch` is a hidden rule, so field
             // annotations sometimes don't propagate to the inner
             // if_stmt / block. Fall back to scanning the if_stmt's
@@ -533,7 +549,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .and_then(|n| lower_expr(cx, n))?;
             let body = node
                 .child_by_field_name("block")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             Stmt::While(WhileStmt {
                 condition,
                 body,
@@ -543,7 +559,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
         "do_while_stmt" => {
             let body = node
                 .child_by_field_name("block")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             let condition = node
                 .child_by_field_name("condition")
                 .and_then(|n| lower_expr(cx, n))?;
@@ -571,7 +587,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .and_then(|n| lower_expr(cx, n));
             let body = node
                 .child_by_field_name("block")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             Stmt::For(ForStmt {
                 init_name,
                 init_ty,
@@ -614,7 +630,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .and_then(|r| lower_expr(cx, r))?;
             let body = node
                 .child_by_field_name("block")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             Stmt::ForIn(ForInStmt {
                 params,
                 range,
@@ -641,7 +657,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
         "try_stmt" => {
             let try_block = node
                 .child_by_field_name("try_block")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             // P17.3 — the grammar's `_catch_param` is a hidden rule
             // (`seq("(", $.ident, ")")`), so tree-sitter inlines it
             // and tags every child of the inlined rule with the
@@ -658,7 +674,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .map(|n| cx.alloc_ident(n));
             let catch_block = node
                 .child_by_field_name("catch_block")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             Stmt::Try(TryStmt {
                 try_block,
                 error_param,
@@ -672,7 +688,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .and_then(|n| lower_expr(cx, n))?;
             let block = node
                 .child_by_field_name("block")
-                .and_then(|n| lower_stmt(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             Stmt::At(AtStmt {
                 expr,
                 block,
