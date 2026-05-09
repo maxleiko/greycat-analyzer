@@ -102,9 +102,35 @@ pub struct ProjectIndex {
     /// `resolve_member` resolves cross-module hits inline at body-walk
     /// time, removing the deferral.
     pub type_members: HashMap<String, TypeMembers>,
+    /// **P23** — pre-lowered top-level fn signatures, keyed by fn
+    /// name. First-decl-wins, matching `type_members` collision
+    /// semantics. `home_uri` lets the analyzer's call-typing path
+    /// disambiguate the right module when needed; `return_ty` is
+    /// already minted into the shared arena, so the analyzer applies
+    /// `arena.substitute` at the call site for generic fns. Built
+    /// by `ProjectAnalysis::stage_lower_signatures` after every
+    /// module is loaded but before any body walks.
+    pub fn_signatures: HashMap<String, FnSignature>,
+    /// **P23** — enum types pre-registered in the shared project
+    /// arena, keyed by enum name. Lets the analyzer's
+    /// `QualifiedStatic` value-position typing recognise
+    /// `other_module::Foo::a` as the enum `Foo` (not `any`).
+    pub enum_types: HashMap<String, TypeId>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
+}
+
+/// **P23** — top-level fn signature record. `return_ty` is the
+/// pre-lowered return `TypeId` in the shared project arena; it may
+/// be `GenericParam(T, owner=fn)` for generic fns. The analyzer's
+/// `try_member_call_typing` consults this for cross-module Ident
+/// callees and `QualifiedStatic` `module::fn` shapes.
+#[derive(Debug, Clone)]
+pub struct FnSignature {
+    pub home_uri: Uri,
+    pub return_ty: TypeId,
+    pub generics: Vec<String>,
 }
 
 /// P21 — per-type cross-module member index. `home_uri` names the

@@ -246,6 +246,7 @@ impl ProjectAnalysis {
     /// minted into the same arena. Generic params owned by the type
     /// being walked resolve to `GenericParam(T, owner=Type(name))`.
     fn stage_lower_signatures(&mut self, lowered: &[(Uri, Hir, String, Duration)]) {
+        use crate::stdlib::FnSignature;
         use greycat_analyzer_hir::types::Decl;
         use greycat_analyzer_types::GenericOwner;
 
@@ -258,54 +259,128 @@ impl ProjectAnalysis {
         // name lookup *during* lowering, then apply the writes after.
         type AttrUpdate = (String, String, greycat_analyzer_types::TypeId);
         type MethodUpdate = (String, String, greycat_analyzer_types::TypeId);
+        type FnUpdate = (String, FnSignature);
+        type EnumUpdate = (String, greycat_analyzer_types::TypeId);
         let mut attr_updates: Vec<AttrUpdate> = Vec::new();
         let mut method_updates: Vec<MethodUpdate> = Vec::new();
+        let mut fn_updates: Vec<FnUpdate> = Vec::new();
+        let mut enum_updates: Vec<EnumUpdate> = Vec::new();
 
-        for (_uri, hir, _lib, _) in lowered {
+        for (uri, hir, _lib, _) in lowered {
             let Some(module) = hir.module.as_ref() else {
                 continue;
             };
             for d_id in &module.decls {
-                let Decl::Type(td) = &hir.decls[*d_id] else {
-                    continue;
-                };
-                let type_name = hir.idents[td.name].text.clone();
-                // Build the generics scope for this type.
-                let owner = GenericOwner::Type(type_name.clone());
-                let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
-                for g in &td.generics {
-                    generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
-                }
-                // Lower attrs.
-                for attr_id in &td.attrs {
-                    let attr = &hir.type_attrs[*attr_id];
-                    let attr_name = hir.idents[attr.name].text.clone();
-                    let Some(tr) = attr.ty else {
-                        continue;
-                    };
-                    let ty =
-                        lower_type_ref_project(hir, tr, arena_mut, index_ref, &generics_in_scope);
-                    attr_updates.push((type_name.clone(), attr_name, ty));
-                }
-                // Lower method returns.
-                for method_id in &td.methods {
-                    let Decl::Fn(fnd) = &hir.decls[*method_id] else {
-                        continue;
-                    };
-                    let method_name = hir.idents[fnd.name].text.clone();
-                    let Some(ret) = fnd.return_type else {
-                        continue;
-                    };
-                    // Method bodies see *both* the type's generics and
-                    // any of the method's own (`fn<U>(...)`).
-                    let mut method_generics = generics_in_scope.clone();
-                    let method_owner = GenericOwner::Function(method_name.clone());
-                    for g in &fnd.generics {
-                        method_generics.insert(hir.idents[*g].text.clone(), method_owner.clone());
+                match &hir.decls[*d_id] {
+                    Decl::Type(td) => {
+                        let type_name = hir.idents[td.name].text.clone();
+                        // Build the generics scope for this type.
+                        let owner = GenericOwner::Type(type_name.clone());
+                        let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                        for g in &td.generics {
+                            generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
+                        }
+                        // Lower attrs.
+                        for attr_id in &td.attrs {
+                            let attr = &hir.type_attrs[*attr_id];
+                            let attr_name = hir.idents[attr.name].text.clone();
+                            let Some(tr) = attr.ty else {
+                                continue;
+                            };
+                            let ty = lower_type_ref_project(
+                                hir,
+                                tr,
+                                arena_mut,
+                                index_ref,
+                                &generics_in_scope,
+                            );
+                            attr_updates.push((type_name.clone(), attr_name, ty));
+                        }
+                        // Lower method returns.
+                        for method_id in &td.methods {
+                            let Decl::Fn(fnd) = &hir.decls[*method_id] else {
+                                continue;
+                            };
+                            let method_name = hir.idents[fnd.name].text.clone();
+                            let Some(ret) = fnd.return_type else {
+                                continue;
+                            };
+                            // Method bodies see *both* the type's generics
+                            // and any of the method's own (`fn<U>(...)`).
+                            let mut method_generics = generics_in_scope.clone();
+                            let method_owner = GenericOwner::Function(method_name.clone());
+                            for g in &fnd.generics {
+                                method_generics
+                                    .insert(hir.idents[*g].text.clone(), method_owner.clone());
+                            }
+                            let ty = lower_type_ref_project(
+                                hir,
+                                ret,
+                                arena_mut,
+                                index_ref,
+                                &method_generics,
+                            );
+                            method_updates.push((type_name.clone(), method_name, ty));
+                        }
                     }
-                    let ty =
-                        lower_type_ref_project(hir, ret, arena_mut, index_ref, &method_generics);
-                    method_updates.push((type_name.clone(), method_name, ty));
+                    Decl::Enum(ed) => {
+                        // P23 — pre-register the enum type in the
+                        // *shared* project arena and record the TypeId
+                        // in `index.enum_types` so cross-module variant
+                        // typing (`other_module::Foo::a` → `Foo`) can
+                        // resolve inline.
+                        let name = hir.idents[ed.name].text.clone();
+                        let variants: Vec<String> = ed
+                            .fields
+                            .iter()
+                            .map(|f| hir.idents[hir.enum_fields[*f].name].text.clone())
+                            .collect();
+                        let enum_id = arena_mut.alloc(greycat_analyzer_types::Type {
+                            kind: greycat_analyzer_types::TypeKind::Enum {
+                                name: name.clone(),
+                                variants,
+                            },
+                            nullable: false,
+                        });
+                        enum_updates.push((name, enum_id));
+                    }
+                    Decl::Fn(fnd) => {
+                        // P23 — top-level fn signatures. Native fns are
+                        // included so the analyzer's call-typing path
+                        // can resolve them inline through the shared
+                        // arena (`NativeRegistry` mints into a
+                        // *different* arena and predates P19).
+                        let fn_name = hir.idents[fnd.name].text.clone();
+                        let Some(ret) = fnd.return_type else {
+                            continue;
+                        };
+                        let owner = GenericOwner::Function(fn_name.clone());
+                        let mut generics_in_scope: HashMap<String, GenericOwner> = HashMap::new();
+                        for g in &fnd.generics {
+                            generics_in_scope.insert(hir.idents[*g].text.clone(), owner.clone());
+                        }
+                        let ret_ty = lower_type_ref_project(
+                            hir,
+                            ret,
+                            arena_mut,
+                            index_ref,
+                            &generics_in_scope,
+                        );
+                        let generics: Vec<String> = fnd
+                            .generics
+                            .iter()
+                            .map(|g| hir.idents[*g].text.clone())
+                            .collect();
+                        fn_updates.push((
+                            fn_name,
+                            FnSignature {
+                                home_uri: uri.clone(),
+                                return_ty: ret_ty,
+                                generics,
+                            },
+                        ));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -319,6 +394,12 @@ impl ProjectAnalysis {
             if let Some(tm) = self.index.type_members.get_mut(&type_name) {
                 tm.method_returns.insert(method_name, ty);
             }
+        }
+        for (fn_name, sig) in fn_updates {
+            self.index.fn_signatures.entry(fn_name).or_insert(sig);
+        }
+        for (name, ty) in enum_updates {
+            self.index.enum_types.entry(name).or_insert(ty);
         }
     }
 
@@ -381,39 +462,15 @@ impl ProjectAnalysis {
     /// signatures, so call-site monomorphization and member typing
     /// happen inline rather than in a fix-up sweep).
     fn stage_cross_module_post_passes(&mut self) {
-        // P22 — passes 3.4 / 3.45 are gone: the analyzer's
-        // Member/Arrow typing consults `index.type_members.attr_types`
-        // inline via `Cx::foreign_member_type` during the body walk.
-        //
-        // Pass 3.5 (`infer_cross_module_call_types`) survives until P23
-        // — it patches cross-module *call* return types, which the
-        // analyzer's per-module body walker can't compute today
-        // (foreign fn signatures aren't yet in `ProjectIndex`). When
-        // P23 absorbs call typing into the staged S12, this falls.
-        //
-        // Pass 3.52 (`rebind_for_in_iter_types`) also survives until
-        // P23 — it covers `for (g in foo())` where `foo()` returns a
-        // foreign type and the analyzer's first pass typed the call
-        // as `any`.
-        let _ = self.infer_cross_module_call_types();
-        self.rebind_for_in_iter_types();
-        for _ in 0..3 {
-            let prev_len = self
-                .modules
-                .values()
-                .map(|m| m.analysis.expr_types.len())
-                .sum::<usize>();
-            let _ = self.infer_cross_module_call_types();
-            self.rebind_for_in_iter_types();
-            let new_len = self
-                .modules
-                .values()
-                .map(|m| m.analysis.expr_types.len())
-                .sum::<usize>();
-            if new_len == prev_len {
-                break;
-            }
-        }
+        // P23 — passes 3.4 / 3.45 / 3.5 / 3.52 are all gone. The
+        // analyzer's body walker now types Member / Arrow / Static /
+        // QualifiedStatic / Ident calls inline via the S7-S11
+        // signatures index (`Cx::try_member_call_typing`,
+        // `Cx::foreign_member_type`). For-in iterables that depend on
+        // those typings settle naturally during the same body walk.
+        // Only the typed-lint pass (3.55) and type-relation
+        // validation (3.6) survive — both still need to walk every
+        // module's now-settled `expr_types`.
         self.run_typed_lints(None);
         self.validate_type_relations(None);
     }

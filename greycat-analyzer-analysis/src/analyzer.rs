@@ -431,6 +431,25 @@ struct EnumChain {
     has_final_else: bool,
 }
 
+/// **P23** — small dispatch enum used by [`Cx::try_member_call_typing`]
+/// so we can read the callee shape from `&self.hir.exprs[idx]` and
+/// then drop that borrow before the recursive `&mut self` call. Plain
+/// `Copy` fields plus an owned `Vec<Idx<Ident>>` for the qualified-
+/// chain case (the only shape that actually allocates).
+enum CalleeShape {
+    Member {
+        receiver: Idx<Expr>,
+        property: Idx<Ident>,
+        is_arrow: bool,
+    },
+    Static {
+        ty: Idx<TypeRef>,
+        property: Idx<Ident>,
+    },
+    Ident(Idx<Ident>),
+    QualifiedStatic(Vec<Idx<Ident>>),
+}
+
 struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
@@ -515,10 +534,11 @@ impl<'a> Cx<'a> {
         self.out.def_types.get(&name).copied()
     }
     fn strip_nullable(&mut self, ty: TypeId) -> TypeId {
-        let mut t = self.arena.get(ty).clone();
+        let t = self.arena.get(ty);
         if !t.nullable {
             return ty;
         }
+        let mut t = t.clone();
         t.nullable = false;
         self.arena.alloc(t)
     }
@@ -565,7 +585,7 @@ impl<'a> Cx<'a> {
             TypeKind::Anonymous { fields } => {
                 // Anonymous types don't have a backing TypeDecl, so we
                 // resolve their fields directly from the type shape.
-                let prop = self.hir.idents[property].text.clone();
+                let prop = &*self.hir.idents[property].text;
                 if fields.iter().any(|(n, _)| *n == prop) {
                     // No TypeAttr / Decl to point to — capabilities
                     // gracefully no-op without a member_uses entry.
@@ -577,11 +597,11 @@ impl<'a> Cx<'a> {
         let Some(name) = type_name else {
             return;
         };
-        let prop_text = self.ident_text(property).to_string();
+        let prop_text = self.ident_text(property);
 
         if let Some(decl_id) = self.out.type_decls.get(&name).copied() {
             // Local: type declared in this module.
-            let Decl::Type(type_decl) = self.hir.decls[decl_id].clone() else {
+            let Decl::Type(type_decl) = &self.hir.decls[decl_id] else {
                 return;
             };
             for attr_id in &type_decl.attrs {
@@ -611,7 +631,7 @@ impl<'a> Cx<'a> {
         // `foreign_member_uses`. Replaces the old `deferred_member_uses`
         // → pass-3 drain (which is now deleted).
         if let Some(members) = self.index.type_members.get(&name) {
-            if let Some(attr_id) = members.attrs.get(&prop_text).copied() {
+            if let Some(attr_id) = members.attrs.get(prop_text).copied() {
                 self.out.foreign_member_uses.insert(
                     property,
                     ForeignMember {
@@ -621,7 +641,7 @@ impl<'a> Cx<'a> {
                 );
                 return;
             }
-            if let Some(method_id) = members.methods.get(&prop_text).copied() {
+            if let Some(method_id) = members.methods.get(prop_text).copied() {
                 self.out.foreign_member_uses.insert(
                     property,
                     ForeignMember {
@@ -633,6 +653,255 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// **P23** — inline call-return typing for Member / Arrow /
+    /// Static callees. Looks up the method's pre-lowered return
+    /// `TypeId` in `index.type_members[type_name].method_returns` and
+    /// applies `arena.substitute` against the receiver's
+    /// instantiation. Returns `None` for callees this path doesn't
+    /// handle (Ident / QualifiedStatic / Lambda / etc.) so the
+    /// caller falls back to `any` until those branches land.
+    fn try_member_call_typing(&mut self, callee: Idx<Expr>) -> Option<TypeId> {
+        // Pull the small Copy / cheaply-borrowed bits out of the HIR
+        // expression up front so we can drop the `&self.hir.exprs`
+        // borrow before the recursive `&mut self` calls.
+        let dispatch: CalleeShape = match &self.hir.exprs[callee] {
+            Expr::Member(m) => CalleeShape::Member {
+                receiver: m.receiver,
+                property: m.property,
+                is_arrow: false,
+            },
+            Expr::Arrow(m) => CalleeShape::Member {
+                receiver: m.receiver,
+                property: m.property,
+                is_arrow: true,
+            },
+            Expr::Static(s) => CalleeShape::Static {
+                ty: s.ty,
+                property: s.property,
+            },
+            Expr::Ident(name_idx) => CalleeShape::Ident(*name_idx),
+            Expr::QualifiedStatic { chain, .. } => CalleeShape::QualifiedStatic(chain.clone()),
+            _ => return None,
+        };
+        match dispatch {
+            CalleeShape::Member {
+                receiver,
+                property,
+                is_arrow,
+            } => {
+                let recv_ty = self.out.expr_types.get(&receiver).copied()?;
+                self.method_return_for(recv_ty, property, is_arrow)
+            }
+            CalleeShape::Static { ty, property } => {
+                let recv_ty = self.lower_type_ref(ty);
+                self.method_return_for(recv_ty, property, false)
+            }
+            CalleeShape::Ident(name_idx) => self.bare_fn_return(name_idx),
+            CalleeShape::QualifiedStatic(chain) => self.qualified_static_call_return(&chain),
+        }
+    }
+
+    /// **P23** — type a bare-Ident call (`foo()` / `module_fn()`) by
+    /// looking up the fn's signature. Local fns lower the return
+    /// `TypeRef` inline; cross-module fns consult the project
+    /// signatures index. Generic fns aren't handled here — they
+    /// route through [`Self::try_generic_call_inference`] which the
+    /// caller tries first.
+    fn bare_fn_return(&mut self, name_idx: Idx<Ident>) -> Option<TypeId> {
+        let def = self.res.lookup(name_idx)?;
+        let fn_name = self.ident_text(name_idx);
+        // Project signatures index covers local + cross-module + native
+        // fns (P23 includes natives in `stage_lower_signatures`).
+        if let Some(sig) = self.index.fn_signatures.get(fn_name) {
+            return Some(sig.return_ty);
+        }
+        match def {
+            Definition::Decl(decl_id) => {
+                let Decl::Fn(fnd) = &self.hir.decls[decl_id] else {
+                    return None;
+                };
+                if !fnd.generics.is_empty() {
+                    return None;
+                }
+                let ret = fnd.return_type?;
+                Some(self.lower_type_ref(ret))
+            }
+            _ => None,
+        }
+    }
+
+    /// **P23** — type a `QualifiedStatic` callee. Two shapes:
+    /// - `module::fn(...)` — chain has 2 segments. Look up
+    ///   `chain[1]` in `index.fn_signatures`.
+    /// - `module::Type::method(...)` — chain has 3 segments. Look
+    ///   up `chain[1]` as a type, then `chain[2]` as one of its
+    ///   methods.
+    fn qualified_static_call_return(&mut self, chain: &[Idx<Ident>]) -> Option<TypeId> {
+        match chain.len() {
+            2 => {
+                let fn_name = self.ident_text(chain[1]);
+                let sig = self.index.fn_signatures.get(fn_name)?;
+                Some(sig.return_ty)
+            }
+            3 => {
+                let type_name = self.ident_text(chain[1]);
+                let method_name = self.ident_text(chain[2]);
+                let members = self.index.type_members.get(type_name)?;
+                members.method_returns.get(method_name).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// Shared body of [`Self::try_member_call_typing`]: given the
+    /// receiver's `TypeId` and the property `Ident`, look up the
+    /// method's pre-lowered return type in the project signatures
+    /// index, then substitute the receiver's generic args. Auto-derefs
+    /// node-tag receivers when `is_arrow` (mirrors `arrow_deref_receiver`).
+    fn method_return_for(
+        &mut self,
+        recv_ty: TypeId,
+        property: Idx<Ident>,
+        is_arrow: bool,
+    ) -> Option<TypeId> {
+        // Auto-deref node-tag receivers for arrow callees.
+        let lookup_ty = if is_arrow {
+            self.arrow_deref_receiver(recv_ty).unwrap_or(recv_ty)
+        } else {
+            recv_ty
+        };
+        let recv = self.arena.get(lookup_ty).clone();
+        let (type_name, instantiation) = match recv.kind {
+            TypeKind::Named { name } => (name, Vec::new()),
+            TypeKind::Generic { name, args } => (name, args),
+            TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
+            _ => return None,
+        };
+        let members = self.index.type_members.get(&type_name)?;
+        let property_text = self.ident_text(property);
+        let ret_ty = members.method_returns.get(property_text).copied()?;
+        let mut subst: HashMap<String, TypeId> = HashMap::new();
+        for (i, gp_name) in members.generics.iter().enumerate() {
+            if let Some(arg) = instantiation.get(i) {
+                subst.insert(gp_name.clone(), *arg);
+            }
+        }
+        Some(self.arena.substitute(ret_ty, &subst))
+    }
+
+    /// **P23** — populate `foreign_decl_uses[chain[1]]` (the type
+    /// segment) and `foreign_member_uses[chain[2]]` (the member
+    /// segment, when present) for a `module::Type[::member]`
+    /// QualifiedStatic. Lets hover / goto-def render the right thing
+    /// on each chain segment without depending on the deleted pass
+    /// 3.5 chain-segment writeback.
+    fn bind_qualified_chain_segments(&mut self, chain: &[Idx<Ident>]) {
+        if chain.len() < 2 {
+            return;
+        }
+        // Snapshot decl-location: the &Uri from `locate_decl` borrows
+        // `self.index`, so we'd otherwise collide with the `&mut
+        // self.out` insert below. Cloning the Uri is the necessary
+        // owned copy here, not the laziness kind.
+        let (host_uri, host_decl_id) =
+            match self.index.locate_decl(self.ident_text(chain[1])).first() {
+                Some((uri, decl_id)) => (uri.clone(), *decl_id),
+                None => return,
+            };
+        self.out.foreign_decl_uses.insert(
+            chain[1],
+            ForeignDecl {
+                uri: host_uri,
+                decl: host_decl_id,
+            },
+        );
+        if chain.len() == 3 {
+            // Resolve the (uri, member) pair without holding an
+            // `&self.index` borrow across the `&mut self.out` insert.
+            let resolved =
+                self.index
+                    .type_members
+                    .get(self.ident_text(chain[1]))
+                    .and_then(|members| {
+                        let prop = self.hir.idents[chain[2]].text.as_str();
+                        if let Some(&attr_id) = members.attrs.get(prop) {
+                            Some((members.home_uri.clone(), MemberDef::Attr(attr_id)))
+                        } else {
+                            members.methods.get(prop).map(|&decl_id| {
+                                (members.home_uri.clone(), MemberDef::Method(decl_id))
+                            })
+                        }
+                    });
+            if let Some((uri, member)) = resolved {
+                self.out
+                    .foreign_member_uses
+                    .insert(chain[2], ForeignMember { uri, member });
+            }
+        }
+    }
+
+    /// **P23** — type a `Type::name` / `Type::method` value-position
+    /// Static expr. Looks at the property's `member_uses` /
+    /// `foreign_member_uses` binding (already populated by
+    /// `resolve_member`) and maps Attr → `field`, Method → `function`.
+    fn static_value_type(&mut self, property: Idx<Ident>) -> Option<TypeId> {
+        let kind = self.out.member_uses.get(&property).copied().or_else(|| {
+            self.out
+                .foreign_member_uses
+                .get(&property)
+                .map(|f| f.member)
+        })?;
+        Some(match kind {
+            MemberDef::Attr(_) => self.arena.named("field"),
+            MemberDef::Method(_) => self.arena.named("function"),
+        })
+    }
+
+    /// **P23** — type a `module::name` / `module::Type::name`
+    /// value-position QualifiedStatic expr. Two shapes:
+    /// - 2-segment chain (`module::name`) — fn name resolves via
+    ///   the project fn signatures index → `function`. Type name
+    ///   resolves → `type`.
+    /// - 3-segment chain (`module::Type::name`) — same as
+    ///   `static_value_type` but routed through the cross-module
+    ///   index. Attr → `field`, Method → `function`.
+    fn qualified_static_value_type(&mut self, chain: &[Idx<Ident>]) -> Option<TypeId> {
+        match chain.len() {
+            2 => {
+                let name = self.ident_text(chain[1]);
+                if self.index.fn_signatures.contains_key(name) {
+                    Some(self.arena.named("function"))
+                } else if self.index.type_members.contains_key(name) || self.index.has_name(name) {
+                    Some(self.arena.named("type"))
+                } else {
+                    None
+                }
+            }
+            3 => {
+                let type_name = self.ident_text(chain[1]).to_string();
+                let member_name = self.ident_text(chain[2]).to_string();
+                // Enum variant: `module::Foo::a` types as `Foo` (the
+                // enum), matching the analyzer's `Static` enum-variant
+                // arm so call-arg validation against `_: Foo` passes.
+                if let Some(&ty_id) = self.index.enum_types.get(&type_name)
+                    && let TypeKind::Enum { variants, .. } = &self.arena.get(ty_id).kind
+                    && variants.iter().any(|v| v == &member_name)
+                {
+                    return Some(ty_id);
+                }
+                let members = self.index.type_members.get(&type_name)?;
+                if members.methods.contains_key(&member_name) {
+                    Some(self.arena.named("function"))
+                } else if members.attrs.contains_key(&member_name) {
+                    Some(self.arena.named("field"))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// **P22** — type a `foreign_member_uses`-bound `recv.attr` /
     /// `recv.method()` shape inline by looking up the project
     /// signatures index. `recv_ty` is the resolution-side receiver
@@ -641,32 +910,37 @@ impl<'a> Cx<'a> {
     /// resolve to the `function` named-type the rest of the analyzer
     /// expects for method references.
     fn foreign_member_type(&mut self, recv_ty: TypeId, property: Idx<Ident>) -> Option<TypeId> {
-        let foreign = self.out.foreign_member_uses.get(&property)?.clone();
+        let foreign = self.out.foreign_member_uses.get(&property)?;
         // Always model method references as `function` — the actual
         // return-type substitution happens at the call site (P22's
         // call-typing path consults `method_returns` directly).
         if matches!(foreign.member, MemberDef::Method(_)) {
             return Some(self.arena.named("function"));
         }
-        // Attr — pull the lowered attr type from the project index
-        // and apply receiver-driven substitution.
-        let recv = self.arena.get(recv_ty).clone();
-        let (type_name, instantiation) = match recv.kind {
-            TypeKind::Named { name } => (name, Vec::new()),
-            TypeKind::Generic { name, args } => (name, args),
+        // Attr — extract receiver shape (need owned name + args because
+        // the arena entry borrow has to drop before we re-borrow as
+        // mutable for `substitute`).
+        let (type_name, instantiation): (String, Vec<TypeId>) = match &self.arena.get(recv_ty).kind
+        {
+            TypeKind::Named { name } => (name.clone(), Vec::new()),
+            TypeKind::Generic { name, args } => (name.clone(), args.clone()),
             TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
             _ => return None,
         };
-        let members = self.index.type_members.get(&type_name)?;
-        let property_text = self.ident_text(property).to_string();
-        let attr_ty = members.attr_types.get(&property_text).copied()?;
-        // Build generic substitution from receiver's instantiation.
-        let mut subst: HashMap<String, TypeId> = HashMap::new();
-        for (i, gp_name) in members.generics.iter().enumerate() {
-            if let Some(arg) = instantiation.get(i) {
-                subst.insert(gp_name.clone(), *arg);
+        // Build the substitution map *before* mutably borrowing the
+        // arena (substitute) — `members` borrows `self.index`.
+        let property_text = self.hir.idents[property].text.as_str();
+        let (attr_ty, subst) = {
+            let members = self.index.type_members.get(&type_name)?;
+            let attr_ty = members.attr_types.get(property_text).copied()?;
+            let mut subst: HashMap<String, TypeId> = HashMap::new();
+            for (i, gp_name) in members.generics.iter().enumerate() {
+                if let Some(arg) = instantiation.get(i) {
+                    subst.insert(gp_name.clone(), *arg);
+                }
             }
-        }
+            (attr_ty, subst)
+        };
         Some(self.arena.substitute(attr_ty, &subst))
     }
 
@@ -1432,24 +1706,34 @@ impl<'a> Cx<'a> {
                 Some(Definition::Param(def)) | Some(Definition::Local(def)) => {
                     self.lookup_def_type(def).unwrap_or_else(|| self.any())
                 }
-                Some(Definition::Decl(decl_id)) => {
-                    // Module-level `var x: T;` references type as `T`.
-                    // Type / enum / fn decls used as bare values get
-                    // their `type` / `function` shape from pass 3.5
-                    // (`resolve_bare_ident_decl_shape`); leaving them
-                    // `any` here lets that override land cleanly.
-                    if let Decl::Var(vd) = &self.hir.decls[decl_id]
-                        && let Some(ty_ref) = vd.ty
+                Some(Definition::Decl(decl_id)) => match &self.hir.decls[decl_id] {
+                    Decl::Var(vd) => vd
+                        .ty
+                        .map(|ty_ref| self.lower_type_ref(ty_ref))
+                        .unwrap_or_else(|| self.any()),
+                    // P23 — bare type / enum / fn references used as
+                    // values were typed by pass 3.5 before. Now type
+                    // them inline against the runtime "type" /
+                    // "function" named shapes.
+                    Decl::Type(_) | Decl::Enum(_) => self.arena.named("type"),
+                    Decl::Fn(_) => self.arena.named("function"),
+                    _ => self.any(),
+                },
+                Some(Definition::ProjectDecl { .. }) => {
+                    // P23 — cross-module bare ident value typing via
+                    // the project signatures index.
+                    let name = self.ident_text(idx).to_string();
+                    if self.index.fn_signatures.contains_key(&name) {
+                        self.arena.named("function")
+                    } else if self.index.type_members.contains_key(&name)
+                        || self.index.has_name(&name)
                     {
-                        self.lower_type_ref(ty_ref)
+                        self.arena.named("type")
                     } else {
                         self.any()
                     }
                 }
-                Some(Definition::Generic(_))
-                | Some(Definition::ProjectDecl { .. })
-                | Some(Definition::Project)
-                | None => self.any(),
+                Some(Definition::Generic(_)) | Some(Definition::Project) | None => self.any(),
             },
             Expr::Literal(LiteralExpr { kind, text, .. }) => match kind {
                 LiteralKind::Bool => self.primitive(Primitive::Bool),
@@ -1586,34 +1870,45 @@ impl<'a> Cx<'a> {
                 // P15.6 — `Type::method` resolution. Lower the receiver
                 // type so cross-module receivers land as `Named(name)`
                 // (via `lower_type_ref`'s `index.has_name(&name)` arm),
-                // then run `resolve_member` on the property: in-module
-                // hits land in `member_uses`; cross-module hits land
-                // directly in `foreign_member_uses` via P21's structure
-                // index (no more pass-3 deferral).
+                // then run `resolve_member` on the property.
                 let recv_ty = self.lower_type_ref(s.ty);
                 self.resolve_member(recv_ty, s.property);
                 // Enum-variant access: `Foo::a` where `Foo` is an enum
                 // and `a` is one of its variants — the value's type is
-                // the enum itself, not `any`. Without this the static-
-                // expr post-pass falls through to `any` (variants don't
-                // appear in `type_decls.attrs` / `.methods`), which
-                // cascades into `value of type 'any' is not assignable
-                // to parameter '_: Foo'` false-positives at every call
-                // site that takes the enum as a parameter.
+                // the enum itself, not `any`.
                 if let TypeKind::Enum { variants, .. } = &self.arena.get(recv_ty).kind {
                     let prop = self.hir.idents[s.property].text.as_str();
                     if variants.iter().any(|v| v == prop) {
                         return recv_ty;
                     }
                 }
-                self.any()
+                // P23 — `Type::attr` (no parens) → `field`,
+                // `Type::method` (no parens) → `function`. Replaces
+                // pass 3.5's static-as-value typing.
+                if let Some(ty) = self.static_value_type(s.property) {
+                    return ty;
+                }
+                // P23 — `module::Name` shapes parse as `Static` with
+                // the module name as the "type ref" (the parser
+                // doesn't distinguish modules from types). Fall back
+                // to a 2-segment QualifiedStatic-style lookup against
+                // the project signatures index.
+                let recv_name = self.hir.type_refs[s.ty].name;
+                let chain = [recv_name, s.property];
+                self.qualified_static_value_type(&chain)
+                    .unwrap_or_else(|| self.any())
             }
-            Expr::QualifiedStatic { .. } => {
-                // P15.8 — chained `module::Type::name` shapes.
-                // Member binding + return-type / static-shape inference
-                // happen in `ProjectAnalysis` pass 3.5 because they need
-                // cross-module HIR access. Default to `any` here.
-                self.any()
+            Expr::QualifiedStatic { chain, .. } => {
+                // P23 — chained `module::name` / `module::Type::name`
+                // shapes. Bind the chain segments to their foreign
+                // decls / members so hover / goto-def have something
+                // to point at, then type the value-position expr
+                // inline using the project signatures index. (Calls
+                // are routed through `try_member_call_typing` from
+                // the `Expr::Call` branch.)
+                self.bind_qualified_chain_segments(&chain);
+                self.qualified_static_value_type(&chain)
+                    .unwrap_or_else(|| self.any())
             }
             Expr::Offset(OffsetExpr {
                 receiver,
@@ -1645,20 +1940,24 @@ impl<'a> Cx<'a> {
                 let callee_ty = self.visit_expr(callee);
                 let arg_tys: Vec<TypeId> = args.iter().map(|a| self.visit_expr(*a)).collect();
                 // P12.1: if the callee resolves to an in-module fn decl
-                // with generics, run constraint-based inference. Cross-
-                // module generic inference (callee is `ProjectDecl`)
-                // and method-call generic inference are deferred —
-                // they need foreign HIR access the analyzer doesn't yet
-                // carry.
+                // with generics, run constraint-based inference.
                 let call_range = self.hir.exprs[expr_id].byte_range();
                 if let Some(ret) = self.try_generic_call_inference(callee, &arg_tys, call_range) {
                     return ret;
                 }
+                // P23 — inline call-return typing for Member / Arrow /
+                // Static method calls. Pulls the method's lowered
+                // return type from the S7 signatures index and applies
+                // `arena.substitute` against the receiver's
+                // instantiation. Replaces pass 3.5 + the receiver-
+                // driven shape-substitution shim for these shapes.
+                if let Some(ret) = self.try_member_call_typing(callee) {
+                    return ret;
+                }
                 // P15.10: pairwise arg-type validation runs in
-                // `ProjectAnalysis` pass 3.6 (after pass 3.5 settles
-                // static-expr call return types) so outer calls whose
-                // args contain inner static-expr calls validate
-                // against the *post-pass-3.5* arg types. Doing it here
+                // `ProjectAnalysis::validate_type_relations` so outer
+                // calls whose args contain inner static-expr calls
+                // validate against settled arg types. Doing it here
                 // would surface false positives for arg shapes whose
                 // type isn't known until pass 3.5 fixes them up.
                 let _ = callee_ty;
