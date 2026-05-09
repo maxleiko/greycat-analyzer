@@ -1697,6 +1697,49 @@ fn completion_cross_module_decl_carries_signature_and_module_label() {
     );
 }
 
+/// LSP must not surface lints from non-`project` libraries. Library
+/// code isn't the user's — the `unused-decl` (and friends) signals
+/// from stdlib / vendored deps would be pure editor noise. Type-
+/// relation diagnostics still flow regardless so cross-module shape
+/// mismatches can't hide behind a lib boundary.
+#[test]
+fn diagnostics_skip_non_project_lib_lints() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let project_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let lib_uri = Uri::from_str("file:///proj/lib/std/core.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    // Both modules carry a `private fn unused() {}` — the
+    // unused-decl lint fires on each.
+    mgr.add_simple(
+        project_uri.clone(),
+        "private fn unused() {}\n",
+        "project",
+        false,
+    );
+    mgr.add_simple(lib_uri.clone(), "private fn unused() {}\n", "std", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+
+    let project_module = pa.module(&project_uri).unwrap();
+    let project_diags =
+        capabilities::diagnostics_from_module("private fn unused() {}\n", project_module);
+    assert!(
+        project_diags
+            .iter()
+            .any(|d| d.message.contains("unused private fn")),
+        "project lints SHOULD surface in the editor; got: {project_diags:?}"
+    );
+
+    let lib_module = pa.module(&lib_uri).unwrap();
+    let lib_diags = capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module);
+    assert!(
+        !lib_diags
+            .iter()
+            .any(|d| d.message.contains("unused private fn")),
+        "lib-owned (`std`) lints must NOT surface in the editor; got: {lib_diags:?}"
+    );
+}
+
 /// P16.5 — `n.|` where `n: node<Foo>` lists `node`'s own methods AND
 /// `Foo`'s attrs/methods. The inner-type items carry an
 /// `additional_text_edits` that rewrites `.` → `->` so accepting one

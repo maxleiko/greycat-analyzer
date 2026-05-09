@@ -47,6 +47,16 @@ pub struct Lint {
                 shape. Pass explicitly to override."
     )]
     format: Option<OutputFormat>,
+    #[clap(
+        long,
+        help = "Also surface lints from non-`project` libraries (modules \
+                under `lib/<name>/`). Off by default — library code isn't \
+                yours, and the `unused-decl` / etc. signals are noise \
+                when triaging warnings on your own project. Type-relation \
+                errors are unaffected by this flag — those always surface \
+                so cross-module shape mismatches can't hide."
+    )]
+    lint_libs: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -167,19 +177,21 @@ impl Lint {
                         ..Default::default()
                     });
                 }
-                for l in &module.lints {
-                    diagnostics.push(Diagnostic {
-                        range: byte_range_to_lsp(&doc.text, &l.byte_range),
-                        severity: Some(match l.severity {
-                            LintSeverity::Error => DiagnosticSeverity::ERROR,
-                            LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                            LintSeverity::Hint => DiagnosticSeverity::HINT,
-                        }),
-                        code: Some(NumberOrString::String(l.rule.into())),
-                        source: Some("lint".into()),
-                        message: l.message.clone(),
-                        ..Default::default()
-                    });
+                if self.lint_libs || module.lib == "project" {
+                    for l in &module.lints {
+                        diagnostics.push(Diagnostic {
+                            range: byte_range_to_lsp(&doc.text, &l.byte_range),
+                            severity: Some(match l.severity {
+                                LintSeverity::Error => DiagnosticSeverity::ERROR,
+                                LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                                LintSeverity::Hint => DiagnosticSeverity::HINT,
+                            }),
+                            code: Some(NumberOrString::String(l.rule.into())),
+                            source: Some("lint".into()),
+                            message: l.message.clone(),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
             entries.push(Entry {
@@ -293,19 +305,21 @@ impl Lint {
                                 ..Default::default()
                             });
                         }
-                        for l in &module.lints {
-                            diagnostics.push(Diagnostic {
-                                range: byte_range_to_lsp(&doc.text, &l.byte_range),
-                                severity: Some(match l.severity {
-                                    LintSeverity::Error => DiagnosticSeverity::ERROR,
-                                    LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                                    LintSeverity::Hint => DiagnosticSeverity::HINT,
-                                }),
-                                code: Some(NumberOrString::String(l.rule.into())),
-                                source: Some("lint".into()),
-                                message: l.message.clone(),
-                                ..Default::default()
-                            });
+                        if self.lint_libs || module.lib == "project" {
+                            for l in &module.lints {
+                                diagnostics.push(Diagnostic {
+                                    range: byte_range_to_lsp(&doc.text, &l.byte_range),
+                                    severity: Some(match l.severity {
+                                        LintSeverity::Error => DiagnosticSeverity::ERROR,
+                                        LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                                        LintSeverity::Hint => DiagnosticSeverity::HINT,
+                                    }),
+                                    code: Some(NumberOrString::String(l.rule.into())),
+                                    source: Some("lint".into()),
+                                    message: l.message.clone(),
+                                    ..Default::default()
+                                });
+                            }
                         }
                     }
                     entries.push(Entry {

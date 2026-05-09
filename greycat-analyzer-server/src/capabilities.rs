@@ -1803,6 +1803,7 @@ pub fn inlay_hints(
         resolutions,
         analysis,
         lints: Vec::new(),
+        lib: lib.to_string(),
         timings: Default::default(),
     };
     inlay_hints_with_project(&module, text, range)
@@ -4314,7 +4315,7 @@ pub(crate) fn current_diagnostics(
 /// finding to an `lsp_types::Diagnostic`. Mirrors the body of the cli
 /// `lint` command's per-module conversion (P14.5) so the LSP and the
 /// CLI surface the same diagnostic shape.
-pub(crate) fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagnostic> {
+pub fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Vec<Diagnostic> {
     let mut out: Vec<Diagnostic> = module
         .analysis
         .diagnostics
@@ -4332,19 +4333,27 @@ pub(crate) fn diagnostics_from_module(text: &str, module: &ModuleAnalysis) -> Ve
             ..Default::default()
         })
         .collect();
-    for lint in &module.lints {
-        out.push(Diagnostic {
-            range: byte_range_to_lsp_range(text, &lint.byte_range),
-            severity: Some(match lint.severity {
-                LintSeverity::Error => DiagnosticSeverity::ERROR,
-                LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                LintSeverity::Hint => DiagnosticSeverity::HINT,
-            }),
-            code: Some(NumberOrString::String(lint.rule.into())),
-            source: Some("lint".into()),
-            message: lint.message.clone(),
-            ..Default::default()
-        });
+    // Lib-owned modules don't surface lints in the editor — those are
+    // about library authors' code, not the user's project. Type-relation
+    // diagnostics above stay regardless so cross-module shape mismatches
+    // can't hide behind a library boundary. CLI users who want lib lints
+    // pass `lint --lint-libs`; there's no LSP equivalent today (no
+    // user-supplied LSP-settings story yet).
+    if module.lib == "project" {
+        for lint in &module.lints {
+            out.push(Diagnostic {
+                range: byte_range_to_lsp_range(text, &lint.byte_range),
+                severity: Some(match lint.severity {
+                    LintSeverity::Error => DiagnosticSeverity::ERROR,
+                    LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                    LintSeverity::Hint => DiagnosticSeverity::HINT,
+                }),
+                code: Some(NumberOrString::String(lint.rule.into())),
+                source: Some("lint".into()),
+                message: lint.message.clone(),
+                ..Default::default()
+            });
+        }
     }
     out
 }

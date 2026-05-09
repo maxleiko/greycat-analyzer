@@ -35,6 +35,13 @@ pub struct ModuleAnalysis {
     pub resolutions: Resolutions,
     pub analysis: AnalysisResult,
     pub lints: Vec<LintDiagnostic>,
+    /// Library this module belongs to — copied from
+    /// [`greycat_analyzer_core::Document::lib`] at construction.
+    /// `"project"` for the user's own modules, `"std"` /
+    /// `"explorer"` / etc. for vendored deps under `lib/`. CLI / LSP
+    /// consumers filter on this to skip lib-owned lints by default
+    /// (see `cli lint --lint-libs`).
+    pub lib: String,
     /// P14.5 — per-phase wall-clock timings captured during the
     /// last `rebuild` / `invalidate`. Useful for surfacing where the
     /// pipeline spends its time (`cli lint --csv`).
@@ -98,19 +105,19 @@ impl ProjectAnalysis {
 
         // Pass 1: lower every doc to HIR and ingest into the project
         // index so types declared in one module are visible to peers.
-        let mut hirs: Vec<(Uri, Hir, Duration)> = Vec::with_capacity(manager.len());
+        let mut hirs: Vec<(Uri, Hir, String, Duration)> = Vec::with_capacity(manager.len());
         for (uri, cell) in manager.iter() {
             let doc = cell.borrow();
             let lower_start = Instant::now();
             let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
             let lower_took = lower_start.elapsed();
             self.index.ingest(uri, &hir);
-            hirs.push((uri.clone(), hir, lower_took));
+            hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took));
         }
 
         // Pass 2: per-module resolver + analyzer + lints. The per-module
         // analyzer still owns its own arena; P6.2 reroutes the lookups.
-        for (uri, hir, lower_took) in hirs {
+        for (uri, hir, lib, lower_took) in hirs {
             let mut timings = ModuleTimings {
                 lower: lower_took,
                 ..ModuleTimings::default()
@@ -131,6 +138,7 @@ impl ProjectAnalysis {
                     resolutions,
                     analysis,
                     lints,
+                    lib,
                     timings,
                 },
             );
@@ -902,11 +910,13 @@ impl ProjectAnalysis {
 
         // Lower the changed doc fresh; reuse cached HIRs for the rest.
         let mut lower_took = Duration::ZERO;
+        let mut changed_lib: Option<String> = None;
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
             let start = Instant::now();
             let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
             lower_took = start.elapsed();
+            changed_lib = Some(doc.lib.clone());
             hir
         });
 
@@ -962,6 +972,7 @@ impl ProjectAnalysis {
                 resolutions,
                 analysis,
                 lints,
+                lib: changed_lib.unwrap_or_else(|| "project".to_string()),
                 timings,
             },
         );
@@ -1915,6 +1926,42 @@ mod tests {
         assert_eq!(pa.len(), 2);
         assert!(pa.module(&uri("/proj/a.gcl")).is_some());
         assert!(pa.module(&uri("/proj/b.gcl")).is_some());
+    }
+
+    #[test]
+    fn module_analysis_carries_doc_lib() {
+        // The lib name is cached on `ModuleAnalysis` at construction so
+        // CLI / LSP consumers can filter lib-owned lints without a
+        // SourceManager lookup at every emission site.
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(uri("/proj/a.gcl"), "fn a() {}\n", "project", false);
+        mgr.add_simple(uri("/proj/lib/std/core.gcl"), "fn b() {}\n", "std", false);
+        let pa = ProjectAnalysis::analyze(&mgr);
+        assert_eq!(pa.module(&uri("/proj/a.gcl")).unwrap().lib, "project");
+        assert_eq!(
+            pa.module(&uri("/proj/lib/std/core.gcl")).unwrap().lib,
+            "std"
+        );
+    }
+
+    #[test]
+    fn invalidate_preserves_doc_lib() {
+        // Re-running `invalidate` for a doc must keep the cached lib
+        // — the name doesn't move between rebuilds.
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(uri("/proj/lib/std/core.gcl"), "fn b() {}\n", "std", false);
+        let mut pa = ProjectAnalysis::analyze(&mgr);
+        mgr.add_simple(
+            uri("/proj/lib/std/core.gcl"),
+            "fn b(): int { return 1; }\n",
+            "std",
+            false,
+        );
+        pa.invalidate(&mgr, &uri("/proj/lib/std/core.gcl"));
+        assert_eq!(
+            pa.module(&uri("/proj/lib/std/core.gcl")).unwrap().lib,
+            "std"
+        );
     }
 
     #[test]
