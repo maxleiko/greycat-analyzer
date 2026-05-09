@@ -541,13 +541,34 @@ fn lower_module_signatures(
                     let Some(ret) = fnd.return_type else {
                         continue;
                     };
-                    let mut method_generics = generics_in_scope.clone();
+                    // P19.8: push the method's generics onto the
+                    // type-level scope, lower, then pop. Avoids
+                    // cloning `generics_in_scope` (a HashMap with
+                    // GenericOwner-owned Strings) per method —
+                    // overrides of the outer scope are saved and
+                    // restored.
                     let method_owner = GenericOwner::Function(method_text.to_string());
+                    let mut saved: Vec<(Symbol, Option<GenericOwner>)> =
+                        Vec::with_capacity(fnd.generics.len());
                     for g in &fnd.generics {
                         let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
-                        method_generics.insert(g_sym, method_owner.clone());
+                        let prev = generics_in_scope.insert(g_sym, method_owner.clone());
+                        saved.push((g_sym, prev));
                     }
-                    let ty = lower_type_ref_project(hir, ret, arena_mut, &*index, &method_generics);
+                    let ty =
+                        lower_type_ref_project(hir, ret, arena_mut, &*index, &generics_in_scope);
+                    // Restore: undo every push (in reverse so a method
+                    // that re-shadows an outer name plays back correctly).
+                    for (k, prev) in saved.into_iter().rev() {
+                        match prev {
+                            Some(v) => {
+                                generics_in_scope.insert(k, v);
+                            }
+                            None => {
+                                generics_in_scope.remove(&k);
+                            }
+                        }
+                    }
                     entry.methods.push((type_sym, method_sym, ty));
                 }
             }

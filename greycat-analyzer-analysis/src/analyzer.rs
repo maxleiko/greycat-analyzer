@@ -1011,25 +1011,34 @@ impl<'a> Cx<'a> {
         arg_tys: &[TypeId],
         call_range: Range<usize>,
     ) -> Option<TypeId> {
-        let Expr::Ident(name_idx) = self.hir.exprs[callee].clone() else {
-            return None;
+        // P19.8: peek without cloning the whole `Expr` — `name_idx`
+        // is a `Copy` `Idx<Ident>`, no allocation.
+        let name_idx = match &self.hir.exprs[callee] {
+            Expr::Ident(idx) => *idx,
+            _ => return None,
         };
         let Definition::Decl(decl_id) = self.res.lookup(name_idx)? else {
             // Cross-module / param-as-fn / lambda callees aren't
             // handled in this pass — they fall back to `any`.
             return None;
         };
-        let Decl::Fn(fnd) = self.hir.decls[decl_id].clone() else {
-            return None;
+        // Pre-bind the fields we need from the FnDecl so we can drop
+        // the `&self.hir.decls[..]` borrow before the `&mut self`
+        // calls below. `params` / `generics` are `Vec<Idx<_>>` —
+        // the clone copies indices, not the underlying nodes.
+        let (fn_name_idx, fn_generics, fn_params, fn_return_type) = match &self.hir.decls[decl_id] {
+            Decl::Fn(fnd) if !fnd.generics.is_empty() => (
+                fnd.name,
+                fnd.generics.clone(),
+                fnd.params.clone(),
+                fnd.return_type,
+            ),
+            _ => return None,
         };
-        if fnd.generics.is_empty() {
-            return None;
-        }
         // Lower the declared signature with the fn's generics in scope.
-        let owner = GenericOwner::Function(self.hir.idents[fnd.name].text.clone());
-        self.push_generic_scope(&fnd.generics, owner);
-        let declared_params: Vec<TypeId> = fnd
-            .params
+        let owner = GenericOwner::Function(self.hir.idents[fn_name_idx].text.clone());
+        self.push_generic_scope(&fn_generics, owner);
+        let declared_params: Vec<TypeId> = fn_params
             .iter()
             .map(|p_id| {
                 self.hir.fn_params[*p_id]
@@ -1038,8 +1047,7 @@ impl<'a> Cx<'a> {
                     .unwrap_or_else(|| self.any())
             })
             .collect();
-        let declared_return = fnd
-            .return_type
+        let declared_return = fn_return_type
             .map(|t| self.lower_type_ref(t))
             .unwrap_or_else(|| self.any());
         self.pop_generic_scope();
