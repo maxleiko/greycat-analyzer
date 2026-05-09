@@ -22,7 +22,7 @@ use greycat_analyzer_hir::types::{Decl, Ident};
 use greycat_analyzer_hir::{Hir, lower_module};
 
 use crate::analyzer::{AnalysisResult, ForeignMember, MemberDef, analyze_with_index};
-use crate::lint::{LintDiagnostic, run_lints};
+use crate::lint::{LintDiagnostic, lint_arrow_on_non_deref, run_lints};
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::ProjectIndex;
 
@@ -149,6 +149,11 @@ impl ProjectAnalysis {
         // inference (Static / QualifiedStatic / Member / Arrow / Ident
         // callees).
         let _ = self.infer_cross_module_call_types();
+        // Pass 3.55 (P16.6): typed lint — `arrow-on-non-deref`. Runs
+        // after the cross-module type fixups so receiver types reflect
+        // foreign decls. Idempotent on re-entry: clear the rule's prior
+        // findings before re-emitting.
+        self.run_typed_lints(None);
         // Pass 3.6: type-relation validation. Full project re-validate
         // because `rebuild` started from an empty cache.
         self.validate_type_relations(None);
@@ -661,6 +666,36 @@ impl ProjectAnalysis {
     ///   the changed URI plus any module whose `expr_types` were
     ///   touched by the cross-module fixup passes. Used by
     ///   `invalidate` to keep per-keystroke cost bounded.
+    ///
+    /// P16.6 — typed lints that depend on settled per-expr types and
+    /// the project-wide [`ProjectIndex`]. Runs after the cross-module
+    /// type fixup passes (3.4 / 3.5) and before
+    /// [`Self::validate_type_relations`]. Idempotent: drops prior
+    /// findings for the rule before re-emitting.
+    ///
+    /// `restrict = None` lints every cached module; `Some(set)` only
+    /// the listed URIs (matches the type-relation validation scope).
+    fn run_typed_lints(&mut self, restrict: Option<&HashSet<String>>) {
+        let in_scope = |uri: &Uri| -> bool {
+            match restrict {
+                None => true,
+                Some(set) => set.contains(uri.as_str()),
+            }
+        };
+        for (uri, module) in self.modules.iter_mut() {
+            if !in_scope(uri) {
+                continue;
+            }
+            module.lints.retain(|l| l.rule != "arrow-on-non-deref");
+            lint_arrow_on_non_deref(
+                &module.hir,
+                &module.analysis,
+                &self.index,
+                &mut module.lints,
+            );
+        }
+    }
+
     fn validate_type_relations(&mut self, restrict: Option<&HashSet<String>>) {
         use crate::analyzer::{DiagCategory, SemanticDiagnostic};
 
@@ -942,6 +977,9 @@ impl ProjectAnalysis {
         touched.insert(uri.as_str().to_string()); // changed doc itself
         touched.extend(self.infer_cross_module_member_types());
         touched.extend(self.infer_cross_module_call_types());
+        // Typed lint pass (P16.6). Same scope as `validate_type_relations`
+        // — only the modules whose types changed need re-linting.
+        self.run_typed_lints(Some(&touched));
         // Incremental validation — only the changed URI plus any
         // module whose types were updated by the post-passes.
         self.validate_type_relations(Some(&touched));

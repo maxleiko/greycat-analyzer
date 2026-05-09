@@ -16,9 +16,12 @@ use std::ops::Range;
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, FnDecl, Ident, Stmt, TypeDecl};
+use greycat_analyzer_hir::types::{Decl, Expr, FnDecl, Ident, MemberExpr, Stmt, TypeDecl};
+use greycat_analyzer_types::{TypeKind, is_node_tag};
 
+use crate::analyzer::AnalysisResult;
 use crate::resolver::{Definition, Resolutions};
+use crate::stdlib::ProjectIndex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintSeverity {
@@ -337,6 +340,90 @@ fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
     })
 }
 
+// =============================================================================
+// Rule: arrow-on-non-deref (P16.6 — typed lint)
+// =============================================================================
+
+/// Walk every `Expr::Arrow` and emit an error when the receiver's type is
+/// neither a node tag (`is_node_tag`) nor declared with `@deref(...)` in
+/// the `ProjectIndex::type_flags` table. Mirrors the GreyCat runtime's
+/// "cannot deref" rejection — caught at edit time rather than at run.
+///
+/// This is a *typed* lint: it depends on the per-module
+/// [`AnalysisResult`] (for `expr_types`) and the project-wide
+/// [`ProjectIndex`] (for `@deref` type flags), so it doesn't run as part
+/// of [`run_lints`]. The project pipeline drives it after the
+/// cross-module type fixups have settled — see
+/// [`crate::project::ProjectAnalysis`].
+///
+/// Skipped (conservative) cases:
+/// - `any` / `null` / `never` — no concrete type to check.
+/// - `union` / `lambda` / `tuple` / `anonymous` / `enum` / `generic_param`
+///   — no head name to look up. Better to under-warn than to fire on
+///   shapes the lint hasn't been formally taught.
+pub fn lint_arrow_on_non_deref(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    index: &ProjectIndex,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    for (expr_id, expr) in hir.exprs.iter() {
+        let Expr::Arrow(MemberExpr {
+            receiver,
+            byte_range,
+            ..
+        }) = expr
+        else {
+            continue;
+        };
+        let Some(recv_ty) = analysis.expr_types.get(receiver).copied() else {
+            continue;
+        };
+        let head = receiver_head_name(&analysis.types, recv_ty);
+        let Some(name) = head else {
+            // Conservative: receiver is `any` / lambda / tuple / etc. —
+            // no head name to classify. Skip.
+            continue;
+        };
+        if is_node_tag(&name) {
+            continue;
+        }
+        if index
+            .type_flags
+            .get(&name)
+            .is_some_and(|f| f.deref.is_some())
+        {
+            continue;
+        }
+        let _ = expr_id;
+        let display = greycat_analyzer_types::display(&analysis.types, recv_ty);
+        out.push(LintDiagnostic {
+            rule: "arrow-on-non-deref",
+            severity: LintSeverity::Error,
+            message: format!("`->` requires a node-tag or `@deref` receiver, got `{display}`"),
+            byte_range: byte_range.clone(),
+        });
+    }
+}
+
+/// Extract the head name of `recv_ty` for `arrow-on-non-deref` dispatch.
+/// Strips top-level nullability and reduces `Named` / `Generic` /
+/// `Primitive` to their canonical name. Returns `None` for shapes the
+/// lint conservatively skips (any / never / null / lambda / tuple /
+/// anonymous / union / enum / generic-param).
+fn receiver_head_name(
+    arena: &greycat_analyzer_types::TypeArena,
+    ty: greycat_analyzer_types::TypeId,
+) -> Option<String> {
+    let t = arena.get(ty);
+    match &t.kind {
+        TypeKind::Named { name } => Some(name.clone()),
+        TypeKind::Generic { name, .. } => Some(name.clone()),
+        TypeKind::Primitive(p) => Some(p.name().to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +577,145 @@ fn f(_unused: int): int {
         assert!(
             !diags.iter().any(|d| d.rule == "duplicate-decl"),
             "distinct names should not flag: {diags:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // arrow-on-non-deref (P16.6) — exercised via the project pipeline so
+    // the typed-lint pass actually fires (it consumes the analyzer's
+    // `expr_types` table and the project-wide `ProjectIndex`).
+    // -------------------------------------------------------------------
+
+    fn project_lints(src: &str) -> Vec<LintDiagnostic> {
+        use crate::project::ProjectAnalysis;
+        use greycat_analyzer_core::SourceManager;
+        use greycat_analyzer_core::lsp_types::Uri;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(uri.clone(), src, "project", false);
+        let pa = ProjectAnalysis::analyze(&mgr);
+        pa.module(&uri).unwrap().lints.clone()
+    }
+
+    #[test]
+    fn arrow_on_node_tag_receiver_is_silent() {
+        // P16.6 — `n->name` where `n: node<Foo>` is the canonical OK
+        // shape: `node` is a node-tag, the lint should not fire.
+        let diags = project_lints(
+            r#"
+type Foo {
+    name: String;
+}
+
+fn f() {
+    var n = node<Foo> { Foo { name: "x" } };
+    var s = n->name;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "arrow-on-non-deref"),
+            "node<T>->field should not flag arrow-on-non-deref: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_on_primitive_receiver_errors() {
+        // P16.6 — `s->size` where `s: String` mirrors the runtime's
+        // "arrow operator cannot be applied on String" rejection.
+        let diags = project_lints(
+            r#"
+fn f() {
+    var s: String = "hello";
+    var n = s->size;
+}
+"#,
+        );
+        let hits: Vec<&LintDiagnostic> = diags
+            .iter()
+            .filter(|d| d.rule == "arrow-on-non-deref")
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected one arrow-on-non-deref hit on `s->size`, got {diags:?}"
+        );
+        assert_eq!(hits[0].severity, LintSeverity::Error);
+        assert!(
+            hits[0].message.contains("String"),
+            "expected the receiver type to surface in the message: {}",
+            hits[0].message
+        );
+    }
+
+    #[test]
+    fn arrow_on_user_type_without_deref_errors() {
+        // Plain user type without `@deref` — `b->whatever` should
+        // surface `arrow-on-non-deref`.
+        let diags = project_lints(
+            r#"
+type Box {
+    inner: String;
+}
+
+fn f() {
+    var b = Box { inner: "x" };
+    var x = b->inner;
+}
+"#,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "arrow-on-non-deref" && d.message.contains("Box")),
+            "expected arrow-on-non-deref on Box receiver: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_on_deref_annotated_user_type_is_silent() {
+        // `@deref("inner")` means the type opts into `->` semantics in
+        // the type system. Lint should let it through even though the
+        // runtime might still reject non-native bearers — we mirror
+        // the *spec* the analyzer is asked to enforce.
+        let diags = project_lints(
+            r#"
+@deref("inner")
+type Box {
+    inner: String;
+}
+
+fn f() {
+    var b = Box { inner: "x" };
+    var x = b->inner;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "arrow-on-non-deref"),
+            "@deref(...) should suppress arrow-on-non-deref: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_on_any_receiver_is_silent() {
+        // Conservative: when the receiver's type is `any` (no concrete
+        // head name) we skip the lint rather than firing on every
+        // un-typed use.
+        let diags = project_lints(
+            r#"
+fn pick(): any { return 1; }
+
+fn f() {
+    var x = pick();
+    var y = x->whatever;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "arrow-on-non-deref"),
+            "any-typed receivers should not flag: {diags:?}"
         );
     }
 }
