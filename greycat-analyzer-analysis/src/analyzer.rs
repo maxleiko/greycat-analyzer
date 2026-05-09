@@ -605,6 +605,17 @@ impl<'a> Cx<'a> {
                 let prop = self.ident_text(*property);
                 Some(format!("{recv_path}.{prop}"))
             }
+            // **P19.21** — `x->y` participates in member-narrowing the
+            // same way `x.y` does. Distinct separator (`->`) keeps the
+            // path keys disjoint from the dot-form so a same-named
+            // field on the tag vs the inner type doesn't collide.
+            Expr::Arrow(MemberExpr {
+                receiver, property, ..
+            }) => {
+                let recv_path = self.member_path(*receiver)?;
+                let prop = self.ident_text(*property);
+                Some(format!("{recv_path}->{prop}"))
+            }
             _ => None,
         }
     }
@@ -636,7 +647,7 @@ impl<'a> Cx<'a> {
             }
             return;
         }
-        if matches!(self.hir.exprs[target], Expr::Member(_))
+        if matches!(self.hir.exprs[target], Expr::Member(_) | Expr::Arrow(_))
             && let Some(path) = self.member_path(target)
         {
             if self.arena.get(value_ty).nullable {
@@ -647,6 +658,38 @@ impl<'a> Cx<'a> {
             } else {
                 self.write_member_non_null(path);
             }
+        }
+    }
+
+    /// **P19.21** — narrow record for the `?=` (coalesce-assign)
+    /// operator. Semantics: if LHS is null, assign RHS; otherwise
+    /// leave LHS unchanged. The post-state is non-null when RHS is
+    /// non-null (either LHS was already non-null, or we just wrote a
+    /// non-null value). When RHS is itself nullable, we can't
+    /// guarantee non-null after the op — but unlike `=` we also
+    /// MUST NOT drop an existing non-null narrow, since `?=` only
+    /// fires when LHS is null and a previously-non-null LHS stays
+    /// non-null.
+    fn record_coalesce_assign_narrow(&mut self, target: Idx<Expr>, value_ty: TypeId) {
+        if self.arena.get(value_ty).nullable {
+            // RHS nullable — `?=` may leave LHS null. Don't write a
+            // narrow; don't drop one either.
+            return;
+        }
+        if let Expr::Ident(name_idx) = &self.hir.exprs[target] {
+            if let Some(Definition::Param(def) | Definition::Local(def)) =
+                self.res.lookup(*name_idx)
+                && let Some(cur) = self.lookup_def_type(def)
+            {
+                let stripped = self.strip_nullable(cur);
+                self.write_narrow(def, stripped);
+            }
+            return;
+        }
+        if matches!(self.hir.exprs[target], Expr::Member(_) | Expr::Arrow(_))
+            && let Some(path) = self.member_path(target)
+        {
+            self.write_member_non_null(path);
         }
     }
 
@@ -2179,9 +2222,10 @@ impl<'a> Cx<'a> {
         None
     }
 
-    /// **P19.16** — `foo.bar != null` / `null != foo.bar` (and `==`)
-    /// shape detection. Returns the member-access path string when
-    /// one side is an `Expr::Member` rooted at an Ident / `this` and
+    /// **P19.16 + P19.21** — `foo.bar != null` / `null != foo.bar`
+    /// (and `==`, plus the `->` arrow form `foo->bar`) shape detection.
+    /// Returns the member-access path string when one side is an
+    /// `Expr::Member` / `Expr::Arrow` rooted at an Ident / `this` and
     /// the other side is the null literal. Returns `None` for any
     /// other shape (so e.g. `foo.bar == baz.qux` or `f().x != null`
     /// don't participate).
@@ -2195,10 +2239,12 @@ impl<'a> Cx<'a> {
                 })
             )
         };
-        if matches!(self.hir.exprs[l], Expr::Member(_)) && is_null_lit(r) {
+        let is_member_or_arrow =
+            |id: Idx<Expr>| matches!(self.hir.exprs[id], Expr::Member(_) | Expr::Arrow(_));
+        if is_member_or_arrow(l) && is_null_lit(r) {
             return self.member_path(l);
         }
-        if matches!(self.hir.exprs[r], Expr::Member(_)) && is_null_lit(l) {
+        if is_member_or_arrow(r) && is_null_lit(l) {
             return self.member_path(r);
         }
         None
@@ -2408,14 +2454,14 @@ impl<'a> Cx<'a> {
                 } else {
                     base_ty
                 };
-                // **P19.16** — strip the result's nullability when
-                // the member-access path was guarded non-null in
-                // an enclosing scope (`if (foo.bar != null) { ... }`).
-                // Only applies to `Expr::Member` — for `Expr::Arrow`
-                // the result lives on the deref'd type and the
-                // receiver's narrow doesn't carry directly.
-                if matches!(self.hir.exprs[expr_id], Expr::Member(_))
-                    && self.arena.get(result_ty).nullable
+                // **P19.16 + P19.21** — strip the result's nullability
+                // when the member-access path was guarded non-null in
+                // an enclosing scope (`if (foo.bar != null) { ... }`)
+                // or write-narrowed by `?=`. Applies to both
+                // `Expr::Member` (`.`) and `Expr::Arrow` (`->`); the
+                // path keys carry the operator (`->` vs `.`) so the
+                // two forms don't share narrows.
+                if self.arena.get(result_ty).nullable
                     && let Some(path) = self.member_path(expr_id)
                     && self.member_path_is_non_null(&path)
                 {
@@ -2616,6 +2662,8 @@ impl<'a> Cx<'a> {
                 // hold along every path.
                 if matches!(op, BinOp::Other("=")) {
                     self.record_assign_narrow(left, rt);
+                } else if matches!(op, BinOp::Other("?=")) {
+                    self.record_coalesce_assign_narrow(left, rt);
                 }
                 self.infer_binary(op, lt, rt)
             }

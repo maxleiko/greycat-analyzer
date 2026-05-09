@@ -1376,6 +1376,92 @@ fn f(x: String?) {
         );
     }
 
+    // -------------------------------------------------------------------
+    // P19.21 — narrowing extensions: `?=` and Arrow paths
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn coalesce_assign_narrows_member_lhs() {
+        // `x.y ?= value` where `value` is non-null guarantees `x.y` is
+        // non-null after the op. Subsequent reads must NOT flag
+        // `possibly-null`. Mirrors the dominant pattern in the
+        // solarleb corpus (`country->governorates ?= nodeIndex<…> {};`).
+        let diags = project_lints(
+            r#"
+type Bag { items: Map<String, int>?; }
+fn f(b: Bag) {
+    b.items ?= Map<String, int> {};
+    var _ = b.items.size();
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "?= with non-null RHS should narrow LHS to non-null: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn coalesce_assign_narrows_arrow_lhs() {
+        // Same as above but with the `->` form on a node-tag receiver.
+        let diags = project_lints(
+            r#"
+type Inner { v: int; }
+type Outer { items: Map<String, int>?; }
+fn f(x: node<Outer>) {
+    x->items ?= Map<String, int> {};
+    var _ = x->items.size();
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "?= on arrow path should narrow: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_path_if_null_guard_narrows_else_branch() {
+        // `if (x->y == null) { ... } else { x->y.foo() }` — the else
+        // branch should see `x->y` as non-null. Required Arrow support
+        // in `member_compared_to_null` and `member_path`.
+        let diags = project_lints(
+            r#"
+type Inner { fn ping(): int { return 0; } }
+type Outer { y: Inner?; }
+fn f(x: node<Outer>) {
+    if (x->y == null) {
+        return;
+    }
+    var _ = x->y.ping();
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "post-guard arrow access should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_path_short_circuit_and_narrows_rhs() {
+        // `x->y != null && x->y.foo()` — the right operand of `&&`
+        // sees the LHS narrows applied (P13.2-followup).
+        let diags = project_lints(
+            r#"
+type Inner { fn ping(): int { return 0; } }
+type Outer { y: Inner?; }
+fn f(x: node<Outer>) {
+    var _ = x->y != null && x->y.ping() > 0;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "RHS of `&&` after `x->y != null` should not flag: {diags:?}"
+        );
+    }
+
     #[test]
     fn nullability_lints_skip_any_receiver() {
         // `any` carries `nullable: true` in the arena, so a naive
