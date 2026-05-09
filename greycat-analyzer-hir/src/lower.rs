@@ -966,30 +966,65 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "object_expr" => {
+            // Grammar:
+            //   object_expr        := type_ident (object_initializers | object_fields)
+            //   object_initializers := "{" sepBy(",", _expr) "}"          // positional
+            //   object_fields       := "{" sepBy(",", object_field) "}"   // named
+            //   object_field        := name:_expr ":" value:_expr
+            //
+            // Bug fixed (P17.6 investigation): the previous lowering
+            // looked for `object_field` children inside `object_initializers`
+            // and never entered the `object_fields` branch at all. Both
+            // forms ended up producing `fields = []`, dropping every
+            // value expression from the HIR — which silenced the
+            // resolver on every ident inside an object literal and
+            // produced cascading `unused-local` / `unused-param` /
+            // `unresolved name` false positives downstream.
             let ty = node
                 .child_by_field_name("type")
                 .and_then(|n| lower_type_ref(cx, n));
             let mut fields = Vec::new();
-            if let Some(inits) = node
-                .named_children(&mut node.walk())
-                .find(|c| c.kind() == "object_initializers")
-            {
-                let mut c = inits.walk();
-                for of in inits.named_children(&mut c) {
-                    if of.kind() != "object_field" {
-                        continue;
+            let mut walk = node.walk();
+            for child in node.named_children(&mut walk) {
+                match child.kind() {
+                    "object_initializers" => {
+                        let mut c = child.walk();
+                        for value_node in child.named_children(&mut c) {
+                            if let Some(value) = lower_expr(cx, value_node) {
+                                fields.push(ObjectField {
+                                    name: None,
+                                    value,
+                                    byte_range: value_node.byte_range(),
+                                });
+                            }
+                        }
                     }
-                    let name = of.child_by_field_name("name").map(|n| cx.alloc_ident(n));
-                    let value = of
-                        .child_by_field_name("value")
-                        .and_then(|v| lower_expr(cx, v));
-                    if let Some(value) = value {
-                        fields.push(ObjectField {
-                            name,
-                            value,
-                            byte_range: of.byte_range(),
-                        });
+                    "object_fields" => {
+                        let mut c = child.walk();
+                        for of in child.named_children(&mut c) {
+                            if of.kind() != "object_field" {
+                                continue;
+                            }
+                            // `name` is graphed as `_expr` in the grammar
+                            // but is conventionally a bare ident; only
+                            // record the binding when it actually is one.
+                            let name = of
+                                .child_by_field_name("name")
+                                .filter(|n| n.kind() == "ident")
+                                .map(|n| cx.alloc_ident(n));
+                            let value = of
+                                .child_by_field_name("value")
+                                .and_then(|v| lower_expr(cx, v));
+                            if let Some(value) = value {
+                                fields.push(ObjectField {
+                                    name,
+                                    value,
+                                    byte_range: of.byte_range(),
+                                });
+                            }
+                        }
                     }
+                    _ => {}
                 }
             }
             Expr::Object(ObjectExpr {

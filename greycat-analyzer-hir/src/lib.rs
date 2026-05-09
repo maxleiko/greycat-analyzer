@@ -137,4 +137,82 @@ type Point {
         };
         assert!(matches!(rhs.op, BinOp::Mul));
     }
+
+    #[test]
+    fn object_expr_named_fields_lower_their_values() {
+        // Regression: lowering used to look for `object_field` children
+        // inside `object_initializers`; the named form (`object_fields`)
+        // was never handled, so every value expression was dropped from
+        // the HIR. That silenced the resolver on every ident inside a
+        // named object literal and produced cascading `unused-local` /
+        // `unused-param` false positives.
+        let src = r#"
+type Foo { name: String; age: int; }
+fn build(n: String, a: int): Foo {
+    return Foo { name: n, age: a };
+}
+"#;
+        let tree = parse(src);
+        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let module = hir.module.as_ref().unwrap();
+        let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
+            panic!("expected fn decl")
+        };
+        let body = fnd.body.unwrap();
+        let Stmt::Block(block) = &hir.stmts[body] else {
+            panic!("expected block")
+        };
+        let Stmt::Return(Some(ret)) = &hir.stmts[block.stmts[0]] else {
+            panic!("expected return")
+        };
+        let Expr::Object(obj) = &hir.exprs[*ret] else {
+            panic!("expected object expr, got {:?}", &hir.exprs[*ret])
+        };
+        assert_eq!(obj.fields.len(), 2, "named fields must be lowered");
+        assert!(obj.fields[0].name.is_some(), "name slot is bound");
+        let Expr::Ident(name_use) = &hir.exprs[obj.fields[0].value] else {
+            panic!("expected ident use for value")
+        };
+        assert_eq!(hir.idents[*name_use].text, "n");
+    }
+
+    #[test]
+    fn object_expr_positional_initializers_lower_each_value() {
+        // The positional form `node<T> { val }` produced empty fields
+        // before — the lowering iterated children searching for
+        // `object_field` nodes that don't exist there. Each child is a
+        // bare `_expr`. Locking the corrected shape in.
+        let src = r#"
+type Group { name: String; }
+fn make(g: Group) {
+    var n = node<Group> { g };
+}
+"#;
+        let tree = parse(src);
+        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let module = hir.module.as_ref().unwrap();
+        let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
+            panic!("expected fn decl")
+        };
+        let body = fnd.body.unwrap();
+        let Stmt::Block(block) = &hir.stmts[body] else {
+            panic!("expected block")
+        };
+        let Stmt::Var(var) = &hir.stmts[block.stmts[0]] else {
+            panic!("expected var stmt")
+        };
+        let init_expr = var.init.expect("initializer present");
+        let Expr::Object(obj) = &hir.exprs[init_expr] else {
+            panic!("expected object expr")
+        };
+        assert_eq!(obj.fields.len(), 1, "single positional value");
+        assert!(
+            obj.fields[0].name.is_none(),
+            "positional values have no name slot"
+        );
+        let Expr::Ident(used) = &hir.exprs[obj.fields[0].value] else {
+            panic!("expected ident use")
+        };
+        assert_eq!(hir.idents[*used].text, "g");
+    }
 }
