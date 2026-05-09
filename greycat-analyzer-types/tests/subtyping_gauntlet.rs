@@ -85,14 +85,21 @@ fn rt_int_to_any_allowed() {
 }
 
 #[test]
-fn rt_any_to_int_rejected() {
-    // Runtime: `var a: any = 1; take(a)` against `take(_: int)` is
-    // REJECTED. `any` is the top type — values flow *into* it, not
-    // *out of* it without a cast.
+fn rt_any_to_int_allowed() {
+    // **P20.1** — Runtime: `var a: any = 1; take(a)` against
+    // `take(_: int)` *compiles* and *runs* successfully (the runtime
+    // accepts `any → T` at compile time and defers the dynamic type
+    // check to call time; only `var a: any = "x"; take(a)` fails —
+    // and that failure is an `Error` raised at runtime, not a
+    // compile-time rejection). The earlier "rejected" capture
+    // conflated runtime *dynamic* dispatch failures with compile-time
+    // assignability; verified against `greycat run` 8.0.269-dev.
+    // `is_assignable_to` is a compile-time relation, so `any → T`
+    // must pass — `any` is *both* top and bottom in the lattice.
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let any = a.any();
-    assert!(!is_assignable_to(&a, any, i));
+    assert!(is_assignable_to(&a, any, i));
 }
 
 #[test]

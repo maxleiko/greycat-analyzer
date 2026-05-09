@@ -484,6 +484,17 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     if matches!(b.kind, TypeKind::Any) {
         return true;
     }
+    // **P20.1** — `any` is *also* the bottom type. The GreyCat
+    // compiler accepts `any → T` for any `T` (it compiles cleanly
+    // and defers the type check to runtime assignment / call time);
+    // the static analyzer must match. This mirrors TypeScript's
+    // `any` semantics where the type is both top and bottom. Source
+    // nullability is ignored: `any?` → `T` also passes (the runtime
+    // compiles it; null at runtime would fail the same way a wrong
+    // type would).
+    if matches!(a.kind, TypeKind::Any) {
+        return true;
+    }
     // A non-nullable can't widen into a different non-nullable type just
     // because of nullability difference: `T → T?` is fine, `T? → T` is not.
     if a.nullable && !b.nullable {
@@ -1074,21 +1085,33 @@ mod tests {
     }
 
     #[test]
-    fn lambda_contravariant_params_covariant_return() {
+    fn lambda_with_any_slot_is_symmetric() {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
         let any = a.any();
-        // After P12.4 dropped int→float widening, exercise the variance
-        // through the `any` top type. `f1: (any) -> int` is assignable
-        // to `f2: (int) -> any`:
-        //   * param: f2.param `int` → f1.param `any`  ✓ (int → any).
-        //   * return: f1.ret `int` → f2.ret `any`     ✓ (int → any).
-        // Reverse fails: `f2: (int) -> any` → `f1: (any) -> int` would
-        // need `any → int` for the param (`any` is nullable, `int` is
-        // not — rejected by the null-flow check).
+        // After P20.1, `any` is interchangeable with any other type
+        // (both top *and* bottom in the lattice — mirrors the runtime
+        // which compiles `any → T` and defers the type check). So a
+        // lambda with `any` in any slot is mutually assignable with a
+        // lambda that has a concrete type in the same slot.
+        // `f1: (any) -> int` ↔ `f2: (int) -> any`:
+        //   * f1 → f2: param needs `int → any` ✓, return needs `int → any` ✓.
+        //   * f2 → f1: param needs `any → int` ✓ (P20.1), return needs `any → int` ✓.
         let f1 = a.lambda(vec![any], int);
         let f2 = a.lambda(vec![int], any);
         assert!(is_assignable_to(&a, f1, f2));
+        assert!(is_assignable_to(&a, f2, f1));
+    }
+
+    #[test]
+    fn lambda_arity_mismatch_rejected() {
+        let mut a = fresh();
+        let int = a.primitive(Primitive::Int);
+        // Arity mismatch is hard-rejected regardless of the `any`
+        // bidirectionality from P20.1 — no slot count, no relation.
+        let f1 = a.lambda(vec![int], int);
+        let f2 = a.lambda(vec![int, int], int);
+        assert!(!is_assignable_to(&a, f1, f2));
         assert!(!is_assignable_to(&a, f2, f1));
     }
 
