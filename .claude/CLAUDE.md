@@ -52,10 +52,15 @@ Grammar edit loop:
 ```sh
 # 1. Edit tree-sitter-greycat/grammar.js
 # 2. Regenerate parser.c + node-types.json
-cd tree-sitter-greycat && tree-sitter generate && cd -
-# 3. Re-run gauntlet
+cd tree-sitter-greycat && tree-sitter generate
+# 3. Run the in-grammar corpus tests (locks shape of tricky parses)
+tree-sitter test
+cd -
+# 4. Re-run gauntlet
 cargo test -p greycat-analyzer-syntax --test coverage
 ```
+
+`tree-sitter-greycat/test/corpus/*.txt` holds **regression tests for grammar shape** — precedence (`binary_expr_precedence.txt`), associativity, nullable postfix (`optional_postfix.txt`), and any other parse where the right tree was historically not obvious. Each block is a named source snippet plus the exact CST s-expression it should produce. **When you fix a parse bug, add a test here** so it can't regress silently. Run via `tree-sitter test` from inside the submodule. These tests run *fast* (no Rust compile) and catch shape regressions earlier than the Rust gauntlet, so they are the first signal — but they are not a substitute for the gauntlet.
 
 The syntax crate's `build.rs` reads `node-types.json` directly from the submodule; there is no vendored copy in `greycat-analyzer-syntax/`. The submodule SHA *is* the grammar pin.
 
