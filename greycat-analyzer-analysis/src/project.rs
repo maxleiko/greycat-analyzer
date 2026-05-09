@@ -23,7 +23,9 @@ use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_hir::{Hir, lower_module};
 
 use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
-use crate::lint::{LintDiagnostic, lint_arrow_on_non_deref, lint_nullability, run_lints};
+use crate::lint::{
+    LintDiagnostic, lint_arrow_on_non_deref, lint_inferred_return_type, lint_nullability, run_lints,
+};
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::{FnSignature, ProjectIndex};
 
@@ -1014,6 +1016,7 @@ impl ProjectAnalysis {
                         | "redundant-nullable-access"
                         | "redundant-non-null-assertion"
                         | "redundant-coalesce"
+                        | "infer-return-type"
                 )
             });
             lint_arrow_on_non_deref(
@@ -1024,6 +1027,7 @@ impl ProjectAnalysis {
                 &mut module.lints,
             );
             lint_nullability(&module.hir, &module.analysis, arena, &mut module.lints);
+            lint_inferred_return_type(&module.hir, &module.analysis, arena, &mut module.lints);
         }
     }
 

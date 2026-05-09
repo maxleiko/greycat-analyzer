@@ -546,6 +546,99 @@ impl LintRule for ModVarShape {
 // `Null` — those are too noisy to warn on (every untyped expression
 // would flag) and degenerate, respectively.
 
+// =============================================================================
+// Rule: infer-return-type  (P19.20 — typed lint)
+// =============================================================================
+//
+// Hint when a `fn` has no declared return type but the analyzer could
+// infer one from its body. Mirrors the TS reference's
+// `Return type can be inferred as 'X' (fix available)` hint. Pure HIR +
+// `expr_types` walk: pulls the last `return value;` per fn body and
+// reads its settled type. Skips `any` / `never` (uninformative) and
+// fns with `native` / `abstract` modifiers (no body to infer from).
+
+/// Runs from the project pipeline alongside the other typed lints.
+/// Walks every top-level fn and every type-method fn; any `Decl::Fn`
+/// without a declared `return_type` whose body terminates in
+/// `return e;` with a settled, informative type gets a HINT.
+pub fn lint_inferred_return_type(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    let Some(module) = hir.module.as_ref() else {
+        return;
+    };
+    for decl_id in &module.decls {
+        match &hir.decls[*decl_id] {
+            Decl::Fn(fnd) => check_fn_inferred_return(hir, analysis, arena, fnd, out),
+            Decl::Type(td) => {
+                for m_id in &td.methods {
+                    if let Decl::Fn(fnd) = &hir.decls[*m_id] {
+                        check_fn_inferred_return(hir, analysis, arena, fnd, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_fn_inferred_return(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    fnd: &FnDecl,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    if fnd.return_type.is_some() {
+        return;
+    }
+    if fnd.modifiers.native || fnd.modifiers.abstract_ {
+        return;
+    }
+    let Some(body) = fnd.body else {
+        return;
+    };
+    let Some(ret_ty) = inferred_return_from_body(hir, analysis, body) else {
+        return;
+    };
+    let kind = &arena.get(ret_ty).kind;
+    if matches!(kind, TypeKind::Any | TypeKind::Never) {
+        return;
+    }
+    let display = greycat_analyzer_types::display(arena, ret_ty);
+    let name = &hir.idents[fnd.name];
+    out.push(LintDiagnostic {
+        rule: "infer-return-type",
+        severity: LintSeverity::Hint,
+        message: format!("return type can be inferred as `{display}`"),
+        byte_range: name.byte_range.clone(),
+    });
+}
+
+/// Walk a fn body's terminal block looking for the last `return e;`
+/// whose value type was recorded in `expr_types`. Mirrors the inlay-
+/// hint helper in `capabilities`. Misses fns whose every return is
+/// in a nested branch (acceptable — we only suggest when the inference
+/// is unambiguous from the surface).
+fn inferred_return_from_body(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    body: Idx<Stmt>,
+) -> Option<greycat_analyzer_types::TypeId> {
+    let Stmt::Block(block) = &hir.stmts[body] else {
+        return None;
+    };
+    for s in block.stmts.iter().rev() {
+        if let Stmt::Return(Some(e)) = &hir.stmts[*s] {
+            return analysis.expr_types.get(e).copied();
+        }
+    }
+    None
+}
+
 /// True when `expr_id` is downstream of a `?.` / `?->` / `?[` somewhere
 /// in its receiver chain. Such positions are *runtime-safe* even when
 /// the expression's type is nullable: optional chaining short-circuits
@@ -591,6 +684,13 @@ pub fn chain_has_upstream_nullsafe(hir: &Hir, expr_id: Idx<Expr>) -> bool {
 /// is `Any` / `Null` (conservative skip) or absent from `expr_types`
 /// (the visit didn't reach this expression — usually because it's
 /// inside dead code or an `Unsupported` lowering).
+///
+/// **Intentionally NOT covered: `*n` (`Expr::Unary { op: Deref }`)** —
+/// the GreyCat runtime's deref operator handles the null-receiver case
+/// gracefully (returns `null` for a null node-tag), so flagging
+/// `*nullable_node` as "possibly null" would be a false positive even
+/// though the underlying type is nullable. Diverges from the TS
+/// reference here on purpose.
 pub fn lint_nullability(
     hir: &Hir,
     analysis: &AnalysisResult,
