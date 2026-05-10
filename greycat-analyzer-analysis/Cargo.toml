@@ -9,6 +9,11 @@ description.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# P26 — exploration branch. Enables rayon-driven parallelism on the
+# stage_lower / run_typed_lints / resolver / S12 paths. Off by default.
+parallel = ["dep:rayon"]
+
 [dependencies]
 greycat-analyzer-types.workspace = true
 greycat-analyzer-hir.workspace = true
@@ -16,6 +21,7 @@ greycat-analyzer-core.workspace = true
 greycat-analyzer-syntax.workspace = true
 rustc-hash.workspace = true
 smol_str.workspace = true
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 greycat-analyzer-syntax.workspace = true

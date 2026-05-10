@@ -832,6 +832,40 @@ The fix pattern in all cases: **make the quickfix produce a syntactically valid 
 
 ---
 
+### Phase 26 — Easy-win parallelism (rayon, exploration branch — ~1 week)
+
+**Goal:** measure how much wall-clock time `cli lint` (the cold-load path that the bench-lint script exercises) actually loses to single-threaded execution, and try the cheap-to-add parallel seams to see what they buy. **This phase lives on the `parallelism-explore` branch — only landing on `main` if the wins justify the dep / complexity.**
+
+**Why now.** P25 closed at rust ~5× faster than the TS reference and shaved every easy single-threaded allocation win in sight. The remaining latency on the `pro` corpus (~940 ms cold) is dominated by per-module work that is independent across modules: parse + HIR-lower (225 modules × ~3 ms each), per-module body walker (S12), per-module typed-lint pass. A modern laptop has 8-16 cores idling during every `cli lint` run.
+
+**Why caveat-first.** The body walker (S12) takes `&mut TypeArena` for inference — that's the single point of synchronisation that decides whether project-wide parallelism is "embarrassing" or "messy". The cheap chunks (parallel HIR lowering, parallel typed-lint pass) don't touch the arena at all and are obviously safe. The body walker itself is the speculative chunk: gate it behind a Mutex and measure honestly. If contention dominates, drop it.
+
+**Decisions locked.**
+- **Crate: `rayon`** (not `tokio` / not `crossbeam` channels). The work is CPU-bound, embarrassingly per-module, and rayon's `par_iter` is the rust-analyzer-ecosystem default for exactly this shape. The work-stealing scheduler is a single small dep.
+- **Cargo feature flag: `parallel`**, off by default. The CLI binary (`greycat-analyzer`) and the analysis crate gain a `parallel` feature; rayon is an optional dep gated on it. `cfg(feature = "parallel")` switches between the serial `for` loop and the rayon `par_iter`. **Both shapes ship side-by-side** so we can A/B them without a code-fork.
+- **`scripts/bench-lint.sh` flex update**: the TS-reference comparison goes away (the `5×` flex was the P25 finale; further chunks compare to *ourselves*). Replace it with a serial-vs-parallel comparison: build two release binaries — one with `--features parallel`, one without — into separate `target/par-*` dirs, then run hyperfine across both for each corpus.
+- **`DashMap`?** Probably not. The `ProjectIndex` is fully populated *before* the parallel phases run (S1 → S7-S11 are the population stages), and read-only afterwards. `&ProjectIndex` shared across rayon threads needs no DashMap. If profiling surfaces a per-module write hot spot we'll revisit.
+- **Hard rule — no behaviour drift.** Diagnostic counts on `pro` and `solarleb` must remain byte-identical between the serial and parallel builds at every chunk. Rayon's iteration order is non-deterministic; any pass that emits diagnostics in a particular order needs an explicit `sort_by_key` step before consumers see it.
+- **Stop conditions.** Bail out of subsequent chunks when (a) parallel build is *slower* than serial on either corpus (overhead exceeds gain — rare on 225-module workloads, common on 41-module ones if startup is the bottleneck), (b) a chunk would require restructuring `&mut TypeArena` flow rather than wrapping it, (c) the diff against serial mode shows non-deterministic diagnostic output that can't be sorted away cheaply.
+
+**Chunks:**
+
+- [x] **26.1 Bench-lint: drop reference comparison, add serial-vs-parallel mode** (XS) — `scripts/bench-lint.sh` no longer reads `$BENCH_REF`. Builds two release binaries side-by-side: `target/par-off` (default features) and `target/par-on` (`--features parallel`). Runs hyperfine across both for each corpus; the summary table reads off the speedup directly. The `parallel` feature is declared on `greycat-analyzer` (CLI) and `greycat-analyzer-analysis` as a no-op stub for this chunk — `rayon = "1"` lands in workspace deps and as an optional dep behind the feature, but no `cfg(feature = "parallel")` blocks exist yet, so both rows show the same number. **Baseline (P26.1)**: `pro` serial 953 ms, parallel 917 ms (1.04 ± 0.11×); `solarleb` serial 253 ms, parallel 253 ms (1.00 ± 0.07×). Both rows within 1σ of each other — confirms the no-op stub state.
+
+- [ ] **26.2 `parallel` feature + parallel HIR lowering in `stage_lower`** (S) — add `rayon = "1"` as an optional workspace dep, gated behind a `parallel` feature on `greycat-analyzer-analysis` and `greycat-analyzer` (CLI) and `greycat-analyzer-server` (LSP). [`stage_lower`](../greycat-analyzer-analysis/src/project.rs) splits into two passes: (a) collect `(Uri, &Document)` pairs serially, (b) call `lower_module` + `parse_directives` per pair, (c) ingest into `self.index` serially. Step (b) becomes `par_iter` under `cfg(feature = "parallel")`, falls back to a serial `iter().map(...)` chain otherwise. The lowerer is fully self-contained (no project-state writes), so this is mechanical. Index ingestion stays serial because `ProjectIndex::ingest` mutates the project-wide interner. Expected biggest single-chunk win on `pro` (225 modules × per-module lowering).
+
+- [ ] **26.3 Parallel `run_typed_lints`** (S) — [`run_typed_lints`](../greycat-analyzer-analysis/src/project.rs) loops over `self.modules.iter_mut()` and runs N typed-lint passes per module. Each iteration mutates only `module.lints` / `module.directives` and reads `&self.arena` / `&self.index` (post-S12, both are stable). Switch the outer loop to `par_iter_mut` under `cfg(feature = "parallel")`. The lints emit per-module — diagnostic order within a module is preserved by the lint sequence; cross-module ordering doesn't matter (consumers key on `(uri, byte_range)`).
+
+- [ ] **26.4 Parallel resolver pass in `stage_per_module_analysis`** (S) — the per-module loop runs `resolve_with_index(&hir, &self.index)` first (read-only against `&self.index`), then the body walker (mutates `&mut self.arena`). Split the loop: pass 1 does parallel `resolve_with_index` per module into a `Vec<Resolutions>`; pass 2 does the serial body-walker iteration. Resolver-only parallelism is safe because the resolver writes only its return value (`Resolutions` struct).
+
+- [ ] **26.5 Speculative: parallel S12 body walker via `Mutex<TypeArena>`** (M, gated on 26.2-4 deltas) — wrap `self.arena` in a `Mutex<TypeArena>` for the duration of `stage_per_module_analysis`. Each rayon worker locks the arena for `alloc` calls and releases between. Most of the body walker's time is *not* in `alloc` (per the P19 follow-up — the arena is mostly hit-and-return after S7-S11 has prefilled). If contention is < 30% of wall-clock, this lands a real speed-up. If contention dominates: revert. Bench delta is the only acceptance criterion. **Skip if 26.2-4 already saturate the available speedup.**
+
+- [ ] **26.6 Parallel pragma diagnostics + per-module parse_diagnostics in CLI** (XS) — the CLI's [`lint`](../greycat-analyzer/src/cmd/lint.rs) command iterates every loaded doc and runs `parse_diagnostics` + `pragma_diagnostics`. Each is independent. Switch to `par_iter` under the same `parallel` feature. Cheap chunk, only relevant if 26.2-4 don't already swallow the wall-clock.
+
+**M26:** the parallel build is **measurably faster** than the serial build on `pro` (≥ 25 % wall-clock reduction is a strong outcome; even 10 % is worth keeping). On `solarleb` the speedup will be smaller — 41 modules × cheaper per-module work means rayon's startup / scheduling overhead is a bigger fraction. The **decision criterion** is whether the parallel feature lands on `main`: **only if** (a) `pro` is faster by ≥ 10 %, (b) `solarleb` is no slower by more than 1 σ, (c) workspace tests + corpus diagnostic counts stay byte-identical between serial and parallel. If the data lands the chunks, fold rayon into the default feature set; otherwise keep `parallelism-explore` as a documented dead-end branch and update this M26 with the actual numbers.
+
+---
+
 ## 7. Test strategy
 
 Two layers, no "port every TS test" milestone (tarpit).

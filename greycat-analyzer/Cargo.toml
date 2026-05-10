@@ -9,6 +9,13 @@ description.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# P26 — exploration branch.
+# When enabled, propagates rayon-based parallelism through the analysis
+# crate (parallel HIR lowering, typed-lint pass, resolver). Off by
+# default — the bench-lint.sh script builds both flavours side-by-side.
+parallel = ["greycat-analyzer-analysis/parallel"]
+
 [dependencies]
 greycat-analyzer-analysis.workspace = true
 greycat-analyzer-core.workspace = true

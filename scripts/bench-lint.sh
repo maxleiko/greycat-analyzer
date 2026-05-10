@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# P25.1: lint-throughput baseline.
+# P25.1: lint-throughput baseline. P26.1: serial-vs-parallel mode.
 #
-# Runs `cargo run --release -p greycat-analyzer -- lint <project>` under
-# hyperfine for each named corpus, so the SmolStr / FxHashMap / SmallVec
-# chunks (P25.2-P25.8) can quote a delta against a recorded reference.
+# Builds two release binaries — one with `--features parallel`, one
+# without — into separate `target/par-{off,on}` dirs, then runs hyperfine
+# across both for each named corpus, side-by-side. The hyperfine summary
+# table reads off the speedup directly.
 #
-# When `BENCH_REF` points at the TypeScript reference's `greycat-lang`
-# binary (defaults to `$HOME/.greycat/bin/greycat-lang` if it exists),
-# each corpus is benched against both the Rust port and the reference,
-# rendered side-by-side in a single hyperfine table so the speedup is
-# read directly off the output.
+# Until the `parallel` feature exists (P26.2 introduces it), the parallel
+# build falls back to the serial code path — both rows show the same
+# number, which is the right behaviour for chunks that haven't enabled
+# rayon yet.
 #
 # Corpora are referenced by short name only ("pro", "solarleb"). Their
 # absolute paths live in the env (BENCH_PRO / BENCH_SOLARLEB) so the
@@ -19,7 +19,6 @@
 #   scripts/bench-lint.sh                          # run every configured corpus
 #   scripts/bench-lint.sh pro solarleb             # explicit subset
 #   BENCH_PRO=/path/to/pro scripts/bench-lint.sh   # override env path
-#   BENCH_REF= scripts/bench-lint.sh               # disable reference comparison
 #
 # Defaults to the paths the maintainer uses locally; override via env.
 set -euo pipefail
@@ -28,23 +27,22 @@ set -euo pipefail
 : "${BENCH_SOLARLEB:=/home/leiko/dev/datathings/assaad/solarleb}"
 : "${BENCH_WARMUP:=3}"
 : "${BENCH_RUNS:=20}"
-: "${BENCH_REF:=$HOME/.greycat/bin/greycat-lang}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Build once in release so the timed runs don't include the build.
-echo "[bench-lint] cargo build --release -p greycat-analyzer"
-(cd "$REPO_ROOT" && cargo build --release -p greycat-analyzer >/dev/null)
+# Build both flavours into separate target dirs so the binaries can
+# coexist on disk and hyperfine can A/B them without rebuilds in
+# between.
+echo "[bench-lint] cargo build --release -p greycat-analyzer (serial)"
+(cd "$REPO_ROOT" && CARGO_TARGET_DIR=target/par-off \
+    cargo build --release -p greycat-analyzer >/dev/null)
 
-BIN="$REPO_ROOT/target/release/greycat-analyzer"
+echo "[bench-lint] cargo build --release -p greycat-analyzer --features parallel"
+(cd "$REPO_ROOT" && CARGO_TARGET_DIR=target/par-on \
+    cargo build --release -p greycat-analyzer --features parallel >/dev/null)
 
-# When the reference impl exists, hyperfine runs both side-by-side
-# (single warmup + comparison table). Otherwise fall back to a Rust-only
-# bench so the script stays useful in environments without it.
-have_ref=0
-if [[ -n "$BENCH_REF" && -x "$BENCH_REF" ]]; then
-    have_ref=1
-fi
+BIN_OFF="$REPO_ROOT/target/par-off/release/greycat-analyzer"
+BIN_ON="$REPO_ROOT/target/par-on/release/greycat-analyzer"
 
 run_corpus() {
     local name="$1" path="$2"
@@ -61,17 +59,11 @@ run_corpus() {
     # `lint` exits non-zero whenever any diagnostic is emitted (warnings
     # included), which hyperfine treats as a benchmark failure unless we
     # opt out — we just want the wall-clock cost of analysis.
-    if (( have_ref == 1 )); then
-        hyperfine --warmup "$BENCH_WARMUP" --runs "$BENCH_RUNS" --ignore-failure \
-            --command-name "rust ($name)" \
-            "$BIN lint $path/project.gcl --format=compact > /dev/null" \
-            --command-name "ref  ($name)" \
-            "$BENCH_REF lint $path/project.gcl > /dev/null"
-    else
-        hyperfine --warmup "$BENCH_WARMUP" --runs "$BENCH_RUNS" --ignore-failure \
-            --command-name "rust ($name)" \
-            "$BIN lint $path/project.gcl --format=compact > /dev/null"
-    fi
+    hyperfine --warmup "$BENCH_WARMUP" --runs "$BENCH_RUNS" --ignore-failure \
+        --command-name "serial   ($name)" \
+        "$BIN_OFF lint $path/project.gcl --format=compact > /dev/null" \
+        --command-name "parallel ($name)" \
+        "$BIN_ON  lint $path/project.gcl --format=compact > /dev/null"
 }
 
 targets=("$@")
