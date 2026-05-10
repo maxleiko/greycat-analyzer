@@ -77,7 +77,8 @@ pub fn default_tag_for(rule: &str) -> Option<DiagTag> {
         | "unused-suppression"
         | "redundant-nullable-access"
         | "redundant-non-null-assertion"
-        | "redundant-coalesce" => Some(DiagTag::Unnecessary),
+        | "redundant-coalesce"
+        | "redundant-semicolon" => Some(DiagTag::Unnecessary),
         _ => None,
     }
 }
@@ -247,6 +248,10 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
         name: "unused-catch-param",
         summary: "warn when `catch (e) { … }` binds `e` but never reads it — auto-fix drops `(e)` so the form becomes `catch { … }`",
     },
+    LintRuleInfo {
+        name: "redundant-semicolon",
+        summary: "error on a stray `;` after a fn or method body (`fn f() {};`) — the runtime rejects it; auto-fix removes the `;`",
+    },
 ];
 
 /// Run every registered HIR-only rule in order and return the merged
@@ -394,6 +399,56 @@ pub fn lint_catch_empty_parens(
             severity: LintSeverity::Error,
             message: "empty catch parens — drop them (`catch { … }` is the no-binding form)"
                 .to_string(),
+            byte_range,
+            tag: None,
+        });
+    }
+}
+
+/// Flag every `block_trailing_semi` node — a stray `;` after a fn or
+/// method body's closing `}`. The grammar permissively accepts the
+/// shape so a `};` doesn't open a recovery span that swallows the
+/// rest of the surrounding type / module, but the runtime rejects
+/// it; this lint is the analyzer-side strict check that pulls the
+/// scope back to a single-token diagnostic with a quickfix removing
+/// the offending range.
+pub fn lint_redundant_semicolon(
+    text: &str,
+    root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    use greycat_analyzer_syntax::tree_sitter::Node;
+    fn walk(node: Node<'_>, hits: &mut Vec<std::ops::Range<usize>>) {
+        if node.kind() == "block_trailing_semi" {
+            hits.push(node.byte_range());
+        }
+        let mut cur = node.walk();
+        for ch in node.children(&mut cur) {
+            walk(ch, hits);
+        }
+    }
+    let mut hits: Vec<std::ops::Range<usize>> = Vec::new();
+    walk(root, &mut hits);
+    for byte_range in hits {
+        if !bypass_suppressions
+            && directives.suppresses_lint(byte_range.start, "redundant-semicolon")
+        {
+            continue;
+        }
+        let message = if text
+            .get(byte_range.clone())
+            .is_some_and(|s| s.contains(";;"))
+        {
+            "redundant `;` after fn / method body — drop them".to_string()
+        } else {
+            "redundant `;` after fn / method body — drop it".to_string()
+        };
+        out.push(LintDiagnostic {
+            rule: "redundant-semicolon",
+            severity: LintSeverity::Error,
+            message,
             byte_range,
             tag: None,
         });
@@ -2825,5 +2880,81 @@ fn f() {
             )),
             "any-typed receivers/operands should not flag the nullability family: {diags:?}"
         );
+    }
+
+    #[test]
+    fn redundant_semicolon_on_method_body() {
+        // The headline case: stray `;` after a `type` method body. The
+        // grammar permissively accepts it; the lint must flag the single
+        // `;` byte range (not the surrounding span — that's the whole
+        // point of pulling the recovery in via `block_trailing_semi`).
+        let src = "type T {\n    static fn m(): int { return 0; };\n}\n";
+        let diags = project_lints(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.rule == "redundant-semicolon")
+            .expect("expected one `redundant-semicolon` lint");
+        assert_eq!(hit.severity, LintSeverity::Error);
+        assert_eq!(
+            &src[hit.byte_range.clone()],
+            ";",
+            "diagnostic should pin to exactly the stray `;`"
+        );
+    }
+
+    #[test]
+    fn redundant_semicolon_on_top_level_fn_body() {
+        // Same shape but on a top-level `fn_decl`; lints the `;`
+        // after the body's closing `}`.
+        let src = "fn n(): int { return 1; };\n";
+        let diags = project_lints(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.rule == "redundant-semicolon")
+            .expect("expected one `redundant-semicolon` lint");
+        assert_eq!(&src[hit.byte_range.clone()], ";");
+    }
+
+    #[test]
+    fn redundant_semicolon_silent_on_canonical_form() {
+        // No trailing `;` after the body — no diagnostic. Anchors the
+        // permissive-grammar change against accidentally flagging
+        // every method.
+        let diags = project_lints("type T {\n    static fn m(): int { return 0; }\n}\n");
+        assert!(!diags.iter().any(|d| d.rule == "redundant-semicolon"));
+    }
+
+    #[test]
+    fn redundant_semicolon_silent_on_native_method() {
+        // Native (no-body) methods are still allowed to end with `;`
+        // — that's the `_semi` alternative in the grammar, not
+        // `block_trailing_semi`. The lint must not fire.
+        let diags = project_lints("type T {\n    fn m();\n}\n");
+        assert!(!diags.iter().any(|d| d.rule == "redundant-semicolon"));
+    }
+
+    #[test]
+    fn redundant_semicolon_covers_multi_semi_run() {
+        // `};;;` parses as one `block_trailing_semi` whose range
+        // spans all three `;`s. The lint's message switches to plural
+        // ("drop them") and the quickfix removes the whole run.
+        let src = "fn n() { var x = 0; };;;\n";
+        let diags = project_lints(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.rule == "redundant-semicolon")
+            .expect("expected one `redundant-semicolon` lint");
+        assert_eq!(&src[hit.byte_range.clone()], ";;;");
+        assert!(hit.message.contains("drop them"), "got: {}", hit.message);
+    }
+
+    #[test]
+    fn redundant_semicolon_respects_lint_off_next() {
+        // `// gcl-lint-off-next redundant-semicolon` directly above
+        // the offending fn drops the diagnostic — proves the rule
+        // plugs into the standard suppression machinery.
+        let diags =
+            project_lints("// gcl-lint-off-next redundant-semicolon\nfn n(): int { return 1; };\n");
+        assert!(!diags.iter().any(|d| d.rule == "redundant-semicolon"));
     }
 }

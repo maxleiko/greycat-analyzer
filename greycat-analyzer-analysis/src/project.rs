@@ -29,8 +29,8 @@ use crate::directives::Directives;
 use crate::lint::{
     LintDiagnostic, lint_arrow_on_non_deref_with_directives, lint_catch_empty_parens,
     lint_inferred_return_type_with_directives, lint_non_exhaustive_with_directives,
-    lint_nullability_with_directives, lint_unreachable_with_directives, lint_unused_suppressions,
-    run_lints_with_directives,
+    lint_nullability_with_directives, lint_redundant_semicolon, lint_unreachable_with_directives,
+    lint_unused_suppressions, run_lints_with_directives,
 };
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::{FnSignature, ProjectIndex};
@@ -1807,10 +1807,18 @@ fn run_typed_lints_for_module(
                 | "unreachable"
                 | "non-exhaustive"
                 | "catch-empty-parens"
+                | "redundant-semicolon"
         )
     });
     if let Some((text, tree)) = doc_data.get(uri) {
         lint_catch_empty_parens(
+            text,
+            tree.root_node(),
+            &mut module.directives,
+            bypass,
+            &mut module.lints,
+        );
+        lint_redundant_semicolon(
             text,
             tree.root_node(),
             &mut module.directives,

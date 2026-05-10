@@ -51,8 +51,22 @@ pub fn edit_for_diagnostic(
         "non-exhaustive" => non_exhaustive_fix(text, start, message),
         "catch-empty-parens" => catch_empty_parens_fix(text, start, end),
         "unused-catch-param" => unused_catch_param_fix(text, start),
+        "redundant-semicolon" => redundant_semicolon_fix(start, end),
         _ => Vec::new(),
     }
+}
+
+/// Delete the stray trailing `;` (or `;;;`) after a fn / method body.
+/// The diagnostic's byte range already covers exactly the
+/// `block_trailing_semi` CST node, so the fix is just a slice-delete.
+fn redundant_semicolon_fix(start: usize, end: usize) -> Vec<TextEdit> {
+    if end <= start {
+        return Vec::new();
+    }
+    vec![TextEdit {
+        byte_range: start..end,
+        new_text: String::new(),
+    }]
 }
 
 /// Delete the `(e)` after a `catch` keyword, including the leading
@@ -960,5 +974,30 @@ fn t(e: E) {
             "totally not the expected shape",
         );
         assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn redundant_semicolon_deletes_the_range() {
+        // The diagnostic byte range covers exactly the
+        // `block_trailing_semi` CST node, so the quickfix is a plain
+        // slice-delete.
+        let src = "fn n(): int { return 1; };\n";
+        let semi = src.find(";\n").unwrap();
+        let edits = edit_for_diagnostic(src, "redundant-semicolon", &(semi..semi + 1), "");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].byte_range, semi..semi + 1);
+        assert_eq!(edits[0].new_text, "");
+    }
+
+    #[test]
+    fn redundant_semicolon_deletes_multi_semi_run() {
+        // `};;;` -> `}` (entire run is one diagnostic range).
+        let src = "fn n() {};;;\n";
+        let run_start = src.find(";;;").unwrap();
+        let edits =
+            edit_for_diagnostic(src, "redundant-semicolon", &(run_start..run_start + 3), "");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].byte_range, run_start..run_start + 3);
+        assert_eq!(edits[0].new_text, "");
     }
 }
