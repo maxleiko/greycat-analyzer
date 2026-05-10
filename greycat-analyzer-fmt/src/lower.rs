@@ -121,7 +121,31 @@ fn lower_node<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         "for_in_stmt" => lower_for_in_stmt(cx, node),
         "try_stmt" => lower_try_stmt(cx, node),
         "at_stmt" => lower_at_stmt(cx, node),
-        // Exprs (fall back to verbatim until P21.5)
+        // Expressions
+        "binary_expr" => lower_binary_expr(cx, node),
+        "unary_expr" => lower_unary_expr(cx, node),
+        "paren_expr" => lower_paren_expr(cx, node),
+        "tuple_expr" => lower_tuple_expr(cx, node),
+        "object_expr" => lower_object_expr(cx, node),
+        "object_initializers" => lower_object_initializers(cx, node),
+        "object_fields" => lower_object_fields(cx, node),
+        "object_field" => lower_object_field(cx, node),
+        "array_expr" => lower_array_expr(cx, node),
+        "call_expr" => lower_call_expr(cx, node),
+        "args" => lower_args_call(cx, node),
+        "member_expr" => lower_member_expr(cx, node),
+        "arrow_expr" => lower_arrow_expr(cx, node),
+        "static_expr" => lower_static_expr(cx, node),
+        "offset_expr" => lower_offset_expr(cx, node),
+        "lambda_expr" => lower_lambda_expr(cx, node),
+        "range_expr" => lower_range_expr(cx, node),
+        "interval_expr" => lower_interval_expr(cx, node),
+        "type_ident" => lower_type_ident(cx, node),
+        "string" => lower_string(cx, node),
+        "ident" | "number" | "time" | "char" | "true" | "false" | "null" | "this" | "iso8601" => {
+            Doc::text(cx.text(node))
+        }
+        // Default: walk named children with no inter-child spacing.
         _ => verbatim(cx, node),
     }
 }
@@ -871,6 +895,385 @@ fn lower_at_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         parts.push(lower_node(cx, b));
     }
     Doc::concat(parts)
+}
+
+// -------- Expressions --------
+
+fn lower_binary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // left <op> right. Op is one of: ?? ^ / * % + - > >= < <= == != as is && || = ?=
+    // All take spaces around. `as`/`is` take a `type_ident` on the right.
+    let left = node.child_by_field_name("left").map(|n| lower_node(cx, n));
+    let right = node.child_by_field_name("right").map(|n| lower_node(cx, n));
+    // Operator: scan children for the first anonymous one between left and right.
+    let mut op_text: Option<String> = None;
+    let mut walker = node.walk();
+    for c in node.children(&mut walker) {
+        if !c.is_named() && !c.byte_range().is_empty() {
+            op_text = Some(cx.text(c).to_string());
+            break;
+        }
+    }
+    let op = op_text.unwrap_or_else(|| String::from("?"));
+    let mut parts = Vec::new();
+    if let Some(l) = left {
+        parts.push(l);
+    }
+    parts.push(Doc::space());
+    parts.push(Doc::text(op));
+    parts.push(Doc::space());
+    if let Some(r) = right {
+        parts.push(r);
+    }
+    Doc::concat(parts)
+}
+
+fn lower_unary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // Two shapes: prefix (`-x` / `!x` / `+x` / `*x` / `--x` / `++x`)
+    // and postfix (`x--` / `x++` / `x!!`). Distinguish by source order
+    // — the operator is anonymous; the operand is the named `_expr`
+    // sub-node.
+    let mut walker = node.walk();
+    let mut leading: Vec<Doc> = Vec::new();
+    let mut trailing: Vec<Doc> = Vec::new();
+    let mut saw_named = false;
+    for c in node.children(&mut walker) {
+        if c.is_named() {
+            leading.push(lower_node(cx, c));
+            saw_named = true;
+        } else if !c.byte_range().is_empty() {
+            let text = cx.text(c).to_string();
+            if saw_named {
+                trailing.push(Doc::text(text));
+            } else {
+                leading.insert(leading.len().saturating_sub(0), Doc::text(text));
+            }
+        }
+    }
+    // Reorder: `leading` already has prefix-op then operand in source
+    // order if the prefix came first; the `insert` above is a no-op
+    // because we only encountered ops before any named child.
+    let mut parts = Vec::new();
+    parts.extend(leading);
+    parts.extend(trailing);
+    Doc::concat(parts)
+}
+
+fn lower_paren_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let inner = node
+        .child_by_field_name("expr")
+        .map(|n| lower_node(cx, n))
+        .unwrap_or(Doc::nil());
+    Doc::concat(vec![Doc::text("("), inner, Doc::text(")")])
+}
+
+fn lower_tuple_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let l = node.child_by_field_name("left").map(|n| lower_node(cx, n));
+    let r = node.child_by_field_name("right").map(|n| lower_node(cx, n));
+    let mut parts = vec![Doc::text("(")];
+    if let Some(l) = l {
+        parts.push(l);
+    }
+    parts.push(Doc::text(", "));
+    if let Some(r) = r {
+        parts.push(r);
+    }
+    parts.push(Doc::text(")"));
+    Doc::concat(parts)
+}
+
+fn lower_object_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // `<type> { ... }` — type ident followed by either object_initializers or object_fields.
+    let mut parts = Vec::new();
+    if let Some(t) = node.child_by_field_name("type") {
+        parts.push(lower_node(cx, t));
+        parts.push(Doc::space());
+    }
+    let mut walker = node.walk();
+    for c in node.named_children(&mut walker) {
+        match c.kind() {
+            "object_initializers" | "object_fields" => parts.push(lower_node(cx, c)),
+            _ => {}
+        }
+    }
+    Doc::concat(parts)
+}
+
+fn lower_object_initializers<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut walker = node.walk();
+    let inits: Vec<Node<'_>> = node.named_children(&mut walker).collect();
+    if inits.is_empty() {
+        return Doc::text("{}");
+    }
+    // `{ a, b, c }` — fields_spaced when fits, multiline otherwise.
+    let mut inner = Vec::new();
+    inner.push(Doc::line());
+    for (i, e) in inits.iter().enumerate() {
+        if i > 0 {
+            inner.push(Doc::text(","));
+            inner.push(Doc::line());
+        }
+        inner.push(lower_node(cx, *e));
+    }
+    Doc::group(Doc::concat(vec![
+        Doc::text("{"),
+        Doc::indent(Doc::concat(inner)),
+        Doc::line(),
+        Doc::text("}"),
+    ]))
+}
+
+fn lower_object_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut walker = node.walk();
+    let fields: Vec<Node<'_>> = node.named_children(&mut walker).collect();
+    if fields.is_empty() {
+        return Doc::text("{}");
+    }
+    let mut inner = Vec::new();
+    inner.push(Doc::line());
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            inner.push(Doc::text(","));
+            inner.push(Doc::line());
+        }
+        inner.push(lower_node(cx, *f));
+    }
+    Doc::group(Doc::concat(vec![
+        Doc::text("{"),
+        Doc::indent(Doc::concat(inner)),
+        Doc::line(),
+        Doc::text("}"),
+    ]))
+}
+
+fn lower_object_field<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut parts = Vec::new();
+    if let Some(name) = node.child_by_field_name("name") {
+        parts.push(lower_node(cx, name));
+    }
+    parts.push(Doc::text(": "));
+    if let Some(value) = node.child_by_field_name("value") {
+        parts.push(lower_node(cx, value));
+    }
+    Doc::concat(parts)
+}
+
+fn lower_array_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut walker = node.walk();
+    let elems: Vec<Node<'_>> = node.named_children(&mut walker).collect();
+    if elems.is_empty() {
+        return Doc::text("[]");
+    }
+    let mut inner = Vec::new();
+    inner.push(Doc::softline());
+    for (i, e) in elems.iter().enumerate() {
+        if i > 0 {
+            inner.push(Doc::text(","));
+            inner.push(Doc::line());
+        }
+        inner.push(lower_node(cx, *e));
+    }
+    Doc::group(Doc::concat(vec![
+        Doc::text("["),
+        Doc::indent(Doc::concat(inner)),
+        Doc::softline(),
+        Doc::text("]"),
+    ]))
+}
+
+fn lower_call_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // <fn> <args>
+    let mut parts = Vec::new();
+    if let Some(f) = node.child_by_field_name("fn") {
+        parts.push(lower_node(cx, f));
+    }
+    let mut walker = node.walk();
+    for c in node.named_children(&mut walker) {
+        if c.kind() == "args" {
+            parts.push(lower_args_call(cx, c));
+            break;
+        }
+    }
+    Doc::concat(parts)
+}
+
+fn lower_member_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    lower_dot_arrow_expr(cx, node, ".")
+}
+
+fn lower_arrow_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    lower_dot_arrow_expr(cx, node, "->")
+}
+
+fn lower_dot_arrow_expr<'a>(cx: &Cx<'a>, node: Node<'a>, sep: &'static str) -> Doc {
+    // `<recv> <pre_optional?> . <property> <post_optional?>`
+    // Children in source order: receiver (named), optional `?` (named),
+    // `.` (anon), property (named ident), optional `?` (named).
+    let mut walker = node.walk();
+    let mut parts: Vec<Doc> = Vec::new();
+    let mut emitted_sep = false;
+    for c in node.children(&mut walker) {
+        if !c.is_named() && !c.byte_range().is_empty() {
+            // The `.` or `->` operator.
+            parts.push(Doc::text(sep.to_string()));
+            emitted_sep = true;
+            continue;
+        }
+        if !c.is_named() {
+            continue;
+        }
+        // Named children: receiver, optional `?`, property ident.
+        if c.kind() == "optional" {
+            // Render the literal `?` token as-is.
+            parts.push(Doc::text("?"));
+        } else if !emitted_sep {
+            parts.push(lower_node(cx, c));
+        } else {
+            // Property ident.
+            parts.push(Doc::text(cx.text(c)));
+        }
+    }
+    Doc::concat(parts)
+}
+
+fn lower_static_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // `<recv>::<property>` — tight, no spaces.
+    let mut walker = node.walk();
+    let mut parts: Vec<Doc> = Vec::new();
+    let mut saw_recv = false;
+    for c in node.children(&mut walker) {
+        if c.is_named() {
+            if !saw_recv {
+                parts.push(lower_node(cx, c));
+                saw_recv = true;
+            } else {
+                parts.push(Doc::text(cx.text(c)));
+            }
+        } else if !c.byte_range().is_empty() {
+            // The `::` operator.
+            parts.push(Doc::text("::"));
+        }
+    }
+    Doc::concat(parts)
+}
+
+fn lower_offset_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // `<recv>?[<index>]?`
+    let mut walker = node.walk();
+    let mut parts: Vec<Doc> = Vec::new();
+    let mut state = 0u8; // 0=before [, 1=after [, 2=after ]
+    for c in node.children(&mut walker) {
+        if c.is_named() {
+            if c.kind() == "optional" {
+                parts.push(Doc::text("?"));
+            } else {
+                parts.push(lower_node(cx, c));
+            }
+        } else if !c.byte_range().is_empty() {
+            let t = cx.text(c);
+            match t {
+                "[" => {
+                    parts.push(Doc::text("["));
+                    state = 1;
+                }
+                "]" => {
+                    parts.push(Doc::text("]"));
+                    state = 2;
+                }
+                _ => parts.push(Doc::text(t.to_string())),
+            }
+        }
+    }
+    let _ = state;
+    Doc::concat(parts)
+}
+
+fn lower_lambda_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut parts = vec![Doc::text("fn")];
+    if let Some(p) = node.child_by_field_name("params") {
+        parts.push(lower_node(cx, p));
+    }
+    parts.push(Doc::space());
+    if let Some(b) = node.child_by_field_name("body") {
+        parts.push(lower_node(cx, b));
+    }
+    Doc::concat(parts)
+}
+
+fn lower_range_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // <from?>..<to?> — tight `..`.
+    let from = node.child_by_field_name("from").map(|n| lower_node(cx, n));
+    let to = node.child_by_field_name("to").map(|n| lower_node(cx, n));
+    let mut parts = Vec::new();
+    if let Some(f) = from {
+        parts.push(f);
+    }
+    parts.push(Doc::text(".."));
+    if let Some(t) = to {
+        parts.push(t);
+    }
+    Doc::concat(parts)
+}
+
+fn lower_interval_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // <[|]><from?>..<to?><[|]>
+    let mut walker = node.walk();
+    let mut parts: Vec<Doc> = Vec::new();
+    for c in node.children(&mut walker) {
+        if c.is_named() {
+            parts.push(lower_node(cx, c));
+        } else if !c.byte_range().is_empty() {
+            parts.push(Doc::text(cx.text(c).to_string()));
+        }
+    }
+    Doc::concat(parts)
+}
+
+fn lower_type_ident<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // `<typeof?> <ns0::ns1::..::>name<<args>>?<?>`
+    // Children in source order: optional "typeof", repeating ident+"::"
+    // segments, name ident, optional `<` ... `>` with type_ident
+    // params, optional `?`.
+    //
+    // We walk `node.children` to preserve order and emit each piece
+    // with appropriate spacing (tight everywhere except `typeof`).
+    let mut walker = node.walk();
+    let mut parts: Vec<Doc> = Vec::new();
+    // First emit any `typeof` keyword (anonymous), then idents/`::`,
+    // then `<...>` if present, then optional `?`.
+    let children: Vec<Node<'_>> = node.children(&mut walker).collect();
+    let mut i = 0;
+    while i < children.len() {
+        let c = children[i];
+        if c.is_named() {
+            match c.kind() {
+                "ident" => parts.push(Doc::text(cx.text(c))),
+                "type_ident" => parts.push(lower_node(cx, c)),
+                "optional" => parts.push(Doc::text("?")),
+                _ => parts.push(verbatim(cx, c)),
+            }
+        } else if !c.byte_range().is_empty() {
+            let t = cx.text(c);
+            match t {
+                "typeof" => {
+                    parts.push(Doc::text("typeof "));
+                }
+                "::" => parts.push(Doc::text("::")),
+                "," => parts.push(Doc::text(", ")),
+                "<" => parts.push(Doc::text("<")),
+                ">" => parts.push(Doc::text(">")),
+                _ => parts.push(Doc::text(t.to_string())),
+            }
+        }
+        i += 1;
+    }
+    Doc::concat(parts)
+}
+
+fn lower_string<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // Strings are emitted verbatim — preserving every byte, including
+    // multi-line content and any embedded `${...}` interpolations.
+    // The grammar's string nodes wrap their bytes faithfully.
+    Doc::text(cx.text(node).to_string())
 }
 
 // -------- Verbatim fallback --------

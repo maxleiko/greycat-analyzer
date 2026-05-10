@@ -80,25 +80,29 @@ pub fn render(doc: &Doc, opts: &FmtOptions) -> String {
 
 /// Decide whether `doc` (laid out flat) fits in `width` columns of the
 /// current line. Walks `doc` plus the *remainder of the outer stack*
-/// because a group's fit depends on what follows on the same line.
+/// because a group's fit depends on what follows on the same line —
+/// once a Hard / Line-in-Break / BlankLine is encountered in the
+/// continuation, the line ends and anything after is on a fresh line
+/// (so the group fits regardless of trailing content).
 fn fits(doc: &Doc, width: usize, outer: &[(usize, Mode, &Doc)], opts: &FmtOptions) -> bool {
     if width == 0 && !is_zero_width_flat(doc) {
         return false;
     }
-    // Local stack mirrors the renderer's. The fits walker processes
-    // items in flat mode for the doc-under-test and continues into the
-    // outer stack remainder so a group's "fit" reflects what's already
-    // committed on the current line plus the upcoming (still on the
-    // same logical line) nodes.
     let mut budget: isize = width as isize;
     let mut local: Vec<(usize, Mode, &Doc)> = vec![(0, Mode::Flat, doc)];
-    // Process local first; when empty, fall through to the outer's
-    // tail in reverse order (tail = unprocessed continuation).
+    // True while we're still walking the candidate doc; flips to false
+    // once `local` first drains and we start consuming the outer
+    // continuation. The distinction matters for hard breaks: a Hard
+    // *within* the candidate forces a break (return false), but a Hard
+    // *in the continuation* ends the current line (return true) — the
+    // candidate fits if it fits up to the next line boundary, period.
+    let mut in_candidate = true;
     let mut outer_iter_idx = outer.len();
     loop {
         let (indent, mode, item) = if let Some(top) = local.pop() {
             top
         } else if outer_iter_idx > 0 {
+            in_candidate = false;
             outer_iter_idx -= 1;
             outer[outer_iter_idx]
         } else {
@@ -121,16 +125,32 @@ fn fits(doc: &Doc, width: usize, outer: &[(usize, Mode, &Doc)], opts: &FmtOption
                 local.push((indent + opts.indent, mode, inner));
             }
             Doc::Group(inner) => {
-                // For fits-checking, treat the inner group as flat
-                // *unless* the outer mode is Break, in which case the
-                // group has already been measured separately and we
-                // continue with whatever its own fit says — but we
-                // can't recompute, so the safe approximation is "flat
-                // if outer is Flat, hard-break if outer is Break".
+                // Nested groups inside the candidate are measured flat
+                // (if the outer fits flat, the inner does too). In the
+                // continuation, nested groups inherit their parent's
+                // already-decided mode — but we don't know that here,
+                // so flat is the safe approximation; the caller's own
+                // fits-check at render time will give the exact answer.
                 local.push((indent, Mode::Flat, inner));
             }
-            Doc::Line { space_if_flat } => match mode {
-                Mode::Flat => {
+            Doc::Line { space_if_flat } => {
+                if !in_candidate {
+                    // Continuation Line: in flat mode it's a space,
+                    // in break mode it ends the line.
+                    match mode {
+                        Mode::Flat => {
+                            if *space_if_flat {
+                                budget -= 1;
+                                if budget < 0 {
+                                    return false;
+                                }
+                            }
+                        }
+                        Mode::Break => return true,
+                    }
+                } else {
+                    // Inside the candidate, we're always in Flat mode
+                    // (the candidate is being measured *as if* flat).
                     if *space_if_flat {
                         budget -= 1;
                         if budget < 0 {
@@ -138,18 +158,20 @@ fn fits(doc: &Doc, width: usize, outer: &[(usize, Mode, &Doc)], opts: &FmtOption
                         }
                     }
                 }
-                Mode::Break => {
+            }
+            Doc::Hard => {
+                if in_candidate {
+                    // Forces a break inside the candidate — does not
+                    // fit flat.
+                    return false;
+                } else {
+                    // Continuation Hard: line ends here, anything past
+                    // is on a fresh line — candidate fits.
                     return true;
                 }
-            },
-            Doc::Hard => {
-                // A hard break inside the candidate group means the
-                // group must be broken, so it does *not* fit flat.
-                return false;
             }
             Doc::BlankLine => {
-                // Blank lines reset the budget — anything beyond fits
-                // because we'll be on a fresh line.
+                // Always ends the current line.
                 return true;
             }
             Doc::IfBroken(_) => {
