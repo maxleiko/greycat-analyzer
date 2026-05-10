@@ -2346,6 +2346,51 @@ fn f(): int {
     }
 
     #[test]
+    fn outer_dead_island_dominates_nested_dead_code() {
+        // P24.4: an outer dead island should swallow any inner dead
+        // statements that sit inside it. Without dominance, we'd flag
+        // both the outer post-return island AND the inner post-return
+        // dead `var _ = 0;` separately.
+        let diags = project_lints(
+            r#"
+fn f(): int {
+    return 1;
+    if (true) {
+        return 2;
+        var _ = 0;
+    }
+    var _ = 1;
+}
+"#,
+        );
+        let hits = diags.iter().filter(|d| d.rule == "unreachable").count();
+        assert_eq!(
+            hits, 1,
+            "expected one outer dead island only (inner contained), got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn dead_inside_reachable_branch_is_still_flagged() {
+        // P24.4 sanity: when the OUTER block has no dead code but a
+        // reachable inner block contains dead code, the inner dead
+        // code IS flagged.
+        let diags = project_lints(
+            r#"
+fn f(x: int): int {
+    if (x > 0) {
+        return 1;
+        var _ = 0;
+    }
+    return 0;
+}
+"#,
+        );
+        let hits = diags.iter().filter(|d| d.rule == "unreachable").count();
+        assert_eq!(hits, 1, "expected one inner dead diagnostic, got {diags:?}");
+    }
+
+    #[test]
     fn unreachable_suppressible_via_directive() {
         let diags = project_lints(
             r#"
