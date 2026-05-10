@@ -47,6 +47,7 @@ pub fn edit_for_diagnostic(
         "empty-suppression" | "unbalanced-lint-off" | "unbalanced-fmt-off" => {
             delete_comment_line_fix(text, start)
         }
+        "unreachable" => unreachable_fix(text, start, end),
         _ => Vec::new(),
     }
 }
@@ -195,6 +196,71 @@ fn modvar_append_inner_nullable_fix(end: usize) -> Vec<TextEdit> {
 /// fails. The re-parse is local to this call — no caching, no shared
 /// state. Re-parsing a single file is on the order of microseconds, so
 /// the simplicity wins.
+/// **P24.6** — fix for `unreachable`. The diagnostic's byte range is
+/// already the dead island (single statement, coalesced sibling run,
+/// or trailing `else { … }` block). Default: delete that range.
+///
+/// Special case for the dead-`else` shape: when the dead range starts
+/// at a `{` (the body of a final else under exhaustive coverage), walk
+/// back over whitespace to find and swallow the leading `else` keyword
+/// alongside any whitespace between them. Otherwise we'd leave
+/// `if (…) { … } else ` dangling — a parse error.
+fn unreachable_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
+    let bytes = text.as_bytes();
+    if end > bytes.len() || start > end {
+        return Vec::new();
+    }
+    let mut del_start = start;
+    // Detect the "dead else block" shape: range starts at a `{`.
+    if bytes.get(start) == Some(&b'{') {
+        let mut i = start;
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        // Look back for "else" — a 4-byte ASCII keyword preceded by a
+        // word boundary and followed by whitespace (which we just
+        // walked over).
+        if i >= 4 && &bytes[i - 4..i] == b"else" {
+            let kw_start = i - 4;
+            let pre_ok = kw_start == 0
+                || !matches!(
+                    bytes[kw_start - 1],
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'
+                );
+            if pre_ok {
+                // Swallow leading whitespace before the `else` too,
+                // so we don't leave a trailing space after the prior
+                // `}`. Stop at a newline so the prior block's
+                // indentation isn't disturbed.
+                let mut j = kw_start;
+                while j > 0 && matches!(bytes[j - 1], b' ' | b'\t') {
+                    j -= 1;
+                }
+                del_start = j;
+            }
+        }
+    }
+    // Eat a trailing newline if the deletion would otherwise leave a
+    // blank line behind (the dead range was the only content on its
+    // line(s)). Cheap heuristic: when the byte after `end` is `\n`
+    // and the line preceding `del_start` looks empty.
+    let mut del_end = end;
+    if del_end < bytes.len() && bytes[del_end] == b'\n' {
+        let line_start = text[..del_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let pre_only_ws = text[line_start..del_start]
+            .chars()
+            .all(|c| c.is_whitespace());
+        if pre_only_ws {
+            del_end += 1;
+            del_start = line_start;
+        }
+    }
+    vec![TextEdit {
+        byte_range: del_start..del_end,
+        new_text: String::new(),
+    }]
+}
+
 /// **P23.3 follow-up** — fix for `unused-suppression`. The diagnostic's
 /// `byte_range` points at the dead rule word inside a `// gcl-lint-…`
 /// directive comment. Two shapes:
@@ -557,6 +623,63 @@ mod tests {
         assert!(
             after.contains("fn main() {\n    var y"),
             "expected no leftover blank line, after = {after:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P24.6 — `unreachable` quickfix
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unreachable_fix_deletes_post_return_dead_stmt() {
+        let src = "fn f(): int { return 1; var _ = 0; }";
+        let dead_start = src.find("var _ = 0;").unwrap();
+        let dead_end = dead_start + "var _ = 0;".len();
+        let edits = fix("unreachable", src, dead_start..dead_end);
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            !after.contains("var _ = 0;"),
+            "expected dead stmt removed, after = {after:?}"
+        );
+        // Re-parse must succeed.
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "fix would have introduced parse errors: {after}"
+        );
+    }
+
+    #[test]
+    fn unreachable_fix_swallows_else_keyword_for_dead_else_block() {
+        // The dead-else case: the diagnostic's range covers `{ … }`.
+        // The fix must also delete the leading `else` keyword + the
+        // whitespace between the prior `}` and the `else`.
+        let src = "fn f(): int {\n    if (true) {\n        return 1;\n    } else {\n        return 2;\n    }\n}\n";
+        // The dead else block is the SECOND `{...}` chunk. Compute the
+        // end as `(start of else { + offset to the matching `}`)`.
+        let dead_block_start = src.find("else {").unwrap() + "else ".len();
+        // The dead block ends at the `}` that closes the `else { … }`
+        // body — that's the SECOND `}` from the start of `else`.
+        let after_open = dead_block_start + 1;
+        let dead_block_end = src[after_open..]
+            .find('}')
+            .map(|i| after_open + i + 1)
+            .unwrap();
+        let edits = fix("unreachable", src, dead_block_start..dead_block_end);
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        // The `else` keyword should be gone alongside the block.
+        assert!(
+            !after.contains("else"),
+            "expected `else` keyword swallowed, after = {after:?}"
+        );
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "fix would have introduced parse errors: {after}"
         );
     }
 
