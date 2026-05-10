@@ -4818,7 +4818,7 @@ fn object_field_completion(
     // Find the type's HIR (in-module first, then cross-module).
     let module = project.module(uri)?;
     let mut items: Vec<CompletionItem> = Vec::new();
-    if let Some(decl_id) = module.analysis.type_decls.get(&type_name).copied()
+    if let Some(decl_id) = module.analysis.type_decls.get(type_name.as_str()).copied()
         && let Decl::Type(td) = &module.hir.decls[decl_id]
     {
         emit_attrs(&module.hir, td, &prefix_lower, &mut items);

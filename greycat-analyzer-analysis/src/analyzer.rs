@@ -23,6 +23,7 @@
 use std::ops::Range;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -200,7 +201,8 @@ pub struct AnalysisResult {
     /// Built when the analyzer walks top-level decls — lets
     /// member resolution navigate from a receiver's `TypeId` back to
     /// the declaring node so attr / method idents can be bound.
-    pub type_decls: FxHashMap<String, Idx<Decl>>,
+    // P25.3
+    pub type_decls: FxHashMap<SmolStr, Idx<Decl>>,
     /// Member-access bindings produced by each property ident in
     /// `a.b` / `a->b` that resolves to a [`TypeAttr`] or to a
     /// `TypeDecl::methods` entry, keyed by the property `Idx<Ident>`.
@@ -423,13 +425,13 @@ fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisRes
         let decl = &hir.decls[*d];
         match decl {
             Decl::Type(td) => {
-                let name = hir.idents[td.name].text.clone();
-                let id = arena.named(&name);
+                let name: SmolStr = hir.idents[td.name].text.as_str().into();
+                let id = arena.named(name.as_str());
                 out.registry.register(name.clone(), id);
                 out.type_decls.insert(name, *d);
             }
             Decl::Enum(ed) => {
-                let name = hir.idents[ed.name].text.clone();
+                let name: SmolStr = hir.idents[ed.name].text.as_str().into();
                 let variants: Vec<String> = ed
                     .fields
                     .iter()
@@ -437,7 +439,7 @@ fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisRes
                     .collect();
                 let id = arena.alloc(Type {
                     kind: TypeKind::Enum {
-                        name: name.clone(),
+                        name: name.to_string(),
                         variants,
                     },
                     nullable: false,
@@ -807,7 +809,7 @@ impl<'a> Cx<'a> {
         };
         let prop_text = self.ident_text(property);
 
-        if let Some(decl_id) = self.out.type_decls.get(&name).copied() {
+        if let Some(decl_id) = self.out.type_decls.get(name.as_str()).copied() {
             // Local: type declared in this module.
             let Decl::Type(type_decl) = &self.hir.decls[decl_id] else {
                 return;
