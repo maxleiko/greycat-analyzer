@@ -315,21 +315,85 @@ impl ProjectAnalysis {
         &mut self,
         manager: &SourceManager,
     ) -> Vec<(Uri, Hir, String, Duration, Directives)> {
-        let mut hirs: Vec<(Uri, Hir, String, Duration, Directives)> =
-            Vec::with_capacity(manager.len());
-        for (uri, cell) in manager.iter() {
-            let doc = cell.borrow();
-            let lower_start = Instant::now();
-            let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
-            let lower_took = lower_start.elapsed();
-            // **P23.1** — parse `// gcl-…` directives off the same CST
-            // we just lowered, so lints and the formatter can see the
-            // user's per-region opt-outs.
-            let directives = crate::directives::parse_directives(&doc.text, doc.root_node());
-            self.index.ingest(uri, &hir);
-            hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took, directives));
+        // P26.2 — when the `parallel` feature is on, lower every module
+        // off the rayon work-stealing pool. Each lowering is fully
+        // self-contained (no project-state writes) so this is
+        // embarrassingly parallel; the only synchronisation point is
+        // the post-loop `index.ingest` sweep, which stays serial because
+        // it mutates the project-wide interner.
+        //
+        // The serial path is preserved verbatim under `cfg(not(parallel))`
+        // — the parallel preamble's per-doc clones (text + lib + Tree)
+        // are skipped entirely so the serial cost stays at zero.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+
+            // Phase A (serial): borrow each `RefCell<Document>` once and
+            // extract the owned data the parallel phase needs. `Document`
+            // is `!Sync` (it holds a tree-sitter `Parser` + a `OnceCell`),
+            // so we can't hold its `Ref<'_, _>` across rayon's worker
+            // boundaries. `Tree::clone` is reference-counted internally,
+            // so the only real allocations here are the text + lib
+            // strings — both bounded by total source size.
+            let docs: Vec<(
+                Uri,
+                String,
+                String,
+                greycat_analyzer_syntax::tree_sitter::Tree,
+            )> = manager
+                .iter()
+                .map(|(uri, cell)| {
+                    let doc = cell.borrow();
+                    (
+                        uri.clone(),
+                        doc.text.clone(),
+                        doc.lib.clone(),
+                        doc.tree.clone(),
+                    )
+                })
+                .collect();
+
+            // Phase B (parallel): lower each module + parse its
+            // directives. No shared mutable state.
+            let lowered: Vec<(Uri, Hir, String, Duration, Directives)> = docs
+                .par_iter()
+                .map(|(uri, text, lib, tree)| {
+                    let lower_start = Instant::now();
+                    let hir = lower_module(text, "module", lib.as_str(), tree.root_node());
+                    let lower_took = lower_start.elapsed();
+                    let directives = crate::directives::parse_directives(text, tree.root_node());
+                    (uri.clone(), hir, lib.clone(), lower_took, directives)
+                })
+                .collect();
+
+            // Phase C (serial): ingest into the project-wide index. This
+            // mutates `self.index.symbols` etc., which is `!Send` on
+            // purpose — it owns interner state that's amortised across
+            // the whole project.
+            for (uri, hir, _lib, _lower_took, _directives) in &lowered {
+                self.index.ingest(uri, hir);
+            }
+            lowered
         }
-        hirs
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut hirs: Vec<(Uri, Hir, String, Duration, Directives)> =
+                Vec::with_capacity(manager.len());
+            for (uri, cell) in manager.iter() {
+                let doc = cell.borrow();
+                let lower_start = Instant::now();
+                let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
+                let lower_took = lower_start.elapsed();
+                // **P23.1** — parse `// gcl-…` directives off the same CST
+                // we just lowered, so lints and the formatter can see the
+                // user's per-region opt-outs.
+                let directives = crate::directives::parse_directives(&doc.text, doc.root_node());
+                self.index.ingest(uri, &hir);
+                hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took, directives));
+            }
+            hirs
+        }
     }
 
     /// **Stages S7-S11** — lower every type's attr `TypeRef`s
