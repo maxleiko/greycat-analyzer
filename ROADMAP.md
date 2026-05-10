@@ -710,34 +710,46 @@ The fix pattern in all cases: **make the quickfix produce a syntactically valid 
 
 ---
 
-### Phase 23 — Lint rule relaxation via line comments (~1 week, **deferred**)
+### Phase 23 — Lint relaxation & formatter skip via line directives (~1-2 weeks, **deferred**)
 
-**Goal:** per-line user opt-out from individual lint rules via leading line comments. Mirrors the convention from rustc / clippy: `// allow(<rule-name>)` on the line above the offending construct disables that rule for the construct.
+**Goal:** per-region user opt-out from individual lint rules and from the formatter via comment directives. Mirrors ESLint / clippy / prettier conventions, scoped tighter — every directive carries an explicit rule list (no wildcard footgun) and every off-toggle has a paired on-toggle (no scope ambiguity).
 
-**Use cases.** False positives the lint detection won't catch until a future fix lands; intentional dead code (placeholder params for trait-shape, work-in-progress locals); pre-existing patterns the user wants to preserve. Today the only escape hatch is the `_`-prefix convention (which only covers `unused-local` / `unused-param`); broader rules have no opt-out at all.
+**Use cases.** False positives the lint detection won't catch until a future fix lands; intentional dead code (placeholder params, WIP locals); pre-existing patterns the user wants to preserve; vendored / generated `.gcl` files that shouldn't be reformatted. Today the only escape hatch is the `_`-prefix convention (covers `unused-local` / `unused-param` only); everything else has no opt-out.
 
-**Sketch:**
+**Directives.** All carry the `gcl-` prefix so they sort together in completion (P23.5) and don't collide with user comments. Lint directives take a space-separated rule list; formatter directives take none (the formatter is one thing).
 
-```gcl
-// allow(redundant-non-null-assertion)
-var line = csvReader.read()!!;   // analyzer thinks it's non-null but it isn't
+| Directive                                | Scope                                  |
+|------------------------------------------|----------------------------------------|
+| `// gcl-lint-off <rule0> <rule1> ...`    | Until matching `gcl-lint-on` (or EOF)  |
+| `// gcl-lint-on <rule0> <rule1> ...`     | Closes a prior `gcl-lint-off`          |
+| `// gcl-lint-off-next <rule0> ...`       | Next AST item (decl / stmt) only       |
+| `// gcl-lint-off-file <rule0> ...`       | Whole file (must be at module head)    |
+| `// gcl-fmt-off`                         | Until matching `gcl-fmt-on` (or EOF)   |
+| `// gcl-fmt-on`                          | Closes a prior `gcl-fmt-off`           |
+| `// gcl-fmt-skip`                        | Next AST node only                     |
+| `// gcl-fmt-off-file`                    | Whole file (must be at module head)    |
 
-// allow(unused-local, unused-decl)
-fn placeholder() {}
-
-// allow(*)
-var really_dont_lint_this = expr;
-```
+**Decisions locked.** No `-next-line` variant — `-next` (AST-item scope) is more robust against reformatting and the manual off/on pair covers surgical line ranges. No wildcard `*` rule — explicit rule names only; CI gets `lint --no-suppressions` (P23.7) for the nuclear option. Unbalanced `gcl-fmt-off` extends to EOF + emits a warning rather than refusing to format.
 
 **Chunks (deferred — define only):**
 
-- [ ] **23.1 Parse `// allow(<rule-name>[, <rule-name>]*)` comments** (S) — at the lint stage entry point, walk the parsed CST for `line_comment` extras whose text matches `/\/\/\s*allow\((.*)\)\s*$/`. Build a `HashMap<line_number_after_comment, HashSet<&'static str>>` keyed on the *next* source line.
-- [ ] **23.2 Suppress emission** (S) — every `LintDiagnostic` push site converts its `byte_range.start` to a line number and consults the allow-map. If the diagnostic's rule is in the allow-set for that line, drop it before pushing. Centralized in a new `LintCx::emit(diag)` helper so individual rules don't reach into the map.
-- [ ] **23.3 Wildcard `// allow(*)`** (XS) — `*` in the rule list disables all lints for the next line. Already covered by 23.1's parse + a special sentinel `Symbol("*")` that 23.2 short-circuits on.
-- [ ] **23.4 Block-level `// allow_block(...)`** (S) — disables for the entire next block (e.g. a function body, a type body). Implementation: walk the CST for the `_stmt` / `_decl` whose start line equals `comment_line + 1`, expand the suppression range to that node's full byte range, store as `(start_byte, end_byte) → HashSet<&'static str>` and probe at emission time.
-- [ ] **23.5 Documentation** (S) — surface the convention in the cli `lint --help` output, the LSP server README, and the analyzer crate's rustdoc. Include a list of all rule names users can disable (auto-generated from the registered `LintRule::name()` values so the doc never goes stale).
+- [ ] **23.1 Parse & store directives** (S) — at the lint / format stage entry, walk every `line_comment` extra for the `gcl-` directive prefixes. Build (a) a `Vec<LintSuppression { byte_range: Range<usize>, rules: HashSet<Symbol> }>` from the lint set, and (b) a `Vec<FmtSkipRange { byte_range: Range<usize> }>` from the formatter set. `-off-next` and `-fmt-skip` resolve to the next AST item's `byte_range` via the parsed CST. `-off-file` resolves to `0..source.len()` and is only honored when the comment is at the module head (no prior decl). Misspelled rule names emit `unknown-suppression-rule` (a new `LintDiagnostic`); empty rule lists on `-off` / `-off-next` / `-off-file` emit `empty-suppression`.
 
-**M23:** `// allow(<rule>)` on the previous line silences that rule for the construct on the next line. `// allow(*)` silences every rule. The escape hatch matches what users expect from rustc / clippy / eslint, and gives them a place to land while a lint detection bug is being fixed in the analyzer proper.
+- [ ] **23.2 Suppress lint emission** (S) — every `LintDiagnostic` push site consults the suppression list at the diagnostic's byte position. Drop the diagnostic if its rule is in any active suppression covering that byte. Centralized in a new `LintCx::emit(diag)` helper so individual rules don't reach into the map. Records each *successful* suppression so 23.3 can compute deadness.
+
+- [ ] **23.3 `unused-suppression` rule** (S) — flags suppressions that didn't actually suppress anything. **Per-rule** granularity: `// gcl-lint-off-next A B C` where A fires but B and C don't → emit on B and C, not on the whole comment. `unused-suppression` is itself suppressible only via `// gcl-lint-off-file unused-suppression` (would be circular at narrower scopes).
+
+- [ ] **23.4 Formatter skip directives** (M) — `gcl-fmt-off` / `gcl-fmt-on` mark verbatim regions in a source-byte map; the lowering checks each AST item against the map and emits `Doc::Text(verbatim_text)` instead of recursing. `gcl-fmt-skip` covers the next AST node only. `gcl-fmt-off-file` short-circuits the whole pipeline — emit `source.to_string()` and skip the lowering entirely. Unbalanced `gcl-fmt-off` extends to EOF + warns; nested `gcl-fmt-off` inside an already-off region warns + ignores. New `unused-suppression` shape covers a `gcl-fmt-skip` whose target node would have rendered identically anyway (deferred — formatter idempotence makes "would have changed" expensive to compute; ship without it first).
+
+- [ ] **23.5 LSP completion for `// gcl-` prefix** (S) — `capabilities::completion` adds a new dispatch arm: when the cursor is inside a `line_comment` whose text starts with `// gcl-` (allowing leading spaces), emit completion items for each directive form (`gcl-lint-off`, `gcl-lint-off-next`, `gcl-lint-off-file`, `gcl-lint-on`, `gcl-fmt-off`, `gcl-fmt-on`, `gcl-fmt-skip`, `gcl-fmt-off-file`) with snippet bodies that include placeholder rule lists for the lint forms. When the comment is `// gcl-lint-off-* ` and the cursor sits in the rule list, emit a rule completion drawn from the registered `LintRule::name()` set. Trigger character `-` added to `initialize`. Triggered the moment the user types `// gcl` so discovery is immediate.
+
+- [ ] **23.6 `lint --list-rules` CLI** (XS) — new flag that prints the registered rule names (one per line, with a one-line description from a new `LintRule::summary()` method) and exits. Auto-generated from `LintRule` so the doc never goes stale. Same data feeds 23.5's completion.
+
+- [ ] **23.7 `--no-suppressions` CLI flag** (XS) — re-emit every suppressed diagnostic. For CI pipelines that want to enforce "no suppressions allowed in code review" or to audit what's hidden behind suppressions in a project.
+
+- [ ] **23.8 Documentation** (S) — surface the convention in the cli `lint --help`, the LSP server README, and the analyzer crate's rustdoc. Include a worked example for each directive shape so users have something to copy from.
+
+**M23:** `// gcl-lint-off-next <rule>` silences that rule for the next AST item; `// gcl-lint-off ... // gcl-lint-on` silences within the toggle range; `// gcl-lint-off-file <rule>` silences for the whole file; `// gcl-fmt-off ... // gcl-fmt-on` and `// gcl-fmt-skip` and `// gcl-fmt-off-file` preserve regions verbatim through the formatter and `lint --fix`; `unused-suppression` flags dead toggles per-rule; `unknown-suppression-rule` flags typos; LSP completion fires on `// gcl-` and discovers every directive + every rule name; `lint --list-rules` makes the rule namespace discoverable from the CLI.
 
 ---
 
