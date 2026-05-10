@@ -485,11 +485,7 @@ impl Lint {
                     }
                 }
             }
-            println!(
-                "{} diagnostic(s) across {} file(s) in {total:?}",
-                total_diagnostics,
-                entries.len(),
-            );
+            print_summary(&entries, total, self.color.enabled());
         }
 
         Ok(if total_diagnostics == 0 {
@@ -532,6 +528,72 @@ fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let s = uri.as_str();
     let stripped = s.strip_prefix("file://")?;
     Some(PathBuf::from(stripped))
+}
+
+/// Trailing one-liner that aggregates diagnostics by severity. Each
+/// non-zero category is colored to its conventional severity hue (red
+/// errors, yellow warnings, cyan hints); the error count is always
+/// shown so the success badge is visible — green when zero, red
+/// otherwise. The module count and total wall-clock are dimmed to keep
+/// the colored counts as the focal point.
+///
+/// `color` toggles all ANSI escapes off so `--color=never` /
+/// non-TTY-without-override stays grep-friendly.
+fn print_summary(entries: &[Entry], total: Duration, color: bool) {
+    const RED: &str = "\x1b[31m";
+    const GREEN: &str = "\x1b[32m";
+    const YELLOW: &str = "\x1b[33m";
+    const CYAN: &str = "\x1b[36m";
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
+
+    let paint = |code: &str, s: String| -> String {
+        if color {
+            format!("{code}{s}{RESET}")
+        } else {
+            s
+        }
+    };
+    let pluralize = |n: usize, stem: &str| -> String {
+        if n == 1 {
+            format!("1 {stem}")
+        } else {
+            format!("{n} {stem}s")
+        }
+    };
+
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut hints = 0usize;
+    for e in entries {
+        for d in &e.diagnostics {
+            match d.severity {
+                Some(DiagnosticSeverity::ERROR) => errors += 1,
+                Some(DiagnosticSeverity::WARNING) => warnings += 1,
+                Some(DiagnosticSeverity::HINT) | Some(DiagnosticSeverity::INFORMATION) => {
+                    hints += 1
+                }
+                // Unknown severity ⇒ count as an error so the exit
+                // status stays fail-closed.
+                _ => errors += 1,
+            }
+        }
+    }
+
+    let err_color = if errors == 0 { GREEN } else { RED };
+    let mut parts: Vec<String> = vec![paint(err_color, pluralize(errors, "error"))];
+    if warnings > 0 {
+        parts.push(paint(YELLOW, pluralize(warnings, "warning")));
+    }
+    if hints > 0 {
+        parts.push(paint(CYAN, pluralize(hints, "hint")));
+    }
+    println!(
+        "{summary} across {modules} in {dur}",
+        summary = parts.join(", "),
+        modules = paint(DIM, pluralize(entries.len(), "module")),
+        dur = paint(DIM, format!("{total:?}")),
+    );
 }
 
 /// P10.7 pretty-rendered diagnostic — pipes through `miette` so the
