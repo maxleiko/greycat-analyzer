@@ -725,6 +725,57 @@ fn semantic_tokens_emits_typed_idents_and_literals() {
     );
 }
 
+#[test]
+fn semantic_tokens_string_interpolation_no_overlap() {
+    // The whole-`string` node previously got a STRING token spanning the
+    // `${world}` substitution, which then overlapped the VARIABLE token
+    // emitted for the inner `world` ident. LSP forbids overlapping
+    // semantic tokens; VSCode reacted by losing the string color for the
+    // interpolated section.
+    let src = "fn main() { var world = 0; var s = \"hello ${world}\"; }\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    let tokens = capabilities::semantic_tokens(src, "project", r);
+
+    // STRING token type is index 6.
+    let string_type_idx = 6u32;
+    let var_type_idx = 4u32;
+    assert!(
+        tokens.data.iter().any(|t| t.token_type == string_type_idx),
+        "expected at least one STRING-typed token (the literal fragment)"
+    );
+    assert!(
+        tokens.data.iter().any(|t| t.token_type == var_type_idx),
+        "expected at least one VARIABLE-typed token (the interpolated `world`)"
+    );
+
+    // Decode delta-encoded ranges and assert no two intervals overlap.
+    let mut line = 0u32;
+    let mut col = 0u32;
+    let mut ranges: Vec<(u32, u32, u32)> = Vec::new();
+    for tk in &tokens.data {
+        if tk.delta_line != 0 {
+            line += tk.delta_line;
+            col = tk.delta_start;
+        } else {
+            col += tk.delta_start;
+        }
+        ranges.push((line, col, tk.length));
+    }
+    for win in ranges.windows(2) {
+        let (l0, c0, len0) = win[0];
+        let (l1, c1, _) = win[1];
+        if l0 == l1 {
+            assert!(
+                c0 + len0 <= c1,
+                "overlapping semantic tokens on line {l0}: \
+                 [{c0}..{}) overlaps [{c1}..)",
+                c0 + len0
+            );
+        }
+    }
+}
+
 // =============================================================================
 // P24.5 — DiagnosticTag::UNNECESSARY plumbing
 // =============================================================================

@@ -2255,7 +2255,13 @@ pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Se
             });
         };
         match kind {
-            "string" => push(&mut events, TOK_STRING),
+            // Don't paint the whole `string` node — its `string_substitution`
+            // children hold real expressions (e.g. an `ident`) that need their
+            // own token type. Overlapping ranges are forbidden by the LSP
+            // semantic-tokens spec and break VSCode's rendering of the
+            // interpolation. Tokenize only the literal string fragments;
+            // the `"` quotes are anonymous and stay with textmate.
+            "string_fragment" | "string_escape_sequence" => push(&mut events, TOK_STRING),
             "number" => push(&mut events, TOK_NUMBER),
             "line_comment" | "doc_comment" => push(&mut events, TOK_COMMENT),
             "ident" => {
