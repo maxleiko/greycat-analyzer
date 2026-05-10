@@ -37,5 +37,6 @@ pub mod directives;
 pub mod lint;
 pub mod project;
 pub mod quickfix;
+pub mod reachability;
 pub mod resolver;
 pub mod stdlib;
