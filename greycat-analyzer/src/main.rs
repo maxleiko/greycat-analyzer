@@ -17,7 +17,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Lint a project — parse + semantic + lint diagnostics.
+    /// Lint a GreyCat project. Loads the entrypoint and walks its
+    /// @library / @include pragmas to discover modules — only
+    /// reachable files are analyzed.
     Lint(Lint),
     /// Format a GreyCat project (`--mode=write|check|stdout|diff`).
     Fmt(Fmt),
