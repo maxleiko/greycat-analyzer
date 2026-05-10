@@ -726,6 +726,98 @@ fn semantic_tokens_emits_typed_idents_and_literals() {
 }
 
 #[test]
+fn semantic_tokens_typed_suffix_distinct_from_digits() {
+    // Painting the whole `number` node as NUMBER hides the textual
+    // suffix in `42_time`, `3day_2hour42s`, `3.14f`. Tokenize each
+    // numeric segment as NUMBER and each `number_suffix` as KEYWORD
+    // (distinct theme color) — including the in-between suffixes of a
+    // compound duration.
+    let src = "fn main() { 42_time; 3day_2hour42s; 3.14f; }\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    let tokens = capabilities::semantic_tokens(src, "project", r);
+
+    let number_idx = 7u32; // TOK_NUMBER
+    let keyword_idx = 9u32; // TOK_KEYWORD
+
+    // Decode delta-encoded ranges plus token type.
+    let mut line = 0u32;
+    let mut col = 0u32;
+    let mut spans: Vec<(u32, u32, u32, u32)> = Vec::new(); // (line, col, len, ty)
+    for tk in &tokens.data {
+        if tk.delta_line != 0 {
+            line += tk.delta_line;
+            col = tk.delta_start;
+        } else {
+            col += tk.delta_start;
+        }
+        spans.push((line, col, tk.length, tk.token_type));
+    }
+
+    // No overlap on the same line.
+    for win in spans.windows(2) {
+        let (l0, c0, len0, _) = win[0];
+        let (l1, c1, _, _) = win[1];
+        if l0 == l1 {
+            assert!(
+                c0 + len0 <= c1,
+                "overlapping semantic tokens on line {l0}: \
+                 [{c0}..{}) overlaps [{c1}..)",
+                c0 + len0
+            );
+        }
+    }
+
+    // Helper: text at a span.
+    let line_text =
+        |target_line: u32| -> &str { src.lines().nth(target_line as usize).unwrap_or("") };
+    let span_text = |line: u32, col: u32, len: u32| -> &str {
+        let lt = line_text(line);
+        let start = col as usize;
+        let end = start + len as usize;
+        &lt[start..end.min(lt.len())]
+    };
+
+    let on_body_line: Vec<_> = spans.iter().filter(|(l, _, _, _)| *l == 0).collect();
+    let mut texts: Vec<(&str, u32)> = on_body_line
+        .iter()
+        .map(|(l, c, len, ty)| (span_text(*l, *c, *len), *ty))
+        .collect();
+    // Drop the `main` ident (TOK_FN). Keep only number-related spans.
+    texts.retain(|(_, ty)| *ty == number_idx || *ty == keyword_idx);
+
+    // The body has spans, in order:
+    //   42(NUMBER) _time(KEYWORD)
+    //   3(NUMBER) day(KEYWORD) _2(?...) hour(KEYWORD) 42(NUMBER) s(KEYWORD)
+    //   3.14(NUMBER) f(KEYWORD)
+    //
+    // The grammar puts trailing `_` either with `number_int` or
+    // `number_suffix` depending on context — assert behavior, not
+    // exact byte boundaries.
+    let n_number = texts.iter().filter(|(_, ty)| *ty == number_idx).count();
+    let n_keyword = texts.iter().filter(|(_, ty)| *ty == keyword_idx).count();
+    assert!(
+        n_number >= 5,
+        "expected >=5 NUMBER spans (42, 3, 2, 42, 3.14); got {n_number}: {texts:?}"
+    );
+    assert!(
+        n_keyword >= 5,
+        "expected >=5 KEYWORD spans (time, day, hour, s, f); got {n_keyword}: {texts:?}"
+    );
+
+    // The textual suffixes must NOT contain digits — otherwise we'd be
+    // back to painting digit-runs as suffix.
+    for (txt, ty) in &texts {
+        if *ty == keyword_idx {
+            assert!(
+                !txt.chars().any(|c| c.is_ascii_digit()),
+                "suffix span `{txt}` contains digits — painting at the wrong granularity"
+            );
+        }
+    }
+}
+
+#[test]
 fn semantic_tokens_string_interpolation_no_overlap() {
     // The whole-`string` node previously got a STRING token spanning the
     // `${world}` substitution, which then overlapped the VARIABLE token

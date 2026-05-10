@@ -2262,7 +2262,15 @@ pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Se
             // interpolation. Tokenize only the literal string fragments;
             // the `"` quotes are anonymous and stay with textmate.
             "string_fragment" | "string_escape_sequence" => push(&mut events, TOK_STRING),
-            "number" => push(&mut events, TOK_NUMBER),
+            // Same idea for numbers: the outer `number` (and inner
+            // `number_suffixed`) nodes span both digit-runs AND the textual
+            // type-suffix (`42_time`, `3day_2hour42s`, `3.14f`). Painting
+            // the wrapper NUMBER hides the suffix as part of the literal.
+            // Emit NUMBER only for the actual numeric segments, and a
+            // distinct KEYWORD token for each `number_suffix` so themes
+            // render the suffix differently from the digits.
+            "number_int" | "number_decimal" | "number_scientific" => push(&mut events, TOK_NUMBER),
+            "number_suffix" => push(&mut events, TOK_KEYWORD),
             "line_comment" | "doc_comment" => push(&mut events, TOK_COMMENT),
             "ident" => {
                 if let Some((idx, _)) = hir
