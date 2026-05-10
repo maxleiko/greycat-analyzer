@@ -250,11 +250,34 @@ impl Lint {
                     if non_overlap.is_empty() {
                         continue;
                     }
-                    let mut new_text = original;
+                    let original_had_errors = greycat_analyzer_syntax::parse(&original)
+                        .root_node()
+                        .has_error();
+                    let edit_count = non_overlap.len();
+                    let mut new_text = original.clone();
                     for (r, t) in non_overlap.into_iter().rev() {
                         new_text.replace_range(r, &t);
-                        applied_this_pass += 1;
                     }
+                    // **P22.5** — re-parse before committing. If the
+                    // edits would introduce parse errors that the
+                    // original didn't have, REVERT the file and warn.
+                    // The safety net catches any per-rule fix bug —
+                    // even one we haven't found yet.
+                    let new_has_errors = greycat_analyzer_syntax::parse(&new_text)
+                        .root_node()
+                        .has_error();
+                    if new_has_errors && !original_had_errors {
+                        eprintln!(
+                            "[fix] reverted {}: would have introduced parse error(s) — \
+                             skipped {} edit(s) on this pass",
+                            entry.path.display(),
+                            edit_count,
+                        );
+                        // Leave the file untouched, do not count edits
+                        // as applied. Outer loop will exit naturally.
+                        continue;
+                    }
+                    applied_this_pass += edit_count;
                     std::fs::write(&entry.path, new_text)?;
                 }
                 if applied_this_pass == 0 {
@@ -479,8 +502,14 @@ fn print_pretty_diagnostic(path: &str, source: &str, diag: &Diagnostic) {
     eprintln!("{report:?}");
 }
 
-/// P8.4 fix synthesis — diagnostic → byte-range + replacement text.
-/// Returns `None` for diagnostics that don't have an automatic fix.
+/// Diagnostic → byte-range + replacement text. Routes through the
+/// shared [`greycat_analyzer_analysis::quickfix`] module (P22.7).
+/// Returns `None` for diagnostics that don't have an automatic fix or
+/// whose preconditions don't hold.
+///
+/// Each rule may produce multiple `TextEdit`s in principle; the
+/// current cli `--fix` driver expects a single range+text pair, so we
+/// flatten "one edit" rules and drop multi-edit cases (none today).
 fn diag_to_edit(text: &str, diag: &Diagnostic) -> Option<(std::ops::Range<usize>, String)> {
     let code = match diag.code.as_ref()? {
         NumberOrString::String(s) => s.as_str(),
@@ -488,80 +517,17 @@ fn diag_to_edit(text: &str, diag: &Diagnostic) -> Option<(std::ops::Range<usize>
     };
     let start = lsp_to_byte(text, diag.range.start);
     let end = lsp_to_byte(text, diag.range.end);
-    match code {
-        "missing-token" => {
-            let token = diag
-                .message
-                .split_once('`')
-                .and_then(|(_, rest)| rest.split_once('`').map(|(t, _)| t))?;
-            Some((start..start, token.to_string()))
-        }
-        "unused-local" | "unused-decl" => {
-            if end > start && end <= text.len() {
-                Some((start..end, String::new()))
-            } else {
-                None
-            }
-        }
-        "unused-param" => {
-            if end > start && end <= text.len() {
-                let name = &text[start..end];
-                Some((start..end, format!("_{name}")))
-            } else {
-                None
-            }
-        }
-        "possibly-null" => {
-            // Range = the receiver. Insert `?` at the access op.
-            let bytes = text.as_bytes();
-            let mut i = end;
-            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
-                i += 1;
-            }
-            let is_op = bytes
-                .get(i)
-                .map(|b| matches!(b, b'.' | b'[' | b'?'))
-                .unwrap_or(false)
-                || (bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'>'));
-            if !is_op || bytes.get(i) == Some(&b'?') {
-                return None;
-            }
-            Some((i..i, "?".into()))
-        }
-        "redundant-nullable-access" => {
-            // Range covers the operator slice. Drop the lone `?` byte.
-            if end > start
-                && end <= text.len()
-                && let Some(q) = text.as_bytes()[start..end]
-                    .iter()
-                    .position(|b| *b == b'?')
-                    .map(|off| start + off)
-            {
-                return Some((q..q + 1, String::new()));
-            }
-            None
-        }
-        "redundant-non-null-assertion" | "redundant-coalesce" => {
-            if end > start && end <= text.len() {
-                Some((start..end, String::new()))
-            } else {
-                None
-            }
-        }
-        "modvar-node-cannot-be-nullable" => {
-            // Range covers the type ref ending in `?`. Drop the last byte.
-            if end > 0 && end <= text.len() && text.as_bytes()[end - 1] == b'?' {
-                Some(((end - 1)..end, String::new()))
-            } else {
-                None
-            }
-        }
-        "modvar-node-inner-must-be-nullable" => {
-            // Append `?` at the end of the inner type ref's range.
-            Some((end..end, "?".into()))
-        }
-        _ => None,
+    let edits = greycat_analyzer_analysis::quickfix::edit_for_diagnostic(
+        text,
+        code,
+        &(start..end),
+        &diag.message,
+    );
+    if edits.len() != 1 {
+        return None;
     }
+    let e = edits.into_iter().next()?;
+    Some((e.byte_range, e.new_text))
 }
 
 fn lsp_to_byte(text: &str, pos: Position) -> usize {

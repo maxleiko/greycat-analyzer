@@ -1631,7 +1631,17 @@ fn code_actions_from_diagnostics(
         .into_iter()
         .filter(|d| ranges_overlap(&d.range, &range))
         .map(|d| {
-            let edits = synthesize_fix(text, &d);
+            let raw_edits = synthesize_fix(text, &d);
+            // **P22.5** — never offer an edit whose application would
+            // break the document's parse. Apply the edit in-memory,
+            // re-parse, and drop the edit if it adds new parse errors
+            // the original didn't have. Mirrors the cli `--fix`
+            // safety net.
+            let edits = if !raw_edits.is_empty() && would_break_parse(text, &raw_edits) {
+                Vec::new()
+            } else {
+                raw_edits
+            };
             let title = match edits.is_empty() {
                 true => format!("Quickfix: {}", d.message),
                 false => format!("Fix: {}", d.message),
@@ -1659,139 +1669,68 @@ fn code_actions_from_diagnostics(
         .collect()
 }
 
-/// Map a diagnostic to a concrete `Vec<TextEdit>` (P8.3). Returns an
-/// empty vec when no automatic fix is known for this diagnostic shape.
+/// Apply `edits` against `text` in-memory and check if the result has
+/// new parse errors. Returns `true` if the edit would break a
+/// previously-valid parse. Used to gate quickfix offers (P22.5).
+fn would_break_parse(text: &str, edits: &[TextEdit]) -> bool {
+    let original_has_errors = greycat_analyzer_syntax::parse(text).root_node().has_error();
+    // Apply edits in reverse byte order so prior offsets stay stable.
+    let mut byte_edits: Vec<(std::ops::Range<usize>, &str)> = edits
+        .iter()
+        .map(|e| {
+            (
+                position_to_byte(text, e.range.start)..position_to_byte(text, e.range.end),
+                e.new_text.as_str(),
+            )
+        })
+        .collect();
+    byte_edits.sort_by_key(|(r, _)| r.start);
+    // Drop overlapping edits.
+    let mut last_end = 0usize;
+    let mut clean: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    for (r, t) in byte_edits {
+        if r.start < last_end {
+            continue;
+        }
+        last_end = r.end;
+        clean.push((r, t));
+    }
+    let mut new_text = text.to_string();
+    for (r, t) in clean.into_iter().rev() {
+        new_text.replace_range(r, t);
+    }
+    let new_has_errors = greycat_analyzer_syntax::parse(&new_text)
+        .root_node()
+        .has_error();
+    new_has_errors && !original_has_errors
+}
+
+/// Map a diagnostic to a concrete `Vec<TextEdit>`. Routes through the
+/// shared [`greycat_analyzer_analysis::quickfix`] module so the LSP and
+/// the cli `lint --fix` path share a single source of truth (P22.7).
 fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
     let code = match &diag.code {
         Some(NumberOrString::String(s)) => s.as_str(),
         _ => return Vec::new(),
     };
-    match code {
-        "missing-token" => {
-            // The diagnostic message is "missing `<kind>`". Pluck the
-            // token between backticks and insert it at the diagnostic's
-            // start position (a zero-width range).
-            let Some(token) = diag
-                .message
-                .split_once('`')
-                .and_then(|(_, rest)| rest.split_once('`').map(|(t, _)| t))
-            else {
-                return Vec::new();
-            };
-            vec![TextEdit {
-                range: lsp_types::Range {
-                    start: diag.range.start,
-                    end: diag.range.start,
-                },
-                new_text: token.to_string(),
-            }]
-        }
-        "unused-local" | "unused-decl" => {
-            // Best-effort delete: replace the diagnostic's range with
-            // empty text. Caller's editor will collapse the resulting
-            // empty line; full statement-level deletion lives in P8.4
-            // (lint-fix driver) where we have HIR context.
-            vec![TextEdit {
-                range: diag.range,
-                new_text: String::new(),
-            }]
-        }
-        "unused-param" => {
-            // Prepend `_` to opt out of the rule. Read the source
-            // text at the diagnostic range to produce `_<name>`.
-            let start = position_to_byte(text, diag.range.start);
-            let end = position_to_byte(text, diag.range.end);
-            if end <= start || end > text.len() {
-                return Vec::new();
-            }
-            let name = &text[start..end];
-            vec![TextEdit {
-                range: diag.range,
-                new_text: format!("_{name}"),
-            }]
-        }
-        "possibly-null" => {
-            // Lint range = the receiver. Find the access operator that
-            // follows (`.`, `->`, `[`) and insert `?` immediately
-            // before it, mirroring the TS reference's "fix available".
-            let recv_end = position_to_byte(text, diag.range.end);
-            let Some(op_pos) = find_access_op_after(text, recv_end) else {
-                return Vec::new();
-            };
-            // Already null-safe — no fix to offer (defensive guard;
-            // the lint shouldn't have fired in the first place).
-            if text.as_bytes().get(op_pos) == Some(&b'?') {
-                return Vec::new();
-            }
-            let pos = byte_to_position(text, op_pos);
-            vec![TextEdit {
-                range: lsp_types::Range {
-                    start: pos,
-                    end: pos,
-                },
-                new_text: "?".into(),
-            }]
-        }
-        "redundant-nullable-access" => {
-            // Lint range covers the operator slice (`?.` / `?->` / `?[`
-            // plus any whitespace). Drop the lone `?` byte inside it.
-            let start = position_to_byte(text, diag.range.start);
-            let end = position_to_byte(text, diag.range.end);
-            if end <= start || end > text.len() {
-                return Vec::new();
-            }
-            let bytes = text.as_bytes();
-            let Some(q) = bytes[start..end]
-                .iter()
-                .position(|b| *b == b'?')
-                .map(|off| start + off)
-            else {
-                return Vec::new();
-            };
-            vec![TextEdit {
-                range: lsp_types::Range {
-                    start: byte_to_position(text, q),
-                    end: byte_to_position(text, q + 1),
-                },
-                new_text: String::new(),
-            }]
-        }
-        "redundant-non-null-assertion" | "redundant-coalesce" => {
-            // Lint range = the dead-weight slice (`!!` for the unary,
-            // `?? rhs` for the coalesce). Delete it.
-            vec![TextEdit {
-                range: diag.range,
-                new_text: String::new(),
-            }]
-        }
-        "modvar-node-cannot-be-nullable" => {
-            // Lint range = the type ref (e.g. `node<float?>?`). Drop the
-            // trailing `?` byte.
-            let end = position_to_byte(text, diag.range.end);
-            if end == 0 || text.as_bytes().get(end - 1) != Some(&b'?') {
-                return Vec::new();
-            }
-            vec![TextEdit {
-                range: lsp_types::Range {
-                    start: byte_to_position(text, end - 1),
-                    end: byte_to_position(text, end),
-                },
-                new_text: String::new(),
-            }]
-        }
-        "modvar-node-inner-must-be-nullable" => {
-            // Lint range = the inner type ref (e.g. `int` in `node<int>`).
-            // Append `?` at its end.
-            vec![TextEdit {
-                range: lsp_types::Range {
-                    start: diag.range.end,
-                    end: diag.range.end,
-                },
-                new_text: "?".into(),
-            }]
-        }
-        _ => Vec::new(),
-    }
+    let start = position_to_byte(text, diag.range.start);
+    let end = position_to_byte(text, diag.range.end);
+    let edits = greycat_analyzer_analysis::quickfix::edit_for_diagnostic(
+        text,
+        code,
+        &(start..end),
+        &diag.message,
+    );
+    edits
+        .into_iter()
+        .map(|e| TextEdit {
+            range: lsp_types::Range {
+                start: byte_to_position(text, e.byte_range.start),
+                end: byte_to_position(text, e.byte_range.end),
+            },
+            new_text: e.new_text,
+        })
+        .collect()
 }
 
 /// Scan forward from `from` over whitespace until we hit an access

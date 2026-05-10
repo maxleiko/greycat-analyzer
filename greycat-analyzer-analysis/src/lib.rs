@@ -26,5 +26,6 @@ pub mod actions;
 pub mod analyzer;
 pub mod lint;
 pub mod project;
+pub mod quickfix;
 pub mod resolver;
 pub mod stdlib;

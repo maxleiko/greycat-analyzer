@@ -625,9 +625,35 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             if params.is_empty() {
                 return None;
             }
-            let range = node
-                .child_by_field_name("iterator")
-                .and_then(|r| lower_expr(cx, r))?;
+            // **P22.4** — the grammar carries TWO sibling fields here:
+            // `iterator: $._expr` and `range: optional($.interval_expr)`.
+            // When the source is `xs[from..to]`, tree-sitter often
+            // resolves the ambiguity as `iterator: xs` + `range:
+            // [from..to]` (interval_expr at prec 2 winning over
+            // offset_expr at prec 13 in this slot). If we lower only
+            // the iterator, the body's `from`/`to` references never
+            // reach the resolver and the unused-local lint fires
+            // false-positive. Fold the range into the iterator: the
+            // semantic shape is `Offset(iterator, range)` regardless
+            // of how the parser split it.
+            let iter_node = node.child_by_field_name("iterator").ok_or(()).ok();
+            let range_node = node.child_by_field_name("range");
+            let range = match (iter_node, range_node) {
+                (Some(iter), Some(rng)) => {
+                    let recv = lower_expr(cx, iter)?;
+                    let idx = lower_expr(cx, rng)?;
+                    let span = iter.start_byte()..rng.end_byte();
+                    cx.hir.exprs.alloc(Expr::Offset(OffsetExpr {
+                        receiver: recv,
+                        index: idx,
+                        pre_optional: false,
+                        post_optional: false,
+                        byte_range: span,
+                    }))
+                }
+                (Some(iter), None) => lower_expr(cx, iter)?,
+                _ => return None,
+            };
             let body = node
                 .child_by_field_name("block")
                 .and_then(|n| lower_block_inline(cx, n))?;
