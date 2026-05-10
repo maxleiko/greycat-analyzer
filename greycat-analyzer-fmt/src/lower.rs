@@ -950,13 +950,13 @@ fn lower_try_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         parts.push(lower_node(cx, t));
     }
     parts.push(Doc::text(" catch"));
+    // Three accepted shapes: `catch`, `catch (e)`, `catch ()`. The third is
+    // grammar-permissive so partial edits don't surface as ERROR nodes —
+    // the formatter normalizes it to the bare `catch` form since no ident
+    // is bound either way.
     if let Some(p) = node.child_by_field_name("error_param") {
         parts.push(Doc::text(" ("));
-        parts.push(Doc::text(
-            cx.text(p)
-                .trim_matches(|c| c == '(' || c == ')')
-                .to_string(),
-        ));
+        parts.push(Doc::text(cx.text(p).to_string()));
         parts.push(Doc::text(")"));
     }
     parts.push(Doc::space());

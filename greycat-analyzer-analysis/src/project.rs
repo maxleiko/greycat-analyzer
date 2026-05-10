@@ -25,7 +25,7 @@ use greycat_analyzer_hir::{Hir, lower_module};
 use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
 use crate::directives::Directives;
 use crate::lint::{
-    LintDiagnostic, lint_arrow_on_non_deref_with_directives,
+    LintDiagnostic, lint_arrow_on_non_deref_with_directives, lint_catch_empty_parens,
     lint_inferred_return_type_with_directives, lint_non_exhaustive_with_directives,
     lint_nullability_with_directives, lint_unreachable_with_directives, lint_unused_suppressions,
     run_lints_with_directives,
@@ -313,6 +313,7 @@ impl ProjectAnalysis {
         &mut self,
         manager: &SourceManager,
     ) -> Vec<(Uri, Hir, String, Duration, Directives)> {
+        let bypass = self.bypass_suppressions;
         let mut hirs: Vec<(Uri, Hir, String, Duration, Directives)> =
             Vec::with_capacity(manager.len());
         for (uri, cell) in manager.iter() {
@@ -323,7 +324,22 @@ impl ProjectAnalysis {
             // **P23.1** — parse `// gcl-…` directives off the same CST
             // we just lowered, so lints and the formatter can see the
             // user's per-region opt-outs.
-            let directives = crate::directives::parse_directives(&doc.text, doc.root_node());
+            let mut directives = crate::directives::parse_directives(&doc.text, doc.root_node());
+            // CST-shape lint: `catch ()` empty parens. Walks the CST
+            // because the parens are noise the HIR drops; piggybacks on
+            // `directives.diagnostics` so the existing pipeline drains it
+            // into the per-module lint stream. Move the diagnostics vec
+            // out, mutate alongside `&mut directives` (suppression check),
+            // then move it back — avoids aliasing the `Directives` borrow.
+            let mut catch_lints: Vec<LintDiagnostic> = Vec::new();
+            lint_catch_empty_parens(
+                &doc.text,
+                doc.root_node(),
+                &mut directives,
+                bypass,
+                &mut catch_lints,
+            );
+            directives.diagnostics.extend(catch_lints);
             self.index.ingest(uri, &hir);
             hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took, directives));
         }

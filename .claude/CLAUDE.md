@@ -139,6 +139,19 @@ cd playground && pnpm install && pnpm dev
 scripts/parity-oracle.sh <ts-lang-checkout> <corpus-dir>
 ```
 
+## Adding / removing a lint rule
+
+Whenever you add a new lint rule (or retire an existing one), visit all four touchpoints below in the same change. Forgetting any one silently breaks `--list-rules`, LSP completion, suppression validation, the auto-fix path, or the editor "dim unused code" UX.
+
+| Touchpoint | File | When |
+|---|---|---|
+| `LINT_RULES` registry — name + one-line summary | [greycat-analyzer-analysis/src/lint.rs](../greycat-analyzer-analysis/src/lint.rs) | **Always.** Drives `lint --list-rules` and the LSP's `// gcl-lint-off …` rule-name completion. Both read straight from this slice — there is no second registry. |
+| Emission wiring | [greycat-analyzer-analysis/src/lint.rs](../greycat-analyzer-analysis/src/lint.rs) (`default_rules()`) for HIR-walking rules, OR an explicit call from [greycat-analyzer-analysis/src/project.rs](../greycat-analyzer-analysis/src/project.rs) for typed / CST-shape passes (e.g. `lint_arrow_on_non_deref_with_directives`, `lint_catch_empty_parens`). | **Always.** A rule registered in `LINT_RULES` but never emitted is a permanent ghost in `--list-rules`. |
+| Auto-fix dispatch | [greycat-analyzer-analysis/src/quickfix.rs](../greycat-analyzer-analysis/src/quickfix.rs) (`edit_for_diagnostic` match + per-rule fn) | When the rule has an auto-fix. Both `lint --fix` and the LSP's `textDocument/codeAction` go through this single dispatch — there is no second one. |
+| Editor "unused" tag | [greycat-analyzer-analysis/src/lint.rs](../greycat-analyzer-analysis/src/lint.rs) (`default_tag_for`) | When the rule represents "this code does nothing" (`unused-*`, `unreachable`, `redundant-*`). Editors render the span dimmed via LSP `DiagnosticTag::UNNECESSARY`. |
+
+Removal-side: walk the same four files in reverse, then **grep the repo for the rule name** — fixture files under [greycat-analyzer-analysis/tests/](../greycat-analyzer-analysis/tests/), the conformance corpus, and snapshot tests reference rules by string, and the compiler cannot catch a stale literal.
+
 ## Conventions
 
 - **`lsp_types` is re-exported from `greycat-analyzer-core`** — depend on `greycat_analyzer_core::lsp_types` from downstream crates so versions stay in lockstep.

@@ -49,8 +49,34 @@ pub fn edit_for_diagnostic(
         }
         "unreachable" => unreachable_fix(text, start, end),
         "non-exhaustive" => non_exhaustive_fix(text, start, message),
+        "catch-empty-parens" => catch_empty_parens_fix(text, start, end),
         _ => Vec::new(),
     }
+}
+
+/// Delete the empty `(...)` plus any whitespace immediately preceding it
+/// (typically the single space after `catch`), so `catch () { … }` becomes
+/// `catch { … }`. The diagnostic's range already covers the parens; we
+/// extend left to absorb the leading whitespace so the result has tidy
+/// spacing.
+fn catch_empty_parens_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
+    if end <= start || end > text.len() {
+        return Vec::new();
+    }
+    let mut new_start = start;
+    let bytes = text.as_bytes();
+    while new_start > 0 {
+        let b = bytes[new_start - 1];
+        if b == b' ' || b == b'\t' {
+            new_start -= 1;
+        } else {
+            break;
+        }
+    }
+    vec![TextEdit {
+        byte_range: new_start..end,
+        new_text: String::new(),
+    }]
 }
 
 // =============================================================================
@@ -548,9 +574,18 @@ fn is_param_name_unused_in_enclosing_fn(text: &str, param_start: usize, name: &s
     let Some(mut node) = root.descendant_for_byte_range(param_start, param_start) else {
         return true;
     };
-    // Walk up to the enclosing function-shaped node.
+    // Walk up to the enclosing scope. For a catch param the scope is the
+    // catch_block — `e` only exists there, so scanning the whole fn body
+    // would refuse the fix on unrelated `e` occurrences elsewhere. For a
+    // regular fn / method / lambda param the scope is the body.
     loop {
         match node.kind() {
+            "try_stmt" => {
+                let Some(cb) = node.child_by_field_name("catch_block") else {
+                    return true;
+                };
+                return !contains_whole_word(&text[cb.byte_range()], name);
+            }
             "fn_decl" | "type_method" | "lambda_expr" => break,
             _ => {}
         }

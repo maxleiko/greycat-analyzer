@@ -236,6 +236,10 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
         name: "unbalanced-lint-off",
         summary: "flag a `// gcl-lint-off …` with no matching `gcl-lint-on`",
     },
+    LintRuleInfo {
+        name: "catch-empty-parens",
+        summary: "error on `catch ()` — drop the empty parens (`catch { … }` is the no-binding form)",
+    },
 ];
 
 /// Run every registered HIR-only rule in order and return the merged
@@ -321,6 +325,71 @@ pub fn lint_unused_suppressions(
             continue;
         }
         out.push(d);
+    }
+}
+
+/// CST walker for `catch ()` — empty catch-parens. The grammar accepts
+/// `catch ()` so partial mid-edit text doesn't surface as an `ERROR`
+/// node, but the shape carries no semantic information (no ident is
+/// bound) and is purely transient. Emit an error with a quickfix that
+/// deletes the parens.
+///
+/// The diagnostic's byte range covers the `(...)` (inclusive of any
+/// whitespace between `catch` and `(` that the quickfix should also
+/// delete).
+pub fn lint_catch_empty_parens(
+    text: &str,
+    root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    use greycat_analyzer_syntax::tree_sitter::Node;
+    fn walk(text: &str, node: Node<'_>, hits: &mut Vec<std::ops::Range<usize>>) {
+        if node.kind() == "try_stmt" && node.child_by_field_name("error_param").is_none() {
+            // Find the anonymous `(` and `)` direct children. With the
+            // P-current grammar the parens are inlined siblings of the
+            // try_stmt's named children — they only exist when the user
+            // typed `catch ()`.
+            let mut cur = node.walk();
+            let mut open: Option<usize> = None;
+            let mut close: Option<usize> = None;
+            for ch in node.children(&mut cur) {
+                if ch.is_named() {
+                    continue;
+                }
+                let s = &text[ch.byte_range()];
+                if s == "(" && open.is_none() {
+                    open = Some(ch.start_byte());
+                } else if s == ")" && open.is_some() {
+                    close = Some(ch.end_byte());
+                }
+            }
+            if let (Some(start), Some(end)) = (open, close) {
+                hits.push(start..end);
+            }
+        }
+        let mut cur = node.walk();
+        for ch in node.children(&mut cur) {
+            walk(text, ch, hits);
+        }
+    }
+    let mut hits: Vec<std::ops::Range<usize>> = Vec::new();
+    walk(text, root, &mut hits);
+    for byte_range in hits {
+        if !bypass_suppressions
+            && directives.suppresses_lint(byte_range.start, "catch-empty-parens")
+        {
+            continue;
+        }
+        out.push(LintDiagnostic {
+            rule: "catch-empty-parens",
+            severity: LintSeverity::Error,
+            message: "empty catch parens — drop them (`catch { … }` is the no-binding form)"
+                .to_string(),
+            byte_range,
+            tag: None,
+        });
     }
 }
 
@@ -471,8 +540,30 @@ impl LintRule for UnusedParam {
             return;
         };
         for decl_id in &module.decls {
-            if let Decl::Fn(fnd) = &cx.hir.decls[*decl_id] {
-                check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
+            match &cx.hir.decls[*decl_id] {
+                Decl::Fn(fnd) => {
+                    check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
+                    if let Some(body) = fnd.body {
+                        visit_for_catch_params(cx.hir, cx.res, body, &mut candidates, self.name());
+                    }
+                }
+                Decl::Type(td) => {
+                    for method_id in &td.methods {
+                        if let Decl::Fn(fnd) = &cx.hir.decls[*method_id] {
+                            check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
+                            if let Some(body) = fnd.body {
+                                visit_for_catch_params(
+                                    cx.hir,
+                                    cx.res,
+                                    body,
+                                    &mut candidates,
+                                    self.name(),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         for d in candidates {
@@ -513,6 +604,70 @@ fn check_fn_params(
                 tag: None,
             });
         }
+    }
+}
+
+/// Walk a fn body looking for `try { … } catch (e) { … }` shapes whose
+/// `e` is never read. The catch param is bound by the resolver as
+/// `Definition::Local(name)` (same as a `var`), so the usage check
+/// mirrors `unused-local`'s — emit under `unused-param` with a
+/// catch-flavored message.
+fn visit_for_catch_params(
+    hir: &Hir,
+    res: &Resolutions,
+    stmt_id: Idx<Stmt>,
+    out: &mut Vec<LintDiagnostic>,
+    rule: &'static str,
+) {
+    use greycat_analyzer_hir::types::BlockStmt;
+    fn visit_block(
+        hir: &Hir,
+        res: &Resolutions,
+        block: &BlockStmt,
+        out: &mut Vec<LintDiagnostic>,
+        rule: &'static str,
+    ) {
+        for s in &block.stmts {
+            visit_for_catch_params(hir, res, *s, out, rule);
+        }
+    }
+    let stmt = &hir.stmts[stmt_id];
+    match stmt {
+        Stmt::Block(b) => visit_block(hir, res, b, out, rule),
+        Stmt::If(i) => {
+            visit_block(hir, res, &i.then_branch, out, rule);
+            if let Some(eb) = i.else_branch {
+                visit_for_catch_params(hir, res, eb, out, rule);
+            }
+        }
+        Stmt::While(w) => visit_block(hir, res, &w.body, out, rule),
+        Stmt::DoWhile(w) => visit_block(hir, res, &w.body, out, rule),
+        Stmt::For(f) => visit_block(hir, res, &f.body, out, rule),
+        Stmt::ForIn(f) => visit_block(hir, res, &f.body, out, rule),
+        Stmt::Try(t) => {
+            visit_block(hir, res, &t.try_block, out, rule);
+            if let Some(name) = t.error_param {
+                let ident = &hir.idents[name];
+                if !ident.text.starts_with('_') {
+                    let used = res.uses.values().any(|d| match d {
+                        Definition::Local(n) => *n == name,
+                        _ => false,
+                    });
+                    if !used {
+                        out.push(LintDiagnostic {
+                            rule,
+                            severity: LintSeverity::Warning,
+                            message: format!("unused catch parameter `{}`", ident.text),
+                            byte_range: ident.byte_range.clone(),
+                            tag: None,
+                        });
+                    }
+                }
+            }
+            visit_block(hir, res, &t.catch_block, out, rule);
+        }
+        Stmt::At(a) => visit_block(hir, res, &a.block, out, rule),
+        _ => {}
     }
 }
 
