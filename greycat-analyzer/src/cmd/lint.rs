@@ -37,15 +37,7 @@ pub struct Lint {
                 quiet    summary line only (exit code is the gate)\n"
     )]
     format: Option<OutputFormat>,
-    #[clap(
-        long,
-        help = "Also surface lints from non-`project` libraries (modules \
-                under `lib/<name>/`). Off by default — library code isn't \
-                yours, and the `unused-decl` / etc. signals are noise \
-                when triaging warnings on your own project. Type-relation \
-                errors are unaffected by this flag — those always surface \
-                so cross-module shape mismatches can't hide."
-    )]
+    #[clap(long, help = "Also lint `lib/<name>/` modules (default: project only)")]
     lint_libs: bool,
     #[clap(
         long,
@@ -54,10 +46,7 @@ pub struct Lint {
     list_rules: bool,
     #[clap(
         long,
-        help = "Re-emit every diagnostic, even those silenced by a \
-                `// gcl-lint-off …` directive. For CI pipelines that want \
-                to enforce \"no suppressions allowed in code review\" or \
-                to audit what's hidden behind suppressions in a project."
+        help = "Re-emit diagnostics silenced by `// gcl-lint-off …` directives"
     )]
     no_suppressions: bool,
     #[clap(
