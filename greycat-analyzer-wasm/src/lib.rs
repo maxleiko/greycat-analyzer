@@ -319,13 +319,13 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
             };
             (
                 kind,
-                Some(ident_text(hir, m.property)),
+                Some(ident_text(hir, m.property.ident())),
                 vec![expr_node(hir, m.receiver)],
             )
         }
         Expr::Static(s) => (
             "expr:static",
-            Some(ident_text(hir, s.property)),
+            Some(ident_text(hir, s.property.ident())),
             vec![type_ref_node(hir, s.ty)],
         ),
         Expr::QualifiedStatic { chain, .. } => (

@@ -619,8 +619,8 @@ fn short_expr_label(hir: &Hir, expr: &Expr) -> String {
         Expr::Call(_) => "call".into(),
         Expr::Binary(_) => "expression".into(),
         Expr::Unary(_) => "expression".into(),
-        Expr::Member(m) | Expr::Arrow(m) => hir.idents[m.property].text.to_string(),
-        Expr::Static(s) => hir.idents[s.property].text.to_string(),
+        Expr::Member(m) | Expr::Arrow(m) => hir.idents[m.property.ident()].text.to_string(),
+        Expr::Static(s) => hir.idents[s.property.ident()].text.to_string(),
         _ => "expression".into(),
     }
 }

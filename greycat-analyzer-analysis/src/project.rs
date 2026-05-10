@@ -1717,10 +1717,11 @@ fn resolve_call_target(
             _ => None,
         },
         Expr::Static(s) => {
-            if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(s.property) {
+            let property = s.property.ident();
+            if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(property) {
                 return Some((None, decl_id));
             }
-            if let Some(foreign) = cur.analysis.foreign_member_lookup(s.property)
+            if let Some(foreign) = cur.analysis.foreign_member_lookup(property)
                 && let MemberDef::Method(decl_id) = foreign.member
             {
                 return Some((Some(foreign.uri.clone()), decl_id));

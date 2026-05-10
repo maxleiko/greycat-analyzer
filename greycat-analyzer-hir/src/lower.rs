@@ -42,6 +42,12 @@ impl<'src> LowerCtx<'src> {
     /// variant access). For the `string` form, store the unquoted
     /// fragment text so `member_uses` / variant lookups succeed
     /// without callers having to strip quotes.
+    ///
+    /// Use this when the call site flattens both forms to a bare
+    /// `Idx<Ident>` (e.g. the `Expr::QualifiedStatic` chain).
+    /// New call sites should prefer
+    /// [`Self::alloc_property_name`], which preserves the syntactic
+    /// form via [`PropertyName`].
     fn alloc_property_ident(&mut self, node: tree_sitter::Node<'_>) -> Idx<Ident> {
         if node.kind() == "string" {
             let mut c = node.walk();
@@ -57,6 +63,18 @@ impl<'src> LowerCtx<'src> {
             }
         }
         self.alloc_ident(node)
+    }
+
+    /// Allocate a property-position node and tag the returned
+    /// [`PropertyName`] with the syntactic form (`ident` vs quoted
+    /// `string`). The decoded text and byte range are interned the
+    /// same way as [`Self::alloc_property_ident`].
+    fn alloc_property_name(&mut self, node: tree_sitter::Node<'_>) -> PropertyName {
+        if node.kind() == "string" {
+            PropertyName::String(self.alloc_property_ident(node))
+        } else {
+            PropertyName::Ident(self.alloc_ident(node))
+        }
     }
 }
 
@@ -820,7 +838,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             let prop = node.child_by_field_name("property")?;
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
-            let property = cx.alloc_ident(prop);
+            let property = cx.alloc_property_name(prop);
             let (pre_optional, post_optional) = optional_flags_around(node, prop.id());
             Expr::Member(MemberExpr {
                 receiver,
@@ -834,7 +852,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             let prop = node.child_by_field_name("property")?;
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
-            let property = cx.alloc_ident(prop);
+            let property = cx.alloc_property_name(prop);
             let (pre_optional, post_optional) = optional_flags_around(node, prop.id());
             Expr::Arrow(MemberExpr {
                 receiver,
@@ -866,8 +884,10 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 let ty = lower_type_ref(cx, head)?;
                 // The property can be either an `ident` (`Foo::a`) or a
                 // quoted `string` (`Foo::"a"`); both forms are valid
-                // enum-variant access syntax.
-                let property = cx.alloc_property_ident(prop);
+                // enum-variant access syntax. The `PropertyName` enum
+                // preserves the syntactic form for diagnostics and
+                // formatter round-trips.
+                let property = cx.alloc_property_name(prop);
                 Expr::Static(StaticExpr {
                     ty,
                     property,

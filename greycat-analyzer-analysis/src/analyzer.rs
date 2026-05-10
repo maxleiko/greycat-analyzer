@@ -767,7 +767,7 @@ impl<'a, 'b> Cx<'a, 'b> {
                 receiver, property, ..
             }) => {
                 let recv_path = self.member_path(*receiver)?;
-                let prop = self.ident_text(*property);
+                let prop = self.ident_text(property.ident());
                 Some(format!("{recv_path}.{prop}"))
             }
             // **P19.21** — `x->y` participates in member-narrowing the
@@ -778,7 +778,7 @@ impl<'a, 'b> Cx<'a, 'b> {
                 receiver, property, ..
             }) => {
                 let recv_path = self.member_path(*receiver)?;
-                let prop = self.ident_text(*property);
+                let prop = self.ident_text(property.ident());
                 Some(format!("{recv_path}->{prop}"))
             }
             _ => None,
@@ -992,17 +992,17 @@ impl<'a, 'b> Cx<'a, 'b> {
         let dispatch: CalleeShape = match &self.hir.exprs[callee] {
             Expr::Member(m) => CalleeShape::Member {
                 receiver: m.receiver,
-                property: m.property,
+                property: m.property.ident(),
                 is_arrow: false,
             },
             Expr::Arrow(m) => CalleeShape::Member {
                 receiver: m.receiver,
-                property: m.property,
+                property: m.property.ident(),
                 is_arrow: true,
             },
             Expr::Static(s) => CalleeShape::Static {
                 ty: s.ty,
-                property: s.property,
+                property: s.property.ident(),
             },
             Expr::Ident(name_idx) => CalleeShape::Ident(*name_idx),
             Expr::QualifiedStatic { chain, .. } => CalleeShape::QualifiedStatic(chain.clone()),
@@ -2392,7 +2392,7 @@ impl<'a, 'b> Cx<'a, 'b> {
         let enum_name = self.hir.idents[self.hir.type_refs[*ty].name]
             .text
             .to_string();
-        let variant = self.hir.idents[*property].text.to_string();
+        let variant = self.hir.idents[property.ident()].text.to_string();
         Some((binding, enum_name, variant))
     }
 
@@ -2590,6 +2590,7 @@ impl<'a, 'b> Cx<'a, 'b> {
                 post_optional,
                 ..
             }) => {
+                let property = property.ident();
                 let recv_ty = self.visit_expr(receiver);
                 // P16.5 — `n->field` where `n: node<T>` (or any node-tag
                 // shape: `nodeTime<T>`, `nodeIndex<K, V>`, …) resolves
@@ -2677,12 +2678,13 @@ impl<'a, 'b> Cx<'a, 'b> {
                 // (via `lower_type_ref`'s `index.has_name(&name)` arm),
                 // then run `resolve_member` on the property.
                 let recv_ty = self.lower_type_ref(s.ty);
-                self.resolve_member(recv_ty, s.property);
+                let property = s.property.ident();
+                self.resolve_member(recv_ty, property);
                 // Enum-variant access: `Foo::a` where `Foo` is an enum
                 // and `a` is one of its variants — the value's type is
                 // the enum itself, not `any`.
                 if let TypeKind::Enum { variants, .. } = &self.arena.get(recv_ty).kind {
-                    let prop = self.hir.idents[s.property].text.as_str();
+                    let prop = self.hir.idents[property].text.as_str();
                     if variants.iter().any(|v| v == prop) {
                         return recv_ty;
                     }
@@ -2695,7 +2697,7 @@ impl<'a, 'b> Cx<'a, 'b> {
                 // project index (`Programs::python3` typed as
                 // `String` instead of `field` when `python3` is
                 // declared `static`).
-                if let Some(ty) = self.static_value_type(recv_ty, s.property) {
+                if let Some(ty) = self.static_value_type(recv_ty, property) {
                     return ty;
                 }
                 // P23 — `module::Name` shapes parse as `Static` with
@@ -2704,7 +2706,7 @@ impl<'a, 'b> Cx<'a, 'b> {
                 // to a 2-segment QualifiedStatic-style lookup against
                 // the project signatures index.
                 let recv_name = self.hir.type_refs[s.ty].name;
-                let chain = [recv_name, s.property];
+                let chain = [recv_name, property];
                 self.qualified_static_value_type(&chain)
                     .unwrap_or_else(|| self.any())
             }
