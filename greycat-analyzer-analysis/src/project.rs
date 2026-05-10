@@ -870,18 +870,46 @@ impl ProjectAnalysis {
     /// to a thin "wire it all together" call.
     fn stage_per_module_analysis(&mut self, hirs: Vec<(Uri, Hir, String, Duration, Directives)>) {
         let bypass = self.bypass_suppressions;
-        for (uri, hir, lib, lower_took, mut directives) in hirs {
-            let mut timings = ModuleTimings {
-                lower: lower_took,
-                ..ModuleTimings::default()
-            };
+        let index = &self.index;
+
+        // P26.4 — split the per-module pass into two phases:
+        //
+        //   Pass A (parallel): resolve + HIR-shape lints. Both are
+        //   read-only against `&self.index` and write only to their
+        //   per-module return values.
+        //
+        //   Pass B (serial): the analyzer's body walker
+        //   (`analyze_with_index_into`), which mutates `&mut self.arena`
+        //   for type allocation. P26.5 will probe whether wrapping
+        //   the arena in a Mutex makes this parallel too; for now it
+        //   stays serial.
+        //
+        // The serial path under `cfg(not(feature = "parallel"))` runs
+        // both phases inline per module, identical to the original
+        // sequential flow.
+        struct PassAOut {
+            uri: Uri,
+            hir: Hir,
+            lib: String,
+            lower_took: Duration,
+            directives: Directives,
+            resolutions: Resolutions,
+            lints: Vec<LintDiagnostic>,
+            resolve_took: Duration,
+            lint_took: Duration,
+        }
+
+        let pass_a_run = |(uri, hir, lib, lower_took, mut directives): (
+            Uri,
+            Hir,
+            String,
+            Duration,
+            Directives,
+        )|
+         -> PassAOut {
             let t0 = Instant::now();
-            let resolutions = resolve_with_index(&hir, &self.index);
-            timings.resolve = t0.elapsed();
-            let t1 = Instant::now();
-            let analysis =
-                analyze_with_index_into(&hir, &resolutions, &self.index, &mut self.arena);
-            timings.analyze = t1.elapsed();
+            let resolutions = resolve_with_index(&hir, index);
+            let resolve_took = t0.elapsed();
             let t2 = Instant::now();
             // Seed `lints` with the directive parser's own diagnostics
             // (`unknown-suppression-rule`, `empty-suppression`, …) so
@@ -893,17 +921,50 @@ impl ProjectAnalysis {
                 &mut directives,
                 bypass,
             ));
-            timings.lint = t2.elapsed();
-            self.modules.insert(
+            let lint_took = t2.elapsed();
+            PassAOut {
                 uri,
+                hir,
+                lib,
+                lower_took,
+                directives,
+                resolutions,
+                lints,
+                resolve_took,
+                lint_took,
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        let pass_a: Vec<PassAOut> = {
+            use rayon::prelude::*;
+            hirs.into_par_iter().map(pass_a_run).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let pass_a: Vec<PassAOut> = hirs.into_iter().map(pass_a_run).collect();
+
+        // Pass B (serial): body walker mutates `self.arena`.
+        for p in pass_a {
+            let mut timings = ModuleTimings {
+                lower: p.lower_took,
+                resolve: p.resolve_took,
+                lint: p.lint_took,
+                ..ModuleTimings::default()
+            };
+            let t1 = Instant::now();
+            let analysis =
+                analyze_with_index_into(&p.hir, &p.resolutions, &self.index, &mut self.arena);
+            timings.analyze = t1.elapsed();
+            self.modules.insert(
+                p.uri,
                 ModuleAnalysis {
-                    hir,
-                    resolutions,
+                    hir: p.hir,
+                    resolutions: p.resolutions,
                     analysis,
-                    lints,
-                    lib,
+                    lints: p.lints,
+                    lib: p.lib,
                     timings,
-                    directives,
+                    directives: p.directives,
                 },
             );
         }
