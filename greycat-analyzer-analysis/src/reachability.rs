@@ -22,9 +22,13 @@
 //! (`@never_returns` is deferred — see ROADMAP). When that lands, this
 //! primitive grows a `&FnIndex` arg.
 
+use std::ops::Range;
+
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{BlockStmt, IfStmt, Stmt, TryStmt};
+
+use crate::analyzer::AnalysisResult;
 
 /// `true` iff control flow cannot fall through past `stmt_id`. See the
 /// module docs for the conservative-on-loops / conservative-on-calls
@@ -91,6 +95,90 @@ pub fn first_dead_index(hir: &Hir, block: &BlockStmt) -> Option<usize> {
         }
     }
     None
+}
+
+/// **P24.2** — analyzer-aware divergence: same as [`stmt_diverges`]
+/// but also treats an exhaustive enum-eq if-chain (recorded in
+/// `analysis.exhaustive_enum_chains`) as divergent when every arm body
+/// diverges. Without this, the canonical `if (x == E::A) { return …; }
+/// else if (x == E::B) { return …; }` shape would not flag the
+/// post-chain `var _` as dead — the HIR-only walker can't tell that
+/// the chain semantically covers every branch.
+pub fn stmt_diverges_with_analysis(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    stmt_id: Idx<Stmt>,
+) -> bool {
+    if stmt_diverges(hir, stmt_id) {
+        return true;
+    }
+    // The HIR walker said "doesn't diverge". The only extra signal we
+    // know about is "this if is the head of an exhaustive chain whose
+    // every arm body diverges". Check that.
+    if let Stmt::If(_) = &hir.stmts[stmt_id]
+        && analysis.exhaustive_enum_chains.contains(&stmt_id)
+        && every_arm_diverges(hir, analysis, stmt_id)
+    {
+        return true;
+    }
+    false
+}
+
+/// `true` iff every arm body in the if-chain rooted at `head_id`
+/// diverges. Walks the chain via the `else_branch` field — same shape
+/// `extract_enum_chain` follows, but only consults divergence (no
+/// enum-name binding lookup needed).
+fn every_arm_diverges(hir: &Hir, analysis: &AnalysisResult, head_id: Idx<Stmt>) -> bool {
+    let mut cur = head_id;
+    loop {
+        match &hir.stmts[cur] {
+            Stmt::If(IfStmt {
+                then_branch,
+                else_branch,
+                ..
+            }) => {
+                if !block_diverges(hir, then_branch) {
+                    return false;
+                }
+                let Some(eb) = else_branch else {
+                    // No else — chain has no fall-through arm, so
+                    // "every arm" is just every then-branch. We've
+                    // walked them all.
+                    return true;
+                };
+                cur = *eb;
+            }
+            Stmt::Block(b) => {
+                // Final `else { … }` arm.
+                return block_diverges(hir, b);
+            }
+            _ => {
+                // Anything else in the else-branch slot (e.g. a single
+                // statement) — fall back to the divergence primitive.
+                return stmt_diverges_with_analysis(hir, analysis, cur);
+            }
+        }
+    }
+}
+
+/// **P24.2** — byte range of the trailing `else { … }` block of an
+/// exhaustive chain. Returns `None` when the chain has no final else
+/// (no dead arm to flag) or the head doesn't match the chain shape.
+/// The dead-code lint emits `unreachable` at this range.
+pub fn dead_else_range_for_exhaustive_chain(hir: &Hir, head_id: Idx<Stmt>) -> Option<Range<usize>> {
+    let mut cur = head_id;
+    loop {
+        match &hir.stmts[cur] {
+            Stmt::If(IfStmt { else_branch, .. }) => {
+                let Some(eb) = else_branch else {
+                    return None;
+                };
+                cur = *eb;
+            }
+            Stmt::Block(b) => return Some(b.byte_range.clone()),
+            _ => return None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +303,83 @@ mod tests {
         let body = fn_body(&hir, "f");
         // The return is the last stmt — nothing after it, no dead index.
         assert_eq!(first_dead_index(&hir, &body), None);
+    }
+
+    // -------------------------------------------------------------------
+    // P24.2 — exhaustive-chain divergence promotion
+    // -------------------------------------------------------------------
+
+    fn project_analyze(
+        src: &str,
+    ) -> (
+        greycat_analyzer_core::lsp_types::Uri,
+        crate::project::ProjectAnalysis,
+    ) {
+        use crate::project::ProjectAnalysis;
+        use greycat_analyzer_core::SourceManager;
+        use greycat_analyzer_core::lsp_types::Uri;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(uri.clone(), src, "project", false);
+        (uri, ProjectAnalysis::analyze(&mgr))
+    }
+
+    #[test]
+    fn exhaustive_chain_recorded_when_all_variants_covered() {
+        let (uri, pa) = project_analyze(
+            "enum E { A, B }\nfn f(x: E): int { if (x == E::A) { return 1; } else if (x == E::B) { return 2; } return 0; }\n",
+        );
+        let m = pa.module(&uri).unwrap();
+        assert_eq!(
+            m.analysis.exhaustive_enum_chains.len(),
+            1,
+            "expected one exhaustive chain"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_chain_not_recorded() {
+        let (uri, pa) = project_analyze(
+            "enum E { A, B, C }\nfn f(x: E): int { if (x == E::A) { return 1; } else if (x == E::B) { return 2; } return 0; }\n",
+        );
+        let m = pa.module(&uri).unwrap();
+        assert!(
+            m.analysis.exhaustive_enum_chains.is_empty(),
+            "non-exhaustive chains should not be recorded"
+        );
+    }
+
+    #[test]
+    fn stmt_diverges_with_analysis_promotes_exhaustive_chain() {
+        let (uri, pa) = project_analyze(
+            "enum E { A, B }\nfn f(x: E): int { if (x == E::A) { return 1; } else if (x == E::B) { return 2; } return 0; }\n",
+        );
+        let m = pa.module(&uri).unwrap();
+        let body = fn_body(&m.hir, "f");
+        // The exhaustive chain is at index 0; every arm returns; so
+        // `stmt_diverges_with_analysis` should call it divergent.
+        let head_id = body.stmts[0];
+        assert!(stmt_diverges_with_analysis(&m.hir, &m.analysis, head_id,));
+        // Plain `stmt_diverges` doesn't know about enum exhaustiveness
+        // (no else arm), so it returns false.
+        assert!(!stmt_diverges(&m.hir, head_id));
+    }
+
+    #[test]
+    fn dead_else_range_for_exhaustive_chain_returns_else_block_span() {
+        let src = "enum E { A, B }\nfn f(x: E): int { if (x == E::A) { return 1; } else if (x == E::B) { return 2; } else { return 3; } }\n";
+        let (uri, pa) = project_analyze(src);
+        let m = pa.module(&uri).unwrap();
+        let body = fn_body(&m.hir, "f");
+        let head_id = body.stmts[0];
+        assert!(m.analysis.exhaustive_enum_chains.contains(&head_id));
+        let dead_range =
+            dead_else_range_for_exhaustive_chain(&m.hir, head_id).expect("should find else block");
+        let covered = &src[dead_range];
+        assert!(
+            covered.contains("return 3"),
+            "expected else block contents in dead range, got {covered:?}"
+        );
     }
 }

@@ -203,6 +203,13 @@ pub struct AnalysisResult {
     /// `runtime::Identity::create`.
     pub foreign_decl_uses: HashMap<Idx<Ident>, ForeignDecl>,
     pub diagnostics: Vec<SemanticDiagnostic>,
+    /// **P24.2** — head if-stmt ids of enum-eq chains that
+    /// exhaustively cover every variant of the dispatched-on enum.
+    /// Consumed by the `unreachable` lint (P24.3) to flag the trailing
+    /// `else` arm of such a chain as dead code, and to treat the
+    /// chain as effectively divergent for fall-through-deadness
+    /// analysis when every arm body diverges.
+    pub exhaustive_enum_chains: HashSet<Idx<Stmt>>,
 }
 
 /// Where a member-access property name resolves to.
@@ -2077,19 +2084,8 @@ impl<'a> Cx<'a> {
         for arm in &chain.arms {
             self.chain_member_ifs.insert(arm.if_stmt_id);
         }
-        if chain.has_final_else {
-            return;
-        }
         // **P20.3** — a lone `if (x == E::V) { ... }` (no `else if`,
-        // no final `else`) is *not* a match-like dispatch: the user
-        // is checking a single variant, not enumerating all of them.
-        // Flagging it as "non-exhaustive" against every other variant
-        // is a false positive; the canonical pattern in the wild is
-        // sequential `if (x == E::A) { return ...; } if (x == E::B)
-        // { return ...; } ... return fallback;` where each `if` stands
-        // alone. Only fire when the chain has at least one `else if`
-        // arm (`arms.len() >= 2`) — that's when the user is using the
-        // chain as a switch and we can meaningfully assert coverage.
+        // no final `else`) is *not* a match-like dispatch.
         if chain.arms.len() < 2 {
             return;
         }
@@ -2108,6 +2104,17 @@ impl<'a> Cx<'a> {
             .filter(|v| !covered.contains(v))
             .collect();
         if missing.is_empty() {
+            // **P24.2** — record exhaustive coverage even when the
+            // chain has a trailing `else`: the dead-code lint uses
+            // this to flag the trailing `else` as unreachable AND to
+            // treat the chain as effectively divergent when every arm
+            // body diverges.
+            self.out.exhaustive_enum_chains.insert(head_id);
+            return;
+        }
+        // Missing variants exist — only emit the "non-exhaustive"
+        // warning when there's no catch-all `else` to fall through to.
+        if chain.has_final_else {
             return;
         }
         let msg = format!(
