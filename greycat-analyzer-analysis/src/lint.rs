@@ -19,8 +19,8 @@ use smol_str::SmolStr;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
-    BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, Stmt, TypeDecl,
-    UnaryExpr, UnaryOp,
+    BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, PropertyName, Stmt,
+    TypeDecl, UnaryExpr, UnaryOp,
 };
 use greycat_analyzer_types::{TypeKind, is_node_tag};
 
@@ -1366,7 +1366,7 @@ fn lint_nullability_inner(
                         },
                     );
                 } else if !recv.nullable && *pre_optional {
-                    let prop_start = hir.idents[*property].byte_range.start;
+                    let prop_start = hir.idents[property.ident()].byte_range.start;
                     let _ = expr_id;
                     let _ = byte_range;
                     emit_typed(
@@ -1502,6 +1502,18 @@ fn receiver_byte_range(hir: &Hir, expr_id: Idx<Expr>) -> Range<usize> {
 /// `possibly-null` message. Walks Ident / Member / Arrow / Static
 /// chains directly. Falls back to `expression` for shapes that don't
 /// have a clean textual form (calls, lambdas, casts, …).
+/// Render a [`PropertyName`] back to its source-shaped form for use
+/// inside diagnostic messages: bareword for `Ident`, quoted for
+/// `String`. Mirrors what the user wrote so messages like
+/// `` `conf."ssl.location"` is possibly null `` quote the source.
+fn display_property(hir: &Hir, property: PropertyName) -> String {
+    let text = &hir.idents[property.ident()].text;
+    match property {
+        PropertyName::Ident(_) => text.to_string(),
+        PropertyName::String(_) => format!("\"{text}\""),
+    }
+}
+
 fn display_receiver(hir: &Hir, expr_id: Idx<Expr>) -> String {
     match &hir.exprs[expr_id] {
         Expr::Ident(name_idx) => hir.idents[*name_idx].text.to_string(),
@@ -1511,21 +1523,21 @@ fn display_receiver(hir: &Hir, expr_id: Idx<Expr>) -> String {
         },
         Expr::Member(m) => {
             let recv = display_receiver(hir, m.receiver);
-            let prop = &hir.idents[m.property].text;
+            let prop = display_property(hir, m.property);
             let q = if m.pre_optional { "?." } else { "." };
             let post = if m.post_optional { "?" } else { "" };
             format!("{recv}{q}{prop}{post}")
         }
         Expr::Arrow(m) => {
             let recv = display_receiver(hir, m.receiver);
-            let prop = &hir.idents[m.property].text;
+            let prop = display_property(hir, m.property);
             let q = if m.pre_optional { "?->" } else { "->" };
             let post = if m.post_optional { "?" } else { "" };
             format!("{recv}{q}{prop}{post}")
         }
         Expr::Static(s) => {
             let ty = &hir.type_refs[s.ty];
-            let prop = &hir.idents[s.property].text;
+            let prop = display_property(hir, s.property);
             let ty_name = &hir.idents[ty.name].text;
             format!("{ty_name}::{prop}")
         }

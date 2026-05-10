@@ -486,7 +486,7 @@ pub struct ObjectField {
 #[derive(Debug, Clone)]
 pub struct MemberExpr {
     pub receiver: Idx<Expr>,
-    pub property: Idx<Ident>,
+    pub property: PropertyName,
     /// `a?.b` / `a?->b` — null-safe access. When `a: T?`, the result
     /// lifts to `(typeof a.b)?`; when `a: T`, the marker is a no-op.
     pub pre_optional: bool,
@@ -500,8 +500,39 @@ pub struct MemberExpr {
 #[derive(Debug, Clone)]
 pub struct StaticExpr {
     pub ty: Idx<TypeRef>,
-    pub property: Idx<Ident>,
+    pub property: PropertyName,
     pub byte_range: Span,
+}
+
+/// Property name in a `member_expr` / `arrow_expr` / `static_expr`.
+///
+/// Both forms resolve to the same field/method by name, so most
+/// consumers should reach for [`PropertyName::ident`] and treat
+/// either variant uniformly. Match on the variant only when the
+/// syntactic form matters (e.g. diagnostics that quote the source,
+/// or formatter round-trips).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyName {
+    /// `a.b`, `a->b`, `T::b` — bareword identifier property.
+    Ident(Idx<Ident>),
+    /// `a."b.c"`, `a->"b.c"`, `T::"b.c"` — string-literal property.
+    /// The pointed-to `Ident.text` carries the *decoded* property name
+    /// (without surrounding quotes); `Ident.byte_range` covers the
+    /// entire `"..."` literal in source.
+    String(Idx<Ident>),
+}
+
+impl PropertyName {
+    /// The interned ident carrying the property name's text + span.
+    /// Both variants resolve to the same field/method, so most callers
+    /// should use this and only match on the variant when they care
+    /// about the syntactic form.
+    #[inline]
+    pub fn ident(self) -> Idx<Ident> {
+        match self {
+            PropertyName::Ident(i) | PropertyName::String(i) => i,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
