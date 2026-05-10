@@ -753,6 +753,50 @@ The fix pattern in all cases: **make the quickfix produce a syntactically valid 
 
 ---
 
+### Phase 24 — Reachability analysis & dead-code detection (~2-3 weeks)
+
+**Goal:** prove statements unreachable through CFG-style divergence + exhaustive-enum-chain analysis, surface them as a new `unreachable` lint, grey them out in the editor via `DiagnosticTag::UNNECESSARY`, and offer a one-click fix to delete the dead range. Same machinery promotes the existing `unused-*` / `redundant-*` rules to UNNECESSARY so editors can dim them too.
+
+**Why now.** P6.6's enum-exhaustiveness already detects when an `if (x == E::A) … else if (x == E::B) …` chain covers every variant (the `extract_enum_chain` walker), but it stops at "warn if non-exhaustive" — it never flags the dead `else` branch on an *exhaustive* chain, nor the statements that fall through after one. Real-world example: `if (x == Option::Some) { return 1; } else if (x == Option::None) { return -1; } else { … } var _ = 42;` — both the trailing `else` body and the post-chain `var _ = 42;` are unreachable, but neither is flagged today. This shows up routinely in refactors (a variant gets removed and the catch-all `else` becomes dead) and in WIP code (a `return` is added inside a chain and the trailing block becomes dead). LSP-side, even the existing `unused-*` rules don't carry `DiagnosticTag::UNNECESSARY`, so VS Code doesn't grey them — that's a latent ergonomic bug that this phase fixes alongside.
+
+**Decisions locked.**
+- **One lint rule, one signal name.** `unreachable` covers every "control flow can't reach this" finding (post-`return`, post-`throw`, post-divergent-if-chain, exhaustive-else, …). No per-pattern subdivision — keeps suppression / UI / docs simple.
+- **Span coalescing.** Contiguous dead siblings inside one block become one diagnostic, not N. Less noise, and the quickfix's "delete this range" matches what the user actually wants. The diagnostic's range covers the whole dead island; cursor placement lands on the first dead statement.
+- **Conservative loop handling.** `while` / `for` / `for-in` / `do-while` bodies are never treated as guaranteed to execute (the condition might be false at entry; we don't const-fold today). So `while (cond) { return; }` does not make the post-while statement dead. `do-while` is the obvious exception (body runs at least once); we still skip it for v1 since the win is small and the risk of false positives is real.
+- **Native / abstract / `@expose` opt-out.** Bodies under `native fn` / `abstract fn` are skipped (they have no body to analyze). `@expose` doesn't change anything — the lint is body-local.
+- **Suppressible like every other rule.** `// gcl-lint-off-next unreachable` works for free via P23. CI gate via `lint --no-suppressions` works for free.
+- **Out of scope (v1):** const-fold of `if (true)` / `if (false)`; user-defined never-returning functions (`@never_returns` annotation); unreachable arms of a `switch`-like dispatch (we don't have switch); cross-procedural analysis. All deferred — they'd each multiply the false-positive surface.
+
+**Chunks:**
+
+- [ ] **24.1 `Diverges` primitive on HIR statements** (M) — pure-HIR walker `pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool` in a new `greycat-analyzer-analysis::reachability` module. Returns `true` iff control cannot fall through past `stmt_id` in normal execution. Recursive shape: `Stmt::Return(_)` / `Stmt::Throw(_)` / `Stmt::Break` / `Stmt::Continue` ⇒ true; `Stmt::Block(b)` ⇒ true if **any** stmt in `b.stmts` diverges (and is not preceded by another divergent stmt — but those are dead anyway, so the answer is just "does any stmt diverge"); `Stmt::If(i)` ⇒ true if `then_branch` diverges AND `else_branch` is `Some(e)` AND `e` diverges (recursive into else-if chains); `Stmt::Try(t)` ⇒ true if both `try_block` and `catch_block` diverge; `Stmt::At(a)` ⇒ same as its inner block; `Stmt::While(_) | DoWhile(_) | For(_) | ForIn(_)` ⇒ false (conservative; see "Decisions locked"); `Stmt::Var(_) | Expr(_) | Empty` ⇒ false. Unit tests in the module cover every arm.
+
+- [ ] **24.2 Exhaustive-chain divergence promotion** (S) — extend `extract_enum_chain` (in `analyzer.rs`) to expose a new `ChainCoverage::Exhaustive { dead_else: Option<Range<usize>> }` outcome. When every variant is covered by `arms[*].variant`, the chain semantically diverges if every arm body diverges *and* the trailing `else` (when present) also diverges. The trailing `else` itself is *always* dead under exhaustive coverage — record its `byte_range` for 24.3 to flag. Caches the result keyed on the chain's head `Idx<Stmt>` so the dead-code lint and the existing exhaustiveness check share one walk.
+
+- [ ] **24.3 `unreachable` lint rule** (M) — new entry in `LINT_RULES`. Walks every fn / method body block, threads `Diverges` through each statement sequence, and flags every statement that follows a divergent sibling — plus every dead `else` arm surfaced by 24.2. Severity: **Hint** (greyed-out is the editor signal; not error / not warning — dead code is rarely a *bug*, just a maintenance smell). Per-block, contiguous dead statements coalesce into one diagnostic whose `byte_range` spans the whole island (`[first_dead.byte_range.start, last_dead.byte_range.end)`). Module-level vars are skipped (no control flow there).
+
+- [ ] **24.4 Span coalescing across nested blocks** (S) — when an entire inner block is dead (e.g., the unreachable `else` arm itself contains a dead block), the outer flag dominates: don't emit a separate `unreachable` for each nested dead stmt — one diagnostic per *outermost* dead island. Implemented as a post-walk filter that drops sub-ranges fully contained by a previously-recorded outer range. Drives the 24.6 quickfix (one delete operation per island) and avoids "dead, dead, dead" stacking in the editor.
+
+- [ ] **24.5 `DiagnosticTag::UNNECESSARY` plumbing** (S) — add an optional `tag: Option<DiagnosticTag>` field to `LintDiagnostic` (default `None`). Set `Some(DiagnosticTag::UNNECESSARY)` on every "this code does nothing" rule: `unreachable` (new), `unused-local`, `unused-param`, `unused-decl`, `unused-suppression`, `redundant-nullable-access`, `redundant-non-null-assertion`, `redundant-coalesce`, `infer-return-type` stays untagged (it's an *additive* hint, not unnecessary code). The LSP layer's `to_lsp_diagnostic` translates `Some(UNNECESSARY)` into `tags: Some(vec![DiagnosticTag::UNNECESSARY])` so VS Code / Neovim / Helix dim the span. CLI compact / pretty rendering ignores the tag (no behavior change there).
+
+- [ ] **24.6 Quickfix: delete dead range** (S) — wire `unreachable` into `quickfix::edit_for_diagnostic` as a single-edit "delete the diagnostic's byte range". Because 24.4 coalesces siblings, the byte range is already exactly what the user wants gone. Edge: if the dead range *is* the whole `else { … }` arm of an `if`, expand the deletion to swallow the leading `else` keyword + surrounding whitespace so the result isn't `if (…) { … } else  // gone`. Helper: walk the parent CST node, find the `else` keyword's leading whitespace + the `else` token + the inter-token whitespace before the block, fold them into the delete range. Tested with the user's example: the trailing `else { }` becomes 0 bytes, no orphan `else` left.
+
+- [ ] **24.7 Reachability test suite** (M) — `tests/reachability.rs` plus expanded unit tests on the `reachability` module:
+  - **Divergence primitive:** returns true for `return` / `throw` / `break` / `continue`; true for blocks containing them; true for if-then-else where both branches diverge; false for while / for / for-in / do-while regardless of body; true for try-catch when both blocks diverge.
+  - **Straight-line dead code:** `return 1; var _ = 2;` flags the `var _ = 2;`.
+  - **Dead else on exhaustive enum chain:** the user's `Option::Some / Option::None / else { }` example.
+  - **Dead post-chain code:** `if (E::A) { return; } else if (E::B) { return; } var _ = 0;` flags the `var _ = 0;`.
+  - **Coalescing:** three `var _ = N;` after a `return` produce one diagnostic spanning all three, not three separate ones.
+  - **Conservative loop:** `while (cond) { return; } var _ = 0;` does NOT flag the post-while `var _`.
+  - **Suppression interaction:** `// gcl-lint-off-next unreachable` over a dead stmt drops the diagnostic; `unused-suppression` doesn't fire on the directive (it suppressed something).
+  - **Quickfix end-to-end:** `lint --fix` on the user's example removes both the trailing `else` and the post-chain `var _`.
+
+- [ ] **24.8 Documentation** (S) — README "diagnostic sources" section gets `unreachable` added, with a one-line description of the exhaustive-enum + divergent-arm trigger. Analysis crate's lib-level rustdoc grows a `reachability` bullet alongside `directives` (P23). `lint --list-rules` picks up the new rule automatically (auto-derived from `LINT_RULES`).
+
+**M24:** `unreachable` fires on the user's `Option::Some / Option::None / else { }` example (both the `else` body and the trailing `var _`); fires on every straight-line `return; <stmt>` / `throw; <stmt>` / `break; <stmt>` / `continue; <stmt>` shape; coalesces contiguous dead siblings into one diagnostic; carries `DiagnosticTag::UNNECESSARY` so VS Code dims the span; the existing `unused-*` and `redundant-*` rules also become dimmable through the same plumbing; `lint --fix` removes the dead range as a single edit (no broken parse); `// gcl-lint-off-next unreachable` silences false positives via the P23 plumbing for free; deeply nested chains (if-inside-else-inside-if) coalesce correctly so the outermost dead island is the only thing flagged.
+
+---
+
 ## 7. Test strategy
 
 Three layers, no "port every TS test" milestone (tarpit).
