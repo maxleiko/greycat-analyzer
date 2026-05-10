@@ -124,10 +124,16 @@ pub fn stmt_diverges_with_analysis(
     false
 }
 
-/// `true` iff every arm body in the if-chain rooted at `head_id`
-/// diverges. Walks the chain via the `else_branch` field — same shape
-/// `extract_enum_chain` follows, but only consults divergence (no
-/// enum-name binding lookup needed).
+/// `true` iff every reachable arm body in the if-chain rooted at
+/// `head_id` diverges. Walks the chain via the `else_branch` field
+/// (same shape [`crate::analyzer::Cx::extract_enum_chain`] follows),
+/// checking each variant-matching `then_branch` for divergence. The
+/// trailing `else { … }` arm is *ignored* — under exhaustive
+/// coverage it's already dead (`dead_else_range_for_exhaustive_chain`
+/// flags it independently), and requiring its (often empty) body to
+/// diverge would suppress the post-chain dead-code signal in the
+/// canonical "Some/None arms both return; else { } is dead;
+/// post-chain code is dead" shape.
 fn every_arm_diverges(hir: &Hir, analysis: &AnalysisResult, head_id: Idx<Stmt>) -> bool {
     let mut cur = head_id;
     loop {
@@ -148,9 +154,11 @@ fn every_arm_diverges(hir: &Hir, analysis: &AnalysisResult, head_id: Idx<Stmt>) 
                 };
                 cur = *eb;
             }
-            Stmt::Block(b) => {
-                // Final `else { … }` arm.
-                return block_diverges(hir, b);
+            Stmt::Block(_) => {
+                // Final `else { … }` arm — under exhaustive coverage
+                // (the only context that calls this helper), the else
+                // is dead anyway. Treat as "doesn't block divergence".
+                return true;
             }
             _ => {
                 // Anything else in the else-branch slot (e.g. a single

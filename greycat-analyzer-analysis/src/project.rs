@@ -27,7 +27,7 @@ use crate::directives::Directives;
 use crate::lint::{
     LintDiagnostic, lint_arrow_on_non_deref_with_directives,
     lint_inferred_return_type_with_directives, lint_nullability_with_directives,
-    lint_unused_suppressions, run_lints_with_directives,
+    lint_unreachable_with_directives, lint_unused_suppressions, run_lints_with_directives,
 };
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::{FnSignature, ProjectIndex};
@@ -1051,6 +1051,7 @@ impl ProjectAnalysis {
                         | "redundant-coalesce"
                         | "infer-return-type"
                         | "unused-suppression"
+                        | "unreachable"
                 )
             });
             lint_arrow_on_non_deref_with_directives(
@@ -1074,6 +1075,13 @@ impl ProjectAnalysis {
                 &module.hir,
                 &module.analysis,
                 arena,
+                &mut module.lints,
+                &mut module.directives,
+                bypass,
+            );
+            lint_unreachable_with_directives(
+                &module.hir,
+                &module.analysis,
                 &mut module.lints,
                 &mut module.directives,
                 bypass,

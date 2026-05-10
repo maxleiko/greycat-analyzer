@@ -163,6 +163,11 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
         summary: "hint when a fn's return type can be inferred from its body",
     },
     LintRuleInfo {
+        name: "unreachable",
+        summary: "hint when a statement is unreachable (after a divergent prior statement, \
+                  or the trailing `else` of an exhaustive enum chain)",
+    },
+    LintRuleInfo {
         name: "unused-suppression",
         summary: "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
     },
@@ -1261,6 +1266,227 @@ fn display_receiver(hir: &Hir, expr_id: Idx<Expr>) -> String {
     }
 }
 
+// =============================================================================
+// Rule: unreachable  (P24.3 — typed lint)
+// =============================================================================
+//
+// Walk every fn / method body and flag statements that follow a
+// divergent prior statement (return / throw / break / continue or a
+// recursively-divergent block / if / try / exhaustive-enum chain).
+// Also flag the trailing `else { … }` arm of an exhaustive enum chain
+// — it's covered by the prior arms and can never be entered.
+//
+// Severity = Hint. Dead code is rarely a *bug* (more often it's a
+// refactor leftover), so the editor's greyed-out treatment via
+// `DiagnosticTag::UNNECESSARY` (P24.5) is the right surface — not an
+// error or warning.
+//
+// Per-block, contiguous dead siblings are coalesced into one
+// diagnostic whose byte range spans the whole island. P24.4 layers
+// outer-island dominance on top so a dead inner block doesn't
+// double-flag.
+
+pub fn lint_unreachable(hir: &Hir, analysis: &AnalysisResult, out: &mut Vec<LintDiagnostic>) {
+    lint_unreachable_inner(hir, analysis, out, None, false);
+}
+
+/// Directive-aware variant.
+pub fn lint_unreachable_with_directives(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    out: &mut Vec<LintDiagnostic>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+) {
+    lint_unreachable_inner(hir, analysis, out, Some(directives), bypass_suppressions);
+}
+
+fn lint_unreachable_inner(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    out: &mut Vec<LintDiagnostic>,
+    mut directives: Option<&mut crate::directives::Directives>,
+    bypass_suppressions: bool,
+) {
+    let Some(module) = hir.module.as_ref() else {
+        return;
+    };
+    // Two-phase: collect every dead range first (with outer-island
+    // dominance applied), then emit. Deferring emission lets P24.4's
+    // "skip ranges contained in an already-recorded outer range"
+    // post-filter operate cleanly.
+    let mut dead_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for decl_id in &module.decls {
+        match &hir.decls[*decl_id] {
+            Decl::Fn(fnd) => collect_dead_in_fn(hir, analysis, fnd, &mut dead_ranges),
+            Decl::Type(td) => {
+                for m_id in &td.methods {
+                    if let Decl::Fn(fnd) = &hir.decls[*m_id] {
+                        collect_dead_in_fn(hir, analysis, fnd, &mut dead_ranges);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Outer-island dominance: drop any range that's fully contained
+    // in another. Sorting by start ascending then end descending
+    // makes the "outer covers inner" check linear.
+    dead_ranges.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    let mut kept: Vec<std::ops::Range<usize>> = Vec::with_capacity(dead_ranges.len());
+    for r in dead_ranges {
+        if let Some(last) = kept.last()
+            && last.start <= r.start
+            && r.end <= last.end
+        {
+            continue;
+        }
+        kept.push(r);
+    }
+    for r in kept {
+        emit_typed(
+            out,
+            directives.as_deref_mut(),
+            bypass_suppressions,
+            LintDiagnostic {
+                rule: "unreachable",
+                severity: LintSeverity::Hint,
+                message: "unreachable code".into(),
+                byte_range: r,
+            },
+        );
+    }
+}
+
+fn collect_dead_in_fn(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    fnd: &FnDecl,
+    out: &mut Vec<std::ops::Range<usize>>,
+) {
+    if fnd.modifiers.native || fnd.modifiers.abstract_ {
+        return;
+    }
+    let Some(body_id) = fnd.body else {
+        return;
+    };
+    if let Stmt::Block(body) = &hir.stmts[body_id] {
+        collect_dead_in_block(hir, analysis, body, out);
+    }
+}
+
+/// Walk a block: find dead siblings (post-divergent), recurse into
+/// every statement's nested blocks, and flag dead else arms of
+/// exhaustive enum chains.
+fn collect_dead_in_block(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+    out: &mut Vec<std::ops::Range<usize>>,
+) {
+    // Pass 1: any statement that follows a divergent sibling becomes
+    // dead. Coalesce the contiguous dead suffix into one range.
+    let mut dead_start_idx: Option<usize> = None;
+    for (i, s) in block.stmts.iter().enumerate() {
+        if dead_start_idx.is_none()
+            && crate::reachability::stmt_diverges_with_analysis(hir, analysis, *s)
+            && i + 1 < block.stmts.len()
+        {
+            dead_start_idx = Some(i + 1);
+            break;
+        }
+    }
+    if let Some(start_idx) = dead_start_idx {
+        let first = stmt_byte_range(hir, block.stmts[start_idx]);
+        let last = stmt_byte_range(hir, *block.stmts.last().unwrap());
+        out.push(first.start..last.end);
+    }
+    // Pass 2: recurse into every statement's nested blocks (so dead
+    // code inside a still-reachable arm is also flagged), but skip
+    // statements that already sit inside the dead suffix above —
+    // outer-island dominance handles those.
+    let dead_from = dead_start_idx.unwrap_or(usize::MAX);
+    for (i, s) in block.stmts.iter().enumerate() {
+        if i >= dead_from {
+            // Already covered by the outer dead range; recursing
+            // would double-flag.
+            continue;
+        }
+        collect_dead_in_stmt(hir, analysis, *s, out);
+    }
+}
+
+fn collect_dead_in_stmt(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    stmt_id: Idx<Stmt>,
+    out: &mut Vec<std::ops::Range<usize>>,
+) {
+    match &hir.stmts[stmt_id] {
+        Stmt::Block(b) => collect_dead_in_block(hir, analysis, b, out),
+        Stmt::If(i) => {
+            collect_dead_in_block(hir, analysis, &i.then_branch, out);
+            // Dead-else flagging: if THIS if is the head of an
+            // exhaustive chain AND has a final `else { … }`, the
+            // else block is unreachable. Flag it.
+            if analysis.exhaustive_enum_chains.contains(&stmt_id)
+                && let Some(dead) =
+                    crate::reachability::dead_else_range_for_exhaustive_chain(hir, stmt_id)
+            {
+                out.push(dead);
+            }
+            if let Some(eb) = i.else_branch {
+                collect_dead_in_stmt(hir, analysis, eb, out);
+            }
+        }
+        Stmt::While(w) => collect_dead_in_block(hir, analysis, &w.body, out),
+        Stmt::DoWhile(w) => collect_dead_in_block(hir, analysis, &w.body, out),
+        Stmt::For(f) => collect_dead_in_block(hir, analysis, &f.body, out),
+        Stmt::ForIn(f) => collect_dead_in_block(hir, analysis, &f.body, out),
+        Stmt::Try(t) => {
+            collect_dead_in_block(hir, analysis, &t.try_block, out);
+            collect_dead_in_block(hir, analysis, &t.catch_block, out);
+        }
+        Stmt::At(a) => collect_dead_in_block(hir, analysis, &a.block, out),
+        _ => {}
+    }
+}
+
+/// Best-effort `byte_range` for an arbitrary statement. Mirrors what
+/// quickfix's enclosing-node walker would compute — we use the
+/// statement's own byte_range when available, falling back to a
+/// recursive lookup for shapes like `Stmt::Expr` that don't carry a
+/// span.
+fn stmt_byte_range(hir: &Hir, stmt_id: Idx<Stmt>) -> std::ops::Range<usize> {
+    match &hir.stmts[stmt_id] {
+        Stmt::Block(b) => b.byte_range.clone(),
+        Stmt::Var(v) => v.byte_range.clone(),
+        Stmt::Assign(a) => a.byte_range.clone(),
+        Stmt::If(i) => i.byte_range.clone(),
+        Stmt::While(w) => w.byte_range.clone(),
+        Stmt::DoWhile(w) => w.byte_range.clone(),
+        Stmt::For(f) => f.byte_range.clone(),
+        Stmt::ForIn(f) => f.byte_range.clone(),
+        Stmt::Try(t) => t.byte_range.clone(),
+        Stmt::At(a) => a.byte_range.clone(),
+        Stmt::Expr(e) => hir.exprs[*e].byte_range(),
+        Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Throw(_) => {
+            // These keyword-only statements don't carry their own
+            // byte_range; fall back to the inner expression's span
+            // (return/throw) or to a zero-width range (break/continue).
+            // The lint never produces a *primary* diagnostic on these
+            // shapes anyway — they're divergent, not dead — so the
+            // 0..0 fallback only fires when one of them is the *first*
+            // dead stmt, which can't happen.
+            match &hir.stmts[stmt_id] {
+                Stmt::Return(Some(e)) => hir.exprs[*e].byte_range(),
+                Stmt::Throw(e) => hir.exprs[*e].byte_range(),
+                _ => 0..0,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1985,6 +2211,154 @@ fn f(x: Outer) {
             m.lints.iter().any(|l| l.rule == "unknown-suppression-rule"),
             "expected unknown-suppression-rule: {:?}",
             m.lints
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // P24.3 — `unreachable` lint
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn unreachable_after_return() {
+        let diags = project_lints(
+            r#"
+fn f(): int {
+    return 1;
+    var _ = 0;
+}
+"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "unreachable"),
+            "expected `unreachable` after return, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_dead_else_on_exhaustive_chain() {
+        // The user's example: `Some/None` covers `Option`; the
+        // trailing `else { ... }` is dead.
+        let diags = project_lints(
+            r#"
+enum Option { Some, None }
+fn test(x: Option): int {
+    if (x == Option::Some) {
+        return 1;
+    } else if (x == Option::None) {
+        return -1;
+    } else {
+        return 0;
+    }
+}
+"#,
+        );
+        let hits: Vec<&LintDiagnostic> = diags.iter().filter(|d| d.rule == "unreachable").collect();
+        assert!(!hits.is_empty(), "expected dead else flagged: {diags:?}");
+    }
+
+    #[test]
+    fn unreachable_post_chain_when_arms_diverge() {
+        // The user's full example: dead else AND dead post-chain stmt.
+        let diags = project_lints(
+            r#"
+enum Option { Some, None }
+fn test(x: Option) {
+    if (x == Option::Some) {
+        return;
+    } else if (x == Option::None) {
+        return;
+    } else {
+
+    }
+    var _ = 42;
+}
+"#,
+        );
+        let hits = diags.iter().filter(|d| d.rule == "unreachable").count();
+        assert_eq!(
+            hits, 2,
+            "expected 2 unreachable diagnostics (dead else + post-chain), got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn no_unreachable_when_chain_arms_dont_diverge() {
+        // Chain is exhaustive but the variant arms don't return —
+        // post-chain code is REACHABLE; only the trailing else (if any)
+        // would be flagged. This tests "post-chain is not blanket-dead
+        // just because the chain is exhaustive".
+        let diags = project_lints(
+            r#"
+enum Option { Some, None }
+fn test(x: Option): int {
+    var r = 0;
+    if (x == Option::Some) {
+        r = 1;
+    } else if (x == Option::None) {
+        r = -1;
+    }
+    return r;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unreachable"),
+            "post-chain code is reachable when arms don't diverge: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn coalesces_contiguous_dead_siblings() {
+        // Three dead stmts after a return → one coalesced diagnostic,
+        // not three.
+        let diags = project_lints(
+            r#"
+fn f(): int {
+    return 1;
+    var _ = 0;
+    var _ = 1;
+    var _ = 2;
+}
+"#,
+        );
+        let hits = diags.iter().filter(|d| d.rule == "unreachable").count();
+        assert_eq!(hits, 1, "expected one coalesced diagnostic, got {diags:?}");
+    }
+
+    #[test]
+    fn while_loop_does_not_make_post_loop_dead() {
+        // Conservative on loops: even though the body returns, the
+        // post-while statement is reachable (loop may not execute).
+        let diags = project_lints(
+            r#"
+fn f(): int {
+    while (true) {
+        return 1;
+    }
+    return 0;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unreachable"),
+            "post-while should be reachable: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_suppressible_via_directive() {
+        let diags = project_lints(
+            r#"
+fn f(): int {
+    return 1;
+    // gcl-lint-off-next unreachable
+    var _ = 0;
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unreachable"),
+            "directive should suppress unreachable: {diags:?}"
         );
     }
 
