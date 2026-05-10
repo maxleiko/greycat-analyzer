@@ -17,9 +17,6 @@ use greycat_analyzer_core::{
 use crate::utils::{AnyError, ColorMode};
 
 #[derive(clap::Parser)]
-#[clap(about = "Lint a GreyCat project. Loads the entrypoint and walks its \
-             @library / @include pragmas to discover modules — only \
-             reachable files are analyzed.")]
 pub struct Lint {
     #[clap(help = "Path to a project.gcl entrypoint (or any single .gcl \
                 file to lint in isolation). When omitted, looks for \
@@ -27,25 +24,17 @@ pub struct Lint {
     project: Option<PathBuf>,
     #[clap(
         long,
-        help = "CSV per-file timing summary instead of human-readable diagnostics"
-    )]
-    csv: bool,
-    #[clap(
-        long,
-        help = "Apply auto-fixable lint suggestions in place (P8.4). \
-                Sorts edits by start position, drops overlaps, applies \
-                non-overlapping ones, and re-runs until convergence \
-                (max 5 passes)."
+        help = "Apply auto-fixable lint suggestions in place (max 5 passes)"
     )]
     fix: bool,
     #[clap(
         long,
         value_enum,
-        help = "Diagnostic rendering style. Defaults to `pretty` (miette: \
-                source-snippet + caret + color) when stdout is a TTY and \
-                `compact` (`path:line:col: severity: message`) when piped — \
-                so the P10.3 parity oracle still gets a stable diffable \
-                shape. Pass explicitly to override."
+        help = "Diagnostic rendering style\n\
+                compact  `path:line:col: severity: message` per diagnostic, plus summary\n\
+                pretty   source-snippet, caret, colors, plus summary\n\
+                csv      per-file timing rows (sorted by total descending), no summary\n\
+                quiet    summary line only (exit code is the gate)\n"
     )]
     format: Option<OutputFormat>,
     #[clap(
@@ -60,11 +49,7 @@ pub struct Lint {
     lint_libs: bool,
     #[clap(
         long,
-        help = "Print every registered lint rule (one per line, with a \
-                one-line summary) and exit. Auto-generated from \
-                `LintRule::summary()` so the CLI's `--help` is always in \
-                sync with the rule registry — same data feeds the LSP's \
-                directive completion."
+        help = "Print every registered lint rule (one per line, with a one-line summary) and exit"
     )]
     list_rules: bool,
     #[clap(
@@ -80,7 +65,7 @@ pub struct Lint {
         value_enum,
         default_value_t = ColorMode::Auto,
         help = "auto    color when stdout is a TTY and `NO_COLOR` is unset (default)\n\
-                always  always emit ANSI color escapes — use with `less -R` to view colored pretty diagnostics through a pager\n\
+                always  always emit ANSI color escapes\n\
                 never   never color\n"
     )]
     color: ColorMode,
@@ -88,14 +73,28 @@ pub struct Lint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
+    /// `path:line:col: severity: message` per diagnostic, plus the
+    /// trailing severity-count summary.
     Compact,
+    /// `miette` source-snippet + caret rendering per diagnostic,
+    /// plus the trailing summary. Default on a TTY.
     Pretty,
+    /// Per-file timing rows, sorted by total descending. No
+    /// per-diagnostic dump and no summary — the consumer is a script
+    /// piping into `awk` / a spreadsheet, not a human.
+    Csv,
+    /// Trailing severity-count summary only (no per-diagnostic
+    /// output). Useful in CI / pre-commit where the exit code is
+    /// the gate and you want a one-line pulse in the build log.
+    Quiet,
 }
 
 impl OutputFormat {
     // P10.7
     /// TTY-aware default: `pretty` interactively, `compact` when
-    /// piped (`miette when stdout is a TTY OR --format=pretty`).
+    /// piped (`miette` when stdout is a TTY OR `--format=pretty`).
+    /// `csv` and `quiet` are explicit-opt-in only — neither is ever
+    /// selected by `auto()`.
     fn auto() -> Self {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
@@ -460,71 +459,97 @@ impl Lint {
             }
         }
 
-        let total_diagnostics: usize = entries.iter().map(|e| e.diagnostics.len()).sum();
-
         if self.fix && fixes_applied > 0 {
             println!("[fix] applied {fixes_applied} edit(s)");
         }
 
-        if self.csv {
-            let mut w = std::io::stdout();
-            // P14.5: per-phase microsecond columns (read = file I/O,
-            // parse = tree-sitter, lower = HIR walker, resolve / analyze
-            // / lint = analyzer pipeline). `total_us` is the sum of all
-            // phase columns. Sorted by total descending so the heaviest
-            // file lands at the top.
-            writeln!(
-                w,
-                "total_us,read_us,parse_us,lower_us,resolve_us,analyze_us,lint_us,nb_nodes,nb_diagnostics,filepath"
-            )?;
-            entries.sort_by_key(|e| std::cmp::Reverse(e.total()));
-            for e in &entries {
-                writeln!(
-                    w,
-                    "{},{},{},{},{},{},{},{},{},{}",
-                    e.total().as_micros(),
-                    e.read.as_micros(),
-                    e.parse.as_micros(),
-                    e.lower.as_micros(),
-                    e.resolve.as_micros(),
-                    e.analyze.as_micros(),
-                    e.lint.as_micros(),
-                    e.nodes,
-                    e.diagnostics.len(),
-                    e.path.display(),
-                )?;
-            }
-        } else {
-            // Human-readable: per-file diagnostic dump. P10.7: pretty
-            // by default when stdout is a TTY (miette: snippet + caret
-            // + color), compact when piped so the parity oracle and
-            // grep-style consumers keep a stable shape. Explicit
-            // `--format` always wins.
-            let render = self.format.unwrap_or_else(OutputFormat::auto);
-            entries.sort_by(|a, b| a.path.cmp(&b.path));
-            for e in &entries {
-                let path = e.path.display().to_string();
-                let source = std::fs::read_to_string(&e.path).unwrap_or_default();
-                for diag in &e.diagnostics {
-                    match render {
-                        OutputFormat::Compact => {
-                            println!("{}", format_cli(&path, diag));
-                        }
-                        OutputFormat::Pretty => {
-                            print_pretty_diagnostic(&path, &source, diag);
+        // P10.7 — pretty by default when stdout is a TTY (miette:
+        // snippet + caret + color), compact when piped so the parity
+        // oracle and grep-style consumers keep a stable shape. `csv`
+        // and `quiet` are always explicit; `auto()` never picks them.
+        let render = self.format.unwrap_or_else(OutputFormat::auto);
+        match render {
+            OutputFormat::Csv => render_csv_timings(&mut entries)?,
+            OutputFormat::Compact | OutputFormat::Pretty => {
+                entries.sort_by(|a, b| a.path.cmp(&b.path));
+                for e in &entries {
+                    let path = e.path.display().to_string();
+                    let source = std::fs::read_to_string(&e.path).unwrap_or_default();
+                    for diag in &e.diagnostics {
+                        match render {
+                            OutputFormat::Compact => println!("{}", format_cli(&path, diag)),
+                            OutputFormat::Pretty => print_pretty_diagnostic(&path, &source, diag),
+                            OutputFormat::Csv | OutputFormat::Quiet => {}
                         }
                     }
                 }
+                print_summary(&entries, total, self.color.enabled());
             }
-            print_summary(&entries, total, self.color.enabled());
+            OutputFormat::Quiet => print_summary(&entries, total, self.color.enabled()),
         }
 
-        Ok(if total_diagnostics == 0 {
+        // Hints are advisory by design (return-type inference suggestions,
+        // style nudges) — they must not flip CI red. Only errors and
+        // warnings count toward the failure exit code.
+        let blocking = count_blocking(&entries);
+        Ok(if blocking == 0 {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
         })
     }
+}
+
+/// Sum of error + warning diagnostics across every entry. Hints
+/// (and `INFORMATION`-severity entries) are advisory and never
+/// contribute to the failure exit code.
+fn count_blocking(entries: &[Entry]) -> usize {
+    let mut n = 0usize;
+    for e in entries {
+        for d in &e.diagnostics {
+            match d.severity {
+                Some(DiagnosticSeverity::ERROR) | Some(DiagnosticSeverity::WARNING) => n += 1,
+                // Diagnostics with an unknown / missing severity are
+                // counted as blocking — fail-closed so a misclassified
+                // diag never silently passes CI.
+                None => n += 1,
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
+/// Per-file timing rows, sorted by total descending so the heaviest
+/// file lands at the top. P14.5 — per-phase microsecond columns
+/// (`read` = file I/O, `parse` = tree-sitter, `lower` = HIR walker,
+/// `resolve` / `analyze` / `lint` = analyzer pipeline). `total_us` is
+/// the sum of all phase columns. No human summary follows — the
+/// consumer is `awk` / a spreadsheet.
+fn render_csv_timings(entries: &mut [Entry]) -> std::io::Result<()> {
+    let mut w = std::io::stdout();
+    writeln!(
+        w,
+        "total_us,read_us,parse_us,lower_us,resolve_us,analyze_us,lint_us,nb_nodes,nb_diagnostics,filepath"
+    )?;
+    entries.sort_by_key(|e| std::cmp::Reverse(e.total()));
+    for e in entries {
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{},{},{},{}",
+            e.total().as_micros(),
+            e.read.as_micros(),
+            e.parse.as_micros(),
+            e.lower.as_micros(),
+            e.resolve.as_micros(),
+            e.analyze.as_micros(),
+            e.lint.as_micros(),
+            e.nodes,
+            e.diagnostics.len(),
+            e.path.display(),
+        )?;
+    }
+    Ok(())
 }
 
 struct Entry {
