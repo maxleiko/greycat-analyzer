@@ -137,19 +137,27 @@ pub enum TypeKind {
     /// Named user / stdlib type, identified by its fully-qualified name
     /// (`<lib>::<module>::<TypeName>` or just `<TypeName>` until we wire
     /// fully-qualified resolution).
-    Named { name: String },
+    // P25.4
+    Named { name: SmolStr },
     /// Generic type instantiation — `Array<int>`, `Map<String, int>`, etc.
-    Generic { name: String, args: Vec<TypeId> },
+    // P25.4
+    Generic { name: SmolStr, args: Vec<TypeId> },
     /// Generic type *parameter* — the `T` inside a `fn<T>(x: T)` body.
-    GenericParam { name: String, owner: GenericOwner },
+    // P25.4
+    GenericParam { name: SmolStr, owner: GenericOwner },
     /// Function / lambda type.
     Lambda(LambdaType),
     /// Tuple — `t2`, `t3`, `t4` plus their float variants.
     Tuple { elements: Vec<TypeId> },
     /// Anonymous object literal type — `{ a: int, b: String }`.
-    Anonymous { fields: Vec<(String, TypeId)> },
+    // P25.4
+    Anonymous { fields: Vec<(SmolStr, TypeId)> },
     /// Enum type.
-    Enum { name: String, variants: Vec<String> },
+    // P25.4
+    Enum {
+        name: SmolStr,
+        variants: Vec<SmolStr>,
+    },
     /// Union of two-or-more alternatives. Construction normalizes:
     /// `T | T = T`, `T | null = nullable(T)`.
     Union { alts: Vec<TypeId> },
@@ -189,12 +197,13 @@ pub struct LambdaType {
 }
 
 /// Where a generic parameter was declared.
+// P25.4
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GenericOwner {
     /// `fn<T>(...)`.
-    Function(String),
+    Function(SmolStr),
     /// `type Foo<T> {...}`.
-    Type(String),
+    Type(SmolStr),
 }
 
 // =============================================================================
@@ -275,14 +284,14 @@ impl TypeArena {
         })
     }
 
-    pub fn named(&mut self, name: impl Into<String>) -> TypeId {
+    pub fn named(&mut self, name: impl Into<SmolStr>) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Named { name: name.into() },
             nullable: false,
         })
     }
 
-    pub fn generic(&mut self, name: impl Into<String>, args: Vec<TypeId>) -> TypeId {
+    pub fn generic(&mut self, name: impl Into<SmolStr>, args: Vec<TypeId>) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Generic {
                 name: name.into(),
@@ -292,7 +301,7 @@ impl TypeArena {
         })
     }
 
-    pub fn generic_param(&mut self, name: impl Into<String>, owner: GenericOwner) -> TypeId {
+    pub fn generic_param(&mut self, name: impl Into<SmolStr>, owner: GenericOwner) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::GenericParam {
                 name: name.into(),
@@ -334,7 +343,7 @@ impl TypeArena {
         }
         let t = self.get(ty).clone();
         match &t.kind {
-            TypeKind::GenericParam { name, .. } => match subst.get(name) {
+            TypeKind::GenericParam { name, .. } => match subst.get(name.as_str()) {
                 Some(&witness) if t.nullable => self.nullable(witness),
                 Some(&witness) => witness,
                 None => ty,
@@ -386,7 +395,7 @@ impl TypeArena {
                 }
             }
             TypeKind::Anonymous { fields } => {
-                let new_fields: Vec<(String, TypeId)> = fields
+                let new_fields: Vec<(SmolStr, TypeId)> = fields
                     .iter()
                     .map(|(n, t)| (n.clone(), self.substitute(*t, subst)))
                     .collect();
@@ -696,7 +705,7 @@ impl InferenceTable {
         let t = arena.get(ty).clone();
         match &t.kind {
             TypeKind::GenericParam { name, .. } => {
-                if let Some(witness) = self.bindings.get(name) {
+                if let Some(witness) = self.bindings.get(name.as_str()) {
                     let nullable = t.nullable;
                     if !nullable {
                         return *witness;
@@ -824,10 +833,10 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     }
 }
 
-fn generic_or_named_name(t: &Type) -> Option<String> {
+fn generic_or_named_name(t: &Type) -> Option<SmolStr> {
     match &t.kind {
         TypeKind::Generic { name, .. } | TypeKind::Named { name } => Some(name.clone()),
-        TypeKind::Primitive(p) => Some(p.name().to_string()),
+        TypeKind::Primitive(p) => Some(p.name().into()),
         _ => None,
     }
 }
@@ -864,12 +873,12 @@ pub fn display(arena: &TypeArena, id: TypeId) -> String {
         TypeKind::Any => "any".to_string(),
         TypeKind::Never => "never".to_string(),
         TypeKind::Primitive(p) => p.name().to_string(),
-        TypeKind::Named { name } => name.clone(),
+        TypeKind::Named { name } => name.to_string(),
         TypeKind::Generic { name, args } => {
             let parts: Vec<String> = args.iter().map(|a| display(arena, *a)).collect();
             format!("{name}<{}>", parts.join(", "))
         }
-        TypeKind::GenericParam { name, .. } => name.clone(),
+        TypeKind::GenericParam { name, .. } => name.to_string(),
         TypeKind::Lambda(l) => {
             let parts: Vec<String> = l.params.iter().map(|p| display(arena, *p)).collect();
             format!("({}) -> {}", parts.join(", "), display(arena, l.ret))
@@ -885,7 +894,7 @@ pub fn display(arena: &TypeArena, id: TypeId) -> String {
                 .collect();
             format!("{{ {} }}", parts.join(", "))
         }
-        TypeKind::Enum { name, .. } => name.clone(),
+        TypeKind::Enum { name, .. } => name.to_string(),
         TypeKind::Union { alts } => {
             let parts: Vec<String> = alts.iter().map(|a| display(arena, *a)).collect();
             parts.join(" | ")
@@ -928,18 +937,18 @@ pub fn display_fqn(
         TypeKind::Primitive(p) => format!("core::{}", p.name()),
         TypeKind::Named { name } => format!(
             "{}::{}",
-            home_lib(name).unwrap_or_else(|| "core".to_string()),
+            home_lib(name.as_str()).unwrap_or_else(|| "core".to_string()),
             name
         ),
         TypeKind::Generic { name, args } => {
-            let lib = home_lib(name).unwrap_or_else(|| "core".to_string());
+            let lib = home_lib(name.as_str()).unwrap_or_else(|| "core".to_string());
             let parts: Vec<String> = args
                 .iter()
                 .map(|a| display_fqn(arena, *a, home_lib))
                 .collect();
             format!("{lib}::{name}<{}>", parts.join(", "))
         }
-        TypeKind::GenericParam { name, .. } => name.clone(),
+        TypeKind::GenericParam { name, .. } => name.to_string(),
         TypeKind::Lambda(l) => {
             let parts: Vec<String> = l
                 .params
@@ -968,7 +977,7 @@ pub fn display_fqn(
         }
         TypeKind::Enum { name, .. } => format!(
             "{}::{}",
-            home_lib(name).unwrap_or_else(|| "core".to_string()),
+            home_lib(name.as_str()).unwrap_or_else(|| "core".to_string()),
             name
         ),
         TypeKind::Union { alts } => {
@@ -1000,6 +1009,32 @@ mod tests {
         let i2 = a.primitive(Primitive::Int);
         assert_eq!(i1, i2);
         assert_eq!(a.len(), 1);
+    }
+
+    // P25.4
+    /// `TypeKind` name fields are `SmolStr`. The arena's intern map
+    /// keys on `Type` (which derives Hash + Eq), so two equivalent
+    /// `Type` values constructed via different name-source paths must
+    /// hash and compare equal. `SmolStr::hash` and `String::hash` both
+    /// delegate to `str::hash`, so `arena.named("Foo")` from a
+    /// `String`-flavoured callsite (`String::from("Foo").into()`) and
+    /// from a `SmolStr`-flavoured callsite (`SmolStr::from("Foo")`)
+    /// must collapse to the same TypeId. This test anchors that
+    /// invariant so a future refactor that accidentally introduces a
+    /// hashing-asymmetric variant gets caught.
+    #[test]
+    fn typekind_name_dedups_across_smolstr_and_string_paths() {
+        let mut a = fresh();
+        let from_string = a.named(String::from("Foo"));
+        let from_smol = a.named(SmolStr::from("Foo"));
+        let from_str = a.named("Foo");
+        assert_eq!(from_string, from_smol);
+        assert_eq!(from_smol, from_str);
+
+        let arg_string = a.primitive(Primitive::Int);
+        let g_a = a.generic(String::from("Array"), vec![arg_string]);
+        let g_b = a.generic(SmolStr::from("Array"), vec![arg_string]);
+        assert_eq!(g_a, g_b);
     }
 
     #[test]

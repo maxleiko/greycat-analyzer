@@ -974,8 +974,8 @@ fn receiver_head_name(
 ) -> Option<String> {
     let t = arena.get(ty);
     match &t.kind {
-        TypeKind::Named { name } => Some(name.clone()),
-        TypeKind::Generic { name, .. } => Some(name.clone()),
+        TypeKind::Named { name } => Some(name.to_string()),
+        TypeKind::Generic { name, .. } => Some(name.to_string()),
         TypeKind::Primitive(p) => Some(p.name().to_string()),
         _ => None,
     }

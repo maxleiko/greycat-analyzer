@@ -432,14 +432,14 @@ fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisRes
             }
             Decl::Enum(ed) => {
                 let name: SmolStr = hir.idents[ed.name].text.as_str().into();
-                let variants: Vec<String> = ed
+                let variants: Vec<SmolStr> = ed
                     .fields
                     .iter()
-                    .map(|f| hir.idents[hir.enum_fields[*f].name].text.clone())
+                    .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str().into())
                     .collect();
                 let id = arena.alloc(Type {
                     kind: TypeKind::Enum {
-                        name: name.to_string(),
+                        name: name.clone(),
                         variants,
                     },
                     nullable: false,
@@ -783,7 +783,7 @@ impl<'a> Cx<'a> {
     /// no `deferred_member_uses` deferral.
     fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
         let ty = self.arena.get(recv_ty);
-        let type_name = match &ty.kind {
+        let type_name: Option<SmolStr> = match &ty.kind {
             TypeKind::Named { name } => Some(name.clone()),
             TypeKind::Generic { name, .. } => Some(name.clone()),
             // P16.2 — primitives (`String`, `int`, ...) carry methods
@@ -791,7 +791,7 @@ impl<'a> Cx<'a> {
             // Map the primitive back to its name and fall through to
             // the same `type_decls` / `decl_locations` lookup path so
             // `"hello".size()` and friends bind correctly.
-            TypeKind::Primitive(p) => Some(p.name().to_string()),
+            TypeKind::Primitive(p) => Some(p.name().into()),
             TypeKind::Anonymous { fields } => {
                 // Anonymous types don't have a backing TypeDecl, so we
                 // resolve their fields directly from the type shape.
@@ -1001,10 +1001,10 @@ impl<'a> Cx<'a> {
             recv_ty
         };
         let recv = self.arena.get(lookup_ty).clone();
-        let (type_name, instantiation) = match recv.kind {
+        let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match recv.kind {
             TypeKind::Named { name } => (name, Vec::new()),
             TypeKind::Generic { name, args } => (name, args),
-            TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
+            TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
             _ => return None,
         };
         // **P19.14** — chain-walking lookup so methods declared on
@@ -1107,7 +1107,7 @@ impl<'a> Cx<'a> {
             // Cross-module attr — consult `static_attrs` for the
             // receiver's type. The receiver is the `Type::` part
             // of the static expr; we have its lowered TypeId.
-            let owner_name = match &self.arena.get(recv_ty).kind {
+            let owner_name: Option<SmolStr> = match &self.arena.get(recv_ty).kind {
                 TypeKind::Named { name } => Some(name.clone()),
                 TypeKind::Generic { name, .. } => Some(name.clone()),
                 TypeKind::Enum { name, .. } => Some(name.clone()),
@@ -1115,7 +1115,7 @@ impl<'a> Cx<'a> {
                 // attrs in stdlib (`time::max`, `int::max`, etc.);
                 // map them to the stdlib type name so the
                 // static-attr lookup hits.
-                TypeKind::Primitive(p) => Some(p.name().to_string()),
+                TypeKind::Primitive(p) => Some(p.name().into()),
                 _ => None,
             };
             if let Some(name) = owner_name
@@ -1227,11 +1227,11 @@ impl<'a> Cx<'a> {
         // Attr — extract receiver shape (need owned name + args because
         // the arena entry borrow has to drop before we re-borrow as
         // mutable for `substitute`).
-        let (type_name, instantiation): (String, Vec<TypeId>) = match &self.arena.get(recv_ty).kind
+        let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match &self.arena.get(recv_ty).kind
         {
             TypeKind::Named { name } => (name.clone(), Vec::new()),
             TypeKind::Generic { name, args } => (name.clone(), args.clone()),
-            TypeKind::Primitive(p) => (p.name().to_string(), Vec::new()),
+            TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
             _ => return None,
         };
         // Build the substitution map *before* mutably borrowing the
@@ -1358,7 +1358,8 @@ impl<'a> Cx<'a> {
                         _ => return None,
                     };
                 // Lower the declared signature with the fn's generics in scope.
-                let owner = GenericOwner::Function(self.hir.idents[fn_name_idx].text.clone());
+                let owner =
+                    GenericOwner::Function(self.hir.idents[fn_name_idx].text.as_str().into());
                 self.push_generic_scope(&fn_generics, owner);
                 let declared_params: Vec<TypeId> = fn_params
                     .iter()
@@ -1489,7 +1490,7 @@ impl<'a> Cx<'a> {
         // P12.1: register the fn's generic params into scope so
         // `lower_type_ref` mints `GenericParam` for each `T` mention
         // instead of falling back to `any`.
-        let owner = GenericOwner::Function(self.hir.idents[d.name].text.clone());
+        let owner = GenericOwner::Function(self.hir.idents[d.name].text.as_str().into());
         self.push_generic_scope(&d.generics, owner);
         // Bind parameter types into def_types so identifier inference
         // produces real types instead of `any`.
@@ -1513,7 +1514,7 @@ impl<'a> Cx<'a> {
     fn visit_type_decl(&mut self, d: &TypeDecl) {
         // P12.1: type-level generics are visible in attrs + method
         // signatures.
-        let type_name = self.hir.idents[d.name].text.clone();
+        let type_name: SmolStr = self.hir.idents[d.name].text.as_str().into();
         let owner = GenericOwner::Type(type_name.clone());
         self.push_generic_scope(&d.generics, owner.clone());
         // **P19.11** — build the `this` TypeId. For non-generic
@@ -2162,7 +2163,7 @@ impl<'a> Cx<'a> {
         let covered: FxHashSet<&str> = chain.arms.iter().map(|a| a.variant.as_str()).collect();
         let missing: Vec<&str> = variants
             .iter()
-            .map(String::as_str)
+            .map(SmolStr::as_str)
             .filter(|v| !covered.contains(v))
             .collect();
         if missing.is_empty() {

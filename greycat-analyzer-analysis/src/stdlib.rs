@@ -13,6 +13,7 @@
 //! call-site type checking works even though there's no body to walk.
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
@@ -677,11 +678,11 @@ impl ProjectIndex {
                     let name_str = hir.idents[ed.name].text.as_str();
                     let name_sym = self.symbols.intern(name_str);
                     if self.registry.lookup(name_str).is_none() {
-                        let name_owned = name_str.to_string();
-                        let variants: Vec<String> = ed
+                        let name_owned: SmolStr = name_str.into();
+                        let variants: Vec<SmolStr> = ed
                             .fields
                             .iter()
-                            .map(|f| hir.idents[hir.enum_fields[*f].name].text.clone())
+                            .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str().into())
                             .collect();
                         let id = self.types.alloc(Type {
                             kind: TypeKind::Enum {

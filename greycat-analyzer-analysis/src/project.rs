@@ -16,6 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
 
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
@@ -584,7 +585,7 @@ fn lower_module_signatures(
             Decl::Type(td) => {
                 let type_name_text = hir.idents[td.name].text.as_str();
                 let type_sym = index.symbols.intern(type_name_text);
-                let owner = GenericOwner::Type(type_name_text.to_string());
+                let owner = GenericOwner::Type(type_name_text.into());
                 let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 for g in &td.generics {
                     let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
@@ -615,7 +616,7 @@ fn lower_module_signatures(
                     // GenericOwner-owned Strings) per method —
                     // overrides of the outer scope are saved and
                     // restored.
-                    let method_owner = GenericOwner::Function(method_text.to_string());
+                    let method_owner = GenericOwner::Function(method_text.into());
                     let mut saved: Vec<(Symbol, Option<GenericOwner>)> =
                         Vec::with_capacity(fnd.generics.len());
                     for g in &fnd.generics {
@@ -643,14 +644,14 @@ fn lower_module_signatures(
             Decl::Enum(ed) => {
                 let name_text = hir.idents[ed.name].text.as_str();
                 let name_sym = index.symbols.intern(name_text);
-                let variants: Vec<String> = ed
+                let variants: Vec<SmolStr> = ed
                     .fields
                     .iter()
-                    .map(|f| hir.idents[hir.enum_fields[*f].name].text.clone())
+                    .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str().into())
                     .collect();
                 let enum_id = arena_mut.alloc(greycat_analyzer_types::Type {
                     kind: greycat_analyzer_types::TypeKind::Enum {
-                        name: name_text.to_string(),
+                        name: name_text.into(),
                         variants,
                     },
                     nullable: false,
@@ -663,7 +664,7 @@ fn lower_module_signatures(
                 let Some(ret) = fnd.return_type else {
                     continue;
                 };
-                let owner = GenericOwner::Function(fn_text.to_string());
+                let owner = GenericOwner::Function(fn_text.into());
                 let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 let mut generics: Vec<Symbol> = Vec::with_capacity(fnd.generics.len());
                 for g in &fnd.generics {
