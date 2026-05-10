@@ -1,13 +1,11 @@
-//! Per-fixture parity gauntlet (P9.2).
+//! Per-fixture parity gauntlet against `tests/corpus/parser_fixtures/`.
 //!
-//! For every `tests/corpus/parser_fixtures/<n>/{in.gcl,out.gcl}` pair,
-//! format `in.gcl` and compare against `out.gcl`. The test reports a
-//! per-fixture match / mismatch and asserts that the total *match
-//! count* doesn't decrease — a regression budget that lets P9.1's
-//! honest-first-pass progress show up in CI as the formatter improves.
-//!
-//! When formatter parity becomes complete (M9 acceptance), this test
-//! flips to require all fixtures pass.
+//! After P21.5 the gauntlet is **hard equality**: every `in.gcl` must
+//! format byte-for-byte to its sibling `out.gcl`, and every `out.gcl`
+//! must be a fixed point of `format` (idempotency). The earlier
+//! `MATCH_FLOOR` / `IDEMPOTENT_FLOOR` regression budgets are gone —
+//! they were ratchets while the new pipeline was being built; the
+//! pipeline now meets the M5 / M9 acceptance criteria.
 
 use std::path::PathBuf;
 
@@ -48,25 +46,11 @@ fn formatter_parity_against_corpus() {
     eprintln!(
         "[parity_gauntlet] {matches}/{total} fixtures format byte-for-byte; mismatches: {mismatches:?}"
     );
-    // Regression budget: at least the fixtures that match today must
-    // continue to match. Bump as P14.3 lands more rules. The two
-    // remaining hard cases need line-length-aware reflow (args_split,
-    // nested_args_split, if_var_object) plus the comment + annotation
-    // ordering edge case (doc_eol_stmt, stmts_rules).
-    const MATCH_FLOOR: usize = 4;
-    let _ = total;
-    assert!(
-        matches >= MATCH_FLOOR,
-        "formatter parity regressed: {matches} matches < floor {MATCH_FLOOR}; mismatches: {mismatches:?}"
-    );
+    assert_eq!(matches, total, "formatter parity broke on: {mismatches:?}");
 }
 
 #[test]
 fn formatter_idempotent_on_corpus() {
-    // Honest first-pass status — the property `fmt(fmt(x)) == fmt(x)`
-    // doesn't hold on every corpus fixture today (string-literal
-    // whitespace handling has a known bug). Until P9.1 is complete
-    // we report mismatches without failing the build.
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -98,12 +82,8 @@ fn formatter_idempotent_on_corpus() {
         }
     }
     eprintln!("[idempotency] {idempotent}/{total} fixtures idempotent; violators: {violators:?}");
-    // Regression budget: prevent slip below today's baseline. Bump as
-    // P14.3 / P9.1 lands fixes.
-    const IDEMPOTENT_FLOOR: usize = 6;
-    let _ = total;
-    assert!(
-        idempotent >= IDEMPOTENT_FLOOR,
-        "formatter idempotency regressed: {idempotent} idempotent < floor {IDEMPOTENT_FLOOR}; violators: {violators:?}"
+    assert_eq!(
+        idempotent, total,
+        "formatter idempotency broke on: {violators:?}"
     );
 }
