@@ -17,5 +17,14 @@ greycat-analyzer-syntax.workspace = true
 rustc-hash.workspace = true
 smol_str.workspace = true
 
+# P27.1 — rayon is unconditional on native targets and absent on wasm.
+# `wasm32-unknown-unknown` doesn't have `std::thread::spawn` without
+# wasm-bindgen-rayon (cross-origin-isolation headers etc.), and the
+# playground doesn't enable that. The `parallel` shim module dispatches
+# on `cfg(target_arch = "wasm32")`; rayon never gets called from the
+# wasm side, so it doesn't need to be present in the wasm dep tree.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+
 [dev-dependencies]
 greycat-analyzer-syntax.workspace = true

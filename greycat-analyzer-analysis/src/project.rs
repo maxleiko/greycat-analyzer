@@ -315,21 +315,54 @@ impl ProjectAnalysis {
         &mut self,
         manager: &SourceManager,
     ) -> Vec<(Uri, Hir, String, Duration, Directives)> {
-        let mut hirs: Vec<(Uri, Hir, String, Duration, Directives)> =
-            Vec::with_capacity(manager.len());
-        for (uri, cell) in manager.iter() {
-            let doc = cell.borrow();
-            let lower_start = Instant::now();
-            let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
-            let lower_took = lower_start.elapsed();
-            // **P23.1** — parse `// gcl-…` directives off the same CST
-            // we just lowered, so lints and the formatter can see the
-            // user's per-region opt-outs.
-            let directives = crate::directives::parse_directives(&doc.text, doc.root_node());
-            self.index.ingest(uri, &hir);
-            hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took, directives));
+        // P27.1 — three phases. The middle one runs through the
+        // `parallel` shim so native targets get rayon and wasm gets
+        // a serial fallback; both branches live in `crate::parallel`.
+        //
+        // Phase A (serial): borrow each `RefCell<Document>` once and
+        // extract the owned data the parallel phase needs. `Document`
+        // is `!Sync` (it holds a tree-sitter `Parser` + a `OnceCell`),
+        // so we can't hold its `Ref<'_, _>` across rayon's worker
+        // boundaries. `Tree::clone` is reference-counted internally,
+        // so the only real allocations here are the text + lib
+        // strings — both bounded by total source size.
+        let docs: Vec<(
+            Uri,
+            String,
+            String,
+            greycat_analyzer_syntax::tree_sitter::Tree,
+        )> = manager
+            .iter()
+            .map(|(uri, cell)| {
+                let doc = cell.borrow();
+                (
+                    uri.clone(),
+                    doc.text.clone(),
+                    doc.lib.clone(),
+                    doc.tree.clone(),
+                )
+            })
+            .collect();
+
+        // Phase B (parallel on native, serial on wasm): lower each
+        // module + parse its directives. No shared mutable state.
+        let lowered: Vec<(Uri, Hir, String, Duration, Directives)> =
+            crate::parallel::par_map(docs, |(uri, text, lib, tree)| {
+                let lower_start = Instant::now();
+                let hir = lower_module(&text, "module", lib.as_str(), tree.root_node());
+                let lower_took = lower_start.elapsed();
+                let directives = crate::directives::parse_directives(&text, tree.root_node());
+                (uri, hir, lib, lower_took, directives)
+            });
+
+        // Phase C (serial): ingest into the project-wide index. This
+        // mutates `self.index.symbols` etc., which is `!Send` on
+        // purpose — it owns interner state that's amortised across
+        // the whole project.
+        for (uri, hir, _lib, _lower_took, _directives) in &lowered {
+            self.index.ingest(uri, hir);
         }
-        hirs
+        lowered
     }
 
     /// **Stages S7-S11** — lower every type's attr `TypeRef`s
@@ -806,18 +839,46 @@ impl ProjectAnalysis {
     /// to a thin "wire it all together" call.
     fn stage_per_module_analysis(&mut self, hirs: Vec<(Uri, Hir, String, Duration, Directives)>) {
         let bypass = self.bypass_suppressions;
-        for (uri, hir, lib, lower_took, mut directives) in hirs {
-            let mut timings = ModuleTimings {
-                lower: lower_took,
-                ..ModuleTimings::default()
-            };
+        let index = &self.index;
+
+        // P26.4 — split the per-module pass into two phases:
+        //
+        //   Pass A (parallel): resolve + HIR-shape lints. Both are
+        //   read-only against `&self.index` and write only to their
+        //   per-module return values.
+        //
+        //   Pass B (serial): the analyzer's body walker
+        //   (`analyze_with_index_into`), which mutates `&mut self.arena`
+        //   for type allocation. P26.5 will probe whether wrapping
+        //   the arena in a Mutex makes this parallel too; for now it
+        //   stays serial.
+        //
+        // The serial path under `cfg(not(feature = "parallel"))` runs
+        // both phases inline per module, identical to the original
+        // sequential flow.
+        struct PassAOut {
+            uri: Uri,
+            hir: Hir,
+            lib: String,
+            lower_took: Duration,
+            directives: Directives,
+            resolutions: Resolutions,
+            lints: Vec<LintDiagnostic>,
+            resolve_took: Duration,
+            lint_took: Duration,
+        }
+
+        let pass_a_run = |(uri, hir, lib, lower_took, mut directives): (
+            Uri,
+            Hir,
+            String,
+            Duration,
+            Directives,
+        )|
+         -> PassAOut {
             let t0 = Instant::now();
-            let resolutions = resolve_with_index(&hir, &self.index);
-            timings.resolve = t0.elapsed();
-            let t1 = Instant::now();
-            let analysis =
-                analyze_with_index_into(&hir, &resolutions, &self.index, &mut self.arena);
-            timings.analyze = t1.elapsed();
+            let resolutions = resolve_with_index(&hir, index);
+            let resolve_took = t0.elapsed();
             let t2 = Instant::now();
             // Seed `lints` with the directive parser's own diagnostics
             // (`unknown-suppression-rule`, `empty-suppression`, …) so
@@ -829,17 +890,46 @@ impl ProjectAnalysis {
                 &mut directives,
                 bypass,
             ));
-            timings.lint = t2.elapsed();
-            self.modules.insert(
+            let lint_took = t2.elapsed();
+            PassAOut {
                 uri,
+                hir,
+                lib,
+                lower_took,
+                directives,
+                resolutions,
+                lints,
+                resolve_took,
+                lint_took,
+            }
+        };
+
+        // P27.1 — single call site, the rayon-vs-serial branch lives
+        // in `crate::parallel`.
+        let pass_a: Vec<PassAOut> = crate::parallel::par_map(hirs, pass_a_run);
+
+        // Pass B (serial): body walker mutates `self.arena`.
+        for p in pass_a {
+            let mut timings = ModuleTimings {
+                lower: p.lower_took,
+                resolve: p.resolve_took,
+                lint: p.lint_took,
+                ..ModuleTimings::default()
+            };
+            let t1 = Instant::now();
+            let analysis =
+                analyze_with_index_into(&p.hir, &p.resolutions, &self.index, &mut self.arena);
+            timings.analyze = t1.elapsed();
+            self.modules.insert(
+                p.uri,
                 ModuleAnalysis {
-                    hir,
-                    resolutions,
+                    hir: p.hir,
+                    resolutions: p.resolutions,
                     analysis,
-                    lints,
-                    lib,
+                    lints: p.lints,
+                    lib: p.lib,
                     timings,
-                    directives,
+                    directives: p.directives,
                 },
             );
         }
@@ -1064,89 +1154,38 @@ impl ProjectAnalysis {
         let arena = &self.arena;
         let index = &self.index;
         let bypass = self.bypass_suppressions;
-        for (uri, module) in self.modules.iter_mut() {
-            if !in_scope(uri) {
-                continue;
-            }
-            module.lints.retain(|l| {
-                !matches!(
-                    l.rule,
-                    "arrow-on-non-deref"
-                        | "possibly-null"
-                        | "redundant-nullable-access"
-                        | "redundant-non-null-assertion"
-                        | "redundant-coalesce"
-                        | "infer-return-type"
-                        | "unused-suppression"
-                        | "unreachable"
-                        | "non-exhaustive"
-                        | "catch-empty-parens"
-                )
-            });
-            // CST-shape lint. Walks the source/tree (not the HIR) so the
-            // empty `()` between `catch` and `{` shows up — that shape
-            // carries no semantic info and the HIR drops it. Lives in
-            // this pass alongside the typed lints so the LSP's
-            // incremental `invalidate` path picks it up too (the full-
-            // analyze + invalidate flows both run `run_typed_lints`).
-            if let Some(cell) = manager.get(uri) {
-                let doc = cell.borrow();
-                lint_catch_empty_parens(
-                    &doc.text,
-                    doc.root_node(),
-                    &mut module.directives,
-                    bypass,
-                    &mut module.lints,
-                );
-            }
-            lint_arrow_on_non_deref_with_directives(
-                &module.hir,
-                &module.analysis,
-                arena,
-                index,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_nullability_with_directives(
-                &module.hir,
-                &module.analysis,
-                arena,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_inferred_return_type_with_directives(
-                &module.hir,
-                &module.analysis,
-                arena,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_unreachable_with_directives(
-                &module.hir,
-                &module.analysis,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_non_exhaustive_with_directives(
-                &module.analysis,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            // **P23.3** — every suppression has now had a chance to
-            // fire. Walk the directive set one last time and surface a
-            // diagnostic for any rule that didn't actually drop
-            // anything. Skipped entirely under `--no-suppressions`
-            // because every suppression is "unused" by construction in
-            // that mode.
-            if !bypass {
-                lint_unused_suppressions(&mut module.directives, &mut module.lints);
-            }
-        }
+
+        // P26.3 / P27.1 — every typed-lint pass takes `&arena`
+        // (immutable) + `&index` (immutable) and writes only to its
+        // module's own `lints` / `directives`. Different modules touch
+        // disjoint memory, so the loop is embarrassingly parallel.
+        //
+        // Pre-extract each in-scope doc's `(text, tree)` into a
+        // Send-safe map (Document is `!Sync` because of its
+        // Parser + OnceCell, so we can't hold a `Ref<'_, _>` across
+        // workers). Then collect `(uri, &mut ModuleAnalysis)` into a
+        // Vec and dispatch through the `parallel::par_for_each` shim —
+        // rayon on native, serial loop on wasm.
+        #[allow(clippy::mutable_key_type)]
+        let doc_data: FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)> = self
+            .modules
+            .keys()
+            .filter(|uri| in_scope(uri))
+            .filter_map(|uri| {
+                manager.get(uri).map(|cell| {
+                    let doc = cell.borrow();
+                    (uri.clone(), (doc.text.clone(), doc.tree.clone()))
+                })
+            })
+            .collect();
+        let modules: Vec<(&Uri, &mut ModuleAnalysis)> = self
+            .modules
+            .iter_mut()
+            .filter(|(uri, _)| in_scope(uri))
+            .collect();
+        crate::parallel::par_for_each(modules, |(uri, module)| {
+            run_typed_lints_for_module(uri, module, arena, index, bypass, &doc_data);
+        });
     }
 
     fn validate_type_relations(&mut self, restrict: Option<&FxHashSet<&str>>) {
@@ -1733,6 +1772,94 @@ fn resolve_qualified_chain(
 }
 
 /// Walk one module's HIR and emit every type-relation diagnostic
+// P26.3
+/// Per-module typed-lint runner extracted out of [`ProjectAnalysis::run_typed_lints`]
+/// so the parallel and serial paths share one body and a future
+/// regression doesn't drift between them.
+///
+/// Reads `arena` + `index` immutably; writes only to `module.lints` /
+/// `module.directives`. `doc_data` is consulted for the `catch-empty-parens`
+/// lint, which needs the source text + parsed tree (the HIR drops the
+/// empty `()` shape).
+// P27.1 — the cfg gate is gone; the helper is the canonical body
+// for both native (rayon-driven) and wasm (serial fallback) call
+// sites in `run_typed_lints`.
+#[allow(clippy::mutable_key_type)]
+fn run_typed_lints_for_module(
+    uri: &Uri,
+    module: &mut ModuleAnalysis,
+    arena: &greycat_analyzer_types::TypeArena,
+    index: &ProjectIndex,
+    bypass: bool,
+    doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
+) {
+    module.lints.retain(|l| {
+        !matches!(
+            l.rule,
+            "arrow-on-non-deref"
+                | "possibly-null"
+                | "redundant-nullable-access"
+                | "redundant-non-null-assertion"
+                | "redundant-coalesce"
+                | "infer-return-type"
+                | "unused-suppression"
+                | "unreachable"
+                | "non-exhaustive"
+                | "catch-empty-parens"
+        )
+    });
+    if let Some((text, tree)) = doc_data.get(uri) {
+        lint_catch_empty_parens(
+            text,
+            tree.root_node(),
+            &mut module.directives,
+            bypass,
+            &mut module.lints,
+        );
+    }
+    lint_arrow_on_non_deref_with_directives(
+        &module.hir,
+        &module.analysis,
+        arena,
+        index,
+        &mut module.lints,
+        &mut module.directives,
+        bypass,
+    );
+    lint_nullability_with_directives(
+        &module.hir,
+        &module.analysis,
+        arena,
+        &mut module.lints,
+        &mut module.directives,
+        bypass,
+    );
+    lint_inferred_return_type_with_directives(
+        &module.hir,
+        &module.analysis,
+        arena,
+        &mut module.lints,
+        &mut module.directives,
+        bypass,
+    );
+    lint_unreachable_with_directives(
+        &module.hir,
+        &module.analysis,
+        &mut module.lints,
+        &mut module.directives,
+        bypass,
+    );
+    lint_non_exhaustive_with_directives(
+        &module.analysis,
+        &mut module.lints,
+        &mut module.directives,
+        bypass,
+    );
+    if !bypass {
+        lint_unused_suppressions(&mut module.directives, &mut module.lints);
+    }
+}
+
 /// the analyzer's per-module pass deferred. Reads only — never
 /// mutates `module`. The shared project arena is passed in;
 /// any newly-needed declared-side TypeIds are minted into it

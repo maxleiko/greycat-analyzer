@@ -209,30 +209,38 @@ impl Lint {
         > = report.loaded.iter().cloned().collect();
 
         // Hydrate cli `Entry`s from the manager's loaded set.
-        let mut entries: Vec<Entry> = Vec::with_capacity(mgr.len());
-        for (uri, cell) in mgr.iter() {
-            let doc = cell.borrow();
-            let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
+        //
+        // P26.6 — under `--features parallel`, hydrate every entry off
+        // the rayon work-stealing pool. Each entry's work is fully
+        // independent (per-doc parse_diagnostics + pragma_diagnostics +
+        // per-doc translation of analyzer-emitted diagnostics into LSP
+        // shape). The serial path is preserved verbatim; the parallel
+        // preamble's per-doc clones (text + tree) are skipped under
+        // `cfg(not(feature = "parallel"))` so the serial cost stays
+        // at zero.
+        let lint_libs = self.lint_libs;
+        let hydrate = |uri: &Uri,
+                       path: PathBuf,
+                       text: &str,
+                       root: greycat_analyzer_syntax::tree_sitter::Node<'_>|
+         -> Entry {
             let load = load_by_uri.get(uri).copied().unwrap_or_default();
             let timings = analysis.module(uri).map(|m| m.timings).unwrap_or_default();
-            let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
-            if let Some(root) = pragma_root.as_ref() {
-                let desc = greycat_analyzer_core::module_desc::parse_module_desc(
-                    uri.clone(),
-                    &doc.text,
-                    doc.root_node(),
-                );
+            let mut diagnostics = parse_diagnostics(root, text);
+            if let Some(proot) = pragma_root.as_ref() {
+                let desc =
+                    greycat_analyzer_core::module_desc::parse_module_desc(uri.clone(), text, root);
                 diagnostics.extend(greycat_analyzer_core::diagnostics::pragma_diagnostics(
-                    &doc.text,
+                    text,
                     &desc,
-                    root,
+                    proot,
                     &pragma_ctx,
                 ));
             }
             if let Some(module) = analysis.module(uri) {
                 for d in &module.analysis.diagnostics {
                     diagnostics.push(Diagnostic {
-                        range: byte_range_to_lsp(&doc.text, &d.byte_range),
+                        range: byte_range_to_lsp(text, &d.byte_range),
                         severity: Some(match d.severity {
                             Severity::Error => DiagnosticSeverity::ERROR,
                             Severity::Warning => DiagnosticSeverity::WARNING,
@@ -244,10 +252,10 @@ impl Lint {
                         ..Default::default()
                     });
                 }
-                if self.lint_libs || module.lib == "project" {
+                if lint_libs || module.lib == "project" {
                     for l in &module.lints {
                         diagnostics.push(Diagnostic {
-                            range: byte_range_to_lsp(&doc.text, &l.byte_range),
+                            range: byte_range_to_lsp(text, &l.byte_range),
                             severity: Some(match l.severity {
                                 LintSeverity::Error => DiagnosticSeverity::ERROR,
                                 LintSeverity::Warning => DiagnosticSeverity::WARNING,
@@ -261,7 +269,7 @@ impl Lint {
                     }
                 }
             }
-            entries.push(Entry {
+            Entry {
                 path,
                 read: load.read,
                 parse: load.parse,
@@ -269,10 +277,33 @@ impl Lint {
                 resolve: timings.resolve,
                 analyze: timings.analyze,
                 lint: timings.lint,
-                nodes: doc.root_node().descendant_count(),
+                nodes: root.descendant_count(),
                 diagnostics,
+            }
+        };
+
+        // P27.1 — single dispatch through the analysis crate's
+        // parallel shim (rayon on native, serial on wasm).
+        // Pre-extract per-doc data into Send-safe form (text + tree
+        // clone). RefCell<Document> is !Sync so we can't hold its
+        // borrow across workers.
+        let docs: Vec<(
+            Uri,
+            PathBuf,
+            String,
+            greycat_analyzer_syntax::tree_sitter::Tree,
+        )> = mgr
+            .iter()
+            .map(|(uri, cell)| {
+                let doc = cell.borrow();
+                let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
+                (uri.clone(), path, doc.text.clone(), doc.tree.clone())
+            })
+            .collect();
+        let mut entries: Vec<Entry> =
+            greycat_analyzer_analysis::parallel::par_map(docs, |(uri, path, text, tree)| {
+                hydrate(&uri, path, &text, tree.root_node())
             });
-        }
 
         // P8.4: lint fix-application driver. Each pass synthesizes
         // auto-fixes for the live diagnostics, applies non-overlapping
