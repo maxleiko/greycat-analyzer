@@ -1050,7 +1050,7 @@ impl ProjectAnalysis {
     ///
     /// `restrict = None` lints every cached module; `Some(set)` only
     /// the listed URIs (matches the type-relation validation scope).
-    fn run_typed_lints(&mut self, manager: &SourceManager, restrict: Option<&HashSet<String>>) {
+    fn run_typed_lints(&mut self, manager: &SourceManager, restrict: Option<&HashSet<&str>>) {
         let in_scope = |uri: &Uri| -> bool {
             match restrict {
                 None => true,
@@ -1147,7 +1147,7 @@ impl ProjectAnalysis {
         }
     }
 
-    fn validate_type_relations(&mut self, restrict: Option<&HashSet<String>>) {
+    fn validate_type_relations(&mut self, restrict: Option<&HashSet<&str>>) {
         use crate::analyzer::{DiagCategory, SemanticDiagnostic};
 
         let in_scope = |uri: &Uri| -> bool {
@@ -1214,7 +1214,7 @@ impl ProjectAnalysis {
     }
 
     #[cfg(debug_assertions)]
-    fn assert_no_in_scope_type_relation_diags(&self, restrict: Option<&HashSet<String>>) {
+    fn assert_no_in_scope_type_relation_diags(&self, restrict: Option<&HashSet<&str>>) {
         use crate::analyzer::DiagCategory;
         for (uri, m) in &self.modules {
             let in_scope = match restrict {
@@ -1503,8 +1503,8 @@ impl ProjectAnalysis {
         // module typing happens inline in the analyzer's body walker.
         // Only the typed-lint pass and type-relation validation remain
         // — both run on the changed URI only here for incremental cost.
-        let mut touched: HashSet<String> = HashSet::new();
-        touched.insert(uri.as_str().to_string());
+        let mut touched: HashSet<&str> = HashSet::new();
+        touched.insert(uri.as_str());
         self.run_typed_lints(manager, Some(&touched));
         self.validate_type_relations(Some(&touched));
         self.compute_qualified_refs(manager);
