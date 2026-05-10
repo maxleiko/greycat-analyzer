@@ -43,6 +43,10 @@ pub fn edit_for_diagnostic(
         "redundant-non-null-assertion" | "redundant-coalesce" => redundant_slice_fix(start, end),
         "modvar-node-cannot-be-nullable" => modvar_strip_outer_nullable_fix(text, end),
         "modvar-node-inner-must-be-nullable" => modvar_append_inner_nullable_fix(end),
+        "unused-suppression" => unused_suppression_fix(text, start, end),
+        "empty-suppression" | "unbalanced-lint-off" | "unbalanced-fmt-off" => {
+            delete_comment_line_fix(text, start)
+        }
         _ => Vec::new(),
     }
 }
@@ -191,6 +195,145 @@ fn modvar_append_inner_nullable_fix(end: usize) -> Vec<TextEdit> {
 /// fails. The re-parse is local to this call — no caching, no shared
 /// state. Re-parsing a single file is on the order of microseconds, so
 /// the simplicity wins.
+/// **P23.3 follow-up** — fix for `unused-suppression`. The diagnostic's
+/// `byte_range` points at the dead rule word inside a `// gcl-lint-…`
+/// directive comment. Two shapes:
+///
+/// - **Multi-rule directive** (`// gcl-lint-off-next A B`, B is dead):
+///   delete `B` plus its leading whitespace separator → leaves
+///   `// gcl-lint-off-next A`. If `B` was the *first* rule, eat the
+///   trailing whitespace instead so the result is `// gcl-lint-off-next
+///   …rest…`.
+/// - **Sole rule** (`// gcl-lint-off-next B`, B is dead): the directive
+///   becomes useless when its only rule is removed; delete the entire
+///   comment line (including any leading whitespace and the trailing
+///   newline if the comment was the only content on the line).
+///
+/// Returns an empty Vec when the diagnostic byte range doesn't sit
+/// inside a `line_comment`'s rule-list slot.
+fn unused_suppression_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
+    let Some(comment_range) = enclosing_node_range(text, start, &["line_comment"]) else {
+        return Vec::new();
+    };
+    let comment = &text[comment_range.clone()];
+    let Some(rules) = comment_rule_word_ranges(comment) else {
+        return Vec::new();
+    };
+    let rel_start = start - comment_range.start;
+    let rel_end = end - comment_range.start;
+    let Some(idx) = rules
+        .iter()
+        .position(|r| r.start == rel_start && r.end == rel_end)
+    else {
+        return Vec::new();
+    };
+    if rules.len() == 1 {
+        return vec![TextEdit {
+            byte_range: full_line_range_for_comment(text, &comment_range),
+            new_text: String::new(),
+        }];
+    }
+    // Multi-rule: drop this rule plus one whitespace separator.
+    let bytes = text.as_bytes();
+    let (del_start, del_end) = if idx == 0 {
+        let mut j = end;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() && bytes[j] != b'\n' {
+            j += 1;
+        }
+        (start, j)
+    } else {
+        let mut s = start;
+        while s > comment_range.start && bytes[s - 1].is_ascii_whitespace() && bytes[s - 1] != b'\n'
+        {
+            s -= 1;
+        }
+        (s, end)
+    };
+    vec![TextEdit {
+        byte_range: del_start..del_end,
+        new_text: String::new(),
+    }]
+}
+
+/// Fix for `empty-suppression` / `unbalanced-{lint,fmt}-off` — the
+/// directive comment has no useful effect, so deleting it is the
+/// minimal repair. Removes the whole comment line (and its trailing
+/// newline if the comment was the sole content on the line) so the
+/// rest of the file's blank-line vertical rhythm is preserved.
+fn delete_comment_line_fix(text: &str, byte: usize) -> Vec<TextEdit> {
+    let Some(comment_range) = enclosing_node_range(text, byte, &["line_comment"]) else {
+        return Vec::new();
+    };
+    vec![TextEdit {
+        byte_range: full_line_range_for_comment(text, &comment_range),
+        new_text: String::new(),
+    }]
+}
+
+/// Walk a comment text (`// …`) and return the byte ranges of each
+/// rule-list word — i.e. every whitespace-delimited word *after* the
+/// directive name. Returns `None` for non-directive comments and for
+/// directives that don't take rule lists (`gcl-fmt-…`).
+fn comment_rule_word_ranges(comment: &str) -> Option<Vec<Range<usize>>> {
+    let bytes = comment.as_bytes();
+    if bytes.len() < 2 || &bytes[..2] != b"//" {
+        return None;
+    }
+    let mut i = 2;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() && bytes[i] != b'\n' {
+        i += 1;
+    }
+    let name_start = i;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let name = &comment[name_start..i];
+    if !matches!(
+        name,
+        "gcl-lint-off" | "gcl-lint-on" | "gcl-lint-off-next" | "gcl-lint-off-file"
+    ) {
+        return None;
+    }
+    let mut rules: Vec<Range<usize>> = Vec::new();
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let s = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if s < i {
+            rules.push(s..i);
+        }
+    }
+    Some(rules)
+}
+
+/// Compute the byte range to delete for a "remove the whole comment"
+/// fix. When the comment is the only content on its line, we eat the
+/// leading whitespace and the trailing newline so no blank line is
+/// left behind. Otherwise, we delete just the comment span (preserving
+/// surrounding code on the same line).
+fn full_line_range_for_comment(text: &str, comment_range: &Range<usize>) -> Range<usize> {
+    let line_start = text[..comment_range.start]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let leading_only_ws = text[line_start..comment_range.start]
+        .chars()
+        .all(|c| c.is_whitespace());
+    if !leading_only_ws {
+        return comment_range.clone();
+    }
+    let bytes = text.as_bytes();
+    let mut end = comment_range.end;
+    if end < bytes.len() && bytes[end] == b'\n' {
+        end += 1;
+    }
+    line_start..end
+}
+
 fn enclosing_node_range(text: &str, byte: usize, kinds: &[&str]) -> Option<Range<usize>> {
     let tree = greycat_analyzer_syntax::parse(text);
     let root = tree.root_node();
@@ -346,5 +489,88 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].byte_range, bb_start..(bb_start + 2));
         assert_eq!(edits[0].new_text, "");
+    }
+
+    // -----------------------------------------------------------------
+    // P23 — directive-comment quickfixes
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unused_suppression_drops_dead_rule_from_multi_rule_directive() {
+        // `unused-param` is dead → fix should remove just that word
+        // plus its leading space, leaving `// gcl-lint-off-next unused-local`.
+        let src =
+            "fn main() {\n    // gcl-lint-off-next unused-local unused-param\n    var x = 42;\n}\n";
+        let dead = src.find("unused-param").unwrap();
+        let edits = fix(
+            "unused-suppression",
+            src,
+            dead..(dead + "unused-param".len()),
+        );
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            after.contains("// gcl-lint-off-next unused-local\n"),
+            "after = {after:?}"
+        );
+        assert!(!after.contains("unused-param"), "after = {after:?}");
+    }
+
+    #[test]
+    fn unused_suppression_drops_first_rule_eats_trailing_space() {
+        let src =
+            "fn main() {\n    // gcl-lint-off-next unused-local unused-param\n    var y = 0;\n}\n";
+        let dead = src.find("unused-local").unwrap();
+        let edits = fix(
+            "unused-suppression",
+            src,
+            dead..(dead + "unused-local".len()),
+        );
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            after.contains("// gcl-lint-off-next unused-param\n"),
+            "after = {after:?}"
+        );
+    }
+
+    #[test]
+    fn unused_suppression_on_sole_rule_deletes_whole_comment_line() {
+        let src = "fn main() {\n    // gcl-lint-off-next unused-param\n    var y = 0;\n}\n";
+        let dead = src.find("unused-param").unwrap();
+        let edits = fix(
+            "unused-suppression",
+            src,
+            dead..(dead + "unused-param".len()),
+        );
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            !after.contains("gcl-lint-off-next"),
+            "expected the whole directive line gone, after = {after:?}"
+        );
+        // The leading 4-space indent should also be eaten so no blank
+        // line is left behind.
+        assert!(
+            after.contains("fn main() {\n    var y"),
+            "expected no leftover blank line, after = {after:?}"
+        );
+    }
+
+    #[test]
+    fn empty_suppression_deletes_whole_comment_line() {
+        let src = "fn main() {\n    // gcl-lint-off\n    var x = 1;\n}\n";
+        let comment_start = src.find("// gcl-lint-off").unwrap();
+        // empty-suppression's diagnostic byte_range covers the whole
+        // comment (matches what the directive parser emits).
+        let comment_end = src[comment_start..].find('\n').unwrap() + comment_start;
+        let edits = fix("empty-suppression", src, comment_start..comment_end);
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(!after.contains("gcl-lint-off"), "after = {after:?}");
     }
 }
