@@ -1,4 +1,5 @@
-//! P27 — parallelism shim.
+// P27.1
+//! Parallelism shim.
 //!
 //! Single point of dispatch between rayon (on native targets) and a
 //! serial fallback (on `wasm32-unknown-unknown`, where `std::thread::spawn`
