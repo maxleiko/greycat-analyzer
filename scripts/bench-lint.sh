@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# P25.1: lint-throughput baseline. P26.1: serial-vs-parallel mode.
+# P25.1: lint-throughput baseline. P27.2: single-binary mode.
 #
-# Builds two release binaries — one with `--features parallel`, one
-# without — into separate `target/par-{off,on}` dirs, then runs hyperfine
-# across both for each named corpus, side-by-side. The hyperfine summary
-# table reads off the speedup directly.
-#
-# Until the `parallel` feature exists (P26.2 introduces it), the parallel
-# build falls back to the serial code path — both rows show the same
-# number, which is the right behaviour for chunks that haven't enabled
-# rayon yet.
+# Builds `cargo build --release -p greycat-analyzer` and runs hyperfine
+# on the resulting binary against each named corpus. Tracks lint
+# throughput across phases. The P26 serial-vs-parallel A/B mode is
+# gone — after P27 there's only one binary on native (parallel via
+# the `crate::parallel` shim, no Cargo feature flag).
 #
 # Corpora are referenced by short name only ("pro", "solarleb"). Their
 # absolute paths live in the env (BENCH_PRO / BENCH_SOLARLEB) so the
@@ -30,19 +26,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Build both flavours into separate target dirs so the binaries can
-# coexist on disk and hyperfine can A/B them without rebuilds in
-# between.
-echo "[bench-lint] cargo build --release -p greycat-analyzer (serial)"
-(cd "$REPO_ROOT" && CARGO_TARGET_DIR=target/par-off \
-    cargo build --release -p greycat-analyzer >/dev/null)
+echo "[bench-lint] cargo build --release -p greycat-analyzer"
+(cd "$REPO_ROOT" && cargo build --release -p greycat-analyzer >/dev/null)
 
-echo "[bench-lint] cargo build --release -p greycat-analyzer --features parallel"
-(cd "$REPO_ROOT" && CARGO_TARGET_DIR=target/par-on \
-    cargo build --release -p greycat-analyzer --features parallel >/dev/null)
-
-BIN_OFF="$REPO_ROOT/target/par-off/release/greycat-analyzer"
-BIN_ON="$REPO_ROOT/target/par-on/release/greycat-analyzer"
+BIN="$REPO_ROOT/target/release/greycat-analyzer"
 
 run_corpus() {
     local name="$1" path="$2"
@@ -60,10 +47,8 @@ run_corpus() {
     # included), which hyperfine treats as a benchmark failure unless we
     # opt out — we just want the wall-clock cost of analysis.
     hyperfine --warmup "$BENCH_WARMUP" --runs "$BENCH_RUNS" --ignore-failure \
-        --command-name "serial   ($name)" \
-        "$BIN_OFF lint $path/project.gcl --format=compact > /dev/null" \
-        --command-name "parallel ($name)" \
-        "$BIN_ON  lint $path/project.gcl --format=compact > /dev/null"
+        --command-name "$name" \
+        "$BIN lint $path/project.gcl --format=compact > /dev/null"
 }
 
 targets=("$@")
