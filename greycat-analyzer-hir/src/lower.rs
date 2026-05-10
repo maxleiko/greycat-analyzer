@@ -30,7 +30,8 @@ impl<'src> LowerCtx<'src> {
 
     fn alloc_ident(&mut self, node: tree_sitter::Node<'_>) -> Idx<Ident> {
         self.hir.idents.alloc(Ident {
-            text: self.text(node).to_string(),
+            // P25.5
+            text: self.text(node).into(),
             byte_range: node.byte_range(),
         })
     }
@@ -49,7 +50,8 @@ impl<'src> LowerCtx<'src> {
                 .find(|n| n.kind() == "string_fragment")
             {
                 return self.hir.idents.alloc(Ident {
-                    text: self.text(frag).to_string(),
+                    // P25.5
+                    text: self.text(frag).into(),
                     byte_range: node.byte_range(),
                 });
             }

@@ -5,6 +5,8 @@
 
 use std::ops::Range;
 
+use smol_str::SmolStr;
+
 use crate::arena::Idx;
 
 pub type Span = Range<usize>;
@@ -21,7 +23,8 @@ pub struct Module {
 
 #[derive(Debug, Clone)]
 pub struct Ident {
-    pub text: String,
+    // P25.5
+    pub text: SmolStr,
     pub byte_range: Span,
 }
 

@@ -12,6 +12,7 @@ categories.workspace = true
 [dependencies]
 greycat-analyzer-syntax.workspace = true
 greycat-analyzer-core.workspace = true
+smol_str.workspace = true
 
 [dev-dependencies]
 greycat-analyzer-syntax.workspace = true

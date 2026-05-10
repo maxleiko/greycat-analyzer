@@ -603,7 +603,7 @@ fn collect_expr_descendants(
 /// Local copy of `analysis::stdlib::lower_type_ref` (private upstream).
 fn lower_type_ref_local(hir: &Hir, idx: Idx<TypeRef>, arena: &mut TypeArena) -> TypeId {
     let tr = &hir.type_refs[idx];
-    let name = hir.idents[tr.name].text.clone();
+    let name = hir.idents[tr.name].text.to_string();
     let mut base = match name.as_str() {
         "bool" => arena.primitive(Primitive::Bool),
         "int" => arena.primitive(Primitive::Int),
@@ -665,12 +665,12 @@ fn collect_resolution_records(
             "FnDecl" | "TypeDecl" | "EnumDecl" | "ModuleVar" => {
                 format!("{lib_stem}::{}", ident.text)
             }
-            _ => ident.text.clone(),
+            _ => ident.text.to_string(),
         };
         let payload = DeclPayload {
             ref_kind,
             decl_kind,
-            name: ident.text.clone(),
+            name: ident.text.to_string(),
             fqn,
             decl_file: file.clone(),
             decl_range: ident.byte_range.clone(),
@@ -872,8 +872,8 @@ fn build_decl_payload(
             Some(DeclPayload {
                 ref_kind: "var",
                 decl_kind: "VarDecl",
-                name: id.text.clone(),
-                fqn: id.text.clone(),
+                name: id.text.to_string(),
+                fqn: id.text.to_string(),
                 decl_file: self_file.to_string(),
                 decl_range: id.byte_range.clone(),
                 decl_line: 0,
@@ -885,8 +885,8 @@ fn build_decl_payload(
             Some(DeclPayload {
                 ref_kind: "var",
                 decl_kind: "FnParam",
-                name: id.text.clone(),
-                fqn: id.text.clone(),
+                name: id.text.to_string(),
+                fqn: id.text.to_string(),
                 decl_file: self_file.to_string(),
                 decl_range: id.byte_range.clone(),
                 decl_line: 0,
@@ -898,8 +898,8 @@ fn build_decl_payload(
             Some(DeclPayload {
                 ref_kind: "type",
                 decl_kind: "TypeParam",
-                name: id.text.clone(),
-                fqn: id.text.clone(),
+                name: id.text.to_string(),
+                fqn: id.text.to_string(),
                 decl_file: self_file.to_string(),
                 decl_range: id.byte_range.clone(),
                 decl_line: 0,
@@ -949,11 +949,11 @@ fn build_decl_payload(
 
 fn decl_summary(hir: &Hir, decl: &Decl) -> (&'static str, &'static str, String) {
     match decl {
-        Decl::Fn(d) => ("fn", "FnDecl", hir.idents[d.name].text.clone()),
-        Decl::Type(d) => ("type", "TypeDecl", hir.idents[d.name].text.clone()),
-        Decl::Enum(d) => ("type", "EnumDecl", hir.idents[d.name].text.clone()),
-        Decl::Var(d) => ("var", "ModuleVar", hir.idents[d.name].text.clone()),
-        Decl::Pragma(p) => ("type", "Pragma", hir.idents[p.name].text.clone()),
+        Decl::Fn(d) => ("fn", "FnDecl", hir.idents[d.name].text.to_string()),
+        Decl::Type(d) => ("type", "TypeDecl", hir.idents[d.name].text.to_string()),
+        Decl::Enum(d) => ("type", "EnumDecl", hir.idents[d.name].text.to_string()),
+        Decl::Var(d) => ("var", "ModuleVar", hir.idents[d.name].text.to_string()),
+        Decl::Pragma(p) => ("type", "Pragma", hir.idents[p.name].text.to_string()),
     }
 }
 

@@ -753,7 +753,7 @@ impl ProjectIndex {
                         entries.push(ExposureSite {
                             uri: uri.clone(),
                             decl: *decl_id,
-                            local_name: local_name.clone(),
+                            local_name: local_name.to_string(),
                             rename,
                         });
                     }

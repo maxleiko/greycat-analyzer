@@ -559,7 +559,7 @@ fn render_type_ref(
     type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
 ) -> String {
     let tr = &hir.type_refs[type_ref];
-    let mut out = hir.idents[tr.name].text.clone();
+    let mut out = hir.idents[tr.name].text.to_string();
     if !tr.params.is_empty() {
         out.push('<');
         for (i, p) in tr.params.iter().enumerate() {
@@ -613,14 +613,14 @@ fn hover_from_markdown(markdown: String, range: Range<usize>, text: &str) -> Hov
 
 fn short_expr_label(hir: &Hir, expr: &Expr) -> String {
     match expr {
-        Expr::Ident(idx) => hir.idents[*idx].text.clone(),
+        Expr::Ident(idx) => hir.idents[*idx].text.to_string(),
         Expr::Literal(_) => "literal".into(),
         Expr::String(_) => "string".into(),
         Expr::Call(_) => "call".into(),
         Expr::Binary(_) => "expression".into(),
         Expr::Unary(_) => "expression".into(),
-        Expr::Member(m) | Expr::Arrow(m) => hir.idents[m.property].text.clone(),
-        Expr::Static(s) => hir.idents[s.property].text.clone(),
+        Expr::Member(m) | Expr::Arrow(m) => hir.idents[m.property].text.to_string(),
+        Expr::Static(s) => hir.idents[s.property].text.to_string(),
         _ => "expression".into(),
     }
 }
@@ -659,7 +659,7 @@ pub fn signature_help(
             label.push_str(", ");
         }
         let p = &hir.fn_params[*p_id];
-        let pname = hir.idents[p.name].text.clone();
+        let pname = hir.idents[p.name].text.to_string();
         let label_start = label.len();
         let mut piece = pname.clone();
         if let Some(ty_id) = p.ty {
@@ -1039,7 +1039,7 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
                 let a = &hir.type_attrs[*attr_id];
                 let aname = &hir.idents[a.name];
                 children.push(DocumentSymbol {
-                    name: aname.text.clone(),
+                    name: aname.text.to_string(),
                     detail: None,
                     kind: SymbolKind::FIELD,
                     tags: None,
@@ -1055,7 +1055,7 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
                     let mname = &hir.idents[fnd.name];
                     #[allow(deprecated)]
                     children.push(DocumentSymbol {
-                        name: mname.text.clone(),
+                        name: mname.text.to_string(),
                         detail: None,
                         kind: SymbolKind::METHOD,
                         tags: None,
@@ -1069,7 +1069,7 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
         }
         #[allow(deprecated)]
         out.push(DocumentSymbol {
-            name: ident.text.clone(),
+            name: ident.text.to_string(),
             detail: None,
             kind,
             tags: None,
@@ -1992,7 +1992,7 @@ fn emit_call_arg_hints_expr(
                         break;
                     };
                     let p = &hir.fn_params[*p_id];
-                    let param_name = hir.idents[p.name].text.clone();
+                    let param_name = hir.idents[p.name].text.to_string();
                     if param_name.starts_with('_') {
                         continue;
                     }
@@ -3440,7 +3440,7 @@ fn ident_or_keyword_completion(
                     md.decls
                         .iter()
                         .filter_map(|d| m.hir.decls[*d].name())
-                        .map(|n| m.hir.idents[n].text.clone())
+                        .map(|n| m.hir.idents[n].text.to_string())
                         .collect()
                 })
                 .unwrap_or_default()
@@ -3746,7 +3746,7 @@ fn scope_names_at(
     // Module-level decls are always visible (forward-ref allowed).
     for &decl_id in &module.decls {
         if let Some(name_id) = hir.decls[decl_id].name() {
-            let name = hir.idents[name_id].text.clone();
+            let name = hir.idents[name_id].text.to_string();
             let kind = match &hir.decls[decl_id] {
                 HD::Fn(_) => CompletionItemKind::FUNCTION,
                 HD::Type(_) => CompletionItemKind::CLASS,
@@ -3767,7 +3767,7 @@ fn scope_names_at(
             HD::Fn(d) => collect_fn_scope(hir, d, cursor_byte, &mut out),
             HD::Type(d) => {
                 for g in &d.generics {
-                    let n = hir.idents[*g].text.clone();
+                    let n = hir.idents[*g].text.to_string();
                     out.push((
                         n,
                         CompletionItemKind::TYPE_PARAMETER,
@@ -3798,7 +3798,7 @@ fn collect_fn_scope(
     out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
 ) {
     for g in &fnd.generics {
-        let n = hir.idents[*g].text.clone();
+        let n = hir.idents[*g].text.to_string();
         out.push((
             n,
             CompletionItemKind::TYPE_PARAMETER,
@@ -3808,7 +3808,7 @@ fn collect_fn_scope(
     }
     for p in &fnd.params {
         let p = &hir.fn_params[*p];
-        let n = hir.idents[p.name].text.clone();
+        let n = hir.idents[p.name].text.to_string();
         out.push((
             n,
             CompletionItemKind::VARIABLE,
@@ -3845,7 +3845,7 @@ fn collect_block_scope(
         let r = stmt_byte_range(hir, *s);
         if r.end <= cursor_byte {
             if let HS::Var(lv) = &hir.stmts[*s] {
-                let n = hir.idents[lv.name].text.clone();
+                let n = hir.idents[lv.name].text.to_string();
                 out.push((
                     n,
                     CompletionItemKind::VARIABLE,
@@ -3881,7 +3881,7 @@ fn collect_stmt_scope(
         HS::DoWhile(s) => collect_block_scope(hir, &s.body, cursor_byte, out),
         HS::For(s) if cursor_in_block(&s.body, cursor_byte) => {
             if let Some(name_id) = s.init_name {
-                let n = hir.idents[name_id].text.clone();
+                let n = hir.idents[name_id].text.to_string();
                 out.push((
                     n,
                     CompletionItemKind::VARIABLE,
@@ -3893,7 +3893,7 @@ fn collect_stmt_scope(
         }
         HS::ForIn(s) if cursor_in_block(&s.body, cursor_byte) => {
             for p in &s.params {
-                let n = hir.idents[p.name].text.clone();
+                let n = hir.idents[p.name].text.to_string();
                 out.push((
                     n,
                     CompletionItemKind::VARIABLE,
@@ -3907,7 +3907,7 @@ fn collect_stmt_scope(
             collect_block_scope(hir, &s.try_block, cursor_byte, out);
             if cursor_in_block(&s.catch_block, cursor_byte) {
                 if let Some(err_id) = s.error_param {
-                    let n = hir.idents[err_id].text.clone();
+                    let n = hir.idents[err_id].text.to_string();
                     out.push((
                         n,
                         CompletionItemKind::VARIABLE,
@@ -4370,7 +4370,7 @@ fn collect_type_members(
 ) {
     for attr_id in &td.attrs {
         let a = &hir.type_attrs[*attr_id];
-        let name = hir.idents[a.name].text.clone();
+        let name = hir.idents[a.name].text.to_string();
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
@@ -4395,7 +4395,7 @@ fn collect_type_members(
         if m.modifiers.static_ {
             continue;
         }
-        let name = hir.idents[m.name].text.clone();
+        let name = hir.idents[m.name].text.to_string();
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
@@ -4471,7 +4471,7 @@ fn static_completion(
                     if !m.modifiers.static_ {
                         continue;
                     }
-                    let name = fmod.hir.idents[m.name].text.clone();
+                    let name = fmod.hir.idents[m.name].text.to_string();
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
@@ -4517,7 +4517,7 @@ fn static_completion(
             let Some(name_id) = mod_analysis.hir.decls[decl_id].name() else {
                 continue;
             };
-            let name = mod_analysis.hir.idents[name_id].text.clone();
+            let name = mod_analysis.hir.idents[name_id].text.to_string();
             if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                 continue;
             }
@@ -4729,7 +4729,7 @@ fn type_position_completion(
                 _ => continue,
             };
             if let Some(name_id) = module.hir.decls[*decl_id].name() {
-                let name = module.hir.idents[name_id].text.clone();
+                let name = module.hir.idents[name_id].text.to_string();
                 push(&mut items, &mut seen, &name, kind);
             }
         }
@@ -4845,7 +4845,7 @@ fn emit_attrs(
 ) {
     for attr_id in &td.attrs {
         let a = &hir.type_attrs[*attr_id];
-        let name = hir.idents[a.name].text.clone();
+        let name = hir.idents[a.name].text.to_string();
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }

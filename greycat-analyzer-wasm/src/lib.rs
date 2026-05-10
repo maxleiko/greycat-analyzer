@@ -240,7 +240,7 @@ struct HirCounts {
 }
 
 fn ident_text(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Ident>) -> String {
-    hir.idents[idx].text.clone()
+    hir.idents[idx].text.to_string()
 }
 
 fn type_ref_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::TypeRef>) -> HirNode {

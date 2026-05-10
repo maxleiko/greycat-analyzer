@@ -449,6 +449,7 @@ version = "0.1.0"
 dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-syntax",
+ "smol_str",
 ]
 
 [[package]]

@@ -554,7 +554,8 @@ struct Cx<'a> {
     /// of `Named(name)` / `Any` for in-scope generics. The stack is a
     /// `Vec<HashMap>` so nested fns inside a generic type see both
     /// outer and inner names.
-    generics_in_scope: Vec<FxHashMap<String, GenericOwner>>,
+    // P25.5
+    generics_in_scope: Vec<FxHashMap<SmolStr, GenericOwner>>,
     // P19.11
     /// `this` typing stack. Pushed on entry to a
     /// type's method body (in `visit_type_decl`), popped on exit.
@@ -2277,8 +2278,10 @@ impl<'a> Cx<'a> {
         let Expr::Static(StaticExpr { ty, property, .. }) = &self.hir.exprs[static_side] else {
             return None;
         };
-        let enum_name = self.hir.idents[self.hir.type_refs[*ty].name].text.clone();
-        let variant = self.hir.idents[*property].text.clone();
+        let enum_name = self.hir.idents[self.hir.type_refs[*ty].name]
+            .text
+            .to_string();
+        let variant = self.hir.idents[*property].text.to_string();
         Some((binding, enum_name, variant))
     }
 
