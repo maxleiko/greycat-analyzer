@@ -315,85 +315,54 @@ impl ProjectAnalysis {
         &mut self,
         manager: &SourceManager,
     ) -> Vec<(Uri, Hir, String, Duration, Directives)> {
-        // P26.2 — when the `parallel` feature is on, lower every module
-        // off the rayon work-stealing pool. Each lowering is fully
-        // self-contained (no project-state writes) so this is
-        // embarrassingly parallel; the only synchronisation point is
-        // the post-loop `index.ingest` sweep, which stays serial because
-        // it mutates the project-wide interner.
+        // P27.1 — three phases. The middle one runs through the
+        // `parallel` shim so native targets get rayon and wasm gets
+        // a serial fallback; both branches live in `crate::parallel`.
         //
-        // The serial path is preserved verbatim under `cfg(not(parallel))`
-        // — the parallel preamble's per-doc clones (text + lib + Tree)
-        // are skipped entirely so the serial cost stays at zero.
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-
-            // Phase A (serial): borrow each `RefCell<Document>` once and
-            // extract the owned data the parallel phase needs. `Document`
-            // is `!Sync` (it holds a tree-sitter `Parser` + a `OnceCell`),
-            // so we can't hold its `Ref<'_, _>` across rayon's worker
-            // boundaries. `Tree::clone` is reference-counted internally,
-            // so the only real allocations here are the text + lib
-            // strings — both bounded by total source size.
-            let docs: Vec<(
-                Uri,
-                String,
-                String,
-                greycat_analyzer_syntax::tree_sitter::Tree,
-            )> = manager
-                .iter()
-                .map(|(uri, cell)| {
-                    let doc = cell.borrow();
-                    (
-                        uri.clone(),
-                        doc.text.clone(),
-                        doc.lib.clone(),
-                        doc.tree.clone(),
-                    )
-                })
-                .collect();
-
-            // Phase B (parallel): lower each module + parse its
-            // directives. No shared mutable state.
-            let lowered: Vec<(Uri, Hir, String, Duration, Directives)> = docs
-                .par_iter()
-                .map(|(uri, text, lib, tree)| {
-                    let lower_start = Instant::now();
-                    let hir = lower_module(text, "module", lib.as_str(), tree.root_node());
-                    let lower_took = lower_start.elapsed();
-                    let directives = crate::directives::parse_directives(text, tree.root_node());
-                    (uri.clone(), hir, lib.clone(), lower_took, directives)
-                })
-                .collect();
-
-            // Phase C (serial): ingest into the project-wide index. This
-            // mutates `self.index.symbols` etc., which is `!Send` on
-            // purpose — it owns interner state that's amortised across
-            // the whole project.
-            for (uri, hir, _lib, _lower_took, _directives) in &lowered {
-                self.index.ingest(uri, hir);
-            }
-            lowered
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            let mut hirs: Vec<(Uri, Hir, String, Duration, Directives)> =
-                Vec::with_capacity(manager.len());
-            for (uri, cell) in manager.iter() {
+        // Phase A (serial): borrow each `RefCell<Document>` once and
+        // extract the owned data the parallel phase needs. `Document`
+        // is `!Sync` (it holds a tree-sitter `Parser` + a `OnceCell`),
+        // so we can't hold its `Ref<'_, _>` across rayon's worker
+        // boundaries. `Tree::clone` is reference-counted internally,
+        // so the only real allocations here are the text + lib
+        // strings — both bounded by total source size.
+        let docs: Vec<(
+            Uri,
+            String,
+            String,
+            greycat_analyzer_syntax::tree_sitter::Tree,
+        )> = manager
+            .iter()
+            .map(|(uri, cell)| {
                 let doc = cell.borrow();
+                (
+                    uri.clone(),
+                    doc.text.clone(),
+                    doc.lib.clone(),
+                    doc.tree.clone(),
+                )
+            })
+            .collect();
+
+        // Phase B (parallel on native, serial on wasm): lower each
+        // module + parse its directives. No shared mutable state.
+        let lowered: Vec<(Uri, Hir, String, Duration, Directives)> =
+            crate::parallel::par_map(docs, |(uri, text, lib, tree)| {
                 let lower_start = Instant::now();
-                let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
+                let hir = lower_module(&text, "module", lib.as_str(), tree.root_node());
                 let lower_took = lower_start.elapsed();
-                // **P23.1** — parse `// gcl-…` directives off the same CST
-                // we just lowered, so lints and the formatter can see the
-                // user's per-region opt-outs.
-                let directives = crate::directives::parse_directives(&doc.text, doc.root_node());
-                self.index.ingest(uri, &hir);
-                hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took, directives));
-            }
-            hirs
+                let directives = crate::directives::parse_directives(&text, tree.root_node());
+                (uri, hir, lib, lower_took, directives)
+            });
+
+        // Phase C (serial): ingest into the project-wide index. This
+        // mutates `self.index.symbols` etc., which is `!Send` on
+        // purpose — it owns interner state that's amortised across
+        // the whole project.
+        for (uri, hir, _lib, _lower_took, _directives) in &lowered {
+            self.index.ingest(uri, hir);
         }
+        lowered
     }
 
     /// **Stages S7-S11** — lower every type's attr `TypeRef`s
@@ -935,13 +904,9 @@ impl ProjectAnalysis {
             }
         };
 
-        #[cfg(feature = "parallel")]
-        let pass_a: Vec<PassAOut> = {
-            use rayon::prelude::*;
-            hirs.into_par_iter().map(pass_a_run).collect()
-        };
-        #[cfg(not(feature = "parallel"))]
-        let pass_a: Vec<PassAOut> = hirs.into_iter().map(pass_a_run).collect();
+        // P27.1 — single call site, the rayon-vs-serial branch lives
+        // in `crate::parallel`.
+        let pass_a: Vec<PassAOut> = crate::parallel::par_map(hirs, pass_a_run);
 
         // Pass B (serial): body walker mutates `self.arena`.
         for p in pass_a {
@@ -1190,131 +1155,37 @@ impl ProjectAnalysis {
         let index = &self.index;
         let bypass = self.bypass_suppressions;
 
-        // P26.3 — every typed-lint pass takes `&arena` (immutable) +
-        // `&index` (immutable) and writes only to its module's own
-        // `lints` / `directives`. Different modules touch disjoint
-        // memory, so the loop is embarrassingly parallel.
+        // P26.3 / P27.1 — every typed-lint pass takes `&arena`
+        // (immutable) + `&index` (immutable) and writes only to its
+        // module's own `lints` / `directives`. Different modules touch
+        // disjoint memory, so the loop is embarrassingly parallel.
         //
-        // The serial path under `cfg(not(feature = "parallel"))` is
-        // preserved verbatim. On the parallel path we pre-extract each
-        // doc's `(text, tree)` into a sendable map so the rayon
-        // workers don't need to cross `RefCell<Document>` borrows
-        // (Document is `!Sync`).
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            #[allow(clippy::mutable_key_type)]
-            let doc_data: FxHashMap<
-                Uri,
-                (String, greycat_analyzer_syntax::tree_sitter::Tree),
-            > = self
-                .modules
-                .keys()
-                .filter(|uri| in_scope(uri))
-                .filter_map(|uri| {
-                    manager.get(uri).map(|cell| {
-                        let doc = cell.borrow();
-                        (uri.clone(), (doc.text.clone(), doc.tree.clone()))
-                    })
+        // Pre-extract each in-scope doc's `(text, tree)` into a
+        // Send-safe map (Document is `!Sync` because of its
+        // Parser + OnceCell, so we can't hold a `Ref<'_, _>` across
+        // workers). Then collect `(uri, &mut ModuleAnalysis)` into a
+        // Vec and dispatch through the `parallel::par_for_each` shim —
+        // rayon on native, serial loop on wasm.
+        #[allow(clippy::mutable_key_type)]
+        let doc_data: FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)> = self
+            .modules
+            .keys()
+            .filter(|uri| in_scope(uri))
+            .filter_map(|uri| {
+                manager.get(uri).map(|cell| {
+                    let doc = cell.borrow();
+                    (uri.clone(), (doc.text.clone(), doc.tree.clone()))
                 })
-                .collect();
-
-            // Collect `(uri, &mut ModuleAnalysis)` into a Vec so
-            // rayon's `par_iter_mut` over a slice works without
-            // requiring HashMap-rayon-feature plumbing.
-            let modules: Vec<(&Uri, &mut ModuleAnalysis)> = self
-                .modules
-                .iter_mut()
-                .filter(|(uri, _)| in_scope(uri))
-                .collect();
-            modules.into_par_iter().for_each(|(uri, module)| {
-                run_typed_lints_for_module(uri, module, arena, index, bypass, &doc_data);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        for (uri, module) in self.modules.iter_mut() {
-            if !in_scope(uri) {
-                continue;
-            }
-            module.lints.retain(|l| {
-                !matches!(
-                    l.rule,
-                    "arrow-on-non-deref"
-                        | "possibly-null"
-                        | "redundant-nullable-access"
-                        | "redundant-non-null-assertion"
-                        | "redundant-coalesce"
-                        | "infer-return-type"
-                        | "unused-suppression"
-                        | "unreachable"
-                        | "non-exhaustive"
-                        | "catch-empty-parens"
-                )
-            });
-            // CST-shape lint. Walks the source/tree (not the HIR) so the
-            // empty `()` between `catch` and `{` shows up — that shape
-            // carries no semantic info and the HIR drops it. Lives in
-            // this pass alongside the typed lints so the LSP's
-            // incremental `invalidate` path picks it up too (the full-
-            // analyze + invalidate flows both run `run_typed_lints`).
-            if let Some(cell) = manager.get(uri) {
-                let doc = cell.borrow();
-                lint_catch_empty_parens(
-                    &doc.text,
-                    doc.root_node(),
-                    &mut module.directives,
-                    bypass,
-                    &mut module.lints,
-                );
-            }
-            lint_arrow_on_non_deref_with_directives(
-                &module.hir,
-                &module.analysis,
-                arena,
-                index,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_nullability_with_directives(
-                &module.hir,
-                &module.analysis,
-                arena,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_inferred_return_type_with_directives(
-                &module.hir,
-                &module.analysis,
-                arena,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_unreachable_with_directives(
-                &module.hir,
-                &module.analysis,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            lint_non_exhaustive_with_directives(
-                &module.analysis,
-                &mut module.lints,
-                &mut module.directives,
-                bypass,
-            );
-            // **P23.3** — every suppression has now had a chance to
-            // fire. Walk the directive set one last time and surface a
-            // diagnostic for any rule that didn't actually drop
-            // anything. Skipped entirely under `--no-suppressions`
-            // because every suppression is "unused" by construction in
-            // that mode.
-            if !bypass {
-                lint_unused_suppressions(&mut module.directives, &mut module.lints);
-            }
-        }
+            })
+            .collect();
+        let modules: Vec<(&Uri, &mut ModuleAnalysis)> = self
+            .modules
+            .iter_mut()
+            .filter(|(uri, _)| in_scope(uri))
+            .collect();
+        crate::parallel::par_for_each(modules, |(uri, module)| {
+            run_typed_lints_for_module(uri, module, arena, index, bypass, &doc_data);
+        });
     }
 
     fn validate_type_relations(&mut self, restrict: Option<&FxHashSet<&str>>) {
@@ -1910,7 +1781,9 @@ fn resolve_qualified_chain(
 /// `module.directives`. `doc_data` is consulted for the `catch-empty-parens`
 /// lint, which needs the source text + parsed tree (the HIR drops the
 /// empty `()` shape).
-#[cfg(feature = "parallel")]
+// P27.1 — the cfg gate is gone; the helper is the canonical body
+// for both native (rayon-driven) and wasm (serial fallback) call
+// sites in `run_typed_lints`.
 #[allow(clippy::mutable_key_type)]
 fn run_typed_lints_for_module(
     uri: &Uri,

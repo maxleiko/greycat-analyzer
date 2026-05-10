@@ -282,40 +282,28 @@ impl Lint {
             }
         };
 
-        #[cfg(feature = "parallel")]
-        let entries: Vec<Entry> = {
-            use rayon::prelude::*;
-            // Pre-extract per-doc data into Send-safe form (text +
-            // tree clone). RefCell<Document> is !Sync so we can't
-            // hold its borrow across rayon workers.
-            let docs: Vec<(
-                Uri,
-                PathBuf,
-                String,
-                greycat_analyzer_syntax::tree_sitter::Tree,
-            )> = mgr
-                .iter()
-                .map(|(uri, cell)| {
-                    let doc = cell.borrow();
-                    let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
-                    (uri.clone(), path, doc.text.clone(), doc.tree.clone())
-                })
-                .collect();
-            docs.par_iter()
-                .map(|(uri, path, text, tree)| hydrate(uri, path.clone(), text, tree.root_node()))
-                .collect()
-        };
-        #[cfg(not(feature = "parallel"))]
-        let entries: Vec<Entry> = {
-            let mut entries: Vec<Entry> = Vec::with_capacity(mgr.len());
-            for (uri, cell) in mgr.iter() {
+        // P27.1 — single dispatch through the analysis crate's
+        // parallel shim (rayon on native, serial on wasm).
+        // Pre-extract per-doc data into Send-safe form (text + tree
+        // clone). RefCell<Document> is !Sync so we can't hold its
+        // borrow across workers.
+        let docs: Vec<(
+            Uri,
+            PathBuf,
+            String,
+            greycat_analyzer_syntax::tree_sitter::Tree,
+        )> = mgr
+            .iter()
+            .map(|(uri, cell)| {
                 let doc = cell.borrow();
                 let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.as_str()));
-                entries.push(hydrate(uri, path, &doc.text, doc.root_node()));
-            }
-            entries
-        };
-        let mut entries = entries;
+                (uri.clone(), path, doc.text.clone(), doc.tree.clone())
+            })
+            .collect();
+        let mut entries: Vec<Entry> =
+            greycat_analyzer_analysis::parallel::par_map(docs, |(uri, path, text, tree)| {
+                hydrate(&uri, path, &text, tree.root_node())
+            });
 
         // P8.4: lint fix-application driver. Each pass synthesizes
         // auto-fixes for the live diagnostics, applies non-overlapping

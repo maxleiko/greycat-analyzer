@@ -42,6 +42,8 @@ pub mod actions;
 pub mod analyzer;
 pub mod directives;
 pub mod lint;
+// P27.1
+pub mod parallel;
 pub mod project;
 pub mod quickfix;
 pub mod reachability;

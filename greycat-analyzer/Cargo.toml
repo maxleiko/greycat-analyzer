@@ -9,14 +9,6 @@ description.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[features]
-# P26 — exploration branch.
-# When enabled, propagates rayon-based parallelism through the analysis
-# crate (parallel HIR lowering, typed-lint pass, resolver) and the CLI's
-# per-doc diagnostic hydration loop. Off by default — the
-# bench-lint.sh script builds both flavours side-by-side.
-parallel = ["greycat-analyzer-analysis/parallel", "dep:rayon"]
-
 [dependencies]
 greycat-analyzer-analysis.workspace = true
 greycat-analyzer-core.workspace = true
@@ -29,7 +21,6 @@ greycat-analyzer-types.workspace = true
 clap.workspace = true
 env_logger.workspace = true
 miette.workspace = true
-rayon = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true

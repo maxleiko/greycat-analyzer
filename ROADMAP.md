@@ -866,6 +866,56 @@ The fix pattern in all cases: **make the quickfix produce a syntactically valid 
 
 ---
 
+### Phase 27 — Parallelism shim (drop the feature flag) (~half a day)
+
+**Goal:** consolidate P26's six scattered `cfg(feature = "parallel")` blocks into a single shim module, switch the gating from a Cargo feature to `cfg(target_arch = "wasm32")` (the *actual* reason the dual path exists), and drop the now-vestigial `parallel` feature. After this phase the native CLI / LSP unconditionally use rayon, the wasm playground unconditionally uses the serial fallback, and there's exactly one place in the workspace that knows about the dual path.
+
+**Why now.** P26 proved parallelism is a strict win on every measured workload (1.44× / 1.45× cold-load, byte-identical output). The remaining reason to gate is wasm — `rayon` compiles to `wasm32-unknown-unknown` but `par_iter` panics at runtime because `std::thread::spawn` doesn't work without `wasm-bindgen-rayon` + cross-origin-isolation headers, and the playground doesn't enable that. So the dual path stays, but it should be gated on the platform constraint (`target_arch`), not on a Cargo feature pretending parallelism is opt-in. And the dual-path code that's currently spread across `stage_lower` / `stage_per_module_analysis` / `run_typed_lints` / CLI hydration should consolidate into one shim — when the body-walker work lands in P28 it'll use the same seam.
+
+**Decisions locked.**
+- **Gate on `cfg(target_arch = "wasm32")`**, not on a Cargo feature. The constraint is "wasm doesn't have threads," so the cfg should say that. `default-features = false` dances in the wasm crate's Cargo.toml go away.
+- **Per-target rayon dep.** `rayon = { workspace = true }` moves from `[dependencies]` (optional) to `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` (unconditional on native). Wasm builds don't pull rayon at all.
+- **Shim lives in `greycat-analyzer-analysis::parallel`**, exposing a tight set of free functions (`par_map`, `par_map_ref`, `par_for_each`) with `T: Send` / `U: Send` / `F: Sync + Send` bounds. Each function dispatches once on `cfg(target_arch)`. Adding a new function takes ~10 lines.
+- **Drop the `parallel` feature** from `greycat-analyzer-analysis/Cargo.toml` and `greycat-analyzer/Cargo.toml`. No more A/B build comparison in the bench script — there's only one binary on native.
+- **`scripts/bench-lint.sh` simplifies.** Single binary build, single hyperfine run per corpus. Keep the corpus split (`pro` / `solarleb`) — that's still useful for tracking deltas across future chunks. The serial-vs-parallel A/B mode goes away with the feature it measured.
+- **No behaviour change.** Workspace tests + corpus diagnostic output stay byte-identical to the parallel build of P26.6.
+
+**Chunks:**
+
+- [x] **27.1 Shim module + cfg gating + drop `parallel` feature** (M, atomic) — new [`greycat-analyzer-analysis/src/parallel.rs`](../greycat-analyzer-analysis/src/parallel.rs) with three free fns (`par_map`, `par_map_ref`, `par_for_each`), each dispatching once on `cfg(target_arch = "wasm32")`. Four call sites migrated: `stage_lower` (`par_map`), `stage_per_module_analysis` Pass A (`par_map`), `run_typed_lints` (`par_for_each`), CLI `lint`'s hydration loop (`par_map`). Every `#[cfg(feature = "parallel")]` block in those files is gone; the `run_typed_lints_for_module` helper is now a plain fn used by both native and wasm. The `parallel` feature is dropped from `greycat-analyzer-analysis/Cargo.toml` + `greycat-analyzer/Cargo.toml`. `rayon = { workspace = true }` moved from optional `[dependencies]` to unconditional `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` — only in the analysis crate (the CLI no longer needs its own rayon dep, it goes through `analysis::parallel::*`). **Verification**: `cargo tree -p greycat-analyzer | grep rayon` shows rayon in the native dep tree; `cargo tree --target wasm32-unknown-unknown -p greycat-analyzer-wasm | grep rayon` is empty. **Bench delta**: `pro` 628 ms (was 660 ms in P26.6 parallel mode), `solarleb` 172 ms (was 185 ms) — within noise; no perf regression from the shim hop. User-time on the new runs (1148 ms / 299 ms) preserved — same multi-core saturation. Workspace tests + corpus diagnostic counts byte-identical.
+
+- [ ] **27.2 Simplify `scripts/bench-lint.sh`** (XS) — drop the dual-build (`target/par-off` + `target/par-on`) plumbing. Single `cargo build --release -p greycat-analyzer` into the default `target/` dir. Single hyperfine run per corpus. The script's purpose collapses from "A/B parallel vs serial" to "track lint throughput delta across phases" — useful now and in P28.
+
+**M27:** the workspace builds with no `--features` flags and runs at the same wall-clock as P26.6's parallel build. `cargo build --target wasm32-unknown-unknown -p greycat-analyzer-wasm` succeeds without rayon in the dep tree (verify via `cargo tree --target wasm32-unknown-unknown -p greycat-analyzer-wasm | grep rayon` — empty). Workspace tests + corpus diagnostic counts byte-identical to P26.6.
+
+---
+
+### Phase 28 — Parallel body walker (S12, per-thread arena merge) (~2-3 weeks)
+
+**Goal:** parallelize the per-module body walker (`analyze_with_index_into`) — the last serial bottleneck after P26 — by giving each rayon worker its own `LocalArena`, then merging the locals into the canonical project arena via a TypeId-remap step at the end of the parallel phase. This is the XL refactor P26.5 deliberately deferred. **This phase is plan-only; execute under its own branch when scheduled.**
+
+**Why this shape, not Mutex.** The body walker holds `arena: &mut TypeArena` and threads it through hundreds of `alloc` / `get` / `nullable` / `substitute` callsites. A `Mutex<TypeArena>` lock-per-call would make the parallel walk slower than serial because of contention; a coarse "lock for whole module" lock degenerates to serial. The principled answer is per-thread arenas — each worker mints into its own buffer, no contention — followed by a single-shot merge that reuses canonical TypeIds where the same `Type` already exists and appends genuinely-new ones. The merge cost is bounded (one walk per thread × types-minted-by-thread) and amortized over the parallel work.
+
+**Decisions to lock at the start of execution.**
+- **`LocalArena` API matches `TypeArena`** so the analyzer's `Cx<'a>` only changes its `arena: &'a mut TypeArena` field; every `arena.alloc(...)` / `arena.get(...)` / etc. callsite stays untouched. The local arena starts as a *snapshot* of the canonical arena (or a thin Arc'd view of it) so existing `TypeId`s are valid keys from byte 0.
+- **Merge step builds a `Vec<TypeId>` remap table** indexed by local-thread `TypeId`. Every per-module `AnalysisResult`'s `expr_types` / `def_types` / `member_uses.attr_ty` / etc. gets remapped through it before the analyzer hands the result back.
+- **Hash-equivalence is the soundness invariant.** Two threads minting `Type { kind: Generic { name: "Array", args: [int] }, nullable: false }` get different *local* TypeIds, but the canonical arena dedups them to one ID at merge. Existing P25.4 anchor test (`typekind_name_dedups_across_smolstr_and_string_paths`) extends to cover the merge — minting via a local arena and via the canonical arena must produce the same canonical ID.
+- **Bench delta is the only acceptance criterion.** Expected: another 1.3-1.5× on top of P26.6 on `pro` (where the body walker is the dominant remaining serial work). Smaller on `solarleb` (less per-module body to walk).
+
+**Chunks (planned, not committed):**
+
+- [ ] **28.1 Design + scaffold `LocalArena`** (L) — new type in [`greycat-analyzer-types`](../greycat-analyzer-types/src/lib.rs) that wraps a snapshot of the canonical arena's `items` + `intern` plus an "appended" tail. `alloc` / `get` / `nullable` / `substitute` work transparently; `new_local_ids() -> Range<u32>` exposes the appended tail for the merge step. `LocalArena: Send` so workers can own one. Document the snapshot semantics: the local view is read-only against the canonical body, append-only against the tail.
+
+- [ ] **28.2 Refactor `Cx` to take `LocalArena`** (M) — change the analyzer's `Cx<'a>::arena` field type. Public surface of the analyzer (`analyze_with_index_into`) keeps taking `&mut TypeArena` but internally wraps it in a `LocalArena::wrap(arena)` for the duration of the body walk. No worker spawning yet — this chunk verifies the local-arena abstraction is API-equivalent to the canonical one. Bench: parallel mode disabled, expect zero delta.
+
+- [ ] **28.3 Per-thread arena + merge step** (L) — at `stage_per_module_analysis` Pass B, swap the serial `for` loop for `parallel::par_map` over the resolved modules. Each rayon worker calls `analyze_with_index_into` with its own freshly-cloned-from-canonical `LocalArena`. After the parallel pass, walk each thread's local arena, merge new entries into the canonical arena (reusing canonical IDs where the same `Type` already exists, appending where genuinely new), and build the per-thread `TypeId`-remap table. Apply remaps to each module's `AnalysisResult`. Validate byte-identical output against the (still-serial) parallel-passes-A baseline.
+
+- [ ] **28.4 Bench + ratchet** (XS) — full bench-lint run on `pro` + `solarleb`. The whole P26+P28 stack should land **~50-60 % faster cold-load** vs. the P25 baseline. If the delta is < 25 % vs. P26.6 alone, profile the merge-step overhead — most likely the remap walk over `expr_types` / `def_types` (millions of entries on `pro`) is the new bottleneck, in which case the merge can amortize via a "delta-only" walk that skips entries whose TypeId is in the canonical-prefix (didn't change).
+
+**M28:** parallel body walker lands a measurable additional speedup on `pro` (≥ 1.3× over P26.6 — i.e. cold-load drops to ~500 ms or below). On `solarleb`, even 1.1× is acceptable since the serial body walk is already cheap. Workspace tests stay green; corpus diagnostic output stays byte-identical (sorted) between any two runs of the same phase. The merge step's overhead is documented (per-corpus, per-thread-count) so a future "small-workspace fast path" can short-circuit it if needed.
+
+---
+
 ## 7. Test strategy
 
 Two layers, no "port every TS test" milestone (tarpit).
