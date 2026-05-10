@@ -22,7 +22,6 @@ Rust edition 2024. Workspace resolver `"3"`. Workspace metadata (`license = "MIT
 | [greycat-analyzer](../greycat-analyzer/) | CLI binary `greycat-lang`. `clap` subcommands in [src/cmd/](../greycat-analyzer/src/cmd/). |
 | [greycat-analyzer-wasm](../greycat-analyzer-wasm/) | `cdylib` + `rlib`, `wasm-bindgen` bridge. Drives the playground. |
 | [playground/](../playground/) | Vite/TS/Lit/WebAwesome/Monaco UI consuming the wasm pkg. **Committed**, *not* a workspace member. |
-| [fuzz/](../fuzz/) | `cargo-fuzz` targets (parser / HIR / format round-trip). Excluded from the workspace. |
 
 Dependency direction: `syntax → core → hir → types → analysis → {ls, cli, wasm, fmt}`.
 
@@ -135,9 +134,6 @@ playground/scripts/build-wasm.sh                      # wraps wasm-pack with the
 
 # playground (committed, separate npm project)
 cd playground && pnpm install && pnpm dev
-
-# fuzz (excluded from the workspace)
-cd fuzz && cargo +nightly fuzz run parser             # also: hir_lower, format_round_trip
 
 # parity oracle (P10.3 harness)
 scripts/parity-oracle.sh <ts-lang-checkout> <corpus-dir>

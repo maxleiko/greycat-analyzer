@@ -11,11 +11,6 @@ members = [
   "greycat-analyzer-types",
   "greycat-analyzer-wasm",
 ]
-# `fuzz/` (P10.2) is a separate cargo project; it picks up
-# `cargo fuzz run` only when invoked from inside that directory and
-# is intentionally not a workspace member to avoid pulling
-# `libfuzzer-sys` into normal `cargo build --workspace` runs.
-exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

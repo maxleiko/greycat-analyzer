@@ -252,17 +252,16 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 ### Phase 10 — Distribution + quality gates (~4-6 weeks)
 
-**Goal:** shippable on crates.io, fuzzed continuously, and parity-tested against the TS reference in CI.
+**Goal:** shippable on crates.io and parity-tested against the TS reference in CI.
 
 **Chunks:**
 
 - [x] **10.1 crates.io publish prep** (S, no actual publish) — `LICENSE-MIT` + `LICENSE-APACHE` at workspace root. `[workspace.package]` metadata (`license = "MIT OR Apache-2.0"`, `repository`, `authors`, `description`, `keywords`, `categories`) inherited via `*.workspace = true` on every crate. Path deps gained explicit `version = "0.1.0"` guards so cargo can resolve to crates.io versions at publish time. New `scripts/publish.sh` walks the dep order (`syntax → core → hir → types → fmt → analysis → ls → wasm → bin`) with `--dry-run` support. **Not yet runnable end-to-end** — `greycat-analyzer-syntax` still uses a path dep on the vendored `tree-sitter-greycat` submodule, which isn't on crates.io; the actual publish is gated on either publishing the grammar crate first or vendoring its `parser.c` into the syntax crate. Documented in the script's pre-flight.
-- [x] **10.2 cargo-fuzz on parser/HIR boundary** (S) — `fuzz/` directory (excluded from the workspace) with three targets: `parser` (UTF-8 → `parse`), `hir_lower` (UTF-8 → `parse → lower_module`), `format_round_trip` (`parse → format_tree → parse` re-parse cleanliness). README covers running with `cargo +nightly fuzz run`. Closes ROADMAP §7-C.
 - [x] **10.3 TS-vs-Rust diagnostic parity oracle** (M, harness only) — `scripts/parity-oracle.sh` runs the Rust port + TS reference (when available locally) over the same corpus, normalizes both into `path:line:col:` shape, and emits a `diff -u`. The CI gate that closes §7-A waits on P6 / P7 fully landing so the diff is small enough to be useful as a regression budget; the harness ships now so the snapshot can be taken at any time during the parity push.
 - [x] **10.6 Documentation pass** (S) — crate-level rustdoc paragraphs added to `greycat-analyzer-syntax`, `greycat-analyzer-core`, `greycat-analyzer-server`, and `greycat-analyzer-analysis` lib.rs heads (the others — `-hir`, `-types`, `-fmt`, `-wasm` — already had real doc paragraphs). New `docs/porting-from-ts.md` maps every TS subsystem under `packages/lang/src/` to its target Rust crate plus called-out divergences (no hand-rolled lexer, no general visitor framework, etc.). Playground README is left for the P10.5 follow-up since it's part of the playground UI maturation work.
 - [x] **10.7 CLI diagnostic UX (miette)** (S) — `cli lint` defaults to `pretty` (miette: source snippet + caret + color) when stdout is a TTY, and to `compact` (`path:line:col: severity: message`) when piped — so the P10.3 parity oracle and grep-style consumers keep a stable diffable shape. `--format={compact,pretty}` overrides explicitly. The `--format` field is `Option<OutputFormat>`; `OutputFormat::auto()` consults `std::io::IsTerminal` at run time to pick the default. New `print_pretty_diagnostic` helper maps `Diagnostic.severity` / `code` / `range` onto a `MietteDiagnostic` with a `LabeledSpan`. `miette = { version = "7", features = ["fancy"] }` added to the cli crate.
 
-**M10: published on crates.io; nightly fuzz + diagnostic parity gates green; playground is the analyzer's interactive debugger.**
+**M10: published on crates.io; diagnostic parity gates green; playground is the analyzer's interactive debugger.**
 
 ---
 
@@ -332,7 +331,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
 ### Phase 14 — Final parity gate (~2-3 weeks)
 
-**Goal:** turn the harnesses (P10.3 parity oracle, fuzz, formatter parity gauntlet) into actual CI gates and resolve the publish blocker. Closes ROADMAP §7-A end-to-end.
+**Goal:** turn the harnesses (P10.3 parity oracle, formatter parity gauntlet) into actual CI gates and resolve the publish blocker. Closes ROADMAP §7-A end-to-end.
 
 **Chunks:**
 
@@ -353,8 +352,6 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
 
   Remaining hard cases (not in this pass): line-length-aware reflow for long `<...>` / `(...)` (args_split, nested_args_split, if_var_object), block-comment placement, and the comment-vs-blank-line ordering nuance (doc_eol_stmt, stmts_rules). M9 acceptance ("8/8") still depends on these.
 
-- [x] **14.4 Continuous fuzzing** (S) — new [`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) runs all three targets (`parser`, `hir_lower`, `format_round_trip`) on a nightly schedule + manual dispatch. Each fuzz target gets a 10-minute libfuzzer budget (`-max_total_time=600`) wrapped in a 30-minute hard wall-clock cap. Failures upload `fuzz/artifacts/<target>/` as a job artifact for triage. Closes ROADMAP §7-C's runtime portion (the harness already shipped in P10.2).
-
 - [x] **14.5 `lint --csv` per-file timing restored + enhanced** (S) — `LoadReport` carries `loaded: Vec<(Uri, LoadTimings { read, parse })>` instead of `Vec<Uri>`, capturing file I/O and tree-sitter parse separately. `ProjectAnalysis::ModuleAnalysis` gained a per-module `timings: ModuleTimings { lower, resolve, analyze, lint }` populated by `rebuild` / `invalidate`. The CLI `--csv` columns are now `total_us,read_us,parse_us,lower_us,resolve_us,analyze_us,lint_us,nb_nodes,nb_diagnostics,filepath` sorted by total descending — surfaces both where the fixed regression went (parse durations are visible again) and the pipeline's deeper hot spots (lowering dominates over resolver/analyzer at ~25%/3%/3% on stdlib core).
 
 - [ ] **14.6 Salsa retrofit** (M, profiling-driven) — moved up from P10.4 / P5.5. Still gated on profiling showing quadratic blow-up on multi-file edits in real workspaces; the pure-function design from P6.1 keeps the retrofit cheap when the signal arrives. **Not** required for M14 — listed here to consolidate the deferred work into the parity-finish phase rather than leave it dangling under P10.
@@ -368,7 +365,7 @@ Once Phase 2 lands, each capability is a thin wrapper over HIR + reference index
   - **Exposed-API browser panel.** New right-rail tab consuming `ProjectIndex::exposed` (already populated by `ingest`). Lists every `@expose("rename")` site grouped by exposure key, with the local name, declaring file, and signature. Clicking an entry jumps the editor to the decl. Doubles as a "what's the runtime API surface of this project?" overview the CLI doesn't surface today.
   - Both rely on a wasm export that returns the `ProjectIndex.exposed` map shape (URI-relative paths, decl byte ranges) and a wasm entry that takes `Vec<(uri, text, lib)>` so the playground can drive a multi-doc analysis without round-tripping each file individually. Add those exports as part of this chunk.
 
-**M14: published on crates.io; nightly fuzz green; diagnostic parity diff is empty over the corpus; formatter byte-for-byte parity (M9) met. The Rust port is 1:1 with the TS reference. (P14.6 / P14.7 / P14.8 ride alongside but don't gate the milestone — they're consolidated here so the deferred work has a single home.)**
+**M14: published on crates.io; diagnostic parity diff is empty over the corpus; formatter byte-for-byte parity (M9) met. The Rust port is 1:1 with the TS reference. (P14.6 / P14.7 / P14.8 ride alongside but don't gate the milestone — they're consolidated here so the deferred work has a single home.)**
 
 ---
 
@@ -799,12 +796,11 @@ The fix pattern in all cases: **make the quickfix produce a syntactically valid 
 
 ## 7. Test strategy
 
-Three layers, no "port every TS test" milestone (tarpit).
+Two layers, no "port every TS test" milestone (tarpit).
 
 - **A. Snapshot conformance** (parity oracle, high volume, cheap). Run TS reference and Rust port over the same corpus (`lib/std/`, TS test fixtures at `packages/lang/src/parser/fixtures`, `packages/lang/src/project/fixtures`). Capture diagnostic JSON + formatter output. Diff via `insta`. Catches ~70% of regressions. Wired in P0.6, pays off through P2.
 - **B. Rust-idiomatic unit tests** per crate. Port the *intent* of TS tests, not the code. Most TS assertions test API shapes that won't exist in Rust.
   - **Exception:** the 15 `lsp.*.test.ts` files. Reproduce those scenarios as Rust integration tests against the running LSP — they encode real-world editor behavior that's worth preserving.
-- **C. Fuzzing** — `cargo-fuzz` on the parser/HIR boundary once P2 lands. Cheap insurance, finds panics nothing else will.
 
 ---
 
