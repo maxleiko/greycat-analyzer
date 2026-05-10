@@ -44,13 +44,46 @@ Walks every `.gcl` file under the project's directory (skipping `node_modules/`,
 
 ```sh
 greycat-analyzer lint examples/project.gcl
-greycat-analyzer lint examples/project.gcl --csv    # per-file timing summary
+greycat-analyzer lint examples/project.gcl --csv              # per-file timing summary
+greycat-analyzer lint --list-rules                            # registered rule namespace
+greycat-analyzer lint examples/project.gcl --no-suppressions  # CI: ignore // gcl-lint-off
 ```
 
 Diagnostic sources:
 - `greycat-analyzer` / `parse-error` / `missing-token` — tree-sitter recovery emitted these.
 - `greycat-analyzer` / `semantic` — return-type mismatch, condition-must-be-bool, unresolved name, etc.
-- `lint` / `<rule>` — currently `unused-local`, `unused-param` (skips `_`-prefixed names and native fns).
+- `lint` / `<rule>` — full rule list available via `lint --list-rules` (auto-generated from the registry, so it's always in sync with what the analyzer emits).
+
+#### Per-region opt-out (P23)
+
+A few comment directives let you silence a specific rule (or skip the formatter) over a region without disabling lints workspace-wide. Every directive carries the `gcl-` prefix so they sort together in completion and don't collide with prose:
+
+| Directive                                | Scope                                  |
+|------------------------------------------|----------------------------------------|
+| `// gcl-lint-off <rule0> <rule1> ...`    | Until matching `gcl-lint-on` (or EOF)  |
+| `// gcl-lint-on <rule0> <rule1> ...`     | Closes a prior `gcl-lint-off`          |
+| `// gcl-lint-off-next <rule0> ...`       | Next AST item (decl / stmt) only       |
+| `// gcl-lint-off-file <rule0> ...`       | Whole file (must be at module head)    |
+| `// gcl-fmt-off`                         | Until matching `gcl-fmt-on` (or EOF)   |
+| `// gcl-fmt-on`                          | Closes a prior `gcl-fmt-off`           |
+| `// gcl-fmt-skip`                        | Next AST node only                     |
+| `// gcl-fmt-off-file`                    | Whole file (must be at module head)    |
+
+Worked examples:
+
+```gcl
+// gcl-lint-off-next unused-decl
+private fn _scratch_pad() { }
+
+// gcl-lint-off possibly-null
+fn explore(x: Foo?) { x.bar(); x.baz(); }
+// gcl-lint-on possibly-null
+
+// gcl-fmt-skip
+fn  weirdly_spaced(  a:int  ){ return  a;  }
+```
+
+Wildcards (`*`) aren't supported on purpose — explicit rule names only. CI gets `--no-suppressions` for the nuclear option ("re-emit every silenced diagnostic"). Misspelled rule names surface `unknown-suppression-rule`; empty rule lists surface `empty-suppression`; toggles that didn't actually drop anything surface `unused-suppression` (per-rule granularity, so `gcl-lint-off-next A B C` where only A fired flags B and C separately). The LSP autocompletes the directive forms when you type `// gcl-…`, and the rule-name slots autocomplete from the same registry as `--list-rules`.
 
 ### `fmt` — format a single file
 
@@ -59,7 +92,7 @@ greycat-analyzer fmt path/to/file.gcl            # rewrite in place
 greycat-analyzer fmt path/to/file.gcl --check    # exit non-zero on drift
 ```
 
-Foundational printer — output is guaranteed to re-parse cleanly and is idempotent on simple inputs. Byte-for-byte parity with the TS prettifier is the M5 follow-up milestone.
+Foundational printer — output is guaranteed to re-parse cleanly and is idempotent on simple inputs. Byte-for-byte parity with the TS prettifier is the M5 follow-up milestone. The `gcl-fmt-off` / `gcl-fmt-on` / `gcl-fmt-skip` / `gcl-fmt-off-file` directives above preserve marked regions verbatim through both `fmt` and `lint --fix`.
 
 ### `server` — language server
 

@@ -23,8 +23,11 @@ use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_hir::{Hir, lower_module};
 
 use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
+use crate::directives::Directives;
 use crate::lint::{
-    LintDiagnostic, lint_arrow_on_non_deref, lint_inferred_return_type, lint_nullability, run_lints,
+    LintDiagnostic, lint_arrow_on_non_deref_with_directives,
+    lint_inferred_return_type_with_directives, lint_nullability_with_directives,
+    lint_unused_suppressions, run_lints_with_directives,
 };
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::{FnSignature, ProjectIndex};
@@ -49,6 +52,11 @@ pub struct ModuleAnalysis {
     /// last `rebuild` / `invalidate`. Useful for surfacing where the
     /// pipeline spends its time (`cli lint --csv`).
     pub timings: ModuleTimings,
+    /// **P23.1** — directive set parsed from the source's `// gcl-…`
+    /// comments. Drives lint suppressions ([`run_lints_with_directives`])
+    /// and is consulted by the formatter when this module is being
+    /// re-rendered.
+    pub directives: Directives,
 }
 
 /// P14.5 — per-module pipeline timings.
@@ -92,6 +100,10 @@ pub struct ProjectAnalysis {
     /// `seed_builtins` calls per `analyze_with_index_into` are a
     /// no-op.
     pub arena: greycat_analyzer_types::TypeArena,
+    /// **P23.7** — when `true`, lint suppressions (`// gcl-lint-off …`)
+    /// are still recorded but never silence emissions. Drives the CLI's
+    /// `--no-suppressions` flag.
+    pub bypass_suppressions: bool,
     modules: HashMap<Uri, ModuleAnalysis>,
     /// P19.6 — per-module signature-stage cache. Records what each
     /// module contributed to the project signature index
@@ -159,6 +171,7 @@ impl ProjectAnalysis {
         Self {
             index: ProjectIndex::new(),
             arena,
+            bypass_suppressions: false,
             modules: HashMap::new(),
             sig_cache: HashMap::new(),
         }
@@ -280,15 +293,23 @@ impl ProjectAnalysis {
     /// the project index. Returns the lowered modules in document-order
     /// so [`Self::stage_per_module_analysis`] can move them into the
     /// per-module cache without re-lowering.
-    fn stage_lower(&mut self, manager: &SourceManager) -> Vec<(Uri, Hir, String, Duration)> {
-        let mut hirs: Vec<(Uri, Hir, String, Duration)> = Vec::with_capacity(manager.len());
+    fn stage_lower(
+        &mut self,
+        manager: &SourceManager,
+    ) -> Vec<(Uri, Hir, String, Duration, Directives)> {
+        let mut hirs: Vec<(Uri, Hir, String, Duration, Directives)> =
+            Vec::with_capacity(manager.len());
         for (uri, cell) in manager.iter() {
             let doc = cell.borrow();
             let lower_start = Instant::now();
             let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
             let lower_took = lower_start.elapsed();
+            // **P23.1** — parse `// gcl-…` directives off the same CST
+            // we just lowered, so lints and the formatter can see the
+            // user's per-region opt-outs.
+            let directives = crate::directives::parse_directives(&doc.text, doc.root_node());
             self.index.ingest(uri, &hir);
-            hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took));
+            hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took, directives));
         }
         hirs
     }
@@ -310,8 +331,8 @@ impl ProjectAnalysis {
     /// in the shared arena — directly comparable to anything else
     /// minted into the same arena. Generic params owned by the type
     /// being walked resolve to `GenericParam(T, owner=Type(name))`.
-    fn stage_lower_signatures(&mut self, lowered: &[(Uri, Hir, String, Duration)]) {
-        let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _)| (u, h)).collect();
+    fn stage_lower_signatures(&mut self, lowered: &[(Uri, Hir, String, Duration, Directives)]) {
+        let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _, _)| (u, h)).collect();
         lower_signatures_into(
             &mut self.arena,
             &mut self.index,
@@ -757,8 +778,9 @@ impl ProjectAnalysis {
     /// inside `Cx::visit_decl`. P21 extracts S2-S6, P22 extracts
     /// S7-S11, P23 rewrites S12 — at which point this stage shrinks
     /// to a thin "wire it all together" call.
-    fn stage_per_module_analysis(&mut self, hirs: Vec<(Uri, Hir, String, Duration)>) {
-        for (uri, hir, lib, lower_took) in hirs {
+    fn stage_per_module_analysis(&mut self, hirs: Vec<(Uri, Hir, String, Duration, Directives)>) {
+        let bypass = self.bypass_suppressions;
+        for (uri, hir, lib, lower_took, mut directives) in hirs {
             let mut timings = ModuleTimings {
                 lower: lower_took,
                 ..ModuleTimings::default()
@@ -771,7 +793,16 @@ impl ProjectAnalysis {
                 analyze_with_index_into(&hir, &resolutions, &self.index, &mut self.arena);
             timings.analyze = t1.elapsed();
             let t2 = Instant::now();
-            let lints = run_lints(&hir, &resolutions);
+            // Seed `lints` with the directive parser's own diagnostics
+            // (`unknown-suppression-rule`, `empty-suppression`, …) so
+            // they ride alongside regular lints into LSP / CLI surfaces.
+            let mut lints = std::mem::take(&mut directives.diagnostics);
+            lints.extend(run_lints_with_directives(
+                &hir,
+                &resolutions,
+                &mut directives,
+                bypass,
+            ));
             timings.lint = t2.elapsed();
             self.modules.insert(
                 uri,
@@ -782,6 +813,7 @@ impl ProjectAnalysis {
                     lints,
                     lib,
                     timings,
+                    directives,
                 },
             );
         }
@@ -1004,6 +1036,7 @@ impl ProjectAnalysis {
         // alongside `&mut self.modules`.
         let arena = &self.arena;
         let index = &self.index;
+        let bypass = self.bypass_suppressions;
         for (uri, module) in self.modules.iter_mut() {
             if !in_scope(uri) {
                 continue;
@@ -1017,17 +1050,43 @@ impl ProjectAnalysis {
                         | "redundant-non-null-assertion"
                         | "redundant-coalesce"
                         | "infer-return-type"
+                        | "unused-suppression"
                 )
             });
-            lint_arrow_on_non_deref(
+            lint_arrow_on_non_deref_with_directives(
                 &module.hir,
                 &module.analysis,
                 arena,
                 index,
                 &mut module.lints,
+                &mut module.directives,
+                bypass,
             );
-            lint_nullability(&module.hir, &module.analysis, arena, &mut module.lints);
-            lint_inferred_return_type(&module.hir, &module.analysis, arena, &mut module.lints);
+            lint_nullability_with_directives(
+                &module.hir,
+                &module.analysis,
+                arena,
+                &mut module.lints,
+                &mut module.directives,
+                bypass,
+            );
+            lint_inferred_return_type_with_directives(
+                &module.hir,
+                &module.analysis,
+                arena,
+                &mut module.lints,
+                &mut module.directives,
+                bypass,
+            );
+            // **P23.3** — every suppression has now had a chance to
+            // fire. Walk the directive set one last time and surface a
+            // diagnostic for any rule that didn't actually drop
+            // anything. Skipped entirely under `--no-suppressions`
+            // because every suppression is "unused" by construction in
+            // that mode.
+            if !bypass {
+                lint_unused_suppressions(&mut module.directives, &mut module.lints);
+            }
         }
     }
 
@@ -1219,12 +1278,14 @@ impl ProjectAnalysis {
         for module in self.modules.values_mut() {
             module.lints.retain(|l| l.rule != "unused-decl");
             let mut new_lints = Vec::new();
-            crate::lint::LintRule::check(
-                &crate::lint::UnusedDecl,
+            let mut cx = crate::lint::LintCx::new(
                 &module.hir,
                 &module.resolutions,
+                Some(&mut module.directives),
+                false,
                 &mut new_lints,
             );
+            crate::lint::LintRule::check(&crate::lint::UnusedDecl, &mut cx);
             module.lints.append(&mut new_lints);
         }
     }
@@ -1269,12 +1330,17 @@ impl ProjectAnalysis {
 
         let mut lower_took = Duration::ZERO;
         let mut changed_lib: Option<String> = None;
+        let mut changed_directives: Option<Directives> = None;
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
             let start = Instant::now();
             let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
             lower_took = start.elapsed();
             changed_lib = Some(doc.lib.clone());
+            changed_directives = Some(crate::directives::parse_directives(
+                &doc.text,
+                doc.root_node(),
+            ));
             hir
         });
 
@@ -1353,7 +1419,15 @@ impl ProjectAnalysis {
         let analysis = analyze_with_index_into(&hir, &resolutions, &self.index, &mut self.arena);
         timings.analyze = t1.elapsed();
         let t2 = Instant::now();
-        let lints = run_lints(&hir, &resolutions);
+        let mut directives = changed_directives.unwrap_or_default();
+        let bypass = self.bypass_suppressions;
+        let mut lints = std::mem::take(&mut directives.diagnostics);
+        lints.extend(run_lints_with_directives(
+            &hir,
+            &resolutions,
+            &mut directives,
+            bypass,
+        ));
         timings.lint = t2.elapsed();
         self.modules.insert(
             uri.clone(),
@@ -1364,6 +1438,7 @@ impl ProjectAnalysis {
                 lints,
                 lib: changed_lib.unwrap_or_else(|| "project".to_string()),
                 timings,
+                directives,
             },
         );
         // P22-P23 — passes 3.4 / 3.45 / 3.5 / 3.52 are gone; cross-

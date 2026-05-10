@@ -58,6 +58,23 @@ pub struct Lint {
                 so cross-module shape mismatches can't hide."
     )]
     lint_libs: bool,
+    #[clap(
+        long,
+        help = "Print every registered lint rule (one per line, with a \
+                one-line summary) and exit. Auto-generated from \
+                `LintRule::summary()` so the CLI's `--help` is always in \
+                sync with the rule registry — same data feeds the LSP's \
+                directive completion."
+    )]
+    list_rules: bool,
+    #[clap(
+        long,
+        help = "Re-emit every diagnostic, even those silenced by a \
+                `// gcl-lint-off …` directive. For CI pipelines that want \
+                to enforce \"no suppressions allowed in code review\" or \
+                to audit what's hidden behind suppressions in a project."
+    )]
+    no_suppressions: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -83,6 +100,17 @@ impl OutputFormat {
 impl Lint {
     pub fn run(self) -> Result<ExitCode, AnyError> {
         env_logger::init();
+
+        // **P23.6** — `--list-rules` short-circuits everything else and
+        // dumps the rule registry. Auto-generated from
+        // `lint::LINT_RULES`, so the listing never goes out of sync
+        // with the live rule set.
+        if self.list_rules {
+            for rule in greycat_analyzer_analysis::lint::LINT_RULES {
+                println!("{}\t{}", rule.name, rule.summary);
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
 
         // Convenience: when given a directory, look for `project.gcl`
         // at its root and use that as the entrypoint. Matches what
@@ -136,7 +164,12 @@ impl Lint {
         let pragma_root = project_filepath.parent().map(Path::to_path_buf);
 
         // One project-level analyzer pipeline over every reachable doc.
-        let analysis = ProjectAnalysis::analyze(&mgr);
+        // **P23.7** — `--no-suppressions` flips the project's
+        // `bypass_suppressions` flag so every `// gcl-lint-off …` is
+        // ignored and the underlying diagnostics resurface.
+        let mut analysis = ProjectAnalysis::new();
+        analysis.bypass_suppressions = self.no_suppressions;
+        analysis.analyze_staged(&mgr);
         let total = total_start.elapsed();
 
         // P14.5: per-uri load-phase timings come from the load report;
@@ -296,7 +329,9 @@ impl Lint {
                     Uri,
                     greycat_analyzer_core::LoadTimings,
                 > = new_report.loaded.iter().cloned().collect();
-                let new_analysis = ProjectAnalysis::analyze(&new_mgr);
+                let mut new_analysis = ProjectAnalysis::new();
+                new_analysis.bypass_suppressions = self.no_suppressions;
+                new_analysis.analyze_staged(&new_mgr);
                 entries.clear();
                 for (uri, cell) in new_mgr.iter() {
                     let doc = cell.borrow();

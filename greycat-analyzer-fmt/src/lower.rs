@@ -15,6 +15,7 @@
 //! fallback is what makes incremental progress possible — every chunk
 //! lights up specific constructs and the rest fall through to verbatim.
 
+use crate::directives::FmtDirectives;
 use crate::doc::Doc;
 use crate::trivia::{GapItem, scan_gap};
 use greycat_analyzer_syntax::tree_sitter::Node;
@@ -22,15 +23,35 @@ use greycat_analyzer_syntax::tree_sitter::Node;
 /// Lowering context — owns the source, threads through every visitor.
 pub struct Cx<'a> {
     source: &'a str,
+    directives: FmtDirectives,
 }
 
 impl<'a> Cx<'a> {
     pub fn new(source: &'a str) -> Self {
-        Cx { source }
+        Cx {
+            source,
+            directives: FmtDirectives::empty(),
+        }
+    }
+
+    /// **P23.4** — build a context whose lowerer honors `// gcl-fmt-…`
+    /// directives parsed from `source`. Used by [`crate::format`] /
+    /// [`crate::format_tree`] / [`crate::format_with`] /
+    /// [`crate::format_tree_with`] so the verbatim regions land in the
+    /// output. External callers driving [`Cx`] directly can pass their
+    /// own pre-parsed directive set.
+    pub fn with_directives(source: &'a str, directives: FmtDirectives) -> Self {
+        Cx { source, directives }
     }
 
     pub fn text(&self, node: Node<'_>) -> &'a str {
         &self.source[node.byte_range()]
+    }
+
+    /// **P23.4** — `true` when the lowerer should emit `node`'s source
+    /// bytes verbatim instead of recursing.
+    pub fn skip_for_fmt(&self, node: Node<'_>) -> bool {
+        self.directives.is_skipped(&node.byte_range())
     }
 
     /// Source byte gap between two non-overlapping nodes — `[a.end, b.start)`.
@@ -80,6 +101,13 @@ pub fn lower_module<'a>(cx: &Cx<'a>, root: Node<'a>) -> Doc {
 
 /// Dispatch on `node.kind()`. Unknown kinds fall through to `verbatim`.
 fn lower_node<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // **P23.4** — `// gcl-fmt-off` / `// gcl-fmt-skip` regions: emit
+    // the node's source bytes unchanged instead of recursing into the
+    // CST. Checked at the dispatcher entry so every node-kind honors
+    // it without per-arm plumbing.
+    if cx.skip_for_fmt(node) {
+        return Doc::text(cx.text(node));
+    }
     match node.kind() {
         // Decls
         "mod_pragma" => lower_mod_pragma(cx, node),

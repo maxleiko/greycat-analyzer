@@ -13,6 +13,7 @@
 //! `mod_pragma` chain by [`parse_pragma_options`] and applied to the
 //! defaults before lowering.
 
+pub mod directives;
 pub mod doc;
 pub mod lower;
 pub mod render;
@@ -62,6 +63,14 @@ pub fn format_with(source: &str, opts: FmtOptions) -> String {
     format_tree_with(source, root, opts)
 }
 
+/// **P23.4** — `// gcl-fmt-off-file` short-circuit. When the source's
+/// module head carries this directive, return `source.to_string()`
+/// without lowering. Centralized here so every public entry point
+/// honors it.
+fn fmt_off_file(source: &str, root: greycat_analyzer_syntax::tree_sitter::Node<'_>) -> bool {
+    directives::FmtDirectives::parse(source, root).fmt_off_file
+}
+
 /// Format a pre-parsed CST under default options. Useful when callers
 /// already have a tree from incremental parsing (LSP, editor
 /// integrations). Pragmas are consulted from `source`.
@@ -73,7 +82,11 @@ pub fn format_tree(source: &str, root: Node<'_>) -> String {
 /// Format a pre-parsed CST under explicit options. Pragmas are **not**
 /// consulted.
 pub fn format_tree_with(source: &str, root: Node<'_>, opts: FmtOptions) -> String {
-    let cx = lower::Cx::new(source);
+    if fmt_off_file(source, root) {
+        return source.to_string();
+    }
+    let directives = directives::FmtDirectives::parse(source, root);
+    let cx = lower::Cx::with_directives(source, directives);
     let doc = lower::lower_module(&cx, root);
     render::render(&doc, &opts)
 }
@@ -225,6 +238,51 @@ type Foo {
         assert!(
             out.contains("\n    a: int,"),
             "expected broken params:\n{out}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // P23.4 — formatter skip directives
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fmt_off_file_short_circuits_to_verbatim() {
+        // `// gcl-fmt-off-file` at module head: the formatter must
+        // return the source unchanged, even when it'd otherwise
+        // reformat heavily.
+        let src = "// gcl-fmt-off-file\nfn  weirdly_spaced(  a:int  ){ return  a;  }\n";
+        let out = format(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn fmt_off_on_pair_preserves_region_verbatim() {
+        // The fn between `gcl-fmt-off` / `gcl-fmt-on` keeps its odd
+        // spacing; the fn outside the toggle is reformatted normally.
+        let src = "\
+// gcl-fmt-off
+fn  weird(  a:int  ){ return  a;  }
+// gcl-fmt-on
+fn normal(a: int): int { return a; }
+";
+        let out = format(src);
+        assert!(
+            out.contains("fn  weird(  a:int  ){ return  a;  }"),
+            "expected verbatim region preserved, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn fmt_skip_preserves_next_node_verbatim() {
+        let src = "\
+// gcl-fmt-skip
+fn  weird(  a:int  ){ return  a;  }
+fn normal(a: int): int { return a; }
+";
+        let out = format(src);
+        assert!(
+            out.contains("fn  weird(  a:int  ){ return  a;  }"),
+            "expected fmt-skip to preserve next decl verbatim, got:\n{out}"
         );
     }
 

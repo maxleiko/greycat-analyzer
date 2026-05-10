@@ -724,3 +724,45 @@ fn semantic_tokens_emits_typed_idents_and_literals() {
         "expected at least one PARAMETER-typed token"
     );
 }
+
+// =============================================================================
+// P23.5 — directive completion (`// gcl-…`)
+// =============================================================================
+
+#[test]
+fn completion_inside_gcl_directive_comment_lists_directives() {
+    let src = "// gcl-\nfn f() {}\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    // Cursor right after `// gcl-` (line 0, character 7).
+    let list = capabilities::completion(src, r, pos(0, 7), None)
+        .expect("expected completion items inside `// gcl-`");
+    let labels: Vec<_> = list.items.into_iter().map(|c| c.label).collect();
+    assert!(
+        labels.iter().any(|l| l == "gcl-lint-off"),
+        "expected `gcl-lint-off` in directive completion, got {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "gcl-fmt-off-file"),
+        "expected `gcl-fmt-off-file` in directive completion, got {labels:?}"
+    );
+}
+
+#[test]
+fn completion_inside_lint_off_rule_list_lists_known_rules() {
+    let src = "// gcl-lint-off \nfn f() {}\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    // Cursor at the rule-list slot (right after the trailing space).
+    let list = capabilities::completion(src, r, pos(0, 16), None)
+        .expect("expected rule-list completion inside `gcl-lint-off `");
+    let labels: Vec<_> = list.items.into_iter().map(|c| c.label).collect();
+    assert!(
+        labels.iter().any(|l| l == "unused-decl"),
+        "expected `unused-decl` rule in completion, got {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "possibly-null"),
+        "expected `possibly-null` rule in completion, got {labels:?}"
+    );
+}

@@ -1852,6 +1852,7 @@ pub fn inlay_hints(
         lints: Vec::new(),
         lib: lib.to_string(),
         timings: Default::default(),
+        directives: greycat_analyzer_analysis::directives::Directives::default(),
     };
     inlay_hints_with_project(&module, &arena, text, range)
 }
@@ -2344,6 +2345,12 @@ pub fn completion(
 ) -> Option<CompletionList> {
     let byte = position_to_byte(text, pos);
     let node = node_at_offset(root, byte)?;
+    if let Some(items) = directive_completion(text, byte) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     if let Some(items) = include_dir_completion(text, node, byte, project_root) {
         return Some(CompletionList {
             is_incomplete: false,
@@ -2381,6 +2388,12 @@ pub fn completion_with_project(
 ) -> Option<CompletionList> {
     let byte = position_to_byte(text, pos);
     let node = node_at_offset(root, byte)?;
+    if let Some(items) = directive_completion(text, byte) {
+        return Some(CompletionList {
+            is_incomplete: false,
+            items,
+        });
+    }
     let mut items = if let Some(items) = include_dir_completion(text, node, byte, project_root) {
         items
     } else if let Some(items) = pragma_completion(text, byte) {
@@ -2655,6 +2668,209 @@ fn pragma_items() -> Vec<CompletionItem> {
             ..Default::default()
         },
     ]
+}
+
+// =============================================================================
+// P23.5 — directive completion for `// gcl-…` line comments
+// =============================================================================
+
+/// Emit completion items when the cursor sits inside a `line_comment`
+/// whose text starts with `// gcl` (allowing leading whitespace). Two
+/// shapes:
+///
+/// - **Directive name** — when the cursor sits on the directive name
+///   itself (`// gcl-` / `// gcl-lint-o<cursor>`), emit one item per
+///   directive form (`gcl-lint-off`, `gcl-lint-off-next`, …) with
+///   snippet bodies that include placeholder rule lists for the lint
+///   forms.
+/// - **Rule name** — when the cursor sits in a `// gcl-lint-off-* `
+///   directive's rule list, emit one item per registered
+///   [`greycat_analyzer_analysis::lint::LINT_RULES`] entry.
+///
+/// Returns `None` when the cursor isn't inside a `// gcl…` comment so
+/// the parent dispatcher can fall through to the other completion shapes.
+fn directive_completion(text: &str, cursor_byte: usize) -> Option<Vec<CompletionItem>> {
+    let line = current_line_slice(text, cursor_byte);
+    let line_start = current_line_start(text, cursor_byte);
+    let in_line_byte = cursor_byte - line_start;
+    let trimmed = line.trim_start();
+    let leading_ws = line.len() - trimmed.len();
+    if !trimmed.starts_with("//") {
+        return None;
+    }
+    // Position relative to the comment payload (after `//` plus any
+    // following whitespace).
+    let after_slashes_offset = leading_ws + 2;
+    if in_line_byte < after_slashes_offset {
+        return None;
+    }
+    let payload = &line[after_slashes_offset..];
+    let payload_offset_in_line = after_slashes_offset;
+    let cursor_in_payload = in_line_byte - payload_offset_in_line;
+    let payload_trimmed = payload.trim_start();
+    let payload_leading = payload.len() - payload_trimmed.len();
+    if cursor_in_payload < payload_leading {
+        return None;
+    }
+
+    // Decide: are we still typing the directive name, or are we past
+    // the first whitespace and typing rule names?
+    let after_payload_ws = cursor_in_payload - payload_leading;
+    let first_ws = payload_trimmed
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| i);
+
+    let in_name_slot = match first_ws {
+        None => true,
+        Some(idx) => after_payload_ws <= idx,
+    };
+    if in_name_slot {
+        let typed = &payload_trimmed[..after_payload_ws.min(payload_trimmed.len())];
+        if !"gcl".starts_with(typed) && !typed.starts_with("gcl") {
+            return None;
+        }
+        let mut items: Vec<CompletionItem> = directive_items()
+            .into_iter()
+            .filter(|item| typed.is_empty() || item.label.starts_with(typed))
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        return Some(items);
+    }
+
+    // Cursor is in the rule-list slot (after the first whitespace).
+    // Only fire for `gcl-lint-off`, `gcl-lint-off-next`,
+    // `gcl-lint-off-file`, `gcl-lint-on` — the four forms that accept
+    // a rule list.
+    let idx = first_ws?;
+    let directive_name = &payload_trimmed[..idx];
+    if !matches!(
+        directive_name,
+        "gcl-lint-off" | "gcl-lint-on" | "gcl-lint-off-next" | "gcl-lint-off-file"
+    ) {
+        return None;
+    }
+    let rule_typed = current_word_around(payload_trimmed, after_payload_ws);
+    let mut items: Vec<CompletionItem> = greycat_analyzer_analysis::lint::LINT_RULES
+        .iter()
+        .filter(|r| rule_typed.is_empty() || r.name.starts_with(rule_typed))
+        .map(|r| CompletionItem {
+            label: r.name.into(),
+            kind: Some(CompletionItemKind::ENUM_MEMBER),
+            insert_text: Some(r.name.into()),
+            detail: Some(r.summary.into()),
+            ..Default::default()
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    Some(items)
+}
+
+/// Snippet items for every `gcl-…` directive form. Snippet bodies for
+/// the lint forms include a `${1:rule}` placeholder so editors that
+/// honor `InsertTextFormat::Snippet` get an immediate tabstop.
+fn directive_items() -> Vec<CompletionItem> {
+    vec![
+        CompletionItem {
+            label: "gcl-lint-off".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-lint-off ${1:rule}".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("silence the named rule(s) until matching `gcl-lint-on` (or EOF)".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "gcl-lint-on".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-lint-on ${1:rule}".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("close a prior `gcl-lint-off` for the named rule(s)".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "gcl-lint-off-next".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-lint-off-next ${1:rule}".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("silence the named rule(s) for the next AST item only".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "gcl-lint-off-file".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-lint-off-file ${1:rule}".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some(
+                "silence the named rule(s) for the whole file (must appear at module head)".into(),
+            ),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "gcl-fmt-off".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-fmt-off".into()),
+            detail: Some("preserve source verbatim until matching `gcl-fmt-on` (or EOF)".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "gcl-fmt-on".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-fmt-on".into()),
+            detail: Some("close a prior `gcl-fmt-off`".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "gcl-fmt-skip".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-fmt-skip".into()),
+            detail: Some("preserve the next AST node verbatim".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "gcl-fmt-off-file".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("gcl-fmt-off-file".into()),
+            detail: Some("preserve the whole file verbatim (must appear at module head)".into()),
+            ..Default::default()
+        },
+    ]
+}
+
+fn current_line_slice(text: &str, byte: usize) -> &str {
+    let start = current_line_start(text, byte);
+    let end = text[byte..]
+        .find('\n')
+        .map(|i| byte + i)
+        .unwrap_or(text.len());
+    &text[start..end]
+}
+
+fn current_line_start(text: &str, byte: usize) -> usize {
+    text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0)
+}
+
+/// Walk back from `cursor` over `[A-Za-z0-9_-]*` to find the word the
+/// user is currently typing. Returns the slice between the word's start
+/// and the cursor.
+fn current_word_around(s: &str, cursor: usize) -> &str {
+    let bytes = s.as_bytes();
+    let cap = cursor.min(bytes.len());
+    let mut start = cap;
+    while start > 0 {
+        let b = bytes[start - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    &s[start..cap]
 }
 
 // =============================================================================

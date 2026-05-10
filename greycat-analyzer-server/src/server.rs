@@ -84,6 +84,7 @@ pub fn start_server() -> Result<()> {
                     ".".into(),
                     ":".into(),
                     ">".into(),
+                    "-".into(),
                 ]),
                 ..Default::default()
             }),

@@ -41,27 +41,237 @@ pub struct LintDiagnostic {
     pub byte_range: Range<usize>,
 }
 
-/// Trait every lint rule implements. Impls walk `hir` / `res` and push
-/// findings into the supplied vector.
+/// Trait every lint rule implements. Impls walk `hir` / `res` and emit
+/// findings via [`LintCx::emit`], which routes through the active
+/// [`crate::directives::Directives`] so rule-specific suppressions
+/// (`// gcl-lint-off …`) silence the diagnostic before it lands in the
+/// output vector.
 pub trait LintRule {
     fn name(&self) -> &'static str;
-    fn check(&self, hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>);
+    fn check(&self, cx: &mut LintCx<'_>);
 }
 
-/// Run every registered rule in order and return the merged findings.
+/// Lint context — borrowed by [`LintRule::check`]. Owns the diagnostic
+/// sink + the active directive set so per-rule suppressions
+/// (`// gcl-lint-off …`) can intercept emissions.
+///
+/// `bypass_suppressions = true` re-emits every diagnostic the rules
+/// produce, even when a suppression covers them — drives the CLI's
+/// `--no-suppressions` flag (P23.7).
+pub struct LintCx<'a> {
+    pub hir: &'a Hir,
+    pub res: &'a Resolutions,
+    pub directives: Option<&'a mut crate::directives::Directives>,
+    pub bypass_suppressions: bool,
+    out: &'a mut Vec<LintDiagnostic>,
+}
+
+impl<'a> LintCx<'a> {
+    pub fn new(
+        hir: &'a Hir,
+        res: &'a Resolutions,
+        directives: Option<&'a mut crate::directives::Directives>,
+        bypass_suppressions: bool,
+        out: &'a mut Vec<LintDiagnostic>,
+    ) -> Self {
+        Self {
+            hir,
+            res,
+            directives,
+            bypass_suppressions,
+            out,
+        }
+    }
+
+    /// Push `diag` into the output vector unless an active directive
+    /// suppresses it (and `bypass_suppressions` is off).
+    pub fn emit(&mut self, diag: LintDiagnostic) {
+        if !self.bypass_suppressions
+            && let Some(dirs) = self.directives.as_deref_mut()
+            && dirs.suppresses_lint(diag.byte_range.start, diag.rule)
+        {
+            return;
+        }
+        self.out.push(diag);
+    }
+}
+
+/// One row of the lint registry. Keeps the rule's name, severity, and
+/// one-line summary together in one place so `lint --list-rules` (P23.6)
+/// and the LSP's directive-completion (P23.5) read from the same table.
+#[derive(Debug, Clone, Copy)]
+pub struct LintRuleInfo {
+    pub name: &'static str,
+    pub summary: &'static str,
+}
+
+/// Project-wide registry of every lint rule the analyzer can emit.
+/// Includes both the pure-HIR rules (driven through [`run_lints`]) and
+/// the typed lints driven from the project pipeline (`arrow-on-non-deref`,
+/// the `nullability` family, `infer-return-type`).
+pub const LINT_RULES: &[LintRuleInfo] = &[
+    LintRuleInfo {
+        name: "unused-local",
+        summary: "warn when a `var name = …;` local is bound but never read",
+    },
+    LintRuleInfo {
+        name: "unused-param",
+        summary: "warn when a function parameter is never read in its body",
+    },
+    LintRuleInfo {
+        name: "unused-decl",
+        summary: "warn when a top-level `private` decl is never referenced",
+    },
+    LintRuleInfo {
+        name: "duplicate-decl",
+        summary: "error when two top-level decls share a name",
+    },
+    LintRuleInfo {
+        name: "modvar-must-be-node-tag",
+        summary: "module variable type must be a node tag (`node` / `nodeTime` / …)",
+    },
+    LintRuleInfo {
+        name: "modvar-node-cannot-be-nullable",
+        summary: "module-variable nodes are auto-initialized — drop the trailing `?`",
+    },
+    LintRuleInfo {
+        name: "modvar-node-inner-must-be-nullable",
+        summary: "`node<T>` requires a nullable inner type — use `node<T?>`",
+    },
+    LintRuleInfo {
+        name: "arrow-on-non-deref",
+        summary: "`->` requires a node-tag or `@deref` receiver",
+    },
+    LintRuleInfo {
+        name: "possibly-null",
+        summary: "warn when `.` / `->` / `[…]` is used on a possibly-null receiver",
+    },
+    LintRuleInfo {
+        name: "redundant-nullable-access",
+        summary: "warn when `?.` / `?->` / `?[…]` is used on a non-nullable receiver",
+    },
+    LintRuleInfo {
+        name: "redundant-non-null-assertion",
+        summary: "warn when `!!` is used on an already-non-nullable expression",
+    },
+    LintRuleInfo {
+        name: "redundant-coalesce",
+        summary: "warn when `??` is used on an already-non-nullable left operand",
+    },
+    LintRuleInfo {
+        name: "infer-return-type",
+        summary: "hint when a fn's return type can be inferred from its body",
+    },
+    LintRuleInfo {
+        name: "unused-suppression",
+        summary: "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
+    },
+    LintRuleInfo {
+        name: "unknown-suppression-rule",
+        summary: "flag a `// gcl-lint-off…` directive that names an unknown rule",
+    },
+    LintRuleInfo {
+        name: "empty-suppression",
+        summary: "flag a `// gcl-lint-off…` directive with an empty rule list",
+    },
+    LintRuleInfo {
+        name: "unbalanced-fmt-off",
+        summary: "flag a `// gcl-fmt-off` with no matching `gcl-fmt-on`",
+    },
+    LintRuleInfo {
+        name: "unbalanced-lint-off",
+        summary: "flag a `// gcl-lint-off …` with no matching `gcl-lint-on`",
+    },
+];
+
+/// Run every registered HIR-only rule in order and return the merged
+/// findings. Suppressions are honored when `directives` is `Some(_)`.
 pub fn run_lints(hir: &Hir, res: &Resolutions) -> Vec<LintDiagnostic> {
-    let rules: Vec<Box<dyn LintRule>> = vec![
+    let mut out = Vec::new();
+    let mut cx = LintCx::new(hir, res, None, false, &mut out);
+    for rule in default_rules() {
+        rule.check(&mut cx);
+    }
+    out
+}
+
+/// Same as [`run_lints`] but consults `directives` to suppress rules
+/// listed in `// gcl-lint-off …` comments. `bypass_suppressions = true`
+/// re-emits everything (drives `lint --no-suppressions`).
+pub fn run_lints_with_directives(
+    hir: &Hir,
+    res: &Resolutions,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+) -> Vec<LintDiagnostic> {
+    let mut out = Vec::new();
+    let mut cx = LintCx::new(hir, res, Some(directives), bypass_suppressions, &mut out);
+    for rule in default_rules() {
+        rule.check(&mut cx);
+    }
+    out
+}
+
+/// Walk `directives.lint_suppressions` and emit `unused-suppression`
+/// diagnostics for every (suppression × rule) pair that didn't actually
+/// drop a diagnostic. Per-rule granularity: a `// gcl-lint-off-next A B
+/// C` whose A fired but B / C didn't surfaces two diagnostics, one per
+/// dead rule.
+///
+/// `unused-suppression` itself is suppressible only via
+/// `// gcl-lint-off-file unused-suppression` (narrower scopes would be
+/// circular). Folds findings directly into `out`.
+pub fn lint_unused_suppressions(
+    directives: &mut crate::directives::Directives,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    // Two-phase: collect first so we can let `Directives::suppresses_lint`
+    // mutate state without re-borrowing the suppression list.
+    let mut emissions: Vec<LintDiagnostic> = Vec::new();
+    for s in &directives.lint_suppressions {
+        for rule in &s.rules {
+            if s.used_rules.contains(rule) {
+                continue;
+            }
+            // Don't flag the synthetic suppressions that the directive
+            // parser itself emits diagnostics for (`unknown-suppression-
+            // rule`, `empty-suppression`) — those have no chance of
+            // suppressing anything by construction.
+            if matches!(
+                rule.as_str(),
+                "unknown-suppression-rule"
+                    | "empty-suppression"
+                    | "unbalanced-fmt-off"
+                    | "unbalanced-lint-off"
+            ) {
+                continue;
+            }
+            emissions.push(LintDiagnostic {
+                rule: "unused-suppression",
+                severity: LintSeverity::Warning,
+                message: format!("unused suppression for `{rule}`"),
+                byte_range: s.directive_range.clone(),
+            });
+        }
+    }
+    for d in emissions {
+        // Honor `gcl-lint-off-file unused-suppression` (the only valid
+        // way to silence this rule per spec).
+        if directives.suppresses_lint(d.byte_range.start, d.rule) {
+            continue;
+        }
+        out.push(d);
+    }
+}
+
+fn default_rules() -> Vec<Box<dyn LintRule>> {
+    vec![
         Box::new(UnusedLocal),
         Box::new(UnusedParam),
         Box::new(UnusedDecl),
         Box::new(DuplicateDecl),
         Box::new(ModVarShape),
-    ];
-    let mut out = Vec::new();
-    for rule in rules {
-        rule.check(hir, res, &mut out);
-    }
-    out
+    ]
 }
 
 // =============================================================================
@@ -76,16 +286,20 @@ impl LintRule for UnusedLocal {
         "unused-local"
     }
 
-    fn check(&self, hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
-        let Some(module) = hir.module.as_ref() else {
+    fn check(&self, cx: &mut LintCx<'_>) {
+        let mut candidates: Vec<LintDiagnostic> = Vec::new();
+        let Some(module) = cx.hir.module.as_ref() else {
             return;
         };
         for decl_id in &module.decls {
-            match &hir.decls[*decl_id] {
-                Decl::Fn(fnd) => check_fn(hir, res, fnd, out, self.name()),
-                Decl::Type(td) => check_type(hir, res, td, out, self.name()),
+            match &cx.hir.decls[*decl_id] {
+                Decl::Fn(fnd) => check_fn(cx.hir, cx.res, fnd, &mut candidates, self.name()),
+                Decl::Type(td) => check_type(cx.hir, cx.res, td, &mut candidates, self.name()),
                 _ => {}
             }
+        }
+        for d in candidates {
+            cx.emit(d);
         }
     }
 }
@@ -140,15 +354,10 @@ fn visit_for_locals(
     match stmt {
         Stmt::Block(b) => visit_block_for_locals(hir, res, b, out, rule),
         Stmt::Var(v) => {
-            // Convention (matches `unused-param` and Rust): a leading
-            // `_` opts out of the unused warning. Lets users keep
-            // `var _x = expr;` for typing / side-effect reasons
-            // without the linter complaining.
             let ident = &hir.idents[v.name];
             if ident.text.starts_with('_') {
                 return;
             }
-            // Was `v.name` referenced anywhere as a Local?
             let used = res.uses.values().any(|d| match d {
                 Definition::Local(name) => *name == v.name,
                 _ => false,
@@ -195,14 +404,18 @@ impl LintRule for UnusedParam {
         "unused-param"
     }
 
-    fn check(&self, hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
-        let Some(module) = hir.module.as_ref() else {
+    fn check(&self, cx: &mut LintCx<'_>) {
+        let mut candidates: Vec<LintDiagnostic> = Vec::new();
+        let Some(module) = cx.hir.module.as_ref() else {
             return;
         };
         for decl_id in &module.decls {
-            if let Decl::Fn(fnd) = &hir.decls[*decl_id] {
-                check_fn_params(hir, res, fnd, out, self.name());
+            if let Decl::Fn(fnd) = &cx.hir.decls[*decl_id] {
+                check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
             }
+        }
+        for d in candidates {
+            cx.emit(d);
         }
     }
 }
@@ -257,53 +470,51 @@ impl LintRule for UnusedDecl {
         "unused-decl"
     }
 
-    fn check(&self, hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
-        let Some(module) = hir.module.as_ref() else {
-            return;
+    fn check(&self, cx: &mut LintCx<'_>) {
+        let mut candidates: Vec<LintDiagnostic> = Vec::new();
+        check_unused_decl(cx.hir, cx.res, &mut candidates);
+        for d in candidates {
+            cx.emit(d);
+        }
+    }
+}
+
+fn check_unused_decl(hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
+    let Some(module) = hir.module.as_ref() else {
+        return;
+    };
+    for decl_id in &module.decls {
+        let decl = &hir.decls[*decl_id];
+        // Pragmas + native / abstract fns don't represent user
+        // code that could be "unused" in a meaningful way.
+        let (name_idx, modifiers, kind) = match decl {
+            Decl::Fn(fnd) => (fnd.name, &fnd.modifiers, "fn"),
+            Decl::Type(td) => (td.name, &td.modifiers, "type"),
+            Decl::Enum(ed) => (ed.name, &ed.modifiers, "enum"),
+            Decl::Var(vd) => (vd.name, &vd.modifiers, "var"),
+            Decl::Pragma(_) => continue,
         };
-        let _ = module; // module-name / lib intentionally unused — the
-        // gate is the `private` modifier (see below).
-        for decl_id in &module.decls {
-            let decl = &hir.decls[*decl_id];
-            // Pragmas + native / abstract fns don't represent user
-            // code that could be "unused" in a meaningful way.
-            let (name_idx, modifiers, kind) = match decl {
-                Decl::Fn(fnd) => (fnd.name, &fnd.modifiers, "fn"),
-                Decl::Type(td) => (td.name, &td.modifiers, "type"),
-                Decl::Enum(ed) => (ed.name, &ed.modifiers, "enum"),
-                Decl::Var(vd) => (vd.name, &vd.modifiers, "var"),
-                Decl::Pragma(_) => continue,
-            };
-            if modifiers.native || modifiers.abstract_ {
-                continue;
-            }
-            // Only `private` decls are checked — anything non-private
-            // is potentially called from outside this module (other
-            // modules, stdlib consumers, runtime tooling) and we can't
-            // see those use sites here.
-            if !modifiers.private {
-                continue;
-            }
-            // `@expose` (and other runtime-exposing annotations) keep
-            // the decl alive even without intra-module references.
-            if exposes_runtime(modifiers) {
-                continue;
-            }
-            let ident = &hir.idents[name_idx];
-            // Underscore-prefixed names are an opt-out marker, mirroring
-            // the param convention.
-            if ident.text.starts_with('_') {
-                continue;
-            }
-            let count = res.references_to.get(decl_id).copied().unwrap_or(0);
-            if count == 0 {
-                out.push(LintDiagnostic {
-                    rule: self.name(),
-                    severity: LintSeverity::Warning,
-                    message: format!("unused private {kind} `{}`", ident.text),
-                    byte_range: ident.byte_range.clone(),
-                });
-            }
+        if modifiers.native || modifiers.abstract_ {
+            continue;
+        }
+        if !modifiers.private {
+            continue;
+        }
+        if exposes_runtime(modifiers) {
+            continue;
+        }
+        let ident = &hir.idents[name_idx];
+        if ident.text.starts_with('_') {
+            continue;
+        }
+        let count = res.references_to.get(decl_id).copied().unwrap_or(0);
+        if count == 0 {
+            out.push(LintDiagnostic {
+                rule: "unused-decl",
+                severity: LintSeverity::Warning,
+                message: format!("unused private {kind} `{}`", ident.text),
+                byte_range: ident.byte_range.clone(),
+            });
         }
     }
 }
@@ -323,29 +534,31 @@ impl LintRule for DuplicateDecl {
         "duplicate-decl"
     }
 
-    fn check(&self, hir: &Hir, _res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
-        let Some(module) = hir.module.as_ref() else {
+    fn check(&self, cx: &mut LintCx<'_>) {
+        let Some(module) = cx.hir.module.as_ref() else {
             return;
         };
         let mut seen: HashMap<String, ()> = HashMap::new();
+        let mut candidates: Vec<LintDiagnostic> = Vec::new();
         for decl_id in &module.decls {
-            let Some(name_id) = hir.decls[*decl_id].name() else {
+            let Some(name_id) = cx.hir.decls[*decl_id].name() else {
                 continue;
             };
-            // Skip pragma-pragma duplicates (multiple `@library` /
-            // `@include` pragmas with the same key are normal).
-            if matches!(&hir.decls[*decl_id], Decl::Pragma(_)) {
+            if matches!(&cx.hir.decls[*decl_id], Decl::Pragma(_)) {
                 continue;
             }
-            let ident = &hir.idents[name_id];
+            let ident = &cx.hir.idents[name_id];
             if seen.insert(ident.text.clone(), ()).is_some() {
-                out.push(LintDiagnostic {
-                    rule: self.name(),
+                candidates.push(LintDiagnostic {
+                    rule: "duplicate-decl",
                     severity: LintSeverity::Error,
                     message: format!("identifier `{}` is already declared", ident.text),
                     byte_range: ident.byte_range.clone(),
                 });
             }
+        }
+        for d in candidates {
+            cx.emit(d);
         }
     }
 }
@@ -387,6 +600,40 @@ pub fn lint_arrow_on_non_deref(
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
 ) {
+    lint_arrow_on_non_deref_inner(hir, analysis, arena, index, out, None, false);
+}
+
+/// Directive-aware variant of [`lint_arrow_on_non_deref`]. Drops
+/// suppressed emissions before they land in `out`.
+pub fn lint_arrow_on_non_deref_with_directives(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    index: &ProjectIndex,
+    out: &mut Vec<LintDiagnostic>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+) {
+    lint_arrow_on_non_deref_inner(
+        hir,
+        analysis,
+        arena,
+        index,
+        out,
+        Some(directives),
+        bypass_suppressions,
+    );
+}
+
+fn lint_arrow_on_non_deref_inner(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    index: &ProjectIndex,
+    out: &mut Vec<LintDiagnostic>,
+    mut directives: Option<&mut crate::directives::Directives>,
+    bypass_suppressions: bool,
+) {
     for (expr_id, expr) in hir.exprs.iter() {
         let Expr::Arrow(MemberExpr {
             receiver,
@@ -416,13 +663,37 @@ pub fn lint_arrow_on_non_deref(
         }
         let _ = expr_id;
         let display = greycat_analyzer_types::display(arena, recv_ty);
-        out.push(LintDiagnostic {
-            rule: "arrow-on-non-deref",
-            severity: LintSeverity::Error,
-            message: format!("`->` requires a node-tag or `@deref` receiver, got `{display}`"),
-            byte_range: byte_range.clone(),
-        });
+        emit_typed(
+            out,
+            directives.as_deref_mut(),
+            bypass_suppressions,
+            LintDiagnostic {
+                rule: "arrow-on-non-deref",
+                severity: LintSeverity::Error,
+                message: format!("`->` requires a node-tag or `@deref` receiver, got `{display}`"),
+                byte_range: byte_range.clone(),
+            },
+        );
     }
+}
+
+/// Emit-via-directives helper for the typed-lint free functions. They
+/// don't go through [`LintCx`] because they take a richer set of
+/// arguments (TypeArena, ProjectIndex, AnalysisResult) and have nothing
+/// useful to do with `LintCx::hir`/`res`'s simpler signature.
+fn emit_typed(
+    out: &mut Vec<LintDiagnostic>,
+    directives: Option<&mut crate::directives::Directives>,
+    bypass_suppressions: bool,
+    diag: LintDiagnostic,
+) {
+    if !bypass_suppressions
+        && let Some(dirs) = directives
+        && dirs.suppresses_lint(diag.byte_range.start, diag.rule)
+    {
+        return;
+    }
+    out.push(diag);
 }
 
 /// Extract the head name of `recv_ty` for `arrow-on-non-deref` dispatch.
@@ -469,33 +740,34 @@ impl LintRule for ModVarShape {
         "modvar-shape"
     }
 
-    fn check(&self, hir: &Hir, _res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
-        let Some(module) = hir.module.as_ref() else {
+    fn check(&self, cx: &mut LintCx<'_>) {
+        let Some(module) = cx.hir.module.as_ref() else {
             return;
         };
+        let mut candidates: Vec<LintDiagnostic> = Vec::new();
         for decl_id in &module.decls {
-            let Decl::Var(vd) = &hir.decls[*decl_id] else {
+            let Decl::Var(vd) = &cx.hir.decls[*decl_id] else {
                 continue;
             };
             let Some(ty_ref) = vd.ty else {
                 continue;
             };
-            let ty = &hir.type_refs[ty_ref];
-            let head = hir.idents[ty.name].text.as_str();
+            let ty = &cx.hir.type_refs[ty_ref];
+            let head = cx.hir.idents[ty.name].text.as_str();
             if !is_node_tag(head) {
-                out.push(LintDiagnostic {
+                candidates.push(LintDiagnostic {
                     rule: "modvar-must-be-node-tag",
                     severity: LintSeverity::Error,
                     message: "module variable type must be one of: \
                               `node<T?>`, `nodeTime<T>`, `nodeList<T>`, \
                               `nodeIndex<K, V>`, or `nodeGeo<T>`"
                         .into(),
-                    byte_range: hir.idents[vd.name].byte_range.clone(),
+                    byte_range: cx.hir.idents[vd.name].byte_range.clone(),
                 });
                 continue;
             }
             if ty.optional {
-                out.push(LintDiagnostic {
+                candidates.push(LintDiagnostic {
                     rule: "modvar-node-cannot-be-nullable",
                     severity: LintSeverity::Error,
                     message: "nodes are automatically initialized by GreyCat \
@@ -507,9 +779,9 @@ impl LintRule for ModVarShape {
             if head == "node"
                 && let Some(inner_ref) = ty.params.first()
             {
-                let inner = &hir.type_refs[*inner_ref];
+                let inner = &cx.hir.type_refs[*inner_ref];
                 if !inner.optional {
-                    out.push(LintDiagnostic {
+                    candidates.push(LintDiagnostic {
                         rule: "modvar-node-inner-must-be-nullable",
                         severity: LintSeverity::Error,
                         message: "`node<T>` requires a nullable inner type — \
@@ -519,6 +791,9 @@ impl LintRule for ModVarShape {
                     });
                 }
             }
+        }
+        for d in candidates {
+            cx.emit(d);
         }
     }
 }
@@ -567,16 +842,62 @@ pub fn lint_inferred_return_type(
     arena: &greycat_analyzer_types::TypeArena,
     out: &mut Vec<LintDiagnostic>,
 ) {
+    lint_inferred_return_type_inner(hir, analysis, arena, out, None, false);
+}
+
+/// Directive-aware variant of [`lint_inferred_return_type`].
+pub fn lint_inferred_return_type_with_directives(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    out: &mut Vec<LintDiagnostic>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+) {
+    lint_inferred_return_type_inner(
+        hir,
+        analysis,
+        arena,
+        out,
+        Some(directives),
+        bypass_suppressions,
+    );
+}
+
+fn lint_inferred_return_type_inner(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    out: &mut Vec<LintDiagnostic>,
+    mut directives: Option<&mut crate::directives::Directives>,
+    bypass_suppressions: bool,
+) {
     let Some(module) = hir.module.as_ref() else {
         return;
     };
     for decl_id in &module.decls {
         match &hir.decls[*decl_id] {
-            Decl::Fn(fnd) => check_fn_inferred_return(hir, analysis, arena, fnd, out),
+            Decl::Fn(fnd) => check_fn_inferred_return(
+                hir,
+                analysis,
+                arena,
+                fnd,
+                out,
+                directives.as_deref_mut(),
+                bypass_suppressions,
+            ),
             Decl::Type(td) => {
                 for m_id in &td.methods {
                     if let Decl::Fn(fnd) = &hir.decls[*m_id] {
-                        check_fn_inferred_return(hir, analysis, arena, fnd, out);
+                        check_fn_inferred_return(
+                            hir,
+                            analysis,
+                            arena,
+                            fnd,
+                            out,
+                            directives.as_deref_mut(),
+                            bypass_suppressions,
+                        );
                     }
                 }
             }
@@ -591,6 +912,8 @@ fn check_fn_inferred_return(
     arena: &greycat_analyzer_types::TypeArena,
     fnd: &FnDecl,
     out: &mut Vec<LintDiagnostic>,
+    directives: Option<&mut crate::directives::Directives>,
+    bypass_suppressions: bool,
 ) {
     if fnd.return_type.is_some() {
         return;
@@ -610,12 +933,17 @@ fn check_fn_inferred_return(
     }
     let display = greycat_analyzer_types::display(arena, ret_ty);
     let name = &hir.idents[fnd.name];
-    out.push(LintDiagnostic {
-        rule: "infer-return-type",
-        severity: LintSeverity::Hint,
-        message: format!("return type can be inferred as `{display}`"),
-        byte_range: name.byte_range.clone(),
-    });
+    emit_typed(
+        out,
+        directives,
+        bypass_suppressions,
+        LintDiagnostic {
+            rule: "infer-return-type",
+            severity: LintSeverity::Hint,
+            message: format!("return type can be inferred as `{display}`"),
+            byte_range: name.byte_range.clone(),
+        },
+    );
 }
 
 /// Walk a fn body's terminal block looking for the last `return e;`
@@ -697,6 +1025,36 @@ pub fn lint_nullability(
     arena: &greycat_analyzer_types::TypeArena,
     out: &mut Vec<LintDiagnostic>,
 ) {
+    lint_nullability_inner(hir, analysis, arena, out, None, false);
+}
+
+/// Directive-aware variant of [`lint_nullability`].
+pub fn lint_nullability_with_directives(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    out: &mut Vec<LintDiagnostic>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+) {
+    lint_nullability_inner(
+        hir,
+        analysis,
+        arena,
+        out,
+        Some(directives),
+        bypass_suppressions,
+    );
+}
+
+fn lint_nullability_inner(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    arena: &greycat_analyzer_types::TypeArena,
+    out: &mut Vec<LintDiagnostic>,
+    mut directives: Option<&mut crate::directives::Directives>,
+    bypass_suppressions: bool,
+) {
     for (expr_id, expr) in hir.exprs.iter() {
         match expr {
             Expr::Member(MemberExpr {
@@ -723,25 +1081,32 @@ pub fn lint_nullability(
                 let recv_range = receiver_byte_range(hir, *receiver);
                 if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
                     let display = display_receiver(hir, *receiver);
-                    out.push(LintDiagnostic {
-                        rule: "possibly-null",
-                        severity: LintSeverity::Warning,
-                        message: format!("`{display}` is possibly `null`"),
-                        byte_range: recv_range.clone(),
-                    });
+                    emit_typed(
+                        out,
+                        directives.as_deref_mut(),
+                        bypass_suppressions,
+                        LintDiagnostic {
+                            rule: "possibly-null",
+                            severity: LintSeverity::Warning,
+                            message: format!("`{display}` is possibly `null`"),
+                            byte_range: recv_range.clone(),
+                        },
+                    );
                 } else if !recv.nullable && *pre_optional {
-                    // Display range = receiver_end..property_start covers
-                    // `?.` / `?->` and any whitespace; the fix scans this
-                    // slice for the lone `?` byte to drop.
                     let prop_start = hir.idents[*property].byte_range.start;
                     let _ = expr_id;
                     let _ = byte_range;
-                    out.push(LintDiagnostic {
-                        rule: "redundant-nullable-access",
-                        severity: LintSeverity::Warning,
-                        message: "redundant `?` — receiver is non-nullable".into(),
-                        byte_range: recv_range.end..prop_start,
-                    });
+                    emit_typed(
+                        out,
+                        directives.as_deref_mut(),
+                        bypass_suppressions,
+                        LintDiagnostic {
+                            rule: "redundant-nullable-access",
+                            severity: LintSeverity::Warning,
+                            message: "redundant `?` — receiver is non-nullable".into(),
+                            byte_range: recv_range.end..prop_start,
+                        },
+                    );
                 }
             }
             Expr::Offset(OffsetExpr {
@@ -760,22 +1125,29 @@ pub fn lint_nullability(
                 let recv_range = receiver_byte_range(hir, *receiver);
                 if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
                     let display = display_receiver(hir, *receiver);
-                    out.push(LintDiagnostic {
-                        rule: "possibly-null",
-                        severity: LintSeverity::Warning,
-                        message: format!("`{display}` is possibly `null`"),
-                        byte_range: recv_range.clone(),
-                    });
+                    emit_typed(
+                        out,
+                        directives.as_deref_mut(),
+                        bypass_suppressions,
+                        LintDiagnostic {
+                            rule: "possibly-null",
+                            severity: LintSeverity::Warning,
+                            message: format!("`{display}` is possibly `null`"),
+                            byte_range: recv_range.clone(),
+                        },
+                    );
                 } else if !recv.nullable && *pre_optional {
-                    // Display range = receiver_end..whole_expr_end covers
-                    // `?[…]` (the indexer span); the fix scans for the
-                    // `?` byte to drop.
-                    out.push(LintDiagnostic {
-                        rule: "redundant-nullable-access",
-                        severity: LintSeverity::Warning,
-                        message: "redundant `?` — receiver is non-nullable".into(),
-                        byte_range: recv_range.end..byte_range.end,
-                    });
+                    emit_typed(
+                        out,
+                        directives.as_deref_mut(),
+                        bypass_suppressions,
+                        LintDiagnostic {
+                            rule: "redundant-nullable-access",
+                            severity: LintSeverity::Warning,
+                            message: "redundant `?` — receiver is non-nullable".into(),
+                            byte_range: recv_range.end..byte_range.end,
+                        },
+                    );
                 }
             }
             Expr::Unary(UnaryExpr {
@@ -792,15 +1164,17 @@ pub fn lint_nullability(
                 }
                 if !opnd.nullable {
                     let opnd_range = receiver_byte_range(hir, *operand);
-                    // `!!` is *postfix* in GreyCat (`$._expr, "!!"`),
-                    // so the operator slice is `[operand_end, unary_end)`.
-                    // Display + fix range covers exactly the `!!`.
-                    out.push(LintDiagnostic {
-                        rule: "redundant-non-null-assertion",
-                        severity: LintSeverity::Warning,
-                        message: "redundant `!!` — expression is already non-nullable".into(),
-                        byte_range: opnd_range.end..byte_range.end,
-                    });
+                    emit_typed(
+                        out,
+                        directives.as_deref_mut(),
+                        bypass_suppressions,
+                        LintDiagnostic {
+                            rule: "redundant-non-null-assertion",
+                            severity: LintSeverity::Warning,
+                            message: "redundant `!!` — expression is already non-nullable".into(),
+                            byte_range: opnd_range.end..byte_range.end,
+                        },
+                    );
                 }
             }
             Expr::Binary(BinaryExpr {
@@ -818,15 +1192,17 @@ pub fn lint_nullability(
                 }
                 if !l.nullable {
                     let left_range = receiver_byte_range(hir, *left);
-                    // Display + fix range = `?? rhs` (everything after
-                    // the lhs). Fix deletes this slice, leaving just
-                    // the lhs.
-                    out.push(LintDiagnostic {
-                        rule: "redundant-coalesce",
-                        severity: LintSeverity::Warning,
-                        message: "redundant `??` — left operand is already non-nullable".into(),
-                        byte_range: left_range.end..byte_range.end,
-                    });
+                    emit_typed(
+                        out,
+                        directives.as_deref_mut(),
+                        bypass_suppressions,
+                        LintDiagnostic {
+                            rule: "redundant-coalesce",
+                            severity: LintSeverity::Warning,
+                            message: "redundant `??` — left operand is already non-nullable".into(),
+                            byte_range: left_range.end..byte_range.end,
+                        },
+                    );
                 }
             }
             _ => {}
@@ -1528,6 +1904,82 @@ fn f(x: Outer) {
         assert!(
             diags.iter().any(|d| d.rule == "possibly-null"),
             "post-reassignment read should re-flag possibly-null: {diags:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // P23 — directive-driven suppressions
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn lint_off_next_silences_unused_decl() {
+        use crate::project::ProjectAnalysis;
+        use greycat_analyzer_core::SourceManager;
+        use greycat_analyzer_core::lsp_types::Uri;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(
+            uri.clone(),
+            "// gcl-lint-off-next unused-decl\nprivate fn foo() {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        let m = pa.module(&uri).unwrap();
+        assert!(
+            !m.lints.iter().any(|l| l.rule == "unused-decl"),
+            "expected unused-decl to be silenced: {:?}",
+            m.lints
+        );
+    }
+
+    #[test]
+    fn lint_off_next_unused_when_no_diagnostic_to_suppress() {
+        // P23.3 — `gcl-lint-off-next unused-decl` on a non-private fn
+        // (which `unused-decl` never fires on) is a dead toggle and
+        // should surface `unused-suppression`.
+        use crate::project::ProjectAnalysis;
+        use greycat_analyzer_core::SourceManager;
+        use greycat_analyzer_core::lsp_types::Uri;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(
+            uri.clone(),
+            "// gcl-lint-off-next unused-decl\nfn callable() {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        let m = pa.module(&uri).unwrap();
+        assert!(
+            m.lints.iter().any(|l| l.rule == "unused-suppression"),
+            "expected unused-suppression on dead toggle: {:?}",
+            m.lints
+        );
+    }
+
+    #[test]
+    fn unknown_rule_in_directive_surfaces_diagnostic() {
+        use crate::project::ProjectAnalysis;
+        use greycat_analyzer_core::SourceManager;
+        use greycat_analyzer_core::lsp_types::Uri;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(
+            uri.clone(),
+            "// gcl-lint-off-next not-a-rule\nfn foo() {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        let m = pa.module(&uri).unwrap();
+        assert!(
+            m.lints.iter().any(|l| l.rule == "unknown-suppression-rule"),
+            "expected unknown-suppression-rule: {:?}",
+            m.lints
         );
     }
 
