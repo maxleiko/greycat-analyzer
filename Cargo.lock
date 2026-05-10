@@ -391,6 +391,7 @@ dependencies = [
  "greycat-analyzer-server",
  "greycat-analyzer-syntax",
  "greycat-analyzer-types",
+ "libc",
  "miette",
  "serde",
  "serde_json",
