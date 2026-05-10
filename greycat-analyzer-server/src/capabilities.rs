@@ -1024,6 +1024,17 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
             continue;
         };
         let ident = &hir.idents[name_id];
+        // The LSP `DocumentSymbol.name` field is required non-empty —
+        // VSCode's client throws "name must not be falsy" if it sees
+        // a `""`. Tree-sitter's error recovery synthesizes empty-range
+        // name nodes when the user is mid-typing (`type Foo { static<CURSOR> }`
+        // recovers as a partial method decl with an empty name ident),
+        // and lowering's `alloc_ident` faithfully interns that empty
+        // text. Skip rather than push it; an out-of-LSP-spec symbol
+        // poisons the whole batch on the client side.
+        if ident.text.is_empty() {
+            continue;
+        }
         let kind = match decl {
             Decl::Fn(_) => SymbolKind::FUNCTION,
             Decl::Type(_) => SymbolKind::CLASS,
@@ -1038,6 +1049,9 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
             for attr_id in &td.attrs {
                 let a = &hir.type_attrs[*attr_id];
                 let aname = &hir.idents[a.name];
+                if aname.text.is_empty() {
+                    continue;
+                }
                 children.push(DocumentSymbol {
                     name: aname.text.to_string(),
                     detail: None,
@@ -1053,6 +1067,9 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
             for method_id in &td.methods {
                 if let Decl::Fn(fnd) = &hir.decls[*method_id] {
                     let mname = &hir.idents[fnd.name];
+                    if mname.text.is_empty() {
+                        continue;
+                    }
                     #[allow(deprecated)]
                     children.push(DocumentSymbol {
                         name: mname.text.to_string(),

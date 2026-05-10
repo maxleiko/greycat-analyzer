@@ -136,6 +136,41 @@ fn outside(): int { return 0; }
     assert!(child_names.contains(&"dist"));
 }
 
+/// Regression: VSCode's LSP client throws `name must not be falsy`
+/// when any `DocumentSymbol.name` is the empty string. Tree-sitter's
+/// recovery synthesizes empty-range name nodes mid-edit (for example
+/// while the user is typing a new method declaration —
+/// `static<CURSOR>` inside a `type` body), and the HIR lowering
+/// faithfully interns that as `Ident { text: "" }`. The
+/// `document_symbols` capability must filter those out at every
+/// nesting level (top-level decl, type attrs, type methods);
+/// otherwise one in-flight keystroke poisons the whole symbol
+/// outline.
+#[test]
+fn document_symbols_skips_empty_name_recovered_from_partial_edit() {
+    // Reproduces the exact shape the user reported: a complete static
+    // method, then a partial `static` keyword with no name yet.
+    let src = "type Foo {\n    static fn whatever() {};\n\n    static\n}\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    let syms = capabilities::document_symbols(src, "project", r);
+
+    // Walk every level of the symbol tree and assert no name is empty.
+    fn walk(symbols: &[DocumentSymbol]) {
+        for s in symbols {
+            assert!(
+                !s.name.is_empty(),
+                "DocumentSymbol with empty name leaked through (kind={:?})",
+                s.kind,
+            );
+            if let Some(children) = &s.children {
+                walk(children);
+            }
+        }
+    }
+    walk(&syms);
+}
+
 // =============================================================================
 // references + rename
 // =============================================================================
