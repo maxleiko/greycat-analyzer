@@ -544,7 +544,6 @@ fn print_summary(entries: &[Entry], total: Duration, color: bool) {
     const GREEN: &str = "\x1b[32m";
     const YELLOW: &str = "\x1b[33m";
     const CYAN: &str = "\x1b[36m";
-    const DIM: &str = "\x1b[2m";
     const RESET: &str = "\x1b[0m";
 
     let paint = |code: &str, s: String| -> String {
@@ -591,8 +590,8 @@ fn print_summary(entries: &[Entry], total: Duration, color: bool) {
     println!(
         "{summary} across {modules} in {dur}",
         summary = parts.join(", "),
-        modules = paint(DIM, pluralize(entries.len(), "module")),
-        dur = paint(DIM, format!("{total:?}")),
+        modules = paint(CYAN, pluralize(entries.len(), "module")),
+        dur = paint(GREEN, format!("{total:?}")),
     );
 }
 
