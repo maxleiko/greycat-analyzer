@@ -794,6 +794,42 @@ The fix pattern in all cases: **make the quickfix produce a syntactically valid 
 
 ---
 
+### Phase 25 — Inline-string + small-vec sweep (~1-2 weeks)
+
+**Goal:** close the P19.9 follow-up note ("evaluate `SmolStr` for the per-module `AnalysisResult.{type_decls, registry}` String storage that interning doesn't touch") and capture the adjacent identifier-shaped String / small-Vec allocations on the same hot path. Every chunk targets storage that's rebuilt on every LSP `did_change` invalidate — `TypeKind` name fields, HIR `Ident.text`, the per-module type-decl map, and the 0-2-element `Vec`s on `Modifiers` / generics / generic args. Per-keystroke allocator pressure on the `did_change → publish_diagnostics` p99 path is the M19 latency lever this phase pulls on.
+
+**Why now.** P19.9's `Symbol(u32)` interner paid down the project-wide indexes (the largest category). What survives is per-module storage that the interner deliberately skipped. `SmolStr` and `SmallVec` are mechanical drop-ins for *exactly* the shapes left over: short identifier strings (≤ 23 bytes inline) and small collection vectors (0-2 elements). A `hyperfine` baseline first lets every subsequent chunk quote a concrete delta instead of relying on intuition.
+
+**Decisions locked.**
+- **`smol_str = "0.3"`** (not `compact_str`). Rust-analyzer-ecosystem default; byte-identical hashing to `String` (both delegate to `str::hash`); 23-byte inline cap is plenty for GreyCat identifiers; `HashMap<SmolStr, _>` borrows as `&str` so consumer-side APIs survive unchanged.
+- **`smallvec = "1"`** for the small-vec chunk.
+- Both crates are `no_std`-friendly → wasm-safe (~3-5KB to the bundle each).
+- **`TypeKind` swap is atomic** — `Type` / `TypeKind` are `Hash + Eq` keys in `TypeArena.intern: HashMap<Type, TypeId>`. `SmolStr` agrees with `String` byte-for-byte on hashing, but the sweep across all six string-bearing variants (`Named`, `Generic`, `GenericParam`, `Enum`, `Anonymous`, `GenericOwner`) lands in one chunk. Don't leave `Named.name: SmolStr` next to a still-`String` `Generic.name` — partial sweeps create a false sense of consistency. An explicit dedup-roundtrip test anchors the invariant.
+- **Stop conditions.** Bail out of subsequent chunks when (a) hyperfine delta is < 2% across two consecutive chunks (allocator noise floor), (b) a field flows into user-facing diagnostic text (`Diagnostic.message`, `CompletionItem.detail`, hover markdown — typically > 23 bytes, allocated once per LSP response), or (c) a chunk would touch the ~129 owned-string sites in [capabilities.rs](../greycat-analyzer-server/src/capabilities.rs) (LSP API constraints, not analyzer hot paths — P19.8 documented this).
+- **Hard cap: stop after 25.4** unless the hyperfine delta from 25.3 is dramatic enough (> 10%) that 25.5 / 25.6 look like cheap follow-ons.
+- **`SmallVec` candidate filter** — apply only to fields with documented 0-2 element distribution. Skip `Tuple.elements` and `LambdaType.params` (the 2-4 element range puts them in SmallVec's friction zone — one inline / one heap with no clear win).
+- **Verification (every chunk).** `cargo fmt → build → clippy --all-targets -D warnings → test --workspace`; `cli lint <registry-corpus>` byte-identical to pre-chunk (the registry baseline is the 0-error gold standard); `cli lint <closed-source-corpus>` byte-identical; `scripts/bench-lint.sh` delta recorded in the commit message.
+
+**Chunks:**
+
+- [x] **25.1 Lint-throughput baseline** (XS) — new [`scripts/bench-lint.sh`](../scripts/bench-lint.sh) wraps `hyperfine --warmup 3 --runs 20 --ignore-failure` (lint exits non-zero whenever a diagnostic fires, hyperfine's failure mode otherwise) over two corpora referenced by short name only: **pro** (lots of libs, little impl) and **solarleb** (little libs, lots of user-facing impl). Paths come from `BENCH_PRO` / `BENCH_SOLARLEB` env vars (defaults set for the maintainer's local layout) so the script stays public-shareable without leaking implementation paths. Recorded baseline numbers (release build, 20 runs, warmup 3): **pro 1.158 s ± 0.094 s** (range 1.036 – 1.338 s); **solarleb 349.7 ms ± 19.2 ms** (range 310.1 – 377.6 ms). Reference for every subsequent chunk.
+
+- [ ] **25.2 SmolStr in `TypeRegistry`** (S) — add `smol_str = "0.3"` to `[workspace.dependencies]` in [Cargo.toml](../Cargo.toml); add `smol_str.workspace = true` to `greycat-analyzer-types/Cargo.toml`. [`TypeRegistry.named`](../greycat-analyzer-types/src/lib.rs) becomes `HashMap<SmolStr, TypeId>` with `register(name: impl Into<SmolStr>, …)` ergonomics. The `lookup(&self, name: &str)` accessor surface survives unchanged (`HashMap<SmolStr, _>` borrows as `&str`). Blast radius: ~5-10 callsites across `analyzer.rs` and `stdlib.rs`. Closes half of the P19.9 follow-up.
+
+- [ ] **25.3 SmolStr in `AnalysisResult.type_decls`** (S) — [`AnalysisResult.type_decls`](../greycat-analyzer-analysis/src/analyzer.rs) becomes `HashMap<SmolStr, Idx<Decl>>`. Population in `analyzer.rs` (the per-module top-decl walk) + consumer sites in [capabilities.rs](../greycat-analyzer-server/src/capabilities.rs) (rename / goto-def — already pass `&str`). Closes the P19.9 follow-up note in full.
+
+- [ ] **25.4 SmolStr in `TypeKind` name fields** (M, atomic sweep) — sweep all six string-bearing sites in [greycat-analyzer-types/src/lib.rs](../greycat-analyzer-types/src/lib.rs) in one chunk: `TypeKind::Named { name: SmolStr }`, `Generic { name: SmolStr, args }`, `GenericParam { name: SmolStr, owner }`, `Enum { name: SmolStr, variants: Vec<SmolStr> }`, `Anonymous { fields: Vec<(SmolStr, TypeId)> }`, `GenericOwner::{Function, Type}(SmolStr)`. New unit test allocates the same logical `Type` via two name-source paths (`String::from("Foo").into()` vs `SmolStr::from("Foo")`) and asserts `TypeArena` returns the same `TypeId`. Blast radius: ~80-120 `TypeKind::*` destructures across [analyzer.rs](../greycat-analyzer-analysis/src/analyzer.rs), [project.rs](../greycat-analyzer-analysis/src/project.rs), [stdlib.rs](../greycat-analyzer-analysis/src/stdlib.rs) — all mechanical (`.clone()` becomes free; `&str` comparison unchanged).
+
+- [ ] **25.5 SmolStr in HIR `Ident.text`** (M) — [`Ident { text: SmolStr, byte_range: Span }`](../greycat-analyzer-hir/src/types.rs). The highest-call-frequency string field in the workspace: cloned on every name lookup in resolver / analyzer / capabilities. Touch points: HIR construction in the syntax→HIR lowerer + ~40 `ident.text.clone()` / `&ident.text` sites across the analysis crate. Mechanical sweep. Expected single-field win — largest of any chunk in this phase.
+
+- [ ] **25.6 SmolStr cleanup: `Annotation` + `NonExhaustiveFinding`** (S) — consistency sweep across the remaining identifier-shaped String fields. [`Annotation { name: SmolStr, args: Vec<SmolStr> }`](../greycat-analyzer-hir/src/types.rs); [`NonExhaustiveFinding { enum_name: SmolStr, missing: Vec<SmolStr> }`](../greycat-analyzer-analysis/src/analyzer.rs). Defensible as a tidiness chunk; skip if 25.4 / 25.5 deltas are already small.
+
+- [ ] **25.7 SmallVec for ≤2-element collections** (S) — add `smallvec = "1"` to `[workspace.dependencies]`. Apply only to fields with documented 0-2 element distribution: `Modifiers.annotations: SmallVec<[Annotation; 1]>`, `FnDecl.generics` / `TypeDecl.generics: SmallVec<[Idx<Ident>; 2]>`, `Annotation.args: SmallVec<[SmolStr; 1]>`, `TypeKind::Generic.args: SmallVec<[TypeId; 2]>`. **Skip** `Tuple.elements` and `LambdaType.params` (per "Decisions locked"). Eliminates heap allocation for the common case on every annotation / generic param / generic arg in the project.
+
+**M25:** `did_change → publish_diagnostics` p99 measurably faster vs. the 25.1 baseline on the same corpus / hardware (concrete number recorded in the 25.7 commit message); registry parity baseline still 0; closed-source corpus byte-identical diagnostics; 297+ workspace tests still green.
+
+---
+
 ## 7. Test strategy
 
 Two layers, no "port every TS test" milestone (tarpit).
