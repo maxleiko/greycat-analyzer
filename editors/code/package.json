@@ -35,7 +35,7 @@
       {
         "language": "greycat",
         "scopeName": "source.gcl",
-        "path": "./grammar/Greycat.tmLanguage",
+        "path": "./grammar/Greycat.tmLanguage.json",
         "embeddedLanguages": {
           "source.md": "markdown",
           "meta.embedded.doc.gcl": "markdown"
