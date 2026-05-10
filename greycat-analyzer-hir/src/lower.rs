@@ -156,8 +156,10 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<Ann
         let Some(ident) = ann.named_children(&mut c3).find(|n| n.kind() == "ident") else {
             continue;
         };
-        let name = cx.text(ident).to_string();
-        let mut args: Vec<String> = Vec::new();
+        // P25.6
+        let name: smol_str::SmolStr = cx.text(ident).into();
+        // P25.6
+        let mut args: Vec<smol_str::SmolStr> = Vec::new();
         let mut c4 = ann.walk();
         if let Some(args_node) = ann.named_children(&mut c4).find(|n| n.kind() == "args") {
             let mut c5 = args_node.walk();
@@ -165,7 +167,7 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<Ann
                 if a.kind() == "string"
                     && let Some(value) = string_literal_value(cx, a)
                 {
-                    args.push(value);
+                    args.push(value.into());
                 }
             }
         }

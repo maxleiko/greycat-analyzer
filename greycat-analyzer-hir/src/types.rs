@@ -47,8 +47,10 @@ pub struct Modifiers {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Annotation {
-    pub name: String,
-    pub args: Vec<String>,
+    // P25.6
+    pub name: SmolStr,
+    // P25.6
+    pub args: Vec<SmolStr>,
 }
 
 #[derive(Debug, Clone)]

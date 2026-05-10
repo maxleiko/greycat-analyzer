@@ -326,7 +326,8 @@ impl TypeMembers {
 #[derive(Debug, Default, Clone)]
 pub struct TypeFlags {
     pub iterable: bool,
-    pub deref: Option<String>,
+    // P25.6
+    pub deref: Option<SmolStr>,
     pub primitive: bool,
 }
 
@@ -339,8 +340,10 @@ pub struct TypeFlags {
 pub struct ExposureSite {
     pub uri: Uri,
     pub decl: Idx<Decl>,
-    pub local_name: String,
-    pub rename: Option<String>,
+    // P25.6
+    pub local_name: SmolStr,
+    // P25.6
+    pub rename: Option<SmolStr>,
 }
 
 impl ProjectIndex {
@@ -753,7 +756,7 @@ impl ProjectIndex {
                         entries.push(ExposureSite {
                             uri: uri.clone(),
                             decl: *decl_id,
-                            local_name: local_name.to_string(),
+                            local_name: local_name.clone(),
                             rename,
                         });
                     }
@@ -947,7 +950,7 @@ fn derive_type_flags(annotations: &[Annotation]) -> TypeFlags {
         match ann.name.as_str() {
             "iterable" => flags.iterable = true,
             "primitive" => flags.primitive = true,
-            "deref" => flags.deref = ann.args.first().cloned().or(Some(String::new())),
+            "deref" => flags.deref = ann.args.first().cloned().or(Some(SmolStr::default())),
             _ => {}
         }
     }

@@ -173,9 +173,11 @@ pub struct NonExhaustiveFinding {
     /// future consumer can correlate against `exhaustive_enum_chains`.
     pub head_id: Idx<Stmt>,
     /// Enum that the chain dispatched on (e.g. `"Example"`).
-    pub enum_name: String,
+    // P25.6
+    pub enum_name: SmolStr,
     /// Variants the chain failed to cover, in declaration order.
-    pub missing: Vec<String>,
+    // P25.6
+    pub missing: Vec<SmolStr>,
     /// Byte range of the head `if`, used as the diagnostic's range.
     pub byte_range: Range<usize>,
 }
@@ -2186,8 +2188,9 @@ impl<'a> Cx<'a> {
         }
         self.out.non_exhaustive_findings.push(NonExhaustiveFinding {
             head_id,
-            enum_name: chain.enum_name.clone(),
-            missing: missing.iter().map(|v| (*v).to_string()).collect(),
+            // P25.6
+            enum_name: chain.enum_name.as_str().into(),
+            missing: missing.iter().map(|v| SmolStr::from(*v)).collect(),
             byte_range: head_range,
         });
     }
