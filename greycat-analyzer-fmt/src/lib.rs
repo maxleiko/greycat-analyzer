@@ -296,4 +296,74 @@ fn normal(a: int): int { return a; }
             "expected 2-space indent:\n{out}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // EOL `//` line-comment placement (must stay on the same source
+    // line as the previous member / stmt; spacing-before-`//` matches
+    // the TS reference's `cst_format.ts`: one space inside type / enum
+    // bodies, zero inside fn / block bodies).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn type_attr_eol_comment_stays_on_same_line() {
+        let src = "type Example {\n    aaa: String;//tight\n    bbb: int;   // padded\n}\n";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("aaa: String; //tight"),
+            "expected EOL glued with one space:\n{out}"
+        );
+        assert!(
+            out.contains("bbb: int; // padded"),
+            "expected leading whitespace before EOL collapsed to one space:\n{out}"
+        );
+        assert!(
+            !out.contains("\n    //tight"),
+            "EOL comment must not be demoted to next line:\n{out}"
+        );
+    }
+
+    #[test]
+    fn enum_field_eol_comment_stays_on_same_line() {
+        let src = "enum Color {\n    Red,//eol\n    Green,\n}\n";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("Red, //eol"),
+            "expected enum EOL glued with one space after the comma:\n{out}"
+        );
+    }
+
+    #[test]
+    fn block_stmt_eol_comment_stays_on_same_line() {
+        let src = "fn f() {\n    var x = 1;//eol\n    var y = 2; //padded\n}\n";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("var x = 1;//eol"),
+            "expected block EOL glued with no leading space:\n{out}"
+        );
+        assert!(
+            out.contains("var y = 2;//padded"),
+            "expected block EOL whitespace-before-`//` stripped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn block_open_brace_eol_comment_keeps_one_space() {
+        let src = "fn f() {//tight\n    var x = 1;\n}\n";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("fn f() { //tight"),
+            "expected `{{ //` open with one space:\n{out}"
+        );
+    }
+
+    #[test]
+    fn eol_comment_format_is_idempotent() {
+        let src = "type T {\n    a: int;//x\n    b: int; // y\n}\n";
+        let once = format(src);
+        let twice = format(&once);
+        assert_eq!(
+            once, twice,
+            "expected idempotency, got:\n{once}\n--\n{twice}"
+        );
+    }
 }

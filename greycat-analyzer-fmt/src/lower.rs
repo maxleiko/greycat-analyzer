@@ -416,6 +416,19 @@ fn lower_type_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut inner = Vec::new();
     let mut prev: Option<Node<'_>> = None;
     for m in &members {
+        // EOL `// ...` line comment that lives on the same source line as
+        // the previous member: glue it to that member with a single space
+        // instead of demoting it to the next line. Mirrors the TS
+        // reference's `cst_format.ts` behavior for type / enum bodies.
+        if m.kind() == "line_comment"
+            && let Some(p) = prev
+            && cx.newlines_between(p, *m) == 0
+        {
+            inner.push(Doc::text(" "));
+            inner.push(Doc::text(cx.text(*m).to_string()));
+            prev = Some(*m);
+            continue;
+        }
         if let Some(p) = prev {
             // Preserve user blank lines between members.
             let nls = cx.newlines_between(p, *m);
@@ -452,9 +465,11 @@ fn lower_enum_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut inner: Vec<Doc> = Vec::new();
     let mut pending_sep: Option<&'a str> = None;
     let mut needs_hardline = true; // first item on its own line
+    let mut prev_node: Option<Node<'_>> = None;
     for c in &children {
         let kind = c.kind();
         if kind == "{" || kind == "}" {
+            prev_node = Some(*c);
             continue;
         }
         match kind {
@@ -468,14 +483,35 @@ fn lower_enum_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
                 inner.push(lower_node(cx, *c));
                 needs_hardline = true;
             }
-            "line_comment" | "doc_comment" => {
+            "line_comment" => {
+                // EOL line comment on the same source line as whatever
+                // came before (typically the trailing `,` or `;`): glue
+                // it with a single space instead of demoting it. The
+                // pending separator is emitted first so the comment
+                // lands as `Field, // text`.
+                let is_eol = prev_node.is_some_and(|p| cx.newlines_between(p, *c) == 0);
+                if let Some(sep) = pending_sep.take() {
+                    inner.push(Doc::text(sep.to_string()));
+                }
+                if is_eol {
+                    inner.push(Doc::text(" "));
+                    inner.push(Doc::text(cx.text(*c).to_string()));
+                } else {
+                    if needs_hardline {
+                        inner.push(Doc::hardline());
+                    }
+                    inner.push(Doc::text(cx.text(*c).to_string()));
+                }
+                needs_hardline = true;
+            }
+            "doc_comment" => {
                 if let Some(sep) = pending_sep.take() {
                     inner.push(Doc::text(sep.to_string()));
                 }
                 if needs_hardline {
                     inner.push(Doc::hardline());
                 }
-                inner.push(Doc::text(cx.text(*c)));
+                inner.push(Doc::text(cx.text(*c).to_string()));
                 needs_hardline = true;
             }
             "," => {
@@ -489,6 +525,7 @@ fn lower_enum_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
             }
             _ => {}
         }
+        prev_node = Some(*c);
     }
     // Final separator: TS reference prints whatever was last in source.
     // If the source had no terminator after the last field, we don't
@@ -520,6 +557,7 @@ fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         .unwrap_or(node.start_byte() + 1);
     let mut inner = Vec::new();
     let mut prev_end: usize = lbrace_end;
+    let mut after_brace = true;
     for s in &stmts {
         // Recover block comments + extra blank lines from the source
         // gap. The grammar drops `_block_comment` (hidden), so the
@@ -538,8 +576,24 @@ fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
                     }
                     inner.push(Doc::text(text.to_string()));
                     nl_total = 0;
+                    after_brace = false;
                 }
             }
+        }
+        // EOL `// ...` line comment on the same source line as whatever
+        // came before. Two flavors, both matching the TS reference's
+        // `cst_format.ts`:
+        //   - immediately after `{` (no stmt seen yet): emit `{ //...`
+        //     with one space.
+        //   - after a stmt: emit `<stmt>//...` with no whitespace.
+        if s.kind() == "line_comment" && nl_total == 0 {
+            if after_brace {
+                inner.push(Doc::text(" "));
+            }
+            inner.push(Doc::text(cx.text(*s).to_string()));
+            prev_end = s.end_byte();
+            after_brace = false;
+            continue;
         }
         inner.push(Doc::hardline());
         if nl_total >= 2 {
@@ -547,52 +601,7 @@ fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
         inner.push(lower_node(cx, *s));
         prev_end = s.end_byte();
-    }
-    // Detect EOL comment after `{` for the `eol_comment_spaced` shape:
-    // first named child is a `line_comment` whose source position is
-    // on the same line as the `{`.
-    let first = stmts.first().copied();
-    let inline_eol = first.and_then(|c| {
-        if c.kind() != "line_comment" {
-            return None;
-        }
-        // Find the `{` token's position.
-        let lbrace = node.child(0)?;
-        if cx.newlines_between(lbrace, c) == 0 {
-            Some(c)
-        } else {
-            None
-        }
-    });
-    if let Some(eol) = inline_eol {
-        // Re-emit: `{` + ` ` + eol_text + Hardline + remaining stmts indented + Hardline + `}`.
-        let mut new_inner = Vec::new();
-        let mut iter_first = true;
-        let mut prev: Option<Node<'_>> = None;
-        for s in &stmts {
-            if std::ptr::eq(s, &eol) || s.id() == eol.id() {
-                continue;
-            }
-            if iter_first {
-                new_inner.push(Doc::hardline());
-                iter_first = false;
-            } else if let Some(p) = prev {
-                let nls = cx.newlines_between(p, *s);
-                new_inner.push(Doc::hardline());
-                if nls >= 2 {
-                    new_inner.push(Doc::hardline());
-                }
-            }
-            new_inner.push(lower_node(cx, *s));
-            prev = Some(*s);
-        }
-        return Doc::concat(vec![
-            Doc::text("{ "),
-            Doc::text(cx.text(eol).to_string()),
-            Doc::indent(Doc::concat(new_inner)),
-            Doc::hardline(),
-            Doc::text("}"),
-        ]);
+        after_brace = false;
     }
     Doc::concat(vec![
         Doc::text("{"),
