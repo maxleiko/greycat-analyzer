@@ -120,8 +120,10 @@ cargo install --path greycat-analyzer --debug         # install CLI on host (bin
 cargo run -p greycat-analyzer -- lint project.gcl                      # @library/@include closure
 cargo run -p greycat-analyzer -- lint project.gcl --fix                # apply auto-fixable lints
 cargo run -p greycat-analyzer -- lint project.gcl --format=pretty      # miette rendering (default on TTY)
-cargo run -p greycat-analyzer -- fmt path/to/file.gcl                  # format in place
-cargo run -p greycat-analyzer -- fmt path/to/file.gcl --check          # exit non-zero on drift
+cargo run -p greycat-analyzer -- fmt                                   # cwd/project.gcl, write mode (default)
+cargo run -p greycat-analyzer -- fmt path/to/project.gcl --mode=check  # exit non-zero on drift, list drifted files
+cargo run -p greycat-analyzer -- fmt path/to/project.gcl --mode=diff   # unified diff per file (colored on TTY)
+cargo run -p greycat-analyzer -- fmt path/to/file.gcl   --mode=stdout  # format only the entrypoint, print to stdout
 cargo run -p greycat-analyzer -- server                                # LSP (alias: `lang-server`)
 cargo run -p greycat-analyzer -- cst path/to/file.gcl                  # debug: print CST s-expr
 

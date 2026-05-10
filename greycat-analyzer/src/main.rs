@@ -19,7 +19,7 @@ struct Cli {
 enum Command {
     /// Lint a project — parse + semantic + lint diagnostics.
     Lint(Lint),
-    /// Format a `.gcl` file (`--check` mode exits non-zero on drift).
+    /// Format a GreyCat project (`--mode=write|check|stdout|diff`).
     Fmt(Fmt),
     /// Start the LSP server. Alias: `lang-server`.
     #[clap(alias = "lang-server")]

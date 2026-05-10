@@ -33,7 +33,7 @@ greycat-analyzer <COMMAND>
 
 Commands:
   lint    Lint a project — parse + semantic + lint diagnostics
-  fmt     Format a `.gcl` file (`--check` mode exits non-zero on drift)
+  fmt     Format a GreyCat project (`--mode=write|check|stdout|diff`)
   server  Start the LSP server. Alias: `lang-server`
   cst     Print the tree-sitter CST s-expression for a `.gcl` file (debug)
 ```
@@ -94,12 +94,24 @@ fn  weirdly_spaced(  a:int  ){ return  a;  }
 
 Wildcards (`*`) aren't supported on purpose — explicit rule names only. CI gets `--no-suppressions` for the nuclear option ("re-emit every silenced diagnostic"). Misspelled rule names surface `unknown-suppression-rule`; empty rule lists surface `empty-suppression`; toggles that didn't actually drop anything surface `unused-suppression` (per-rule granularity, so `gcl-lint-off-next A B C` where only A fired flags B and C separately). The LSP autocompletes the directive forms when you type `// gcl-…`, and the rule-name slots autocomplete from the same registry as `--list-rules`.
 
-### `fmt` — format a single file
+### `fmt` — format a project
+
+Same project-shape as `lint`: optional positional accepting a `.gcl` entrypoint *or* a directory (auto-discovers `project.gcl`), defaulting to the cwd. The `@library` / `@include` closure is what gets formatted — never a flat directory walk.
 
 ```sh
-greycat-analyzer fmt path/to/file.gcl            # rewrite in place
-greycat-analyzer fmt path/to/file.gcl --check    # exit non-zero on drift
+greycat-analyzer fmt                                  # cwd / project.gcl, in-place
+greycat-analyzer fmt path/to/dir                      # dir / project.gcl, in-place
+greycat-analyzer fmt path/to/project.gcl              # explicit entrypoint
+greycat-analyzer fmt path/to/standalone.gcl           # one-file project, in-place
+greycat-analyzer fmt --mode=check                     # CI: list drifted files, exit non-zero on drift
+greycat-analyzer fmt --mode=diff                      # unified diff per file (colored on TTY)
+greycat-analyzer fmt --mode=stdout                    # format only the entrypoint, print to stdout
+greycat-analyzer fmt --fmt-libs                       # also reformat files under `lib/<name>/` (off by default)
 ```
+
+Modes are mutually exclusive (`--mode=write|check|stdout|diff`, default `write`). `stdout` is single-file by design — it formats only the entrypoint and ignores the closure. Files with parse errors are skipped + warned (the formatter would otherwise print recovered-but-garbage output) and contribute to a non-zero exit.
+
+Library files (`module.lib != "project"`) are skipped by default; pass `--fmt-libs` to opt in. Mirrors `lint --lint-libs`.
 
 Foundational printer — output is guaranteed to re-parse cleanly and is idempotent on simple inputs. Byte-for-byte parity with the TS prettifier is the M5 follow-up milestone. The `gcl-fmt-off` / `gcl-fmt-on` / `gcl-fmt-skip` / `gcl-fmt-off-file` directives above preserve marked regions verbatim through both `fmt` and `lint --fix`.
 
