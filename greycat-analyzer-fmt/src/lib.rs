@@ -1,20 +1,48 @@
-//! Formatter for `.gcl` source (P4.1).
+//! Formatter for `.gcl` source.
 //!
-//! Walks the tree-sitter CST and emits a normalized source string with
-//! consistent indentation and spacing. This is a *foundational* port —
-//! enough to round-trip representative fixtures through `parse → fmt →
-//! parse` without errors. **Byte-for-byte parity with the TS prettifier**
-//! (M5 acceptance criterion) is explicitly out of scope for this pass;
-//! the TS port lives at `packages/lang/src/parser/cst/cst_format.ts`
-//! (~1,354 LoC of cases) and a faithful port is its own milestone.
+//! Two layers stacked on a small Wadler/Leijen pretty printer:
 //!
-//! The algorithm is a single linear walk in source order using a
-//! `TreeCursor`. Each named/anonymous token contributes its source text
-//! plus a small per-kind rule for whitespace before/after.
+//! - [`doc`] — the layout IR (`Doc::Text`, `Doc::Group`, `Doc::Indent`,
+//!   `Doc::Line`, `Doc::Hard`, `Doc::IfBroken`, `Doc::BlankLine`).
+//! - [`render`] — width-aware printer that picks flat-vs-broken per
+//!   `Group` via fits-flat measurement.
+//!
+//! P21 is rebuilding the CST → Doc lowering on top of these primitives;
+//! while that work lands, [`format`] / [`format_tree`] still route
+//! through the legacy single-pass walker (in this file). New chunks
+//! flip individual constructs over to the new pipeline as their
+//! lowering visitors land.
+
+pub mod doc;
+pub mod render;
 
 use greycat_analyzer_syntax::tree_sitter::{Node, TreeCursor};
 
 const INDENT: &str = "    ";
+
+/// Layout options. Defaults match the TS reference (`cst_format.ts`).
+#[derive(Debug, Clone, Copy)]
+pub struct FmtOptions {
+    /// Maximum line width before a `Group` breaks. TS default: 120.
+    pub line_width: usize,
+    /// Spaces per indent step. TS default: 4.
+    pub indent: usize,
+    /// Append a trailing newline at end of file. TS default: false.
+    /// We default to `true` because real-world files carry one and the
+    /// playground / LSP path preserves it; the parity gauntlet's fixtures
+    /// don't (the corpus `out.gcl` files are saved without one).
+    pub eol_last: bool,
+}
+
+impl Default for FmtOptions {
+    fn default() -> Self {
+        FmtOptions {
+            line_width: 120,
+            indent: 4,
+            eol_last: false,
+        }
+    }
+}
 
 /// Format `source` and return the canonical text. A best-effort pass —
 /// see the module docs for parity caveats.
