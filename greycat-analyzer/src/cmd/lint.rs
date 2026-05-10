@@ -150,9 +150,10 @@ impl Lint {
         for name in &self.disable {
             if !valid_rules.contains(name.as_str()) {
                 eprintln!(
-                    "warning: unknown lint rule `{name}` in --disable \
+                    "error: unknown lint rule `{name}` in --disable \
                      (see --list-rules for the available set)"
                 );
+                std::process::exit(1);
             }
         }
         let disabled: std::collections::HashSet<String> = self.disable.iter().cloned().collect();
