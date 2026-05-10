@@ -283,7 +283,7 @@ impl ProjectAnalysis {
         // analyzer can't run because they need every module's
         // signatures to be settled first. P22-P23 absorbs them into
         // the staged S7-S12 work.
-        self.stage_cross_module_post_passes();
+        self.stage_cross_module_post_passes(manager);
 
         // Post-S12 — qualified-ref bookkeeping for the unused-decl
         // lint. Lives outside the 12 stages because it mutates the
@@ -313,7 +313,6 @@ impl ProjectAnalysis {
         &mut self,
         manager: &SourceManager,
     ) -> Vec<(Uri, Hir, String, Duration, Directives)> {
-        let bypass = self.bypass_suppressions;
         let mut hirs: Vec<(Uri, Hir, String, Duration, Directives)> =
             Vec::with_capacity(manager.len());
         for (uri, cell) in manager.iter() {
@@ -324,22 +323,7 @@ impl ProjectAnalysis {
             // **P23.1** — parse `// gcl-…` directives off the same CST
             // we just lowered, so lints and the formatter can see the
             // user's per-region opt-outs.
-            let mut directives = crate::directives::parse_directives(&doc.text, doc.root_node());
-            // CST-shape lint: `catch ()` empty parens. Walks the CST
-            // because the parens are noise the HIR drops; piggybacks on
-            // `directives.diagnostics` so the existing pipeline drains it
-            // into the per-module lint stream. Move the diagnostics vec
-            // out, mutate alongside `&mut directives` (suppression check),
-            // then move it back — avoids aliasing the `Directives` borrow.
-            let mut catch_lints: Vec<LintDiagnostic> = Vec::new();
-            lint_catch_empty_parens(
-                &doc.text,
-                doc.root_node(),
-                &mut directives,
-                bypass,
-                &mut catch_lints,
-            );
-            directives.diagnostics.extend(catch_lints);
+            let directives = crate::directives::parse_directives(&doc.text, doc.root_node());
             self.index.ingest(uri, &hir);
             hirs.push((uri.clone(), hir, doc.lib.clone(), lower_took, directives));
         }
@@ -880,7 +864,7 @@ impl ProjectAnalysis {
     /// time) and S12 (which walks bodies against fully-resolved
     /// signatures, so call-site monomorphization and member typing
     /// happen inline rather than in a fix-up sweep).
-    fn stage_cross_module_post_passes(&mut self) {
+    fn stage_cross_module_post_passes(&mut self, manager: &SourceManager) {
         // P23 — passes 3.4 / 3.45 / 3.5 / 3.52 are all gone. The
         // analyzer's body walker now types Member / Arrow / Static /
         // QualifiedStatic / Ident calls inline via the S7-S11
@@ -890,7 +874,7 @@ impl ProjectAnalysis {
         // Only the typed-lint pass (3.55) and type-relation
         // validation (3.6) survive — both still need to walk every
         // module's now-settled `expr_types`.
-        self.run_typed_lints(None);
+        self.run_typed_lints(manager, None);
         self.validate_type_relations(None);
     }
 
@@ -1066,7 +1050,7 @@ impl ProjectAnalysis {
     ///
     /// `restrict = None` lints every cached module; `Some(set)` only
     /// the listed URIs (matches the type-relation validation scope).
-    fn run_typed_lints(&mut self, restrict: Option<&HashSet<String>>) {
+    fn run_typed_lints(&mut self, manager: &SourceManager, restrict: Option<&HashSet<String>>) {
         let in_scope = |uri: &Uri| -> bool {
             match restrict {
                 None => true,
@@ -1094,8 +1078,25 @@ impl ProjectAnalysis {
                         | "unused-suppression"
                         | "unreachable"
                         | "non-exhaustive"
+                        | "catch-empty-parens"
                 )
             });
+            // CST-shape lint. Walks the source/tree (not the HIR) so the
+            // empty `()` between `catch` and `{` shows up — that shape
+            // carries no semantic info and the HIR drops it. Lives in
+            // this pass alongside the typed lints so the LSP's
+            // incremental `invalidate` path picks it up too (the full-
+            // analyze + invalidate flows both run `run_typed_lints`).
+            if let Some(cell) = manager.get(uri) {
+                let doc = cell.borrow();
+                lint_catch_empty_parens(
+                    &doc.text,
+                    doc.root_node(),
+                    &mut module.directives,
+                    bypass,
+                    &mut module.lints,
+                );
+            }
             lint_arrow_on_non_deref_with_directives(
                 &module.hir,
                 &module.analysis,
@@ -1504,7 +1505,7 @@ impl ProjectAnalysis {
         // — both run on the changed URI only here for incremental cost.
         let mut touched: HashSet<String> = HashSet::new();
         touched.insert(uri.as_str().to_string());
-        self.run_typed_lints(Some(&touched));
+        self.run_typed_lints(manager, Some(&touched));
         self.validate_type_relations(Some(&touched));
         self.compute_qualified_refs(manager);
     }

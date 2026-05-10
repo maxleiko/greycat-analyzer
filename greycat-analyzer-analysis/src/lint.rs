@@ -70,6 +70,7 @@ pub fn default_tag_for(rule: &str) -> Option<DiagTag> {
         "unreachable"
         | "unused-local"
         | "unused-param"
+        | "unused-catch-param"
         | "unused-decl"
         | "unused-suppression"
         | "redundant-nullable-access"
@@ -240,6 +241,10 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
         name: "catch-empty-parens",
         summary: "error on `catch ()` — drop the empty parens (`catch { … }` is the no-binding form)",
     },
+    LintRuleInfo {
+        name: "unused-catch-param",
+        summary: "warn when `catch (e) { … }` binds `e` but never reads it — auto-fix drops `(e)` so the form becomes `catch { … }`",
+    },
 ];
 
 /// Run every registered HIR-only rule in order and return the merged
@@ -397,6 +402,7 @@ fn default_rules() -> Vec<Box<dyn LintRule>> {
     vec![
         Box::new(UnusedLocal),
         Box::new(UnusedParam),
+        Box::new(UnusedCatchParam),
         Box::new(UnusedDecl),
         Box::new(DuplicateDecl),
         Box::new(ModVarShape),
@@ -541,25 +547,60 @@ impl LintRule for UnusedParam {
         };
         for decl_id in &module.decls {
             match &cx.hir.decls[*decl_id] {
+                Decl::Fn(fnd) => check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name()),
+                Decl::Type(td) => {
+                    for method_id in &td.methods {
+                        if let Decl::Fn(fnd) = &cx.hir.decls[*method_id] {
+                            check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for d in candidates {
+            cx.emit(d);
+        }
+    }
+}
+
+/// Warn when a `catch (e)` parameter is bound but never read inside
+/// the catch block. Distinct from [`UnusedParam`] because the auto-fix
+/// is qualitatively different — a fn param can't disappear (it's part
+/// of the signature), but a catch ident has the bare `catch { … }`
+/// form to fall back to. The fix drops `(e)` entirely instead of
+/// renaming to `_e`.
+pub struct UnusedCatchParam;
+
+impl LintRule for UnusedCatchParam {
+    fn name(&self) -> &'static str {
+        "unused-catch-param"
+    }
+
+    fn check(&self, cx: &mut LintCx<'_>) {
+        let mut candidates: Vec<LintDiagnostic> = Vec::new();
+        let Some(module) = cx.hir.module.as_ref() else {
+            return;
+        };
+        for decl_id in &module.decls {
+            match &cx.hir.decls[*decl_id] {
                 Decl::Fn(fnd) => {
-                    check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
                     if let Some(body) = fnd.body {
                         visit_for_catch_params(cx.hir, cx.res, body, &mut candidates, self.name());
                     }
                 }
                 Decl::Type(td) => {
                     for method_id in &td.methods {
-                        if let Decl::Fn(fnd) = &cx.hir.decls[*method_id] {
-                            check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
-                            if let Some(body) = fnd.body {
-                                visit_for_catch_params(
-                                    cx.hir,
-                                    cx.res,
-                                    body,
-                                    &mut candidates,
-                                    self.name(),
-                                );
-                            }
+                        if let Decl::Fn(fnd) = &cx.hir.decls[*method_id]
+                            && let Some(body) = fnd.body
+                        {
+                            visit_for_catch_params(
+                                cx.hir,
+                                cx.res,
+                                body,
+                                &mut candidates,
+                                self.name(),
+                            );
                         }
                     }
                 }
@@ -610,8 +651,8 @@ fn check_fn_params(
 /// Walk a fn body looking for `try { … } catch (e) { … }` shapes whose
 /// `e` is never read. The catch param is bound by the resolver as
 /// `Definition::Local(name)` (same as a `var`), so the usage check
-/// mirrors `unused-local`'s — emit under `unused-param` with a
-/// catch-flavored message.
+/// mirrors `unused-local`'s — emit under the caller-supplied rule
+/// name (today: `unused-catch-param`).
 fn visit_for_catch_params(
     hir: &Hir,
     res: &Resolutions,

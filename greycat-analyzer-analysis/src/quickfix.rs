@@ -50,8 +50,61 @@ pub fn edit_for_diagnostic(
         "unreachable" => unreachable_fix(text, start, end),
         "non-exhaustive" => non_exhaustive_fix(text, start, message),
         "catch-empty-parens" => catch_empty_parens_fix(text, start, end),
+        "unused-catch-param" => unused_catch_param_fix(text, start),
         _ => Vec::new(),
     }
+}
+
+/// Delete the `(e)` after a `catch` keyword, including the leading
+/// whitespace, so `catch (e) { … }` becomes `catch { … }`. Locates the
+/// enclosing `try_stmt` and walks its anonymous-token children for the
+/// `(` and `)` that bracket the `error_param` ident.
+fn unused_catch_param_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
+    let tree = greycat_analyzer_syntax::parse(text);
+    let root = tree.root_node();
+    let Some(mut node) = root.descendant_for_byte_range(ident_start, ident_start) else {
+        return Vec::new();
+    };
+    loop {
+        if node.kind() == "try_stmt" {
+            break;
+        }
+        let Some(p) = node.parent() else {
+            return Vec::new();
+        };
+        node = p;
+    }
+    let mut cur = node.walk();
+    let mut open: Option<usize> = None;
+    let mut close: Option<usize> = None;
+    for ch in node.children(&mut cur) {
+        if ch.is_named() {
+            continue;
+        }
+        let s = &text[ch.byte_range()];
+        if s == "(" && open.is_none() {
+            open = Some(ch.start_byte());
+        } else if s == ")" && open.is_some() {
+            close = Some(ch.end_byte());
+        }
+    }
+    let (Some(start), Some(end)) = (open, close) else {
+        return Vec::new();
+    };
+    let mut new_start = start;
+    let bytes = text.as_bytes();
+    while new_start > 0 {
+        let b = bytes[new_start - 1];
+        if b == b' ' || b == b'\t' {
+            new_start -= 1;
+        } else {
+            break;
+        }
+    }
+    vec![TextEdit {
+        byte_range: new_start..end,
+        new_text: String::new(),
+    }]
 }
 
 /// Delete the empty `(...)` plus any whitespace immediately preceding it
@@ -574,18 +627,9 @@ fn is_param_name_unused_in_enclosing_fn(text: &str, param_start: usize, name: &s
     let Some(mut node) = root.descendant_for_byte_range(param_start, param_start) else {
         return true;
     };
-    // Walk up to the enclosing scope. For a catch param the scope is the
-    // catch_block — `e` only exists there, so scanning the whole fn body
-    // would refuse the fix on unrelated `e` occurrences elsewhere. For a
-    // regular fn / method / lambda param the scope is the body.
+    // Walk up to the enclosing function-shaped node.
     loop {
         match node.kind() {
-            "try_stmt" => {
-                let Some(cb) = node.child_by_field_name("catch_block") else {
-                    return true;
-                };
-                return !contains_whole_word(&text[cb.byte_range()], name);
-            }
             "fn_decl" | "type_method" | "lambda_expr" => break,
             _ => {}
         }
