@@ -15,6 +15,7 @@
 
 pub mod doc;
 pub mod render;
+pub mod trivia;
 
 use greycat_analyzer_syntax::tree_sitter::{Node, TreeCursor};
 
