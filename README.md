@@ -40,32 +40,54 @@ Commands:
 
 ### `lint` — parse, type-check, lint
 
-Walks every `.gcl` file under the project's directory (skipping `node_modules/`, `gcdata/`, `.git/`) and runs the full pipeline: tree-sitter parse → CST→HIR lower → name resolution → type analyzer → lint rules. Prints `path:line:col: severity: message` per finding and exits non-zero when any are produced.
+Loads the project entrypoint (`./project.gcl` by default, or any `.gcl` file / directory you pass in), walks its `@library` / `@include` pragmas to discover reachable modules, and runs the full pipeline on each: tree-sitter parse → CST→HIR lower → name resolution → type analyzer → lint rules. **There is no flat directory walk** — only modules reachable from the entrypoint are analyzed. Prints `path:line:col: severity: message` per finding plus a trailing severity-count summary; exits non-zero on errors or warnings (hints alone don't fail CI — they're advisory).
 
 ```sh
-greycat-analyzer lint examples/project.gcl
-greycat-analyzer lint examples/project.gcl --csv              # per-file timing summary
-greycat-analyzer lint --list-rules                            # registered rule namespace
-greycat-analyzer lint examples/project.gcl --no-suppressions  # CI: ignore // gcl-lint-off
+greycat-analyzer lint                                          # ./project.gcl, current dir
+greycat-analyzer lint path/to/dir                              # dir / project.gcl
+greycat-analyzer lint path/to/project.gcl                      # explicit entrypoint
+greycat-analyzer lint path/to/standalone.gcl                   # single-file project
+greycat-analyzer lint --fix                                    # apply auto-fixable lint suggestions in place
+greycat-analyzer lint --list-rules                             # dump registered rule namespace and exit
+greycat-analyzer lint --disable=unused-local,redundant-coalesce  # silence specific rules globally
+greycat-analyzer lint --no-suppressions                        # CI: re-emit every `// gcl-lint-off`-silenced diagnostic
+greycat-analyzer lint --lint-libs                              # also surface lints from `lib/<name>/` modules
 ```
 
 Diagnostic sources:
 - `greycat-analyzer` / `parse-error` / `missing-token` — tree-sitter recovery emitted these.
 - `greycat-analyzer` / `semantic` — return-type mismatch, condition-must-be-bool, unresolved name, etc.
-- `lint` / `<rule>` — full rule list available via `lint --list-rules` (auto-generated from the registry, so it's always in sync with what the analyzer emits). Rules that flag "this code does nothing" — `unreachable`, `unused-{local,param,decl,suppression}`, `redundant-{nullable-access,non-null-assertion,coalesce}` — carry LSP `DiagnosticTag::UNNECESSARY` so VS Code / Helix / Neovim dim the span.
+- `lint` / `<rule>` — full rule list available via `lint --list-rules` (auto-generated from the registry, so it's always in sync with what the analyzer emits). Rules that flag "this code does nothing" — `unreachable`, `unused-{local,param,decl,suppression}`, `redundant-{nullable-access,non-null-assertion,coalesce,semicolon}` — carry LSP `DiagnosticTag::UNNECESSARY` so VS Code / Helix / Neovim dim the span.
 
-#### Dead-code detection (P24)
+#### Output formats
+
+`--format` (default: `pretty` on a TTY, `compact` when piped):
+
+| Format    | Per-diagnostic           | Trailing summary | Use case                                 |
+|-----------|--------------------------|------------------|------------------------------------------|
+| `compact` | `path:line:col: …`       | yes              | parity oracle / grep / scripts           |
+| `pretty`  | `miette` snippet + caret | yes              | interactive shell, colored on TTY        |
+| `csv`     | —                        | no               | per-file timing rows, pipe into `awk`    |
+| `quiet`   | —                        | yes              | CI / pre-commit one-line pulse           |
+
+`csv` and `quiet` are explicit-opt-in; the default never picks them. Exit code is the same across every format — `0` when there are no errors or warnings, `1` otherwise. Hints (return-type inference suggestions, style nudges) are advisory and never flip the exit code red.
+
+#### Dead-code detection
 
 The `unreachable` rule (severity Hint) flags two shapes:
 
 - **Post-divergent siblings** — code that follows a `return` / `throw` / `break` / `continue` (or any block / if / try chain that recursively diverges). Conservative on loops: `while (cond) { return; } var _ = 0;` does NOT flag the post-loop `var _` since we can't prove the loop body executed.
 - **Dead `else` arms on exhaustive enum chains** — `if (x == E::A) { … } else if (x == E::B) { … } else { … }` where `A` + `B` exhaust `E`. The trailing `else` is unreachable and gets greyed-out. When every variant arm also diverges (e.g., both return), the post-chain code is flagged too.
 
-Contiguous dead siblings inside one block coalesce into a single diagnostic spanning the whole island. `lint --fix` removes the dead range as one edit; for the dead-`else` shape the fix also swallows the leading `else` keyword so the result parses cleanly. Suppress via `// gcl-lint-off-next unreachable` or the file/range variants.
+Contiguous dead siblings inside one block coalesce into a single diagnostic spanning the whole island. `lint --fix` removes the dead range as one edit; for the dead-`else` shape the fix also swallows the leading `else` keyword so the result parses cleanly. Suppress via `// gcl-lint-off-next unreachable` or the file/range variants below.
 
-#### Per-region opt-out (P23)
+#### Silencing rules
 
-A few comment directives let you silence a specific rule (or skip the formatter) over a region without disabling lints workspace-wide. Every directive carries the `gcl-` prefix so they sort together in completion and don't collide with prose:
+Three knobs, increasing in scope:
+
+- **Per-region directives** (source-level, fine-grained). Comment forms with the `gcl-` prefix so they sort together in completion and don't collide with prose. Apply to one AST item, one toggle range, or one whole file — see the table and examples below.
+- **`--disable=<rule>[,<rule>...]`** (CLI, project-wide). Repeatable / comma-list; same effect as `// gcl-lint-off-file <rule>` in every file at once, without source edits. For CI invocations that need to silence a noisy rule across the whole project. Unknown rule names print a fail-soft stderr warning and the lint continues.
+- **`--no-suppressions`** (CLI, nuclear). Ignores every `// gcl-lint-off`-style directive and re-emits the underlying diagnostics. For auditing "what's hidden behind suppressions in this codebase."
 
 | Directive                                | Scope                                  |
 |------------------------------------------|----------------------------------------|
@@ -92,7 +114,7 @@ fn explore(x: Foo?) { x.bar(); x.baz(); }
 fn  weirdly_spaced(  a:int  ){ return  a;  }
 ```
 
-Wildcards (`*`) aren't supported on purpose — explicit rule names only. CI gets `--no-suppressions` for the nuclear option ("re-emit every silenced diagnostic"). Misspelled rule names surface `unknown-suppression-rule`; empty rule lists surface `empty-suppression`; toggles that didn't actually drop anything surface `unused-suppression` (per-rule granularity, so `gcl-lint-off-next A B C` where only A fired flags B and C separately). The LSP autocompletes the directive forms when you type `// gcl-…`, and the rule-name slots autocomplete from the same registry as `--list-rules`.
+Wildcards (`*`) aren't supported on purpose — explicit rule names only. Misspelled rule names surface `unknown-suppression-rule`; empty rule lists surface `empty-suppression`; toggles that didn't actually drop anything surface `unused-suppression` (per-rule granularity, so `gcl-lint-off-next A B C` where only A fired flags B and C separately). The LSP autocompletes the directive forms when you type `// gcl-…`, and the rule-name slots autocomplete from the same registry as `--list-rules` / `--disable`.
 
 ### `fmt` — format a project
 
@@ -137,7 +159,8 @@ Speaks LSP over stdio. Capabilities advertised in `initialize`:
 | `textDocument/rename`, `prepareRename` | ✅ |
 | `textDocument/foldingRange` | ✅ |
 | `textDocument/selectionRange` | ✅ |
-| `textDocument/codeAction`   | ✅ — quickfix-per-diagnostic placeholders |
+| `textDocument/codeAction`   | ✅ — quickfix per diagnostic via the shared `quickfix` module (same edits as `lint --fix`) |
+| `textDocument/completion`   | ✅ — idents in scope, `@library` version completion, `// gcl-…` directive + rule-name completion |
 | `textDocument/inlayHint`    | ✅ — `: <type>` after typeless `var` initializers |
 | `textDocument/semanticTokens/full` | ✅ — typed FUNCTION / TYPE / ENUM / VARIABLE / PARAMETER |
 | `textDocument/formatting`   | ✅ |
