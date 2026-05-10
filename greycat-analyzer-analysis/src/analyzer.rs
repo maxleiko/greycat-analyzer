@@ -157,6 +157,25 @@ impl SemanticDiagnostic {
     }
 }
 
+/// A non-exhaustive enum-eq if-chain detected in pass 2. Recorded into
+/// [`AnalysisResult`] rather than emitted directly so the lint pipeline
+/// can surface it as a real, suppressible `non-exhaustive` rule via
+/// [`crate::lint::lint_non_exhaustive_with_directives`]. Mirrors the
+/// existing record-then-emit pattern used by `exhaustive_enum_chains`.
+#[derive(Debug, Clone)]
+pub struct NonExhaustiveFinding {
+    /// Head `if_stmt` HIR id of the chain. The lint key plus quickfix
+    /// dispatch only need `byte_range`, but the id is kept so any
+    /// future consumer can correlate against `exhaustive_enum_chains`.
+    pub head_id: Idx<Stmt>,
+    /// Enum that the chain dispatched on (e.g. `"Example"`).
+    pub enum_name: String,
+    /// Variants the chain failed to cover, in declaration order.
+    pub missing: Vec<String>,
+    /// Byte range of the head `if`, used as the diagnostic's range.
+    pub byte_range: Range<usize>,
+}
+
 /// Output of the analyzer for a single module.
 ///
 /// **P19:** the [`TypeArena`] that backs every `TypeId` in this struct
@@ -210,6 +229,13 @@ pub struct AnalysisResult {
     /// chain as effectively divergent for fall-through-deadness
     /// analysis when every arm body diverges.
     pub exhaustive_enum_chains: HashSet<Idx<Stmt>>,
+    /// Non-exhaustive enum-eq chains detected in pass 2. The
+    /// `non-exhaustive` lint reads this and emits a real
+    /// [`crate::lint::LintDiagnostic`] (rule-keyed, suppressible via
+    /// `// gcl-lint-off…`). Unlike historical structural diagnostics
+    /// (which lacked a rule code), this flow integrates with the
+    /// shared directive / quickfix machinery.
+    pub non_exhaustive_findings: Vec<NonExhaustiveFinding>,
 }
 
 /// Where a member-access property name resolves to.
@@ -2112,17 +2138,20 @@ impl<'a> Cx<'a> {
             self.out.exhaustive_enum_chains.insert(head_id);
             return;
         }
-        // Missing variants exist — only emit the "non-exhaustive"
-        // warning when there's no catch-all `else` to fall through to.
+        // Missing variants exist — only record the finding when there's
+        // no catch-all `else` to fall through to. Recording (instead of
+        // emitting a SemanticDiagnostic directly) lets the
+        // `non-exhaustive` lint surface this as a rule-keyed,
+        // suppressible diagnostic in the shared lint pipeline.
         if chain.has_final_else {
             return;
         }
-        let msg = format!(
-            "non-exhaustive match over `{}` (missing: {})",
-            chain.enum_name,
-            missing.join(", "),
-        );
-        self.diag(Severity::Warning, msg, head_range);
+        self.out.non_exhaustive_findings.push(NonExhaustiveFinding {
+            head_id,
+            enum_name: chain.enum_name.clone(),
+            missing: missing.iter().map(|v| (*v).to_string()).collect(),
+            byte_range: head_range,
+        });
     }
 
     /// Walk the `else if` chain rooted at `head_id`. Each arm's
@@ -3398,7 +3427,7 @@ fn dispatch(x: any) {
     }
 
     #[test]
-    fn non_exhaustive_enum_chain_warns() {
+    fn non_exhaustive_enum_chain_records_finding() {
         let src = r#"
 enum Color { Red, Green, Blue }
 fn pick(c: Color): int {
@@ -3411,12 +3440,23 @@ fn pick(c: Color): int {
 }
 "#;
         let r = analyze_src_only(src);
+        // Recording happens during analysis; the lint pipeline turns
+        // this into a `non-exhaustive` LintDiagnostic later.
+        assert_eq!(
+            r.non_exhaustive_findings.len(),
+            1,
+            "expected one non-exhaustive finding, got: {:?}",
+            r.non_exhaustive_findings
+        );
+        let finding = &r.non_exhaustive_findings[0];
+        assert_eq!(finding.enum_name, "Color");
+        assert_eq!(finding.missing, vec!["Blue".to_string()]);
+        // The legacy `SemanticDiagnostic` channel must not also fire.
         assert!(
-            r.diagnostics
+            !r.diagnostics
                 .iter()
-                .any(|d| d.message.contains("non-exhaustive match over `Color`")
-                    && d.message.contains("Blue")),
-            "expected non-exhaustive diag mentioning Blue, got: {:?}",
+                .any(|d| d.message.contains("non-exhaustive")),
+            "non-exhaustive must no longer ride the structural channel, got: {:?}",
             r.diagnostics
         );
     }
@@ -3445,11 +3485,9 @@ fn pick(c: Color): int {
 "#;
         let r = analyze_src_only(src);
         assert!(
-            !r.diagnostics
-                .iter()
-                .any(|d| d.message.contains("non-exhaustive")),
+            r.non_exhaustive_findings.is_empty(),
             "lone `if (x == E::V)` should not flag exhaustiveness, got: {:?}",
-            r.diagnostics
+            r.non_exhaustive_findings
         );
     }
 
@@ -3470,11 +3508,9 @@ fn pick(c: Color): int {
 "#;
         let r = analyze_src_only(src);
         assert!(
-            !r.diagnostics
-                .iter()
-                .any(|d| d.message.contains("non-exhaustive")),
-            "expected no exhaustiveness diag, got: {:?}",
-            r.diagnostics
+            r.non_exhaustive_findings.is_empty(),
+            "expected no exhaustiveness finding, got: {:?}",
+            r.non_exhaustive_findings
         );
     }
 
@@ -3492,11 +3528,9 @@ fn pick(c: Color): int {
 "#;
         let r = analyze_src_only(src);
         assert!(
-            !r.diagnostics
-                .iter()
-                .any(|d| d.message.contains("non-exhaustive")),
-            "expected final-else to suppress diag, got: {:?}",
-            r.diagnostics
+            r.non_exhaustive_findings.is_empty(),
+            "expected final-else to suppress finding, got: {:?}",
+            r.non_exhaustive_findings
         );
     }
 

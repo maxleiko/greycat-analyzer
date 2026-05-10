@@ -26,8 +26,9 @@ use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
 use crate::directives::Directives;
 use crate::lint::{
     LintDiagnostic, lint_arrow_on_non_deref_with_directives,
-    lint_inferred_return_type_with_directives, lint_nullability_with_directives,
-    lint_unreachable_with_directives, lint_unused_suppressions, run_lints_with_directives,
+    lint_inferred_return_type_with_directives, lint_non_exhaustive_with_directives,
+    lint_nullability_with_directives, lint_unreachable_with_directives, lint_unused_suppressions,
+    run_lints_with_directives,
 };
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::{FnSignature, ProjectIndex};
@@ -1052,6 +1053,7 @@ impl ProjectAnalysis {
                         | "infer-return-type"
                         | "unused-suppression"
                         | "unreachable"
+                        | "non-exhaustive"
                 )
             });
             lint_arrow_on_non_deref_with_directives(
@@ -1081,6 +1083,12 @@ impl ProjectAnalysis {
             );
             lint_unreachable_with_directives(
                 &module.hir,
+                &module.analysis,
+                &mut module.lints,
+                &mut module.directives,
+                bypass,
+            );
+            lint_non_exhaustive_with_directives(
                 &module.analysis,
                 &mut module.lints,
                 &mut module.directives,

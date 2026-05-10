@@ -48,6 +48,7 @@ pub fn edit_for_diagnostic(
             delete_comment_line_fix(text, start)
         }
         "unreachable" => unreachable_fix(text, start, end),
+        "non-exhaustive" => non_exhaustive_fix(text, start, message),
         _ => Vec::new(),
     }
 }
@@ -259,6 +260,127 @@ fn unreachable_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
         byte_range: del_start..del_end,
         new_text: String::new(),
     }]
+}
+
+/// Quickfix for `non-exhaustive`: append an `else if (rec == E::V) { … }`
+/// arm for every missing variant, keyed off the diagnostic message and
+/// the head `if_stmt`'s CST shape. The diagnostic's byte_range starts on
+/// the head if; the splice point is `head.byte_range().end` (right after
+/// the chain's trailing `}`), which keeps `} else if {` on the same line
+/// in line with the existing chain style.
+///
+/// We *don't* offer a separate "add catch-all `else { }`" alternative
+/// here — `edit_for_diagnostic` returns one fix per diagnostic, and the
+/// missing-arm shape is the more useful default (each variant gets
+/// explicit handling, the user can collapse to `else { }` themselves
+/// in seconds). Extending the API to return multiple alternatives is a
+/// larger surface change tracked separately.
+fn non_exhaustive_fix(text: &str, start: usize, message: &str) -> Vec<TextEdit> {
+    let tree = greycat_analyzer_syntax::parse(text);
+    let root = tree.root_node();
+    let Some(head) = enclosing_kind(root, start, "if_stmt") else {
+        return Vec::new();
+    };
+    let Some(receiver) = receiver_text_for_chain_head(text, head) else {
+        return Vec::new();
+    };
+    let Some((enum_name, missing)) = parse_non_exhaustive_message(message) else {
+        return Vec::new();
+    };
+    let head_range = head.byte_range();
+    let indent = leading_whitespace_at(text, head_range.start);
+    let body_indent_extra = "    ";
+
+    let mut new_text = String::new();
+    for variant in &missing {
+        new_text.push_str(" else if (");
+        new_text.push_str(receiver);
+        new_text.push_str(" == ");
+        new_text.push_str(enum_name);
+        new_text.push_str("::");
+        new_text.push_str(variant);
+        new_text.push_str(") {\n");
+        new_text.push_str(indent);
+        new_text.push_str(body_indent_extra);
+        new_text.push_str("// TODO: handle ");
+        new_text.push_str(enum_name);
+        new_text.push_str("::");
+        new_text.push_str(variant);
+        new_text.push('\n');
+        new_text.push_str(indent);
+        new_text.push('}');
+    }
+
+    vec![TextEdit {
+        byte_range: head_range.end..head_range.end,
+        new_text,
+    }]
+}
+
+/// Walk up from `byte` until a node of `kind` is hit. Like
+/// [`enclosing_node_range`] but returns the [`Node`] itself so the
+/// caller can read fields / children.
+fn enclosing_kind<'tree>(root: Node<'tree>, byte: usize, kind: &str) -> Option<Node<'tree>> {
+    let mut node = root.descendant_for_byte_range(byte, byte)?;
+    loop {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+/// Read the receiver ident text from the head if's `binary_expr`
+/// condition. The chain extractor only matches `ident == E::variant`
+/// (or its mirror), so one operand is always an `ident` — return its
+/// source text. The `static_expr` side carries the enum reference and
+/// is handled separately via the message.
+fn receiver_text_for_chain_head<'a>(text: &'a str, if_stmt: Node<'_>) -> Option<&'a str> {
+    let cond = if_stmt.child_by_field_name("condition")?;
+    if cond.kind() != "binary_expr" {
+        return None;
+    }
+    let left = cond.child_by_field_name("left")?;
+    let right = cond.child_by_field_name("right")?;
+    let ident_node = match (left.kind(), right.kind()) {
+        ("ident", _) => left,
+        (_, "ident") => right,
+        _ => return None,
+    };
+    Some(&text[ident_node.byte_range()])
+}
+
+/// Parse `non-exhaustive match over \`Foo\` (missing: a, b, c)` into
+/// `("Foo", ["a","b","c"])`. Returns `None` on any deviation so the
+/// quickfix bails out cleanly rather than emitting wrong code.
+fn parse_non_exhaustive_message(message: &str) -> Option<(&str, Vec<&str>)> {
+    let after_over = message.split_once("over `")?.1;
+    let (enum_name, rest) = after_over.split_once('`')?;
+    let after_missing = rest.split_once("missing:")?.1;
+    let inside_parens = after_missing.split_once(')')?.0;
+    let missing: Vec<&str> = inside_parens
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some((enum_name, missing))
+}
+
+/// Leading whitespace (spaces / tabs) on the line that contains `byte`,
+/// up to `byte`. Used so injected arms inherit the existing chain's
+/// column. Returns `""` when `byte` sits at the start of a line.
+fn leading_whitespace_at(text: &str, byte: usize) -> &str {
+    let line_start = text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &text[line_start..byte];
+    let ws_end = line
+        .char_indices()
+        .find(|(_, c)| !matches!(c, ' ' | '\t'))
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    &line[..ws_end]
 }
 
 /// **P23.3 follow-up** — fix for `unused-suppression`. The diagnostic's
@@ -695,5 +817,64 @@ mod tests {
         let mut after = src.to_string();
         after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
         assert!(!after.contains("gcl-lint-off"), "after = {after:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // `non-exhaustive` quickfix
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn non_exhaustive_appends_else_if_arms_for_each_missing_variant() {
+        let src = "\
+enum E { foo, bar, baz, qux }
+fn t(e: E) {
+    if (e == E::foo) {
+    } else if (e == E::bar) {
+    }
+}
+";
+        let head = src.find("if (e == E::foo)").unwrap();
+        // Use a realistic message — the quickfix parses missing variants
+        // out of it. The quickfix dispatcher requires the right `code`,
+        // and the message is what the lint emitter actually produces.
+        let msg = "non-exhaustive match over `E` (missing: baz, qux)";
+        let edits = edit_for_diagnostic(
+            src,
+            "non-exhaustive",
+            &(head..head + "if (e == E::foo)".len()),
+            msg,
+        );
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        // Both missing arms appear, in order, with same-line `} else if`.
+        assert!(
+            after.contains("} else if (e == E::baz) {"),
+            "expected `else if E::baz` arm, after =\n{after}"
+        );
+        assert!(
+            after.contains("} else if (e == E::qux) {"),
+            "expected `else if E::qux` arm, after =\n{after}"
+        );
+        // Indentation matches the head `if`'s 4-space indent (chain
+        // sits inside `fn t(e: E) {`, so head is at 4 spaces, bodies at 8).
+        assert!(
+            after.contains("    } else if (e == E::baz) {\n        // TODO: handle E::baz\n    }"),
+            "expected indented arm body, after =\n{after}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_no_edits_when_message_doesnt_parse() {
+        // Defensive: a malformed message must not produce edits.
+        let src = "fn t(e: E) { if (e == E::foo) {} else if (e == E::bar) {} }\n";
+        let head = src.find("if (e == E::foo)").unwrap();
+        let edits = edit_for_diagnostic(
+            src,
+            "non-exhaustive",
+            &(head..head + 4),
+            "totally not the expected shape",
+        );
+        assert!(edits.is_empty());
     }
 }

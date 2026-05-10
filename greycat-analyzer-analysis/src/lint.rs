@@ -211,6 +211,11 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
                   or the trailing `else` of an exhaustive enum chain)",
     },
     LintRuleInfo {
+        name: "non-exhaustive",
+        summary: "warn when an `if (x == E::A) … else if (x == E::B) …` chain over an enum \
+                  doesn't cover every variant (and has no catch-all final `else`)",
+    },
+    LintRuleInfo {
         name: "unused-suppression",
         summary: "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
     },
@@ -1422,6 +1427,39 @@ fn lint_unreachable_inner(
     }
 }
 
+/// Emit a `non-exhaustive` lint for every enum-eq chain the analyzer
+/// flagged in pass 2. The analyzer records the findings into
+/// [`AnalysisResult::non_exhaustive_findings`] so this rule can ride
+/// the standard lint pipeline (`emit_typed` honors `// gcl-lint-off…`
+/// directives, `unused-suppression` checks against actual emissions,
+/// quickfixes dispatch by `code`).
+pub fn lint_non_exhaustive_with_directives(
+    analysis: &AnalysisResult,
+    out: &mut Vec<LintDiagnostic>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+) {
+    for finding in &analysis.non_exhaustive_findings {
+        let msg = format!(
+            "non-exhaustive match over `{}` (missing: {})",
+            finding.enum_name,
+            finding.missing.join(", "),
+        );
+        emit_typed(
+            out,
+            Some(&mut *directives),
+            bypass_suppressions,
+            LintDiagnostic {
+                rule: "non-exhaustive",
+                severity: LintSeverity::Warning,
+                message: msg,
+                byte_range: finding.byte_range.clone(),
+                tag: None,
+            },
+        );
+    }
+}
+
 fn collect_dead_in_fn(
     hir: &Hir,
     analysis: &AnalysisResult,
@@ -2275,6 +2313,86 @@ fn f(x: Outer) {
             m.lints.iter().any(|l| l.rule == "unknown-suppression-rule"),
             "expected unknown-suppression-rule: {:?}",
             m.lints
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `non-exhaustive` lint (promoted from a structural diagnostic; see
+    // analyzer.rs `check_enum_exhaustiveness` + `lint_non_exhaustive_with_directives`)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn non_exhaustive_lint_emits_for_uncovered_chain() {
+        let diags = project_lints(
+            r#"
+enum Color { Red, Green, Blue }
+fn pick(c: Color) {
+    if (c == Color::Red) {
+    } else if (c == Color::Green) {
+    }
+}
+"#,
+        );
+        let hit = diags
+            .iter()
+            .find(|d| d.rule == "non-exhaustive")
+            .expect("expected one `non-exhaustive` lint");
+        assert!(hit.message.contains("Color"));
+        assert!(hit.message.contains("Blue"));
+    }
+
+    #[test]
+    fn non_exhaustive_lint_respects_lint_off_next() {
+        // `// gcl-lint-off-next non-exhaustive` directly above the head
+        // if drops the diagnostic. The directive must not also surface
+        // an `unused-suppression` (it actually suppressed something).
+        let diags = project_lints(
+            r#"
+enum Color { Red, Green, Blue }
+fn pick(c: Color) {
+    // gcl-lint-off-next non-exhaustive
+    if (c == Color::Red) {
+    } else if (c == Color::Green) {
+    }
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "non-exhaustive"),
+            "directive should suppress `non-exhaustive`, got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-suppression"),
+            "active suppression must not be flagged unused, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_directive_on_exhaustive_chain_is_unused() {
+        // The chain *is* exhaustive (every variant covered), so the
+        // suppression has nothing to do — `unused-suppression` fires,
+        // and no `non-exhaustive` lint is emitted in the first place.
+        let diags = project_lints(
+            r#"
+enum Color { Red, Green, Blue }
+fn pick(c: Color) {
+    // gcl-lint-off-next non-exhaustive
+    if (c == Color::Red) {
+    } else if (c == Color::Green) {
+    } else if (c == Color::Blue) {
+    }
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "non-exhaustive"),
+            "exhaustive chain should not flag, got {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "unused-suppression" && d.message.contains("non-exhaustive")),
+            "expected unused-suppression on dead `non-exhaustive` toggle: {diags:?}"
         );
     }
 
