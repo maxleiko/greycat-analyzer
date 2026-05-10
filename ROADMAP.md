@@ -677,6 +677,70 @@ The TS reference's per-construct *intent* is preserved (e.g. `args_spaced` ↔ `
 
 ---
 
+### Phase 22 — Code-action / quickfix correctness (~1 week)
+
+**Goal:** `cli lint --fix` and the LSP code-action layer never produce broken `.gcl`. Fix the per-rule edit-construction bugs the solarleb dogfood exposed, and add a parse-after-fix safety net so a future bug can't silently mangle source again.
+
+**Why now.** Running `greycat-analyzer lint --fix` on a real-world project ([`assaad/solarleb`](file:///home/leiko/dev/datathings/assaad/solarleb)) produces 7 modified files of which **every modification has at least one syntactic break** — see the `git diff` snapshot. Concrete bugs from that run:
+
+- **Bug A — `unused-local` quickfix removes the ident only.** The diagnostic's `byte_range` covers just the ident (`foo` in `var foo = expr;`), and `diag_to_edit` replaces *that* range with empty, producing `var  = expr;` (parse error). 6 files in solarleb show this pattern.
+- **Bug B — `unused-decl` shares the same code path** at top level. Same shape: ident-only removal would produce `fn  () {}` etc. Not yet exercised on solarleb because the project has no unused-decl warnings, but the bug is identical.
+- **Bug C — `unused-param` cascade.** Lint fires false-positive `unused-param` on `from`/`to` in `fn f(from: time, to: time) { for (k, v in xs[from..to]) { ... } }`. Quickfix renames to `_from` / `_to`, and now the body's `[from..to]` references undefined idents. **Root cause is upstream:** the `for_in_stmt` HIR lowering reads only the `iterator` field and ignores the optional `range: interval_expr` field. When tree-sitter parses `xs[from..to]` (in for-in iterator position) as `iterator: xs` + `range: [from..to]` (the math-style interval, prec 2 wins over offset_expr), the body's `from`/`to` references never reach the resolver and the lint sees them as unused.
+- **Bug D — stray tokens injected on cascade passes.** `lint --fix` is a 5-pass loop: pass 1 applies fixes, pass 2 re-lints the now-broken file. The recovery parser fires `missing-token` diagnostics at arbitrary recovery points; the fix injects those tokens. solarleb's `livefeed.gcl:585` ends up with a stray `)` after a string literal because a downstream parse error cascaded into a `missing-token` quickfix. Compound symptom of A.
+
+The fix pattern in all cases: **make the quickfix produce a syntactically valid result, and refuse to write if it doesn't.**
+
+**Chunks:**
+
+- [ ] **22.1 `unused-local` removes whole `var x = expr;` statement** (S) — `diag_to_edit` and `synthesize_fix` both call a new helper `enclosing_var_decl_range(text, ident_byte_start)` that re-parses the source via `greycat_analyzer_syntax::parse`, walks `descendant_for_byte_range` up to a `var_decl` ancestor, and returns its `byte_range`. The diagnostic's display range stays narrow (just the ident) for cursor placement; the **fix range** widens to the whole statement. Acceptance: `var foo = bar();` with `foo` flagged unused → the entire statement is removed (empty line + caller indent left behind for the formatter to clean).
+
+- [ ] **22.2 `unused-decl` removes whole top-level decl** (S) — same helper shape: walk to enclosing `fn_decl` / `type_decl` / `enum_decl` / `modvar`. Doc-comment + `@annotations` siblings (immediate predecessors with no source-line gap between them and the decl keyword) are absorbed into the fix range so a removed `private fn foo() {}` doesn't leave its `/// foo doc` orphan above. Acceptance: a private unused fn becomes 0 lines of output.
+
+- [ ] **22.3 `unused-param` rename verifies safety** (S) — before applying the rename, scan the function body's source range for any text-level occurrence of the bare ident name. If found, refuse the fix (`diag_to_edit` returns `None`, `synthesize_fix` returns `vec![]`). Belt-and-suspenders against a lint detection bug surfacing as an auto-fix that breaks the source. The lint detection itself stays untouched — when it's correct (zero uses), the fix applies; when it's a false positive (uses present that the resolver missed), the fix is skipped. Mirrors the pattern Rust's clippy uses for "have I missed something?" cases.
+
+- [ ] **22.4 For-in iterator/range lowering** (M) — root cause of Bug C. `for_in_stmt` lowering currently reads `child_by_field_name("iterator")` and ignores `range: optional($.interval_expr)`. When both fields are present (the math-style for-in range, e.g. `for (k, v in xs[from..to])` parsed as `iterator: xs` + `range: [from..to]`), fold the range into the iterator: `Expr::Offset { receiver: lower(iterator), index: lower(range), pre_optional: false, post_optional: false }`. Resolver / analyzer arms that already handle Offset+Range pick up the body's `from`/`to` references for free. Acceptance: `for (k, v in xs[from..to]) {}` produces zero `unused-param` / `unused-local` diagnostics on `from`/`to`. New resolver test anchors the binding.
+
+- [ ] **22.5 Post-fix parse validation: revert on breakage** (M) — after applying edits in `cli lint --fix`'s per-pass loop, re-parse the new text via `greycat_analyzer_syntax::parse` and check `root.has_error()`. If the new text has parse errors that the *old* text didn't, **revert** the file to the pre-edit content and emit a hard error: `[fix] reverted <path>: would have introduced N parse error(s)`. The CLI exit code then reflects the partial failure. Same gate at the LSP `synthesize_fix` boundary: never return a code action whose edits would break the document's parse (apply-in-memory + re-parse before returning the `WorkspaceEdit`). The safety net catches future bugs even when the per-rule logic is wrong.
+
+- [ ] **22.6 solarleb dogfood test** (S) — new `greycat-analyzer/tests/solarleb_fix.rs` that, when `~/dev/datathings/assaad/solarleb/.git` exists, does: (1) snapshot the project's clean state with `git stash --include-untracked` (no-op on clean tree), (2) runs `lint --fix` on `backend/`, (3) re-parses every modified file and asserts zero parse errors, (4) restores the project with `git stash pop`. Skips when the corpus is missing so CI on a clean runner doesn't break. Belt-and-suspenders for 22.5 — even if 22.5's revert path has a hole, the dogfood test catches a regression on the actual corpus that exposed the bugs.
+
+- [ ] **22.7 Extract a shared `quickfix` module** (S) — `diag_to_edit` (cli) and `synthesize_fix` (LSP) currently maintain parallel implementations of the same per-rule logic. Pull both into `greycat-analyzer-analysis::quickfix::edit_for_diagnostic(text: &str, diag: &Diagnostic) -> Vec<TextEdit>` and have both callers consume the shared function. Eliminates the "fix in one place, forget the other" failure mode that 22.1 / 22.2 / 22.3 each have to dodge. Drops ~150 LoC of duplication.
+
+**M22:** `cli lint --fix` on solarleb produces zero parse errors and zero spurious diffs (only the diffs the user actually asked for). `lint --fix` *cannot* write a file with new parse errors — if a quickfix would produce one, the file is reverted and the error is surfaced. The 348 workspace tests stay green plus a handful of new ones (for-in lowering, fix-range expansion, post-fix validation, solarleb dogfood when present).
+
+---
+
+### Phase 23 — Lint rule relaxation via line comments (~1 week, **deferred**)
+
+**Goal:** per-line user opt-out from individual lint rules via leading line comments. Mirrors the convention from rustc / clippy: `// allow(<rule-name>)` on the line above the offending construct disables that rule for the construct.
+
+**Use cases.** False positives the lint detection won't catch until a future fix lands; intentional dead code (placeholder params for trait-shape, work-in-progress locals); pre-existing patterns the user wants to preserve. Today the only escape hatch is the `_`-prefix convention (which only covers `unused-local` / `unused-param`); broader rules have no opt-out at all.
+
+**Sketch:**
+
+```gcl
+// allow(redundant-non-null-assertion)
+var line = csvReader.read()!!;   // analyzer thinks it's non-null but it isn't
+
+// allow(unused-local, unused-decl)
+fn placeholder() {}
+
+// allow(*)
+var really_dont_lint_this = expr;
+```
+
+**Chunks (deferred — define only):**
+
+- [ ] **23.1 Parse `// allow(<rule-name>[, <rule-name>]*)` comments** (S) — at the lint stage entry point, walk the parsed CST for `line_comment` extras whose text matches `/\/\/\s*allow\((.*)\)\s*$/`. Build a `HashMap<line_number_after_comment, HashSet<&'static str>>` keyed on the *next* source line.
+- [ ] **23.2 Suppress emission** (S) — every `LintDiagnostic` push site converts its `byte_range.start` to a line number and consults the allow-map. If the diagnostic's rule is in the allow-set for that line, drop it before pushing. Centralized in a new `LintCx::emit(diag)` helper so individual rules don't reach into the map.
+- [ ] **23.3 Wildcard `// allow(*)`** (XS) — `*` in the rule list disables all lints for the next line. Already covered by 23.1's parse + a special sentinel `Symbol("*")` that 23.2 short-circuits on.
+- [ ] **23.4 Block-level `// allow_block(...)`** (S) — disables for the entire next block (e.g. a function body, a type body). Implementation: walk the CST for the `_stmt` / `_decl` whose start line equals `comment_line + 1`, expand the suppression range to that node's full byte range, store as `(start_byte, end_byte) → HashSet<&'static str>` and probe at emission time.
+- [ ] **23.5 Documentation** (S) — surface the convention in the cli `lint --help` output, the LSP server README, and the analyzer crate's rustdoc. Include a list of all rule names users can disable (auto-generated from the registered `LintRule::name()` values so the doc never goes stale).
+
+**M23:** `// allow(<rule>)` on the previous line silences that rule for the construct on the next line. `// allow(*)` silences every rule. The escape hatch matches what users expect from rustc / clippy / eslint, and gives them a place to land while a lint detection bug is being fixed in the analyzer proper.
+
+---
+
 ## 7. Test strategy
 
 Three layers, no "port every TS test" milestone (tarpit).
