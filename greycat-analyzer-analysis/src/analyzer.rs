@@ -1,4 +1,4 @@
-//! Foundational type analyzer (P2.5).
+//! Foundational type analyzer.
 //!
 //! Walks an HIR module after [`crate::resolver::resolve`] has produced a
 //! `Resolutions` table, infers a [`TypeId`] for every expression, and
@@ -39,7 +39,8 @@ use greycat_analyzer_types::{
 use crate::resolver::{Definition, Resolutions};
 use crate::stdlib::ProjectIndex;
 
-/// P13.1 — does this statement always exit the enclosing control
+// P13.1
+/// Does this statement always exit the enclosing control
 /// flow (`return`, `throw`, `break`, `continue`)? `Block` recurses
 /// into its last statement. `If` requires *both* branches to
 /// terminate (no else → not terminal). Used by the analyzer to lift
@@ -72,12 +73,13 @@ fn block_terminates(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -
     block.stmts.last().is_some_and(|s| stmt_terminates(hir, *s))
 }
 
-/// P12.4 — classify a numeric literal's source text as `int` or
+// P12.4
+/// Classify a numeric literal's source text as `int` or
 /// `float`. Returns `Primitive::Float` for literals that contain a
 /// decimal point, scientific notation (`1e3`, `1.5E-2`), or trailing
 /// `_f` suffix; everything else falls back to `Primitive::Int`. Other
 /// typed suffixes (`_time`, `_duration`, …) leave `LiteralKind::Number`
-/// untyped today; P13.3 promotes those to dedicated `LiteralKind`
+/// untyped today;  promotes those to dedicated `LiteralKind`
 /// variants so this helper only sees float / int candidates.
 fn numeric_literal_kind(text: &str) -> Primitive {
     if text.ends_with("_f") {
@@ -106,7 +108,7 @@ fn numeric_literal_kind(text: &str) -> Primitive {
 }
 
 /// Severity sketch for analyzer diagnostics. Maps onto `lsp_types::DiagnosticSeverity`
-/// at the LSP boundary (P2.7).
+/// at the LSP boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -178,7 +180,8 @@ pub struct NonExhaustiveFinding {
 
 /// Output of the analyzer for a single module.
 ///
-/// **P19:** the [`TypeArena`] that backs every `TypeId` in this struct
+// P19
+/// The [`TypeArena`] that backs every `TypeId` in this struct
 /// is owned by [`crate::project::ProjectAnalysis`], not here. Pass it
 /// alongside any `AnalysisResult` you want to inspect — call
 /// [`crate::project::ProjectAnalysis::arena`] to get a borrow.
@@ -193,20 +196,21 @@ pub struct AnalysisResult {
     /// `var y: T = …`).
     pub def_types: HashMap<Idx<Ident>, TypeId>,
     /// Module-local map from declared type name to its HIR `TypeDecl`.
-    /// Built when the analyzer walks top-level decls — lets P6.3
+    /// Built when the analyzer walks top-level decls — lets
     /// member resolution navigate from a receiver's `TypeId` back to
     /// the declaring node so attr / method idents can be bound.
     pub type_decls: HashMap<String, Idx<Decl>>,
-    /// Member-access bindings produced by P6.3: each property ident in
+    /// Member-access bindings produced by each property ident in
     /// `a.b` / `a->b` that resolves to a [`TypeAttr`] or to a
     /// `TypeDecl::methods` entry, keyed by the property `Idx<Ident>`.
     /// Capabilities consult this in addition to [`Resolutions`] so
     /// goto-definition / hover work on member access.
     pub member_uses: HashMap<Idx<Ident>, MemberDef>,
-    /// P11.5 cross-module member bindings — same keying as `member_uses`
+    // P11.5, P21
+    /// Cross-module member bindings — same keying as `member_uses`
     /// but the resolved attr / method lives in another module's HIR.
     ///
-    /// **P21:** populated directly by `Cx::resolve_member` against
+    /// Populated directly by `Cx::resolve_member` against
     /// [`crate::stdlib::ProjectIndex::type_members`] when the
     /// receiver's type isn't declared in this module. Pass 3
     /// (`resolve_cross_module_members`) and the per-module
@@ -214,7 +218,8 @@ pub struct AnalysisResult {
     /// the structure index up front, so the body walker resolves
     /// inline.
     pub foreign_member_uses: HashMap<Idx<Ident>, ForeignMember>,
-    /// P15.x — chain-segment bindings populated by `ProjectAnalysis`
+    // P15.x
+    /// Chain-segment bindings populated by `ProjectAnalysis`
     /// pass 3.5 for `Expr::QualifiedStatic` shapes. Each segment ident
     /// (chain[1] = the type, chain[2] = the member when length is 3)
     /// binds to the foreign top-level decl that declares it. Lets
@@ -222,9 +227,10 @@ pub struct AnalysisResult {
     /// `runtime::Identity::create`.
     pub foreign_decl_uses: HashMap<Idx<Ident>, ForeignDecl>,
     pub diagnostics: Vec<SemanticDiagnostic>,
-    /// **P24.2** — head if-stmt ids of enum-eq chains that
+    // P24.2
+    /// Head if-stmt ids of enum-eq chains that
     /// exhaustively cover every variant of the dispatched-on enum.
-    /// Consumed by the `unreachable` lint (P24.3) to flag the trailing
+    /// Consumed by the `unreachable` lint to flag the trailing
     /// `else` arm of such a chain as dead code, and to treat the
     /// chain as effectively divergent for fall-through-deadness
     /// analysis when every arm body diverges.
@@ -249,7 +255,8 @@ pub enum MemberDef {
     Method(Idx<Decl>),
 }
 
-/// P11.5 — a member-access binding that resolves into another module.
+// P11.5
+/// A member-access binding that resolves into another module.
 /// `uri` names the home module of the foreign type's declaration; the
 /// `member` indices reference that module's HIR arenas, not the
 /// analyzed module's.
@@ -259,8 +266,9 @@ pub struct ForeignMember {
     pub member: MemberDef,
 }
 
-/// P15.x — a top-level decl reference resolved into another module.
-/// Used for chain-segment bindings (`runtime::Identity::create` —
+// P15.x
+/// A top-level decl reference resolved into another module.
+/// Used for chain-segment bindings (`runtime::Identity::create`
 /// chain[1] points at runtime.gcl's `type Identity` decl).
 #[derive(Debug, Clone)]
 pub struct ForeignDecl {
@@ -273,21 +281,23 @@ impl AnalysisResult {
         self.expr_types.get(&expr).copied()
     }
 
-    /// Look up a member-access ident's binding (P6.3). Returns the
+    /// Look up a member-access ident's binding. Returns the
     /// declaring `TypeAttr` or method `Decl` if member resolution
     /// succeeded for this ident.
     pub fn member_lookup(&self, ident: Idx<Ident>) -> Option<MemberDef> {
         self.member_uses.get(&ident).copied()
     }
 
-    /// P11.5 — look up a cross-module member-access binding for `ident`.
+    // P11.5
+    /// Look up a cross-module member-access binding for `ident`.
     /// Falls back to `None` for members that are intra-module
     /// ([`Self::member_lookup`]) or unresolved.
     pub fn foreign_member_lookup(&self, ident: Idx<Ident>) -> Option<&ForeignMember> {
         self.foreign_member_uses.get(&ident)
     }
 
-    /// P15.x — look up a chain-segment binding (e.g. `Identity` in
+    // P15.x
+    /// Look up a chain-segment binding (e.g. `Identity` in
     /// `runtime::Identity::create` -> the foreign type decl).
     pub fn foreign_decl_lookup(&self, ident: Idx<Ident>) -> Option<&ForeignDecl> {
         self.foreign_decl_uses.get(&ident)
@@ -299,7 +309,8 @@ impl AnalysisResult {
 /// `any` and cross-module member access can't bind. Used by per-file
 /// capabilities and unit tests.
 ///
-/// **P19:** allocates a fresh [`TypeArena`] internally and discards it
+// P19
+/// Allocates a fresh [`TypeArena`] internally and discards it
 /// — callers that need to inspect `TypeId`s after the call must use
 /// [`analyze_with_index_into`] instead so the arena outlives the call.
 pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
@@ -323,7 +334,7 @@ pub fn analyze_with_index(
 }
 
 /// Run the analyzer with a shared project index *and* a caller-owned
-/// arena (P19). The arena is shared across every module the project
+/// arena. The arena is shared across every module the project
 /// pipeline analyzes so cross-module `TypeId`s point into the same
 /// storage — no `mint_type_shape` / `read_type_shape` translation
 /// needed at the boundary.
@@ -333,7 +344,7 @@ pub fn analyze_with_index(
 /// type references (`p: Point` where `Point` is declared in another
 /// module) lower to the right `Named` shape and `resolve_member` can
 /// defer `(property, type_name)` for the project's cross-module
-/// member post-pass (P11.5).
+/// member post-pass.
 pub fn analyze_with_index_into(
     hir: &Hir,
     res: &Resolutions,
@@ -401,7 +412,7 @@ pub(crate) fn seed_builtins(arena: &mut TypeArena) {
 /// elaborate the type's attribute list separately.
 ///
 /// Also populates [`AnalysisResult::type_decls`] (name → HIR
-/// `TypeDecl` index) so P6.3 member resolution can navigate from a
+/// `TypeDecl` index) so  member resolution can navigate from a
 /// receiver's `TypeId` back to the declaring node.
 fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisResult) {
     let Some(module) = hir.module.as_ref() else {
@@ -438,7 +449,7 @@ fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisRes
     }
 }
 
-/// Narrowings derived from an `if` condition (P6.4 / P6.5). Each list
+/// Narrowings derived from an `if` condition. Each list
 /// holds *binding* idents (from `Resolutions`) and the override type to
 /// install in the matching branch — `None` means "strip nullable from
 /// the current type", `Some(ty)` means "set to this concrete type"
@@ -449,7 +460,8 @@ struct CondNarrows {
     else_non_null: Vec<Idx<Ident>>,
     /// `(binding, type)` pairs from `x is T` — narrow x to T in then.
     then_typed: Vec<(Idx<Ident>, Idx<TypeRef>)>,
-    /// **P19.16** — non-null narrows for member-access *paths*
+    // P19.16
+    /// Non-null narrows for member-access *paths*
     /// produced by `foo.bar != null` style guards. Same semantics as
     /// `then_non_null` / `else_non_null`, just keyed by a string path
     /// rather than an ident handle. The path is built from
@@ -459,7 +471,7 @@ struct CondNarrows {
     else_member_non_null: Vec<String>,
 }
 
-/// One arm in an enum-equality chain (P6.6).
+/// One arm in an enum-equality chain.
 struct EnumChainArm {
     if_stmt_id: Idx<Stmt>,
     variant: String,
@@ -474,7 +486,8 @@ struct EnumChain {
     has_final_else: bool,
 }
 
-/// **P23** — small dispatch enum used by [`Cx::try_member_call_typing`]
+// P23
+/// Small dispatch enum used by [`Cx::try_member_call_typing`]
 /// so we can read the callee shape from `&self.hir.exprs[idx]` and
 /// then drop that borrow before the recursive `&mut self` call. Plain
 /// `Copy` fields plus an owned `Vec<Idx<Ident>>` for the qualified-
@@ -497,22 +510,25 @@ struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
     out: &'a mut AnalysisResult,
-    /// P19: project-wide type arena. Owned by `ProjectAnalysis`, so
+    // P19
+    /// Project-wide type arena. Owned by `ProjectAnalysis`, so
     /// every module's analyzer mints into the same `TypeArena` and
     /// `TypeId`s are comparable across module boundaries.
     arena: &'a mut TypeArena,
-    /// P11.5: cross-module project index. Per-file callers pass an
+    // P11.5
+    /// Cross-module project index. Per-file callers pass an
     /// empty [`ProjectIndex::new`]; the project pipeline passes the
     /// index it just rebuilt. Used by `lower_type_ref` to recognize
     /// type names that aren't declared in this module.
     index: &'a ProjectIndex,
-    /// Null-flow narrowing stack (P6.4). Each frame is a binding ident
+    /// Null-flow narrowing stack. Each frame is a binding ident
     /// → temporary `TypeId` override. Frames are pushed on block /
     /// then-branch / else-branch entry and popped on exit, so a
     /// narrowing introduced inside a block stays alive for the rest
     /// of that block but doesn't leak to siblings.
     narrows: Vec<HashMap<Idx<Ident>, TypeId>>,
-    /// **P19.16** — parallel narrow stack keyed by member-access
+    // P19.16
+    /// Parallel narrow stack keyed by member-access
     /// *path* (e.g. `"this.matchingNormalisation"`,
     /// `"foo.bar.baz"`). A path's presence in any frame means the
     /// member access at that path is *guaranteed non-null* in the
@@ -524,10 +540,11 @@ struct Cx<'a> {
     /// no stable path and skip narrowing.
     member_narrows: Vec<HashSet<String>>,
     /// `Stmt::If` ids already accounted for as nested members of an
-    /// enclosing exhaustiveness chain (P6.6). Suppresses duplicate
+    /// enclosing exhaustiveness chain. Suppresses duplicate
     /// "non-exhaustive" diagnostics on inner `else if` arms.
     chain_member_ifs: HashSet<Idx<Stmt>>,
-    /// P12.1 generic-context stack: type-parameter names visible at the
+    // P12.1
+    /// Generic-context stack: type-parameter names visible at the
     /// current scope, mapped to their declaring [`GenericOwner`].
     /// Entered on `fn f<T>(...)` / `type Foo<T> {}` and used by
     /// `lower_type_ref` to mint `GenericParam(name, owner)` instead
@@ -535,7 +552,8 @@ struct Cx<'a> {
     /// `Vec<HashMap>` so nested fns inside a generic type see both
     /// outer and inner names.
     generics_in_scope: Vec<HashMap<String, GenericOwner>>,
-    /// **P19.11** — `this` typing stack. Pushed on entry to a
+    // P19.11
+    /// `this` typing stack. Pushed on entry to a
     /// type's method body (in `visit_type_decl`), popped on exit.
     /// `LiteralKind::This` returns the top of the stack so a
     /// reference to `this` inside `type Foo<T> { fn m() { this } }`
@@ -586,7 +604,8 @@ impl<'a> Cx<'a> {
             top.insert(name, ty);
         }
     }
-    /// **P19.16** — record `path` as guaranteed non-null in the current
+    // P19.16
+    /// Record `path` as guaranteed non-null in the current
     /// scope. Subsequent `Expr::Member` evaluations at the same path
     /// strip the result's nullable bit.
     fn write_member_non_null(&mut self, path: String) {
@@ -618,7 +637,8 @@ impl<'a> Cx<'a> {
         }
         self.out.def_types.get(&name).copied()
     }
-    /// **P19.16** — build a string path key for an expression that's a
+    // P19.16
+    /// Build a string path key for an expression that's a
     /// chain of `Expr::Member` rooted at an `Expr::Ident` (the binding
     /// name) or `Expr::Literal(This)` (yielding `"this"` as the root).
     /// Returns `None` for any other shape (offsets, calls, parens, etc.)
@@ -662,7 +682,8 @@ impl<'a> Cx<'a> {
         self.arena.alloc(t)
     }
 
-    /// **P19.16** — when an assignment's LHS is an `Ident` resolving
+    // P19.16
+    /// When an assignment's LHS is an `Ident` resolving
     /// to a Param/Local, narrow that binding to the RHS's type for
     /// the rest of the enclosing block. The `Stmt::If` post-pass
     /// then lifts narrows that hold along every path through the if.
@@ -694,7 +715,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// **P19.21** — narrow record for the `?=` (coalesce-assign)
+    // P19.21
+    /// Narrow record for the `?=` (coalesce-assign)
     /// operator. Semantics: if LHS is null, assign RHS; otherwise
     /// leave LHS unchanged. The post-state is non-null when RHS is
     /// non-null (either LHS was already non-null, or we just wrote a
@@ -726,7 +748,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// P16.5 — when an `Expr::Arrow` receiver is a single-arg node-tag
+    // P16.5
+    /// When an `Expr::Arrow` receiver is a single-arg node-tag
     /// generic (`node<T>`, `nodeTime<T>`, `nodeList<T>`, `nodeGeo<T>`),
     /// `n->field` resolves against the inner type's members rather
     /// than the tag's own. Mirrors the runtime's `*n.field` semantics:
@@ -747,12 +770,13 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// P6.3 member resolution: bind the property ident in `a.b` /
+    // P6.3
+    /// Member resolution: bind the property ident in `a.b` /
     /// `a->b` to the matching `TypeAttr` or method `Decl` whenever the
     /// receiver's type names a `TypeDecl` declared in this module.
     /// Anonymous types and primitives stay no-binding; cross-module
-    /// receivers (P11.5) consult [`crate::stdlib::ProjectIndex::type_members`]
-    /// directly (P21) and write into `foreign_member_uses` inline —
+    /// receivers consult [`crate::stdlib::ProjectIndex::type_members`]
+    /// directly and write into `foreign_member_uses` inline
     /// no `deferred_member_uses` deferral.
     fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
         let ty = self.arena.get(recv_ty);
@@ -841,7 +865,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// **P23** — inline call-return typing for Member / Arrow /
+    // P23
+    /// Inline call-return typing for Member / Arrow /
     /// Static callees. Looks up the method's pre-lowered return
     /// `TypeId` in `index.type_members[type_name].method_returns` and
     /// applies `arena.substitute` against the receiver's
@@ -901,7 +926,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// **P23** — type a bare-Ident call (`foo()` / `module_fn()`) by
+    // P23
+    /// Type a bare-Ident call (`foo()` / `module_fn()`) by
     /// looking up the fn's signature. Local fns lower the return
     /// `TypeRef` inline; cross-module fns consult the project
     /// signatures index. Generic fns aren't handled here — they
@@ -930,7 +956,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// **P23** — type a `QualifiedStatic` callee. Two shapes:
+    // P23
+    /// Type a `QualifiedStatic` callee. Two shapes:
     /// - `module::fn(...)` — chain has 2 segments. Look up
     ///   `chain[1]` in `index.fn_signatures`.
     /// - `module::Type::method(...)` — chain has 3 segments. Look
@@ -995,7 +1022,8 @@ impl<'a> Cx<'a> {
         Some(self.arena.substitute(ret_ty, &subst))
     }
 
-    /// **P23** — populate `foreign_decl_uses[chain[1]]` (the type
+    // P23
+    /// Populate `foreign_decl_uses[chain[1]]` (the type
     /// segment) and `foreign_member_uses[chain[2]]` (the member
     /// segment, when present) for a `module::Type[::member]`
     /// QualifiedStatic. Lets hover / goto-def render the right thing
@@ -1045,8 +1073,9 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// **P23** — type a `Type::name` / `Type::method` value-position
-    /// Static expr. **P19.13** — distinguishes static-attr value
+    // P23
+    /// Type a `Type::name` / `Type::method` value-position
+    /// Static expr. distinguishes static-attr value
     /// access (`type Foo { static path: String }` then `Foo::path`
     /// → `String`) from a non-static `Type::attr` reference (which
     /// is a runtime `field` handle). For methods, returns the
@@ -1113,7 +1142,8 @@ impl<'a> Cx<'a> {
         })
     }
 
-    /// **P23** — type a `module::name` / `module::Type::name`
+    // P23
+    /// Type a `module::name` / `module::Type::name`
     /// value-position QualifiedStatic expr. Two shapes:
     /// - 2-segment chain (`module::name`) — fn name resolves via
     ///   the project fn signatures index → `function`. Type name
@@ -1175,7 +1205,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// **P22** — type a `foreign_member_uses`-bound `recv.attr` /
+    // P22
+    /// Type a `foreign_member_uses`-bound `recv.attr` /
     /// `recv.method()` shape inline by looking up the project
     /// signatures index. `recv_ty` is the resolution-side receiver
     /// (post-arrow-deref); the returned type already has the
@@ -1285,7 +1316,8 @@ impl<'a> Cx<'a> {
         base
     }
 
-    /// P12.1 — call-site generic inference. Returns `Some(return_ty)`
+    // P12.1
+    /// Call-site generic inference. Returns `Some(return_ty)`
     /// when `callee` resolves to a non-native fn decl with `generics`
     /// declared; the witnesses come from each `(declared_param,
     /// arg_ty)` pair via [`Self::collect_witnesses`]. Returns `None`
@@ -2018,8 +2050,8 @@ impl<'a> Cx<'a> {
 
     /// Narrowing analyzer for if-conditions.
     ///
-    /// Recognizes (P6.4) `x != null` / `x == null` and (P6.5) `x is T`,
-    /// plus (P13.2) conjunctive / disjunctive combinations:
+    /// Recognizes `x != null` / `x == null` and `x is T`,
+    /// plus conjunctive / disjunctive combinations:
     /// - `A && B` then-branch: union of both narrowings (both held).
     /// - `A || B` else-branch: union of both `else` narrowings (both
     ///   inverses held). Mixed forms can't safely narrow either side.
@@ -2095,7 +2127,8 @@ impl<'a> Cx<'a> {
         out
     }
 
-    /// P6.6 exhaustiveness: if `head_id` is the start of an
+    // P6.6
+    /// Exhaustiveness: if `head_id` is the start of an
     /// `if (x == E::A) { ... } else if (x == E::B) { ... }` chain (no
     /// final `else`), check that every variant of `E` is covered. Emit
     /// a `non-exhaustive match over E (missing: …)` diagnostic if not.
@@ -2271,7 +2304,8 @@ impl<'a> Cx<'a> {
         None
     }
 
-    /// **P19.16 + P19.21** — `foo.bar != null` / `null != foo.bar`
+    // P19.16 + P19.21
+    /// `foo.bar != null` / `null != foo.bar`
     /// (and `==`, plus the `->` arrow form `foo->bar`) shape detection.
     /// Returns the member-access path string when one side is an
     /// `Expr::Member` / `Expr::Arrow` rooted at an Ident / `this` and
@@ -3534,7 +3568,8 @@ fn pick(c: Color): int {
         );
     }
 
-    /// P16.1 — `Expr::Member` resolving to an `Attr` reports the
+    // P16.1
+    /// `Expr::Member` resolving to an `Attr` reports the
     /// attr's declared type as the expression type, not `any`. Closes
     /// the project.gcl bug where `var s = x.s.size();` typed `x.s` as
     /// `any` even though `s: String` was bound.
@@ -3552,7 +3587,8 @@ fn f(x: Foo): String { return x.s; }
         );
     }
 
-    /// P16.1 — `Expr::Member` resolving to a `Method` reports
+    // P16.1
+    /// `Expr::Member` resolving to a `Method` reports
     /// `function`-typed (gcl's first-class function type).
     #[test]
     fn member_method_ref_types_as_function() {

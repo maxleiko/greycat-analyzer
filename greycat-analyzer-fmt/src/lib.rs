@@ -63,7 +63,8 @@ pub fn format_with(source: &str, opts: FmtOptions) -> String {
     format_tree_with(source, root, opts)
 }
 
-/// **P23.4** — `// gcl-fmt-off-file` short-circuit. When the source's
+// P23.4
+/// `// gcl-fmt-off-file` short-circuit. When the source's
 /// module head carries this directive, return `source.to_string()`
 /// without lowering. Centralized here so every public entry point
 /// honors it.

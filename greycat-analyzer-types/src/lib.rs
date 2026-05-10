@@ -1,7 +1,7 @@
-//! Type system for greycat — foundation port (P2.4).
+//! Type system for greycat — foundation port.
 //!
 //! Ports the core of `packages/lang/src/analysis/types.ts` (~2,811 LoC of
-//! TS). This crate is the foundation P2.5 (analyzer) builds on; it owns
+//! TS). This crate is the foundation the analyzer builds on; it owns
 //! the `Type` enum, type interning, and subtyping rules.
 //!
 //! What's here:
@@ -11,7 +11,7 @@
 //! - [`TypeRegistry`]: holds per-module declared types so Named lookups
 //!   work without walking the HIR every time.
 //! - Subtyping (`is_assignable_to`) covering the cases the analyzer needs
-//!   in P2.5: primitive widening, null-into-nullable, generic invariance,
+//!   in primitive widening, null-into-nullable, generic invariance,
 //!   any/never, lambda variance.
 //!
 //! What's deferred:
@@ -38,11 +38,12 @@ impl TypeId {
     }
 }
 
-/// **P19.9** — a project-wide interned identifier. `Copy`-able 32-bit
+// P19.9
+/// A project-wide interned identifier. `Copy`-able 32-bit
 /// handle into a [`SymbolTable`]; comparing two `Symbol`s is one
 /// integer compare regardless of source string length.
 ///
-/// `Symbol`s are *not* comparable across `SymbolTable` instances —
+/// `Symbol`s are *not* comparable across `SymbolTable` instances
 /// each table assigns its own dense numbering. The
 /// [`crate::SymbolTable`] that issued a symbol must be the one used
 /// to resolve it back to text.
@@ -58,7 +59,8 @@ impl Symbol {
     }
 }
 
-/// **P19.9** — append-only string interner. One allocation per unique
+// P19.9
+/// Append-only string interner. One allocation per unique
 /// name across the project lifetime. Hot lookup paths (analyzer body
 /// walker, project orchestrator) use `lookup` for read-only checks
 /// and `intern` only when extending the index.
@@ -313,7 +315,8 @@ impl TypeArena {
         })
     }
 
-    /// P19 — substitute `GenericParam(name)` occurrences inside `ty`
+    // P19
+    /// Substitute `GenericParam(name)` occurrences inside `ty`
     /// with the matching entry in `subst`, allocating fresh interned
     /// types for any container that changed shape. Idempotent: calling
     /// twice produces the same TypeId. Mirrors
@@ -424,7 +427,7 @@ impl TypeArena {
 // Type registry — holds module-level declared types
 // =============================================================================
 
-/// Looks up named types. P2.5/P2.6 will populate this from HIR + stdlib.
+/// Looks up named types. / will populate this from HIR + stdlib.
 #[derive(Debug, Default)]
 pub struct TypeRegistry {
     /// Maps simple type name -> a Named TypeId in the arena.
@@ -444,7 +447,8 @@ impl TypeRegistry {
         self.named.get(name).copied()
     }
 
-    /// **P19.6** — iterate every registered name. Used by the
+    // P19.6
+    /// Iterate every registered name. Used by the
     /// signature-cache invalidation path to fingerprint the
     /// project-wide name set.
     pub fn iter_names(&self) -> impl Iterator<Item = &str> {
@@ -463,7 +467,7 @@ impl TypeRegistry {
 /// invariant in their parameters (TS reference behavior).
 ///
 /// Returns `false` for shapes the relation hasn't been formally taught
-/// — better to under-accept and surface false negatives in P2.5 than to
+/// — better to under-accept and surface false negatives in  than to
 /// silently widen.
 pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     if from == to {
@@ -636,7 +640,7 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
 /// chars, bools etc. don't widen.
 /// `true` for any of the runtime "node-tag" generic names that
 /// auto-deref to their inner type in the assignability relation
-/// (P7.3). Drawn from the TS reference's `StdCoreTypes` interface.
+///. Drawn from the TS reference's `StdCoreTypes` interface.
 pub fn is_node_tag(name: &str) -> bool {
     matches!(
         name,
@@ -739,7 +743,7 @@ impl InferenceTable {
 /// Mirrors the TS reference's `isCastable` (`packages/lang/src/analysis/
 /// utils.ts:360`). Cast rules are asymmetric to assignability — `int as
 /// nodeTime` is allowed even though `int` doesn't assign-flow into
-/// `nodeTime`. Implements (P12.3 — deeper node-tag rules):
+/// `nodeTime`. Implements (deeper node-tag rules):
 /// - `any → any` always.
 /// - Nullables: `T?` casts the same as `T`.
 /// - `int ↔ {int, float, node, nodeTime, nodeList, nodeIndex, nodeGeo}`.
@@ -891,7 +895,8 @@ pub fn display(arena: &TypeArena, id: TypeId) -> String {
     s
 }
 
-/// P18.1 — fully-qualified-name display, matching the TS reference's
+// P18.1
+/// Fully-qualified-name display, matching the TS reference's
 /// canonical printer (e.g. `core::int`, `core::Array<core::int | null>`,
 /// `project::Foo`).
 ///

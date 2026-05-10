@@ -118,9 +118,9 @@ impl SourceManager {
     /// the [`LoadReport`] with everything actually parsed in this load,
     /// including which `@library` declarations couldn't be resolved.
     ///
+    // P1.4 — diagnostics deferred. P2 — project-graph data model.
     /// This is the recursive-load slice of TS `analyze.ts:resolve_*` —
-    /// trimmed to path resolution + parsing, with diagnostics deferred to
-    /// P1.4 and the project-graph data model deferred to P2.
+    /// trimmed to path resolution + parsing.
     pub fn load_project(&mut self, project_filepath: &Path) -> LoadReport {
         let mut report = LoadReport::default();
         let project_dir = match project_filepath.parent() {
@@ -268,7 +268,8 @@ impl SourceManager {
         Some(uri)
     }
 
-    /// **P19.23** — drop every document NOT in `reachable` (and not
+    // P19.23
+    /// Drop every document NOT in `reachable` (and not
     /// currently opened by the editor). Returns the URIs evicted, so
     /// the LSP layer can publish empty diagnostics for them.
     ///
@@ -323,28 +324,30 @@ impl std::fmt::Display for SourceManager {
 /// Outcome of [`SourceManager::load_project`].
 #[derive(Debug, Default, Clone)]
 pub struct LoadReport {
+    // P14.5 — restored and enriched the per-file timing.
     /// URIs of every document loaded during the call (excluding ones
     /// that were already in the manager) paired with [`LoadTimings`]
     /// — file-read + tree-sitter-parse durations measured separately.
-    /// P14.5 restored and enriched the per-file timing the flat
-    /// `iter_gcl` walk used to surface in cli `lint --csv`.
     pub loaded: Vec<(Uri, LoadTimings)>,
-    /// **P19.23** — every URI reachable from the entrypoint through
+    // P19.23 — reachable set. P19.22 — idempotency change.
+    /// Every URI reachable from the entrypoint through
     /// `@library` / `@include` traversal, *including* files that were
-    /// already in the manager (and therefore absent from `loaded`
-    /// after the P19.22 idempotency change). Consumers that need to
-    /// evict no-longer-reachable docs (LSP `reload_project_closure`)
-    /// take the difference between `manager.iter()` and this set.
+    /// already in the manager (and therefore absent from `loaded`).
+    /// Consumers that need to evict no-longer-reachable docs (LSP
+    /// `reload_project_closure`) take the difference between
+    /// `manager.iter()` and this set.
     pub reachable: Vec<Uri>,
+    // P1.4 — surface as diagnostics.
     /// `@library` declarations that couldn't be resolved to a directory.
-    /// Surface these as diagnostics in P1.4.
     pub unresolved_libraries: Vec<String>,
-    /// Filesystem / decoding errors encountered along the way. Strings for
-    /// now — typed diagnostics arrive in P1.4.
+    // P1.4 — typed diagnostics arrive here.
+    /// Filesystem / decoding errors encountered along the way. Strings
+    /// for now.
     pub errors: Vec<String>,
 }
 
-/// P14.5 — per-file load-phase timings.
+// P14.5
+/// Per-file load-phase timings.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoadTimings {
     /// `Context::read` — file I/O / decoding.
@@ -524,7 +527,8 @@ mod tests {
         assert_eq!(report.unresolved_libraries, vec!["missing".to_string()]);
     }
 
-    /// **P19.22** — `load_project` must be idempotent across calls so
+    // P19.22
+    /// `load_project` must be idempotent across calls so
     /// the LSP can re-walk pragmas after an in-editor edit without
     /// clobbering unsaved buffers (the editor owns the live state via
     /// `did_change`). Concretely: pre-populate the entrypoint with a

@@ -1,4 +1,4 @@
-//! Comment-driven directives for opting out of lints / formatter (P23).
+//! Comment-driven directives for opting out of lints / formatter.
 //!
 //! Walk the CST for `line_comment` extras whose payload starts with the
 //! `gcl-` prefix. Two directive families:
@@ -47,7 +47,7 @@ pub struct LintSuppression {
     /// Source byte range whose diagnostics should be silenced.
     pub byte_range: Range<usize>,
     /// Explicitly named rules + their per-rule byte ranges.
-    /// Wildcards aren't allowed (P23 spec).
+    /// Wildcards aren't allowed ( spec).
     pub rules: Vec<RuleEntry>,
     /// What kind of directive produced this entry — needed when the
     /// `unused-suppression` rule decides which slot to flag.
@@ -58,7 +58,7 @@ pub struct LintSuppression {
     pub directive_range: Range<usize>,
     /// Per-rule "did this suppression actually drop a diagnostic?"
     /// tracking. Mutated by [`Directives::suppresses_lint`] when a
-    /// match occurs. Populated *only* for the rules in `rules` —
+    /// match occurs. Populated *only* for the rules in `rules`
     /// never `unused-suppression` itself, which would be circular.
     pub used_rules: HashSet<String>,
 }

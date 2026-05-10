@@ -132,7 +132,7 @@ fn lower_modifiers(cx: &LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Modifi
 }
 
 /// Collect annotations (`@expose("renamed")`, `@permission`, …) from
-/// the `annotations` named child of a decl-level node. P13.4: returns
+/// the `annotations` named child of a decl-level node. returns
 /// `Annotation { name, args }` where `args` carries every
 /// string-literal argument the source provided (other arg shapes are
 /// dropped — call-site consumers we have today only read string args).
@@ -1084,7 +1084,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
     Some(cx.hir.exprs.alloc(expr))
 }
 
-/// P13.3 — classify a `number` CST node by its typed suffix.
+// P13.3
+/// Classify a `number` CST node by its typed suffix.
 ///
 /// Walks `(number_suffixed (number_int|number_decimal|number_scientific)
 /// (number_suffix) ...)` and inspects each suffix lexeme:
@@ -1192,7 +1193,8 @@ fn optional_flags_around(node: tree_sitter::Node<'_>, prop_id: usize) -> (bool, 
     (pre, post)
 }
 
-/// P15.8 — walk a chained `static_expr` node left-to-right and
+// P15.8
+/// Walk a chained `static_expr` node left-to-right and
 /// alloc each segment's ident into the HIR's idents arena, pushing
 /// the resulting `Idx<Ident>` into `out`. Returns `false` if any
 /// segment's ident node is missing (a malformed chain).

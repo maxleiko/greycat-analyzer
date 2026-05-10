@@ -1,9 +1,10 @@
+// P18.1 — oracle subcommands. P18.2-18.4 — parity gauntlet.
 //! `greycat-lang dump-types` / `dump-resolutions` — typed-AST parity
-//! oracle subcommands (P18.1).
+//! oracle subcommands.
 //!
 //! Emits one JSONL record per typed expression / type-reference
 //! (`dump-types`) or per ident use (`dump-resolutions`), matching the
-//! TS reference's shape so the parity gauntlet (P18.2-18.4) can diff
+//! TS reference's shape so the parity gauntlet can diff
 //! the two outputs directly.
 //!
 //! `dump-types` record (per line):

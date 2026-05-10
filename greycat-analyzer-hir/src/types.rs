@@ -31,8 +31,9 @@ pub struct Modifiers {
     pub static_: bool,
     pub abstract_: bool,
     pub native: bool,
+    // P13.4
     /// Annotations declared on this decl, drawn from grammar
-    /// `annotations`. P13.4: each entry carries the annotation name
+    /// `annotations`. Each entry carries the annotation name
     /// plus any string-literal arguments (e.g.
     /// `@expose("renamed")` → `Annotation { name: "expose",
     /// args: ["renamed"] }`). Non-string arguments are dropped —
@@ -304,7 +305,8 @@ pub enum Expr {
     Member(MemberExpr),
     Arrow(MemberExpr), // `n->name` — same shape, different access semantics
     Static(StaticExpr),
-    /// P15.8 — chained `module::Type::method` (or longer). The
+    // P15.8
+    /// Chained `module::Type::method` (or longer). The
     /// HIR `StaticExpr` only models `Type::name` because its `ty`
     /// slot is a `TypeRef` and the grammar allows a nested
     /// `static_expr` as the head. For chains the lowering emits
@@ -320,7 +322,8 @@ pub enum Expr {
     Unary(UnaryExpr),
     Paren(Idx<Expr>, Span),
     Lambda(LambdaExpr),
-    /// **P19.15** — `from..to` (or `from..` / `..to`) range and the
+    // P19.15
+    /// `from..to` (or `from..` / `..to`) range and the
     /// math-style `]from..to]` / `[from..to[` interval. Both forms
     /// flatten into the same HIR node since the bracket markers
     /// don't change typing — they only matter at runtime for
@@ -332,9 +335,10 @@ pub enum Expr {
         to: Option<Idx<Expr>>,
         byte_range: Span,
     },
+    // P6.5
     /// `value is Type` — runtime type guard, evaluates to `bool`.
     /// Recognized by the analyzer to narrow `value` in the matching
-    /// branch when used inside an `if` condition (P6.5).
+    /// branch when used inside an `if` condition.
     Is {
         value: Idx<Expr>,
         ty: Idx<TypeRef>,
@@ -349,8 +353,8 @@ pub enum Expr {
         byte_range: Span,
     },
     /// Anything we haven't lowered yet — keeps the byte range so downstream
-    /// passes can still gracefully skip. Will shrink as P2.3-P2.5 demand
-    /// more precise variants.
+    /// passes can still gracefully skip. Will shrink as downstream stages
+    /// demand more precise variants.
     Unsupported {
         kind: &'static str,
         byte_range: Span,
@@ -395,7 +399,8 @@ pub enum LiteralKind {
     Null,
     This,
     Duration,
-    /// P13.3 — typed-suffix `123_time` literals. Distinct from
+    // P13.3
+    /// Typed-suffix `123_time` literals. Distinct from
     /// [`Self::Iso8601`], which only covers ISO-8601 string-shaped
     /// time literals.
     Time,
@@ -404,7 +409,8 @@ pub enum LiteralKind {
 
 #[derive(Debug, Clone)]
 pub struct StringExpr {
-    /// P17.5 — `parts` carries the lowered text fragments and
+    // P17.5
+    /// `parts` carries the lowered text fragments and
     /// `${expr}` interpolation expressions in source order. A
     /// non-template string (no `${…}`) lowers to a single
     /// `StringPart::Lit` covering the inner text. Template strings
@@ -440,7 +446,8 @@ impl StringExpr {
     }
 }
 
-/// P17.5 — one piece of a [`StringExpr`].
+// P17.5
+/// One piece of a [`StringExpr`].
 #[derive(Debug, Clone)]
 pub enum StringPart {
     /// Raw text between (or around) interpolations. The byte range
@@ -554,7 +561,8 @@ pub enum UnaryOp {
     Neg,
     Not,
     BitNot,
-    /// `!!x` — non-null assertion (P6.4 narrowing).
+    // P6.4
+    /// `!!x` — non-null assertion (narrowing).
     NonNullAssert,
     /// `*n` — node deref. Returns the inner `T` of a
     /// `node<T>` / `nodeTime<T>` / similar tag-shaped receiver.

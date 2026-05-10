@@ -93,9 +93,9 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
+    // P10.7
     /// TTY-aware default: `pretty` interactively, `compact` when
-    /// piped. Mirrors what the P10.7 roadmap entry promised
-    /// (`miette when stdout is a TTY OR --format=pretty`).
+    /// piped (`miette when stdout is a TTY OR --format=pretty`).
     fn auto() -> Self {
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
@@ -596,7 +596,8 @@ fn print_summary(entries: &[Entry], total: Duration, color: bool) {
     );
 }
 
-/// P10.7 pretty-rendered diagnostic — pipes through `miette` so the
+// P10.7
+/// Pretty-rendered diagnostic — pipes through `miette` so the
 /// user sees a source snippet, a caret pointing at the offending span,
 /// and the diagnostic's severity / code / message rendered with color
 /// when stdout is a TTY. Falls back to a plain `path:line:col:` line
@@ -626,8 +627,9 @@ fn print_pretty_diagnostic(path: &str, source: &str, diag: &Diagnostic) {
     eprintln!("{report:?}");
 }
 
+// P22.7
 /// Diagnostic → byte-range + replacement text. Routes through the
-/// shared [`greycat_analyzer_analysis::quickfix`] module (P22.7).
+/// shared [`greycat_analyzer_analysis::quickfix`] module.
 /// Returns `None` for diagnostics that don't have an automatic fix or
 /// whose preconditions don't hold.
 ///

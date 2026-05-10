@@ -1,4 +1,5 @@
-//! Formatter directive scanner (P23.4).
+// P23.4
+//! Formatter directive scanner.
 //!
 //! Walks the CST for `// gcl-fmt-…` line comments and produces a
 //! [`FmtDirectives`] table that the lowerer consults to skip nodes

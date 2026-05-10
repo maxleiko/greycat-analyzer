@@ -34,7 +34,8 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// **P23.4** — build a context whose lowerer honors `// gcl-fmt-…`
+    // P23.4
+    /// Build a context whose lowerer honors `// gcl-fmt-…`
     /// directives parsed from `source`. Used by [`crate::format`] /
     /// [`crate::format_tree`] / [`crate::format_with`] /
     /// [`crate::format_tree_with`] so the verbatim regions land in the
@@ -48,7 +49,8 @@ impl<'a> Cx<'a> {
         &self.source[node.byte_range()]
     }
 
-    /// **P23.4** — `true` when the lowerer should emit `node`'s source
+    // P23.4
+    /// `true` when the lowerer should emit `node`'s source
     /// bytes verbatim instead of recursing.
     pub fn skip_for_fmt(&self, node: Node<'_>) -> bool {
         self.directives.is_skipped(&node.byte_range())

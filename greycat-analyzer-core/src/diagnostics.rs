@@ -1,4 +1,6 @@
-//! Parse-time diagnostic extraction (P1.4).
+// P1.4 — parse-time diagnostic extraction. P15.5 added
+// [`pragma_diagnostics`].
+//! Parse-time diagnostic extraction.
 //!
 //! Walks a tree-sitter [`Tree`] and emits one [`Diagnostic`] per `ERROR`
 //! or `MISSING` node. The TS reference produces semantically richer parse
@@ -7,8 +9,8 @@
 //! `node.kind()` plus the node's source-text snippet for context.
 //!
 //! Semantic diagnostics (resolver, type-check, etc.) are out of scope here
-//! — they arrive in P2. P15.5 added [`pragma_diagnostics`] so unresolved
-//! / duplicate `@include` / `@library` pragmas surface like other diags.
+//! — they arrive separately. [`pragma_diagnostics`] surfaces unresolved /
+//! duplicate `@include` / `@library` pragmas like other diags.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -114,7 +116,8 @@ fn node_range(node: tree_sitter::Node<'_>) -> Range {
     }
 }
 
-/// P15.5 — pragma resolution diagnostics. Walks a parsed module's
+// P15.5
+/// Pragma resolution diagnostics. Walks a parsed module's
 /// [`ModuleDesc`] and emits warnings for:
 ///
 /// * `unresolved-include` — `@include("path")` whose directory does not
@@ -311,8 +314,9 @@ mod tests {
         parse_diagnostics(tree.root_node(), source)
     }
 
+    // P17.4 added the optional `path → contents` map.
     /// In-memory `Context` for pragma_diagnostics tests. Tracks
-    /// known directories + (P17.4) optional `path → contents` map for
+    /// known directories plus an optional `path → contents` map for
     /// reading the `lib/installed` manifest.
     struct PragmaCtx {
         dirs: std::collections::HashSet<PathBuf>,
@@ -394,7 +398,8 @@ mod tests {
         assert!(ds.iter().any(|d| d.message.starts_with("syntax error")));
     }
 
-    /// P15.5 — `@include` to a missing directory surfaces as
+    // P15.5
+    /// `@include` to a missing directory surfaces as
     /// `unresolved-include` with the pragma's range.
     #[test]
     fn pragma_diagnostics_unresolved_include() {
@@ -410,7 +415,8 @@ mod tests {
         );
     }
 
-    /// P15.x — runtime rejects absolute paths in `@include`; the
+    // P15.x
+    /// Runtime rejects absolute paths in `@include`; the
     /// analyzer mirrors that with an `absolute-include` warning.
     #[test]
     fn pragma_diagnostics_absolute_include() {
@@ -428,7 +434,8 @@ mod tests {
         );
     }
 
-    /// P15.5 — duplicate `@include` of the same dir warns on the
+    // P15.5
+    /// Duplicate `@include` of the same dir warns on the
     /// second occurrence.
     #[test]
     fn pragma_diagnostics_duplicate_include() {
@@ -442,7 +449,8 @@ mod tests {
         assert_eq!(map["duplicate-include"].range.start.line, 1);
     }
 
-    /// P15.5 — `@library` whose name has no local `lib/` dir and isn't
+    // P15.5
+    /// `@library` whose name has no local `lib/` dir and isn't
     /// the global `std` fallback surfaces as `unresolved-library`.
     #[test]
     fn pragma_diagnostics_unresolved_library() {
@@ -454,7 +462,8 @@ mod tests {
         );
     }
 
-    /// P17.4 — `@library("explorer", ...)` resolves to a webroot
+    // P17.4
+    /// `@library("explorer", ...)` resolves to a webroot
     /// asset library: `<project>/webroot/<name>/` exists even though
     /// `<project>/lib/<name>/` does not.
     #[test]
@@ -467,7 +476,8 @@ mod tests {
         );
     }
 
-    /// P17.4 — `@library("foo", ...)` resolves when `lib/installed`
+    // P17.4
+    /// `@library("foo", ...)` resolves when `lib/installed`
     /// lists the name. Useful for asset-only libs that haven't yet
     /// extracted their dir.
     #[test]
@@ -496,7 +506,8 @@ mod tests {
         );
     }
 
-    /// P15.5 — `@library("std", "...")` resolves under the global
+    // P15.5
+    /// `@library("std", "...")` resolves under the global
     /// `<greycat_home>/lib/std/` fallback when no local `lib/std`
     /// exists; no diagnostic emitted.
     #[test]
@@ -509,7 +520,8 @@ mod tests {
         );
     }
 
-    /// P15.5 — duplicate `@library` of the same name warns on the
+    // P15.5
+    /// Duplicate `@library` of the same name warns on the
     /// second occurrence.
     #[test]
     fn pragma_diagnostics_duplicate_library() {

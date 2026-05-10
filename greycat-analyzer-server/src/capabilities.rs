@@ -1,4 +1,5 @@
-//! LSP capability handlers (P3.*).
+// P3.*
+//! LSP capability handlers.
 //!
 //! Each function here takes the raw doc text + parsed tree (and any
 //! extra args) and produces an LSP response value. They're wired up
@@ -96,7 +97,8 @@ pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) 
     hover_inner(text, lib, root, pos)
 }
 
-/// P15.1 — hover with project context. Restores cross-module hover
+// P15.1
+/// Hover with project context. Restores cross-module hover
 /// content lost in earlier phases:
 /// * doc-comments above the foreign decl,
 /// * full function signature / type-decl shape,
@@ -362,7 +364,7 @@ fn ident_hover_markdown(
     }
 }
 
-/// Hover markdown for a property ident bound by P6.3 member resolution
+/// Hover markdown for a property ident bound by  member resolution
 /// (`a.b` / `a->b`). Renders attribute / method shape with the
 /// declared / inferred return type when available.
 fn member_hover_markdown(
@@ -390,7 +392,8 @@ fn member_hover_markdown(
     }
 }
 
-/// P15.x — cross-module variant of [`member_hover_markdown`]. Reads
+// P15.x
+/// Cross-module variant of [`member_hover_markdown`]. Reads
 /// the foreign HIR for the attr / method and appends an italic
 /// `*defined in `<module>`*` footnote.
 fn foreign_member_hover_markdown(
@@ -423,7 +426,8 @@ fn foreign_member_hover_markdown(
     out
 }
 
-/// P15.1 — render a top-level decl as hover markdown. Output layout:
+// P15.1
+/// Render a top-level decl as hover markdown. Output layout:
 /// optional doc paragraph, then a ```greycat fenced code block with the
 /// signature, then (when `provenance` is `Some`) an italic
 /// "*defined in `<name>`*" footnote. `provenance` is supplied only for
@@ -770,7 +774,8 @@ pub fn goto_definition(
     }))
 }
 
-/// P15.9 — goto-def on a module-name segment of a `static_expr` chain.
+// P15.9
+/// Goto-def on a module-name segment of a `static_expr` chain.
 /// In `runtime::Identity::create`, the leftmost ident `runtime` names
 /// the module that owns `Identity`. This helper checks whether the
 /// cursor sits on the leftmost segment of such a chain and, if so,
@@ -823,7 +828,8 @@ pub fn goto_module_segment(
     None
 }
 
-/// P11.3 — turn a `Definition::ProjectDecl { uri, decl }` into the
+// P11.3
+/// Turn a `Definition::ProjectDecl { uri, decl }` into the
 /// concrete `Location` of the foreign module's decl-name range. Pure
 /// helper: caller fetches the foreign HIR + text from the project-
 /// analysis cache + source manager and passes them in.
@@ -841,7 +847,8 @@ pub fn cross_module_decl_location(
     })
 }
 
-/// P11.5 — turn a `ForeignMember` (cross-module attr / method
+// P11.5
+/// Turn a `ForeignMember` (cross-module attr / method
 /// binding) into a `Location` pointing at the foreign attr / method's
 /// name range. Mirrors [`cross_module_decl_location`] but indexes
 /// `type_attrs` for `MemberDef::Attr` and `decls` for `Method`.
@@ -868,7 +875,7 @@ pub fn cross_module_member_location(
     })
 }
 
-/// P11.3 helper — map a cursor position in `text` to its `Idx<Ident>`
+///  helper — map a cursor position in `text` to its `Idx<Ident>`
 /// against the cached `hir`'s `idents` arena, by byte-range match.
 /// Returns `None` if the cursor isn't over an ident or no matching
 /// idx was allocated (e.g. lowering skipped this shape).
@@ -886,7 +893,8 @@ pub fn cursor_ident_idx(
     idx_for_node(hir, node)
 }
 
-/// P8.6 — `textDocument/implementation`. For a method-name ident,
+// P8.6
+/// `textDocument/implementation`. For a method-name ident,
 /// returns every concrete (non-`abstract`, non-`native`) method with
 /// that name across all type decls in the module. For other idents,
 /// falls through to [`goto_definition`] so the editor still produces
@@ -933,7 +941,8 @@ pub fn goto_implementation(
     Some(GotoDefinitionResponse::Array(locations))
 }
 
-/// P11.6 — project-wide `textDocument/implementation`. Walks every
+// P11.6
+/// Project-wide `textDocument/implementation`. Walks every
 /// cached module's `TypeDecl::methods` for concrete (non-`abstract`,
 /// non-`native`) methods whose name matches the cursor's ident text.
 /// Falls through to in-module [`goto_implementation`] (which itself
@@ -1168,7 +1177,7 @@ fn target_binding(
     Some(cursor_idx)
 }
 
-/// Pre-P8.1 text-equality fallback. Used when the cursor doesn't
+/// Pre- text-equality fallback. Used when the cursor doesn't
 /// resolve through `Resolutions` (e.g., cross-module names) so the
 /// capability still returns useful results.
 fn references_by_text(
@@ -1299,9 +1308,9 @@ pub enum RenameTarget {
 
 /// Inspect the cursor's binding through cached project analysis and
 /// classify the rename / reference target. Returns `None` for cursors
-/// not on an ident, runtime-only names ([`Definition::Project`] —
+/// not on an ident, runtime-only names ([`Definition::Project`]
 /// `Array`, `Map`, native fns, primitives), and unrecognized binding
-/// shapes (e.g. method names — that's P11.5 / P11.6 territory).
+/// shapes (e.g. method names — that's  /  territory).
 pub fn resolve_rename_target(
     project: &ProjectAnalysis,
     cursor_uri: &Uri,
@@ -1344,7 +1353,8 @@ pub fn resolve_rename_target(
     })
 }
 
-/// P11.4 — find every reference to the cursor's binding across the
+// P11.4
+/// Find every reference to the cursor's binding across the
 /// whole project. Replaces the previous text-equality fallback.
 pub fn references_across_project(
     project: &ProjectAnalysis,
@@ -1365,7 +1375,8 @@ pub fn references_across_project(
     out
 }
 
-/// P11.4 — produce a `WorkspaceEdit` renaming every site the cursor's
+// P11.4
+/// Produce a `WorkspaceEdit` renaming every site the cursor's
 /// binding is referenced from, across the whole project.
 pub fn rename_across_project(
     project: &ProjectAnalysis,
@@ -1589,7 +1600,7 @@ pub fn folding_ranges(text: &str, root: tree_sitter::Node<'_>) -> Vec<FoldingRan
 /// whole pipeline. Same convention as the rest of the
 /// `*_with_project` family: the LSP server handler in
 /// [`crate::server`] always goes through this path so the cross-
-/// module fixup passes (P15.7 / P16.3 / P16.4) feed into the
+/// module fixup passes feed into the
 /// diagnostic list.
 pub fn code_actions_with_project(
     module: &ModuleAnalysis,
@@ -1671,7 +1682,7 @@ fn code_actions_from_diagnostics(
 
 /// Apply `edits` against `text` in-memory and check if the result has
 /// new parse errors. Returns `true` if the edit would break a
-/// previously-valid parse. Used to gate quickfix offers (P22.5).
+/// previously-valid parse. Used to gate quickfix offers.
 fn would_break_parse(text: &str, edits: &[TextEdit]) -> bool {
     let original_has_errors = greycat_analyzer_syntax::parse(text).root_node().has_error();
     // Apply edits in reverse byte order so prior offsets stay stable.
@@ -1707,7 +1718,7 @@ fn would_break_parse(text: &str, edits: &[TextEdit]) -> bool {
 
 /// Map a diagnostic to a concrete `Vec<TextEdit>`. Routes through the
 /// shared [`greycat_analyzer_analysis::quickfix`] module so the LSP and
-/// the cli `lint --fix` path share a single source of truth (P22.7).
+/// the cli `lint --fix` path share a single source of truth.
 fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
     let code = match &diag.code {
         Some(NumberOrString::String(s)) => s.as_str(),
@@ -1764,8 +1775,8 @@ fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
 
 /// LSP entry point for inlay hints — consumes the cached
 /// [`ModuleAnalysis`] from [`ProjectAnalysis`] so the cross-module
-/// fixup passes (P16.3 cross-module member typing, P16.4 call-on-
-/// member return-type inference, P15.7 cross-module call return-type
+/// fixup passes ( cross-module member typing,  call-on-
+/// member return-type inference,  cross-module call return-type
 /// inference) all flow through. Capabilities that re-run a single-
 /// file [`analyzer::analyze`] would miss those — that's the bug we
 /// kept hitting whenever new project-level inference landed.
@@ -1857,7 +1868,8 @@ pub fn inlay_hints(
     inlay_hints_with_project(&module, &arena, text, range)
 }
 
-/// P13.7 — peek at the last expression-shaped statement of a fn body
+// P13.7
+/// Peek at the last expression-shaped statement of a fn body
 /// to infer its return type. Returns `None` for blocks that don't end
 /// in a `Stmt::Return(...)` with an inferred-type expression.
 fn inferred_fn_return(
@@ -1894,7 +1906,8 @@ fn emit_call_arg_hints_block(
     }
 }
 
-/// P13.7 — walk the body for `Expr::Call` and emit one
+// P13.7
+/// Walk the body for `Expr::Call` and emit one
 /// `<param_name>:` hint anchored at the start of each positional arg.
 fn emit_call_arg_hints(
     hir: &Hir,
@@ -2137,8 +2150,8 @@ pub fn formatting(text: &str, root: tree_sitter::Node<'_>) -> Option<Vec<TextEdi
     }])
 }
 
-/// P8.8 range formatting — format only the text inside `range`. The
-/// foundational formatter (P4.1) operates on whole-tree input, so the
+///  range formatting — format only the text inside `range`. The
+/// foundational formatter operates on whole-tree input, so the
 /// implementation snapshots the slice, formats it, and returns a single
 /// replacement edit covering the requested range. Falls back to no
 /// edits when the slice doesn't change.
@@ -2165,7 +2178,7 @@ pub fn range_formatting(
     }])
 }
 
-/// P8.5 workspace symbols — aggregate every document's
+///  workspace symbols — aggregate every document's
 /// [`document_symbols`] output, then flatten to `WorkspaceSymbol`s
 /// keyed by URI. The `query` filter is a simple case-insensitive
 /// substring match against the symbol name (TS reference does the
@@ -2344,10 +2357,10 @@ fn encode_semantic_tokens(mut events: Vec<SemanticTokenEvent>) -> SemanticTokens
 // =============================================================================
 
 /// LSP `textDocument/completion`. Foundational entry — today only handles
-/// `@include("<cursor>")` directory completion (P15.4). Future chunks
-/// extend this to scope-aware ident completion (P15.2), member
+/// `@include("<cursor>")` directory completion. Future chunks
+/// extend this to scope-aware ident completion, member
 /// completion after `.` / `->`, and `@library` version completion via
-/// the GreyCat registry (P15.3).
+/// the GreyCat registry.
 ///
 /// Returns `None` (LSP-side: empty list) when the cursor isn't in a
 /// shape we know how to complete yet.
@@ -2397,7 +2410,8 @@ pub fn completion(
     None
 }
 
-/// P15.2.3 — completion with project context. Same dispatcher chain as
+// P15.2.3
+/// Completion with project context. Same dispatcher chain as
 /// [`completion`], but the ident-position branch enumerates scope-
 /// visible names (locals / params / generics / in-module decls) plus
 /// the cross-module project surface (`ProjectIndex::values` /
@@ -2450,7 +2464,8 @@ pub fn completion_with_project(
     })
 }
 
-/// P15.4 — `@include("<cursor>")` directory completion. Activated when
+// P15.4
+/// `@include("<cursor>")` directory completion. Activated when
 /// the cursor sits inside a `string` (or its `string_fragment` child)
 /// whose enclosing `mod_pragma`'s annotation name is `include`. Walks
 /// the project root directly (a one-level `read_dir`, no recursion)
@@ -2750,7 +2765,7 @@ pub struct LibVersionPayload {
 /// Design difference from the TS reference: the TS impl *hard-filters*
 /// to the user's typed channel (`-dev`/`-stable`/…), which makes the
 /// channel feel like a constraint and forces backspacing to pivot
-/// between channels. We treat channel as a *preference* instead —
+/// between channels. We treat channel as a *preference* instead
 /// every version surfaces in every list, but matching-channel entries
 /// rank first via `sortText` and the editor's own fuzzy match against
 /// the full label decides what's visible. Result: the user can pivot
@@ -3142,7 +3157,7 @@ fn current_word_around(s: &str, cursor: usize) -> &str {
 /// the alphabetic prefix the user has already typed.
 ///
 /// Type-position only emits the type keywords (`null` / type names);
-/// since dedicated type completion (P15.2.6) hasn't landed yet, we
+/// since dedicated type completion hasn't landed yet, we
 /// just bail when the cursor sits inside a `type_ident` so we don't
 /// pollute that slot with statement keywords.
 fn keyword_completion(
@@ -3312,7 +3327,7 @@ fn enum_variant_completion_item(
 ///
 /// `detail` and `documentation` carry the signature + doc-comment of
 /// the resolved decl so the popup's right-rail tooltip lights up the
-/// same way it does for instance access (P15.2.4 / member completion).
+/// same way it does for instance access ( / member completion).
 fn static_completion_item(
     name: String,
     kind: CompletionItemKind,
@@ -3668,7 +3683,7 @@ fn foreign_decl_completion_meta(
 /// Pick the `CompletionItemKind` for a name resolving through the
 /// project index's decl table. When the name has multiple home
 /// locations we pick the first; that's the same disambiguation policy
-/// the resolver uses (P11.2).
+/// the resolver uses.
 fn decl_locs_kind(
     project: &ProjectAnalysis,
     locs: &[(Uri, greycat_analyzer_hir::arena::Idx<Decl>)],
@@ -4343,7 +4358,7 @@ fn type_head_name(
 
 /// Walk a `TypeDecl`'s attrs + methods and emit one `CompletionItem`
 /// per name that survives the `prefix_lower` filter. Skips abstract /
-/// native methods only on the static-completion side (P15.2.5);
+/// native methods only on the static-completion side;
 /// instance access lists everything.
 fn collect_type_members(
     hir: &greycat_analyzer_hir::Hir,
@@ -4533,7 +4548,7 @@ fn static_completion(
 
 /// Receiver context for `Recv::|prop` / `Recv::"prop|"` completion.
 ///
-/// `replace_range` covers the whole property token at the cursor —
+/// `replace_range` covers the whole property token at the cursor
 /// from the start of the typed prefix to the end of the surrounding
 /// ident run (or to the closing `"` for string-mode). Threading this
 /// into every completion item's `text_edit` is what keeps "ask for
@@ -4901,7 +4916,8 @@ pub(crate) fn current_diagnostics(
     out
 }
 
-/// **P24.5** — translate the analysis crate's [`DiagTag`] into LSP
+// P24.5
+/// Translate the analysis crate's [`DiagTag`] into LSP
 /// `DiagnosticTag` values. Editors that honor `UNNECESSARY` dim the
 /// span ("this code does nothing") and editors that honor `DEPRECATED`
 /// strike it through. Returns `None` so the diagnostic's `tags` field
@@ -4917,7 +4933,7 @@ fn lint_tags(tag: Option<DiagTag>) -> Option<Vec<DiagnosticTag>> {
 /// Project-aware diagnostics — read the cached analyzer + lints from
 /// the [`ModuleAnalysis`] entry for this module and convert each
 /// finding to an `lsp_types::Diagnostic`. Mirrors the body of the cli
-/// `lint` command's per-module conversion (P14.5) so the LSP and the
+/// `lint` command's per-module conversion so the LSP and the
 /// CLI surface the same diagnostic shape.
 ///
 /// `lint_libs` opts into emitting lint diagnostics for non-project

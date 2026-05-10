@@ -1,11 +1,11 @@
-//! Code-action vocabulary (P6.8 — port of TS `analysis/actions.ts`).
+// P6.8 — port of TS `analysis/actions.ts`. P8.3 lands concrete edit
+// synthesis (the `changes: Vec<TextEdit>` payload).
+//! Code-action vocabulary.
 //!
 //! Defines the `CodeActionCategory` enum used to tag code actions
 //! produced by the analyzer / linter so the LSP layer can group,
-//! filter, and prioritize them. Concrete edit synthesis (the
-//! `changes: Vec<TextEdit>` payload) lands in P8.3 — this module just
-//! freezes the category vocabulary so the seam between analysis and
-//! LSP doesn't drift.
+//! filter, and prioritize them. This module freezes the category
+//! vocabulary so the seam between analysis and LSP doesn't drift.
 
 use std::ops::Range;
 
@@ -60,8 +60,8 @@ pub struct TextEdit {
     pub byte_range: Range<usize>,
 }
 
-/// Analyzer-side description of a code action. Translated to an LSP
-/// `CodeAction` at the capability boundary in P8.3.
+// P8.3 — translated to an LSP `CodeAction` at the capability boundary.
+/// Analyzer-side description of a code action.
 #[derive(Debug, Clone)]
 pub struct CodeAction {
     pub category: CodeActionCategory,

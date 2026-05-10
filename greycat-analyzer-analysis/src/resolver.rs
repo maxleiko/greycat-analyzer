@@ -1,4 +1,5 @@
-//! Symbol resolver / name binding (P2.3, extended in P6.2).
+// P2.3 — initial drop. P6.2 — project-scope extension. P6.3 — member resolution lives elsewhere.
+//! Symbol resolver / name binding.
 //!
 //! Walks an [`Hir`] and produces a [`Resolutions`] table that maps each
 //! ident-use site to the declaration or local that introduces it. Builds
@@ -15,7 +16,7 @@
 //! - Block scope: nested var declarations, shadowing parent block.
 //! - For / for-in / try-catch introduce their own scope for their bound
 //!   names.
-//! - **Project scope** (P6.2 / P11.2): consulted after every local scope
+//! - **Project scope**: consulted after every local scope
 //!   misses. Names that match a top-level decl from another module
 //!   (looked up through [`ProjectIndex::locate_decl`]) bind to the
 //!   detailed [`Definition::ProjectDecl`] carrying the foreign module's
@@ -25,7 +26,7 @@
 //!   [`Definition::Project`].
 //!
 //! Member-access (`a.b`) is *not* resolved here — the property `b` needs
-//! the receiver's type, which is P6.3 territory. Only the head of
+//! the receiver's type, which lives in the analyzer. Only the head of
 //! the chain (`a`) is bound now.
 
 use std::collections::HashMap;
@@ -54,12 +55,14 @@ pub enum Definition {
     Local(Idx<Ident>),
     /// A function parameter.
     Param(Idx<Ident>),
+    // P7.4 — inference / constraint handling.
     /// A type-parameter declaration (`type Foo<T>` / `fn f<T>(...)`).
     /// Points back at the binding ident so capabilities can offer goto-
-    /// definition. Inference / constraint handling is **P7.4**.
+    /// definition.
     Generic(Idx<Ident>),
+    // P11.2
     /// A name resolved through the shared [`ProjectIndex`] to a
-    /// concrete top-level decl in another module (P11.2). `uri` /
+    /// concrete top-level decl in another module. `uri` /
     /// `decl` together let cross-module capabilities (goto-def,
     /// references, rename, member access) skip text-equality fallbacks.
     /// When [`ProjectIndex::locate_decl`] returns multiple hits the
@@ -80,13 +83,14 @@ pub struct Resolutions {
     /// Idents that are *definitions* (the name in `fn foo()` etc.) are
     /// *not* present here — only use sites.
     pub uses: HashMap<Idx<Ident>, Definition>,
-    /// Reverse-reference index (P6.7): how many times each top-level
+    // P6.7
+    /// Reverse-reference index: how many times each top-level
     /// `Decl` is referenced through a `Definition::Decl` use. Lets the
     /// `unused-decl` lint rule check at-a-glance whether a decl is
     /// never used outside its own declaration.
     pub references_to: HashMap<Idx<Decl>, usize>,
-    /// Idents the resolver couldn't bind. Surface as "unresolved name"
-    /// diagnostics in P2.5.
+    // P2.5 — surface as "unresolved name" diagnostics.
+    /// Idents the resolver couldn't bind.
     pub unresolved: Vec<Idx<Ident>>,
 }
 
@@ -111,9 +115,10 @@ impl Scope {
 struct Cx<'a> {
     hir: &'a Hir,
     scopes: Vec<Scope>,
+    // P6.1 — project pipeline passes the rebuilt index.
     /// Project-level fallback for names that miss every local scope.
     /// Per-file callers pass an empty [`ProjectIndex::new`]; the project
-    /// pipeline (P6.1) passes the index it just rebuilt.
+    /// pipeline passes the index it just rebuilt.
     index: &'a ProjectIndex,
     res: Resolutions,
 }
@@ -208,8 +213,9 @@ pub fn resolve(hir: &Hir) -> Resolutions {
     resolve_inner(hir, &index)
 }
 
+// P6.2
 /// Run name resolution against `hir`, falling back to `index` for names
-/// that aren't satisfied by any local scope. P6.2 entry point used by
+/// that aren't satisfied by any local scope. Entry point used by
 /// the project pipeline.
 pub fn resolve_with_index(hir: &Hir, index: &ProjectIndex) -> Resolutions {
     resolve_inner(hir, index)
@@ -778,7 +784,8 @@ fn f(p: Foo): Foo { return p; }
         assert!(res.unresolved.is_empty());
     }
 
-    /// P17.2 — `for (i, x in xs) { ... i ... x ... }` should bind both
+    // P17.2
+    /// `for (i, x in xs) { ... i ... x ... }` should bind both
     /// `i` and `x` as locals in the body. Was silently dropping the
     /// entire `for_in_stmt` because lowering misread the iterator
     /// expression as a param wrapper (the `?` short-circuit on the
@@ -806,7 +813,8 @@ fn f(p: Foo): Foo { return p; }
         );
     }
 
-    /// P17.3 — `try { ... } catch (ex) { ... ex ... }` should bind
+    // P17.3
+    /// `try { ... } catch (ex) { ... ex ... }` should bind
     /// `ex` as a Local in the catch block. Was silently unresolved
     /// because lowering asked for a `name` sub-field on `_catch_param`,
     /// which the grammar doesn't declare; the hidden-rule inlining

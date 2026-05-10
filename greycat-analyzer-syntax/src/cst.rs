@@ -1,4 +1,5 @@
-//! Small utility surface over tree-sitter CST nodes (P1.5).
+// P1.5
+//! Small utility surface over tree-sitter CST nodes.
 //!
 //! Replaces the retired `cursor.rs` / `node_query.rs` helpers from the
 //! old hand-rolled CST. Everything here is a thin extension method on

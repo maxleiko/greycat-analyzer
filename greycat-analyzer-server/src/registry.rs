@@ -1,4 +1,5 @@
-//! Native [`RegistryFetcher`] backed by `ureq` (P15.3).
+// P15.3
+//! Native [`RegistryFetcher`] backed by `ureq`.
 //!
 //! Drops into [`greycat_analyzer_core::registry::CachingFetcher`] to
 //! provide on-disk-free caching and parallel branch fan-out for

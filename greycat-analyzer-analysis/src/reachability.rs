@@ -1,4 +1,6 @@
-//! Reachability / divergence analysis on the HIR (P24).
+// P24 — reachability / divergence analysis. The dead-code `unreachable`
+// rule (P24.3) consumes [`stmt_diverges`].
+//! Reachability / divergence analysis on the HIR.
 //!
 //! Single primitive: [`stmt_diverges`]. Returns `true` iff control flow
 //! cannot fall through past the statement in normal execution — i.e.
@@ -6,7 +8,7 @@
 //! `continue`, or recursively a divergent inner statement.
 //!
 //! Pure-HIR walker, no typing / resolver dependency. The dead-code lint
-//! ([`crate::lint`]'s `unreachable` rule, P24.3) consumes this primitive
+//! ([`crate::lint`]'s `unreachable` rule) consumes this primitive
 //! to flag statements that follow a divergent sibling.
 //!
 //! **Conservative on loops.** `while` / `for` / `for-in` / `do-while`
@@ -18,9 +20,9 @@
 //!
 //! **Conservative on functions.** Bare expression statements never
 //! diverge — even when the call is to a function whose body always
-//! throws. P24 doesn't track per-function "never returns" annotations
-//! (`@never_returns` is deferred — see ROADMAP). When that lands, this
-//! primitive grows a `&FnIndex` arg.
+//! throws. We don't track per-function "never returns" annotations
+//! (`@never_returns` is deferred). When that lands, this primitive
+//! grows a `&FnIndex` arg.
 
 use std::ops::Range;
 
@@ -97,7 +99,8 @@ pub fn first_dead_index(hir: &Hir, block: &BlockStmt) -> Option<usize> {
     None
 }
 
-/// **P24.2** — analyzer-aware divergence: same as [`stmt_diverges`]
+// P24.2
+/// Analyzer-aware divergence: same as [`stmt_diverges`]
 /// but also treats an exhaustive enum-eq if-chain (recorded in
 /// `analysis.exhaustive_enum_chains`) as divergent when every arm body
 /// diverges. Without this, the canonical `if (x == E::A) { return …; }
@@ -169,7 +172,8 @@ fn every_arm_diverges(hir: &Hir, analysis: &AnalysisResult, head_id: Idx<Stmt>) 
     }
 }
 
-/// **P24.2** — byte range of the trailing `else { … }` block of an
+// P24.2
+/// Byte range of the trailing `else { … }` block of an
 /// exhaustive chain. Returns `None` when the chain has no final else
 /// (no dead arm to flag) or the head doesn't match the chain shape.
 /// The dead-code lint emits `unreachable` at this range.

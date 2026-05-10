@@ -1,4 +1,5 @@
-//! GreyCat registry walker (P15.3).
+// P15.3
+//! GreyCat registry walker.
 //!
 //! Drives the version-listing dance for `@library("name", "<cursor>")`
 //! completion. The HTTP client lives behind a [`RegistryFetcher`] trait

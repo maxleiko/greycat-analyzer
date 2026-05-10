@@ -1,4 +1,5 @@
-//! WASM API surface for the greycat analyzer (P5.1).
+// P5.1
+//! WASM API surface for the greycat analyzer.
 //!
 //! Every analyzer stage gets its own export so the playground can render
 //! them side-by-side. Each function takes a `&str` source plus optional

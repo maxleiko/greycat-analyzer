@@ -32,9 +32,9 @@ pub struct Backend {
     pub client: Sender<Message>,
     pub manager: SourceManager,
     pub project_analysis: ProjectAnalysis,
+    // P15.5 — used to anchor `@include` / `@library` pragma diagnostics.
     /// Project root (parent of `project.gcl`) captured at workspace
-    /// load time. P15.5 uses it to anchor `@include` / `@library`
-    /// pragma diagnostics on every publish.
+    /// load time.
     pub project_root: Option<PathBuf>,
     /// When `true`, lint diagnostics from non-project modules
     /// (`lib/<name>/...`) are surfaced in the editor too. Driven by
@@ -42,7 +42,8 @@ pub struct Backend {
     /// LSP's `initializationOptions`. Default `false` — most users
     /// don't want warnings about vendored library code.
     pub lint_libs: bool,
-    /// P15.3 — registry fetcher for `@library` version completion.
+    // P15.3
+    /// Registry fetcher for `@library` version completion.
     /// `None` skips the lazy resolution path and surfaces the
     /// placeholder verbatim (the foundational shape used by tests
     /// and the WASM bridge until the playground wires its own
@@ -162,11 +163,11 @@ impl Backend {
         Ok(())
     }
 
+    // P1.4 — typed diagnostic publication lands here.
     /// Resolve a workspace-folder URI to a local path, look for
     /// `project.gcl` at its root, and recursively load every reachable
     /// module via [`SourceManager::load_project`]. Errors are logged but
-    /// don't fail the LSP handshake — typed diagnostic publication lands
-    /// in P1.4.
+    /// don't fail the LSP handshake.
     fn load_workspace(&mut self, ws_uri: &Uri) {
         let Some(ws_root) = uri_to_path(ws_uri) else {
             warn!("skipping non-file workspace folder: {}", ws_uri.as_str());
@@ -371,7 +372,8 @@ impl Backend {
         Ok(())
     }
 
-    /// **P19.22** — workspace file watcher events. Two flavors of
+    // P19.22
+    /// Workspace file watcher events. Two flavors of
     /// trigger matter to us:
     ///
     /// - `lib/installed` — written by `greycat install` after it

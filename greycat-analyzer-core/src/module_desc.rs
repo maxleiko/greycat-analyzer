@@ -13,9 +13,9 @@ use lsp_types::Uri;
 
 use greycat_analyzer_syntax::tree_sitter;
 
+// P1.4 — once the analyzer's full Span/Diag types land, this will move onto those.
 /// Spanned slice of source text — start/end byte offsets plus the resolved
-/// string. Kept stringly-typed for now; once the analyzer's full Span/Diag
-/// types land in P1.4, this will move onto those.
+/// string. Kept stringly-typed for now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spanned<T> {
     pub value: T,

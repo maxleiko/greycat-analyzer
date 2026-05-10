@@ -26,10 +26,12 @@ enum Command {
     Server(LangServer),
     /// Print the tree-sitter CST s-expression for a `.gcl` file (debug).
     Cst(Cst),
-    /// Dump per-expression byte ranges and inferred type display strings as JSONL (P18.1).
+    // P18.1
+    /// Dump per-expression byte ranges and inferred type display strings as JSONL.
     #[clap(name = "dump-types")]
     DumpTypes(DumpTypes),
-    /// Dump per-ident-use byte ranges and decl pointers as JSONL (P18.1).
+    // P18.1
+    /// Dump per-ident-use byte ranges and decl pointers as JSONL.
     #[clap(name = "dump-resolutions")]
     DumpResolutions(DumpResolutions),
 }

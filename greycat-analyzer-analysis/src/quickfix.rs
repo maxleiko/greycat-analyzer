@@ -3,7 +3,7 @@
 //! Single source of truth for "given a diagnostic on this source, what
 //! edits would make it go away?" — consumed by both the CLI's
 //! `lint --fix` driver and the LSP's `textDocument/codeAction` handler.
-//! Before P22.7 these lived as parallel implementations in each
+//! These previously lived as parallel implementations in each
 //! caller; the duplication was the dominant source of "fix in one
 //! place, forget the other" bugs.
 //!
@@ -70,7 +70,8 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
     }]
 }
 
-/// **P22.1** — replace the **whole** `var x = expr;` statement, not just
+// P22.1
+/// Replace the **whole** `var x = expr;` statement, not just
 /// the ident. The diagnostic's range covers the ident only (for cursor
 /// placement); we widen the fix range to the enclosing `var_decl`
 /// node by re-parsing and walking up the CST.
@@ -84,7 +85,8 @@ fn unused_local_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
     }]
 }
 
-/// **P22.2** — same shape for top-level decls. Walks to the enclosing
+// P22.2
+/// Same shape for top-level decls. Walks to the enclosing
 /// `fn_decl` / `type_decl` / `enum_decl` / `modvar` and returns its
 /// full byte range. Doc comments + annotations sitting immediately
 /// above the decl are absorbed (the grammar makes them children of
@@ -103,7 +105,8 @@ fn unused_decl_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
     }]
 }
 
-/// **P22.3** — rename `name` to `_name` only when the body has zero
+// P22.3
+/// Rename `name` to `_name` only when the body has zero
 /// text-level occurrences of `name`. If the body references the name
 /// (which a correctly-detected unused param shouldn't have, but a lint
 /// false-positive *might*), refuse the fix. Belt-and-suspenders so a
@@ -197,7 +200,8 @@ fn modvar_append_inner_nullable_fix(end: usize) -> Vec<TextEdit> {
 /// fails. The re-parse is local to this call — no caching, no shared
 /// state. Re-parsing a single file is on the order of microseconds, so
 /// the simplicity wins.
-/// **P24.6** — fix for `unreachable`. The diagnostic's byte range is
+// P24.6
+/// Fix for `unreachable`. The diagnostic's byte range is
 /// already the dead island (single statement, coalesced sibling run,
 /// or trailing `else { … }` block). Default: delete that range.
 ///
@@ -383,7 +387,8 @@ fn leading_whitespace_at(text: &str, byte: usize) -> &str {
     &line[..ws_end]
 }
 
-/// **P23.3 follow-up** — fix for `unused-suppression`. The diagnostic's
+// P23.3 follow-up
+/// Fix for `unused-suppression`. The diagnostic's
 /// `byte_range` points at the dead rule word inside a `// gcl-lint-…`
 /// directive comment. Two shapes:
 ///

@@ -190,7 +190,7 @@ cargo test  --workspace
 cargo install --path greycat-analyzer --debug
 ```
 
-Per-chunk verification loop (see [.claude/CLAUDE.md](.claude/CLAUDE.md)):
+Verification loop (see [.claude/CLAUDE.md](.claude/CLAUDE.md)):
 
 ```sh
 cargo fmt --all
@@ -200,5 +200,3 @@ cargo test  --workspace
 ```
 
 CI (`.github/workflows/ci.yml`) enforces all of these on push.
-
-The roadmap is at [ROADMAP.md](ROADMAP.md). Phases 0–5 are done (M1–M5 reached); Phases 6–10 (M6–M10) carry the work forward to byte-for-byte parity with the TS reference.

@@ -1,9 +1,9 @@
 //! HIR for greycat — typed surface tree built by lowering tree-sitter CST.
 //!
 //! Single typed-AST + arena layout (Decision B). Each concrete shape is in
-//! [`types`]; the lowering walker is in [`lower`]. P2.1 lays the
-//! scaffolding; later phases (resolver / type system / analyzer) flesh
-//! out shapes that don't yet have a non-`Unsupported` variant.
+//! [`types`]; the lowering walker is in [`lower`]. Shapes that don't yet
+//! have a non-`Unsupported` variant are filled in by downstream stages
+//! (resolver / type system / analyzer).
 
 pub mod arena;
 pub mod lower;

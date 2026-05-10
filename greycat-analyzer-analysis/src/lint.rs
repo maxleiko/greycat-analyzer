@@ -1,4 +1,4 @@
-//! Linter rules (P4.2).
+//! Linter rules.
 //!
 //! A small rule-based framework on top of HIR + Resolutions. Each rule
 //! is a trait impl that walks the module and emits [`LintDiagnostic`]s.
@@ -9,7 +9,7 @@
 //! plus rules embedded in analyzer.ts). The fix-application driver
 //! (sort edits, apply non-overlapping ones, retry) is deferred until
 //! the LSP code-action layer has concrete edit suggestions to apply
-//! (P3.6 placeholder).
+//! ( placeholder).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -39,7 +39,8 @@ pub struct LintDiagnostic {
     pub severity: LintSeverity,
     pub message: String,
     pub byte_range: Range<usize>,
-    /// **P24.5** — optional editor presentation tag. Editors that
+    // P24.5
+    /// Optional editor presentation tag. Editors that
     /// honor [`DiagTag::Unnecessary`] (LSP `DiagnosticTag::UNNECESSARY`,
     /// VS Code / Helix / Neovim) dim the source span — the right
     /// surface for "this code does nothing" findings (`unreachable`,
@@ -55,7 +56,7 @@ pub enum DiagTag {
     /// the span dimmed / faded.
     Unnecessary,
     /// "Deprecated." Editors typically render the span with a
-    /// strikethrough. Reserved for a future `deprecated` lint —
+    /// strikethrough. Reserved for a future `deprecated` lint
     /// nothing emits this today.
     #[allow(dead_code)]
     Deprecated,
@@ -94,7 +95,7 @@ pub trait LintRule {
 ///
 /// `bypass_suppressions = true` re-emits every diagnostic the rules
 /// produce, even when a suppression covers them — drives the CLI's
-/// `--no-suppressions` flag (P23.7).
+/// `--no-suppressions` flag.
 pub struct LintCx<'a> {
     pub hir: &'a Hir,
     pub res: &'a Resolutions,
@@ -140,8 +141,8 @@ impl<'a> LintCx<'a> {
 }
 
 /// One row of the lint registry. Keeps the rule's name, severity, and
-/// one-line summary together in one place so `lint --list-rules` (P23.6)
-/// and the LSP's directive-completion (P23.5) read from the same table.
+/// one-line summary together in one place so `lint --list-rules`
+/// and the LSP's directive-completion read from the same table.
 #[derive(Debug, Clone, Copy)]
 pub struct LintRuleInfo {
     pub name: &'static str,
@@ -519,9 +520,10 @@ fn check_fn_params(
 // Rule: unused-decl
 // =============================================================================
 
+// P6.7
 /// Warn when a top-level `fn` / `type` / `enum` / `var` is never
 /// referenced anywhere in the module *and* doesn't carry a runtime-
-/// exposing annotation (`@expose`). Drives P6.7. The reference count
+/// exposing annotation (`@expose`). The reference count
 /// comes from `Resolutions::references_to`, which the resolver builds
 /// from every `Definition::Decl` use site.
 pub struct UnusedDecl;
@@ -1085,7 +1087,7 @@ pub fn chain_has_upstream_nullsafe(hir: &Hir, expr_id: Idx<Expr>) -> bool {
 /// (the visit didn't reach this expression — usually because it's
 /// inside dead code or an `Unsupported` lowering).
 ///
-/// **Intentionally NOT covered: `*n` (`Expr::Unary { op: Deref }`)** —
+/// **Intentionally NOT covered: `*n` (`Expr::Unary { op: Deref }`)**
 /// the GreyCat runtime's deref operator handles the null-receiver case
 /// gracefully (returns `null` for a null node-tag), so flagging
 /// `*nullable_node` as "possibly null" would be a false positive even
@@ -1669,7 +1671,8 @@ fn f(_unused: int): int {
         );
     }
 
-    /// **P19.10 follow-up** — `var _name = expr;` opts out of the
+    // P19.10 follow-up
+    /// `var _name = expr;` opts out of the
     /// unused-local warning, matching `unused-param`'s behavior and
     /// the Rust convention. Lets users keep a binding for typing /
     /// side-effect reasons without the linter complaining.

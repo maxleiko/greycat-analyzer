@@ -1,4 +1,4 @@
-//! Project-level analyzer driver (P6.1).
+//! Project-level analyzer driver.
 //!
 //! Builds a [`ProjectAnalysis`] over a [`SourceManager`] in one pass:
 //! lower every document to HIR, ingest each module's type / enum /
@@ -9,7 +9,7 @@
 //!
 //! The chunk's "shared `ProjectIndex`" is populated here from every
 //! module's top-level decls; rerouting the per-module analyzer to
-//! consult it for cross-module name lookup is **P6.2** territory. P6.1
+//! consult it for cross-module name lookup is **** territory.
 //! gives that work the cache-shaped seam to plug into.
 
 use std::collections::{HashMap, HashSet};
@@ -49,18 +49,21 @@ pub struct ModuleAnalysis {
     /// consumers filter on this to skip lib-owned lints by default
     /// (see `cli lint --lint-libs`).
     pub lib: String,
-    /// P14.5 — per-phase wall-clock timings captured during the
+    // P14.5
+    /// Per-phase wall-clock timings captured during the
     /// last `rebuild` / `invalidate`. Useful for surfacing where the
     /// pipeline spends its time (`cli lint --csv`).
     pub timings: ModuleTimings,
-    /// **P23.1** — directive set parsed from the source's `// gcl-…`
+    // P23.1
+    /// Directive set parsed from the source's `// gcl-…`
     /// comments. Drives lint suppressions ([`run_lints_with_directives`])
     /// and is consulted by the formatter when this module is being
     /// re-rendered.
     pub directives: Directives,
 }
 
-/// P14.5 — per-module pipeline timings.
+// P14.5
+/// Per-module pipeline timings.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ModuleTimings {
     /// Time spent in `lower_module` (CST → HIR walker).
@@ -87,7 +90,8 @@ impl ModuleTimings {
 /// (re)populated, so removed type / enum / native decls are reflected
 /// instead of lingering.
 ///
-/// **P19:** the [`greycat_analyzer_types::TypeArena`] now lives on the
+// P19
+/// The [`greycat_analyzer_types::TypeArena`] now lives on the
 /// project (not per [`AnalysisResult`]). Every module's analyzer mints
 /// into the same arena so cross-module `TypeId`s are directly
 /// comparable — no `mint_type_shape`/`read_type_shape` translation
@@ -96,17 +100,20 @@ impl ModuleTimings {
 #[derive(Debug, Default)]
 pub struct ProjectAnalysis {
     pub index: ProjectIndex,
-    /// P19 — project-wide type arena. Populated alongside every
+    // P19
+    /// Project-wide type arena. Populated alongside every
     /// module's analyzer pass. Append-only and interned, so duplicate
     /// `seed_builtins` calls per `analyze_with_index_into` are a
     /// no-op.
     pub arena: greycat_analyzer_types::TypeArena,
-    /// **P23.7** — when `true`, lint suppressions (`// gcl-lint-off …`)
+    // P23.7
+    /// When `true`, lint suppressions (`// gcl-lint-off …`)
     /// are still recorded but never silence emissions. Drives the CLI's
     /// `--no-suppressions` flag.
     pub bypass_suppressions: bool,
     modules: HashMap<Uri, ModuleAnalysis>,
-    /// P19.6 — per-module signature-stage cache. Records what each
+    // P19.6
+    /// Per-module signature-stage cache. Records what each
     /// module contributed to the project signature index
     /// (`attr_types`, `method_returns`, `fn_signatures`, `enum_types`)
     /// during the last [`lower_signatures_into`] call, plus the hash
@@ -121,7 +128,8 @@ pub struct ProjectAnalysis {
     sig_cache: HashMap<Uri, ModuleSigCache>,
 }
 
-/// P19.6 — what one module contributed to the project signature index.
+// P19.6
+/// What one module contributed to the project signature index.
 #[derive(Debug, Clone, Default)]
 struct ModuleSigCache {
     /// Hash of every byte the lowering pass reads out of this module's
@@ -135,26 +143,31 @@ struct ModuleSigCache {
     /// the post-ingest project state — otherwise a previously-`any()`
     /// reference to a now-known type would silently stay `any()`.
     name_set_hash: u64,
-    /// **P19.9** — `(type_sym, attr_sym, ty)`.
+    // P19.9
+    /// `(type_sym, attr_sym, ty)`.
     attrs: Vec<(
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::TypeId,
     )>,
-    /// **P19.9** — `(type_sym, method_sym, ty)`.
+    // P19.9
+    /// `(type_sym, method_sym, ty)`.
     methods: Vec<(
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::TypeId,
     )>,
-    /// **P19.9** — `(fn_sym, signature)`.
+    // P19.9
+    /// `(fn_sym, signature)`.
     fns: Vec<(greycat_analyzer_types::Symbol, FnSignature)>,
-    /// **P19.9** — `(enum_sym, ty)`.
+    // P19.9
+    /// `(enum_sym, ty)`.
     enums: Vec<(
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::TypeId,
     )>,
-    /// **P19.10** — `(var_sym, ty)`. Top-level `var` declared types.
+    // P19.10
+    /// `(var_sym, ty)`. Top-level `var` declared types.
     /// Lowered alongside the other signatures in
     /// [`lower_module_signatures`] so the analyzer's bare-Ident path
     /// can type a cross-module `Definition::ProjectDecl` pointing at
@@ -186,7 +199,7 @@ impl ProjectAnalysis {
 
     /// Mutable borrow of the project-wide type arena. Capability
     /// handlers should not mint new types; this is reserved for the
-    /// orchestrator and the staged-pipeline body walker (P22+).
+    /// orchestrator and the staged-pipeline body walker.
     pub fn arena_mut(&mut self) -> &mut greycat_analyzer_types::TypeArena {
         &mut self.arena
     }
@@ -201,15 +214,17 @@ impl ProjectAnalysis {
     /// Rebuild from scratch over the current `manager` state. Existing
     /// cache entries are dropped.
     ///
-    /// **P20:** routes through [`Self::analyze_staged`], the staged-
-    /// pipeline orchestrator that future phases (P21-P23) will fill in
+    // P20
+    /// Routes through [`Self::analyze_staged`], the staged-
+    /// pipeline orchestrator that future phases will fill in
     /// stage-by-stage. For now, every stage delegates to the existing
     /// per-module + post-pass machinery — same shape, named seam.
     pub fn rebuild(&mut self, manager: &SourceManager) {
         self.analyze_staged(manager);
     }
 
-    /// **P20** — staged-pipeline entry point. The 12-stage design from
+    // P20
+    /// Staged-pipeline entry point. The 12-stage design from
     /// the plan:
     ///
     /// ```text
@@ -231,16 +246,16 @@ impl ProjectAnalysis {
     ///                       monomorphize at call sites)
     /// ```
     ///
-    /// **P20 status:** the staged interface exists but each stage
+    /// **Status:** the staged interface exists but each stage
     /// delegates to the existing per-module + post-pass machinery.
     /// Stages get filled in incrementally:
-    /// - **P21** extracts S1-S6 (deletes pass 3 `resolve_cross_module_members`)
-    /// - **P22** extracts S7-S11 (deletes passes 3.4 / 3.45 / 3.52 +
-    ///   the receiver-driven substitution shim)
-    /// - **P23** rewrites S12 (deletes passes 3.5 / 3.55 / 3.6 +
-    ///   the propagate / fixed-point cascade)
-    /// - **P24** wires the Q1-Q5 query DAG so `invalidate(uri)` only
-    ///   replays Q5(uri) (and Q4 / Q5(others) when signatures change)
+    /// - Extract S1-S6 (deletes pass 3 `resolve_cross_module_members`).
+    /// - Extract S7-S11 (deletes passes 3.4 / 3.45 / 3.52 +
+    ///   the receiver-driven substitution shim).
+    /// - Rewrite S12 (deletes passes 3.5 / 3.55 / 3.6 +
+    ///   the propagate / fixed-point cascade).
+    /// - Wire the Q1-Q5 query DAG so `invalidate(uri)` only
+    ///   replays Q5(uri) (and Q4 / Q5(others) when signatures change).
     pub fn analyze_staged(&mut self, manager: &SourceManager) {
         self.reset_state();
 
@@ -315,7 +330,7 @@ impl ProjectAnalysis {
         hirs
     }
 
-    /// **Stages S7-S11** (P22) — lower every type's attr `TypeRef`s
+    /// **Stages S7-S11** — lower every type's attr `TypeRef`s
     /// and method return-`TypeRef`s into the shared arena
     /// project-wide, then store the resulting `TypeId`s on each
     /// type's [`crate::stdlib::TypeMembers`] entry.
@@ -343,7 +358,8 @@ impl ProjectAnalysis {
     }
 }
 
-/// **P19.6** — fingerprint of the project-wide name set used by
+// P19.6
+/// Fingerprint of the project-wide name set used by
 /// [`lower_type_ref_project`]. `lower_type_ref_project` checks
 /// `index.has_name(...)` for every non-primitive, non-generic-param
 /// TypeRef name; the answer flips between `Named(name)` and `any()`.
@@ -378,11 +394,12 @@ fn project_name_set_hash(index: &ProjectIndex) -> u64 {
     hasher.finish()
 }
 
-/// **P19.6** — fingerprint of every byte
+// P19.6
+/// Fingerprint of every byte
 /// [`lower_module_signatures_walk`] would read out of `hir`. Walks
 /// each top-level type / fn / enum decl name, generic ident text,
 /// every reachable [`TypeRef`] (recursively), and the optional
-/// marker on each ref. Body statements / expressions are skipped —
+/// marker on each ref. Body statements / expressions are skipped
 /// they don't contribute to the project signature index.
 fn module_signature_hash(hir: &Hir) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -483,13 +500,15 @@ fn hash_type_ref(
     0u8.hash(hasher);
 }
 
-/// **P24** — free-function variant of [`ProjectAnalysis::stage_lower_signatures`]
+// P24
+/// Free-function variant of [`ProjectAnalysis::stage_lower_signatures`]
 /// that takes the arena + index as separate `&mut` borrows. Lets the
 /// `invalidate` path build the `(Uri, &Hir)` slice from references
 /// into `self.modules` without colliding with the `&mut self` recv
 /// the method form would require.
 ///
-/// **P19.6** — when `cache` already has an entry for a module whose
+// P19.6
+/// When `cache` already has an entry for a module whose
 /// `(sig_hash, name_set_hash)` pair matches the current state, the
 /// cached contributions are reapplied verbatim instead of re-walking
 /// the module. The arena is append-only across `invalidate`, so the
@@ -529,12 +548,14 @@ fn lower_signatures_into(
     }
 }
 
-/// **P19.6** — walk a single module's signatures and return the
+// P19.6
+/// Walk a single module's signatures and return the
 /// contributions it would write into the project index. Mutates
 /// `index.symbols` in passing (every contributed name is interned
 /// so cache entries can use `Symbol` keys).
 ///
-/// **P19.9** — `generics_in_scope` is keyed by [`Symbol`] now, not
+// P19.9
+/// `generics_in_scope` is keyed by [`Symbol`] now, not
 /// `String`; `GenericOwner::{Type,Function}` still carry the source
 /// text since they're stored on `TypeKind::GenericParam` in the
 /// shared arena. The interner makes the *map* lookup cheap; the
@@ -700,7 +721,8 @@ fn lower_module_signatures(
     entry
 }
 
-/// **P19.14** — index-aware extension of [`greycat_analyzer_types::is_assignable_to`]
+// P19.14
+/// Index-aware extension of [`greycat_analyzer_types::is_assignable_to`]
 /// that recognises user-declared inheritance. Adds two cases on top
 /// of the standard relation:
 /// - `Named(Sub)` is assignable to `Named(Super)` when `Sub` is `Super`'s
@@ -742,7 +764,8 @@ fn is_assignable_to_with_index(
     }
 }
 
-/// **P19.6** — apply a cached / freshly-built module contribution to
+// P19.6
+/// Apply a cached / freshly-built module contribution to
 /// the project index. Mirrors the apply-loop the original
 /// `lower_signatures_into` ran at end-of-pass: `or_insert` semantics
 /// preserve the "first decl wins" collision rule that the rest of
@@ -776,8 +799,8 @@ impl ProjectAnalysis {
     /// **Stages S2-S11 + S12 (per-module slice).** Currently delegates
     /// to `analyze_with_index_into`, which combines name declaration,
     /// structure declaration, signature lowering, and body walking
-    /// inside `Cx::visit_decl`. P21 extracts S2-S6, P22 extracts
-    /// S7-S11, P23 rewrites S12 — at which point this stage shrinks
+    /// inside `Cx::visit_decl`. Subsequent extraction passes will split
+    /// out S2-S6, S7-S11, and S12 — at which point this stage shrinks
     /// to a thin "wire it all together" call.
     fn stage_per_module_analysis(&mut self, hirs: Vec<(Uri, Hir, String, Duration, Directives)>) {
         let bypass = self.bypass_suppressions;
@@ -820,22 +843,21 @@ impl ProjectAnalysis {
         }
     }
 
-    /// **Stage S12 cross-module suffix.** Remaining post-passes (P21
-    /// deleted pass 3, P22+ will keep deleting):
+    /// **Stage S12 cross-module suffix.** Remaining post-passes:
     ///
-    /// - Pass 3.4 (P16.3): cross-module member-expr typing.
-    /// - Pass 3.5 (P15.7 + P16.4): cross-module call return-type
+    /// - Pass 3.4: cross-module member-expr typing.
+    /// - Pass 3.5: cross-module call return-type
     ///   inference for Static / QualifiedStatic / Member / Arrow /
     ///   Ident callees.
-    /// - Pass 3.52 (P16.4 follow-up): re-bind for-in iteration vars
+    /// - Pass 3.52: re-bind for-in iteration vars
     ///   from now-settled iterable types.
-    /// - Fixed-point loop (P16.4 cascade closure): each pass propagates
+    /// - Fixed-point cascade-closure loop: each pass propagates
     ///   type information one hop; bound at 5 iterations so a
     ///   degenerate/cyclic case can't hang.
-    /// - Pass 3.55 (P16.6): typed lint — `arrow-on-non-deref`.
+    /// - Pass 3.55: typed lint — `arrow-on-non-deref`.
     /// - Pass 3.6: type-relation validation.
     ///
-    /// **P22-P23 deletes most of these.** The work each pass does is
+    /// The work each pass does is
     /// subsumed by the staged S7-S11 (which lowers TypeRefs into the
     /// shared arena against the *complete* project name set, so
     /// cross-module attr / method types are resolved at signature
@@ -881,7 +903,8 @@ impl ProjectAnalysis {
     /// corresponding declared param. Folded into the unified
     /// validation phase so all type-relation diagnostics share one
     /// producer.
-    /// P19 split-borrow variant: takes `&modules`, `&index`, and a
+    // P19
+    /// Split-borrow variant: takes `&modules`, `&index`, and a
     /// mutable borrow on the shared arena. The validation loop holds
     /// `&mut self.arena` during iteration over `&self.modules`, so the
     /// `&self`-borrowing version can no longer be invoked directly
@@ -1013,12 +1036,13 @@ impl ProjectAnalysis {
     /// Modes:
     /// - `restrict = None` revalidates every cached module (used by
     ///   `rebuild`).
-    /// - `restrict = Some(set)` only revalidates the listed URIs —
+    /// - `restrict = Some(set)` only revalidates the listed URIs
     ///   the changed URI plus any module whose `expr_types` were
     ///   touched by the cross-module fixup passes. Used by
     ///   `invalidate` to keep per-keystroke cost bounded.
     ///
-    /// P16.6 — typed lints that depend on settled per-expr types and
+    // P16.6
+    /// Typed lints that depend on settled per-expr types and
     /// the project-wide [`ProjectIndex`]. Runs after the cross-module
     /// type fixup passes (3.4 / 3.5) and before
     /// [`Self::validate_type_relations`]. Idempotent: drops prior
@@ -1196,7 +1220,8 @@ impl ProjectAnalysis {
         }
     }
 
-    /// P14.9 — walk every module's CST for qualified-name access
+    // P14.9
+    /// Walk every module's CST for qualified-name access
     /// patterns (`<module>::<name>`, `<module>::<type>::<name>`, etc.)
     /// and bump `references_to` for the matching decl in the named
     /// module. This is what lets the `unused-decl` lint correctly
@@ -1472,7 +1497,8 @@ impl ProjectAnalysis {
         self.modules.get(uri)
     }
 
-    /// **P19.6** — number of modules currently held in the
+    // P19.6
+    /// Number of modules currently held in the
     /// signature-stage cache. Exposed for the test that asserts the
     /// cache is populated after a build / partially refreshed after
     /// a body-only edit. Production callers shouldn't depend on the
@@ -1495,7 +1521,8 @@ impl ProjectAnalysis {
     }
 }
 
-/// P14.9 — pull every ident text from a `static_expr` chain (left to
+// P14.9
+/// Pull every ident text from a `static_expr` chain (left to
 /// right). For `runtime::ResponseCode::ok` returns
 /// `["runtime", "ResponseCode", "ok"]`. The leftmost segment comes
 /// from the chain root's `type_ident.name`; subsequent segments come
@@ -1536,7 +1563,8 @@ fn collect_chain(
     }
 }
 
-/// P15.10 — resolve a call's callee to its declaring `Decl::Fn`.
+// P15.10
+/// Resolve a call's callee to its declaring `Decl::Fn`.
 /// Returns `(Some(foreign_uri), decl_id)` for cross-module callees
 /// and `(None, decl_id)` for in-module callees.
 ///
@@ -1601,8 +1629,9 @@ fn resolve_call_target(
     }
 }
 
-/// P15.8 — qualified-chain resolution result, used by
-/// `resolve_qualified_chain` (the only remaining caller after P26
+// P15.8
+/// Qualified-chain resolution result, used by
+/// `resolve_qualified_chain` (the only remaining caller after
 /// cleanup). Discriminates "the chain landed on an attr / method"
 /// from "the chain landed on an enum variant" so call-target
 /// resolution can dispatch correctly.
@@ -1686,7 +1715,7 @@ fn resolve_qualified_chain(
 
 /// Walk one module's HIR and emit every type-relation diagnostic
 /// the analyzer's per-module pass deferred. Reads only — never
-/// mutates `module`. The shared project arena is passed in (P19);
+/// mutates `module`. The shared project arena is passed in;
 /// any newly-needed declared-side TypeIds are minted into it
 /// alongside everything else, which is fine because the arena is
 /// append-only and intern-collapsed.
@@ -2034,7 +2063,8 @@ fn validate_module_type_relations(
     }
 }
 
-/// **P22** — project-wide TypeRef lowerer used by
+// P22
+/// Project-wide TypeRef lowerer used by
 /// [`ProjectAnalysis::stage_lower_signatures`]. Mirrors
 /// `Cx::lower_type_ref` but uses the project index instead of a
 /// per-module registry, so foreign type names resolve directly to
@@ -2143,7 +2173,8 @@ fn lower_type_ref_id(
     })
 }
 
-/// P15.7 — arena-free intermediate for translating a foreign HIR
+// P15.7
+/// Arena-free intermediate for translating a foreign HIR
 /// `TypeRef` into the destination module's `TypeArena`. Captures the
 /// shape (primitive / named / generic / nullable) so phase 2 of
 /// `infer_cross_module_call_types` can mint it without holding a
@@ -2410,7 +2441,8 @@ mod tests {
         assert!(pa.module(&uri("/proj/a.gcl")).is_none());
     }
 
-    /// **P19.6** — body-only edits skip the per-module signature
+    // P19.6
+    /// Body-only edits skip the per-module signature
     /// re-walk by reusing the cached contributions. The cache is
     /// populated after the initial build and stays the same size
     /// after an unrelated body edit; the changed module's hash is
@@ -2463,7 +2495,8 @@ mod tests {
         );
     }
 
-    /// **P19.6** — signature edits invalidate the cache entry for
+    // P19.6
+    /// Signature edits invalidate the cache entry for
     /// the changed module. The new contributions overwrite the old
     /// in `index.fn_signatures`, so callers querying the new return
     /// type see it on the very next `module()` lookup.
