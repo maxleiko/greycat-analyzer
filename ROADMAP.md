@@ -904,7 +904,7 @@ The fix pattern in all cases: **make the quickfix produce a syntactically valid 
 
 **Chunks (planned, not committed):**
 
-- [x] **28.1 Design + scaffold `LocalArena`** (L) — new type in [`greycat-analyzer-types`](../greycat-analyzer-types/src/lib.rs) that wraps a snapshot of the canonical arena's `items` + `intern` plus an "appended" tail. `alloc` / `get` / `nullable` / `substitute` work transparently; `new_local_ids() -> Range<u32>` exposes the appended tail for the merge step. `LocalArena: Send` so workers can own one. Document the snapshot semantics: the local view is read-only against the canonical body, append-only against the tail.
+- [ ] **28.1 Design + scaffold `LocalArena`** (L) — new type in [`greycat-analyzer-types`](../greycat-analyzer-types/src/lib.rs) that wraps a snapshot of the canonical arena's `items` + `intern` plus an "appended" tail. `alloc` / `get` / `nullable` / `substitute` work transparently; `new_local_ids() -> Range<u32>` exposes the appended tail for the merge step. `LocalArena: Send` so workers can own one. Document the snapshot semantics: the local view is read-only against the canonical body, append-only against the tail.
 
 - [ ] **28.2 Refactor `Cx` to take `LocalArena`** (M) — change the analyzer's `Cx<'a>::arena` field type. Public surface of the analyzer (`analyze_with_index_into`) keeps taking `&mut TypeArena` but internally wraps it in a `LocalArena::wrap(arena)` for the duration of the body walk. No worker spawning yet — this chunk verifies the local-arena abstraction is API-equivalent to the canonical one. Bench: parallel mode disabled, expect zero delta.
 

@@ -250,15 +250,6 @@ impl TypeArena {
         self.items.is_empty()
     }
 
-    // P28.1
-    /// Read-only intern lookup. Returns the existing [`TypeId`] for
-    /// `ty` or `None` if no equal `Type` has been allocated yet.
-    /// Used by [`LocalArena`] to dedup against the canonical arena's
-    /// snapshot without taking a mutable borrow.
-    pub fn lookup(&self, ty: &Type) -> Option<TypeId> {
-        self.intern.get(ty).copied()
-    }
-
     /// Make a copy of `id` with `nullable = true`. Idempotent.
     pub fn nullable(&mut self, id: TypeId) -> TypeId {
         let mut ty = self.get(id).clone();
@@ -449,417 +440,6 @@ impl TypeArena {
 }
 
 // =============================================================================
-// Read-only arena view + LocalArena (P28.1)
-// =============================================================================
-
-// P28.1
-/// Read-only view of a typed arena. Both [`TypeArena`] and
-/// [`LocalArena`] implement this so the generic accessor functions
-/// ([`is_assignable_to`], [`is_castable`], [`display`],
-/// [`display_fqn`]) work uniformly across the canonical project arena
-/// and per-thread local arenas built during the parallel S12 body
-/// walk.
-pub trait TypeView {
-    fn get(&self, id: TypeId) -> &Type;
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl TypeView for TypeArena {
-    fn get(&self, id: TypeId) -> &Type {
-        TypeArena::get(self, id)
-    }
-    fn len(&self) -> usize {
-        TypeArena::len(self)
-    }
-}
-
-// P28.1
-/// Append-side trait for typed arenas. Lets [`InferenceTable::substitute`]
-/// and any other mutator that only needs to alloc + nullable work
-/// uniformly over [`TypeArena`] and [`LocalArena`].
-pub trait TypeArenaMut: TypeView {
-    fn alloc(&mut self, ty: Type) -> TypeId;
-    fn nullable(&mut self, id: TypeId) -> TypeId;
-}
-
-impl TypeArenaMut for TypeArena {
-    fn alloc(&mut self, ty: Type) -> TypeId {
-        TypeArena::alloc(self, ty)
-    }
-    fn nullable(&mut self, id: TypeId) -> TypeId {
-        TypeArena::nullable(self, id)
-    }
-}
-
-impl TypeArenaMut for LocalArena<'_> {
-    fn alloc(&mut self, ty: Type) -> TypeId {
-        LocalArena::alloc(self, ty)
-    }
-    fn nullable(&mut self, id: TypeId) -> TypeId {
-        LocalArena::nullable(self, id)
-    }
-}
-
-// P28.1
-/// Per-thread interning arena that layers a private append-only tail
-/// on top of a read-only snapshot of the canonical [`TypeArena`].
-///
-/// Workers in the parallel S12 body walker each own a `LocalArena`
-/// constructed via [`LocalArena::wrap`]. Allocations dedup first
-/// against the canonical snapshot's intern table — so existing
-/// canonical [`TypeId`]s are returned unchanged — and then against
-/// the local tail. New mints land in the tail, with TypeIds offset
-/// past the snapshot's length.
-///
-/// After the parallel phase the orchestrator calls
-/// [`TypeArena::merge_local`] on each thread's
-/// [`LocalArena::into_local_items`], producing a remap table that
-/// canonicalizes every locally-minted [`TypeId`] back into the
-/// project-wide arena. The remap is then applied to every
-/// `TypeId`-carrying field of each per-module result.
-pub struct LocalArena<'a> {
-    base: &'a TypeArena,
-    base_len: u32,
-    local_items: Vec<Type>,
-    local_intern: FxHashMap<Type, TypeId>,
-}
-
-impl<'a> LocalArena<'a> {
-    /// Wrap a snapshot of `base`. The wrapped [`TypeArena`] is treated
-    /// as read-only for the lifetime of this `LocalArena`; new mints
-    /// land in a private tail. `base.len()` is captured at construction
-    /// — the merge step uses the captured value to distinguish base
-    /// TypeIds (`raw() < base_len`) from local-tail TypeIds.
-    pub fn wrap(base: &'a TypeArena) -> Self {
-        let base_len = base.len() as u32;
-        Self {
-            base,
-            base_len,
-            local_items: Vec::new(),
-            local_intern: FxHashMap::default(),
-        }
-    }
-
-    /// Snapshot length captured at construction. Local TypeIds have
-    /// `raw() >= base_len`; canonical TypeIds have `raw() < base_len`.
-    pub fn base_len(&self) -> u32 {
-        self.base_len
-    }
-
-    /// Number of types minted into the local tail.
-    pub fn local_len(&self) -> usize {
-        self.local_items.len()
-    }
-
-    /// Range of TypeIds minted locally — `base_len..(base_len +
-    /// local_len)`. Useful for the merge step's remap walk.
-    pub fn new_local_ids(&self) -> std::ops::Range<u32> {
-        self.base_len..(self.base_len + self.local_items.len() as u32)
-    }
-
-    /// Consume self, returning the locally-minted items in insertion
-    /// order. The merge step walks this vec, remaps inner TypeIds
-    /// through the partial remap built so far, and allocs into the
-    /// canonical arena.
-    pub fn into_local_items(self) -> Vec<Type> {
-        self.local_items
-    }
-
-    pub fn alloc(&mut self, ty: Type) -> TypeId {
-        if let Some(id) = self.base.lookup(&ty) {
-            return id;
-        }
-        if let Some(&id) = self.local_intern.get(&ty) {
-            return id;
-        }
-        let id = TypeId(self.base_len + self.local_items.len() as u32);
-        self.local_items.push(ty.clone());
-        self.local_intern.insert(ty, id);
-        id
-    }
-
-    pub fn get(&self, id: TypeId) -> &Type {
-        let raw = id.0;
-        if raw < self.base_len {
-            self.base.get(id)
-        } else {
-            &self.local_items[(raw - self.base_len) as usize]
-        }
-    }
-
-    pub fn nullable(&mut self, id: TypeId) -> TypeId {
-        let mut ty = self.get(id).clone();
-        if ty.nullable {
-            return id;
-        }
-        ty.nullable = true;
-        self.alloc(ty)
-    }
-
-    pub fn primitive(&mut self, p: Primitive) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Primitive(p),
-            nullable: false,
-        })
-    }
-
-    pub fn null(&mut self) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Null,
-            nullable: true,
-        })
-    }
-
-    pub fn any(&mut self) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Any,
-            nullable: true,
-        })
-    }
-
-    pub fn never(&mut self) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Never,
-            nullable: false,
-        })
-    }
-
-    pub fn named(&mut self, name: impl Into<SmolStr>) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Named { name: name.into() },
-            nullable: false,
-        })
-    }
-
-    pub fn generic(&mut self, name: impl Into<SmolStr>, args: Vec<TypeId>) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Generic {
-                name: name.into(),
-                args: args.into(),
-            },
-            nullable: false,
-        })
-    }
-
-    pub fn generic_param(&mut self, name: impl Into<SmolStr>, owner: GenericOwner) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::GenericParam {
-                name: name.into(),
-                owner,
-            },
-            nullable: false,
-        })
-    }
-
-    pub fn lambda(&mut self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Lambda(LambdaType { params, ret }),
-            nullable: false,
-        })
-    }
-
-    pub fn tuple(&mut self, elements: Vec<TypeId>) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Tuple { elements },
-            nullable: false,
-        })
-    }
-
-    /// Substitute `GenericParam(name)` occurrences inside `ty` with
-    /// the matching entry in `subst`. Mirrors [`TypeArena::substitute`]
-    /// exactly, but mutates the local tail rather than the canonical
-    /// arena.
-    pub fn substitute(&mut self, ty: TypeId, subst: &FxHashMap<String, TypeId>) -> TypeId {
-        if subst.is_empty() {
-            return ty;
-        }
-        let t = self.get(ty).clone();
-        match &t.kind {
-            TypeKind::GenericParam { name, .. } => match subst.get(name.as_str()) {
-                Some(&witness) if t.nullable => self.nullable(witness),
-                Some(&witness) => witness,
-                None => ty,
-            },
-            TypeKind::Generic { name, args } => {
-                let new_args: SmallVec<[TypeId; 2]> =
-                    args.iter().map(|a| self.substitute(*a, subst)).collect();
-                if new_args == *args {
-                    ty
-                } else {
-                    let name = name.clone();
-                    let mut new_t = self.generic(name, new_args.into_vec());
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            TypeKind::Tuple { elements } => {
-                let new_els: Vec<TypeId> = elements
-                    .iter()
-                    .map(|e| self.substitute(*e, subst))
-                    .collect();
-                if new_els == *elements {
-                    ty
-                } else {
-                    let mut new_t = self.tuple(new_els);
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            TypeKind::Lambda(l) => {
-                let new_params: Vec<TypeId> = l
-                    .params
-                    .iter()
-                    .map(|p| self.substitute(*p, subst))
-                    .collect();
-                let new_ret = self.substitute(l.ret, subst);
-                if new_params == l.params && new_ret == l.ret {
-                    ty
-                } else {
-                    let mut new_t = self.lambda(new_params, new_ret);
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            TypeKind::Anonymous { fields } => {
-                let new_fields: Vec<(SmolStr, TypeId)> = fields
-                    .iter()
-                    .map(|(n, t)| (n.clone(), self.substitute(*t, subst)))
-                    .collect();
-                if new_fields == *fields {
-                    ty
-                } else {
-                    let mut new_t = self.alloc(Type {
-                        kind: TypeKind::Anonymous { fields: new_fields },
-                        nullable: false,
-                    });
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            TypeKind::Union { alts } => {
-                let new_alts: Vec<TypeId> =
-                    alts.iter().map(|a| self.substitute(*a, subst)).collect();
-                if new_alts == *alts {
-                    ty
-                } else {
-                    let mut new_t = self.alloc(Type {
-                        kind: TypeKind::Union { alts: new_alts },
-                        nullable: false,
-                    });
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            _ => ty,
-        }
-    }
-}
-
-impl TypeView for LocalArena<'_> {
-    fn get(&self, id: TypeId) -> &Type {
-        LocalArena::get(self, id)
-    }
-    fn len(&self) -> usize {
-        (self.base_len + self.local_items.len() as u32) as usize
-    }
-}
-
-// P28.1
-/// Remap every [`TypeId`] inside `ty` through `remap_id`, returning a
-/// fresh `Type`. Container-shape kinds (Generic / Lambda / Tuple /
-/// Anonymous / Union) are rebuilt with remapped inner ids; leaf kinds
-/// (Null / Any / Never / Primitive / Named / GenericParam / Enum) are
-/// cloned unchanged.
-fn remap_inner_ids<F: Fn(TypeId) -> TypeId>(ty: &Type, remap_id: &F) -> Type {
-    let kind = match &ty.kind {
-        TypeKind::Null => TypeKind::Null,
-        TypeKind::Any => TypeKind::Any,
-        TypeKind::Never => TypeKind::Never,
-        TypeKind::Primitive(p) => TypeKind::Primitive(*p),
-        TypeKind::Named { name } => TypeKind::Named { name: name.clone() },
-        TypeKind::GenericParam { name, owner } => TypeKind::GenericParam {
-            name: name.clone(),
-            owner: owner.clone(),
-        },
-        TypeKind::Enum { name, variants } => TypeKind::Enum {
-            name: name.clone(),
-            variants: variants.clone(),
-        },
-        TypeKind::Generic { name, args } => TypeKind::Generic {
-            name: name.clone(),
-            args: args.iter().map(|a| remap_id(*a)).collect(),
-        },
-        TypeKind::Lambda(l) => TypeKind::Lambda(LambdaType {
-            params: l.params.iter().map(|p| remap_id(*p)).collect(),
-            ret: remap_id(l.ret),
-        }),
-        TypeKind::Tuple { elements } => TypeKind::Tuple {
-            elements: elements.iter().map(|e| remap_id(*e)).collect(),
-        },
-        TypeKind::Anonymous { fields } => TypeKind::Anonymous {
-            fields: fields
-                .iter()
-                .map(|(n, t)| (n.clone(), remap_id(*t)))
-                .collect(),
-        },
-        TypeKind::Union { alts } => TypeKind::Union {
-            alts: alts.iter().map(|a| remap_id(*a)).collect(),
-        },
-    };
-    Type {
-        kind,
-        nullable: ty.nullable,
-    }
-}
-
-impl TypeArena {
-    // P28.1
-    /// Merge a [`LocalArena`]'s locally-minted items into this arena,
-    /// returning a remap table indexed by local-tail offset (`0..local_items.len()`).
-    /// `remap[i]` is the canonical [`TypeId`] for what was at
-    /// `base_len + i` in the LocalArena.
-    ///
-    /// The merge walks `local_items` in insertion order. Because the
-    /// analyzer only refers to TypeIds it has already alloced, every
-    /// inner reference points either into the canonical base (TypeId
-    /// `< base_len`, passes through unchanged) or into an earlier
-    /// position in the local tail (already in `remap`). So the walk
-    /// proceeds in one pass — no topological sort needed.
-    ///
-    /// Callers must apply `remap` to every TypeId-carrying field of
-    /// the per-module result that was produced against the LocalArena
-    /// (e.g. `AnalysisResult::expr_types`, `def_types`, `registry`).
-    pub fn merge_local(&mut self, base_len: u32, local_items: Vec<Type>) -> Vec<TypeId> {
-        let mut remap: Vec<TypeId> = Vec::with_capacity(local_items.len());
-        for ty in &local_items {
-            let canonical = remap_inner_ids(ty, &|id: TypeId| {
-                let raw = id.0;
-                if raw < base_len {
-                    id
-                } else {
-                    remap[(raw - base_len) as usize]
-                }
-            });
-            remap.push(self.alloc(canonical));
-        }
-        remap
-    }
-}
-
-// =============================================================================
 // Type registry — holds module-level declared types
 // =============================================================================
 
@@ -906,7 +486,7 @@ impl TypeRegistry {
 /// Returns `false` for shapes the relation hasn't been formally taught
 /// — better to under-accept and surface false negatives in  than to
 /// silently widen.
-pub fn is_assignable_to<V: TypeView + ?Sized>(arena: &V, from: TypeId, to: TypeId) -> bool {
+pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     if from == to {
         return true;
     }
@@ -1127,11 +707,7 @@ impl InferenceTable {
 
     /// Substitute every `GenericParam(name)` in `ty` with the recorded
     /// witness. Idempotent — re-applying produces the same result.
-    ///
-    // P28.1
-    /// Generic over [`TypeArenaMut`] so callers can pass either the
-    /// canonical [`TypeArena`] or a per-thread [`LocalArena`].
-    pub fn substitute<V: TypeArenaMut + ?Sized>(&self, arena: &mut V, ty: TypeId) -> TypeId {
+    pub fn substitute(&self, arena: &mut TypeArena, ty: TypeId) -> TypeId {
         let t = arena.get(ty).clone();
         match &t.kind {
             TypeKind::GenericParam { name, .. } => {
@@ -1153,13 +729,7 @@ impl InferenceTable {
                     ty
                 } else {
                     let name = name.clone();
-                    let mut new_t = arena.alloc(Type {
-                        kind: TypeKind::Generic {
-                            name,
-                            args: new_args,
-                        },
-                        nullable: false,
-                    });
+                    let mut new_t = arena.generic(name, new_args.into_vec());
                     if t.nullable {
                         new_t = arena.nullable(new_t);
                     }
@@ -1174,10 +744,7 @@ impl InferenceTable {
                 if new_els == *elements {
                     ty
                 } else {
-                    let mut new_t = arena.alloc(Type {
-                        kind: TypeKind::Tuple { elements: new_els },
-                        nullable: false,
-                    });
+                    let mut new_t = arena.tuple(new_els);
                     if t.nullable {
                         new_t = arena.nullable(new_t);
                     }
@@ -1208,7 +775,7 @@ impl InferenceTable {
 /// - Anything else falls through to "same head name OR `from` assignable
 ///   to `to` (no inheritance check yet — that lands when supertype
 ///   chains thread through the analyzer)".
-pub fn is_castable<V: TypeView + ?Sized>(arena: &V, from: TypeId, to: TypeId) -> bool {
+pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     let from_t = arena.get(from);
     let to_t = arena.get(to);
 
@@ -1306,7 +873,7 @@ fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
 // Display
 // =============================================================================
 
-pub fn display<V: TypeView + ?Sized>(arena: &V, id: TypeId) -> String {
+pub fn display(arena: &TypeArena, id: TypeId) -> String {
     let ty = arena.get(id);
     let mut s = match &ty.kind {
         TypeKind::Null => "null".to_string(),
@@ -1362,8 +929,8 @@ pub fn display<V: TypeView + ?Sized>(arena: &V, id: TypeId) -> String {
 /// - User types resolve to `<lib>::<Name>` via `home_lib`.
 /// - `nullable` is rendered as ` | null` instead of the `?` suffix.
 /// - `any` (always nullable) is rendered as `core::any | null`.
-pub fn display_fqn<V: TypeView + ?Sized>(
-    arena: &V,
+pub fn display_fqn(
+    arena: &TypeArena,
     id: TypeId,
     home_lib: &dyn Fn(&str) -> Option<String>,
 ) -> String {
@@ -1763,190 +1330,5 @@ mod tests {
         assert!(is_assignable_to(&a, two, one));
         // {a} → {a, b}  is NOT — would be missing field b.
         assert!(!is_assignable_to(&a, one, two));
-    }
-
-    // P28.1
-    #[test]
-    fn local_arena_returns_canonical_id_for_base_types() {
-        let mut canon = fresh();
-        let int_canon = canon.primitive(Primitive::Int);
-        let local = LocalArena::wrap(&canon);
-        // Local view sees the canonical int by base-prefix lookup.
-        assert_eq!(
-            local.get(int_canon).kind,
-            TypeKind::Primitive(Primitive::Int)
-        );
-        assert_eq!(local.base_len(), canon.len() as u32);
-    }
-
-    // P28.1
-    #[test]
-    fn local_arena_dedups_against_canonical_base() {
-        let mut canon = fresh();
-        let int_canon = canon.primitive(Primitive::Int);
-        let mut local = LocalArena::wrap(&canon);
-        // Allocating an Int via LocalArena returns the *canonical* id —
-        // no new local-tail entry, because the base intern already has it.
-        let int_local = local.primitive(Primitive::Int);
-        assert_eq!(int_local, int_canon);
-        assert_eq!(local.local_len(), 0);
-    }
-
-    // P28.1
-    #[test]
-    fn local_arena_appends_new_types_past_base() {
-        let mut canon = fresh();
-        let _ = canon.primitive(Primitive::Int);
-        let base_len = canon.len() as u32;
-        let mut local = LocalArena::wrap(&canon);
-        let foo = local.named("Foo");
-        assert_eq!(foo.raw(), base_len);
-        assert_eq!(local.local_len(), 1);
-        // Second mint of the same name dedups against local intern.
-        let foo2 = local.named("Foo");
-        assert_eq!(foo, foo2);
-        assert_eq!(local.local_len(), 1);
-        // get works for both base and local TypeIds.
-        let int_canon = TypeId::from_raw(0);
-        assert!(matches!(local.get(int_canon).kind, TypeKind::Primitive(_)));
-        let TypeKind::Named { name } = &local.get(foo).kind else {
-            panic!("expected Named");
-        };
-        assert_eq!(name, "Foo");
-    }
-
-    // P28.1
-    #[test]
-    fn merge_local_canonicalizes_new_types_in_one_pass() {
-        // Two threads each mint `Array<int>` against a shared base.
-        // After merging both into canonical, both threads' remap maps
-        // their local `Array<int>` TypeId to the same canonical id.
-        let mut canon = fresh();
-        seed_primitives(&mut canon);
-        let int_canon = canon.lookup(&Type {
-            kind: TypeKind::Primitive(Primitive::Int),
-            nullable: false,
-        });
-        assert!(int_canon.is_some());
-
-        let thread_a_local: LocalArena<'_> = {
-            let mut la = LocalArena::wrap(&canon);
-            let int = la.primitive(Primitive::Int);
-            assert_eq!(int, int_canon.unwrap());
-            let _arr = la.generic("Array", vec![int]);
-            la
-        };
-        let thread_b_local: LocalArena<'_> = {
-            let mut la = LocalArena::wrap(&canon);
-            let int = la.primitive(Primitive::Int);
-            let _arr = la.generic("Array", vec![int]);
-            la
-        };
-
-        let a_base_len = thread_a_local.base_len();
-        let b_base_len = thread_b_local.base_len();
-        let a_items = thread_a_local.into_local_items();
-        let b_items = thread_b_local.into_local_items();
-
-        // Both threads minted exactly one new entry: Array<int>.
-        assert_eq!(a_items.len(), 1);
-        assert_eq!(b_items.len(), 1);
-
-        let remap_a = canon.merge_local(a_base_len, a_items);
-        let remap_b = canon.merge_local(b_base_len, b_items);
-
-        // Both threads' Array<int> canonicalize to the same TypeId.
-        assert_eq!(remap_a[0], remap_b[0]);
-
-        // The canonical arena has exactly one Array<int> entry.
-        let canon_array = canon.lookup(&Type {
-            kind: TypeKind::Generic {
-                name: "Array".into(),
-                args: smallvec::smallvec![int_canon.unwrap()],
-            },
-            nullable: false,
-        });
-        assert_eq!(canon_array, Some(remap_a[0]));
-    }
-
-    // P28.1
-    #[test]
-    fn merge_local_remaps_nested_local_typeids() {
-        // Local mints Bar then Generic<Foo, [Bar]>. Bar lives in the
-        // local tail, so the Generic's args[0] points at a local TypeId.
-        // Merge must remap the inner reference correctly even when
-        // canonical does not yet contain Bar.
-        let canon = fresh();
-        let mut la = LocalArena::wrap(&canon);
-        let bar = la.named("Bar");
-        let _foo_bar = la.generic("Foo", vec![bar]);
-        let base_len = la.base_len();
-        let items = la.into_local_items();
-        assert_eq!(items.len(), 2);
-
-        let mut canon = canon;
-        let remap = canon.merge_local(base_len, items);
-        // canonical[remap[1]] must be Generic { name: "Foo", args: [remap[0]] }.
-        let canonical_foo = canon.get(remap[1]);
-        let TypeKind::Generic { name, args } = &canonical_foo.kind else {
-            panic!("expected Generic");
-        };
-        assert_eq!(name, "Foo");
-        assert_eq!(args.as_slice(), &[remap[0]]);
-        // And canonical[remap[0]] is Named("Bar").
-        let canonical_bar = canon.get(remap[0]);
-        let TypeKind::Named { name } = &canonical_bar.kind else {
-            panic!("expected Named");
-        };
-        assert_eq!(name, "Bar");
-    }
-
-    // Helper for the merge tests above: seed the canonical arena with
-    // the same primitives the analyzer's `seed_builtins` would, so the
-    // merge tests start from a realistic baseline.
-    fn seed_primitives(arena: &mut TypeArena) {
-        for p in [
-            Primitive::Bool,
-            Primitive::Int,
-            Primitive::Float,
-            Primitive::Char,
-            Primitive::String,
-            Primitive::Time,
-            Primitive::Duration,
-            Primitive::Geo,
-        ] {
-            arena.primitive(p);
-        }
-        arena.null();
-        arena.any();
-        arena.never();
-    }
-
-    // P28.1
-    #[test]
-    fn local_arena_substitute_matches_canonical() {
-        // Same Type::Generic in canonical and via LocalArena must
-        // produce the same canonical TypeId after merge — the
-        // SmolStr/&str dedup anchor (P25.4) extended to the merge path.
-        let mut canon = fresh();
-        seed_primitives(&mut canon);
-        let int_canon = canon.primitive(Primitive::Int);
-        let arr_canon = canon.generic("Array", vec![int_canon]);
-
-        let mut la = LocalArena::wrap(&canon);
-        // Same shape minted via LocalArena should dedup to the same id
-        // since base already has it.
-        let arr_local = la.generic("Array", vec![int_canon]);
-        assert_eq!(arr_local, arr_canon);
-        assert_eq!(la.local_len(), 0);
-    }
-
-    // P28.1
-    /// Anchor that `LocalArena: Send` — required for rayon workers
-    /// to own one. Compile-time assertion via a free fn.
-    #[test]
-    fn local_arena_is_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<LocalArena<'_>>();
     }
 }
