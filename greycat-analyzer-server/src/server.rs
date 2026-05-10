@@ -121,6 +121,10 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
         project_analysis: Default::default(),
         project_root: None,
         lint_libs: false,
+        // P15.3 — production fetcher (ureq + 5min TTL cache). Native
+        // builds always have it; WASM uses a different bridge that
+        // doesn't go through this entry point.
+        registry: Some(crate::registry::shared()),
     };
 
     server.initialized(&init)?;
@@ -513,6 +517,17 @@ fn completion_handler(server: &Backend, params: CompletionParams) -> Option<Comp
         &server.project_analysis,
         server.project_root.as_deref(),
     )?;
+    // P15.3 — swap the lazy `@library` version placeholder with
+    // concrete items. Skipped when no fetcher is configured (WASM
+    // entry / tests), in which case the placeholder reaches the
+    // editor as-is and the bridge layer is expected to own the
+    // resolution.
+    if let Some(fetcher) = server.registry.as_deref()
+        && let Some(payload) = capabilities::extract_lib_version_placeholder(&list)
+    {
+        let resolved = capabilities::resolve_library_version_completion(&payload, fetcher);
+        return Some(CompletionResponse::List(resolved));
+    }
     Some(CompletionResponse::List(list))
 }
 

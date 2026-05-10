@@ -24,6 +24,7 @@
 
 mod backend;
 pub mod capabilities;
+pub mod registry;
 mod server;
 
 pub use server::*;

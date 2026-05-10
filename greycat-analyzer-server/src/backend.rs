@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::module_desc::parse_module_desc;
+use greycat_analyzer_core::registry::RegistryFetcher;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
     Document, SourceManager,
@@ -40,6 +42,12 @@ pub struct Backend {
     /// LSP's `initializationOptions`. Default `false` — most users
     /// don't want warnings about vendored library code.
     pub lint_libs: bool,
+    /// P15.3 — registry fetcher for `@library` version completion.
+    /// `None` skips the lazy resolution path and surfaces the
+    /// placeholder verbatim (the foundational shape used by tests
+    /// and the WASM bridge until the playground wires its own
+    /// JS-side fetcher).
+    pub registry: Option<Arc<dyn RegistryFetcher>>,
 }
 
 impl Backend {

@@ -479,6 +479,217 @@ fn completion_inside_at_include_drills_into_subdirs() {
     fs::remove_dir_all(&tmp).ok();
 }
 
+/// P15.3 — cursor in the version slot of `@library("name", "<cursor>")`
+/// emits a single lazy placeholder. The LSP layer would swap this for
+/// concrete versions; the foundational `completion` entry surfaces it
+/// verbatim so the test can inspect the placeholder shape.
+#[test]
+fn completion_inside_at_library_version_emits_placeholder() {
+    let src = "@library(\"std\", \"\");\n";
+    let tree = parse(src);
+    // Cursor between the two quotes of the version string (col 17).
+    let list =
+        capabilities::completion(src, tree.root_node(), pos(0, 17), None).expect("completion list");
+    assert_eq!(list.items.len(), 1, "got: {:?}", list.items);
+    assert!(list.is_incomplete);
+    let item = &list.items[0];
+    assert_eq!(item.label, "Fetching 'std' versions...");
+    assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
+    let payload =
+        capabilities::extract_lib_version_placeholder(&list).expect("placeholder payload");
+    assert_eq!(payload.lib, "std");
+    assert_eq!(payload.typed, "");
+    // Inner-content range covers the gap between the quotes.
+    assert_eq!(payload.range.start, pos(0, 17));
+    assert_eq!(payload.range.end, pos(0, 17));
+}
+
+/// P15.3 — cursor in the *name* slot (first arg) does NOT emit a
+/// version placeholder. Name completion is intentionally out of
+/// scope for this chunk.
+#[test]
+fn completion_inside_at_library_name_does_not_emit_placeholder() {
+    let src = "@library(\"\", \"\");\n";
+    let tree = parse(src);
+    // Cursor inside the empty first string (col 10).
+    let list = capabilities::completion(src, tree.root_node(), pos(0, 10), None);
+    let payload = list
+        .as_ref()
+        .and_then(capabilities::extract_lib_version_placeholder);
+    assert!(
+        payload.is_none(),
+        "should not produce a version placeholder"
+    );
+}
+
+/// P15.3 — `resolve_library_version_completion` walks the registry via
+/// the supplied fetcher and emits real items in semver-descending
+/// order with channel info in `labelDetails.detail`.
+#[test]
+fn resolve_lib_version_emits_sorted_items_with_channel_detail() {
+    use greycat_analyzer_core::registry::{RegistryFetcher, RegistryItem};
+    use std::collections::HashMap;
+
+    struct Stub(HashMap<String, &'static str>);
+    impl RegistryFetcher for Stub {
+        fn fetch(&self, url: &str) -> Vec<RegistryItem> {
+            self.0
+                .get(url)
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default()
+        }
+    }
+    let pairs = vec![
+        (
+            "https://get.greycat.io/files/core/".to_string(),
+            r#"[{"path":"core/stable/","size":null,"last_modification":"2026-01-01T00:00:00Z"},
+                {"path":"core/dev/","size":null,"last_modification":"2026-01-02T00:00:00Z"}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/stable/".to_string(),
+            r#"[{"path":"core/stable/7.8/","size":null,"last_modification":"2026-01-01T00:00:00Z"}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/dev/".to_string(),
+            r#"[{"path":"core/dev/8.0/","size":null,"last_modification":"2026-01-02T00:00:00Z"}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/stable/7.8/x64-linux/".to_string(),
+            r#"[{"path":"core/stable/7.8/x64-linux/7.8.166-stable.zip","size":1,"last_modification":"2026-04-09T00:00:00Z"}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/stable/7.8/noarch/".to_string(),
+            r#"[]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/dev/8.0/x64-linux/".to_string(),
+            r#"[{"path":"core/dev/8.0/x64-linux/8.0.5-dev.zip","size":1,"last_modification":"2026-04-10T00:00:00Z"}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/dev/8.0/noarch/".to_string(),
+            r#"[]"#,
+        ),
+    ];
+    let stub = Stub(pairs.into_iter().collect());
+    // `std` is aliased to `core` at the registry root.
+    let payload = capabilities::LibVersionPayload {
+        lib: "std".into(),
+        typed: "".into(),
+        range: lsp_types::Range {
+            start: pos(0, 17),
+            end: pos(0, 17),
+        },
+    };
+    let list = capabilities::resolve_library_version_completion(&payload, &stub);
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(labels, vec!["8.0.5-dev", "7.8.166-stable"]);
+
+    let stable = list
+        .items
+        .iter()
+        .find(|i| i.label == "7.8.166-stable")
+        .unwrap();
+    let details = stable.label_details.as_ref().unwrap();
+    assert_eq!(details.detail.as_deref(), Some("[stable]"));
+    assert_eq!(details.description.as_deref(), Some("2026-04-09T00:00:00Z"));
+
+    // textEdit replaces the inner-content range, not the whole string.
+    match stable.text_edit.as_ref().unwrap() {
+        CompletionTextEdit::Edit(edit) => {
+            assert_eq!(edit.range, payload.range);
+            assert_eq!(edit.new_text, "7.8.166-stable");
+        }
+        _ => panic!("expected plain TextEdit"),
+    }
+}
+
+/// P15.3 — when the user has typed a `-dev` prerelease, matching-channel
+/// versions rank first via `sortText` but non-matching channels are
+/// still in the list (no hard filter — see capabilities.rs commentary).
+#[test]
+fn resolve_lib_version_biases_matching_channel_first() {
+    use greycat_analyzer_core::registry::{RegistryFetcher, RegistryItem};
+    use std::collections::HashMap;
+
+    struct Stub(HashMap<String, &'static str>);
+    impl RegistryFetcher for Stub {
+        fn fetch(&self, url: &str) -> Vec<RegistryItem> {
+            self.0
+                .get(url)
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default()
+        }
+    }
+    let pairs = vec![
+        (
+            "https://get.greycat.io/files/core/".to_string(),
+            r#"[{"path":"core/stable/","size":null,"last_modification":""},
+                {"path":"core/dev/","size":null,"last_modification":""}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/stable/".to_string(),
+            r#"[{"path":"core/stable/8.0/","size":null,"last_modification":""}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/dev/".to_string(),
+            r#"[{"path":"core/dev/8.0/","size":null,"last_modification":""}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/stable/8.0/x64-linux/".to_string(),
+            r#"[{"path":"core/stable/8.0/x64-linux/8.0.10-stable.zip","size":1,"last_modification":""}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/stable/8.0/noarch/".to_string(),
+            r#"[]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/dev/8.0/x64-linux/".to_string(),
+            r#"[{"path":"core/dev/8.0/x64-linux/8.0.5-dev.zip","size":1,"last_modification":""}]"#,
+        ),
+        (
+            "https://get.greycat.io/files/core/dev/8.0/noarch/".to_string(),
+            r#"[]"#,
+        ),
+    ];
+    let stub = Stub(pairs.into_iter().collect());
+    let payload = capabilities::LibVersionPayload {
+        lib: "core".into(),
+        typed: "8.0.0-dev".into(),
+        range: lsp_types::Range {
+            start: pos(0, 0),
+            end: pos(0, 0),
+        },
+    };
+    let list = capabilities::resolve_library_version_completion(&payload, &stub);
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    // Both versions are still in the list — no hard filter.
+    assert!(labels.contains(&"8.0.5-dev"));
+    assert!(labels.contains(&"8.0.10-stable"));
+    // Matching-channel (`-dev`) sortText starts with `0_`; the
+    // newer-but-non-matching `-stable` starts with `1_`, so dev ranks
+    // first despite being lower-numbered.
+    let dev = list.items.iter().find(|i| i.label == "8.0.5-dev").unwrap();
+    let stable = list
+        .items
+        .iter()
+        .find(|i| i.label == "8.0.10-stable")
+        .unwrap();
+    let dev_sort = dev.sort_text.as_deref().unwrap();
+    let stable_sort = stable.sort_text.as_deref().unwrap();
+    assert!(
+        dev_sort.starts_with("0_"),
+        "expected matching channel tier 0, got {dev_sort}"
+    );
+    assert!(
+        stable_sort.starts_with("1_"),
+        "expected non-matching channel tier 1, got {stable_sort}"
+    );
+    assert!(
+        dev_sort < stable_sort,
+        "dev should rank before stable: {dev_sort} vs {stable_sort}"
+    );
+}
+
 /// P15.2.1 — typing `@` at top level emits the pragma list (mirrors the
 /// TS reference's `PRAGMA_COMPLETION_ITEMS`).
 #[test]

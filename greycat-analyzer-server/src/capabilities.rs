@@ -2371,6 +2371,17 @@ pub fn completion(
             items,
         });
     }
+    if let Some(items) = library_version_completion(text, node, byte) {
+        // P15.3 — lazy placeholder. The LSP layer will swap this for
+        // concrete versions before returning to the editor; in the
+        // foundational entry (no project context) we surface the
+        // placeholder verbatim so direct callers / tests can still
+        // observe it.
+        return Some(CompletionList {
+            is_incomplete: true,
+            items,
+        });
+    }
     if let Some(items) = pragma_completion(text, byte) {
         return Some(CompletionList {
             is_incomplete: false,
@@ -2410,6 +2421,15 @@ pub fn completion_with_project(
     }
     let mut items = if let Some(items) = include_dir_completion(text, node, byte, project_root) {
         items
+    } else if let Some(items) = library_version_completion(text, node, byte) {
+        // P15.3 — emit the lazy placeholder. `completion_handler` in
+        // server.rs intercepts the placeholder and runs
+        // [`resolve_library_version_completion`] against its
+        // [`RegistryFetcher`] before forwarding to the editor.
+        return Some(CompletionList {
+            is_incomplete: true,
+            items,
+        });
     } else if let Some(items) = pragma_completion(text, byte) {
         items
     } else if let Some(items) = member_completion(text, root, byte, uri, project) {
@@ -2572,6 +2592,231 @@ fn string_prefix_at_cursor(
     }
     let upto = cursor_byte.min(r.end);
     text.get(content_start..upto).unwrap_or("").to_string()
+}
+
+// =============================================================================
+// P15.3 — `@library("<name>", "<cursor>")` version completion
+// =============================================================================
+
+/// Discriminator stored under `data.type` to mark a completion list
+/// as the lazy version-lookup placeholder. The LSP handler swaps the
+/// list with concrete versions before returning to the editor; tests
+/// can target the same shape via [`resolve_library_version_completion`].
+const LIB_VERSION_PLACEHOLDER_KIND: &str = "greycat.lib.version";
+
+/// Payload attached to the placeholder `CompletionItem.data`. Carries
+/// everything the registry resolver needs without round-tripping back
+/// to the document text.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct LibVersionPlaceholder {
+    #[serde(rename = "type")]
+    kind: String,
+    /// First-arg lib name, e.g. `std` or `core`.
+    lib: String,
+    /// What the user has typed inside the version string up to the
+    /// cursor — used for channel filtering (`-dev`, `-beta`) when the
+    /// resolver emits real items.
+    typed: String,
+    /// Inner-content range of the version string (between the quotes).
+    /// The concrete items use this as their `textEdit.range` so each
+    /// version replaces exactly the user's partial input.
+    range: lsp_types::Range,
+}
+
+/// Detect when the cursor sits inside the *version* slot of an
+/// `@library("name", "<cursor>")` pragma and emit a single lazy
+/// placeholder item. The LSP server intercepts the placeholder and
+/// resolves it via [`resolve_library_version_completion`] using its
+/// configured [`RegistryFetcher`]. Returns `None` when we're not in
+/// the version slot so the parent dispatcher falls through.
+///
+/// Why a placeholder rather than fetching here: the analyzer-side
+/// completion path is sync and I/O-free by design, so the registry
+/// walk lives one layer up where a `RegistryFetcher` is in scope.
+fn library_version_completion(
+    text: &str,
+    node: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+) -> Option<Vec<CompletionItem>> {
+    let string_node = ancestor_with_kind(node, "string")?;
+    let args_node = ancestor_with_kind(string_node, "args")?;
+    let annotation_node = ancestor_with_kind(args_node, "annotation")?;
+    let mut name_cursor = annotation_node.walk();
+    let name_text = annotation_node
+        .named_children(&mut name_cursor)
+        .find(|c| c.kind() == "ident")
+        .and_then(|c| text.get(c.byte_range()))?;
+    if name_text != "library" {
+        return None;
+    }
+    // Confirm the cursor's string is the second named arg AND the
+    // first arg is also a string literal (the lib name). Anything
+    // else — a non-string first arg, the cursor on the first arg —
+    // bails out so other dispatchers get a chance.
+    let mut walk = args_node.walk();
+    let args: Vec<tree_sitter::Node<'_>> = args_node
+        .named_children(&mut walk)
+        .filter(|c| c.kind() == "string")
+        .collect();
+    if args.len() < 2 || args[1].id() != string_node.id() {
+        return None;
+    }
+    let lib_name = string_inner_text(text, args[0])?.to_string();
+
+    // Inner-content range (between the quotes). Used as both the
+    // resolver's `textEdit` target and as the channel-filter source
+    // (the slice from content-start to cursor).
+    let r = string_node.byte_range();
+    let raw = text.get(r.clone())?;
+    let open = if raw.starts_with('"') { 1 } else { 0 };
+    let close = if raw.ends_with('"') && raw.len() > open {
+        1
+    } else {
+        0
+    };
+    let inner_start = r.start + open;
+    let inner_end = r.end.saturating_sub(close).max(inner_start);
+    let typed = text
+        .get(inner_start..cursor_byte.min(inner_end))
+        .unwrap_or("")
+        .to_string();
+    let range = lsp_types::Range {
+        start: byte_to_position(text, inner_start),
+        end: byte_to_position(text, inner_end),
+    };
+    let placeholder = LibVersionPlaceholder {
+        kind: LIB_VERSION_PLACEHOLDER_KIND.into(),
+        lib: lib_name.clone(),
+        typed,
+        range,
+    };
+    let item = CompletionItem {
+        label: format!("Fetching '{lib_name}' versions..."),
+        kind: Some(CompletionItemKind::MODULE),
+        data: Some(serde_json::to_value(&placeholder).ok()?),
+        ..Default::default()
+    };
+    Some(vec![item])
+}
+
+/// Read the inner content of a `string` node (everything between the
+/// quotes). Returns `None` for malformed strings.
+fn string_inner_text<'a>(text: &'a str, string_node: tree_sitter::Node<'_>) -> Option<&'a str> {
+    let r = string_node.byte_range();
+    let raw = text.get(r.clone())?;
+    let open = if raw.starts_with('"') { 1 } else { 0 };
+    let close = if raw.ends_with('"') && raw.len() > open {
+        1
+    } else {
+        0
+    };
+    text.get(r.start + open..r.end.saturating_sub(close))
+}
+
+/// Pull the placeholder payload out of a [`CompletionList`] when it
+/// looks like the lazy `@library` version-completion shape (single
+/// item with `data.type == "greycat.lib.version"`). Returns `None`
+/// for any other completion shape so the LSP handler returns the
+/// list verbatim.
+pub fn extract_lib_version_placeholder(list: &CompletionList) -> Option<LibVersionPayload> {
+    if list.items.len() != 1 {
+        return None;
+    }
+    let data = list.items[0].data.as_ref()?;
+    let p: LibVersionPlaceholder = serde_json::from_value(data.clone()).ok()?;
+    if p.kind != LIB_VERSION_PLACEHOLDER_KIND {
+        return None;
+    }
+    Some(LibVersionPayload {
+        lib: p.lib,
+        typed: p.typed,
+        range: p.range,
+    })
+}
+
+/// Public-facing decoded placeholder. Server-side glue uses this to
+/// invoke its [`RegistryFetcher`] and build the concrete item list.
+#[derive(Debug, Clone)]
+pub struct LibVersionPayload {
+    pub lib: String,
+    pub typed: String,
+    pub range: lsp_types::Range,
+}
+
+/// Replace the lazy placeholder with concrete version items. Driven
+/// by the LSP server once it sees [`extract_lib_version_placeholder`]
+/// match.
+///
+/// Design difference from the TS reference: the TS impl *hard-filters*
+/// to the user's typed channel (`-dev`/`-stable`/…), which makes the
+/// channel feel like a constraint and forces backspacing to pivot
+/// between channels. We treat channel as a *preference* instead —
+/// every version surfaces in every list, but matching-channel entries
+/// rank first via `sortText` and the editor's own fuzzy match against
+/// the full label decides what's visible. Result: the user can pivot
+/// between `-dev` and `-stable` without re-fetching, and a blank
+/// string still shows the full set.
+///
+/// Channel info also lands in `labelDetails.detail` (e.g. `[stable]`)
+/// so the popup is readable at a glance without parsing the version
+/// suffix; `last_modification` keeps the `description` slot.
+pub fn resolve_library_version_completion(
+    payload: &LibVersionPayload,
+    fetcher: &dyn greycat_analyzer_core::registry::RegistryFetcher,
+) -> CompletionList {
+    let versions = greycat_analyzer_core::registry::get_lib_versions(&payload.lib, fetcher);
+    let preferred = greycat_analyzer_core::registry::prerelease_tag(&payload.typed);
+    let items: Vec<CompletionItem> = versions
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let channel = version_channel(&v.text);
+            // Two-tier sort key: `0_…` for matching-channel hits (or
+            // every entry when no preference is expressed), `1_…`
+            // otherwise. Within each tier, registry order — already
+            // semver-descending — is preserved by the index suffix.
+            let tier = match preferred {
+                Some(tag) => {
+                    if channel.map(|c| c.contains(tag)).unwrap_or(false) {
+                        0
+                    } else {
+                        1
+                    }
+                }
+                None => 0,
+            };
+            let detail = channel.map(|c| format!("[{c}]"));
+            CompletionItem {
+                label: v.text.clone(),
+                kind: Some(CompletionItemKind::CONSTANT),
+                label_details: Some(CompletionItemLabelDetails {
+                    detail,
+                    description: Some(v.last_modification.clone()),
+                }),
+                sort_text: Some(format!("{tier}_{i:05}")),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: payload.range,
+                    new_text: v.text,
+                })),
+                ..Default::default()
+            }
+        })
+        .collect();
+    CompletionList {
+        is_incomplete: false,
+        items,
+    }
+}
+
+/// Extract the prerelease channel from a version string
+/// (`7.8.166-stable` → `Some("stable")`). Empty / non-prerelease
+/// versions return `None` so the popup shows the bare version with
+/// no `[…]` suffix.
+fn version_channel(version: &str) -> Option<&str> {
+    match version.split_once('-') {
+        Some((_, pre)) if !pre.is_empty() => Some(pre),
+        _ => None,
+    }
 }
 
 // =============================================================================

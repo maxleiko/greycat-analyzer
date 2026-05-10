@@ -19,3 +19,6 @@ md5.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tree-sitter.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
