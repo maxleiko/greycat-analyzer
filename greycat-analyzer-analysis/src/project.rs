@@ -12,9 +12,10 @@
 //! consult it for cross-module name lookup is **** territory.
 //! gives that work the cache-shaped seam to plug into.
 
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
@@ -111,7 +112,7 @@ pub struct ProjectAnalysis {
     /// are still recorded but never silence emissions. Drives the CLI's
     /// `--no-suppressions` flag.
     pub bypass_suppressions: bool,
-    modules: HashMap<Uri, ModuleAnalysis>,
+    modules: FxHashMap<Uri, ModuleAnalysis>,
     // P19.6
     /// Per-module signature-stage cache. Records what each
     /// module contributed to the project signature index
@@ -125,7 +126,7 @@ pub struct ProjectAnalysis {
     /// `lower_type_ref_project` outcome depends on which names exist
     /// in `index`, both hashes must match the new state to reuse the
     /// cached contributions.
-    sig_cache: HashMap<Uri, ModuleSigCache>,
+    sig_cache: FxHashMap<Uri, ModuleSigCache>,
 }
 
 // P19.6
@@ -186,8 +187,8 @@ impl ProjectAnalysis {
             index: ProjectIndex::new(),
             arena,
             bypass_suppressions: false,
-            modules: HashMap::new(),
-            sig_cache: HashMap::new(),
+            modules: FxHashMap::default(),
+            sig_cache: FxHashMap::default(),
         }
     }
 
@@ -520,7 +521,7 @@ fn lower_signatures_into(
     arena_mut: &mut greycat_analyzer_types::TypeArena,
     index: &mut ProjectIndex,
     lowered: &[(&Uri, &Hir)],
-    cache: &mut HashMap<Uri, ModuleSigCache>,
+    cache: &mut FxHashMap<Uri, ModuleSigCache>,
 ) {
     let name_set_hash = project_name_set_hash(index);
 
@@ -528,7 +529,7 @@ fn lower_signatures_into(
     // present (a module was removed). Rebuilding ProjectIndex
     // from scratch in `invalidate` already drops their structural
     // entries, but the contributions cache needs explicit cleanup.
-    let live_uris: HashSet<&Uri> = lowered.iter().map(|(u, _)| *u).collect();
+    let live_uris: FxHashSet<&Uri> = lowered.iter().map(|(u, _)| *u).collect();
     cache.retain(|u, _| live_uris.contains(u));
 
     // Second pass: per-module — reuse cache if hashes match,
@@ -584,7 +585,7 @@ fn lower_module_signatures(
                 let type_name_text = hir.idents[td.name].text.as_str();
                 let type_sym = index.symbols.intern(type_name_text);
                 let owner = GenericOwner::Type(type_name_text.to_string());
-                let mut generics_in_scope: HashMap<Symbol, GenericOwner> = HashMap::new();
+                let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 for g in &td.generics {
                     let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
                     generics_in_scope.insert(g_sym, owner.clone());
@@ -663,7 +664,7 @@ fn lower_module_signatures(
                     continue;
                 };
                 let owner = GenericOwner::Function(fn_text.to_string());
-                let mut generics_in_scope: HashMap<Symbol, GenericOwner> = HashMap::new();
+                let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 let mut generics: Vec<Symbol> = Vec::with_capacity(fnd.generics.len());
                 for g in &fnd.generics {
                     let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
@@ -711,7 +712,7 @@ fn lower_module_signatures(
                     continue;
                 };
                 // Vars never declare generics, so no scope needed.
-                let empty: HashMap<Symbol, GenericOwner> = HashMap::new();
+                let empty: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 let var_ty = lower_type_ref_project(hir, tr, arena_mut, &*index, &empty);
                 entry.vars.push((var_sym, var_ty));
             }
@@ -911,7 +912,7 @@ impl ProjectAnalysis {
     /// from the same scope.
     #[allow(clippy::mutable_key_type)]
     fn collect_call_arg_diags_split(
-        modules: &HashMap<Uri, ModuleAnalysis>,
+        modules: &FxHashMap<Uri, ModuleAnalysis>,
         index: &ProjectIndex,
         cur_uri: &Uri,
         arena: &mut greycat_analyzer_types::TypeArena,
@@ -1050,7 +1051,7 @@ impl ProjectAnalysis {
     ///
     /// `restrict = None` lints every cached module; `Some(set)` only
     /// the listed URIs (matches the type-relation validation scope).
-    fn run_typed_lints(&mut self, manager: &SourceManager, restrict: Option<&HashSet<&str>>) {
+    fn run_typed_lints(&mut self, manager: &SourceManager, restrict: Option<&FxHashSet<&str>>) {
         let in_scope = |uri: &Uri| -> bool {
             match restrict {
                 None => true,
@@ -1147,7 +1148,7 @@ impl ProjectAnalysis {
         }
     }
 
-    fn validate_type_relations(&mut self, restrict: Option<&HashSet<&str>>) {
+    fn validate_type_relations(&mut self, restrict: Option<&FxHashSet<&str>>) {
         use crate::analyzer::{DiagCategory, SemanticDiagnostic};
 
         let in_scope = |uri: &Uri| -> bool {
@@ -1180,7 +1181,7 @@ impl ProjectAnalysis {
         self.assert_no_in_scope_type_relation_diags(restrict);
 
         #[allow(clippy::mutable_key_type)]
-        let mut diag_updates: HashMap<Uri, Vec<SemanticDiagnostic>> = HashMap::new();
+        let mut diag_updates: FxHashMap<Uri, Vec<SemanticDiagnostic>> = FxHashMap::default();
         // P19 — split borrows: pass the shared arena alongside read-only
         // module borrows.
         let arena_mut = &mut self.arena;
@@ -1214,7 +1215,7 @@ impl ProjectAnalysis {
     }
 
     #[cfg(debug_assertions)]
-    fn assert_no_in_scope_type_relation_diags(&self, restrict: Option<&HashSet<&str>>) {
+    fn assert_no_in_scope_type_relation_diags(&self, restrict: Option<&FxHashSet<&str>>) {
         use crate::analyzer::DiagCategory;
         for (uri, m) in &self.modules {
             let in_scope = match restrict {
@@ -1256,7 +1257,7 @@ impl ProjectAnalysis {
 
         // 1. module name → declaring URI.
         #[allow(clippy::mutable_key_type)]
-        let mut by_name: HashMap<String, _Uri> = HashMap::new();
+        let mut by_name: FxHashMap<String, _Uri> = FxHashMap::default();
         for (uri, cell) in manager.iter() {
             let doc = cell.borrow();
             by_name.insert(doc.name().to_string(), uri.clone());
@@ -1265,7 +1266,7 @@ impl ProjectAnalysis {
         // 2. Walk every module's CST for `static_expr` nodes whose
         // chain root names a known module. Collect bumps.
         #[allow(clippy::mutable_key_type)]
-        let mut bumps: HashMap<_Uri, Vec<Idx<Decl>>> = HashMap::new();
+        let mut bumps: FxHashMap<_Uri, Vec<Idx<Decl>>> = FxHashMap::default();
         for (uri, cell) in manager.iter() {
             let doc = cell.borrow();
             let text = &doc.text;
@@ -1380,7 +1381,7 @@ impl ProjectAnalysis {
         // hash → skip step 4; cross-module-reference filter → skip
         // step 6 for unrelated URIs) move into the proper Q1-Q5 DAG.
 
-        let live: HashSet<String> = manager
+        let live: FxHashSet<String> = manager
             .iter()
             .map(|(u, _)| u.as_str().to_string())
             .collect();
@@ -1503,7 +1504,7 @@ impl ProjectAnalysis {
         // module typing happens inline in the analyzer's body walker.
         // Only the typed-lint pass and type-relation validation remain
         // — both run on the changed URI only here for incremental cost.
-        let mut touched: HashSet<&str> = HashSet::new();
+        let mut touched: FxHashSet<&str> = FxHashSet::default();
         touched.insert(uri.as_str());
         self.run_typed_lints(manager, Some(&touched));
         self.validate_type_relations(Some(&touched));
@@ -1595,7 +1596,7 @@ fn collect_chain(
 /// Other shapes (`Expr::Member` / lambda / etc.) return `None`.
 #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
 fn resolve_call_target(
-    modules: &HashMap<Uri, ModuleAnalysis>,
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
     cur: &ModuleAnalysis,
     callee: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
@@ -1664,7 +1665,7 @@ enum QualifiedTarget {
 /// must be exactly 3; other lengths return `None`.
 #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
 fn resolve_qualified_chain(
-    modules: &HashMap<Uri, ModuleAnalysis>,
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
     cur: &ModuleAnalysis,
     chain: &[Idx<greycat_analyzer_hir::types::Ident>],
@@ -2094,7 +2095,7 @@ fn lower_type_ref_project(
     type_ref: Idx<greycat_analyzer_hir::types::TypeRef>,
     arena: &mut greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
-    generics_in_scope: &HashMap<
+    generics_in_scope: &FxHashMap<
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::GenericOwner,
     >,
@@ -2212,7 +2213,7 @@ fn read_type_shape(
     hir: &Hir,
     type_ref_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
 ) -> TypeShape {
-    read_type_shape_subst(hir, type_ref_id, &HashMap::new())
+    read_type_shape_subst(hir, type_ref_id, &FxHashMap::default())
 }
 
 /// `read_type_shape` extended with a generic-param substitution map.
@@ -2225,7 +2226,7 @@ fn read_type_shape(
 fn read_type_shape_subst(
     hir: &Hir,
     type_ref_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
-    subst: &HashMap<String, TypeShape>,
+    subst: &FxHashMap<String, TypeShape>,
 ) -> TypeShape {
     use greycat_analyzer_types::Primitive;
     let tr = &hir.type_refs[type_ref_id];

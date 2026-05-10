@@ -18,6 +18,7 @@ use lsp_types::{
     request::{RegisterCapability, Request as _},
     *,
 };
+use rustc_hash::FxHashSet;
 
 use crate::Result;
 use crate::capabilities::diagnostics_from_module;
@@ -287,7 +288,7 @@ impl Backend {
         // opened buffers — those stay until `did_close` / explicit
         // user action.
         #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
-        let reachable: std::collections::HashSet<Uri> = report.reachable.iter().cloned().collect();
+        let reachable: FxHashSet<Uri> = report.reachable.iter().cloned().collect();
         let evicted = self.manager.evict_unreachable(&reachable);
         if !evicted.is_empty() {
             info!(

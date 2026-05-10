@@ -20,8 +20,9 @@
 //! The design follows TS `analysis/analyzer.ts`: a single recursive
 //! visitor over HIR with an `Inference` table mutated as it goes.
 
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -190,22 +191,22 @@ pub struct AnalysisResult {
     pub registry: TypeRegistry,
     /// Per-expression inferred type (subset — entries only for expressions
     /// the analyzer actually visited).
-    pub expr_types: HashMap<Idx<Expr>, TypeId>,
+    pub expr_types: FxHashMap<Idx<Expr>, TypeId>,
     /// Per-binding inferred type. Keyed by the *defining* `Idx<Ident>`
     /// (e.g. the param name in `fn f(x: int)`, the local name in
     /// `var y: T = …`).
-    pub def_types: HashMap<Idx<Ident>, TypeId>,
+    pub def_types: FxHashMap<Idx<Ident>, TypeId>,
     /// Module-local map from declared type name to its HIR `TypeDecl`.
     /// Built when the analyzer walks top-level decls — lets
     /// member resolution navigate from a receiver's `TypeId` back to
     /// the declaring node so attr / method idents can be bound.
-    pub type_decls: HashMap<String, Idx<Decl>>,
+    pub type_decls: FxHashMap<String, Idx<Decl>>,
     /// Member-access bindings produced by each property ident in
     /// `a.b` / `a->b` that resolves to a [`TypeAttr`] or to a
     /// `TypeDecl::methods` entry, keyed by the property `Idx<Ident>`.
     /// Capabilities consult this in addition to [`Resolutions`] so
     /// goto-definition / hover work on member access.
-    pub member_uses: HashMap<Idx<Ident>, MemberDef>,
+    pub member_uses: FxHashMap<Idx<Ident>, MemberDef>,
     // P11.5, P21
     /// Cross-module member bindings — same keying as `member_uses`
     /// but the resolved attr / method lives in another module's HIR.
@@ -217,7 +218,7 @@ pub struct AnalysisResult {
     /// `deferred_member_uses` deferral list are gone — S2-S6 build
     /// the structure index up front, so the body walker resolves
     /// inline.
-    pub foreign_member_uses: HashMap<Idx<Ident>, ForeignMember>,
+    pub foreign_member_uses: FxHashMap<Idx<Ident>, ForeignMember>,
     // P15.x
     /// Chain-segment bindings populated by `ProjectAnalysis`
     /// pass 3.5 for `Expr::QualifiedStatic` shapes. Each segment ident
@@ -225,7 +226,7 @@ pub struct AnalysisResult {
     /// binds to the foreign top-level decl that declares it. Lets
     /// hover / goto-def show the right content for each segment of
     /// `runtime::Identity::create`.
-    pub foreign_decl_uses: HashMap<Idx<Ident>, ForeignDecl>,
+    pub foreign_decl_uses: FxHashMap<Idx<Ident>, ForeignDecl>,
     pub diagnostics: Vec<SemanticDiagnostic>,
     // P24.2
     /// Head if-stmt ids of enum-eq chains that
@@ -234,7 +235,7 @@ pub struct AnalysisResult {
     /// `else` arm of such a chain as dead code, and to treat the
     /// chain as effectively divergent for fall-through-deadness
     /// analysis when every arm body diverges.
-    pub exhaustive_enum_chains: HashSet<Idx<Stmt>>,
+    pub exhaustive_enum_chains: FxHashSet<Idx<Stmt>>,
     /// Non-exhaustive enum-eq chains detected in pass 2. The
     /// `non-exhaustive` lint reads this and emits a real
     /// [`crate::lint::LintDiagnostic`] (rule-keyed, suppressible via
@@ -366,7 +367,7 @@ pub fn analyze_with_index_into(
         index,
         narrows: Vec::new(),
         member_narrows: Vec::new(),
-        chain_member_ifs: HashSet::new(),
+        chain_member_ifs: FxHashSet::default(),
         generics_in_scope: Vec::new(),
         this_stack: Vec::new(),
     };
@@ -526,7 +527,7 @@ struct Cx<'a> {
     /// then-branch / else-branch entry and popped on exit, so a
     /// narrowing introduced inside a block stays alive for the rest
     /// of that block but doesn't leak to siblings.
-    narrows: Vec<HashMap<Idx<Ident>, TypeId>>,
+    narrows: Vec<FxHashMap<Idx<Ident>, TypeId>>,
     // P19.16
     /// Parallel narrow stack keyed by member-access
     /// *path* (e.g. `"this.matchingNormalisation"`,
@@ -538,11 +539,11 @@ struct Cx<'a> {
     /// the ident-level narrow flow but across structural member
     /// chains. Best-effort — `foo[i].bar` or `getThing().bar` have
     /// no stable path and skip narrowing.
-    member_narrows: Vec<HashSet<String>>,
+    member_narrows: Vec<FxHashSet<String>>,
     /// `Stmt::If` ids already accounted for as nested members of an
     /// enclosing exhaustiveness chain. Suppresses duplicate
     /// "non-exhaustive" diagnostics on inner `else if` arms.
-    chain_member_ifs: HashSet<Idx<Stmt>>,
+    chain_member_ifs: FxHashSet<Idx<Stmt>>,
     // P12.1
     /// Generic-context stack: type-parameter names visible at the
     /// current scope, mapped to their declaring [`GenericOwner`].
@@ -551,7 +552,7 @@ struct Cx<'a> {
     /// of `Named(name)` / `Any` for in-scope generics. The stack is a
     /// `Vec<HashMap>` so nested fns inside a generic type see both
     /// outer and inner names.
-    generics_in_scope: Vec<HashMap<String, GenericOwner>>,
+    generics_in_scope: Vec<FxHashMap<String, GenericOwner>>,
     // P19.11
     /// `this` typing stack. Pushed on entry to a
     /// type's method body (in `visit_type_decl`), popped on exit.
@@ -592,8 +593,8 @@ impl<'a> Cx<'a> {
     }
 
     fn push_narrow(&mut self) {
-        self.narrows.push(HashMap::new());
-        self.member_narrows.push(HashSet::new());
+        self.narrows.push(FxHashMap::default());
+        self.member_narrows.push(FxHashSet::default());
     }
     fn pop_narrow(&mut self) {
         self.narrows.pop();
@@ -1011,7 +1012,7 @@ impl<'a> Cx<'a> {
             .index
             .type_method_return_chain(&type_name, property_text)?;
         let members = self.index.type_members_for(&type_name)?;
-        let mut subst: HashMap<String, TypeId> = HashMap::new();
+        let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
         for (i, gp_sym) in members.generics.iter().enumerate() {
             if let Some(arg) = instantiation.get(i)
                 && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
@@ -1243,7 +1244,7 @@ impl<'a> Cx<'a> {
             // own generic params, not the parent's — `node<Foo<int>>`
             // accessing a `Foo`-declared attr substitutes `T → int`.
             let members = self.index.type_members_for(&type_name)?;
-            let mut subst: HashMap<String, TypeId> = HashMap::new();
+            let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
             for (i, gp_sym) in members.generics.iter().enumerate() {
                 if let Some(arg) = instantiation.get(i)
                     && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
@@ -1547,7 +1548,7 @@ impl<'a> Cx<'a> {
     }
 
     fn push_generic_scope(&mut self, generics: &[Idx<Ident>], owner: GenericOwner) {
-        let mut frame = HashMap::new();
+        let mut frame = FxHashMap::default();
         for g in generics {
             let name = self.hir.idents[*g].text.clone();
             frame.insert(name, owner.clone());
@@ -1682,9 +1683,9 @@ impl<'a> Cx<'a> {
                 for s in &then_branch.stmts {
                     self.visit_stmt(*s, return_ty);
                 }
-                let then_branch_narrows: HashMap<Idx<Ident>, TypeId> =
+                let then_branch_narrows: FxHashMap<Idx<Ident>, TypeId> =
                     self.narrows.last().cloned().unwrap_or_default();
-                let then_branch_member_narrows: HashSet<String> =
+                let then_branch_member_narrows: FxHashSet<String> =
                     self.member_narrows.last().cloned().unwrap_or_default();
                 self.pop_narrow();
                 let then_terminates = block_terminates(self.hir, &then_branch);
@@ -1714,14 +1715,14 @@ impl<'a> Cx<'a> {
                         } else {
                             self.visit_stmt(eb, return_ty);
                         }
-                        let captured: HashMap<Idx<Ident>, TypeId> =
+                        let captured: FxHashMap<Idx<Ident>, TypeId> =
                             self.narrows.last().cloned().unwrap_or_default();
-                        let captured_members: HashSet<String> =
+                        let captured_members: FxHashSet<String> =
                             self.member_narrows.last().cloned().unwrap_or_default();
                         self.pop_narrow();
                         (stmt_terminates(self.hir, eb), captured, captured_members)
                     } else {
-                        (false, HashMap::new(), HashSet::new())
+                        (false, FxHashMap::default(), FxHashSet::default())
                     };
 
                 // P13.1 CFG-aware narrowing — early return / throw etc.
@@ -1779,7 +1780,7 @@ impl<'a> Cx<'a> {
                 // binding, look up its post-then and post-else
                 // effective type and check if both are non-null.
                 if !then_terminates && !else_terminates {
-                    let mut candidates: HashSet<Idx<Ident>> = HashSet::new();
+                    let mut candidates: FxHashSet<Idx<Ident>> = FxHashSet::default();
                     candidates.extend(then_branch_narrows.keys().copied());
                     candidates.extend(else_branch_narrows.keys().copied());
                     candidates.extend(then_non_null.iter().copied());
@@ -1841,7 +1842,7 @@ impl<'a> Cx<'a> {
                     // outside the if, so we conservatively require
                     // the else side to either exist and narrow, or
                     // the condition's else_member side to imply it.
-                    let mut member_candidates: HashSet<&String> = HashSet::new();
+                    let mut member_candidates: FxHashSet<&String> = FxHashSet::default();
                     member_candidates.extend(then_branch_member_narrows.iter());
                     member_candidates.extend(else_branch_member_narrows.iter());
                     for path in &then_member_non_null {
@@ -2156,7 +2157,7 @@ impl<'a> Cx<'a> {
             return;
         };
         let variants = variants.clone();
-        let covered: HashSet<&str> = chain.arms.iter().map(|a| a.variant.as_str()).collect();
+        let covered: FxHashSet<&str> = chain.arms.iter().map(|a| a.variant.as_str()).collect();
         let missing: Vec<&str> = variants
             .iter()
             .map(String::as_str)

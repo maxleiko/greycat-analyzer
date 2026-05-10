@@ -29,7 +29,7 @@
 //! the receiver's type, which lives in the analyzer. Only the head of
 //! the chain (`a`) is bound now.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
@@ -82,13 +82,13 @@ pub struct Resolutions {
     /// For each *use* of an ident (by `Idx<Ident>`), where it resolved.
     /// Idents that are *definitions* (the name in `fn foo()` etc.) are
     /// *not* present here — only use sites.
-    pub uses: HashMap<Idx<Ident>, Definition>,
+    pub uses: FxHashMap<Idx<Ident>, Definition>,
     // P6.7
     /// Reverse-reference index: how many times each top-level
     /// `Decl` is referenced through a `Definition::Decl` use. Lets the
     /// `unused-decl` lint rule check at-a-glance whether a decl is
     /// never used outside its own declaration.
-    pub references_to: HashMap<Idx<Decl>, usize>,
+    pub references_to: FxHashMap<Idx<Decl>, usize>,
     // P2.5 — surface as "unresolved name" diagnostics.
     /// Idents the resolver couldn't bind.
     pub unresolved: Vec<Idx<Ident>>,
@@ -103,7 +103,7 @@ impl Resolutions {
 #[derive(Default)]
 struct Scope {
     /// Lexical name → resolution.
-    names: HashMap<String, Definition>,
+    names: FxHashMap<String, Definition>,
 }
 
 impl Scope {

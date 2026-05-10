@@ -12,7 +12,7 @@
 //! .gcl source captures the signature; this module collects them so
 //! call-site type checking works even though there's no body to walk.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
@@ -32,7 +32,7 @@ use greycat_analyzer_types::{
 /// [`ProjectIndex`]); see [`ProjectIndex::native_for`].
 #[derive(Debug, Default)]
 pub struct NativeRegistry {
-    pub signatures: HashMap<Symbol, NativeSignature>,
+    pub signatures: FxHashMap<Symbol, NativeSignature>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,36 +93,36 @@ pub struct ProjectIndex {
     /// Lets the resolver answer "is this name known anywhere in the
     /// project?" without needing the cross-module decl pointer
     /// (a later deliverable).
-    pub values: HashSet<Symbol>,
+    pub values: FxHashSet<Symbol>,
     /// Cross-module decl table: name → every `(Uri, Idx<Decl>)`
     /// pair that introduces a top-level decl with this name across the
     /// project. Collisions are kept; disambiguation happens at the use
     /// site via the importing module's lib/include closure.
     /// Pragma decls have no name and are excluded.
-    pub decl_locations: HashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
+    pub decl_locations: FxHashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
     // P13.4
     /// Runtime-exposed names. Keyed by the rename string of
     /// `@expose("renamed")` (or the decl's own name when `@expose` has
     /// no arg) → every site that exposed under that key. Lets lints /
     /// capabilities ask "is this name part of the runtime API?".
-    pub exposed: HashMap<Symbol, Vec<ExposureSite>>,
+    pub exposed: FxHashMap<Symbol, Vec<ExposureSite>>,
     // P13.5
     /// Per-type flag bits drawn from `@iterable` / `@deref` /
     /// `@primitive` annotations on a `type` decl. Keyed by the
     /// declared type name (`Array`, `nodeTime`, …).
-    pub type_flags: HashMap<Symbol, TypeFlags>,
+    pub type_flags: FxHashMap<Symbol, TypeFlags>,
     // P13.6
     /// Per-module `@permission("name")` pragmas. Lets later
     /// chunks light up "is this module allowed to call X?" checks the
     /// TS reference declarator threads through `mod.permissions`.
-    pub module_permissions: HashMap<Uri, HashSet<Symbol>>,
+    pub module_permissions: FxHashMap<Uri, FxHashSet<Symbol>>,
     // P15.x
     /// Module-name → URI. Populated from each ingested doc's
     /// filename stem (i.e. `Document::name()`). Lets the resolver
     /// recognize `runtime` in `runtime::Identity::create` as a known
     /// module name (rather than flagging it as unresolved), and lets
     /// pass 3.5 infer types for `module::Decl` static expressions.
-    pub module_names: HashMap<Symbol, Uri>,
+    pub module_names: FxHashMap<Symbol, Uri>,
     // P21
     /// Pre-computed cross-module structure index. Keyed by type
     /// name (as it appears in source). For each type, records the
@@ -138,7 +138,7 @@ pub struct ProjectIndex {
     /// per-module analyzer pass; with this index the analyzer's
     /// `resolve_member` resolves cross-module hits inline at body-walk
     /// time, removing the deferral.
-    pub type_members: HashMap<Symbol, TypeMembers>,
+    pub type_members: FxHashMap<Symbol, TypeMembers>,
     // P23
     /// Pre-lowered top-level fn signatures, keyed by fn
     /// name. First-decl-wins, matching `type_members` collision
@@ -148,13 +148,13 @@ pub struct ProjectIndex {
     /// `arena.substitute` at the call site for generic fns. Built
     /// by `ProjectAnalysis::stage_lower_signatures` after every
     /// module is loaded but before any body walks.
-    pub fn_signatures: HashMap<Symbol, FnSignature>,
+    pub fn_signatures: FxHashMap<Symbol, FnSignature>,
     // P23
     /// Enum types pre-registered in the shared project
     /// arena, keyed by enum name. Lets the analyzer's
     /// `QualifiedStatic` value-position typing recognise
     /// `other_module::Foo::a` as the enum `Foo` (not `any`).
-    pub enum_types: HashMap<Symbol, TypeId>,
+    pub enum_types: FxHashMap<Symbol, TypeId>,
     // P19.10
     /// Pre-lowered top-level `var` declared types,
     /// keyed by var name. First-decl-wins (same collision rule as
@@ -165,7 +165,7 @@ pub struct ProjectIndex {
     /// without this, `for (k, v in foreign_groups)` over a
     /// `nodeIndex<String, node<Group>>` declared in another module
     /// would type the iterable as `type` and bind `v` to `any`.
-    pub var_types: HashMap<Symbol, TypeId>,
+    pub var_types: FxHashMap<Symbol, TypeId>,
     // P19.16
     /// Runtime-implemented value-position globals
     /// (`Infinity`, `NaN`, `-Infinity`) and their declared type.
@@ -176,7 +176,7 @@ pub struct ProjectIndex {
     /// the names would resolve through `has_name` (we register them
     /// in `values` too) but the body-walker would type them as
     /// `any`, masking float/int dispatch downstream.
-    pub runtime_globals: HashMap<Symbol, TypeId>,
+    pub runtime_globals: FxHashMap<Symbol, TypeId>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -226,10 +226,10 @@ pub struct TypeMembers {
     // P19.9
     /// Attr name → HIR index. Symbol-keyed; resolve to
     /// text via [`ProjectIndex::symbols`].
-    pub attrs: HashMap<Symbol, Idx<TypeAttr>>,
+    pub attrs: FxHashMap<Symbol, Idx<TypeAttr>>,
     // P19.9
     /// Method name → HIR index. Symbol-keyed.
-    pub methods: HashMap<Symbol, Idx<Decl>>,
+    pub methods: FxHashMap<Symbol, Idx<Decl>>,
     // P22
     /// Ordered list of generic parameter names declared on the
     /// type (`type Map<K, V> {}` → `[Sym("K"), Sym("V")]`). Empty for
@@ -243,13 +243,13 @@ pub struct TypeMembers {
     /// ([`crate::project::ProjectAnalysis::arena`]). For generic
     /// types, attr TypeIds may reference `GenericParam(T, owner=this)`
     /// — call-site substitution is the consumer's job.
-    pub attr_types: HashMap<Symbol, TypeId>,
+    pub attr_types: FxHashMap<Symbol, TypeId>,
     // P22
     /// Pre-lowered method declared return types. Same arena +
     /// substitution semantics as `attr_types`. Methods without an
     /// explicit return type are absent (the analyzer's call-typing
     /// falls through to the existing inference path).
-    pub method_returns: HashMap<Symbol, TypeId>,
+    pub method_returns: FxHashMap<Symbol, TypeId>,
     // P19.13
     /// Names of attrs declared with the `static`
     /// modifier (`type Foo { static path: String = "..." }`).
@@ -258,7 +258,7 @@ pub struct TypeMembers {
     /// `String`) from a non-static `Foo::path` reference (which is
     /// a runtime `field` handle). Empty for types with no static
     /// attrs.
-    pub static_attrs: HashSet<Symbol>,
+    pub static_attrs: FxHashSet<Symbol>,
     // P19.14
     /// Direct supertype name (the `Super` in
     /// `type Sub extends Super`). Drives inheritance: member
@@ -636,16 +636,16 @@ impl ProjectIndex {
                         });
                         let mut m = TypeMembers {
                             home_uri: uri.clone(),
-                            attrs: HashMap::new(),
-                            methods: HashMap::new(),
+                            attrs: FxHashMap::default(),
+                            methods: FxHashMap::default(),
                             generics,
                             // P22 — `attr_types` / `method_returns`
                             // get filled in by
                             // `ProjectAnalysis::stage_lower_signatures`
                             // after every module is loaded.
-                            attr_types: HashMap::new(),
-                            method_returns: HashMap::new(),
-                            static_attrs: HashSet::new(),
+                            attr_types: FxHashMap::default(),
+                            method_returns: FxHashMap::default(),
+                            static_attrs: FxHashSet::default(),
                             supertype,
                         };
                         for attr_id in &td.attrs {

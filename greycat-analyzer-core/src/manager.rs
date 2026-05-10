@@ -1,12 +1,12 @@
 use std::{
     cell::{Ref, RefCell},
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Document,
@@ -22,7 +22,7 @@ use crate::{
 /// errors maps) plus the recursive-load slice of `analyze.ts` (cycle
 /// detection, lib resolution).
 pub struct SourceManager {
-    documents: HashMap<Uri, RefCell<Document>>,
+    documents: FxHashMap<Uri, RefCell<Document>>,
     ctx: Arc<dyn Context>,
 }
 
@@ -41,7 +41,7 @@ impl SourceManager {
 
     pub fn with_context(ctx: Arc<dyn Context>) -> Self {
         Self {
-            documents: HashMap::new(),
+            documents: FxHashMap::default(),
             ctx,
         }
     }
@@ -134,7 +134,7 @@ impl SourceManager {
             }
         };
 
-        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut visited: FxHashSet<PathBuf> = FxHashSet::default();
         // Load the project.gcl itself first.
         if let Some(uri) = self.load_file(project_filepath, "project", &mut visited, &mut report) {
             // Walk its mod_pragmas to find @library / @include.
@@ -158,7 +158,7 @@ impl SourceManager {
         &mut self,
         project_dir: &Path,
         desc: &ModuleDesc,
-        visited: &mut HashSet<PathBuf>,
+        visited: &mut FxHashSet<PathBuf>,
         report: &mut LoadReport,
     ) {
         for inc in &desc.includes {
@@ -190,7 +190,7 @@ impl SourceManager {
         &mut self,
         project_dir: &Path,
         desc: &ModuleDesc,
-        visited: &mut HashSet<PathBuf>,
+        visited: &mut FxHashSet<PathBuf>,
         report: &mut LoadReport,
     ) {
         for lib in &desc.libraries {
@@ -223,7 +223,7 @@ impl SourceManager {
         &mut self,
         path: &Path,
         lib: &str,
-        visited: &mut HashSet<PathBuf>,
+        visited: &mut FxHashSet<PathBuf>,
         report: &mut LoadReport,
     ) -> Option<Uri> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -279,7 +279,7 @@ impl SourceManager {
     /// `did_close` or when the user removes the pragma AND closes the
     /// buffer.
     #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a HashMap/Set key in practice.
-    pub fn evict_unreachable(&mut self, reachable: &HashSet<Uri>) -> Vec<Uri> {
+    pub fn evict_unreachable(&mut self, reachable: &FxHashSet<Uri>) -> Vec<Uri> {
         let to_remove: Vec<Uri> = self
             .documents
             .iter()
@@ -386,8 +386,8 @@ mod tests {
     /// no `$HOME` / `$GREYCAT_HOME` mutation.
     #[derive(Default)]
     struct MemContext {
-        files: std::sync::Mutex<HashMap<PathBuf, String>>,
-        dirs: std::sync::Mutex<HashSet<PathBuf>>,
+        files: std::sync::Mutex<FxHashMap<PathBuf, String>>,
+        dirs: std::sync::Mutex<FxHashSet<PathBuf>>,
         greycat_home: PathBuf,
     }
 

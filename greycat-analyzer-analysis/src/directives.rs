@@ -21,8 +21,9 @@
 //! Misspelled rule names emit `unknown-suppression-rule`; empty rule
 //! lists on `-off` / `-off-next` / `-off-file` emit `empty-suppression`.
 
-use std::collections::HashSet;
 use std::ops::Range;
+
+use rustc_hash::FxHashSet;
 
 use greycat_analyzer_syntax::tree_sitter::Node;
 
@@ -60,7 +61,7 @@ pub struct LintSuppression {
     /// tracking. Mutated by [`Directives::suppresses_lint`] when a
     /// match occurs. Populated *only* for the rules in `rules`
     /// never `unused-suppression` itself, which would be circular.
-    pub used_rules: HashSet<String>,
+    pub used_rules: FxHashSet<String>,
 }
 
 /// Shape of the originating directive — drives `unused-suppression`'s
@@ -386,7 +387,7 @@ fn parse_with_collected(
                 // the OFF-side rule entries (so unused-suppression
                 // points at the OFF comment, not the ON comment).
                 let target_names: Vec<String> = if rules.is_empty() {
-                    let mut acc: HashSet<String> = HashSet::new();
+                    let mut acc: FxHashSet<String> = FxHashSet::default();
                     for o in &open_lint {
                         for r in &o.rules {
                             acc.insert(r.name.clone());
@@ -417,7 +418,7 @@ fn parse_with_collected(
                                 rules: vec![entry],
                                 kind: LintSuppressionKind::Range,
                                 directive_range: slot.directive_range.clone(),
-                                used_rules: HashSet::new(),
+                                used_rules: FxHashSet::default(),
                             });
                         }
                         if slot.rules.is_empty() {
@@ -455,7 +456,7 @@ fn parse_with_collected(
                     rules,
                     kind: LintSuppressionKind::NextItem,
                     directive_range: raw.byte_range.clone(),
-                    used_rules: HashSet::new(),
+                    used_rules: FxHashSet::default(),
                 });
             }
             Directive::LintOffFile(rules) => {
@@ -496,7 +497,7 @@ fn parse_with_collected(
                     rules,
                     kind: LintSuppressionKind::File,
                     directive_range: raw.byte_range.clone(),
-                    used_rules: HashSet::new(),
+                    used_rules: FxHashSet::default(),
                 });
             }
             Directive::FmtOff => {
@@ -576,7 +577,7 @@ fn parse_with_collected(
                 rules: vec![r],
                 kind: LintSuppressionKind::Range,
                 directive_range: slot.directive_range.clone(),
-                used_rules: HashSet::new(),
+                used_rules: FxHashSet::default(),
             });
         }
     }

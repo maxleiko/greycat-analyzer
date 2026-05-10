@@ -14,9 +14,10 @@
 //! 4. Expect an unresolved-name diagnostic on the `Foo` reference in
 //!    `main.gcl`.
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceManager;
@@ -28,8 +29,8 @@ use greycat_analyzer_core::resolver::Context;
 /// threaded so the lock is uncontended.
 #[derive(Default)]
 struct MemContext {
-    files: Mutex<HashMap<PathBuf, String>>,
-    dirs: Mutex<HashSet<PathBuf>>,
+    files: Mutex<FxHashMap<PathBuf, String>>,
+    dirs: Mutex<FxHashSet<PathBuf>>,
     greycat_home: PathBuf,
 }
 
@@ -138,7 +139,7 @@ fn commenting_out_library_evicts_modules_and_surfaces_unresolved_type() {
     //    project.gcl), then evict anything no longer reachable.
     let report = mgr.load_project(Path::new("/proj/project.gcl"));
     #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
-    let reachable: HashSet<Uri> = report.reachable.iter().cloned().collect();
+    let reachable: FxHashSet<Uri> = report.reachable.iter().cloned().collect();
     let evicted = mgr.evict_unreachable(&reachable);
     assert!(
         evicted

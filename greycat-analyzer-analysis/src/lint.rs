@@ -11,8 +11,9 @@
 //! the LSP code-action layer has concrete edit suggestions to apply
 //! ( placeholder).
 
-use std::collections::HashMap;
 use std::ops::Range;
+
+use rustc_hash::FxHashMap;
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -798,7 +799,7 @@ impl LintRule for DuplicateDecl {
         let Some(module) = cx.hir.module.as_ref() else {
             return;
         };
-        let mut seen: HashMap<String, ()> = HashMap::new();
+        let mut seen: FxHashMap<String, ()> = FxHashMap::default();
         let mut candidates: Vec<LintDiagnostic> = Vec::new();
         for decl_id in &module.decls {
             let Some(name_id) = cx.hir.decls[*decl_id].name() else {

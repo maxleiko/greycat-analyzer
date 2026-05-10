@@ -23,8 +23,7 @@
 //! split). Inference table is a thin map from `Idx<Expr>` to `TypeId`
 //! and lives in the analyzer crate, not here.
 
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 /// A handle into a [`TypeArena`]. Cheap to copy.
@@ -68,7 +67,7 @@ impl Symbol {
 /// and `intern` only when extending the index.
 #[derive(Debug, Default, Clone)]
 pub struct SymbolTable {
-    map: HashMap<String, Symbol>,
+    map: FxHashMap<String, Symbol>,
     rev: Vec<String>,
 }
 
@@ -208,7 +207,7 @@ pub enum GenericOwner {
 #[derive(Debug, Default, Clone)]
 pub struct TypeArena {
     items: Vec<Type>,
-    intern: HashMap<Type, TypeId>,
+    intern: FxHashMap<Type, TypeId>,
 }
 
 impl TypeArena {
@@ -322,14 +321,14 @@ impl TypeArena {
     /// with the matching entry in `subst`, allocating fresh interned
     /// types for any container that changed shape. Idempotent: calling
     /// twice produces the same TypeId. Mirrors
-    /// [`InferenceTable::substitute`] but takes a plain `&HashMap` so
+    /// [`InferenceTable::substitute`] but takes a plain `&FxHashMap` so
     /// callers (e.g. the staged-pipeline body walker) don't have to
     /// route witnesses through an `InferenceTable`.
     ///
     /// Recurses through `Generic`, `Tuple`, `Lambda`, `Anonymous`, and
     /// `Union` shapes. Non-substitutable kinds (`Named`, `Primitive`,
     /// `Null`, `Any`, `Never`, `Enum`) return `ty` unchanged.
-    pub fn substitute(&mut self, ty: TypeId, subst: &HashMap<String, TypeId>) -> TypeId {
+    pub fn substitute(&mut self, ty: TypeId, subst: &FxHashMap<String, TypeId>) -> TypeId {
         if subst.is_empty() {
             return ty;
         }
@@ -434,7 +433,7 @@ impl TypeArena {
 pub struct TypeRegistry {
     /// Maps simple type name -> a Named TypeId in the arena.
     // P25.2
-    named: HashMap<SmolStr, TypeId>,
+    named: FxHashMap<SmolStr, TypeId>,
 }
 
 impl TypeRegistry {
@@ -667,7 +666,7 @@ pub fn is_node_tag(name: &str) -> bool {
 /// merging are deferred — this is the seam, not a full Hindley-Milner.
 #[derive(Debug, Default)]
 pub struct InferenceTable {
-    bindings: HashMap<String, TypeId>,
+    bindings: FxHashMap<String, TypeId>,
 }
 
 impl InferenceTable {
@@ -1232,7 +1231,7 @@ mod tests {
         });
         let map_tu = a.generic("Map", vec![t_param, u_param]);
 
-        let mut subst: HashMap<String, TypeId> = HashMap::new();
+        let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
         subst.insert("T".into(), int);
         subst.insert("U".into(), str_t);
 
@@ -1262,7 +1261,7 @@ mod tests {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
         let arr = a.generic("Array", vec![int]);
-        let empty: HashMap<String, TypeId> = HashMap::new();
+        let empty: FxHashMap<String, TypeId> = FxHashMap::default();
         assert_eq!(a.substitute(arr, &empty), arr);
     }
 

@@ -12,10 +12,10 @@
 //! — they arrive separately. [`pragma_diagnostics`] surfaces unresolved /
 //! duplicate `@include` / `@library` pragmas like other diags.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use rustc_hash::FxHashSet;
 
 use greycat_analyzer_syntax::tree_sitter;
 
@@ -139,7 +139,7 @@ pub fn pragma_diagnostics(
     ctx: &dyn Context,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    let mut seen_includes: HashSet<&str> = HashSet::new();
+    let mut seen_includes: FxHashSet<&str> = FxHashSet::default();
     for inc in &desc.includes {
         if !seen_includes.insert(inc.value.as_str()) {
             out.push(make_pragma_diag(
@@ -178,7 +178,7 @@ pub fn pragma_diagnostics(
             ));
         }
     }
-    let mut seen_libs: HashSet<&str> = HashSet::new();
+    let mut seen_libs: FxHashSet<&str> = FxHashSet::default();
     for lib in &desc.libraries {
         if !seen_libs.insert(lib.name.as_str()) {
             out.push(make_pragma_diag(
@@ -301,8 +301,9 @@ pub fn format_cli(path: &str, diag: &Diagnostic) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::path::PathBuf;
+
+    use rustc_hash::FxHashMap;
 
     use crate::module_desc::parse_module_desc;
     use lsp_types::Uri;
@@ -319,8 +320,8 @@ mod tests {
     /// known directories plus an optional `path → contents` map for
     /// reading the `lib/installed` manifest.
     struct PragmaCtx {
-        dirs: std::collections::HashSet<PathBuf>,
-        files: HashMap<PathBuf, String>,
+        dirs: FxHashSet<PathBuf>,
+        files: FxHashMap<PathBuf, String>,
         greycat_home: PathBuf,
     }
 
@@ -342,13 +343,13 @@ mod tests {
         }
     }
 
-    fn pragma_diags(source: &str, dirs: &[&str]) -> HashMap<String, Diagnostic> {
+    fn pragma_diags(source: &str, dirs: &[&str]) -> FxHashMap<String, Diagnostic> {
         let tree = greycat_analyzer_syntax::parse(source);
         let uri = Uri::from_str("file:///proj/project.gcl").unwrap();
         let desc = parse_module_desc(uri, source, tree.root_node());
         let ctx = PragmaCtx {
             dirs: dirs.iter().map(PathBuf::from).collect(),
-            files: HashMap::new(),
+            files: FxHashMap::default(),
             greycat_home: PathBuf::from("/gcat"),
         };
         let project_dir = Path::new("/proj");
@@ -486,7 +487,7 @@ mod tests {
         let tree = greycat_analyzer_syntax::parse(src);
         let uri = Uri::from_str("file:///proj/project.gcl").unwrap();
         let desc = parse_module_desc(uri, src, tree.root_node());
-        let mut files = HashMap::new();
+        let mut files = FxHashMap::default();
         files.insert(
             PathBuf::from("/proj/lib/installed"),
             "std=8.0.269-dev\nfoo=1.0\n".into(),

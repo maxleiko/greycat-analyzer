@@ -41,10 +41,10 @@
 //! in the LSP completion path, since it depends on what the user has
 //! already typed.
 
-use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
 const REGISTRY_BASE: &str = "https://get.greycat.io/files";
@@ -281,7 +281,7 @@ pub fn prerelease_tag(text: &str) -> Option<&str> {
 /// the duplicate work amortizes to zero after the first hit.
 pub struct CachingFetcher<F> {
     inner: F,
-    cache: RwLock<HashMap<String, (Instant, Vec<RegistryItem>)>>,
+    cache: RwLock<FxHashMap<String, (Instant, Vec<RegistryItem>)>>,
     ttl: Duration,
 }
 
@@ -289,7 +289,7 @@ impl<F: RegistryFetcher> CachingFetcher<F> {
     pub fn new(inner: F, ttl: Duration) -> Self {
         Self {
             inner,
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(FxHashMap::default()),
             ttl,
         }
     }
@@ -352,13 +352,12 @@ impl<F: RegistryFetcher> RegistryFetcher for CachingFetcher<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     /// Scripted fetcher: maps URL -> JSON string. `fetch` parses the
     /// JSON; missing URLs return an empty `Vec`.
     struct StubFetcher {
-        scripted: HashMap<String, &'static str>,
+        scripted: FxHashMap<String, &'static str>,
         calls: Mutex<Vec<String>>,
     }
 

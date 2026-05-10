@@ -12,6 +12,8 @@
 
 use std::ops::Range;
 
+use rustc_hash::FxHashSet;
+
 use greycat_analyzer_analysis::analyzer::Severity;
 use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity, run_lints};
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
@@ -3382,7 +3384,7 @@ fn ident_or_keyword_completion(
     }
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
     let mut items: Vec<CompletionItem> = Vec::new();
 
     // Keywords first, alphabetic-sorted under `sort_text` so they land
@@ -3428,7 +3430,7 @@ fn ident_or_keyword_completion(
     // Project surface — every cross-module top-level decl + primitives
     // + runtime types + native fn signatures. `module(uri)` guarded
     // to avoid double-emitting in-module decls.
-    let in_module: std::collections::HashSet<String> = project
+    let in_module: FxHashSet<String> = project
         .module(uri)
         .map(|m| {
             m.hir
@@ -4697,10 +4699,10 @@ fn type_position_completion(
     }
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
     let mut items: Vec<CompletionItem> = Vec::new();
     let push = |items: &mut Vec<CompletionItem>,
-                seen: &mut std::collections::HashSet<String>,
+                seen: &mut FxHashSet<String>,
                 name: &str,
                 kind: CompletionItemKind| {
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {

@@ -528,9 +528,9 @@ fn completion_inside_at_library_name_does_not_emit_placeholder() {
 #[test]
 fn resolve_lib_version_emits_sorted_items_with_channel_detail() {
     use greycat_analyzer_core::registry::{RegistryFetcher, RegistryItem};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    struct Stub(HashMap<String, &'static str>);
+    struct Stub(FxHashMap<String, &'static str>);
     impl RegistryFetcher for Stub {
         fn fetch(&self, url: &str) -> Vec<RegistryItem> {
             self.0
@@ -609,9 +609,9 @@ fn resolve_lib_version_emits_sorted_items_with_channel_detail() {
 #[test]
 fn resolve_lib_version_biases_matching_channel_first() {
     use greycat_analyzer_core::registry::{RegistryFetcher, RegistryItem};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
-    struct Stub(HashMap<String, &'static str>);
+    struct Stub(FxHashMap<String, &'static str>);
     impl RegistryFetcher for Stub {
         fn fetch(&self, url: &str) -> Vec<RegistryItem> {
             self.0
@@ -1792,8 +1792,7 @@ fn cross_module_goto_implementation_walks_every_module() {
     let GotoDefinitionResponse::Array(locs) = resp else {
         panic!("expected array of impls");
     };
-    let uris: std::collections::HashSet<_> =
-        locs.iter().map(|l| l.uri.as_str().to_owned()).collect();
+    let uris: rustc_hash::FxHashSet<_> = locs.iter().map(|l| l.uri.as_str().to_owned()).collect();
     assert!(
         uris.contains(a.as_str()),
         "should include Foo::run in a.gcl: {locs:?}"
