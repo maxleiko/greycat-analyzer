@@ -9,11 +9,7 @@ import {
 } from 'vscode';
 import { version } from '../package.json';
 
-import {
-  Executable,
-  LanguageClient,
-  TransportKind,
-} from 'vscode-languageclient/node';
+import { Executable, LanguageClient, TransportKind } from 'vscode-languageclient/node';
 
 let channel: OutputChannel;
 let client: LanguageClient | null = null;
@@ -28,12 +24,8 @@ export function activate(ctx: ExtensionContext) {
       // Both settings require an LSP restart: trace.server changes
       // RUST_LOG (only read at startup) and lintLibs is sent via
       // initializationOptions (only consumed on `initialize`).
-      const traceChanged = e.affectsConfiguration(
-        'greycat-analyzer.trace.server'
-      );
-      const lintLibsChanged = e.affectsConfiguration(
-        'greycat-analyzer.lintLibs'
-      );
+      const traceChanged = e.affectsConfiguration('greycat-analyzer.trace.server');
+      const lintLibsChanged = e.affectsConfiguration('greycat-analyzer.lintLibs');
       if (!traceChanged && !lintLibsChanged) {
         return;
       }
@@ -41,12 +33,12 @@ export function activate(ctx: ExtensionContext) {
       const choice = await window.showInformationMessage(
         `greycat-analyzer ${what} changed. Restart the server now?`,
         'Restart',
-        'Later'
+        'Later',
       );
       if (choice === 'Restart') {
         await restart();
       }
-    })
+    }),
   );
 
   statusBar(ctx);
@@ -77,8 +69,13 @@ function startClient() {
     transport: TransportKind.stdio,
     options: {
       env: {
-        ...process.env,
+        // Defaults first, user env last — so a power user who sets
+        // RUST_BACKTRACE=full or RUST_LOG=trace in their shell wins.
+        // RUST_BACKTRACE=1 surfaces a usable backtrace in the output
+        // channel for any LSP-side panic (zero cost otherwise).
+        RUST_BACKTRACE: '1',
         RUST_LOG: buildRustLog(),
+        ...process.env,
       },
     },
   };
@@ -93,7 +90,7 @@ function startClient() {
       outputChannel: channel,
       documentSelector: [{ scheme: 'file', language: 'greycat' }],
       initializationOptions: buildInitializationOptions(),
-    }
+    },
   );
 
   return client.start();
@@ -132,10 +129,7 @@ function buildRustLog(): string {
 }
 
 function statusBar(ctx: ExtensionContext) {
-  const statusBarItem = window.createStatusBarItem(
-    StatusBarAlignment.Left,
-    100
-  );
+  const statusBarItem = window.createStatusBarItem(StatusBarAlignment.Left, 100);
   statusBarItem.text = 'greycat-analyzer';
   statusBarItem.tooltip = new MarkdownString(
     [
@@ -147,7 +141,7 @@ function statusBar(ctx: ExtensionContext) {
       '',
       '[Need help?](https://doc.greycat.io)',
     ].join('\n'),
-    true
+    true,
   );
   // Required to make links clickable
   statusBarItem.tooltip.isTrusted = true;
@@ -169,6 +163,6 @@ function statusBar(ctx: ExtensionContext) {
   ctx.subscriptions.push(
     statusBarItem,
     window.onDidChangeActiveTextEditor(updateStatusBarVisiblity),
-    window.onDidChangeVisibleTextEditors(updateStatusBarVisiblity)
+    window.onDidChangeVisibleTextEditors(updateStatusBarVisiblity),
   );
 }
