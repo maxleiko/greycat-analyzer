@@ -356,44 +356,16 @@ pub fn analyze_with_index_into(
     index: &ProjectIndex,
     arena: &mut TypeArena,
 ) -> AnalysisResult {
-    // Pre-seed canonical so the per-module LocalArena snapshot sees
-    // primitives at their stable canonical TypeIds.
-    seed_builtins(arena);
-    let (mut out, local_items, base_len) = analyze_module_local(hir, res, index, &*arena);
-    let remap = arena.merge_local(base_len, local_items);
-    remap_analysis_result(&mut out, base_len, &remap);
-    out
-}
-
-// P28.3
-/// Per-module body walker against a `LocalArena` layered on
-/// `arena_snapshot`. Returns the per-module [`AnalysisResult`], the
-/// locally-minted types in insertion order, and the snapshot length
-/// captured when the LocalArena was created.
-///
-/// **Caller contract:** merge `local_items` into the canonical
-/// [`TypeArena`] via [`TypeArena::merge_local`] and apply the
-/// resulting remap to `result` via [`remap_analysis_result`] before
-/// the result is read by any code that relies on canonical TypeIds.
-///
-/// **Concurrency:** safe to call from rayon workers. `arena_snapshot`
-/// is shared `&` across all workers (read-only), and every mint
-/// lands in this worker's private local tail. The seqential merge
-/// after the parallel pass canonicalizes the per-worker mints back
-/// into the project arena.
-pub fn analyze_module_local(
-    hir: &Hir,
-    res: &Resolutions,
-    index: &ProjectIndex,
-    arena_snapshot: &TypeArena,
-) -> (AnalysisResult, Vec<Type>, u32) {
     let mut out = AnalysisResult::default();
-    let base_len = arena_snapshot.len() as u32;
-    let mut local = LocalArena::wrap(arena_snapshot);
-    // Idempotent: when the orchestrator has pre-seeded primitives into
-    // canonical, each Primitive::* alloc dedups against the base
-    // intern table without growing the local tail.
-    seed_builtins(&mut local);
+    // P28.2 — seed canonical first so the LocalArena's snapshot sees
+    // the primitives at their stable canonical TypeIds.
+    seed_builtins(arena);
+    let base_len = arena.len() as u32;
+    // P28.2 — body walker now mints into a LocalArena layered on a
+    // snapshot of `arena`. In serial mode the merge step at the end
+    // reproduces the pre-P28 state (locally-minted types appended to
+    // canonical, remap applied to the per-module result).
+    let mut local = LocalArena::wrap(&*arena);
     register_module_types(hir, &mut local, &mut out);
 
     if let Some(module) = hir.module.as_ref() {
@@ -415,8 +387,14 @@ pub fn analyze_module_local(
         drop(cx);
     }
 
-    // Surface resolver's unresolved-name list as analyzer diagnostics
-    // so the LSP publish only needs one list per file.
+    // P28.2 — merge the local tail back into canonical, then remap
+    // every TypeId-carrying field of `out` through the remap table.
+    let local_items = local.into_local_items();
+    let remap = arena.merge_local(base_len, local_items);
+    remap_analysis_result(&mut out, base_len, &remap);
+
+    // Surface resolver's unresolved-name list as analyzer diagnostics so
+    // P2.7 (LSP publish) only needs one list per file.
     let unresolved = res.unresolved.clone();
     for ident_idx in unresolved {
         let ident = &hir.idents[ident_idx];
@@ -427,8 +405,7 @@ pub fn analyze_module_local(
         ));
     }
 
-    let local_items = local.into_local_items();
-    (out, local_items, base_len)
+    out
 }
 
 // P28.2
@@ -443,7 +420,7 @@ pub fn analyze_module_local(
 /// [`AnalysisResult::def_types`]. The remaining fields
 /// (`type_decls`, `member_uses`, `foreign_member_uses`, …) hold HIR
 /// indices / strings only, not TypeIds.
-pub fn remap_analysis_result(out: &mut AnalysisResult, base_len: u32, remap: &[TypeId]) {
+fn remap_analysis_result(out: &mut AnalysisResult, base_len: u32, remap: &[TypeId]) {
     let map_id = |id: TypeId| -> TypeId {
         let raw = id.raw();
         if raw < base_len {
