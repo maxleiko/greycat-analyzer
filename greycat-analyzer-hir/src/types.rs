@@ -5,6 +5,7 @@
 
 use std::ops::Range;
 
+use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::arena::Idx;
@@ -42,15 +43,16 @@ pub struct Modifiers {
     /// args: ["renamed"] }`). Non-string arguments are dropped —
     /// the consumers we have today (`@expose` rename capture, the
     /// `unused-decl` exposure check) only need string args.
-    pub annotations: Vec<Annotation>,
+    // P25.7
+    pub annotations: SmallVec<[Annotation; 1]>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Annotation {
     // P25.6
     pub name: SmolStr,
-    // P25.6
-    pub args: Vec<SmolStr>,
+    // P25.6 / P25.7
+    pub args: SmallVec<[SmolStr; 1]>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +89,8 @@ impl Decl {
 pub struct FnDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    pub generics: Vec<Idx<Ident>>,
+    // P25.7
+    pub generics: SmallVec<[Idx<Ident>; 2]>,
     pub params: Vec<Idx<FnParam>>,
     pub return_type: Option<Idx<TypeRef>>,
     /// `None` for native / abstract functions.
@@ -107,7 +110,8 @@ pub struct FnParam {
 pub struct TypeDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    pub generics: Vec<Idx<Ident>>,
+    // P25.7
+    pub generics: SmallVec<[Idx<Ident>; 2]>,
     pub supertype: Option<Idx<TypeRef>>,
     pub attrs: Vec<Idx<TypeAttr>>,
     pub methods: Vec<Idx<Decl>>, // each is a Decl::Fn (FnDecl with `static_` / `abstract_` etc.)

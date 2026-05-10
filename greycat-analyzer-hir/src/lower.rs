@@ -138,15 +138,19 @@ fn lower_modifiers(cx: &LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Modifi
 /// `Annotation { name, args }` where `args` carries every
 /// string-literal argument the source provided (other arg shapes are
 /// dropped — call-site consumers we have today only read string args).
-fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<Annotation> {
+// P25.7
+fn lower_annotations(
+    cx: &LowerCtx,
+    decl_node: tree_sitter::Node<'_>,
+) -> smallvec::SmallVec<[Annotation; 1]> {
     let mut cursor = decl_node.walk();
     let Some(annots_node) = decl_node
         .named_children(&mut cursor)
         .find(|c| c.kind() == "annotations")
     else {
-        return Vec::new();
+        return smallvec::SmallVec::new();
     };
-    let mut out = Vec::new();
+    let mut out = smallvec::SmallVec::new();
     let mut c2 = annots_node.walk();
     for ann in annots_node.named_children(&mut c2) {
         if ann.kind() != "annotation" {
@@ -158,8 +162,8 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Vec<Ann
         };
         // P25.6
         let name: smol_str::SmolStr = cx.text(ident).into();
-        // P25.6
-        let mut args: Vec<smol_str::SmolStr> = Vec::new();
+        // P25.6 / P25.7
+        let mut args: smallvec::SmallVec<[smol_str::SmolStr; 1]> = smallvec::SmallVec::new();
         let mut c4 = ann.walk();
         if let Some(args_node) = ann.named_children(&mut c4).find(|n| n.kind() == "args") {
             let mut c5 = args_node.walk();
@@ -231,9 +235,15 @@ fn lower_fn_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<FnDec
     })
 }
 
-fn lower_generics(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Vec<Idx<Ident>> {
-    let Some(node) = node else { return Vec::new() };
-    let mut out = Vec::new();
+// P25.7
+fn lower_generics(
+    cx: &mut LowerCtx,
+    node: Option<tree_sitter::Node<'_>>,
+) -> smallvec::SmallVec<[Idx<Ident>; 2]> {
+    let Some(node) = node else {
+        return smallvec::SmallVec::new();
+    };
+    let mut out = smallvec::SmallVec::new();
     let mut cursor = node.walk();
     for c in node.named_children(&mut cursor) {
         if c.kind() == "ident" {

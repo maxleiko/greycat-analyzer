@@ -1006,7 +1006,8 @@ impl<'a> Cx<'a> {
         let recv = self.arena.get(lookup_ty).clone();
         let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match recv.kind {
             TypeKind::Named { name } => (name, Vec::new()),
-            TypeKind::Generic { name, args } => (name, args),
+            // P25.7
+            TypeKind::Generic { name, args } => (name, args.into_vec()),
             TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
             _ => return None,
         };
@@ -1233,7 +1234,8 @@ impl<'a> Cx<'a> {
         let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match &self.arena.get(recv_ty).kind
         {
             TypeKind::Named { name } => (name.clone(), Vec::new()),
-            TypeKind::Generic { name, args } => (name.clone(), args.clone()),
+            // P25.7
+            TypeKind::Generic { name, args } => (name.clone(), args.to_vec()),
             TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
             _ => return None,
         };

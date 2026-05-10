@@ -449,6 +449,7 @@ version = "0.1.0"
 dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-syntax",
+ "smallvec",
  "smol_str",
 ]
 
@@ -492,6 +493,7 @@ dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-hir",
  "rustc-hash",
+ "smallvec",
  "smol_str",
 ]
 

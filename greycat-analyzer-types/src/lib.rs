@@ -24,6 +24,7 @@
 //! and lives in the analyzer crate, not here.
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 /// A handle into a [`TypeArena`]. Cheap to copy.
@@ -140,8 +141,11 @@ pub enum TypeKind {
     // P25.4
     Named { name: SmolStr },
     /// Generic type instantiation — `Array<int>`, `Map<String, int>`, etc.
-    // P25.4
-    Generic { name: SmolStr, args: Vec<TypeId> },
+    // P25.4 / P25.7
+    Generic {
+        name: SmolStr,
+        args: SmallVec<[TypeId; 2]>,
+    },
     /// Generic type *parameter* — the `T` inside a `fn<T>(x: T)` body.
     // P25.4
     GenericParam { name: SmolStr, owner: GenericOwner },
@@ -295,7 +299,8 @@ impl TypeArena {
         self.alloc(Type {
             kind: TypeKind::Generic {
                 name: name.into(),
-                args,
+                // P25.7
+                args: args.into(),
             },
             nullable: false,
         })
@@ -349,13 +354,14 @@ impl TypeArena {
                 None => ty,
             },
             TypeKind::Generic { name, args } => {
-                let new_args: Vec<TypeId> =
+                // P25.7
+                let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(*a, subst)).collect();
                 if new_args == *args {
                     ty
                 } else {
                     let name = name.clone();
-                    let mut new_t = self.generic(name, new_args);
+                    let mut new_t = self.generic(name, new_args.into_vec());
                     if t.nullable {
                         new_t = self.nullable(new_t);
                     }
@@ -716,13 +722,14 @@ impl InferenceTable {
                 }
             }
             TypeKind::Generic { name, args } => {
-                let new_args: Vec<TypeId> =
+                // P25.7
+                let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(arena, *a)).collect();
                 if new_args == *args {
                     ty
                 } else {
                     let name = name.clone();
-                    let mut new_t = arena.generic(name, new_args);
+                    let mut new_t = arena.generic(name, new_args.into_vec());
                     if t.nullable {
                         new_t = arena.nullable(new_t);
                     }
@@ -1242,7 +1249,8 @@ mod tests {
             panic!("expected Array<int>, got {resolved_kind:?}");
         };
         assert_eq!(name, "Array");
-        assert_eq!(args, &vec![int]);
+        // P25.7: args is `SmallVec<[TypeId; 2]>` — compare via slices.
+        assert_eq!(args.as_slice(), &[int]);
     }
 
     #[test]
@@ -1275,7 +1283,8 @@ mod tests {
             panic!("expected Map<int, String>");
         };
         assert_eq!(name, "Map");
-        assert_eq!(args, &vec![int, str_t]);
+        // P25.7: args is `SmallVec<[TypeId; 2]>` — compare via slices.
+        assert_eq!(args.as_slice(), &[int, str_t]);
 
         // Idempotent: re-applying yields the same TypeId.
         let resolved2 = a.substitute(resolved, &subst);

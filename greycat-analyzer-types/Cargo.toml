@@ -13,4 +13,5 @@ categories.workspace = true
 greycat-analyzer-hir.workspace = true
 greycat-analyzer-core.workspace = true
 rustc-hash.workspace = true
+smallvec.workspace = true
 smol_str.workspace = true
