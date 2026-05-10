@@ -25,6 +25,8 @@
 
 use std::collections::HashMap;
 
+use smol_str::SmolStr;
+
 /// A handle into a [`TypeArena`]. Cheap to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(u32);
@@ -431,7 +433,8 @@ impl TypeArena {
 #[derive(Debug, Default)]
 pub struct TypeRegistry {
     /// Maps simple type name -> a Named TypeId in the arena.
-    named: HashMap<String, TypeId>,
+    // P25.2
+    named: HashMap<SmolStr, TypeId>,
 }
 
 impl TypeRegistry {
@@ -439,7 +442,7 @@ impl TypeRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, name: impl Into<String>, id: TypeId) {
+    pub fn register(&mut self, name: impl Into<SmolStr>, id: TypeId) {
         self.named.insert(name.into(), id);
     }
 
