@@ -79,12 +79,19 @@ fn block_terminates(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -
 /// Classify a numeric literal's source text as `int` or
 /// `float`. Returns `Primitive::Float` for literals that contain a
 /// decimal point, scientific notation (`1e3`, `1.5E-2`), or trailing
-/// `_f` suffix; everything else falls back to `Primitive::Int`. Other
-/// typed suffixes (`_time`, `_duration`, …) leave `LiteralKind::Number`
+/// `f` / `_f` suffix; everything else falls back to `Primitive::Int`.
+/// Other typed suffixes (`_time`, `_duration`, …) leave `LiteralKind::Number`
 /// untyped today;  promotes those to dedicated `LiteralKind`
 /// variants so this helper only sees float / int candidates.
 fn numeric_literal_kind(text: &str) -> Primitive {
-    if text.ends_with("_f") {
+    // Bare `f` is the float suffix; the leading `_` (`_f`) is a
+    // formatter convention, not a grammar requirement, so both forms
+    // must classify identically. `time` / duration suffixes have
+    // already been split off into `LiteralKind::Time` /
+    // `LiteralKind::Duration` by HIR lowering's `classify_number`,
+    // and none of them end in `f`, so this check has no false
+    // positives.
+    if text.ends_with('f') {
         return Primitive::Float;
     }
     if text.contains('.') {
@@ -3159,6 +3166,33 @@ fn caller() { pair(1, "s"); }
     #[test]
     fn binary_arith_widens_to_float() {
         let src = "fn f(a: int, b: float): float { return a + b; }\n";
+        let r = analyze_src_only(src);
+        assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
+    }
+
+    /// Regression: `2f` (bare `f` suffix, no leading underscore) must
+    /// classify as `float`. The leading `_` is a formatter convention,
+    /// not a grammar requirement — both `42f` and `42_f` are valid
+    /// GreyCat syntax and the analyzer must agree with the runtime
+    /// that they're float literals. Earlier code only matched `_f`,
+    /// so `foo(2f)` against `fn foo(_: float)` lit up a spurious
+    /// `int → float` assignability error.
+    #[test]
+    fn numeric_literal_kind_recognizes_bare_and_underscored_f_suffix() {
+        assert_eq!(super::numeric_literal_kind("2f"), Primitive::Float);
+        assert_eq!(super::numeric_literal_kind("2_f"), Primitive::Float);
+        assert_eq!(super::numeric_literal_kind("1.5f"), Primitive::Float);
+        assert_eq!(super::numeric_literal_kind("1.79e+308_f"), Primitive::Float);
+        assert_eq!(super::numeric_literal_kind("2"), Primitive::Int);
+        assert_eq!(super::numeric_literal_kind("42"), Primitive::Int);
+    }
+
+    /// End-to-end anchor for the same fix: a bare-`f` float literal
+    /// flowing into a `float`-typed parameter must not raise an
+    /// assignability diagnostic.
+    #[test]
+    fn bare_f_suffix_assigns_to_float_parameter() {
+        let src = "fn main() { foo(2f); }\nnative fn foo(_: float) {}\n";
         let r = analyze_src_only(src);
         assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
     }
