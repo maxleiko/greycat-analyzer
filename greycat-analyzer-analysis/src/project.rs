@@ -23,8 +23,12 @@ use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_hir::{Hir, lower_module};
+use greycat_analyzer_types::{Type, TypeArena};
 
-use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
+use crate::analyzer::{
+    AnalysisResult, analyze_module_local, analyze_with_index_into, remap_analysis_result,
+    seed_builtins,
+};
 use crate::directives::Directives;
 use crate::lint::{
     LintDiagnostic, lint_arrow_on_non_deref_with_directives, lint_catch_empty_parens,
@@ -908,24 +912,71 @@ impl ProjectAnalysis {
         // in `crate::parallel`.
         let pass_a: Vec<PassAOut> = crate::parallel::par_map(hirs, pass_a_run);
 
-        // Pass B (serial): body walker mutates `self.arena`.
-        for p in pass_a {
-            let mut timings = ModuleTimings {
+        // P28.3 — Pass B parallelized via per-thread `LocalArena`.
+        // Each worker takes a read-only snapshot of `self.arena`,
+        // mints into its own local tail, and returns the AnalysisResult
+        // plus its local items + snapshot length. The orchestrator
+        // then merges each thread's local items back into the
+        // canonical arena sequentially, building a per-thread TypeId
+        // remap, and applies the remap to the AnalysisResult.
+        //
+        // Why the merge stays serial: the canonical arena is the
+        // single source of TypeId truth. Mutex'ing it would serialize
+        // every mint inside the parallel pass; the per-thread arena +
+        // batched merge avoids contention by keeping the parallel
+        // phase lock-free and amortizing the canonicalization cost
+        // over a single linear walk per thread at the end.
+        struct ParallelOut {
+            pass_a: PassAOut,
+            result: AnalysisResult,
+            local_items: Vec<Type>,
+            base_len: u32,
+            analyze_took: Duration,
+        }
+
+        let arena_snapshot: &TypeArena = &self.arena;
+        let index_ref: &ProjectIndex = &self.index;
+        let parallel_results: Vec<ParallelOut> = crate::parallel::par_map(pass_a, |p| {
+            let t1 = Instant::now();
+            let (result, local_items, base_len) =
+                analyze_module_local(&p.hir, &p.resolutions, index_ref, arena_snapshot);
+            let analyze_took = t1.elapsed();
+            ParallelOut {
+                pass_a: p,
+                result,
+                local_items,
+                base_len,
+                analyze_took,
+            }
+        });
+
+        // Sequential merge: canonicalize each thread's locally-minted
+        // types into `self.arena`, build the remap, apply to the
+        // per-module result, then insert into `self.modules`.
+        for po in parallel_results {
+            let ParallelOut {
+                pass_a: p,
+                mut result,
+                local_items,
+                base_len,
+                analyze_took,
+            } = po;
+            let t_merge = Instant::now();
+            let remap = self.arena.merge_local(base_len, local_items);
+            remap_analysis_result(&mut result, base_len, &remap);
+            let merge_took = t_merge.elapsed();
+            let timings = ModuleTimings {
                 lower: p.lower_took,
                 resolve: p.resolve_took,
                 lint: p.lint_took,
-                ..ModuleTimings::default()
+                analyze: analyze_took + merge_took,
             };
-            let t1 = Instant::now();
-            let analysis =
-                analyze_with_index_into(&p.hir, &p.resolutions, &self.index, &mut self.arena);
-            timings.analyze = t1.elapsed();
             self.modules.insert(
                 p.uri,
                 ModuleAnalysis {
                     hir: p.hir,
                     resolutions: p.resolutions,
-                    analysis,
+                    analysis: result,
                     lints: p.lints,
                     lib: p.lib,
                     timings,
