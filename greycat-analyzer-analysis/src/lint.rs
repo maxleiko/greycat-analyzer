@@ -229,8 +229,8 @@ pub fn lint_unused_suppressions(
     // mutate state without re-borrowing the suppression list.
     let mut emissions: Vec<LintDiagnostic> = Vec::new();
     for s in &directives.lint_suppressions {
-        for rule in &s.rules {
-            if s.used_rules.contains(rule) {
+        for entry in &s.rules {
+            if s.used_rules.contains(&entry.name) {
                 continue;
             }
             // Don't flag the synthetic suppressions that the directive
@@ -238,7 +238,7 @@ pub fn lint_unused_suppressions(
             // rule`, `empty-suppression`) — those have no chance of
             // suppressing anything by construction.
             if matches!(
-                rule.as_str(),
+                entry.name.as_str(),
                 "unknown-suppression-rule"
                     | "empty-suppression"
                     | "unbalanced-fmt-off"
@@ -246,11 +246,16 @@ pub fn lint_unused_suppressions(
             ) {
                 continue;
             }
+            // Per-rule diagnostic placement: point at the rule word
+            // inside the directive comment, not the whole comment line.
+            // So `// gcl-lint-off-next A B C` where only A fires gets
+            // two diagnostics — one underlining "B", one underlining
+            // "C".
             emissions.push(LintDiagnostic {
                 rule: "unused-suppression",
                 severity: LintSeverity::Warning,
-                message: format!("unused suppression for `{rule}`"),
-                byte_range: s.directive_range.clone(),
+                message: format!("unused suppression for `{}`", entry.name),
+                byte_range: entry.byte_range.clone(),
             });
         }
     }

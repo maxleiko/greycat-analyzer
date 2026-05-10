@@ -28,18 +28,33 @@ use greycat_analyzer_syntax::tree_sitter::Node;
 
 use crate::lint::{LINT_RULES, LintDiagnostic, LintSeverity};
 
+/// One rule named in a directive comment, paired with its byte range
+/// in the source. The range points at the rule word itself (not the
+/// whole comment), so `unused-suppression` can underline the *specific*
+/// dead rule rather than the whole comment line — important when a
+/// directive lists several rules and only some are dead weight.
+#[derive(Debug, Clone)]
+pub struct RuleEntry {
+    pub name: String,
+    /// Absolute source byte range of this rule name. Points into the
+    /// directive comment that introduced it.
+    pub byte_range: Range<usize>,
+}
+
 /// Lint suppression — silences one or more rules over a byte range.
 #[derive(Debug, Clone)]
 pub struct LintSuppression {
     /// Source byte range whose diagnostics should be silenced.
     pub byte_range: Range<usize>,
-    /// Explicitly named rules. Wildcards aren't allowed (P23 spec).
-    pub rules: Vec<String>,
+    /// Explicitly named rules + their per-rule byte ranges.
+    /// Wildcards aren't allowed (P23 spec).
+    pub rules: Vec<RuleEntry>,
     /// What kind of directive produced this entry — needed when the
     /// `unused-suppression` rule decides which slot to flag.
     pub kind: LintSuppressionKind,
-    /// Source byte range of the directive comment itself. Used by
-    /// `unused-suppression` when emitting the dead-toggle diagnostic.
+    /// Source byte range of the directive comment itself. Used as a
+    /// fallback for diagnostics that have no specific rule slot to
+    /// point at (e.g. `empty-suppression` on a bare `// gcl-lint-off`).
     pub directive_range: Range<usize>,
     /// Per-rule "did this suppression actually drop a diagnostic?"
     /// tracking. Mutated by [`Directives::suppresses_lint`] when a
@@ -102,7 +117,7 @@ impl Directives {
     pub fn suppresses_lint(&mut self, byte: usize, rule: &str) -> bool {
         let mut hit = false;
         for s in &mut self.lint_suppressions {
-            if s.byte_range.contains(&byte) && s.rules.iter().any(|r| r == rule) {
+            if s.byte_range.contains(&byte) && s.rules.iter().any(|r| r.name == rule) {
                 s.used_rules.insert(rule.to_string());
                 hit = true;
             }
@@ -129,7 +144,7 @@ impl Directives {
 #[derive(Debug)]
 struct OpenLintOff {
     start: usize,
-    rules: Vec<String>,
+    rules: Vec<RuleEntry>,
     directive_range: Range<usize>,
 }
 
@@ -150,39 +165,79 @@ struct RawComment<'a> {
 
 #[derive(Debug)]
 enum Directive {
-    LintOff(Vec<String>),
-    LintOn(Vec<String>),
-    LintOffNext(Vec<String>),
-    LintOffFile(Vec<String>),
+    LintOff(Vec<RuleEntry>),
+    LintOn(Vec<RuleEntry>),
+    LintOffNext(Vec<RuleEntry>),
+    LintOffFile(Vec<RuleEntry>),
     FmtOff,
     FmtOn,
     FmtSkip,
     FmtOffFile,
 }
 
-/// Strip the leading `//`, trim, and dispatch on the directive name.
-/// Returns `None` for non-directive comments (most of them).
-fn parse_directive(comment_text: &str) -> Option<Directive> {
-    let stripped = comment_text.strip_prefix("//")?.trim();
-    let (head, rest) = match stripped.find(char::is_whitespace) {
-        Some(idx) => (&stripped[..idx], stripped[idx..].trim()),
-        None => (stripped, ""),
-    };
+/// Parse a `// gcl-…` line comment. Tracks per-rule byte positions
+/// (within the source) so `unused-suppression` /
+/// `unknown-suppression-rule` can underline the *specific* rule word
+/// rather than the whole comment line.
+///
+/// `comment_start` is the absolute source byte offset of `comment_text`
+/// (= `raw.byte_range.start`). Returns `None` for non-directive
+/// comments.
+fn parse_directive(comment_text: &str, comment_start: usize) -> Option<Directive> {
+    let bytes = comment_text.as_bytes();
+    if bytes.len() < 2 || &bytes[..2] != b"//" {
+        return None;
+    }
+    let mut i = 2;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let name_start = i;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let head = &comment_text[name_start..i];
+    let rest = parse_rule_list(comment_text, i, comment_start);
+    let rest_empty = rest.is_empty();
     match head {
-        "gcl-lint-off" => Some(Directive::LintOff(parse_rule_list(rest))),
-        "gcl-lint-on" => Some(Directive::LintOn(parse_rule_list(rest))),
-        "gcl-lint-off-next" => Some(Directive::LintOffNext(parse_rule_list(rest))),
-        "gcl-lint-off-file" => Some(Directive::LintOffFile(parse_rule_list(rest))),
-        "gcl-fmt-off" if rest.is_empty() => Some(Directive::FmtOff),
-        "gcl-fmt-on" if rest.is_empty() => Some(Directive::FmtOn),
-        "gcl-fmt-skip" if rest.is_empty() => Some(Directive::FmtSkip),
-        "gcl-fmt-off-file" if rest.is_empty() => Some(Directive::FmtOffFile),
+        "gcl-lint-off" => Some(Directive::LintOff(rest)),
+        "gcl-lint-on" => Some(Directive::LintOn(rest)),
+        "gcl-lint-off-next" => Some(Directive::LintOffNext(rest)),
+        "gcl-lint-off-file" => Some(Directive::LintOffFile(rest)),
+        "gcl-fmt-off" if rest_empty => Some(Directive::FmtOff),
+        "gcl-fmt-on" if rest_empty => Some(Directive::FmtOn),
+        "gcl-fmt-skip" if rest_empty => Some(Directive::FmtSkip),
+        "gcl-fmt-off-file" if rest_empty => Some(Directive::FmtOffFile),
         _ => None,
     }
 }
 
-fn parse_rule_list(rest: &str) -> Vec<String> {
-    rest.split_whitespace().map(str::to_string).collect()
+/// Walk the rule-list slice (everything after the directive name) and
+/// emit a [`RuleEntry`] per whitespace-delimited word with its absolute
+/// source byte range.
+///
+/// `start` is the offset within `comment_text` to begin scanning;
+/// `comment_start` is the absolute source offset of `comment_text`.
+fn parse_rule_list(comment_text: &str, start: usize, comment_start: usize) -> Vec<RuleEntry> {
+    let mut out = Vec::new();
+    let bytes = comment_text.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let word_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if word_start < i {
+            out.push(RuleEntry {
+                name: comment_text[word_start..i].to_string(),
+                byte_range: (comment_start + word_start)..(comment_start + i),
+            });
+        }
+    }
+    out
 }
 
 fn is_known_lint_rule(name: &str) -> bool {
@@ -291,7 +346,7 @@ fn parse_with_collected(
     let mut open_fmt: Option<OpenFmtOff> = None;
 
     for raw in &comments {
-        let Some(parsed) = parse_directive(raw.text) else {
+        let Some(parsed) = parse_directive(raw.text, raw.byte_range.start) else {
             continue;
         };
         match parsed {
@@ -307,12 +362,12 @@ fn parse_with_collected(
                     continue;
                 }
                 for r in &rules {
-                    if !is_known_lint_rule(r) {
+                    if !is_known_lint_rule(&r.name) {
                         out.diagnostics.push(LintDiagnostic {
                             rule: "unknown-suppression-rule",
                             severity: LintSeverity::Warning,
-                            message: format!("unknown lint rule `{r}`"),
-                            byte_range: raw.byte_range.clone(),
+                            message: format!("unknown lint rule `{}`", r.name),
+                            byte_range: r.byte_range.clone(),
                         });
                     }
                 }
@@ -323,35 +378,46 @@ fn parse_with_collected(
                 });
             }
             Directive::LintOn(rules) => {
-                let target_rules: Vec<String> = if rules.is_empty() {
+                // Empty `-on` closes everything currently open across
+                // all rules; named `-on rule0 rule1` closes those rules
+                // only. The `LintSuppression`s emitted on close carry
+                // the OFF-side rule entries (so unused-suppression
+                // points at the OFF comment, not the ON comment).
+                let target_names: Vec<String> = if rules.is_empty() {
                     let mut acc: HashSet<String> = HashSet::new();
                     for o in &open_lint {
                         for r in &o.rules {
-                            acc.insert(r.clone());
+                            acc.insert(r.name.clone());
                         }
                     }
                     acc.into_iter().collect()
                 } else {
-                    rules
+                    rules.iter().map(|r| r.name.clone()).collect()
                 };
-                for r in &target_rules {
+                for name in &target_names {
                     let mut idx_to_remove: Option<usize> = None;
                     for (idx, o) in open_lint.iter().enumerate().rev() {
-                        if o.rules.iter().any(|x| x == r) {
+                        if o.rules.iter().any(|x| x.name == *name) {
                             idx_to_remove = Some(idx);
                             break;
                         }
                     }
                     if let Some(idx) = idx_to_remove {
                         let slot = &mut open_lint[idx];
-                        slot.rules.retain(|x| x != r);
-                        out.lint_suppressions.push(LintSuppression {
-                            byte_range: slot.start..raw.byte_range.start,
-                            rules: vec![r.clone()],
-                            kind: LintSuppressionKind::Range,
-                            directive_range: slot.directive_range.clone(),
-                            used_rules: HashSet::new(),
-                        });
+                        // Pull the closing rule's entry out of the open
+                        // slot so the resulting suppression carries the
+                        // OFF-side byte range.
+                        let entry_pos = slot.rules.iter().position(|x| x.name == *name);
+                        if let Some(pos) = entry_pos {
+                            let entry = slot.rules.remove(pos);
+                            out.lint_suppressions.push(LintSuppression {
+                                byte_range: slot.start..raw.byte_range.start,
+                                rules: vec![entry],
+                                kind: LintSuppressionKind::Range,
+                                directive_range: slot.directive_range.clone(),
+                                used_rules: HashSet::new(),
+                            });
+                        }
                         if slot.rules.is_empty() {
                             open_lint.remove(idx);
                         }
@@ -369,12 +435,12 @@ fn parse_with_collected(
                     continue;
                 }
                 for r in &rules {
-                    if !is_known_lint_rule(r) {
+                    if !is_known_lint_rule(&r.name) {
                         out.diagnostics.push(LintDiagnostic {
                             rule: "unknown-suppression-rule",
                             severity: LintSeverity::Warning,
-                            message: format!("unknown lint rule `{r}`"),
-                            byte_range: raw.byte_range.clone(),
+                            message: format!("unknown lint rule `{}`", r.name),
+                            byte_range: r.byte_range.clone(),
                         });
                     }
                 }
@@ -409,12 +475,12 @@ fn parse_with_collected(
                     continue;
                 }
                 for r in &rules {
-                    if !is_known_lint_rule(r) {
+                    if !is_known_lint_rule(&r.name) {
                         out.diagnostics.push(LintDiagnostic {
                             rule: "unknown-suppression-rule",
                             severity: LintSeverity::Warning,
-                            message: format!("unknown lint rule `{r}`"),
-                            byte_range: raw.byte_range.clone(),
+                            message: format!("unknown lint rule `{}`", r.name),
+                            byte_range: r.byte_range.clone(),
                         });
                     }
                 }
@@ -537,9 +603,13 @@ mod tests {
         let d = dirs(src);
         assert_eq!(d.lint_suppressions.len(), 1);
         let s = &d.lint_suppressions[0];
-        assert_eq!(s.rules, vec!["unused-decl".to_string()]);
+        let names: Vec<&str> = s.rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["unused-decl"]);
+        // Per-rule byte range points at the rule word inside the comment.
+        let rule_slice = &src[s.rules[0].byte_range.clone()];
+        assert_eq!(rule_slice, "unused-decl");
         assert_eq!(s.kind, LintSuppressionKind::NextItem);
-        // Range covers the `private fn foo() {}` decl text.
+        // `byte_range` covers the `private fn foo() {}` decl text.
         let covered = &src[s.byte_range.clone()];
         assert!(
             covered.contains("private fn foo()"),
@@ -554,7 +624,30 @@ mod tests {
         assert_eq!(d.lint_suppressions.len(), 1);
         let s = &d.lint_suppressions[0];
         assert_eq!(s.kind, LintSuppressionKind::Range);
-        assert_eq!(s.rules, vec!["unused-decl".to_string()]);
+        let names: Vec<&str> = s.rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["unused-decl"]);
+        // The OFF-side rule range — i.e. the "unused-decl" word in the
+        // OFF comment — should be carried into the closed suppression.
+        let rule_slice = &src[s.rules[0].byte_range.clone()];
+        assert_eq!(rule_slice, "unused-decl");
+        assert!(
+            s.rules[0].byte_range.start < src.find("\nprivate").unwrap(),
+            "OFF-side rule range should sit inside the OFF comment, not the ON",
+        );
+    }
+
+    #[test]
+    fn rule_byte_range_points_at_specific_rule_word() {
+        // Multiple rules in one comment: each rule's byte range points
+        // at *that* rule word, not the whole comment. Drives
+        // unused-suppression's per-rule diagnostic placement.
+        let src = "// gcl-lint-off-next unused-local unused-param\nfn foo() {}\n";
+        let d = dirs(src);
+        assert_eq!(d.lint_suppressions.len(), 1);
+        let s = &d.lint_suppressions[0];
+        assert_eq!(s.rules.len(), 2);
+        assert_eq!(&src[s.rules[0].byte_range.clone()], "unused-local");
+        assert_eq!(&src[s.rules[1].byte_range.clone()], "unused-param");
     }
 
     #[test]
