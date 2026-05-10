@@ -51,6 +51,13 @@ pub struct Lint {
     no_suppressions: bool,
     #[clap(
         long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        help = "Silence specific lint rule(s) globally (repeatable / comma-list, see --list-rules)"
+    )]
+    disable: Vec<String>,
+    #[clap(
+        long,
         value_enum,
         default_value_t = ColorMode::Auto,
         help = "auto    color when stdout is a TTY and `NO_COLOR` is unset (default)\n\
@@ -126,6 +133,29 @@ impl Lint {
             }
             return Ok(ExitCode::SUCCESS);
         }
+
+        // Build the `--disable` set up-front and warn (fail-soft) on
+        // any unknown rule name. Unknown names don't abort the run —
+        // a typo in a CI invocation shouldn't crash the lint; the
+        // warning to stderr tells the operator to fix it. The set is
+        // captured by reference into both hydration paths (initial +
+        // post-`--fix` re-hydration) so any disabled rule is dropped
+        // at push time and never appears in output, exit-code counts,
+        // or `--fix` edit synthesis.
+        let valid_rules: std::collections::HashSet<&'static str> =
+            greycat_analyzer_analysis::lint::LINT_RULES
+                .iter()
+                .map(|r| r.name)
+                .collect();
+        for name in &self.disable {
+            if !valid_rules.contains(name.as_str()) {
+                eprintln!(
+                    "warning: unknown lint rule `{name}` in --disable \
+                     (see --list-rules for the available set)"
+                );
+            }
+        }
+        let disabled: std::collections::HashSet<String> = self.disable.iter().cloned().collect();
 
         // Convenience: when given a directory, look for `project.gcl`
         // at its root and use that as the entrypoint. Matches what
@@ -207,6 +237,7 @@ impl Lint {
         // `cfg(not(feature = "parallel"))` so the serial cost stays
         // at zero.
         let lint_libs = self.lint_libs;
+        let disabled_ref = &disabled;
         let hydrate = |uri: &Uri,
                        path: PathBuf,
                        text: &str,
@@ -242,6 +273,9 @@ impl Lint {
                 }
                 if lint_libs || module.lib == "project" {
                     for l in &module.lints {
+                        if disabled_ref.contains(l.rule) {
+                            continue;
+                        }
                         diagnostics.push(Diagnostic {
                             range: byte_range_to_lsp(text, &l.byte_range),
                             severity: Some(match l.severity {
@@ -418,6 +452,9 @@ impl Lint {
                         }
                         if self.lint_libs || module.lib == "project" {
                             for l in &module.lints {
+                                if disabled.contains(l.rule) {
+                                    continue;
+                                }
                                 diagnostics.push(Diagnostic {
                                     range: byte_range_to_lsp(&doc.text, &l.byte_range),
                                     severity: Some(match l.severity {
