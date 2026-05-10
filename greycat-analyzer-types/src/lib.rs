@@ -891,6 +891,16 @@ impl TypeRegistry {
     pub fn iter_names(&self) -> impl Iterator<Item = &str> {
         self.named.keys().map(|s| s.as_str())
     }
+
+    // P28.2
+    /// Rewrite every stored [`TypeId`] through `map`. Used by the
+    /// post-merge remap to canonicalize locally-minted TypeIds back to
+    /// project-arena ids after a per-thread body walk.
+    pub fn remap_typeids(&mut self, map: &dyn Fn(TypeId) -> TypeId) {
+        for id in self.named.values_mut() {
+            *id = map(*id);
+        }
+    }
 }
 
 // =============================================================================

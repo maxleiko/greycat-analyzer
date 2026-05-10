@@ -34,8 +34,8 @@ use greycat_analyzer_hir::types::{
     UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
 };
 use greycat_analyzer_types::{
-    GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_castable, is_node_tag,
+    GenericOwner, InferenceTable, LocalArena, Primitive, Type, TypeArena, TypeArenaMut, TypeId,
+    TypeKind, TypeRegistry, is_castable, is_node_tag,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -357,27 +357,41 @@ pub fn analyze_with_index_into(
     arena: &mut TypeArena,
 ) -> AnalysisResult {
     let mut out = AnalysisResult::default();
+    // P28.2 — seed canonical first so the LocalArena's snapshot sees
+    // the primitives at their stable canonical TypeIds.
     seed_builtins(arena);
-    register_module_types(hir, arena, &mut out);
+    let base_len = arena.len() as u32;
+    // P28.2 — body walker now mints into a LocalArena layered on a
+    // snapshot of `arena`. In serial mode the merge step at the end
+    // reproduces the pre-P28 state (locally-minted types appended to
+    // canonical, remap applied to the per-module result).
+    let mut local = LocalArena::wrap(&*arena);
+    register_module_types(hir, &mut local, &mut out);
 
-    let Some(module) = hir.module.as_ref() else {
-        return out;
-    };
-    let mut cx = Cx {
-        hir,
-        res,
-        out: &mut out,
-        arena,
-        index,
-        narrows: Vec::new(),
-        member_narrows: Vec::new(),
-        chain_member_ifs: FxHashSet::default(),
-        generics_in_scope: Vec::new(),
-        this_stack: Vec::new(),
-    };
-    for d in &module.decls {
-        cx.visit_decl(*d);
+    if let Some(module) = hir.module.as_ref() {
+        let mut cx = Cx {
+            hir,
+            res,
+            out: &mut out,
+            arena: &mut local,
+            index,
+            narrows: Vec::new(),
+            member_narrows: Vec::new(),
+            chain_member_ifs: FxHashSet::default(),
+            generics_in_scope: Vec::new(),
+            this_stack: Vec::new(),
+        };
+        for d in &module.decls {
+            cx.visit_decl(*d);
+        }
+        drop(cx);
     }
+
+    // P28.2 — merge the local tail back into canonical, then remap
+    // every TypeId-carrying field of `out` through the remap table.
+    let local_items = local.into_local_items();
+    let remap = arena.merge_local(base_len, local_items);
+    remap_analysis_result(&mut out, base_len, &remap);
 
     // Surface resolver's unresolved-name list as analyzer diagnostics so
     // P2.7 (LSP publish) only needs one list per file.
@@ -394,22 +408,72 @@ pub fn analyze_with_index_into(
     out
 }
 
+// P28.2
+/// Rewrite every TypeId in `out`'s TypeId-carrying fields through the
+/// merge step's remap table. TypeIds below `base_len` were in the
+/// canonical snapshot already and pass through unchanged; TypeIds at
+/// or above `base_len` were locally minted and look up to `remap[id -
+/// base_len]`.
+///
+/// Fields touched: [`AnalysisResult::registry`] (Named/Enum
+/// canonical ids), [`AnalysisResult::expr_types`], and
+/// [`AnalysisResult::def_types`]. The remaining fields
+/// (`type_decls`, `member_uses`, `foreign_member_uses`, …) hold HIR
+/// indices / strings only, not TypeIds.
+fn remap_analysis_result(out: &mut AnalysisResult, base_len: u32, remap: &[TypeId]) {
+    let map_id = |id: TypeId| -> TypeId {
+        let raw = id.raw();
+        if raw < base_len {
+            id
+        } else {
+            remap[(raw - base_len) as usize]
+        }
+    };
+    for ty in out.expr_types.values_mut() {
+        *ty = map_id(*ty);
+    }
+    for ty in out.def_types.values_mut() {
+        *ty = map_id(*ty);
+    }
+    out.registry.remap_typeids(&map_id);
+}
+
 /// Seed primitive type ids in the arena so cx.{int, bool, ...} are cheap.
 /// Idempotent — `alloc` interns equal types so re-seeding is a no-op
 /// (the project pipeline calls this once per `analyze_with_index_into`,
 /// which all share the same arena).
-pub(crate) fn seed_builtins(arena: &mut TypeArena) {
-    let _ = arena.primitive(Primitive::Bool);
-    let _ = arena.primitive(Primitive::Int);
-    let _ = arena.primitive(Primitive::Float);
-    let _ = arena.primitive(Primitive::Char);
-    let _ = arena.primitive(Primitive::String);
-    let _ = arena.primitive(Primitive::Time);
-    let _ = arena.primitive(Primitive::Duration);
-    let _ = arena.primitive(Primitive::Geo);
-    let _ = arena.null();
-    let _ = arena.any();
-    let _ = arena.never();
+// P28.2
+/// Generic over [`TypeArenaMut`] so the project orchestrator can seed
+/// the canonical arena directly while the body walker seeds a
+/// per-module [`LocalArena`].
+pub(crate) fn seed_builtins<V: TypeArenaMut + ?Sized>(arena: &mut V) {
+    for p in [
+        Primitive::Bool,
+        Primitive::Int,
+        Primitive::Float,
+        Primitive::Char,
+        Primitive::String,
+        Primitive::Time,
+        Primitive::Duration,
+        Primitive::Geo,
+    ] {
+        arena.alloc(Type {
+            kind: TypeKind::Primitive(p),
+            nullable: false,
+        });
+    }
+    arena.alloc(Type {
+        kind: TypeKind::Null,
+        nullable: true,
+    });
+    arena.alloc(Type {
+        kind: TypeKind::Any,
+        nullable: true,
+    });
+    arena.alloc(Type {
+        kind: TypeKind::Never,
+        nullable: false,
+    });
 }
 
 /// Build a TypeRegistry from the module's user declarations. Each
@@ -419,7 +483,15 @@ pub(crate) fn seed_builtins(arena: &mut TypeArena) {
 /// Also populates [`AnalysisResult::type_decls`] (name → HIR
 /// `TypeDecl` index) so  member resolution can navigate from a
 /// receiver's `TypeId` back to the declaring node.
-fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisResult) {
+// P28.2
+/// Generic over [`TypeArenaMut`] so the body walker can run this
+/// against a per-module [`LocalArena`]; the merge step later
+/// canonicalizes the Named/Enum entries back into the project arena.
+fn register_module_types<V: TypeArenaMut + ?Sized>(
+    hir: &Hir,
+    arena: &mut V,
+    out: &mut AnalysisResult,
+) {
     let Some(module) = hir.module.as_ref() else {
         return;
     };
@@ -428,7 +500,10 @@ fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisRes
         match decl {
             Decl::Type(td) => {
                 let name: SmolStr = hir.idents[td.name].text.as_str().into();
-                let id = arena.named(name.as_str());
+                let id = arena.alloc(Type {
+                    kind: TypeKind::Named { name: name.clone() },
+                    nullable: false,
+                });
                 out.registry.register(name.clone(), id);
                 out.type_decls.insert(name, *d);
             }
@@ -511,15 +586,23 @@ enum CalleeShape {
     QualifiedStatic(Vec<Idx<Ident>>),
 }
 
-struct Cx<'a> {
+struct Cx<'a, 'b> {
     hir: &'a Hir,
     res: &'a Resolutions,
     out: &'a mut AnalysisResult,
-    // P19
-    /// Project-wide type arena. Owned by `ProjectAnalysis`, so
-    /// every module's analyzer mints into the same `TypeArena` and
-    /// `TypeId`s are comparable across module boundaries.
-    arena: &'a mut TypeArena,
+    // P19 / P28.2
+    /// Per-module type arena layered on top of a read-only snapshot of
+    /// the project's canonical [`TypeArena`]. Mints land in the local
+    /// tail and get canonicalized into the project arena by
+    /// [`super::remap_analysis_result`] after the body walker
+    /// returns. From the body walker's perspective the API is
+    /// identical to operating on the canonical arena directly.
+    ///
+    /// Two lifetimes: `'a` is the borrow of the LocalArena (body-walk
+    /// scope); `'b` is the LocalArena's snapshot lifetime (the
+    /// canonical arena's read-only borrow). `'b: 'a` so the snapshot
+    /// outlives the body-walk borrow.
+    arena: &'a mut LocalArena<'b>,
     // P11.5
     /// Cross-module project index. Per-file callers pass an
     /// empty [`ProjectIndex::new`]; the project pipeline passes the
@@ -569,7 +652,7 @@ struct Cx<'a> {
     this_stack: Vec<TypeId>,
 }
 
-impl<'a> Cx<'a> {
+impl<'a, 'b> Cx<'a, 'b> {
     fn primitive(&mut self, p: Primitive) -> TypeId {
         self.arena.primitive(p)
     }
