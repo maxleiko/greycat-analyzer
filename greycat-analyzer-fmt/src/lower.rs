@@ -408,30 +408,72 @@ fn lower_type_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_enum_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // Always multi-line, like the TS reference's `rules.stmts` indent.
+    // Walk every child in source order so the separator between fields
+    // (either `,` or `;`) survives verbatim, and so a leading
+    // `line_comment` / `doc_comment` extra binds to the next field on
+    // its own line. Empty body still collapses to `{}`.
     let mut walker = node.walk();
-    let fields: Vec<Node<'_>> = node.named_children(&mut walker).collect();
-    if fields.is_empty() {
+    let children: Vec<Node<'_>> = node.children(&mut walker).collect();
+    let has_field = children.iter().any(|c| c.kind() == "enum_field");
+    if !has_field {
         return Doc::text("{}");
     }
-    // Decision: enum bodies render compact-spaced when they fit on one
-    // line, multiline otherwise. Emit a Group with `Line` separators
-    // and the renderer picks layout. Trailing comma is omitted (the TS
-    // reference doesn't add one).
-    let mut inner = Vec::new();
-    inner.push(Doc::line());
-    for (i, f) in fields.iter().enumerate() {
-        if i > 0 {
-            inner.push(Doc::text(","));
-            inner.push(Doc::line());
+    let mut inner: Vec<Doc> = Vec::new();
+    let mut pending_sep: Option<&'a str> = None;
+    let mut needs_hardline = true; // first item on its own line
+    for c in &children {
+        let kind = c.kind();
+        if kind == "{" || kind == "}" {
+            continue;
         }
-        inner.push(lower_node(cx, *f));
+        match kind {
+            "enum_field" => {
+                if let Some(sep) = pending_sep.take() {
+                    inner.push(Doc::text(sep.to_string()));
+                }
+                if needs_hardline {
+                    inner.push(Doc::hardline());
+                }
+                inner.push(lower_node(cx, *c));
+                needs_hardline = true;
+            }
+            "line_comment" | "doc_comment" => {
+                if let Some(sep) = pending_sep.take() {
+                    inner.push(Doc::text(sep.to_string()));
+                }
+                if needs_hardline {
+                    inner.push(Doc::hardline());
+                }
+                inner.push(Doc::text(cx.text(*c)));
+                needs_hardline = true;
+            }
+            "," => {
+                pending_sep = Some(",");
+            }
+            ";" | "extra_semi" => {
+                pending_sep = Some(";");
+            }
+            "_semi" => {
+                pending_sep = Some(";");
+            }
+            _ => {}
+        }
     }
-    Doc::group(Doc::concat(vec![
+    // Final separator: TS reference prints whatever was last in source.
+    // If the source had no terminator after the last field, we don't
+    // add one either — `enum_body`'s grammar lets the trailing
+    // separator be optional and the formatter's job is to preserve it
+    // verbatim, not to canonicalize.
+    if let Some(sep) = pending_sep {
+        inner.push(Doc::text(sep.to_string()));
+    }
+    Doc::concat(vec![
         Doc::text("{"),
         Doc::indent(Doc::concat(inner)),
-        Doc::line(),
+        Doc::hardline(),
         Doc::text("}"),
-    ]))
+    ])
 }
 
 fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
