@@ -358,6 +358,7 @@ fn parse_with_collected(
                         message: "`gcl-lint-off` requires at least one rule name (no wildcard)"
                             .into(),
                         byte_range: raw.byte_range.clone(),
+                        tag: None,
                     });
                     continue;
                 }
@@ -368,6 +369,7 @@ fn parse_with_collected(
                             severity: LintSeverity::Warning,
                             message: format!("unknown lint rule `{}`", r.name),
                             byte_range: r.byte_range.clone(),
+                            tag: None,
                         });
                     }
                 }
@@ -431,6 +433,7 @@ fn parse_with_collected(
                         severity: LintSeverity::Warning,
                         message: "`gcl-lint-off-next` requires at least one rule name".into(),
                         byte_range: raw.byte_range.clone(),
+                        tag: None,
                     });
                     continue;
                 }
@@ -441,6 +444,7 @@ fn parse_with_collected(
                             severity: LintSeverity::Warning,
                             message: format!("unknown lint rule `{}`", r.name),
                             byte_range: r.byte_range.clone(),
+                            tag: None,
                         });
                     }
                 }
@@ -461,6 +465,7 @@ fn parse_with_collected(
                         severity: LintSeverity::Warning,
                         message: "`gcl-lint-off-file` requires at least one rule name".into(),
                         byte_range: raw.byte_range.clone(),
+                        tag: None,
                     });
                     continue;
                 }
@@ -471,6 +476,7 @@ fn parse_with_collected(
                         message: "`gcl-lint-off-file` must appear before any decl at module head"
                             .into(),
                         byte_range: raw.byte_range.clone(),
+                        tag: None,
                     });
                     continue;
                 }
@@ -481,6 +487,7 @@ fn parse_with_collected(
                             severity: LintSeverity::Warning,
                             message: format!("unknown lint rule `{}`", r.name),
                             byte_range: r.byte_range.clone(),
+                            tag: None,
                         });
                     }
                 }
@@ -499,6 +506,7 @@ fn parse_with_collected(
                         severity: LintSeverity::Warning,
                         message: "`gcl-fmt-off` already active — nested toggle ignored".into(),
                         byte_range: raw.byte_range.clone(),
+                        tag: None,
                     });
                     continue;
                 }
@@ -520,6 +528,7 @@ fn parse_with_collected(
                         severity: LintSeverity::Warning,
                         message: "`gcl-fmt-on` without matching `gcl-fmt-off`".into(),
                         byte_range: raw.byte_range.clone(),
+                        tag: None,
                     });
                 }
             }
@@ -540,6 +549,7 @@ fn parse_with_collected(
                         message: "`gcl-fmt-off-file` must appear before any decl at module head"
                             .into(),
                         byte_range: raw.byte_range.clone(),
+                        tag: None,
                     });
                     continue;
                 }
@@ -558,6 +568,7 @@ fn parse_with_collected(
             severity: LintSeverity::Warning,
             message: "`gcl-lint-off` without matching `gcl-lint-on` — extends to EOF".into(),
             byte_range: slot.directive_range.clone(),
+            tag: None,
         });
         for r in slot.rules {
             out.lint_suppressions.push(LintSuppression {
@@ -576,6 +587,7 @@ fn parse_with_collected(
             severity: LintSeverity::Warning,
             message: "`gcl-fmt-off` without matching `gcl-fmt-on` — extends to EOF".into(),
             byte_range: open.directive_range.clone(),
+            tag: None,
         });
         out.fmt_skips.push(FmtSkipRange {
             byte_range: open.start..source_end,

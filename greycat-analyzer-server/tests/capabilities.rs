@@ -726,6 +726,80 @@ fn semantic_tokens_emits_typed_idents_and_literals() {
 }
 
 // =============================================================================
+// P24.5 — DiagnosticTag::UNNECESSARY plumbing
+// =============================================================================
+
+#[test]
+fn dead_code_lint_carries_unnecessary_tag() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    use std::str::FromStr;
+    let mut mgr = SourceManager::new();
+    let uri = Uri::from_str("file:///mod.gcl").unwrap();
+    mgr.add_simple(
+        uri.clone(),
+        "fn f(): int { return 1; var _ = 0; }\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let module = pa.module(&uri).unwrap();
+    let cell = mgr.get(&uri).unwrap();
+    let doc = cell.borrow();
+    let diags = capabilities::diagnostics_from_module(&doc.text, module, false);
+    let unreachable = diags
+        .iter()
+        .find(|d| {
+            matches!(
+                &d.code,
+                Some(NumberOrString::String(s)) if s == "unreachable"
+            )
+        })
+        .expect("expected an `unreachable` diagnostic");
+    let tags = unreachable
+        .tags
+        .as_ref()
+        .expect("expected `tags` to be set on `unreachable`");
+    assert!(
+        tags.contains(&DiagnosticTag::UNNECESSARY),
+        "expected UNNECESSARY tag, got {tags:?}"
+    );
+}
+
+#[test]
+fn unused_local_carries_unnecessary_tag() {
+    // P24.5 retroactively — `unused-local` is one of the rules that
+    // should have been carrying UNNECESSARY all along.
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    use std::str::FromStr;
+    let mut mgr = SourceManager::new();
+    let uri = Uri::from_str("file:///mod.gcl").unwrap();
+    mgr.add_simple(
+        uri.clone(),
+        "fn f(): int { var unused = 0; return 1; }\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let module = pa.module(&uri).unwrap();
+    let cell = mgr.get(&uri).unwrap();
+    let doc = cell.borrow();
+    let diags = capabilities::diagnostics_from_module(&doc.text, module, false);
+    let unused = diags
+        .iter()
+        .find(|d| {
+            matches!(
+                &d.code,
+                Some(NumberOrString::String(s)) if s == "unused-local"
+            )
+        })
+        .expect("expected `unused-local`");
+    let tags = unused.tags.as_ref().expect("expected tags on unused-local");
+    assert!(tags.contains(&DiagnosticTag::UNNECESSARY));
+}
+
+// =============================================================================
 // P23.5 — directive completion (`// gcl-…`)
 // =============================================================================
 

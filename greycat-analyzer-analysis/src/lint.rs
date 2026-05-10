@@ -39,6 +39,43 @@ pub struct LintDiagnostic {
     pub severity: LintSeverity,
     pub message: String,
     pub byte_range: Range<usize>,
+    /// **P24.5** — optional editor presentation tag. Editors that
+    /// honor [`DiagTag::Unnecessary`] (LSP `DiagnosticTag::UNNECESSARY`,
+    /// VS Code / Helix / Neovim) dim the source span — the right
+    /// surface for "this code does nothing" findings (`unreachable`,
+    /// `unused-*`, `redundant-*`). The CLI ignores tags.
+    pub tag: Option<DiagTag>,
+}
+
+/// Editor presentation hint for a [`LintDiagnostic`]. Maps to LSP
+/// `DiagnosticTag` at the server boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagTag {
+    /// "Unused / unreachable / dead code." Editors typically render
+    /// the span dimmed / faded.
+    Unnecessary,
+    /// "Deprecated." Editors typically render the span with a
+    /// strikethrough. Reserved for a future `deprecated` lint —
+    /// nothing emits this today.
+    #[allow(dead_code)]
+    Deprecated,
+}
+
+/// Per-rule lookup for the [`DiagTag`] every emission site should set.
+/// Centralized so a new "this code does nothing" rule wires the tag
+/// just by adding an entry here, rather than touching every emit site.
+pub fn default_tag_for(rule: &str) -> Option<DiagTag> {
+    match rule {
+        "unreachable"
+        | "unused-local"
+        | "unused-param"
+        | "unused-decl"
+        | "unused-suppression"
+        | "redundant-nullable-access"
+        | "redundant-non-null-assertion"
+        | "redundant-coalesce" => Some(DiagTag::Unnecessary),
+        _ => None,
+    }
 }
 
 /// Trait every lint rule implements. Impls walk `hir` / `res` and emit
@@ -84,13 +121,19 @@ impl<'a> LintCx<'a> {
     }
 
     /// Push `diag` into the output vector unless an active directive
-    /// suppresses it (and `bypass_suppressions` is off).
-    pub fn emit(&mut self, diag: LintDiagnostic) {
+    /// suppresses it (and `bypass_suppressions` is off). Auto-fills
+    /// the [`DiagTag`] field via [`default_tag_for`] when the rule
+    /// hasn't already set one — saves every per-rule call site from
+    /// having to remember to set it.
+    pub fn emit(&mut self, mut diag: LintDiagnostic) {
         if !self.bypass_suppressions
             && let Some(dirs) = self.directives.as_deref_mut()
             && dirs.suppresses_lint(diag.byte_range.start, diag.rule)
         {
             return;
+        }
+        if diag.tag.is_none() {
+            diag.tag = default_tag_for(diag.rule);
         }
         self.out.push(diag);
     }
@@ -261,6 +304,7 @@ pub fn lint_unused_suppressions(
                 severity: LintSeverity::Warning,
                 message: format!("unused suppression for `{}`", entry.name),
                 byte_range: entry.byte_range.clone(),
+                tag: None,
             });
         }
     }
@@ -378,6 +422,7 @@ fn visit_for_locals(
                     severity: LintSeverity::Warning,
                     message: format!("unused local `{}`", ident.text),
                     byte_range: ident.byte_range.clone(),
+                    tag: None,
                 });
             }
         }
@@ -459,6 +504,7 @@ fn check_fn_params(
                 severity: LintSeverity::Warning,
                 message: format!("unused parameter `{}`", ident.text),
                 byte_range: ident.byte_range.clone(),
+                tag: None,
             });
         }
     }
@@ -524,6 +570,7 @@ fn check_unused_decl(hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>
                 severity: LintSeverity::Warning,
                 message: format!("unused private {kind} `{}`", ident.text),
                 byte_range: ident.byte_range.clone(),
+                tag: None,
             });
         }
     }
@@ -564,6 +611,7 @@ impl LintRule for DuplicateDecl {
                     severity: LintSeverity::Error,
                     message: format!("identifier `{}` is already declared", ident.text),
                     byte_range: ident.byte_range.clone(),
+                    tag: None,
                 });
             }
         }
@@ -682,6 +730,7 @@ fn lint_arrow_on_non_deref_inner(
                 severity: LintSeverity::Error,
                 message: format!("`->` requires a node-tag or `@deref` receiver, got `{display}`"),
                 byte_range: byte_range.clone(),
+                tag: None,
             },
         );
     }
@@ -690,18 +739,22 @@ fn lint_arrow_on_non_deref_inner(
 /// Emit-via-directives helper for the typed-lint free functions. They
 /// don't go through [`LintCx`] because they take a richer set of
 /// arguments (TypeArena, ProjectIndex, AnalysisResult) and have nothing
-/// useful to do with `LintCx::hir`/`res`'s simpler signature.
+/// useful to do with `LintCx::hir`/`res`'s simpler signature. Same
+/// auto-tag behavior as [`LintCx::emit`].
 fn emit_typed(
     out: &mut Vec<LintDiagnostic>,
     directives: Option<&mut crate::directives::Directives>,
     bypass_suppressions: bool,
-    diag: LintDiagnostic,
+    mut diag: LintDiagnostic,
 ) {
     if !bypass_suppressions
         && let Some(dirs) = directives
         && dirs.suppresses_lint(diag.byte_range.start, diag.rule)
     {
         return;
+    }
+    if diag.tag.is_none() {
+        diag.tag = default_tag_for(diag.rule);
     }
     out.push(diag);
 }
@@ -773,6 +826,7 @@ impl LintRule for ModVarShape {
                               `nodeIndex<K, V>`, or `nodeGeo<T>`"
                         .into(),
                     byte_range: cx.hir.idents[vd.name].byte_range.clone(),
+                    tag: None,
                 });
                 continue;
             }
@@ -784,6 +838,7 @@ impl LintRule for ModVarShape {
                               and cannot be null — drop the trailing `?`"
                         .into(),
                     byte_range: ty.byte_range.clone(),
+                    tag: None,
                 });
             }
             if head == "node"
@@ -798,6 +853,7 @@ impl LintRule for ModVarShape {
                                   use `node<T?>`"
                             .into(),
                         byte_range: inner.byte_range.clone(),
+                        tag: None,
                     });
                 }
             }
@@ -952,6 +1008,7 @@ fn check_fn_inferred_return(
             severity: LintSeverity::Hint,
             message: format!("return type can be inferred as `{display}`"),
             byte_range: name.byte_range.clone(),
+            tag: None,
         },
     );
 }
@@ -1100,6 +1157,7 @@ fn lint_nullability_inner(
                             severity: LintSeverity::Warning,
                             message: format!("`{display}` is possibly `null`"),
                             byte_range: recv_range.clone(),
+                            tag: None,
                         },
                     );
                 } else if !recv.nullable && *pre_optional {
@@ -1115,6 +1173,7 @@ fn lint_nullability_inner(
                             severity: LintSeverity::Warning,
                             message: "redundant `?` — receiver is non-nullable".into(),
                             byte_range: recv_range.end..prop_start,
+                            tag: None,
                         },
                     );
                 }
@@ -1144,6 +1203,7 @@ fn lint_nullability_inner(
                             severity: LintSeverity::Warning,
                             message: format!("`{display}` is possibly `null`"),
                             byte_range: recv_range.clone(),
+                            tag: None,
                         },
                     );
                 } else if !recv.nullable && *pre_optional {
@@ -1156,6 +1216,7 @@ fn lint_nullability_inner(
                             severity: LintSeverity::Warning,
                             message: "redundant `?` — receiver is non-nullable".into(),
                             byte_range: recv_range.end..byte_range.end,
+                            tag: None,
                         },
                     );
                 }
@@ -1183,6 +1244,7 @@ fn lint_nullability_inner(
                             severity: LintSeverity::Warning,
                             message: "redundant `!!` — expression is already non-nullable".into(),
                             byte_range: opnd_range.end..byte_range.end,
+                            tag: None,
                         },
                     );
                 }
@@ -1211,6 +1273,7 @@ fn lint_nullability_inner(
                             severity: LintSeverity::Warning,
                             message: "redundant `??` — left operand is already non-nullable".into(),
                             byte_range: left_range.end..byte_range.end,
+                            tag: None,
                         },
                     );
                 }
@@ -1353,6 +1416,7 @@ fn lint_unreachable_inner(
                 severity: LintSeverity::Hint,
                 message: "unreachable code".into(),
                 byte_range: r,
+                tag: None,
             },
         );
     }

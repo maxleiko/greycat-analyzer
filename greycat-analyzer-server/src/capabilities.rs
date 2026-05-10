@@ -12,7 +12,7 @@
 use std::ops::Range;
 
 use greycat_analyzer_analysis::analyzer::Severity;
-use greycat_analyzer_analysis::lint::{LintSeverity, run_lints};
+use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity, run_lints};
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_analysis::resolver::{Definition, resolve};
 use greycat_analyzer_core::SourceManager;
@@ -4635,10 +4635,24 @@ pub(crate) fn current_diagnostics(
             code: Some(NumberOrString::String(lint.rule.into())),
             source: Some("lint".into()),
             message: lint.message,
+            tags: lint_tags(lint.tag),
             ..Default::default()
         });
     }
     out
+}
+
+/// **P24.5** — translate the analysis crate's [`DiagTag`] into LSP
+/// `DiagnosticTag` values. Editors that honor `UNNECESSARY` dim the
+/// span ("this code does nothing") and editors that honor `DEPRECATED`
+/// strike it through. Returns `None` so the diagnostic's `tags` field
+/// stays absent for un-tagged rules (no extra serialized payload).
+fn lint_tags(tag: Option<DiagTag>) -> Option<Vec<DiagnosticTag>> {
+    let lsp_tag = match tag? {
+        DiagTag::Unnecessary => DiagnosticTag::UNNECESSARY,
+        DiagTag::Deprecated => DiagnosticTag::DEPRECATED,
+    };
+    Some(vec![lsp_tag])
 }
 
 /// Project-aware diagnostics — read the cached analyzer + lints from
@@ -4689,6 +4703,7 @@ pub fn diagnostics_from_module(
                 code: Some(NumberOrString::String(lint.rule.into())),
                 source: Some("lint".into()),
                 message: lint.message.clone(),
+                tags: lint_tags(lint.tag),
                 ..Default::default()
             });
         }
