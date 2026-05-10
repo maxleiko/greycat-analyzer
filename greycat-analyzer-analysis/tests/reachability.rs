@@ -69,7 +69,7 @@ fn user_example_quickfix_removes_both_dead_islands() {
     // disturb downstream byte ranges (mirrors `cli lint --fix`'s
     // edit-application order).
     let mut diags: Vec<_> = m.lints.iter().filter(|l| l.rule == "unreachable").collect();
-    diags.sort_by(|a, b| b.byte_range.start.cmp(&a.byte_range.start));
+    diags.sort_by_key(|b| std::cmp::Reverse(b.byte_range.start));
 
     for d in &diags {
         let edits = quickfix::edit_for_diagnostic(&text, d.rule, &d.byte_range, &d.message);

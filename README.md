@@ -52,7 +52,16 @@ greycat-analyzer lint examples/project.gcl --no-suppressions  # CI: ignore // gc
 Diagnostic sources:
 - `greycat-analyzer` / `parse-error` / `missing-token` — tree-sitter recovery emitted these.
 - `greycat-analyzer` / `semantic` — return-type mismatch, condition-must-be-bool, unresolved name, etc.
-- `lint` / `<rule>` — full rule list available via `lint --list-rules` (auto-generated from the registry, so it's always in sync with what the analyzer emits).
+- `lint` / `<rule>` — full rule list available via `lint --list-rules` (auto-generated from the registry, so it's always in sync with what the analyzer emits). Rules that flag "this code does nothing" — `unreachable`, `unused-{local,param,decl,suppression}`, `redundant-{nullable-access,non-null-assertion,coalesce}` — carry LSP `DiagnosticTag::UNNECESSARY` so VS Code / Helix / Neovim dim the span.
+
+#### Dead-code detection (P24)
+
+The `unreachable` rule (severity Hint) flags two shapes:
+
+- **Post-divergent siblings** — code that follows a `return` / `throw` / `break` / `continue` (or any block / if / try chain that recursively diverges). Conservative on loops: `while (cond) { return; } var _ = 0;` does NOT flag the post-loop `var _` since we can't prove the loop body executed.
+- **Dead `else` arms on exhaustive enum chains** — `if (x == E::A) { … } else if (x == E::B) { … } else { … }` where `A` + `B` exhaust `E`. The trailing `else` is unreachable and gets greyed-out. When every variant arm also diverges (e.g., both return), the post-chain code is flagged too.
+
+Contiguous dead siblings inside one block coalesce into a single diagnostic spanning the whole island. `lint --fix` removes the dead range as one edit; for the dead-`else` shape the fix also swallows the leading `else` keyword so the result parses cleanly. Suppress via `// gcl-lint-off-next unreachable` or the file/range variants.
 
 #### Per-region opt-out (P23)
 

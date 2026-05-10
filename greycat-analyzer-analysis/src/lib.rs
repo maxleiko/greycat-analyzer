@@ -24,11 +24,18 @@
 //!    builds the suppression / fmt-skip tables that downstream stages
 //!    consult. Misspellings emit `unknown-suppression-rule`; dead
 //!    toggles emit `unused-suppression`.
-//! 6. [`project`] (P6.1) — `ProjectAnalysis::analyze(&SourceManager)`
-//!    runs steps 1-5 over every doc in one pass, sharing the index
+//! 6. [`reachability`] (P24) — pure-HIR divergence analysis +
+//!    analyzer-aware exhaustive-chain promotion. The `unreachable`
+//!    lint rule consumes [`reachability::stmt_diverges_with_analysis`]
+//!    and [`reachability::dead_else_range_for_exhaustive_chain`] to
+//!    flag dead islands; the LSP layer translates the lint's
+//!    [`lint::DiagTag::Unnecessary`] into `DiagnosticTag::UNNECESSARY`
+//!    for editor dimming.
+//! 7. [`project`] (P6.1) — `ProjectAnalysis::analyze(&SourceManager)`
+//!    runs steps 1-6 over every doc in one pass, sharing the index
 //!    and caching per-module `ModuleAnalysis` for LSP / CLI
 //!    consumers.
-//! 7. [`actions`] (P6.8) — `CodeActionCategory` vocabulary the LSP
+//! 8. [`actions`] (P6.8) — `CodeActionCategory` vocabulary the LSP
 //!    layer consumes for code-action proposals.
 
 pub mod actions;
