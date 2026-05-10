@@ -14,7 +14,7 @@ use greycat_analyzer_core::{
     resolver::FsContext,
 };
 
-use crate::utils::AnyError;
+use crate::utils::{AnyError, ColorMode};
 
 #[derive(clap::Parser)]
 #[clap(about = "Lint a GreyCat project. Loads the entrypoint and walks its \
@@ -75,6 +75,15 @@ pub struct Lint {
                 to audit what's hidden behind suppressions in a project."
     )]
     no_suppressions: bool,
+    #[clap(
+        long,
+        value_enum,
+        default_value_t = ColorMode::Auto,
+        help = "auto    color when stdout is a TTY and `NO_COLOR` is unset (default)\n\
+                always  always emit ANSI color escapes — use with `less -R` to view colored pretty diagnostics through a pager\n\
+                never   never color\n"
+    )]
+    color: ColorMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -100,6 +109,24 @@ impl OutputFormat {
 impl Lint {
     pub fn run(self) -> Result<ExitCode, AnyError> {
         env_logger::init();
+
+        // Force miette's color decision when the user explicitly
+        // overrides — `auto` leaves miette to its own (correct) TTY
+        // check so we don't second-guess the library on the default
+        // path. `force_graphical(true)` keeps the source-snippet +
+        // caret rendering even when stderr isn't a TTY (the case
+        // when piping pretty diagnostics into `less -R`).
+        if self.color != ColorMode::Auto {
+            let want_color = self.color.enabled();
+            let _ = miette::set_hook(Box::new(move |_| {
+                Box::new(
+                    miette::MietteHandlerOpts::new()
+                        .color(want_color)
+                        .force_graphical(want_color)
+                        .build(),
+                )
+            }));
+        }
 
         // **P23.6** — `--list-rules` short-circuits everything else and
         // dumps the rule registry. Auto-generated from

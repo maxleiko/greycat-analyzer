@@ -1,11 +1,10 @@
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use greycat_analyzer_core::{SourceManager, resolver::FsContext};
 
-use crate::utils::AnyError;
+use crate::utils::{AnyError, ColorMode};
 
 #[derive(clap::Parser)]
 #[clap(
@@ -22,20 +21,25 @@ pub struct Fmt {
         long,
         value_enum,
         default_value_t = FmtMode::Write,
-        help = "Output mode. `write` rewrites resolved files in place. \
-                `check` exits non-zero on drift, listing every file that \
-                would change. `stdout` formats only the entrypoint and \
-                prints to stdout (the @library / @include closure is \
-                ignored). `diff` prints a unified diff per file (colored \
-                when stdout is a TTY)."
+        help = "write    rewrites resolved files in place\n\
+                check    exits non-zero on drift, listing every file that would change\n\
+                stdout   formats only the entrypoint and prints to stdout (the @library / @include closure is ignored)\n\
+                diff     prints a unified diff per file (colored when stdout is a TTY)\n"
     )]
     mode: FmtMode,
     #[clap(
         long,
+        value_enum,
+        default_value_t = ColorMode::Auto,
+        help = "auto    color when stdout is a TTY and `NO_COLOR` is unset (default)\n\
+                always  always emit ANSI color escapes — use with `less -R` to view a colored diff through a pager\n\
+                never   never color\n"
+    )]
+    color: ColorMode,
+    #[clap(
+        long,
         help = "Also format files in non-`project` libraries (modules \
-                under `lib/<name>/`). Off by default — library code \
-                isn't yours, and reformatting third-party stdlib is \
-                rarely what you want. Mirrors `lint --lint-libs`."
+                under `lib/<name>/`). Off by default."
     )]
     fmt_libs: bool,
 }
@@ -150,7 +154,7 @@ impl Fmt {
                 })
             }
             FmtMode::Diff => {
-                let color = std::io::stdout().is_terminal();
+                let color = self.color.enabled();
                 for e in &drift {
                     print_unified_diff(&e.path, &e.source, &e.formatted, color);
                 }
