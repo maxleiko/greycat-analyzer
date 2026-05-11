@@ -354,6 +354,120 @@ fn orphan_file_publishes_dim_diagnostic() {
     let _ = child.wait();
 }
 
+// P32.6
+/// A file reachable from two projects' `@include` closures gets the
+/// `multi-project-owner` advisory in addition to the first owner's
+/// analysis. The diag is Information severity with `UNNECESSARY` so
+/// the editor dims the file.
+#[test]
+fn shared_file_publishes_multi_owner_diagnostic() {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp_multi_owner");
+    let _ = std::fs::remove_dir_all(&base);
+    let shared = base.join("shared");
+    let proj_a = base.join("projA");
+    let proj_b = base.join("projB");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::create_dir_all(&proj_a).unwrap();
+    std::fs::create_dir_all(&proj_b).unwrap();
+
+    let common = shared.join("common.gcl");
+    std::fs::write(&common, "fn shared_fn(): int { return 0; }\n").unwrap();
+    // Both projects include the shared dir via a `..` hop.
+    std::fs::write(proj_a.join("project.gcl"), "@include(\"../shared\");\n").unwrap();
+    std::fs::write(proj_b.join("project.gcl"), "@include(\"../shared\");\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_greycat-analyzer");
+    let mut child = Command::new(bin)
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn greycat-analyzer server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": null,
+                "workspaceFolders": [
+                    { "uri": uri_for(&proj_a), "name": "projA" },
+                    { "uri": uri_for(&proj_b), "name": "projB" },
+                ],
+                "capabilities": {},
+            }
+        }),
+    );
+    let _ = read_msg(&mut stdout, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
+    );
+
+    let common_uri = uri_for(&common);
+    // Collect ALL publishDiagnostics for common.gcl. The eager load
+    // republishes after each project's analyze, so the LATEST one is
+    // the post-second-owner state — that's the one we inspect.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_diags_for_common: Option<serde_json::Value> = None;
+    let mut seen_after_both = false;
+    while !seen_after_both && Instant::now() < deadline {
+        let msg = read_msg(&mut stdout, Duration::from_secs(10));
+        if msg["method"] == "textDocument/publishDiagnostics"
+            && msg["params"]["uri"].as_str() == Some(common_uri.as_str())
+        {
+            let diags = msg["params"]["diagnostics"].clone();
+            let has_multi = diags
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .any(|d| d["code"].as_str() == Some("multi-project-owner"))
+                })
+                .unwrap_or(false);
+            if has_multi {
+                seen_after_both = true;
+            }
+            last_diags_for_common = Some(diags);
+        }
+    }
+
+    let diags = last_diags_for_common.expect("never saw a publish for shared/common.gcl");
+    let arr = diags.as_array().unwrap();
+    let multi = arr
+        .iter()
+        .find(|d| d["code"].as_str() == Some("multi-project-owner"))
+        .unwrap_or_else(|| panic!("missing multi-project-owner diag in: {arr:?}"));
+    assert_eq!(multi["severity"].as_i64(), Some(3));
+    let tags = multi["tags"].as_array().expect("tags array");
+    assert!(
+        tags.iter().any(|t| t.as_i64() == Some(1)),
+        "multi-owner diag must carry UNNECESSARY tag, got: {tags:?}"
+    );
+    let msg = multi["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("projA") && msg.contains("projB"),
+        "diagnostic message should list both conflicting roots, got: {msg}"
+    );
+
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": null }),
+    );
+    let _ = read_until(&mut stdout, |m| m["id"] == 99, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+    );
+    drop(stdin);
+    let _ = child.wait();
+}
+
 fn uri_for(path: &Path) -> String {
     format!("file://{}", path.display())
 }

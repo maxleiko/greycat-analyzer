@@ -305,6 +305,41 @@ pub fn orphan_module_diagnostic(text: &str) -> Diagnostic {
     }
 }
 
+// P32.6
+/// File-spanning advisory: this `.gcl` file is reachable from
+/// multiple projects' `@include` closures. Almost always a design
+/// error — projects should own files disjointly. Lists the
+/// conflicting project roots so the user can collapse the overlap.
+///
+/// Tagged `UNNECESSARY` (dim) and `Information` severity.
+pub fn multi_project_owner_diagnostic(text: &str, roots: &[std::path::PathBuf]) -> Diagnostic {
+    let mut roots_msg = String::new();
+    for (i, r) in roots.iter().enumerate() {
+        if i > 0 {
+            roots_msg.push_str(", ");
+        }
+        roots_msg.push_str(&r.display().to_string());
+    }
+    let message = format!(
+        "This file is reachable from multiple GreyCat projects ({roots_msg}). Almost always a design error — a `.gcl` file should belong to exactly one project. Restructure your `@include` paths so only one project includes it."
+    );
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: position_at(text, text.len()),
+        },
+        severity: Some(DiagnosticSeverity::INFORMATION),
+        code: Some(NumberOrString::String("multi-project-owner".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message,
+        tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+        ..Default::default()
+    }
+}
+
 /// Format a single diagnostic into the `path:line:col [severity] message`
 /// shape the cli lint subcommand prints. The `_` prefix on `code` is a
 /// reminder that the rich struct fields (related info, code, tags) get

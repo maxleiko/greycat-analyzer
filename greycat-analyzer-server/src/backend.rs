@@ -9,7 +9,10 @@ use greycat_analyzer_core::registry::RegistryFetcher;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
     Document, SourceManager,
-    diagnostics::{orphan_module_diagnostic, parse_diagnostics, pragma_diagnostics},
+    diagnostics::{
+        multi_project_owner_diagnostic, orphan_module_diagnostic, parse_diagnostics,
+        pragma_diagnostics,
+    },
 };
 use log::{debug, info, warn};
 use lsp_server::*;
@@ -19,6 +22,13 @@ use lsp_types::{
     *,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+
+// P32.6
+/// Per-URI owner list. Most files have exactly one owner; rare
+/// overlap between two projects' closures pushes a second entry
+/// onto the inline tail.
+pub type OwnerList = SmallVec<[PathBuf; 1]>;
 
 use crate::Result;
 use crate::capabilities::diagnostics_from_module;
@@ -77,10 +87,14 @@ pub struct Backend {
     pub client: Sender<Message>,
     /// All loaded projects, keyed by their root directory.
     pub projects: FxHashMap<PathBuf, Project>,
-    /// URI → owning-project root. Populated eagerly during
+    /// URI → owning-project roots. Populated eagerly during
     /// `load_workspace` and on `did_open` for files that aren't part
-    /// of any project's closure.
-    pub uri_owner: FxHashMap<Uri, PathBuf>,
+    /// of any project's closure. Almost always a single-element
+    /// [`OwnerList`]; when two projects' `@include` closures reach
+    /// the same file (a design error — surfaced via the
+    /// `multi-project-owner` advisory in [`publish_for`]) the list
+    /// grows past one entry.
+    pub uri_owner: FxHashMap<Uri, OwnerList>,
     // P32.5
     /// Documents opened from outside every workspace folder's
     /// `project.gcl` closure. Parsed for syntax diagnostics but not
@@ -110,23 +124,42 @@ pub struct Backend {
 
 impl Backend {
     // P32.1
-    /// Look up the [`Project`] that owns `uri`. Returns `None` when
-    /// the URI hasn't been bound to a project yet (P32.3 will fill
-    /// that in via the parent-walk; P32.5 will surface it as an
-    /// orphan).
+    /// Look up the [`Project`] that owns `uri`. Returns the first
+    /// (primary) owner when several exist — multi-owner conflicts
+    /// surface as a separate [`multi_project_owner_diagnostic`] via
+    /// [`publish_for`], not by altering routing.
     pub fn project_for(&self, uri: &Uri) -> Option<&Project> {
-        let root = self.uri_owner.get(uri)?;
+        let root = self.uri_owner.get(uri)?.first()?;
         self.projects.get(root)
     }
 
     pub fn project_for_mut(&mut self, uri: &Uri) -> Option<&mut Project> {
-        let root = self.uri_owner.get(uri)?.clone();
+        let root = self.uri_owner.get(uri)?.first()?.clone();
         self.projects.get_mut(&root)
     }
 
-    /// Bind `uri` to `root` in `uri_owner`. Idempotent.
+    // P32.6
+    /// Append `root` to `uri`'s owner list. Idempotent: a project
+    /// re-binding a URI it already owns is a no-op.
     fn bind_uri(&mut self, uri: Uri, root: PathBuf) {
-        self.uri_owner.insert(uri, root);
+        let owners = self.uri_owner.entry(uri).or_default();
+        if !owners.iter().any(|p| p == &root) {
+            owners.push(root);
+        }
+    }
+
+    // P32.6
+    /// Drop `root` from `uri`'s owner list; remove the entry entirely
+    /// when no owners remain. Used by reload-time eviction so a file
+    /// only leaving project A's closure (while still in B's) ends up
+    /// with the right shrunk list.
+    fn unbind_uri(&mut self, uri: &Uri, root: &Path) {
+        if let Some(owners) = self.uri_owner.get_mut(uri) {
+            owners.retain(|p| p != root);
+            if owners.is_empty() {
+                self.uri_owner.remove(uri);
+            }
+        }
     }
 
     fn publish_diagnostics(
@@ -175,6 +208,14 @@ impl Backend {
             if let Ok(ctx) = FsContext::new() {
                 diags.extend(pragma_diagnostics(&doc.text, &desc, &project.root, &ctx));
             }
+        }
+        // P32.6 — overlay the multi-project-owner advisory on top of
+        // the first owner's analysis when two or more projects reach
+        // this file.
+        if let Some(owners) = self.uri_owner.get(uri)
+            && owners.len() > 1
+        {
+            diags.push(multi_project_owner_diagnostic(&doc.text, owners));
         }
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
@@ -303,10 +344,11 @@ impl Backend {
             project_file.display()
         );
         let loaded = report.loaded.clone();
-        for uri in &report.reachable {
-            self.uri_owner.insert(uri.clone(), project_root.clone());
+        let reachable = report.reachable.clone();
+        self.projects.insert(project_root.clone(), project);
+        for uri in &reachable {
+            self.bind_uri(uri.clone(), project_root.clone());
         }
-        self.projects.insert(project_root, project);
         for (uri, _) in loaded {
             if let Err(e) = self.publish_for(&uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
@@ -347,7 +389,7 @@ impl Backend {
     /// Decide who owns `uri` and (for project files) ensure that
     /// project is loaded.
     fn resolve_owner_for_did_open(&mut self, uri: &Uri) -> DocOwner {
-        if let Some(root) = self.uri_owner.get(uri).cloned() {
+        if let Some(root) = self.uri_owner.get(uri).and_then(|o| o.first()).cloned() {
             return DocOwner::Project(root);
         }
         if self.orphans.get(uri).is_some() {
@@ -410,10 +452,11 @@ impl Backend {
             project_file.display()
         );
         let root_path = root.to_path_buf();
-        for u in &report.reachable {
-            self.uri_owner.insert(u.clone(), root_path.clone());
+        let reachable = report.reachable.clone();
+        self.projects.insert(root_path.clone(), project);
+        for u in &reachable {
+            self.bind_uri(u.clone(), root_path.clone());
         }
-        self.projects.insert(root_path, project);
     }
 
     pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
@@ -482,7 +525,12 @@ impl Backend {
     /// workspace watcher. `trigger_uri` is the URI whose change
     /// prompted the reload — used only to pick the project to reload.
     fn reload_project_closure(&mut self, trigger_uri: &Uri) {
-        let Some(project_root) = self.uri_owner.get(trigger_uri).cloned() else {
+        let Some(project_root) = self
+            .uri_owner
+            .get(trigger_uri)
+            .and_then(|o| o.first())
+            .cloned()
+        else {
             return;
         };
         self.reload_project_closure_for(&project_root);
@@ -548,12 +596,13 @@ impl Backend {
         let owner_root = project_root.to_path_buf();
 
         // Re-index `uri_owner` for everything still reachable, and
-        // drop entries for the evicted URIs.
+        // drop *this project's* binding for the evicted URIs (other
+        // projects' bindings on the same URI must survive — see P32.6).
         for uri in &evicted {
-            self.uri_owner.remove(uri);
+            self.unbind_uri(uri, &owner_root);
         }
         for uri in &reachable_uris {
-            self.uri_owner.insert(uri.clone(), owner_root.clone());
+            self.bind_uri(uri.clone(), owner_root.clone());
         }
 
         // Clear diagnostics for evicted URIs so the editor's stale
@@ -698,8 +747,15 @@ impl Backend {
                 }
                 FileChangeType::DELETED => {
                     debug!("[watch] deleted {}", uri.as_str());
-                    if let Some(project) = self.project_for_mut(uri) {
-                        let _ = project.manager.remove(uri);
+                    // P32.6 — drop the file from every project's
+                    // manager (it may have had multiple owners in
+                    // the @include-overlap case).
+                    if let Some(owners) = self.uri_owner.get(uri).cloned() {
+                        for root in owners.iter() {
+                            if let Some(project) = self.projects.get_mut(root) {
+                                let _ = project.manager.remove(uri);
+                            }
+                        }
                     }
                     self.uri_owner.remove(uri);
                     self.publish_diagnostics(uri.clone(), Vec::new(), None)?;
@@ -825,8 +881,8 @@ mod tests {
 
         let a1 = uri("file:///ws/projA/main.gcl");
         let b1 = uri("file:///ws/projB/main.gcl");
-        b.uri_owner.insert(a1.clone(), root_a.clone());
-        b.uri_owner.insert(b1.clone(), root_b.clone());
+        b.bind_uri(a1.clone(), root_a.clone());
+        b.bind_uri(b1.clone(), root_b.clone());
 
         assert_eq!(b.project_for(&a1).map(|p| &p.root), Some(&root_a));
         assert_eq!(b.project_for(&b1).map(|p| &p.root), Some(&root_b));
@@ -941,7 +997,10 @@ mod tests {
             },
         })
         .unwrap();
-        assert_eq!(b.uri_owner.get(&bar_uri), Some(&outer));
+        assert_eq!(
+            b.uri_owner.get(&bar_uri).and_then(|o| o.first()),
+            Some(&outer)
+        );
         assert!(
             !b.projects.contains_key(&inner),
             "opening outer/bar.gcl must not spawn inner project"
@@ -958,7 +1017,10 @@ mod tests {
             },
         })
         .unwrap();
-        assert_eq!(b.uri_owner.get(&foo_uri), Some(&inner));
+        assert_eq!(
+            b.uri_owner.get(&foo_uri).and_then(|o| o.first()),
+            Some(&inner)
+        );
         assert!(
             b.projects.contains_key(&inner),
             "opening outer/sub/foo.gcl must spawn inner project"
