@@ -537,6 +537,24 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     match (&a.kind, &b.kind) {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
         (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => na == nb,
+        // Named-vs-GenericParam name match. The project-pipeline's
+        // validation pass lowers TypeRefs without threading generic
+        // scope, so a declared `V?` return / parameter type lowers to
+        // `Named{name:"V"}`, while the body walker — which does have
+        // generic scope — produced `GenericParam{name:"V", owner:…}`
+        // for the same source token. Treat the two as compatible when
+        // their names match so the validation pass doesn't surface
+        // false `value of `V?` is not assignable to declared return
+        // type `V?`` diagnostics. The rule has to live here (not just
+        // at the top-level `is_assignable_to_with_index`) so it also
+        // applies inside the recursive arg-comparison for nested
+        // generics like `Tuple<Table<T>, MeasureUnit>`.
+        (TypeKind::Named { name: na }, TypeKind::GenericParam { name: nb, .. })
+        | (TypeKind::GenericParam { name: na, .. }, TypeKind::Named { name: nb })
+            if na == nb =>
+        {
+            true
+        }
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
             // P12.2: invariant in every generic parameter. The TS
             // reference checker (`GreycatGenericType.isAssignableTo`)
