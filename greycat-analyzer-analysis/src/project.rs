@@ -1303,93 +1303,62 @@ impl ProjectAnalysis {
             by_name.insert(doc.name().to_string(), uri.clone());
         }
 
-        // P29.2 — pre-extract `(uri, text, tree)` per module so the
-        // CST walk can dispatch across rayon workers. `Document` is
-        // `!Sync` (Parser + OnceCell), so we can't hold a `Ref<'_, _>`
-        // across worker boundaries; `Tree::clone()` is reference-
-        // counted and `text.clone()` is a one-shot copy per module.
-        let docs: Vec<(_Uri, String, greycat_analyzer_syntax::tree_sitter::Tree)> = manager
-            .iter()
-            .map(|(uri, cell)| {
-                let doc = cell.borrow();
-                (uri.clone(), doc.text.clone(), doc.tree.clone())
-            })
-            .collect();
-
         // 2. Walk every module's CST for `static_expr` nodes whose
-        // chain root names a known module. Each closure produces a
-        // local `Vec<(target_uri, decl_id)>`; the serial fold below
-        // aggregates into the canonical `bumps` map. The inputs the
-        // closure reads (`by_name`, `self.modules`) are `Sync`.
-        let by_name_ref = &by_name;
-        #[allow(clippy::mutable_key_type)]
-        let modules_ref = &self.modules;
-        let per_module_bumps: Vec<Vec<(_Uri, Idx<Decl>)>> =
-            crate::parallel::par_map(docs, move |(uri, text, tree)| {
-                let mut local: Vec<(_Uri, Idx<Decl>)> = Vec::new();
-                let root = tree.root_node();
-                greycat_analyzer_syntax::cst::walk_named(root, |node| {
-                    if node.kind() != "static_expr" {
-                        return true;
-                    }
-                    // Outer static — only process top-level chains;
-                    // inner ones propagate from there. Skip if our
-                    // parent is also a `static_expr` (we'd double-count
-                    // otherwise).
-                    if let Some(parent) = node.parent()
-                        && parent.kind() == "static_expr"
-                    {
-                        return true;
-                    }
-                    let chain = qualified_chain(node, &text);
-                    if chain.len() < 2 {
-                        return true;
-                    }
-                    let Some(target_uri) = by_name_ref.get(&chain[0]) else {
-                        return true;
-                    };
-                    // Skip self-references — qualified access to a
-                    // decl in the *current* module is treated as
-                    // intra-module.
-                    if target_uri == &uri {
-                        return true;
-                    }
-                    let Some(target_module) = modules_ref.get(target_uri) else {
-                        return true;
-                    };
-                    // Match each subsequent ident in the chain against
-                    // any decl with that name in the target module.
-                    // `chain[1]` is the most common case (top-level
-                    // decl); deeper segments name attrs / methods /
-                    // variants and are outside the unused-decl lint's
-                    // scope (intra-type members aren't in
-                    // `references_to`).
-                    let target_root = match target_module.hir.module.as_ref() {
-                        Some(m) => m,
-                        None => return true,
-                    };
-                    let needle = &chain[1];
-                    for decl_id in &target_root.decls {
-                        if let Some(name_idx) = target_module.hir.decls[*decl_id].name()
-                            && target_module.hir.idents[name_idx].text == *needle
-                        {
-                            local.push((target_uri.clone(), *decl_id));
-                            break;
-                        }
-                    }
-                    true
-                });
-                local
-            });
-
-        // Serial aggregation — fold per-module Vecs into the canonical
-        // bumps map. O(total bumps), microseconds even on `pro`.
+        // chain root names a known module. Collect bumps.
         #[allow(clippy::mutable_key_type)]
         let mut bumps: FxHashMap<_Uri, Vec<Idx<Decl>>> = FxHashMap::default();
-        for local in per_module_bumps {
-            for (target_uri, decl_id) in local {
-                bumps.entry(target_uri).or_default().push(decl_id);
-            }
+        for (uri, cell) in manager.iter() {
+            let doc = cell.borrow();
+            let text = &doc.text;
+            let root = doc.root_node();
+            greycat_analyzer_syntax::cst::walk_named(root, |node| {
+                if node.kind() != "static_expr" {
+                    return true;
+                }
+                // Outer static — only process top-level chains; inner
+                // ones propagate from there. Skip if our parent is
+                // also a `static_expr` (we'd double-count otherwise).
+                if let Some(parent) = node.parent()
+                    && parent.kind() == "static_expr"
+                {
+                    return true;
+                }
+                let chain = qualified_chain(node, text);
+                if chain.len() < 2 {
+                    return true;
+                }
+                let Some(target_uri) = by_name.get(&chain[0]) else {
+                    return true;
+                };
+                // Skip self-references — qualified access to a decl
+                // in the *current* module is treated as intra-module.
+                if target_uri == uri {
+                    return true;
+                }
+                let Some(target_module) = self.modules.get(target_uri) else {
+                    return true;
+                };
+                // Match each subsequent ident in the chain against any
+                // decl with that name in the target module. `chain[1]`
+                // is the most common case (top-level decl); deeper
+                // segments name attrs / methods / variants and are
+                // outside the unused-decl lint's scope (intra-type
+                // members aren't in `references_to`).
+                let target_root = match target_module.hir.module.as_ref() {
+                    Some(m) => m,
+                    None => return true,
+                };
+                let needle = &chain[1];
+                for decl_id in &target_root.decls {
+                    if let Some(name_idx) = target_module.hir.decls[*decl_id].name()
+                        && target_module.hir.idents[name_idx].text == *needle
+                    {
+                        bumps.entry(target_uri.clone()).or_default().push(*decl_id);
+                        break;
+                    }
+                }
+                true
+            });
         }
 
         // 3. Apply bumps.
