@@ -1063,45 +1063,12 @@ The `~120 ms` figure is the whole function. The plan above assumes Phase 2 (CST 
 **Chunks:**
 
 - [x] **33.1 Auto-load std + `missing-std` diagnostic** (S) — extend [`LoadReport`](../greycat-analyzer-core/src/manager.rs) with a `std_resolution: StdResolution { Local | Global | Missing }` field and an `entrypoint_uri: Option<Uri>`. Add `SourceManager::ensure_std_loaded` and call it from `load_project` unconditionally after `process_libraries`. Add [`core::diagnostics::missing_std_diagnostic`](../greycat-analyzer-core/src/diagnostics.rs) (Error severity, `UNNECESSARY` tag, code `missing-std`, range = whole file). LSP: [`Project`](../greycat-analyzer-server/src/backend.rs) captures both fields from each load and `publish_for` overlays the diag when `std_resolution == Missing && entrypoint_uri == Some(uri)`. CLI: [`cmd::lint`](../greycat-analyzer/src/cmd/lint.rs) hydrate closure injects the diag on the entrypoint URI. Tests: three `manager` unit tests covering local-wins / global-fallback / missing; one LSP integration test (hermetic via `GREYCAT_HOME=/tmp/empty`) asserting the diag's code, Error severity, and `UNNECESSARY` tag.
-- [x] **33.2 Directory-delete sweep in the watcher** (XS) — VSCode's `didChangeWatchedFiles` is documented to fire per-file for matching glob patterns, but `rm -rf <dir>` from the terminal sometimes coalesces into a single directory-level DELETED event without per-file follow-ups. Without per-file events, `uri_owner` retains the stale URIs and goto-def returns locations for files that no longer exist. Add `Backend::sweep_deleted_directory(dir, reload_set)` in [backend.rs](../greycat-analyzer-server/src/backend.rs) that walks `uri_owner` and treats every bound URI whose path lives under `dir` as if it had received a per-file DELETED event (drop from each owning project's manager, drop from `uri_owner`, publish empty diagnostics, schedule a reload). The watcher's existing DELETED branch routes non-`.gcl` paths through this sweep. Unit test creates a real `proj/lib/std/{core,util}.gcl` on disk, eager-loads, then fires a directory-level DELETED for `proj/lib/std`; asserts both URIs are unbound after the sweep. Limitation: still relies on the editor firing *some* event for the deleted directory — Phase 34 closes the remaining gap with a server-side watcher.
 
-**M33:** opening a workspace whose project has no `std` available (neither local nor global) shows exactly one Error-severity advisory dimmed across the project.gcl explaining the situation. The CLI's `lint` command surfaces the same diag at the entrypoint. Projects that *do* have std (local or global) keep loading it transparently, without needing `@library("std", ...)` in their project.gcl. Deleting a previously-loaded `lib/std` tree (either via `greycat install` or by hand) eventually cleans the analyzer's state — the watcher sweeps directory-shaped events and the next reload re-runs std resolution.
+**M33:** opening a workspace whose project has no `std` available (neither local nor global) shows exactly one Error-severity advisory dimmed across the project.gcl explaining the situation. The CLI's `lint` command surfaces the same diag at the entrypoint. Projects that *do* have std (local or global) keep loading it transparently, without needing `@library("std", ...)` in their project.gcl.
 
 **Out of scope:**
 - Embedded std fallback. The TS reference and the runtime have a built-in `std` for grammatical correctness; the analyzer doesn't, and shipping a vendored copy is a separate phase if it ever becomes desirable.
 - A code action that runs `greycat install` from the editor. Could ride a future quickfix phase.
-- A server-side filesystem watcher that bypasses the editor entirely (the rust-analyzer model). See Phase 34.
-
----
-
-### Phase 34 — Server-side filesystem watcher (~3-5 days, optional)
-
-**Goal:** stop trusting the editor's `workspace/didChangeWatchedFiles` for filesystem deltas and run our own watcher in the LSP process — the rust-analyzer model. Phase 33.2 papered over the most common gap (directory-shaped deletes), but every editor's `FileSystemWatcher` implementation has subtly different behaviour around: timing of events under heavy fs activity, batching/coalescing of recursive deletes, atomic-replace renames, symlink traversal, network-mount latency, etc. A server-side watcher gives us a single, predictable code path regardless of who the client is — and as a bonus, it works correctly when the LSP is driven by an editor that doesn't support dynamic capability registration at all.
-
-**Trigger to do this phase:** real-world reports of stale URIs or missed reloads that Phase 33.2 doesn't fix. Until then, the defensive sweep is enough. This phase is **opt-in** — it adds a thread, a channel, a dep, and a non-trivial amount of plumbing; we only invest if reliability becomes a recurring complaint.
-
-**Behavioral contract:**
-
-- Add a `notify`-driven watcher thread per [`Backend`](../greycat-analyzer-server/src/backend.rs). Watched roots: every entry in `workspace_roots`, every `<greycat_home>/lib/std` directory, every loaded `project.root`'s `lib/` subtree. Roots are registered/unregistered as projects load/unload and workspace folders come and go.
-- Events ship through a `crossbeam_channel::Sender<WatcherEvent>` into the main `lsp-server` loop alongside `Message::*`. The main loop's `match` gains a third arm that dispatches to a new `Backend::on_fs_event` handler.
-- `on_fs_event` is a strict superset of today's `did_change_watched_files` — same `is_installed` / `is_gcl` / sweep logic, just driven by notify events. We keep `did_change_watched_files` wired for editors that prefer to drive their own watcher; both paths funnel into the same `apply_fs_event` helper.
-- Debounce / coalesce notify's high-frequency event stream (notify emits one event per affected inode; saving a file in vim can produce CREATE+MODIFY+ATTRIB+RENAME+DELETE in milliseconds). 50–100 ms debounce window, batched flush.
-- Cross-platform behaviour: notify abstracts inotify (Linux), FSEvents (macOS), ReadDirectoryChangesW (Windows). Each has quirks; the watcher module owns the abstraction so the rest of the backend doesn't care.
-- Fall back to the editor watcher when notify fails to start (e.g. CI sandboxes with inotify disabled). Log an `info!` once, then operate as today.
-
-**Chunks (sketch):**
-
-- [ ] **34.1 Add `notify` dep + per-Backend watcher thread** (S) — spawn the thread in `Backend::initialized` (or lazily on first project load). Channel into the main loop. Plumb `WatcherEvent { uri, kind: Create | Modify | Remove }` through.
-- [ ] **34.2 Root registration** (S) — `Backend::register_fs_root(path)` / `unregister_fs_root(path)`, called from `load_workspace`, `spawn_lazy_project`, `drop_project`, `did_change_workspace_folders`. Watch only what's loaded.
-- [ ] **34.3 Event → handler dispatch** (M) — main loop's `select!` between `conn.receiver` and the watcher channel. Debounce. Translate notify events into the existing `did_change_watched_files`-shaped processing.
-- [ ] **34.4 Editor-watcher coexistence** (S) — keep the existing `register_file_watchers` capability registration so editors that *do* forward events still work; route both paths through a shared `apply_fs_event`. Avoid double-counting identical events.
-- [ ] **34.5 Tests** (S) — drop a real file on disk between `did_open` and a subsequent `goto_definition`; assert the LSP picks up the change without needing an editor-side event. Test the failure-to-start fallback by injecting a watcher mock that always errors.
-
-**M34:** stale-URI / stale-diagnostic bugs caused by missed editor events disappear from real-world reports. The LSP behaves identically whether it's driven by VSCode, Helix, Emacs lsp-mode, or a headless client that never registers a watcher.
-
-**Out of scope:**
-- Watching arbitrary subtrees the user might care about (e.g. an external schema dir). Limit watched roots to the loaded project closure and `<greycat_home>/lib/std`.
-- A user-facing knob to disable the watcher. The fallback already covers the "won't start" case; a manual toggle would just complicate the configuration surface.
 
 ---
 

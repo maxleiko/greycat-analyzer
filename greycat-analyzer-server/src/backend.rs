@@ -888,52 +888,6 @@ impl Backend {
         Ok(())
     }
 
-    // P33.2
-    /// Walk `self.uri_owner`, find every URI whose path lives under
-    /// `dir`, and clean each one up exactly as the per-file DELETED
-    /// branch would have. Used when a watcher emits a directory-level
-    /// DELETED event without per-file follow-ups (a known VSCode
-    /// behaviour for `rm -rf <dir>` from the terminal).
-    fn sweep_deleted_directory(
-        &mut self,
-        dir: &Path,
-        reload_set: &mut FxHashSet<PathBuf>,
-    ) -> Result<()> {
-        let victims: Vec<(Uri, OwnerList)> = self
-            .uri_owner
-            .iter()
-            .filter_map(|(u, owners)| {
-                let p = uri_to_path(u)?;
-                if p.starts_with(dir) {
-                    Some((u.clone(), owners.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if victims.is_empty() {
-            return Ok(());
-        }
-        debug!(
-            "[{SERVER_LOG_TAG}][watch] directory-delete {} -> sweep {} file(s)",
-            dir.display(),
-            victims.len()
-        );
-        for (uri, owners) in &victims {
-            for root in owners.iter() {
-                if let Some(project) = self.projects.get_mut(root) {
-                    let _ = project.manager.remove(uri);
-                }
-                reload_set.insert(root.clone());
-            }
-            self.uri_owner.remove(uri);
-            // Best-effort clear; ignore send errors so a broken
-            // channel doesn't abort the rest of the sweep.
-            let _ = self.publish_diagnostics(uri.clone(), Vec::new(), None);
-        }
-        Ok(())
-    }
-
     // P32.8
     /// Tear down a single project: clear diagnostics for every URI it
     /// owned, drop the URI bindings, and remove the project from
@@ -1017,17 +971,6 @@ impl Backend {
                 continue;
             }
             if !is_gcl {
-                // P33.2 — VSCode (and other editors) sometimes fire a
-                // directory-level DELETED event without per-file
-                // events when the user removes a whole directory
-                // (e.g. `rm -rf lib/std`). Sweep every bound URI
-                // whose path lives under the deleted path and clean
-                // each one up. Without this, the analyzer holds
-                // stale URIs and goto-def returns locations for
-                // files that don't exist anymore.
-                if ev.typ == FileChangeType::DELETED {
-                    self.sweep_deleted_directory(&path, &mut reload_set)?;
-                }
                 continue;
             }
             // Skip files the editor owns the live state of — `did_change`
@@ -1392,79 +1335,6 @@ mod tests {
         assert!(
             proj_b_state.manager.get(&extra_uri).is_none(),
             "projB's manager must NOT contain extra.gcl"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    // P33.2
-    /// A watcher DELETED event whose path is a directory (not a
-    /// `.gcl` file) sweeps every bound URI under that path out of
-    /// the project's manager and `uri_owner`, and schedules a
-    /// reload. Covers the VSCode case where `rm -rf` of a tree
-    /// fires only a directory-level event.
-    #[test]
-    fn watcher_sweeps_directory_delete() {
-        let tmp = std::env::temp_dir().join(format!(
-            "gca_dir_sweep_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let proj = tmp.join("proj");
-        let lib_std = proj.join("lib").join("std");
-        std::fs::create_dir_all(&lib_std).unwrap();
-        std::fs::write(
-            proj.join("project.gcl"),
-            "@library(\"std\", \"1.0\");\nfn main() {}\n",
-        )
-        .unwrap();
-        std::fs::write(lib_std.join("core.gcl"), "fn core() {}\n").unwrap();
-        std::fs::write(lib_std.join("util.gcl"), "fn util() {}\n").unwrap();
-
-        let (mut b, _rx) = backend();
-        b.workspace_roots.push(tmp.clone());
-        b.load_workspace(&path_uri(&proj));
-
-        let core_uri = path_uri(&lib_std.join("core.gcl"));
-        let util_uri = path_uri(&lib_std.join("util.gcl"));
-        assert!(b.uri_owner.contains_key(&core_uri));
-        assert!(b.uri_owner.contains_key(&util_uri));
-
-        // Simulate VSCode firing a single directory-level DELETED
-        // event for lib/std (no per-file events). Remove from disk
-        // first so the reload's `load_project` reflects reality.
-        std::fs::remove_dir_all(&lib_std).unwrap();
-        b.did_change_watched_files(DidChangeWatchedFilesParams {
-            changes: vec![FileEvent {
-                uri: path_uri(&lib_std),
-                typ: FileChangeType::DELETED,
-            }],
-        })
-        .unwrap();
-
-        // Both std URIs must be gone from uri_owner and from the
-        // project's manager.
-        assert!(
-            !b.uri_owner.contains_key(&core_uri),
-            "core.gcl still bound after directory-delete sweep: {:?}",
-            b.uri_owner.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            !b.uri_owner.contains_key(&util_uri),
-            "util.gcl still bound after directory-delete sweep"
-        );
-        let proj_state = b.projects.get(&proj).expect("project still loaded");
-        assert!(
-            proj_state.manager.get(&core_uri).is_none(),
-            "core.gcl still in project manager"
-        );
-        assert!(
-            proj_state.manager.get(&util_uri).is_none(),
-            "util.gcl still in project manager"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
