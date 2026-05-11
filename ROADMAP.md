@@ -953,6 +953,34 @@ The `~120 ms` figure is the whole function. The plan above assumes Phase 2 (CST 
 
 ---
 
+### Phase 30 — `recv.staticName` / `recv->staticName` advisory lint (~2-3 days)
+
+**Goal:** introduce a new lint rule that flags instance-access (`.` / `->`) to a *static* member and proposes rewriting it as `Type::staticName`. The analyzer already has every signal it needs — for a given `Expr::Member` / `Expr::Arrow` binding it knows whether the resolved member is a `static fn` or `static` attr — so the role of this phase is purely advisory: guide developers toward the syntactic form that matches their intent.
+
+**Why this is its own phase.** The fix in `fix(analysis): attrs win over methods; instance access skips static` already filters static methods out of instance-access resolution to match the runtime. That fix is **silent**: the analyzer reroutes the lookup and the user never finds out their `.` should have been a `::`. For a static method that *would not* shadow an inherited attr, the runtime would happily accept the `.` form too — but that doesn't make it stylistically right. A separate lint surfaces both shapes consistently:
+
+- `recv.staticName` (no attr collision → runtime would accept) → lint warns + offers `Type::staticName` quickfix.
+- `recv.staticName` (attr collision → runtime resolves to the attr, our analyzer already does so) → lint still fires (the user's code is unambiguous to the *reader*, who sees a static-method-shaped name on an instance receiver and is misled).
+
+**Constraints from the existing fix:**
+
+- After `fix(analysis): attrs win over methods`, instance access *never binds to a static method via the local-or-chain lookup*. So `member_uses` / `foreign_member_uses` for an `Expr::Member` / `Expr::Arrow` will not point at a static method on its own. To detect the misuse we have to re-run a *separate* search that explicitly looks for a static member of the same name on the receiver's type chain, *after* the normal lookup has bound (or failed to bind) something else.
+- The lint should not fire when the lookup already bound an inherited attr — that's the case the runtime resolves the same way, and the user's `.` is semantically correct. The condition is: instance access AND a same-named static member exists on the receiver type (regardless of what the normal lookup bound).
+
+**Chunks:**
+
+- [ ] **30.1 Lint rule registration + diagnostic shape** (XS) — add `instance-access-on-static` (working name) to `LINT_RULES` in [`greycat-analyzer-analysis/src/lint.rs`](../greycat-analyzer-analysis/src/lint.rs) with a one-line summary; wire emission through `run_typed_lints` and the per-pass `module.lints.retain` filter; add the rule name to `default_tag_for` (probably no UNNECESSARY tag — this is style guidance, not dead code). Touch all four touchpoints listed in CLAUDE.md's "Adding / removing a lint rule" table.
+- [ ] **30.2 Detection pass** (S) — for each `Expr::Member` / `Expr::Arrow` in HIR, resolve the receiver type the same way the analyzer does (consult `member_uses` / `foreign_member_uses` for the property), then ask the project index "does the receiver type's chain contain a *static* member named `prop`?" The index already exposes `static_attrs` and `static_methods` per `TypeMembers`; add a walk-chain helper if needed. When the answer is yes AND the access is instance-shaped, push a diagnostic at the property segment's byte range with the message `static \`X::{prop}\` accessed via instance form — use \`X::{prop}\` instead`.
+- [ ] **30.3 Quickfix (auto-fix path)** (S) — register a per-rule fixer in [`greycat-analyzer-analysis/src/quickfix.rs`](../greycat-analyzer-analysis/src/quickfix.rs) that rewrites the byte range `[receiver_start, prop_end]` from `recv.prop` / `recv->prop` to `Type::prop`. The `Type` to substitute is the **declared type** of the receiver — *not* the runtime instance type — because `Sub::staticName` resolves through the supertype chain at runtime when `Sub` doesn't declare its own `staticName`. For receivers whose declared type can't be cheaply recovered as text (computed expressions, casts, anonymous types) the quickfix is unavailable; the diagnostic still fires.
+- [ ] **30.4 Suppression + tests** (S) — verify `// gcl-lint-off instance-access-on-static` silences the rule; add tests covering: (a) the no-collision case (lint fires, runtime would have accepted), (b) the inherited-attr-collision case (lint still fires, runtime resolved the attr — same shape that motivates the rule), (c) negative for non-static methods (`recv.someMethod()` doesn't fire), (d) negative for static-access form (`Type::staticName` doesn't fire), (e) suppression directive silences.
+- [ ] **30.5 Run against the secret corpus + stdlib closure** (XS) — confirm zero false positives. If a real call site relies on inherited-attr shadowing where the lint message would be confusing, refine the message or add the case to the test grid; do not relax detection. The lint is opt-in by being a `warning` by default — projects that want it stricter can `--disable=` lint per rule.
+
+**M30:** the rule appears in `--list-rules`, runs in `cargo run -- lint` and the LSP, auto-fixes with `--fix`, and adds zero false positives to the stdlib closure. The lint message text and quickfix rewrite are reviewed against the runtime oracle before landing.
+
+**Out of scope:** rewriting `Type::instanceMember` to `recv.instanceMember` (the opposite direction). That would require the LSP to materialize a receiver, which is a heavier code action — leave it for a separate phase if real demand surfaces.
+
+---
+
 ## 7. Test strategy
 
 Two layers, no "port every TS test" milestone (tarpit).
