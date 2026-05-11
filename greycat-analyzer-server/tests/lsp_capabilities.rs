@@ -1768,6 +1768,10 @@ fn cross_module_member_resolution_binds_foreign_attr() {
 
 #[test]
 fn cross_module_goto_implementation_walks_every_module() {
+    // P31.2 — goto-impl returns concrete overrides on subtypes of
+    // the cursor's declaring type. With `Bar extends Foo`,
+    // cursor on `Foo::run` returns both `Foo::run` (self) and
+    // `Bar::run` (subtype override) across two modules.
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
     let a = Uri::from_str("file:///a.gcl").unwrap();
@@ -1775,13 +1779,13 @@ fn cross_module_goto_implementation_walks_every_module() {
     let mut mgr = SourceManager::new();
     mgr.add_simple(
         a.clone(),
-        "type Foo {\n    fn run(): int { return 1; }\n}\n",
+        "abstract type Foo {\n    fn run(): int { return 1; }\n}\n",
         "p",
         false,
     );
     mgr.add_simple(
         b.clone(),
-        "type Bar {\n    fn run(): int { return 2; }\n}\n",
+        "type Bar extends Foo {\n    fn run(): int { return 2; }\n}\n",
         "p",
         false,
     );

@@ -1023,13 +1023,21 @@ pub fn goto_implementation(
     Some(GotoDefinitionResponse::Array(locations))
 }
 
-// P11.6
-/// Project-wide `textDocument/implementation`. Walks every
-/// cached module's `TypeDecl::methods` for concrete (non-`abstract`,
-/// non-`native`) methods whose name matches the cursor's ident text.
-/// Falls through to in-module [`goto_implementation`] (which itself
-/// falls through to [`goto_definition`]) for non-method idents and
-/// when no project-wide method match is found.
+// P11.6 + P31.2
+/// Project-wide `textDocument/implementation`. For a method-name
+/// ident, returns every *concrete* (non-`abstract`, non-`native`)
+/// method that:
+///
+/// - is named the same as the cursor's ident, AND
+/// - belongs to a type that is a subtype of (or equal to) the
+///   *declaring type* — the type that owns the method binding at
+///   the cursor.
+///
+/// The subtype filter drops the pre-P31.2 false positives where
+/// unrelated types coincidentally shared a method name. Falls
+/// through to in-module [`goto_implementation`] (which itself falls
+/// through to [`goto_definition`]) for non-method idents and when
+/// the declaring type can't be determined.
 pub fn goto_implementation_across_project(
     project: &ProjectAnalysis,
     manager: &SourceManager,
@@ -1046,6 +1054,15 @@ pub fn goto_implementation_across_project(
     let cursor_text = doc.text.get(node.byte_range())?.to_string();
     drop(doc);
 
+    let Some(declaring_type) =
+        declaring_type_for_method_cursor(project, manager, cursor_uri, cursor_pos)
+    else {
+        // No declaring type → fall through to the naive in-module path.
+        let cell = manager.get(cursor_uri)?;
+        let doc = cell.borrow();
+        return goto_implementation(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos);
+    };
+
     let mut locations = Vec::new();
     for (uri, module) in project.iter() {
         let Some(module_root) = module.hir.module.as_ref() else {
@@ -1059,6 +1076,13 @@ pub fn goto_implementation_across_project(
             let Decl::Type(td) = &module.hir.decls[*decl_id] else {
                 continue;
             };
+            let candidate_type = module.hir.idents[td.name].text.as_str();
+            if !project
+                .index
+                .is_subtype_of(candidate_type, declaring_type.as_str())
+            {
+                continue;
+            }
             for method_id in &td.methods {
                 let Decl::Fn(fnd) = &module.hir.decls[*method_id] else {
                     continue;
@@ -1084,6 +1108,85 @@ pub fn goto_implementation_across_project(
         return goto_implementation(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos);
     }
     Some(GotoDefinitionResponse::Array(locations))
+}
+
+/// Determine the *declaring type* of the method-name ident under the
+/// cursor — the type whose method declaration / binding the cursor
+/// is associated with. Used as the root of the subtype filter for
+/// `textDocument/implementation` (and later `textDocument/declaration`).
+///
+/// Resolution order:
+/// 1. Cursor on a method's own declaration site (`type Foo { fn name() {} }`)
+///    → returns `Foo`.
+/// 2. Cursor on a member access (`recv.name` / `recv->name`) whose
+///    binding is in the cursor module's `member_uses`. Find the
+///    `Decl::Type` whose methods contain the bound `Idx<Decl>` and
+///    return its name.
+/// 3. Same shape but the binding is in `foreign_member_uses` — walk
+///    the foreign module's HIR for the owning type.
+fn declaring_type_for_method_cursor(
+    project: &ProjectAnalysis,
+    manager: &SourceManager,
+    cursor_uri: &Uri,
+    cursor_pos: Position,
+) -> Option<String> {
+    let cell = manager.get(cursor_uri)?;
+    let doc = cell.borrow();
+    let module = project.module(cursor_uri)?;
+    let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
+    let cursor_text = module.hir.idents[cursor_idx].text.clone();
+    let cursor_range = module.hir.idents[cursor_idx].byte_range.clone();
+    drop(doc);
+
+    // Case 1: cursor on a method's declaration site in this module.
+    if let Some(module_root) = module.hir.module.as_ref() {
+        for decl_id in &module_root.decls {
+            let Decl::Type(td) = &module.hir.decls[*decl_id] else {
+                continue;
+            };
+            for method_id in &td.methods {
+                let Decl::Fn(fnd) = &module.hir.decls[*method_id] else {
+                    continue;
+                };
+                let name_range = &module.hir.idents[fnd.name].byte_range;
+                if *name_range == cursor_range && module.hir.idents[fnd.name].text == cursor_text {
+                    return Some(module.hir.idents[td.name].text.to_string());
+                }
+            }
+        }
+    }
+
+    // Case 2: cursor on a member access bound in the local module.
+    use greycat_analyzer_analysis::analyzer::MemberDef;
+    if let Some(MemberDef::Method(decl_id)) = module.analysis.member_lookup(cursor_idx) {
+        if let Some(module_root) = module.hir.module.as_ref() {
+            for type_decl_id in &module_root.decls {
+                let Decl::Type(td) = &module.hir.decls[*type_decl_id] else {
+                    continue;
+                };
+                if td.methods.contains(&decl_id) {
+                    return Some(module.hir.idents[td.name].text.to_string());
+                }
+            }
+        }
+    }
+
+    // Case 3: cursor on a member access bound to a foreign module.
+    let foreign = module.analysis.foreign_member_lookup(cursor_idx)?;
+    let MemberDef::Method(decl_id) = foreign.member else {
+        return None;
+    };
+    let foreign_module = project.module(&foreign.uri)?;
+    let foreign_root = foreign_module.hir.module.as_ref()?;
+    for type_decl_id in &foreign_root.decls {
+        let Decl::Type(td) = &foreign_module.hir.decls[*type_decl_id] else {
+            continue;
+        };
+        if td.methods.contains(&decl_id) {
+            return Some(foreign_module.hir.idents[td.name].text.to_string());
+        }
+    }
+    None
 }
 
 // =============================================================================
