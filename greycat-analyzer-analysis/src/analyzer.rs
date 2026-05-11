@@ -1758,10 +1758,15 @@ impl<'a> Cx<'a> {
     }
 
     fn visit_top_var(&mut self, d: &VarDeclTop) {
-        let _ = d.ty.map(|t| self.lower_type_ref(t));
-        if let Some(init) = d.init {
-            let _ = self.visit_expr(init);
-        }
+        let declared = d.ty.map(|t| self.lower_type_ref(t));
+        let init_ty = d.init.map(|i| self.visit_expr(i));
+        // P35.10 — record the modvar's type in `def_types` keyed by
+        // its binding ident. Mirrors what `Stmt::Var` does for
+        // locals; lets capability code (e.g. `receiver_type_at`'s
+        // text-based fallback for ERROR-recovery cases) look up a
+        // modvar's type by name without re-running `lower_type_ref`.
+        let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any());
+        self.out.def_types.insert(d.name, var_ty);
     }
 
     fn visit_pragma(&mut self, p: &Pragma) {

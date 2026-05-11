@@ -2743,13 +2743,6 @@ fn completion_in_module_decl_carries_signature_detail() {
 /// must still surface the receiver's members (the `node` tag's own
 /// methods + the inner type's members via the `.`→`->` rewrite).
 #[test]
-// ERROR-recovery variant — `n.` triggers `(ERROR (ident))` in
-// the body. The body's `n` ident isn't lowered, so
-// `receiver_type_at` can't find it via stages 1/2. Stage 3's
-// text-based fallback walks `Decl::Fn` / `Decl::Type` but not
-// top-level `Decl::Var` — unignore once P35.10 lands the modvar
-// walk + `visit_top_var` `def_types` population.
-#[ignore = "tracked by P35.10 — receiver_type_at needs modvar handling in stage 3"]
 fn completion_after_dot_on_modvar_node_receiver() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;

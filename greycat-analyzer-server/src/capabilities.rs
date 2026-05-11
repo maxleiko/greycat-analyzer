@@ -4424,9 +4424,20 @@ fn receiver_type_at(
     // Stage 2: ident already lowered into the HIR — resolver path.
     if let Some((ident_idx, _)) = module.hir.idents.iter().find(|(_, i)| i.byte_range == r) {
         use greycat_analyzer_analysis::resolver::Definition;
+        use greycat_analyzer_hir::types::Decl;
         if let Some(def) = module.resolutions.lookup(ident_idx) {
+            // P35.10 — `Definition::Decl(decl_id)` for a top-level
+            // `var` resolves through the modvar's binding ident, now
+            // present in `def_types` via the updated `visit_top_var`.
+            // Without this the receiver of `n.foo` (where `n` is a
+            // modvar) silently misses stage 2 and falls through to
+            // the text-based stage 3.
             let ident_for_lookup = match def {
                 Definition::Param(id) | Definition::Local(id) | Definition::Generic(id) => Some(id),
+                Definition::Decl(decl_id) => match &module.hir.decls[decl_id] {
+                    Decl::Var(vd) => Some(vd.name),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(id) = ident_for_lookup
@@ -4453,6 +4464,22 @@ fn lookup_name_type_at(
 ) -> Option<greycat_analyzer_types::TypeId> {
     use greycat_analyzer_hir::types::Decl as HD;
     let module = hir.module.as_ref()?;
+    // P35.10 — first pass: top-level `Decl::Var`. Module-level vars
+    // are visible from *anywhere* in the module body (unlike fn / type
+    // method scopes which are bounded by the decl's byte_range), so
+    // they're checked once before any byte-range filter. This is what
+    // makes the ERROR-recovery completion path work for receivers
+    // like `var n: node<int?>; ... n.` where the body's `n` ident
+    // lives inside a skipped `(ERROR (ident))` and the fn-scope walk
+    // below never sees it.
+    for &decl_id in &module.decls {
+        if let HD::Var(vd) = &hir.decls[decl_id]
+            && hir.idents[vd.name].text == name
+            && let Some(t) = analysis.def_types.get(&vd.name).copied()
+        {
+            return Some(t);
+        }
+    }
     for &decl_id in &module.decls {
         let r = hir.decls[decl_id].byte_range();
         if !(r.start <= cursor_byte && cursor_byte <= r.end) {
