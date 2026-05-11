@@ -314,36 +314,85 @@ impl Backend {
         let uri = params.text_document.uri.clone();
         let doc = Document::new(params.text_document);
         debug!("[did_open] {doc}");
-        // P32.1 — route to the owning project if known; otherwise
-        // fall through to the first loaded project (single-project
-        // semantics preserved). When nothing is loaded — headless
-        // LSP clients that skip `workspace_folders`, the smoke test,
-        // single-file editor sessions — lazily create an implicit
-        // empty-root project so the document still gets analyzed.
-        // P32.3 replaces the lookup with a proper parent-walk
-        // owner-search; P32.5 reroutes truly project-less files into
+        // P32.3 — route via parent-walk owner search if the URI isn't
+        // already bound to a project. Found owner not yet loaded → spin
+        // up a fresh Project lazily. No owner → fall through to the
+        // implicit empty-root project that P32.5 will replace with
         // dedicated orphan handling.
-        let target_root = match self.uri_owner.get(&uri).cloned() {
-            Some(root) => root,
-            None => {
-                let root = match self.projects.keys().next() {
-                    Some(r) => r.clone(),
-                    None => {
-                        let r = PathBuf::new();
-                        self.projects.insert(r.clone(), Project::new(r.clone()));
-                        r
-                    }
-                };
-                self.bind_uri(uri.clone(), root.clone());
-                root
-            }
-        };
+        let target_root = self.resolve_owner_for_did_open(&uri);
         if let Some(project) = self.projects.get_mut(&target_root) {
             project.manager.add(doc);
         }
         self.invalidate_with_slow_warning(&uri, "did_open");
         self.publish_for(&uri)?;
         Ok(())
+    }
+
+    // P32.3
+    /// Pick the project that should own `uri` and ensure it's loaded.
+    ///
+    /// Returns the project-root key, ready to use against
+    /// `self.projects`. The URI is bound in `uri_owner` so subsequent
+    /// requests dispatch in O(1) without re-walking.
+    fn resolve_owner_for_did_open(&mut self, uri: &Uri) -> PathBuf {
+        if let Some(root) = self.uri_owner.get(uri).cloned() {
+            return root;
+        }
+        let owner = find_owning_project_root(uri, &self.workspace_roots);
+        let target = match owner {
+            Some(root) => {
+                if !self.projects.contains_key(&root) {
+                    self.spawn_lazy_project(&root);
+                }
+                root
+            }
+            None => {
+                // Orphan: P32.5 will route here with dedicated
+                // handling. For now route to the implicit empty-root
+                // project so behaviour matches today's single-project
+                // analysis.
+                let r = PathBuf::new();
+                self.projects
+                    .entry(r.clone())
+                    .or_insert_with(|| Project::new(r.clone()));
+                r
+            }
+        };
+        self.bind_uri(uri.clone(), target.clone());
+        target
+    }
+
+    // P32.3
+    /// Spawn a fresh [`Project`] rooted at `root`, load its
+    /// `@library` / `@include` closure, run a project-wide analyze
+    /// pass, and index every reachable URI under that project. Mirrors
+    /// the eager [`load_workspace`] path but for projects discovered
+    /// on-demand by the parent walk.
+    fn spawn_lazy_project(&mut self, root: &Path) {
+        let project_file = root.join("project.gcl");
+        let mut project = Project::new(root.to_path_buf());
+        let load_start = Instant::now();
+        let report = project.manager.load_project(&project_file);
+        let load_took = load_start.elapsed();
+        for lib in &report.unresolved_libraries {
+            warn!("unresolved @library('{lib}') in {}", project_file.display());
+        }
+        for err in &report.errors {
+            warn!("[lazy-load] {err}");
+        }
+        let rebuild_start = Instant::now();
+        project.analysis.rebuild(&project.manager);
+        let rebuild_took = rebuild_start.elapsed();
+        info!(
+            "[lazy-load] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
+            report.loaded.len(),
+            project_file.display()
+        );
+        let root_path = root.to_path_buf();
+        for u in &report.reachable {
+            self.uri_owner.insert(u.clone(), root_path.clone());
+        }
+        self.projects.insert(root_path, project);
     }
 
     pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
@@ -646,6 +695,42 @@ pub(crate) fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     Some(Path::new(stripped).to_path_buf())
 }
 
+// P32.3
+/// Walk up from `uri`'s directory looking for the nearest `project.gcl`,
+/// bounded by the enclosing workspace folder.
+///
+/// Returns the directory holding the closest `project.gcl`, or `None`
+/// when the URI is outside every workspace folder or the walk reaches
+/// the workspace folder root without finding one.
+///
+/// The walk *includes* the workspace folder itself — if a project.gcl
+/// sits exactly at the workspace folder root, that wins.
+pub(crate) fn find_owning_project_root(uri: &Uri, workspace_roots: &[PathBuf]) -> Option<PathBuf> {
+    let path = uri_to_path(uri)?;
+    let start_dir = path.parent()?.to_path_buf();
+    // Find the workspace folder that contains the URI. Multiple
+    // matches: pick the longest (most specific) one, since nested
+    // workspace folders are valid in LSP.
+    let ws_root = workspace_roots
+        .iter()
+        .filter(|ws| start_dir.starts_with(ws))
+        .max_by_key(|ws| ws.as_os_str().len())?
+        .clone();
+    let mut cur = start_dir;
+    loop {
+        if cur.join("project.gcl").is_file() {
+            return Some(cur);
+        }
+        if cur == ws_root {
+            return None;
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
 pub(crate) fn publish_diagnostics(
     client: &Sender<Message>,
     uri: Uri,
@@ -664,23 +749,29 @@ pub(crate) fn publish_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossbeam_channel::unbounded;
+    use crossbeam_channel::{Receiver, unbounded};
     use std::str::FromStr;
 
     fn uri(s: &str) -> Uri {
         Uri::from_str(s).unwrap()
     }
 
-    fn backend() -> Backend {
-        let (tx, _rx) = unbounded();
-        Backend {
-            client: tx,
-            projects: FxHashMap::default(),
-            uri_owner: FxHashMap::default(),
-            workspace_roots: Vec::new(),
-            lint_libs: false,
-            registry: None,
-        }
+    /// Test backend bundled with the receiving end of its publish
+    /// channel — the receiver MUST outlive every `publish_*` call,
+    /// otherwise `Sender::send` errors out.
+    fn backend() -> (Backend, Receiver<Message>) {
+        let (tx, rx) = unbounded();
+        (
+            Backend {
+                client: tx,
+                projects: FxHashMap::default(),
+                uri_owner: FxHashMap::default(),
+                workspace_roots: Vec::new(),
+                lint_libs: false,
+                registry: None,
+            },
+            rx,
+        )
     }
 
     // P32.1
@@ -688,7 +779,7 @@ mod tests {
     /// each URI dispatches to its bound root and never bleeds across.
     #[test]
     fn project_for_routes_by_uri_owner() {
-        let mut b = backend();
+        let (mut b, _rx) = backend();
         let root_a = PathBuf::from("/ws/projA");
         let root_b = PathBuf::from("/ws/projB");
         b.projects
@@ -712,12 +803,143 @@ mod tests {
     // P32.1
     #[test]
     fn project_for_or_any_falls_back_to_first_project() {
-        let mut b = backend();
+        let (mut b, _rx) = backend();
         let root = PathBuf::from("/ws/only");
         b.projects.insert(root.clone(), Project::new(root.clone()));
 
         // Unbound URI gets routed to the only project loaded.
         let unbound = uri("file:///ws/only/extra.gcl");
         assert_eq!(b.project_for_or_any(&unbound).map(|p| &p.root), Some(&root));
+    }
+
+    // P32.3
+    /// Set up a temp directory with the nested layout
+    /// `outer/project.gcl` + `outer/sub/project.gcl` and return the
+    /// outer / inner roots plus the temp base so the caller can clean
+    /// up.
+    fn fixture_nested_projects(slug: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!(
+            "gca_owner_search_{}_{}_{}",
+            slug,
+            std::process::id(),
+            // Cheap monotonically-increasing-ish suffix so parallel
+            // tests don't collide on the same dir.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let outer = tmp.join("outer");
+        let inner = outer.join("sub");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(
+            outer.join("project.gcl"),
+            "fn outer_root(): int { return 0; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join("project.gcl"),
+            "fn inner_root(): int { return 0; }\n",
+        )
+        .unwrap();
+        (tmp, outer, inner)
+    }
+
+    fn path_uri(p: &Path) -> Uri {
+        Uri::from_str(&format!("file://{}", p.display())).unwrap()
+    }
+
+    // P32.3
+    /// Pure-function test of the parent-walk: nearest `project.gcl`
+    /// wins, walk bounded by the workspace folder, files outside
+    /// every workspace folder return `None`.
+    #[test]
+    fn find_owning_project_root_picks_nearest() {
+        let (tmp, outer, inner) = fixture_nested_projects("nearest");
+        let workspace_roots = vec![outer.clone()];
+
+        // File in inner dir → inner wins.
+        let foo_uri = path_uri(&inner.join("foo.gcl"));
+        assert_eq!(
+            find_owning_project_root(&foo_uri, &workspace_roots),
+            Some(inner.clone())
+        );
+
+        // File in outer dir (sibling of `sub`) → outer wins (inner is
+        // not on the walk path).
+        let bar_uri = path_uri(&outer.join("bar.gcl"));
+        assert_eq!(
+            find_owning_project_root(&bar_uri, &workspace_roots),
+            Some(outer.clone())
+        );
+
+        // File outside every workspace folder → no owner.
+        let elsewhere_uri = path_uri(&tmp.join("elsewhere.gcl"));
+        assert_eq!(
+            find_owning_project_root(&elsewhere_uri, &workspace_roots),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // P32.3
+    /// `did_open` for a file in the eagerly-loaded outer project keeps
+    /// using outer; `did_open` for a file under the inner project
+    /// spawns it lazily.
+    #[test]
+    fn did_open_routes_to_nearest_project() {
+        let (tmp, outer, inner) = fixture_nested_projects("did_open");
+        let (mut b, _rx) = backend();
+        b.workspace_roots.push(outer.clone());
+
+        // Simulate eager load of outer.
+        let outer_uri = path_uri(&outer);
+        b.load_workspace(&outer_uri);
+        assert!(
+            b.projects.contains_key(&outer),
+            "outer project should be loaded eagerly"
+        );
+        assert!(
+            !b.projects.contains_key(&inner),
+            "inner project must not be loaded eagerly"
+        );
+
+        // Open outer/bar.gcl — owner is outer (already loaded).
+        let bar_uri = path_uri(&outer.join("bar.gcl"));
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: bar_uri.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "fn bar(): int { return 0; }\n".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(b.uri_owner.get(&bar_uri), Some(&outer));
+        assert!(
+            !b.projects.contains_key(&inner),
+            "opening outer/bar.gcl must not spawn inner project"
+        );
+
+        // Open outer/sub/foo.gcl — owner is inner, must spawn lazily.
+        let foo_uri = path_uri(&inner.join("foo.gcl"));
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: foo_uri.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "fn foo(): int { return 0; }\n".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(b.uri_owner.get(&foo_uri), Some(&inner));
+        assert!(
+            b.projects.contains_key(&inner),
+            "opening outer/sub/foo.gcl must spawn inner project"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
