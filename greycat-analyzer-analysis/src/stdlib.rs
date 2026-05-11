@@ -20,7 +20,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as HirTypeRef};
 use greycat_analyzer_types::{
-    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
+    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeDeclId, TypeId, TypeKind, TypeRegistry,
 };
 
 /// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
@@ -633,6 +633,33 @@ impl ProjectIndex {
             cur = parent;
         }
         false
+    }
+
+    // P36.1
+    /// Handle-keyed variant of [`Self::is_subtype_of`]. Resolves both
+    /// handles to their declared names via `registry` and delegates
+    /// to the name-keyed implementation. Returns `false` when either
+    /// handle isn't in the registry (callers that mint handles via
+    /// the project pipeline always insert both via the same registry,
+    /// so a registered-but-missing handle is a programming error,
+    /// not a user-facing case).
+    ///
+    /// Replaces every `is_subtype_of(&str, &str)` call site as the
+    /// migration progresses; the string form is kept during the
+    /// `Named` -> `Type(handle)` cascade and deleted in P36.7.
+    pub fn is_subtype_of_decl(
+        &self,
+        registry: &crate::well_known::DeclRegistry,
+        sub: TypeDeclId,
+        sup: TypeDeclId,
+    ) -> bool {
+        if sub == sup {
+            return true;
+        }
+        let (Some(sub_name), Some(sup_name)) = (registry.name(sub), registry.name(sup)) else {
+            return false;
+        };
+        self.is_subtype_of(sub_name, sup_name)
     }
     pub fn native_for(&self, name: &str) -> Option<&NativeSignature> {
         self.symbols
@@ -1265,6 +1292,56 @@ fn helper(): int { return 1; }
         // inner TypeMembers — interning preserves identity.
         let weight_sym = idx.symbol("weight").expect("weight interned via ingest");
         assert!(bag.attrs.contains_key(&weight_sym));
+    }
+
+    // P36.1
+    #[test]
+    fn is_subtype_of_decl_resolves_handles_then_delegates_to_name_keyed() {
+        // Inheritance graph: `Cat extends Animal`. `is_subtype_of_decl`
+        // takes handles, looks each up in the registry, and asks the
+        // existing name-keyed walker. Equal handles short-circuit
+        // without registry access; missing handles return false.
+        use crate::well_known::DeclRegistry;
+        use greycat_analyzer_hir::arena::Idx;
+        use greycat_analyzer_hir::types::Decl;
+
+        let hir = lower(
+            "type Animal { name: String; }\n\
+             type Cat extends Animal { whiskers: int; }\n",
+        );
+        let u = uri("/proj/m.gcl");
+        let mut idx = ProjectIndex::new();
+        idx.ingest(&u, &hir);
+
+        // Mint handles into a DeclRegistry by re-walking the HIR decls
+        // (mirrors the project pipeline's bootstrap order).
+        let mut registry = DeclRegistry::new();
+        let module = hir.module.as_ref().unwrap();
+        let mut animal = None;
+        let mut cat = None;
+        for decl_id in &module.decls {
+            if let Decl::Type(td) = &hir.decls[*decl_id] {
+                let name = hir.idents[td.name].text.as_str();
+                let id = registry.get_or_insert(&u, *decl_id, name);
+                match name {
+                    "Animal" => animal = Some(id),
+                    "Cat" => cat = Some(id),
+                    _ => {}
+                }
+            }
+        }
+        let animal = animal.unwrap();
+        let cat = cat.unwrap();
+
+        assert!(idx.is_subtype_of_decl(&registry, cat, animal));
+        assert!(!idx.is_subtype_of_decl(&registry, animal, cat));
+        // Reflexivity short-circuits regardless of registry membership.
+        assert!(idx.is_subtype_of_decl(&registry, animal, animal));
+
+        // A handle not in the registry returns false (no panic).
+        let dangling =
+            registry.get_or_insert(&uri("/other.gcl"), Idx::<Decl>::from_raw(99u32), "Ghost");
+        assert!(!idx.is_subtype_of_decl(&registry, dangling, animal));
     }
 
     #[test]
