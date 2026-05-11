@@ -2743,21 +2743,29 @@ fn completion_in_module_decl_carries_signature_detail() {
 /// must still surface the receiver's members (the `node` tag's own
 /// methods + the inner type's members via the `.`→`->` rewrite).
 #[test]
-// P35.9 — unignore once `member_completion` walks runtime-type
-// decls (`node`, `nodeTime`, etc.). Today `member_completion`
-// looks up `module.analysis.type_decls.get("node")` and
-// `project.index.locate_decl("node")`; both miss because the
-// `node` decl lives in `std/core.gcl` and isn't surfaced by either
-// the per-module type-decls map nor by `locate_decl`. Phase 35
-// replaces SmolStr-name lookups with `TypeDeclId` handles
-// resolved through `WellKnown`, after which this just walks the
-// `node` decl's members the same way it walks a user type's.
-#[ignore = "tracked by P35.9 — member_completion needs to consult well_known.node_decl"]
+// ERROR-recovery variant — `n.` triggers `(ERROR (ident))` in
+// the body. The body's `n` ident isn't lowered, so
+// `receiver_type_at` can't find it via stages 1/2. Stage 3's
+// text-based fallback walks `Decl::Fn` / `Decl::Type` but not
+// top-level `Decl::Var` — unignore once P35.10 lands the modvar
+// walk + `visit_top_var` `def_types` population.
+#[ignore = "tracked by P35.10 — receiver_type_at needs modvar handling in stage 3"]
 fn completion_after_dot_on_modvar_node_receiver() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    // P35.9 — load a minimal std/core fixture so the `node` decl
+    // is part of the project. With it, `member_completion`'s
+    // existing fallback (`project.index.locate_decl("node")`)
+    // finds the std-core decl and walks its members.
+    let std_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        std_uri,
+        "native type node<T> {\n  fn resolve(): node<T>;\n  fn set(value: T): node<T>;\n}\n",
+        "std",
+        false,
+    );
     mgr.add_simple(
         user_uri.clone(),
         "var n: node<int?>;\nfn main() {\n    n.\n}\n",
@@ -2830,18 +2838,20 @@ fn completion_after_dot_on_modvar_user_type_receiver_no_error() {
 /// recovery. Lets us pin down whether the modvar bug lives in the
 /// HIR fast path or only in the ERROR-recovery fallback path.
 #[test]
-// P35.9 — unignore once `member_completion` walks runtime-type
-// decls. Same root cause as
-// `completion_after_dot_on_modvar_node_receiver`; this variant
-// has no ERROR-recovery so it isolates the runtime-tag member
-// gap from the `receiver_type_at` modvar gap (which P35.10
-// addresses separately).
-#[ignore = "tracked by P35.9 — member_completion needs to consult well_known.node_decl"]
 fn completion_after_dot_on_modvar_node_receiver_no_error() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    // P35.9 — minimal std/core fixture (as in
+    // `completion_after_dot_on_modvar_node_receiver`).
+    let std_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        std_uri,
+        "native type node<T> {\n  fn resolve(): node<T>;\n  fn set(value: T): node<T>;\n}\n",
+        "std",
+        false,
+    );
     mgr.add_simple(
         user_uri.clone(),
         "var n: node<int?>;\nfn main() {\n    n.foo;\n}\n",
