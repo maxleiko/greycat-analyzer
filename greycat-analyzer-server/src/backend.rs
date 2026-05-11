@@ -691,7 +691,9 @@ impl Backend {
         if params.changes.is_empty() {
             return Ok(());
         }
-        let mut needs_reload = false;
+        // P32.7 — bucket reload triggers per project so a watcher
+        // event in projectA never wakes up projectB.
+        let mut reload_set: FxHashSet<PathBuf> = FxHashSet::default();
         for ev in &params.changes {
             let uri = &ev.uri;
             let path = match uri_to_path(uri) {
@@ -706,8 +708,23 @@ impl Backend {
                     == Some("lib");
             let is_gcl = path.extension().and_then(|e| e.to_str()) == Some("gcl");
             if is_installed {
-                debug!("[watch] {:?} on lib/installed -> reload", ev.typ);
-                needs_reload = true;
+                // path = <proj_root>/lib/installed; project root is
+                // path.parent().parent(). Only schedule a reload when
+                // the implied root maps to a loaded project; events
+                // for unknown projects are ignored.
+                if let Some(root) = path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf())
+                    && self.projects.contains_key(&root)
+                {
+                    debug!(
+                        "[watch] {:?} on lib/installed -> reload {}",
+                        ev.typ,
+                        root.display()
+                    );
+                    reload_set.insert(root);
+                }
                 continue;
             }
             if !is_gcl {
@@ -724,55 +741,68 @@ impl Backend {
                 debug!("[watch] {:?} on opened {} -> skip", ev.typ, uri.as_str());
                 continue;
             }
+            // Find which project(s) the file belongs to. If the file
+            // has no owner yet (CREATED on a new module), fall back to
+            // a parent-walk against the workspace folders. Files
+            // outside every workspace folder are ignored — orphans
+            // don't trigger reloads.
+            let mut owners: Vec<PathBuf> = self
+                .uri_owner
+                .get(uri)
+                .map(|o| o.to_vec())
+                .unwrap_or_default();
+            if owners.is_empty()
+                && let Some(root) = find_owning_project_root(uri, &self.workspace_roots)
+            {
+                owners.push(root);
+            }
+            if owners.is_empty() {
+                debug!("[watch] {:?} on unowned {} -> skip", ev.typ, uri.as_str());
+                continue;
+            }
             match ev.typ {
                 FileChangeType::CREATED => {
-                    debug!("[watch] created {}", uri.as_str());
-                    needs_reload = true;
+                    debug!("[watch] created {} -> reload {:?}", uri.as_str(), owners);
+                    for root in &owners {
+                        reload_set.insert(root.clone());
+                    }
                 }
                 FileChangeType::CHANGED => {
-                    // Refresh the closed source from disk. A change to a
-                    // non-pragma module doesn't need a project re-walk;
-                    // an `invalidate` is enough.
-                    if let Ok(text) = std::fs::read_to_string(&path)
-                        && let Some(project) = self.project_for_mut(uri)
-                    {
-                        project
-                            .manager
-                            .add_simple(uri.clone(), text, "project", false);
-                        self.invalidate_with_slow_warning(uri, "watch");
-                        if let Err(e) = self.publish_for(uri) {
-                            warn!("publish_for({}) failed: {e}", uri.as_str());
+                    // Refresh the closed source from disk for every
+                    // owning project. A change to a non-pragma module
+                    // doesn't need a re-walk; an `invalidate` per
+                    // project is enough.
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for root in &owners {
+                        if let Some(project) = self.projects.get_mut(root) {
+                            project
+                                .manager
+                                .add_simple(uri.clone(), text.clone(), "project", false);
                         }
+                    }
+                    self.invalidate_with_slow_warning(uri, "watch");
+                    if let Err(e) = self.publish_for(uri) {
+                        warn!("publish_for({}) failed: {e}", uri.as_str());
                     }
                 }
                 FileChangeType::DELETED => {
-                    debug!("[watch] deleted {}", uri.as_str());
-                    // P32.6 — drop the file from every project's
-                    // manager (it may have had multiple owners in
-                    // the @include-overlap case).
-                    if let Some(owners) = self.uri_owner.get(uri).cloned() {
-                        for root in owners.iter() {
-                            if let Some(project) = self.projects.get_mut(root) {
-                                let _ = project.manager.remove(uri);
-                            }
+                    debug!("[watch] deleted {} -> reload {:?}", uri.as_str(), owners);
+                    for root in &owners {
+                        if let Some(project) = self.projects.get_mut(root) {
+                            let _ = project.manager.remove(uri);
                         }
+                        reload_set.insert(root.clone());
                     }
                     self.uri_owner.remove(uri);
                     self.publish_diagnostics(uri.clone(), Vec::new(), None)?;
-                    needs_reload = true;
                 }
                 _ => {}
             }
         }
-        if needs_reload {
-            // P32.7 will narrow this to the projects whose closures
-            // actually changed. For now, fan out to every loaded
-            // project so we don't silently miss reloads in a
-            // multi-project workspace.
-            let roots: Vec<PathBuf> = self.projects.keys().cloned().collect();
-            for root in roots {
-                self.reload_project_closure_for(&root);
-            }
+        for root in reload_set {
+            self.reload_project_closure_for(&root);
         }
         Ok(())
     }
@@ -959,6 +989,123 @@ mod tests {
         assert_eq!(
             find_owning_project_root(&elsewhere_uri, &workspace_roots),
             None
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // P32.7
+    /// Fixture: two sibling project directories with their own
+    /// `project.gcl`. projA `@include`s `src/` so new files dropped
+    /// there get picked up on reload. Returns the temp base + both
+    /// project roots.
+    fn fixture_sibling_projects(slug: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!(
+            "gca_watcher_{}_{}_{}",
+            slug,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let proj_a = tmp.join("projA");
+        let proj_b = tmp.join("projB");
+        let proj_a_src = proj_a.join("src");
+        std::fs::create_dir_all(&proj_a_src).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+        std::fs::write(proj_a.join("project.gcl"), "@include(\"src\");\n").unwrap();
+        std::fs::write(proj_b.join("project.gcl"), "fn b(): int { return 2; }\n").unwrap();
+        (tmp, proj_a, proj_b)
+    }
+
+    // P32.7
+    /// A `CREATED` event under `projA/src/` triggers a reload of
+    /// projA only; projB is untouched. Concretely: after the
+    /// watcher fires, the new file lives in projA's manager and NOT
+    /// in projB's.
+    #[test]
+    fn watcher_routes_created_file_to_owning_project() {
+        let (tmp, proj_a, proj_b) = fixture_sibling_projects("created");
+        let (mut b, _rx) = backend();
+        b.workspace_roots.push(tmp.clone());
+        b.load_workspace(&path_uri(&proj_a));
+        b.load_workspace(&path_uri(&proj_b));
+
+        // Drop a new file in projA/src/ on disk, then fire the watcher.
+        let extra = proj_a.join("src").join("extra.gcl");
+        std::fs::write(&extra, "fn extra(): int { return 0; }\n").unwrap();
+        let extra_uri = path_uri(&extra);
+        b.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: extra_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }],
+        })
+        .unwrap();
+
+        let proj_a_state = b.projects.get(&proj_a).expect("projA loaded");
+        let proj_b_state = b.projects.get(&proj_b).expect("projB loaded");
+        assert!(
+            proj_a_state.manager.get(&extra_uri).is_some(),
+            "projA's manager must now contain extra.gcl"
+        );
+        assert!(
+            proj_b_state.manager.get(&extra_uri).is_none(),
+            "projB's manager must NOT contain extra.gcl"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // P32.7
+    /// A `lib/installed` write under `projA/` reloads projA only.
+    /// We can't easily observe "did not reload projB", so the
+    /// assertion is structural: the per-event routing logic picks
+    /// the right project root.
+    #[test]
+    fn watcher_routes_lib_installed_to_owning_project() {
+        let (tmp, proj_a, proj_b) = fixture_sibling_projects("installed");
+        let (mut b, _rx) = backend();
+        b.workspace_roots.push(tmp.clone());
+        b.load_workspace(&path_uri(&proj_a));
+        b.load_workspace(&path_uri(&proj_b));
+
+        // Add a dummy file to projB so we can later observe that
+        // projB's manager state didn't get clobbered by an unrelated
+        // reload.
+        let b_only = proj_b.join("b_only.gcl");
+        std::fs::write(&b_only, "fn b_only(): int { return 9; }\n").unwrap();
+        let b_only_uri = path_uri(&b_only);
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: b_only_uri.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "fn b_only(): int { return 9; }\n".into(),
+            },
+        })
+        .unwrap();
+
+        // Simulate `greycat install` populating projA/lib/installed.
+        let lib_dir = proj_a.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let installed = lib_dir.join("installed");
+        std::fs::write(&installed, "").unwrap();
+        b.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: path_uri(&installed),
+                typ: FileChangeType::CHANGED,
+            }],
+        })
+        .unwrap();
+
+        // projB still has b_only — its closure wasn't disturbed.
+        let proj_b_state = b.projects.get(&proj_b).expect("projB loaded");
+        assert!(
+            proj_b_state.manager.get(&b_only_uri).is_some(),
+            "projB must still own b_only after a lib/installed reload of projA"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
