@@ -164,12 +164,42 @@ pub enum TypeKind {
     /// Named user / stdlib type, identified by its fully-qualified name
     /// (`<lib>::<module>::<TypeName>` or just `<TypeName>` until we wire
     /// fully-qualified resolution).
+    ///
+    /// **Deprecated as of P35** — being replaced by [`TypeKind::Type`] and
+    /// [`TypeKind::Unresolved`]. Retained until 35.8 to keep existing
+    /// callers compiling while the migration lands chunk by chunk.
     // P25.4
     Named { name: SmolStr },
     /// Generic type instantiation — `Array<int>`, `Map<String, int>`, etc.
+    ///
+    /// **Deprecated as of P35** — being replaced by
+    /// [`TypeKind::GenericInstance`]. Retained until 35.8.
     // P25.4 / P25.7
     Generic {
         name: SmolStr,
+        args: SmallVec<[TypeId; 2]>,
+    },
+    // P35.2
+    /// A resolved non-generic type — user-defined `type Foo {...}` or
+    /// a non-generic native type from `std/core`. The decl handle is
+    /// the identity; cross-module references to the same decl share
+    /// the same `TypeDeclId`, so equality is one register-sized
+    /// compare.
+    ///
+    /// Distinct from [`TypeKind::GenericInstance`] with empty args.
+    /// Non-generic types and zero-arg instantiations are different
+    /// concepts — separating them by variant lets the substitution /
+    /// variance / node-tag-dispatch machinery match only the latter
+    /// without runtime `args.is_empty()` checks.
+    Type(TypeDeclId),
+    // P35.2
+    /// An instantiation of a generic decl — `Array<int>`, `node<int?>`,
+    /// `Map<String, V>`. `decl` is the generic template's handle;
+    /// `args` are the per-use-site type arguments and are guaranteed
+    /// non-empty by the lowering pass (zero-arg uses of a generic
+    /// decl are an analysis error caught upstream).
+    GenericInstance {
+        decl: TypeDeclId,
         args: SmallVec<[TypeId; 2]>,
     },
     /// Generic type *parameter* — the `T` inside a `fn<T>(x: T)` body.
@@ -332,6 +362,30 @@ impl TypeArena {
         })
     }
 
+    // P35.2
+    /// Allocate a resolved non-generic [`TypeKind::Type`].
+    pub fn alloc_type(&mut self, decl: TypeDeclId) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Type(decl),
+            nullable: false,
+        })
+    }
+
+    // P35.2
+    /// Allocate a [`TypeKind::GenericInstance`]. Caller guarantees
+    /// `args` is non-empty — zero-arg uses of a generic decl are an
+    /// upstream lowering error, not a value-shaped concept.
+    pub fn alloc_generic_instance(&mut self, decl: TypeDeclId, args: Vec<TypeId>) -> TypeId {
+        debug_assert!(!args.is_empty(), "GenericInstance must have non-empty args");
+        self.alloc(Type {
+            kind: TypeKind::GenericInstance {
+                decl,
+                args: args.into(),
+            },
+            nullable: false,
+        })
+    }
+
     pub fn generic_param(&mut self, name: impl Into<SmolStr>, owner: GenericOwner) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::GenericParam {
@@ -388,6 +442,23 @@ impl TypeArena {
                 } else {
                     let name = name.clone();
                     let mut new_t = self.generic(name, new_args.into_vec());
+                    if t.nullable {
+                        new_t = self.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            // P35.2 — `Type(decl)` is non-generic, no params to
+            // substitute. `GenericInstance` mirrors `Generic`.
+            TypeKind::Type(_) => ty,
+            TypeKind::GenericInstance { decl, args } => {
+                let new_args: SmallVec<[TypeId; 2]> =
+                    args.iter().map(|a| self.substitute(*a, subst)).collect();
+                if new_args == *args {
+                    ty
+                } else {
+                    let decl = *decl;
+                    let mut new_t = self.alloc_generic_instance(decl, new_args.into_vec());
                     if t.nullable {
                         new_t = self.nullable(new_t);
                     }
@@ -715,6 +786,37 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // assignable to parameter `_: Foo`" false positives.
         (TypeKind::Enum { name: na, .. }, TypeKind::Named { name: nb })
         | (TypeKind::Named { name: nb }, TypeKind::Enum { name: na, .. }) => na == nb,
+        // P35.2 — decl-handle identity. `Type(decl)` and
+        // `GenericInstance { decl, .. }` compare by handle equality;
+        // generic args reuse the same invariance / node-tag bivariance
+        // / all-any-wildcard rules as the SmolStr `Generic` arm above.
+        // Node-tag dispatch here still goes through `is_node_tag(name)`
+        // because no caller mints `GenericInstance` yet — 35.5 switches
+        // the node-tag check to a handle comparison once `WellKnown` is
+        // threaded into this fn.
+        (TypeKind::Type(da), TypeKind::Type(db)) => da == db,
+        (
+            TypeKind::GenericInstance { decl: da, args: aa },
+            TypeKind::GenericInstance { decl: db, args: ab },
+        ) => {
+            if da == db
+                && aa.len() == ab.len()
+                && !ab.is_empty()
+                && ab
+                    .iter()
+                    .all(|y| matches!(arena.get(*y).kind, TypeKind::Any))
+            {
+                return true;
+            }
+            da == db
+                && aa.len() == ab.len()
+                && aa.iter().zip(ab).all(|(x, y)| {
+                    if *x == *y {
+                        return true;
+                    }
+                    is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)
+                })
+        }
         _ => false,
     }
 }
@@ -996,6 +1098,15 @@ pub fn display(arena: &TypeArena, id: TypeId) -> String {
             let parts: Vec<String> = args.iter().map(|a| display(arena, *a)).collect();
             format!("{name}<{}>", parts.join(", "))
         }
+        // P35.2 — placeholder display until consumers thread a way to
+        // resolve `TypeDeclId` → name through `&DeclRegistry`. No
+        // caller mints these variants yet, so this placeholder never
+        // surfaces in user-visible output.
+        TypeKind::Type(d) => format!("?type#{}", d.raw()),
+        TypeKind::GenericInstance { decl, args } => {
+            let parts: Vec<String> = args.iter().map(|a| display(arena, *a)).collect();
+            format!("?type#{}<{}>", decl.raw(), parts.join(", "))
+        }
         TypeKind::GenericParam { name, .. } => name.to_string(),
         TypeKind::Lambda(l) => {
             let parts: Vec<String> = l.params.iter().map(|p| display(arena, *p)).collect();
@@ -1065,6 +1176,16 @@ pub fn display_fqn(
                 .map(|a| display_fqn(arena, *a, home_lib))
                 .collect();
             format!("{lib}::{name}<{}>", parts.join(", "))
+        }
+        // P35.2 — placeholder until consumers thread `&DeclRegistry`
+        // through. Same rationale as in [`display`].
+        TypeKind::Type(d) => format!("?type#{}", d.raw()),
+        TypeKind::GenericInstance { decl, args } => {
+            let parts: Vec<String> = args
+                .iter()
+                .map(|a| display_fqn(arena, *a, home_lib))
+                .collect();
+            format!("?type#{}<{}>", decl.raw(), parts.join(", "))
         }
         TypeKind::GenericParam { name, .. } => name.to_string(),
         TypeKind::Lambda(l) => {
