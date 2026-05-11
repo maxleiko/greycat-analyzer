@@ -277,6 +277,34 @@ fn position_at(text: &str, byte: usize) -> Position {
     }
 }
 
+// P32.5
+/// File-spanning advisory: this `.gcl` file is not part of any
+/// GreyCat project (no `project.gcl` was found walking up from its
+/// directory to its workspace folder root). Used by the LSP server
+/// alongside parse diagnostics to dim the whole file in the editor
+/// and explain why nothing else is being analysed.
+///
+/// Tagged `UNNECESSARY` so VSCode / other editors render the file
+/// greyed out. Severity is `Information` — this is guidance, not
+/// an error.
+pub fn orphan_module_diagnostic(text: &str) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: position_at(text, text.len()),
+        },
+        severity: Some(DiagnosticSeverity::INFORMATION),
+        code: Some(NumberOrString::String("orphan-module".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: "This file is not part of any GreyCat project (no `project.gcl` was found from this file's directory up to the workspace folder root). Add a `project.gcl` to enable full analysis.".into(),
+        tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+        ..Default::default()
+    }
+}
+
 /// Format a single diagnostic into the `path:line:col [severity] message`
 /// shape the cli lint subcommand prints. The `_` prefix on `code` is a
 /// reminder that the rich struct fields (related info, code, tags) get

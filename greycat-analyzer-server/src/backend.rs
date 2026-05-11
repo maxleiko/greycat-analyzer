@@ -9,7 +9,7 @@ use greycat_analyzer_core::registry::RegistryFetcher;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
     Document, SourceManager,
-    diagnostics::{parse_diagnostics, pragma_diagnostics},
+    diagnostics::{orphan_module_diagnostic, parse_diagnostics, pragma_diagnostics},
 };
 use log::{debug, info, warn};
 use lsp_server::*;
@@ -53,6 +53,15 @@ impl Project {
     }
 }
 
+// P32.5
+/// Routing decision for an opened document.
+enum DocOwner {
+    /// File belongs to the project rooted at this directory key.
+    Project(PathBuf),
+    /// File is in `self.orphans` — parse-only, no analysis.
+    Orphan,
+}
+
 // P32.1
 /// LSP server state.
 ///
@@ -72,6 +81,14 @@ pub struct Backend {
     /// `load_workspace` and on `did_open` for files that aren't part
     /// of any project's closure.
     pub uri_owner: FxHashMap<Uri, PathBuf>,
+    // P32.5
+    /// Documents opened from outside every workspace folder's
+    /// `project.gcl` closure. Parsed for syntax diagnostics but not
+    /// fed through any project's analysis pipeline. Each gets a
+    /// file-spanning [`orphan_module_diagnostic`] so the editor dims
+    /// it and explains why. Stored in a `SourceManager` for the
+    /// `update` API; the manager's `load_project` is never called.
+    pub orphans: SourceManager,
     /// Workspace folder roots from `initialize` (and later
     /// `workspace/didChangeWorkspaceFolders`). Bounds the parent-walk
     /// in P32.3's owner-search.
@@ -126,6 +143,16 @@ impl Backend {
     /// [`ProjectAnalysis::analyze`] on workspace load and by
     /// [`ProjectAnalysis::invalidate`] on every `did_open` / `did_change`.
     fn publish_for(&self, uri: &Uri) -> Result<()> {
+        // P32.5 — orphans take a separate parse-only path with a
+        // file-spanning "no project" advisory diag.
+        if let Some(cell) = self.orphans.get(uri) {
+            let doc = cell.borrow();
+            let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
+            diags.push(orphan_module_diagnostic(&doc.text));
+            let version = doc.version;
+            drop(doc);
+            return self.publish_diagnostics(uri.clone(), diags, Some(version));
+        }
         let Some(project) = self.project_for(uri) else {
             return Ok(());
         };
@@ -291,52 +318,69 @@ impl Backend {
         let uri = params.text_document.uri.clone();
         let doc = Document::new(params.text_document);
         debug!("[did_open] {doc}");
-        // P32.3 — route via parent-walk owner search if the URI isn't
-        // already bound to a project. Found owner not yet loaded → spin
-        // up a fresh Project lazily. No owner → fall through to the
-        // implicit empty-root project that P32.5 will replace with
-        // dedicated orphan handling.
-        let target_root = self.resolve_owner_for_did_open(&uri);
-        if let Some(project) = self.projects.get_mut(&target_root) {
-            project.manager.add(doc);
+        // P32.5 — three-way routing:
+        //
+        // - URI already bound to a project (eager-load or prior
+        //   did_open) → reuse that project.
+        // - URI walks to a `project.gcl` → spawn lazily if needed.
+        // - No workspace folder match, but `workspace_roots` IS empty
+        //   (headless single-file LSP session) → implicit empty-root
+        //   project gets full analysis (preserves the smoke-test path).
+        // - No workspace folder match, but `workspace_roots` is
+        //   populated → orphan: parse-only, dim diag, no analysis.
+        match self.resolve_owner_for_did_open(&uri) {
+            DocOwner::Project(root) => {
+                if let Some(project) = self.projects.get_mut(&root) {
+                    project.manager.add(doc);
+                }
+                self.invalidate_with_slow_warning(&uri, "did_open");
+            }
+            DocOwner::Orphan => {
+                self.orphans.add(doc);
+            }
         }
-        self.invalidate_with_slow_warning(&uri, "did_open");
         self.publish_for(&uri)?;
         Ok(())
     }
 
-    // P32.3
-    /// Pick the project that should own `uri` and ensure it's loaded.
-    ///
-    /// Returns the project-root key, ready to use against
-    /// `self.projects`. The URI is bound in `uri_owner` so subsequent
-    /// requests dispatch in O(1) without re-walking.
-    fn resolve_owner_for_did_open(&mut self, uri: &Uri) -> PathBuf {
+    // P32.3 / P32.5
+    /// Decide who owns `uri` and (for project files) ensure that
+    /// project is loaded.
+    fn resolve_owner_for_did_open(&mut self, uri: &Uri) -> DocOwner {
         if let Some(root) = self.uri_owner.get(uri).cloned() {
-            return root;
+            return DocOwner::Project(root);
+        }
+        if self.orphans.get(uri).is_some() {
+            return DocOwner::Orphan;
         }
         let owner = find_owning_project_root(uri, &self.workspace_roots);
-        let target = match owner {
+        match owner {
             Some(root) => {
                 if !self.projects.contains_key(&root) {
                     self.spawn_lazy_project(&root);
                 }
-                root
+                self.bind_uri(uri.clone(), root.clone());
+                DocOwner::Project(root)
             }
             None => {
-                // Orphan: P32.5 will route here with dedicated
-                // handling. For now route to the implicit empty-root
-                // project so behaviour matches today's single-project
-                // analysis.
-                let r = PathBuf::new();
-                self.projects
-                    .entry(r.clone())
-                    .or_insert_with(|| Project::new(r.clone()));
-                r
+                if self.workspace_roots.is_empty() {
+                    // Headless / single-file LSP session: keep the
+                    // implicit empty-root project as the catch-all
+                    // analysed bucket. Matches pre-P32 behaviour for
+                    // clients that didn't supply `workspace_folders`.
+                    let r = PathBuf::new();
+                    self.projects
+                        .entry(r.clone())
+                        .or_insert_with(|| Project::new(r.clone()));
+                    self.bind_uri(uri.clone(), r.clone());
+                    DocOwner::Project(r)
+                } else {
+                    // Inside a workspace but with no project.gcl up-tree
+                    // — true orphan, no analysis.
+                    DocOwner::Orphan
+                }
             }
-        };
-        self.bind_uri(uri.clone(), target.clone());
-        target
+        }
     }
 
     // P32.3
@@ -374,6 +418,15 @@ impl Backend {
 
     pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
         let uri = params.text_document.uri.clone();
+        // P32.5 — orphans live in a separate SourceManager; updating
+        // them is parse-only, no invalidate.
+        if self.orphans.get(&uri).is_some() {
+            let _ = self
+                .orphans
+                .update(&uri, params.content_changes, params.text_document.version);
+            self.publish_for(&uri)?;
+            return Ok(());
+        }
         let Some(project) = self.project_for_mut(&uri) else {
             debug!(
                 "[did_change] {} has no owning project — dropping",
@@ -554,9 +607,14 @@ impl Backend {
     }
 
     pub fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Result<()> {
-        debug!("[did_close] {}", params.text_document.uri.as_str());
+        let uri = params.text_document.uri;
+        debug!("[did_close] {}", uri.as_str());
+        // P32.5 — orphans don't outlive `did_close`. The dim diag
+        // is purely an editor signal, so dropping the doc with the
+        // buffer is correct.
+        let _ = self.orphans.remove(&uri);
         // Clear diagnostics on close so the editor's stale list goes away.
-        self.publish_diagnostics(params.text_document.uri, Vec::new(), None)?;
+        self.publish_diagnostics(uri, Vec::new(), None)?;
         Ok(())
     }
 
@@ -743,6 +801,7 @@ mod tests {
                 client: tx,
                 projects: FxHashMap::default(),
                 uri_owner: FxHashMap::default(),
+                orphans: SourceManager::new(),
                 workspace_roots: Vec::new(),
                 lint_libs: false,
                 registry: None,

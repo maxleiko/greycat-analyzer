@@ -120,6 +120,7 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
         client: conn.sender.clone(),
         projects: Default::default(),
         uri_owner: Default::default(),
+        orphans: greycat_analyzer_core::SourceManager::new(),
         workspace_roots: Vec::new(),
         lint_libs: false,
         // P15.3 — production fetcher (ureq + 5min TTL cache). Native
