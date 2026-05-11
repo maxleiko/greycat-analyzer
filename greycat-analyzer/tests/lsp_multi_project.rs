@@ -112,6 +112,142 @@ fn workspace_with_two_sibling_projects_loads_both() {
     );
 }
 
+// P32.4
+/// Goto-def in project B must not return locations from project A,
+/// even when both projects define an identically-named symbol or
+/// when B references a symbol that *only* exists in A. Projects are
+/// isolated closures; the runtime model says they don't see each
+/// other.
+#[test]
+fn goto_definition_does_not_leak_across_projects() {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp_cross_project_isolation");
+    let _ = std::fs::remove_dir_all(&base);
+    let proj_a = base.join("projA");
+    let proj_b = base.join("projB");
+    std::fs::create_dir_all(&proj_a).unwrap();
+    std::fs::create_dir_all(&proj_b).unwrap();
+
+    // Project A defines `onlyInA`; nothing in B's closure declares it.
+    std::fs::write(
+        proj_a.join("project.gcl"),
+        "fn onlyInA(): int { return 11; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proj_b.join("project.gcl"),
+        "fn rootB(): int { return 0; }\n",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_greycat-analyzer");
+    let mut child = Command::new(bin)
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn greycat-analyzer server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": null,
+                "workspaceFolders": [
+                    { "uri": uri_for(&proj_a), "name": "projA" },
+                    { "uri": uri_for(&proj_b), "name": "projB" },
+                ],
+                "capabilities": {},
+            }
+        }),
+    );
+    let _ = read_msg(&mut stdout, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    );
+
+    // Open a file in projB that references `onlyInA` (declared only
+    // in projA). Goto-def must NOT point into projA.
+    let caller_path = proj_b.join("caller.gcl");
+    let caller_text = "fn caller() { onlyInA(); }\n";
+    std::fs::write(&caller_path, caller_text).unwrap();
+    let caller_uri = uri_for(&caller_path);
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": caller_uri,
+                    "languageId": "greycat",
+                    "version": 1,
+                    "text": caller_text,
+                }
+            }
+        }),
+    );
+    // Drain the publishDiagnostics for caller.gcl so the server has
+    // finished its analyze pass for this file.
+    let _ = read_until(
+        &mut stdout,
+        |m| {
+            m["method"] == "textDocument/publishDiagnostics"
+                && m["params"]["uri"].as_str() == Some(caller_uri.as_str())
+        },
+        Duration::from_secs(10),
+    );
+
+    // Send a goto-def request at the start of `onlyInA(...)`. The
+    // string `onlyInA` begins at column 14 of `fn caller() { onlyInA(); }`.
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": { "uri": caller_uri },
+                "position": { "line": 0, "character": 16 },
+            }
+        }),
+    );
+    let resp = read_until(&mut stdout, |m| m["id"] == 2, Duration::from_secs(5));
+    let result_str = serde_json::to_string(&resp["result"]).unwrap();
+    // Any non-null result MUST not reference projA.
+    let proj_a_uri = uri_for(&proj_a);
+    assert!(
+        !result_str.contains(&proj_a_uri),
+        "goto-def in projB leaked a location from projA: {result_str}"
+    );
+
+    // Tidy shutdown.
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": null
+        }),
+    );
+    let _ = read_until(&mut stdout, |m| m["id"] == 99, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+    );
+    drop(stdin);
+    let _ = child.wait();
+}
+
 fn uri_for(path: &Path) -> String {
     format!("file://{}", path.display())
 }

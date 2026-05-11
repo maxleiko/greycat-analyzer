@@ -107,29 +107,6 @@ impl Backend {
         self.projects.get_mut(&root)
     }
 
-    // P32.1 — temporary fallback. Until P32.3 lands proper
-    // owner-search, callers that need *some* project (legacy
-    // single-project behaviour) reach for the first one. The
-    // ordering is unspecified but with a single project loaded —
-    // today's only supported shape — it's deterministic enough.
-    /// First project in `self.projects` (HashMap order). Caller
-    /// guarantees one exists; otherwise returns `None`.
-    pub fn any_project(&self) -> Option<&Project> {
-        self.projects.values().next()
-    }
-
-    pub fn any_project_mut(&mut self) -> Option<&mut Project> {
-        self.projects.values_mut().next()
-    }
-
-    /// Project-or-any: owner if known, else fall back to the first
-    /// loaded project. The plain `_or_any` flavour exists only for
-    /// the intermediate state between P32.1 and P32.3; new code
-    /// should prefer `project_for` and handle `None` explicitly.
-    pub fn project_for_or_any(&self, uri: &Uri) -> Option<&Project> {
-        self.project_for(uri).or_else(|| self.any_project())
-    }
-
     /// Bind `uri` to `root` in `uri_owner`. Idempotent.
     fn bind_uri(&mut self, uri: Uri, root: PathBuf) {
         self.uri_owner.insert(uri, root);
@@ -149,7 +126,7 @@ impl Backend {
     /// [`ProjectAnalysis::analyze`] on workspace load and by
     /// [`ProjectAnalysis::invalidate`] on every `did_open` / `did_change`.
     fn publish_for(&self, uri: &Uri) -> Result<()> {
-        let Some(project) = self.project_for_or_any(uri) else {
+        let Some(project) = self.project_for(uri) else {
             return Ok(());
         };
         let Some(cell) = project.manager.get(uri) else {
@@ -798,18 +775,6 @@ mod tests {
         // Unowned URI: no routing.
         let unbound = uri("file:///elsewhere/loose.gcl");
         assert!(b.project_for(&unbound).is_none());
-    }
-
-    // P32.1
-    #[test]
-    fn project_for_or_any_falls_back_to_first_project() {
-        let (mut b, _rx) = backend();
-        let root = PathBuf::from("/ws/only");
-        b.projects.insert(root.clone(), Project::new(root.clone()));
-
-        // Unbound URI gets routed to the only project loaded.
-        let unbound = uri("file:///ws/only/extra.gcl");
-        assert_eq!(b.project_for_or_any(&unbound).map(|p| &p.root), Some(&root));
     }
 
     // P32.3
