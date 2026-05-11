@@ -1122,18 +1122,26 @@ impl ProjectAnalysis {
             }
             // Method call on a generic receiver: substitute the
             // enclosing type's generic params into each declared
-            // method-param shape. For `n.set(42)` with
-            // `n: node<int?>`, this turns `set(value: T)` into
-            // `set(value: int?)` before the arg-type comparison so we
-            // don't surface a false "value of type `int` is not
-            // assignable to parameter `value: T`" diagnostic.
-            // Empty map for non-member callees / non-generic receivers
-            // — `read_type_shape_subst` collapses to `read_type_shape`
-            // when the map is empty.
-            let method_subst = method_subst_from_receiver(
+            // method-param type. For `n.set(42)` with `n: node<int?>`,
+            // this turns `set(value: T)` into `set(value: int?)` before
+            // the arg-type comparison so we don't surface a false
+            // "value of type `int` is not assignable to parameter
+            // `value: T`" diagnostic.
+            // Returns two pieces:
+            //   - `generics_in_scope` so `lower_type_ref_project`
+            //     mints the method's `T` as `GenericParam{T, owner=Type(node)}`
+            //     (rather than the default `Unresolved{T}` which would
+            //     accept anything).
+            //   - `subst` mapping `{T → int?}` so `arena.substitute`
+            //     replaces the `GenericParam` with the concrete arg.
+            // Both maps are empty for non-member callees / non-generic
+            // receivers; the lowering then collapses to the
+            // empty-scope path and substitution is a no-op.
+            let (method_generics_in_scope, method_subst) = method_subst_from_receiver(
                 arena,
                 cur_module,
                 fn_module,
+                index,
                 &cur_module.hir.exprs[call.callee],
             );
             let pair_count = fnd.params.len().min(call.args.len());
@@ -1142,17 +1150,29 @@ impl ProjectAnalysis {
                 let Some(declared_ref) = p.ty else {
                     continue;
                 };
-                let declared_shape =
-                    read_type_shape_subst(&fn_module.hir, declared_ref, &method_subst);
+                // Lower the method's param TypeRef directly into the
+                // shared arena (`lower_type_ref_project` returns a
+                // `TypeId`, no intermediate shape needed), then
+                // substitute the receiver-derived generic args via
+                // `arena.substitute`. Replaces the old TypeShape
+                // round-trip — one less type representation, fewer
+                // per-call allocations, no foreign-HIR re-walk.
+                let declared_raw = lower_type_ref_project(
+                    &fn_module.hir,
+                    declared_ref,
+                    arena,
+                    index,
+                    &method_generics_in_scope,
+                );
+                let declared_ty = if method_subst.is_empty() {
+                    declared_raw
+                } else {
+                    arena.substitute(declared_raw, &method_subst)
+                };
                 let arg_ty = match cur_module.analysis.expr_types.get(&call.args[i]).copied() {
                     Some(t) => t,
                     None => continue,
                 };
-                // P19: mint declared types directly into the shared
-                // project arena. Append-only + interned, so re-mints
-                // collapse and `arg_ty` (already from this arena) is
-                // comparable head-on.
-                let declared_ty = mint_type_shape(&declared_shape, arena);
                 if !is_assignable_to_with_index(index, arena, arg_ty, declared_ty) {
                     let p_name = fn_module.hir.idents[p.name].text.clone();
                     let arg_display = greycat_analyzer_types::display(arena, arg_ty);
@@ -2425,160 +2445,6 @@ fn lower_type_ref_id(
 }
 
 // P15.7
-/// Arena-free intermediate for translating a foreign HIR
-/// `TypeRef` into the destination module's `TypeArena`. Captures the
-/// shape (primitive / named / generic / nullable) so phase 2 of
-/// `infer_cross_module_call_types` can mint it without holding a
-/// borrow on the foreign module.
-#[derive(Debug, Clone)]
-enum TypeShape {
-    Primitive(greycat_analyzer_types::Primitive),
-    Any,
-    Null,
-    Named {
-        name: String,
-        params: Vec<TypeShape>,
-    },
-    Optional(Box<TypeShape>),
-}
-
-/// Read a `TypeRef` into a [`TypeShape`], substituting generic-param
-/// names per `subst`. Callers pass an empty map when no substitution
-/// is needed (no-op fast path); the call-arg validator passes a
-/// populated map when validating a method call on a generic receiver,
-/// so the method's `value: T` declaration resolves to the
-/// receiver-instantiated arg type before the assignability check.
-///
-/// When a `TypeRef`'s name matches a key in `subst`, the corresponding
-/// `TypeShape` (already in the *caller's* arena namespace via
-/// [`type_id_to_shape`]) replaces it. Powers cross-module generic
-/// method-return / attr-type substitution: e.g. `nodeIndex<K, V>::get`
-/// declared as `fn get(key: K): V?` resolves with `subst = {K → String,
-/// V → node<Pkg>}` to `Optional(Named { name: "node", params: [Named "Pkg"] })`.
-fn read_type_shape_subst(
-    hir: &Hir,
-    type_ref_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
-    subst: &FxHashMap<String, TypeShape>,
-) -> TypeShape {
-    use greycat_analyzer_types::Primitive;
-    let tr = &hir.type_refs[type_ref_id];
-    let name = hir.idents[tr.name].text.as_str();
-    if let Some(replacement) = subst.get(name) {
-        // Generic-param substitution wins, including over the optional
-        // marker — the substituted TypeShape may itself already be
-        // optional. Wrap nullable when the *use site's* TypeRef was
-        // `T?` (only if not already optional).
-        let r = replacement.clone();
-        return if tr.optional && !matches!(&r, TypeShape::Optional(_)) {
-            TypeShape::Optional(Box::new(r))
-        } else {
-            r
-        };
-    }
-    let base = match name {
-        "bool" => TypeShape::Primitive(Primitive::Bool),
-        "int" => TypeShape::Primitive(Primitive::Int),
-        "float" => TypeShape::Primitive(Primitive::Float),
-        "char" => TypeShape::Primitive(Primitive::Char),
-        "String" => TypeShape::Primitive(Primitive::String),
-        "time" => TypeShape::Primitive(Primitive::Time),
-        "duration" => TypeShape::Primitive(Primitive::Duration),
-        "geo" => TypeShape::Primitive(Primitive::Geo),
-        "any" => TypeShape::Any,
-        "null" => TypeShape::Null,
-        _ => {
-            let params: Vec<TypeShape> = tr
-                .params
-                .iter()
-                .map(|p| read_type_shape_subst(hir, *p, subst))
-                .collect();
-            TypeShape::Named {
-                name: name.to_string(),
-                params,
-            }
-        }
-    };
-    if tr.optional {
-        TypeShape::Optional(Box::new(base))
-    } else {
-        base
-    }
-}
-
-fn mint_type_shape(
-    shape: &TypeShape,
-    arena: &mut greycat_analyzer_types::TypeArena,
-) -> greycat_analyzer_types::TypeId {
-    match shape {
-        TypeShape::Primitive(p) => arena.primitive(*p),
-        TypeShape::Any => arena.any(),
-        TypeShape::Null => arena.null(),
-        TypeShape::Named { name, params } => {
-            if params.is_empty() {
-                arena.named(name.clone())
-            } else {
-                let args: Vec<_> = params.iter().map(|p| mint_type_shape(p, arena)).collect();
-                arena.generic(name.clone(), args)
-            }
-        }
-        TypeShape::Optional(inner) => {
-            let id = mint_type_shape(inner, arena);
-            arena.nullable(id)
-        }
-    }
-}
-
-/// Convert a settled `TypeId` (from the project's shared arena) into
-/// a [`TypeShape`] suitable for the validation-pass substitution map.
-/// Used by the call-arg validator: when a method is called on a
-/// generic receiver `Foo<X, Y>`, we need to substitute the method's
-/// declared `T` references with the *concrete* type at the call site.
-/// `read_type_shape_subst` reads shapes from foreign HIR and expects
-/// `subst` entries to already be in `TypeShape` form — this helper is
-/// the bridge.
-///
-/// Lossy on shapes the validation pass doesn't represent
-/// (`Lambda`, `Tuple`, `Anonymous`, `Union`, `GenericParam`,
-/// `Type` / `GenericInstance`); those fall back to `Any` so the
-/// substitution doesn't crash. Refining those mappings is follow-up
-/// work — they're rare in std/core method signatures and the
-/// validation pass already tolerates `Any` widely.
-fn type_id_to_shape(
-    arena: &greycat_analyzer_types::TypeArena,
-    id: greycat_analyzer_types::TypeId,
-) -> TypeShape {
-    use greycat_analyzer_types::TypeKind;
-    let t = arena.get(id);
-    let inner = match &t.kind {
-        TypeKind::Primitive(p) => TypeShape::Primitive(*p),
-        TypeKind::Null => TypeShape::Null,
-        TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::Never => TypeShape::Any,
-        TypeKind::Named { name } => TypeShape::Named {
-            name: name.to_string(),
-            params: Vec::new(),
-        },
-        TypeKind::Enum { name, .. } => TypeShape::Named {
-            name: name.to_string(),
-            params: Vec::new(),
-        },
-        TypeKind::Generic { name, args } => TypeShape::Named {
-            name: name.to_string(),
-            params: args.iter().map(|a| type_id_to_shape(arena, *a)).collect(),
-        },
-        _ => TypeShape::Any,
-    };
-    if t.nullable
-        && !matches!(
-            &inner,
-            TypeShape::Optional(_) | TypeShape::Null | TypeShape::Any
-        )
-    {
-        TypeShape::Optional(Box::new(inner))
-    } else {
-        inner
-    }
-}
-
 /// When a call's callee is a `Member` / `Arrow` access on a generic
 /// receiver (`n.set(...)` where `n: node<int?>`), build the
 /// `{ generic_param_name → concrete_shape }` map needed to substitute
@@ -2599,17 +2465,23 @@ fn type_id_to_shape(
 /// `value: T`", and the call appears broken to the user even though
 /// the runtime accepts it cleanly. Substituting `T → int?` before
 /// minting closes the gap.
+type GenericsInScope =
+    FxHashMap<greycat_analyzer_types::Symbol, greycat_analyzer_types::GenericOwner>;
+type MethodSubst = FxHashMap<String, greycat_analyzer_types::TypeId>;
+
 fn method_subst_from_receiver(
     arena: &greycat_analyzer_types::TypeArena,
     cur_module: &ModuleAnalysis,
     fn_module: &ModuleAnalysis,
+    index: &ProjectIndex,
     callee_expr: &greycat_analyzer_hir::types::Expr,
-) -> FxHashMap<String, TypeShape> {
+) -> (GenericsInScope, MethodSubst) {
     use greycat_analyzer_hir::types::Expr;
-    use greycat_analyzer_types::TypeKind;
+    use greycat_analyzer_types::{GenericOwner, TypeKind};
+    let empty = || (GenericsInScope::default(), MethodSubst::default());
     let receiver_expr_id = match callee_expr {
         Expr::Member(m) | Expr::Arrow(m) => m.receiver,
-        _ => return FxHashMap::default(),
+        _ => return empty(),
     };
     let Some(receiver_ty) = cur_module
         .analysis
@@ -2617,19 +2489,15 @@ fn method_subst_from_receiver(
         .get(&receiver_expr_id)
         .copied()
     else {
-        return FxHashMap::default();
+        return empty();
     };
     let recv = arena.get(receiver_ty);
-    let TypeKind::Generic {
-        name: recv_name,
-        args: recv_args,
-    } = &recv.kind
-    else {
-        return FxHashMap::default();
+    let (recv_name, recv_args): (&str, &[greycat_analyzer_types::TypeId]) = match &recv.kind {
+        TypeKind::Generic { name, args } => (name.as_str(), args.as_slice()),
+        _ => return empty(),
     };
-    let recv_name = recv_name.as_str();
     let Some(module) = fn_module.hir.module.as_ref() else {
-        return FxHashMap::default();
+        return empty();
     };
     let mut owner_td: Option<&greycat_analyzer_hir::types::TypeDecl> = None;
     for d_id in &module.decls {
@@ -2641,17 +2509,26 @@ fn method_subst_from_receiver(
         }
     }
     let Some(td) = owner_td else {
-        return FxHashMap::default();
+        return empty();
     };
-    let mut subst: FxHashMap<String, TypeShape> = FxHashMap::default();
+    let owner = GenericOwner::Type(recv_name.into());
+    let mut generics_in_scope: GenericsInScope = FxHashMap::default();
+    let mut subst: MethodSubst = FxHashMap::default();
     for (i, gen_idx) in td.generics.iter().enumerate() {
-        let Some(arg_id) = recv_args.get(i).copied() else {
-            break;
-        };
-        let gname = fn_module.hir.idents[*gen_idx].text.to_string();
-        subst.insert(gname, type_id_to_shape(arena, arg_id));
+        let gname = fn_module.hir.idents[*gen_idx].text.as_str();
+        // `lower_type_ref_project` reads `generics_in_scope` keyed by
+        // Symbol; only names *already* in the project's symbol table
+        // get the GenericParam treatment. Use `lookup` (read-only) —
+        // mutating the table here would cross the `&ProjectIndex`
+        // borrow.
+        if let Some(sym) = index.symbol(gname) {
+            generics_in_scope.insert(sym, owner.clone());
+        }
+        if let Some(arg_id) = recv_args.get(i).copied() {
+            subst.insert(gname.to_string(), arg_id);
+        }
     }
-    subst
+    (generics_in_scope, subst)
 }
 
 #[cfg(test)]
