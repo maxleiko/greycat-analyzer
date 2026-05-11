@@ -1048,6 +1048,30 @@ The `~120 ms` figure is the whole function. The plan above assumes Phase 2 (CST 
 
 ---
 
+### Phase 33 — Runtime-aligned `std` resolution (~half a day)
+
+**Goal:** match the GreyCat runtime's `std` resolution policy. Today [`SourceManager::load_project`](../greycat-analyzer-core/src/manager.rs) only loads `std` when `project.gcl` explicitly declares `@library("std", ...)`; the runtime, in contrast, *always* uses `std` — a local `<project>/lib/std/` if present, otherwise the host-wide `<greycat_home>/lib/std/`, otherwise its embedded definitions. The Rust analyzer has no embedded copy, so when both filesystem locations are empty we can't do meaningful analysis. This phase aligns the resolver and surfaces the "no std" case truthfully on the entrypoint.
+
+**Behavioral contract:**
+
+- The resolver loads `std` regardless of pragma declarations. Resolution order: `<project_dir>/lib/std/` → `<greycat_home>/lib/std/` (`$GREYCAT_HOME` env first, else `$HOME/.greycat`). No fallback if neither exists.
+- This applies *only* to `std`. Every other `@library("foo", ...)` keeps its current behavior: local-only, falls through to `unresolved-library` pragma diagnostic if the dir doesn't exist.
+- When `std` can't be resolved, [`SourceManager::load_project`](../greycat-analyzer-core/src/manager.rs) returns `LoadReport::std_resolution = StdResolution::Missing`.
+- The LSP and CLI surface that as a single `missing-std` Error+UNNECESSARY diagnostic on the `project.gcl` entrypoint. Other modules of the project are not annotated — they're already noisy with "unresolved type" errors that the missing-std diag explains.
+- Pragma `@library("std", "1.2.3")` declarations still work as before; the new auto-loader is idempotent against [`SourceManager::load_file`](../greycat-analyzer-core/src/manager.rs)'s `visited` set, so a pragma-driven load + the auto-load don't double-parse.
+
+**Chunks:**
+
+- [x] **33.1 Auto-load std + `missing-std` diagnostic** (S) — extend [`LoadReport`](../greycat-analyzer-core/src/manager.rs) with a `std_resolution: StdResolution { Local | Global | Missing }` field and an `entrypoint_uri: Option<Uri>`. Add `SourceManager::ensure_std_loaded` and call it from `load_project` unconditionally after `process_libraries`. Add [`core::diagnostics::missing_std_diagnostic`](../greycat-analyzer-core/src/diagnostics.rs) (Error severity, `UNNECESSARY` tag, code `missing-std`, range = whole file). LSP: [`Project`](../greycat-analyzer-server/src/backend.rs) captures both fields from each load and `publish_for` overlays the diag when `std_resolution == Missing && entrypoint_uri == Some(uri)`. CLI: [`cmd::lint`](../greycat-analyzer/src/cmd/lint.rs) hydrate closure injects the diag on the entrypoint URI. Tests: three `manager` unit tests covering local-wins / global-fallback / missing; one LSP integration test (hermetic via `GREYCAT_HOME=/tmp/empty`) asserting the diag's code, Error severity, and `UNNECESSARY` tag.
+
+**M33:** opening a workspace whose project has no `std` available (neither local nor global) shows exactly one Error-severity advisory dimmed across the project.gcl explaining the situation. The CLI's `lint` command surfaces the same diag at the entrypoint. Projects that *do* have std (local or global) keep loading it transparently, without needing `@library("std", ...)` in their project.gcl.
+
+**Out of scope:**
+- Embedded std fallback. The TS reference and the runtime have a built-in `std` for grammatical correctness; the analyzer doesn't, and shipping a vendored copy is a separate phase if it ever becomes desirable.
+- A code action that runs `greycat install` from the editor. Could ride a future quickfix phase.
+
+---
+
 ## 7. Test strategy
 
 Two layers, no "port every TS test" milestone (tarpit).

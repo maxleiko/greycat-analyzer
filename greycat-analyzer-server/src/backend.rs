@@ -8,10 +8,10 @@ use greycat_analyzer_core::module_desc::parse_module_desc;
 use greycat_analyzer_core::registry::RegistryFetcher;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
-    Document, SourceManager,
+    Document, SourceManager, StdResolution,
     diagnostics::{
-        multi_project_owner_diagnostic, orphan_module_diagnostic, parse_diagnostics,
-        pragma_diagnostics,
+        missing_std_diagnostic, multi_project_owner_diagnostic, orphan_module_diagnostic,
+        parse_diagnostics, pragma_diagnostics,
     },
 };
 use log::{debug, info, warn};
@@ -69,6 +69,15 @@ pub struct Project {
     /// its enclosing workspace folder, or the workspace folder's
     /// basename when the project lives at the folder root.
     pub tag: String,
+    // P33.1
+    /// Where the resolver found `std`. Drives the `missing-std`
+    /// advisory in [`Backend::publish_for`].
+    pub std_resolution: StdResolution,
+    // P33.1
+    /// URI of the project's `project.gcl` entrypoint, captured from
+    /// the loader's `LoadReport` so we can compare against incoming
+    /// publishes without re-canonicalizing.
+    pub entrypoint_uri: Option<Uri>,
 }
 
 impl Project {
@@ -78,6 +87,8 @@ impl Project {
             manager: SourceManager::new(),
             analysis: ProjectAnalysis::new(),
             tag,
+            std_resolution: StdResolution::default(),
+            entrypoint_uri: None,
         }
     }
 }
@@ -288,6 +299,15 @@ impl Backend {
         {
             diags.push(multi_project_owner_diagnostic(&doc.text, owners));
         }
+        // P33.1 — `missing-std` overlays the entrypoint when the
+        // resolver couldn't find std. Anchored on project.gcl
+        // specifically so users see the cause once, on the file that
+        // declares the project.
+        if project.std_resolution == StdResolution::Missing
+            && project.entrypoint_uri.as_ref() == Some(uri)
+        {
+            diags.push(missing_std_diagnostic(&doc.text));
+        }
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
 
@@ -401,6 +421,11 @@ impl Backend {
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
+        project.std_resolution = report.std_resolution;
+        project.entrypoint_uri = report.entrypoint_uri.clone();
+        if report.std_resolution == StdResolution::Missing {
+            warn!("[{tag}][load_project] std not found (local or $HOME/.greycat)");
+        }
         for lib in &report.unresolved_libraries {
             warn!(
                 "[{tag}] unresolved @library('{lib}') in {}",
@@ -516,6 +541,11 @@ impl Backend {
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
+        project.std_resolution = report.std_resolution;
+        project.entrypoint_uri = report.entrypoint_uri.clone();
+        if report.std_resolution == StdResolution::Missing {
+            warn!("[{tag}][lazy-load] std not found (local or $HOME/.greycat)");
+        }
         for lib in &report.unresolved_libraries {
             warn!(
                 "[{tag}] unresolved @library('{lib}') in {}",
@@ -629,6 +659,11 @@ impl Backend {
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
+        project.std_resolution = report.std_resolution;
+        project.entrypoint_uri = report.entrypoint_uri.clone();
+        if report.std_resolution == StdResolution::Missing {
+            warn!("[{tag}][reload_project] std not found (local or $HOME/.greycat)");
+        }
         for lib in &report.unresolved_libraries {
             warn!(
                 "[{tag}] unresolved @library('{lib}') in {}",

@@ -137,13 +137,50 @@ impl SourceManager {
         let mut visited: FxHashSet<PathBuf> = FxHashSet::default();
         // Load the project.gcl itself first.
         if let Some(uri) = self.load_file(project_filepath, "project", &mut visited, &mut report) {
+            report.entrypoint_uri = Some(uri.clone());
             // Walk its mod_pragmas to find @library / @include.
             let desc = self.module_desc_for(&uri);
             self.process_includes(&project_dir, &desc, &mut visited, &mut report);
             self.process_libraries(&project_dir, &desc, &mut visited, &mut report);
         }
+        // P33.1 — always ensure `std` is loaded, regardless of whether
+        // the project.gcl declared `@library("std", ...)`. This mirrors
+        // the GreyCat runtime: local `lib/std` wins, otherwise
+        // `$HOME/.greycat/lib/std`, otherwise the runtime falls back to
+        // its embedded definitions (which the analyzer can't see — we
+        // surface that as `missing-std` on the entrypoint).
+        report.std_resolution = self.ensure_std_loaded(&project_dir, &mut visited, &mut report);
 
         report
+    }
+
+    // P33.1
+    /// Load the `std` library closure from the local `<project_dir>/lib/std/`
+    /// if present, else from the global `<greycat_home>/lib/std/`. Returns
+    /// which (if any) source was used. `load_file` is idempotent against
+    /// `visited`, so this is safe to call after `process_libraries` even
+    /// when `@library("std", ...)` was declared.
+    fn ensure_std_loaded(
+        &mut self,
+        project_dir: &Path,
+        visited: &mut FxHashSet<PathBuf>,
+        report: &mut LoadReport,
+    ) -> StdResolution {
+        let local = library_dir(project_dir, "std");
+        if self.ctx.is_dir(&local) {
+            for path in self.ctx.iter_gcl(&local) {
+                self.load_file(&path, "std", visited, report);
+            }
+            return StdResolution::Local;
+        }
+        let global = global_std_dir(self.ctx.greycat_home());
+        if self.ctx.is_dir(&global) {
+            for path in self.ctx.iter_gcl(&global) {
+                self.load_file(&path, "std", visited, report);
+            }
+            return StdResolution::Global;
+        }
+        StdResolution::Missing
     }
 
     fn module_desc_for(&self, uri: &Uri) -> ModuleDesc {
@@ -321,6 +358,22 @@ impl std::fmt::Display for SourceManager {
     }
 }
 
+// P33.1
+/// Which `std` source the resolver pulled in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum StdResolution {
+    /// `<project_dir>/lib/std/` — what `greycat install` populates.
+    Local,
+    /// `<greycat_home>/lib/std/` — what a host-wide `greycat` install
+    /// ships.
+    Global,
+    /// Neither location had std. The analyzer will produce many
+    /// spurious "unresolved type" errors; the LSP / CLI surface this
+    /// as a `missing-std` diagnostic on the project.gcl entrypoint.
+    #[default]
+    Missing,
+}
+
 /// Outcome of [`SourceManager::load_project`].
 #[derive(Debug, Default, Clone)]
 pub struct LoadReport {
@@ -344,6 +397,14 @@ pub struct LoadReport {
     /// Filesystem / decoding errors encountered along the way. Strings
     /// for now.
     pub errors: Vec<String>,
+    // P33.1
+    /// Where (if anywhere) `std` was loaded from. Drives the
+    /// `missing-std` entrypoint diagnostic.
+    pub std_resolution: StdResolution,
+    // P33.1
+    /// URI of the project's `project.gcl` entrypoint — `None` only
+    /// when the entrypoint itself failed to load.
+    pub entrypoint_uri: Option<Uri>,
 }
 
 // P14.5
@@ -576,6 +637,76 @@ mod tests {
             entry.text.contains("@include"),
             "in-editor pragma must survive: text={:?}",
             entry.text
+        );
+    }
+
+    // P33.1
+    /// Even without `@library("std", ...)` in project.gcl, the
+    /// resolver pulls in the local `lib/std` when it exists. Mirrors
+    /// the runtime's behavior of preferring a project-local std over
+    /// the embedded one.
+    #[test]
+    fn load_project_auto_loads_local_std_without_declaration() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "fn main() {}\n");
+        ctx.add_file(PathBuf::from("/proj/lib/std/core.gcl"), "fn core() {}\n");
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+        assert_eq!(report.std_resolution, StdResolution::Local);
+        assert_eq!(report.loaded.len(), 2, "loaded: {:?}", report.loaded);
+        let core = mgr
+            .get(&uri("/proj/lib/std/core.gcl"))
+            .expect("core.gcl loaded");
+        assert_eq!(core.borrow().lib, "std");
+    }
+
+    // P33.1
+    /// No local `lib/std` — the resolver falls back to
+    /// `<greycat_home>/lib/std/` even without an `@library("std")`
+    /// declaration.
+    #[test]
+    fn load_project_auto_loads_global_std_without_declaration() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "fn main() {}\n");
+        ctx.add_file(PathBuf::from("/gcat/lib/std/core.gcl"), "fn core() {}\n");
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+        assert_eq!(report.std_resolution, StdResolution::Global);
+        assert_eq!(report.loaded.len(), 2);
+        let core = mgr
+            .get(&uri("/gcat/lib/std/core.gcl"))
+            .expect("global core.gcl loaded");
+        assert_eq!(core.borrow().lib, "std");
+    }
+
+    // P33.1
+    /// No std anywhere — the report records `StdResolution::Missing`
+    /// so the LSP / CLI can emit a `missing-std` advisory on the
+    /// entrypoint.
+    #[test]
+    fn load_project_reports_missing_std() {
+        let ctx = MemContext {
+            greycat_home: PathBuf::from("/gcat"),
+            ..Default::default()
+        };
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "fn main() {}\n");
+
+        let mut mgr = SourceManager::with_context(Arc::new(ctx));
+        let report = mgr.load_project(Path::new("/proj/project.gcl"));
+        assert_eq!(report.std_resolution, StdResolution::Missing);
+        // Just the entrypoint loaded.
+        assert_eq!(report.loaded.len(), 1);
+        assert_eq!(
+            report.entrypoint_uri.as_ref().map(|u| u.as_str()),
+            Some("file:///proj/project.gcl")
         );
     }
 

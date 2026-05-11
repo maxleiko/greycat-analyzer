@@ -239,6 +239,10 @@ impl Lint {
         // at zero.
         let lint_libs = self.lint_libs;
         let disabled_ref = &disabled;
+        // P33.1 — anchor the `missing-std` advisory on the entrypoint
+        // URI captured by `load_project`.
+        let entrypoint_uri = report.entrypoint_uri.clone();
+        let std_missing = report.std_resolution == greycat_analyzer_core::StdResolution::Missing;
         let hydrate = |uri: &Uri,
                        path: PathBuf,
                        text: &str,
@@ -255,6 +259,11 @@ impl Lint {
                     &desc,
                     proot,
                     &pragma_ctx,
+                ));
+            }
+            if std_missing && entrypoint_uri.as_ref() == Some(uri) {
+                diagnostics.push(greycat_analyzer_core::diagnostics::missing_std_diagnostic(
+                    text,
                 ));
             }
             if let Some(module) = analysis.module(uri) {

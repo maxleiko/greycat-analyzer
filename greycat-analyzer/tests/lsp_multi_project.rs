@@ -600,6 +600,96 @@ fn workspace_folders_add_then_remove() {
     let _ = child.wait();
 }
 
+// P33.1
+/// When the resolver can't find `std` (neither `<project>/lib/std/`
+/// nor `<greycat_home>/lib/std/`), the LSP publishes a `missing-std`
+/// Error+UNNECESSARY diag on the project.gcl entrypoint.
+///
+/// Hermetic: spawns the LSP child with `GREYCAT_HOME` pointing at an
+/// empty temp directory so the test passes regardless of whether the
+/// host has greycat installed.
+#[test]
+fn missing_std_emits_diagnostic_on_entrypoint() {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp_missing_std");
+    let _ = std::fs::remove_dir_all(&base);
+    let proj = base.join("proj");
+    let fake_home = base.join("empty-home");
+    std::fs::create_dir_all(&proj).unwrap();
+    // `fake_home` exists but has no `lib/std/` underneath it.
+    std::fs::create_dir_all(&fake_home).unwrap();
+    let entry = proj.join("project.gcl");
+    std::fs::write(&entry, "fn main() {}\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_greycat-analyzer");
+    let mut child = Command::new(bin)
+        .arg("server")
+        .env("GREYCAT_HOME", &fake_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn greycat-analyzer server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": null,
+                "workspaceFolders": [
+                    { "uri": uri_for(&proj), "name": "proj" },
+                ],
+                "capabilities": {},
+            }
+        }),
+    );
+    let _ = read_msg(&mut stdout, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
+    );
+
+    let entry_uri = uri_for(&entry);
+    let msg = read_until(
+        &mut stdout,
+        |m| {
+            m["method"] == "textDocument/publishDiagnostics"
+                && m["params"]["uri"].as_str() == Some(entry_uri.as_str())
+        },
+        Duration::from_secs(10),
+    );
+    let diags = msg["params"]["diagnostics"].as_array().unwrap();
+    let std_diag = diags
+        .iter()
+        .find(|d| d["code"].as_str() == Some("missing-std"))
+        .unwrap_or_else(|| panic!("missing-std diag not found, got: {diags:?}"));
+    // Error severity = 1 in LSP wire.
+    assert_eq!(std_diag["severity"].as_i64(), Some(1));
+    let tags = std_diag["tags"].as_array().expect("tags array");
+    // DiagnosticTag::UNNECESSARY = 1.
+    assert!(
+        tags.iter().any(|t| t.as_i64() == Some(1)),
+        "missing-std diag must carry UNNECESSARY tag, got: {tags:?}"
+    );
+
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": null }),
+    );
+    let _ = read_until(&mut stdout, |m| m["id"] == 99, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+    );
+    drop(stdin);
+    let _ = child.wait();
+}
+
 fn uri_for(path: &Path) -> String {
     format!("file://{}", path.display())
 }

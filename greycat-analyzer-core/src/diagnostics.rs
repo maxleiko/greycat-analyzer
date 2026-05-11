@@ -305,11 +305,39 @@ pub fn orphan_module_diagnostic(text: &str) -> Diagnostic {
     }
 }
 
+// P33.1
+/// File-spanning error: the GreyCat `std` library couldn't be found
+/// (neither `<project_dir>/lib/std/` nor `<greycat_home>/lib/std/`).
+/// The analyzer can't run real type-checking without std, so this
+/// dims the project.gcl and explains why every other module is
+/// drowning in "unresolved type" diagnostics.
+///
+/// Severity is `Error` (this is a hard blocker for any meaningful
+/// analysis) and the diag is also tagged `UNNECESSARY` so editors
+/// dim the whole file as a visual cue.
+pub fn missing_std_diagnostic(text: &str) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: position_at(text, text.len()),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("missing-std".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: "GreyCat `std` library not found. Looked under `<project>/lib/std/` and `$HOME/.greycat/lib/std/`. Run `greycat install` (or populate the local `lib/std/`) — without std the analyzer can't resolve built-in types.".into(),
+        tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+        ..Default::default()
+    }
+}
+
 // P32.6
 /// File-spanning advisory: this `.gcl` file is reachable from
-/// multiple projects' `@include` closures. Almost always a design
-/// error — projects should own files disjointly. Lists the
-/// conflicting project roots so the user can collapse the overlap.
+/// multiple projects' `@include` closures. Lists the conflicting
+/// project roots so the user can collapse the overlap if it's
+/// unintended.
 ///
 /// Tagged `UNNECESSARY` (dim) and `Information` severity.
 pub fn multi_project_owner_diagnostic(text: &str, roots: &[std::path::PathBuf]) -> Diagnostic {
@@ -321,7 +349,7 @@ pub fn multi_project_owner_diagnostic(text: &str, roots: &[std::path::PathBuf]) 
         roots_msg.push_str(&r.display().to_string());
     }
     let message = format!(
-        "This file is reachable from multiple GreyCat projects ({roots_msg}). Almost always a design error — a `.gcl` file should belong to exactly one project. Restructure your `@include` paths so only one project includes it."
+        "This file is reachable from multiple GreyCat projects ({roots_msg}). Analysis is anchored to the first owner; if the overlap is unintended, restructure your `@include` paths so only one project includes it."
     );
     Diagnostic {
         range: Range {
