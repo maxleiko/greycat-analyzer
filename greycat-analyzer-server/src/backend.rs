@@ -39,6 +39,19 @@ use crate::capabilities::diagnostics_from_module;
 /// so 500ms catches genuine outliers.
 const SLOW_REBUILD_MS: u128 = 500;
 
+// P32.9
+/// Static log tag for orphan-file handling. Appears as `[orphan]`
+/// in front of any log line emitted from the orphan path.
+pub const ORPHAN_LOG_TAG: &str = "orphan";
+// P32.9
+/// Static log tag for server lifecycle (`initialized`, capability
+/// registration, workspace-folder add/remove). Appears as `[server]`.
+pub const SERVER_LOG_TAG: &str = "server";
+// P32.9
+/// Tag for the implicit empty-root project that catches headless
+/// single-file LSP sessions (no `workspace_folders` at all).
+pub const SINGLE_FILE_LOG_TAG: &str = "single-file";
+
 // P32.1
 /// One independent GreyCat project: a `project.gcl` plus the
 /// `@library`/`@include` closure it pulls in, with its own
@@ -51,16 +64,59 @@ pub struct Project {
     pub root: PathBuf,
     pub manager: SourceManager,
     pub analysis: ProjectAnalysis,
+    // P32.9
+    /// Pre-computed log tag — the project root's path relative to
+    /// its enclosing workspace folder, or the workspace folder's
+    /// basename when the project lives at the folder root.
+    pub tag: String,
 }
 
 impl Project {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, tag: String) -> Self {
         Self {
             root,
             manager: SourceManager::new(),
             analysis: ProjectAnalysis::new(),
+            tag,
         }
     }
+}
+
+// P32.9
+/// Compute the `[<tag>]` log prefix for a project rooted at `root`.
+///
+/// Resolution order:
+/// 1. Find the longest workspace folder that contains `root`.
+/// 2. `root` relative to that folder — that's the tag.
+/// 3. If the relative path is empty (root == workspace folder), fall
+///    back to the workspace folder's basename.
+/// 4. If `root` isn't under any workspace folder (lazy spawn for a
+///    file dropped outside, or empty `workspace_roots`), use the
+///    root's basename. If even that is empty (`PathBuf::new()` —
+///    the headless single-file project), use [`SINGLE_FILE_LOG_TAG`].
+pub(crate) fn compute_project_tag(root: &Path, workspace_roots: &[PathBuf]) -> String {
+    if root.as_os_str().is_empty() {
+        return SINGLE_FILE_LOG_TAG.to_string();
+    }
+    if let Some(ws) = workspace_roots
+        .iter()
+        .filter(|w| root.starts_with(w))
+        .max_by_key(|w| w.as_os_str().len())
+    {
+        let rel = root.strip_prefix(ws).unwrap_or(root);
+        if rel.as_os_str().is_empty() {
+            return ws
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project")
+                .to_string();
+        }
+        return rel.display().to_string();
+    }
+    root.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string()
 }
 
 // P32.5
@@ -148,6 +204,21 @@ impl Backend {
         }
     }
 
+    // P32.9
+    /// Comma-separated list of project tags for the given owner
+    /// roots. Used to label watcher / multi-owner log lines.
+    fn owners_tag_csv(&self, owners: &[PathBuf]) -> String {
+        let tags: Vec<&str> = owners
+            .iter()
+            .filter_map(|r| self.projects.get(r).map(|p| p.tag.as_str()))
+            .collect();
+        if tags.is_empty() {
+            SERVER_LOG_TAG.into()
+        } else {
+            tags.join(",")
+        }
+    }
+
     // P32.6
     /// Drop `root` from `uri`'s owner list; remove the entry entirely
     /// when no owners remain. Used by reload-time eviction so a file
@@ -231,12 +302,12 @@ impl Backend {
             && let Some(b) = opts.get("lintLibs").and_then(|v| v.as_bool())
         {
             self.lint_libs = b;
-            debug!("[init] lintLibs={b}");
+            debug!("[{SERVER_LOG_TAG}][init] lintLibs={b}");
         }
         if let Some(workspaces) = init.workspace_folders.as_ref() {
-            debug!("workspaces:");
+            debug!("[{SERVER_LOG_TAG}] workspaces:");
             for ws in workspaces {
-                debug!("- {}={}", ws.name, ws.uri.as_str());
+                debug!("[{SERVER_LOG_TAG}] - {}={}", ws.name, ws.uri.as_str());
                 self.load_workspace(&ws.uri);
             }
         }
@@ -255,7 +326,9 @@ impl Backend {
         if supports_watch {
             self.register_file_watchers()?;
         } else {
-            debug!("[init] client does not support didChangeWatchedFiles dynamic registration");
+            debug!(
+                "[{SERVER_LOG_TAG}][init] client does not support didChangeWatchedFiles dynamic registration"
+            );
         }
         Ok(())
     }
@@ -323,15 +396,19 @@ impl Backend {
             return;
         }
         let project_root = ws_root.clone();
-        let mut project = Project::new(project_root.clone());
+        let tag = compute_project_tag(&project_root, &self.workspace_roots);
+        let mut project = Project::new(project_root.clone(), tag.clone());
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
         for lib in &report.unresolved_libraries {
-            warn!("unresolved @library('{lib}') in {}", project_file.display());
+            warn!(
+                "[{tag}] unresolved @library('{lib}') in {}",
+                project_file.display()
+            );
         }
         for err in &report.errors {
-            warn!("[load_project] {err}");
+            warn!("[{tag}][load_project] {err}");
         }
         // Single project-wide pipeline pass over everything we just
         // loaded — the per-doc analyses land in the cache.
@@ -339,7 +416,7 @@ impl Backend {
         project.analysis.rebuild(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
-            "[load_project] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
+            "[{tag}][load_project] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
             report.loaded.len(),
             project_file.display()
         );
@@ -359,7 +436,6 @@ impl Backend {
     pub fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Result<()> {
         let uri = params.text_document.uri.clone();
         let doc = Document::new(params.text_document);
-        debug!("[did_open] {doc}");
         // P32.5 — three-way routing:
         //
         // - URI already bound to a project (eager-load or prior
@@ -373,11 +449,13 @@ impl Backend {
         match self.resolve_owner_for_did_open(&uri) {
             DocOwner::Project(root) => {
                 if let Some(project) = self.projects.get_mut(&root) {
+                    debug!("[{}][did_open] {doc}", project.tag);
                     project.manager.add(doc);
                 }
                 self.invalidate_with_slow_warning(&uri, "did_open");
             }
             DocOwner::Orphan => {
+                debug!("[{ORPHAN_LOG_TAG}][did_open] {doc}");
                 self.orphans.add(doc);
             }
         }
@@ -413,7 +491,7 @@ impl Backend {
                     let r = PathBuf::new();
                     self.projects
                         .entry(r.clone())
-                        .or_insert_with(|| Project::new(r.clone()));
+                        .or_insert_with(|| Project::new(r.clone(), SINGLE_FILE_LOG_TAG.into()));
                     self.bind_uri(uri.clone(), r.clone());
                     DocOwner::Project(r)
                 } else {
@@ -433,21 +511,25 @@ impl Backend {
     /// on-demand by the parent walk.
     fn spawn_lazy_project(&mut self, root: &Path) {
         let project_file = root.join("project.gcl");
-        let mut project = Project::new(root.to_path_buf());
+        let tag = compute_project_tag(root, &self.workspace_roots);
+        let mut project = Project::new(root.to_path_buf(), tag.clone());
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
         for lib in &report.unresolved_libraries {
-            warn!("unresolved @library('{lib}') in {}", project_file.display());
+            warn!(
+                "[{tag}] unresolved @library('{lib}') in {}",
+                project_file.display()
+            );
         }
         for err in &report.errors {
-            warn!("[lazy-load] {err}");
+            warn!("[{tag}][lazy-load] {err}");
         }
         let rebuild_start = Instant::now();
         project.analysis.rebuild(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
-            "[lazy-load] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
+            "[{tag}][lazy-load] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
             report.loaded.len(),
             project_file.display()
         );
@@ -464,6 +546,7 @@ impl Backend {
         // P32.5 — orphans live in a separate SourceManager; updating
         // them is parse-only, no invalidate.
         if self.orphans.get(&uri).is_some() {
+            debug!("[{ORPHAN_LOG_TAG}][did_change] {}", uri.as_str());
             let _ = self
                 .orphans
                 .update(&uri, params.content_changes, params.text_document.version);
@@ -472,16 +555,17 @@ impl Backend {
         }
         let Some(project) = self.project_for_mut(&uri) else {
             debug!(
-                "[did_change] {} has no owning project — dropping",
+                "[{SERVER_LOG_TAG}][did_change] {} has no owning project — dropping",
                 uri.as_str()
             );
             return Ok(());
         };
+        let tag = project.tag.clone();
         let doc =
             project
                 .manager
                 .update(&uri, params.content_changes, params.text_document.version);
-        debug!("[did_change] {doc}");
+        debug!("[{tag}][did_change] {doc}");
         drop(doc);
         // **P19.22** — pragma edits to the project entrypoint can add /
         // remove `@library` / `@include`, which changes the closure of
@@ -540,15 +624,19 @@ impl Backend {
         let Some(project) = self.projects.get_mut(project_root) else {
             return;
         };
+        let tag = project.tag.clone();
         let project_file = project.root.join("project.gcl");
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
         for lib in &report.unresolved_libraries {
-            warn!("unresolved @library('{lib}') in {}", project_file.display());
+            warn!(
+                "[{tag}] unresolved @library('{lib}') in {}",
+                project_file.display()
+            );
         }
         for err in &report.errors {
-            warn!("[reload_project] {err}");
+            warn!("[{tag}][reload_project] {err}");
         }
         // **P19.23** — evict modules that are no longer in the
         // project's reachable closure (e.g., the user commented out an
@@ -562,29 +650,29 @@ impl Backend {
         let evicted = project.manager.evict_unreachable(&reachable);
         if !evicted.is_empty() {
             info!(
-                "[reload_project] evicted {} unreachable file(s):",
+                "[{tag}][reload_project] evicted {} unreachable file(s):",
                 evicted.len()
             );
             for uri in &evicted {
-                info!("[reload_project]   - {}", uri.as_str());
+                info!("[{tag}][reload_project]   - {}", uri.as_str());
             }
         }
         // Log additions explicitly too — symmetric with eviction so the
         // user can see project-closure changes in the LSP output.
         if !report.loaded.is_empty() {
             info!(
-                "[reload_project] loaded {} new file(s):",
+                "[{tag}][reload_project] loaded {} new file(s):",
                 report.loaded.len()
             );
             for (uri, _) in &report.loaded {
-                info!("[reload_project]   + {}", uri.as_str());
+                info!("[{tag}][reload_project]   + {}", uri.as_str());
             }
         }
         let rebuild_start = Instant::now();
         project.analysis.rebuild(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
-            "[reload_project] {load_took:?} (parse+load) + {rebuild_took:?} (analyze) — closure: {} reachable, {} added, {} evicted",
+            "[{tag}][reload_project] {load_took:?} (parse+load) + {rebuild_took:?} (analyze) — closure: {} reachable, {} added, {} evicted",
             report.reachable.len(),
             report.loaded.len(),
             evicted.len(),
@@ -634,30 +722,55 @@ impl Backend {
         let Some(project) = self.project_for_mut(uri) else {
             return;
         };
+        let tag = project.tag.clone();
         let start = Instant::now();
         project.analysis.invalidate(&project.manager, uri);
         let took = start.elapsed();
         if took.as_millis() >= SLOW_REBUILD_MS {
-            info!("[slow-rebuild] {source} for {} took {took:?}", uri.as_str());
+            info!(
+                "[{tag}][slow-rebuild] {source} for {} took {took:?}",
+                uri.as_str()
+            );
         }
     }
 
     pub fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Result<()> {
+        let uri = &params.text_document.uri;
+        let tag = self
+            .project_for(uri)
+            .map(|p| p.tag.as_str().to_string())
+            .unwrap_or_else(|| {
+                if self.orphans.get(uri).is_some() {
+                    ORPHAN_LOG_TAG.into()
+                } else {
+                    SERVER_LOG_TAG.into()
+                }
+            });
         debug!(
-            "[did_save] {} (text={:?})",
-            params.text_document.uri.as_str(),
+            "[{tag}][did_save] {} (text={:?})",
+            uri.as_str(),
             params.text
         );
         // Editors may format/lint on save and send the canonical text;
         // re-publish so any newly-introduced or newly-resolved errors
         // are visible.
-        self.publish_for(&params.text_document.uri)?;
+        self.publish_for(uri)?;
         Ok(())
     }
 
     pub fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Result<()> {
         let uri = params.text_document.uri;
-        debug!("[did_close] {}", uri.as_str());
+        let tag = self
+            .project_for(&uri)
+            .map(|p| p.tag.as_str().to_string())
+            .unwrap_or_else(|| {
+                if self.orphans.get(&uri).is_some() {
+                    ORPHAN_LOG_TAG.into()
+                } else {
+                    SERVER_LOG_TAG.into()
+                }
+            });
+        debug!("[{tag}][did_close] {}", uri.as_str());
         // P32.5 — orphans don't outlive `did_close`. The dim diag
         // is purely an editor signal, so dropping the doc with the
         // buffer is correct.
@@ -684,17 +797,28 @@ impl Backend {
     ) -> Result<()> {
         for ws in &params.event.added {
             let Some(path) = uri_to_path(&ws.uri) else {
-                warn!("[ws-folders] skipping non-file folder: {}", ws.uri.as_str());
+                warn!(
+                    "[{SERVER_LOG_TAG}][ws-folders] skipping non-file folder: {}",
+                    ws.uri.as_str()
+                );
                 continue;
             };
-            debug!("[ws-folders] + {} ({})", ws.name, path.display());
+            debug!(
+                "[{SERVER_LOG_TAG}][ws-folders] + {} ({})",
+                ws.name,
+                path.display()
+            );
             self.load_workspace(&ws.uri);
         }
         for ws in &params.event.removed {
             let Some(path) = uri_to_path(&ws.uri) else {
                 continue;
             };
-            debug!("[ws-folders] - {} ({})", ws.name, path.display());
+            debug!(
+                "[{SERVER_LOG_TAG}][ws-folders] - {} ({})",
+                ws.name,
+                path.display()
+            );
             // Drop every project rooted inside (or at) this folder.
             let drop_roots: Vec<PathBuf> = self
                 .projects
@@ -801,12 +925,11 @@ impl Backend {
                     .parent()
                     .and_then(|p| p.parent())
                     .map(|p| p.to_path_buf())
-                    && self.projects.contains_key(&root)
+                    && let Some(project) = self.projects.get(&root)
                 {
                     debug!(
-                        "[watch] {:?} on lib/installed -> reload {}",
-                        ev.typ,
-                        root.display()
+                        "[{}][watch] {:?} on lib/installed -> reload",
+                        project.tag, ev.typ
                     );
                     reload_set.insert(root);
                 }
@@ -823,7 +946,15 @@ impl Backend {
                 .map(|cell| cell.borrow().opened)
                 .unwrap_or(false);
             if opened {
-                debug!("[watch] {:?} on opened {} -> skip", ev.typ, uri.as_str());
+                let tag = self
+                    .project_for(uri)
+                    .map(|p| p.tag.as_str().to_string())
+                    .unwrap_or_else(|| SERVER_LOG_TAG.into());
+                debug!(
+                    "[{tag}][watch] {:?} on opened {} -> skip",
+                    ev.typ,
+                    uri.as_str()
+                );
                 continue;
             }
             // Find which project(s) the file belongs to. If the file
@@ -845,9 +976,10 @@ impl Backend {
                 debug!("[watch] {:?} on unowned {} -> skip", ev.typ, uri.as_str());
                 continue;
             }
+            let owner_tags = self.owners_tag_csv(&owners);
             match ev.typ {
                 FileChangeType::CREATED => {
-                    debug!("[watch] created {} -> reload {:?}", uri.as_str(), owners);
+                    debug!("[{owner_tags}][watch] created {} -> reload", uri.as_str());
                     for root in &owners {
                         reload_set.insert(root.clone());
                     }
@@ -869,11 +1001,14 @@ impl Backend {
                     }
                     self.invalidate_with_slow_warning(uri, "watch");
                     if let Err(e) = self.publish_for(uri) {
-                        warn!("publish_for({}) failed: {e}", uri.as_str());
+                        warn!(
+                            "[{owner_tags}][watch] publish_for({}) failed: {e}",
+                            uri.as_str()
+                        );
                     }
                 }
                 FileChangeType::DELETED => {
-                    debug!("[watch] deleted {} -> reload {:?}", uri.as_str(), owners);
+                    debug!("[{owner_tags}][watch] deleted {} -> reload", uri.as_str());
                     for root in &owners {
                         if let Some(project) = self.projects.get_mut(root) {
                             let _ = project.manager.remove(uri);
@@ -990,9 +1125,9 @@ mod tests {
         let root_a = PathBuf::from("/ws/projA");
         let root_b = PathBuf::from("/ws/projB");
         b.projects
-            .insert(root_a.clone(), Project::new(root_a.clone()));
+            .insert(root_a.clone(), Project::new(root_a.clone(), "projA".into()));
         b.projects
-            .insert(root_b.clone(), Project::new(root_b.clone()));
+            .insert(root_b.clone(), Project::new(root_b.clone(), "projB".into()));
 
         let a1 = uri("file:///ws/projA/main.gcl");
         let b1 = uri("file:///ws/projB/main.gcl");
@@ -1043,6 +1178,32 @@ mod tests {
 
     fn path_uri(p: &Path) -> Uri {
         Uri::from_str(&format!("file://{}", p.display())).unwrap()
+    }
+
+    // P32.9
+    /// `compute_project_tag` shape covers: (a) project under a
+    /// workspace folder → relative path tag; (b) project AT the
+    /// workspace folder root → workspace folder basename; (c) project
+    /// outside every workspace folder → root basename; (d) implicit
+    /// empty-root project → `"single-file"`.
+    #[test]
+    fn project_tag_resolution() {
+        let ws = PathBuf::from("/ws/repo");
+        let ws_roots = std::slice::from_ref(&ws);
+
+        // (a) under workspace folder
+        let inner = ws.join("clientA").join("api");
+        assert_eq!(compute_project_tag(&inner, ws_roots), "clientA/api");
+
+        // (b) AT the workspace folder root
+        assert_eq!(compute_project_tag(&ws, ws_roots), "repo");
+
+        // (c) outside every workspace folder
+        let stray = PathBuf::from("/tmp/loose-project");
+        assert_eq!(compute_project_tag(&stray, ws_roots), "loose-project");
+
+        // (d) implicit empty-root project
+        assert_eq!(compute_project_tag(&PathBuf::new(), &[]), "single-file");
     }
 
     // P32.3
