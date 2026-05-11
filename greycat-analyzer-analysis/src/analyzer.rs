@@ -1483,6 +1483,30 @@ impl<'a> Cx<'a> {
         Some(self.arena.substitute(attr_ty, &subst))
     }
 
+    // Arity of a generic type decl referenced by `name`, when one
+    // exists. Used by `lower_type_ref` to expand a raw-form
+    // reference (`Tensor` with no params) into the canonical
+    // `Tensor<any?; arity>` form so both lowering paths produce the
+    // same shape.
+    //
+    // Resolution order matches `lower_type_ref`: a local
+    // declaration shadows the project-wide index. Returns `None`
+    // for non-generic decls (arity 0) — those go through the
+    // existing non-generic branches.
+    fn generic_arity_for(&self, name: &str) -> Option<usize> {
+        use greycat_analyzer_hir::types::Decl;
+        // Local: find the decl by name and inspect its generics.
+        if let Some(decl_id) = self.out.type_decls.get(name)
+            && let Decl::Type(td) = &self.hir.decls[*decl_id]
+            && !td.generics.is_empty()
+        {
+            return Some(td.generics.len());
+        }
+        // Foreign: project-index pre-lowered generics list.
+        let arity = self.index.type_members_for(name)?.generics.len();
+        (arity > 0).then_some(arity)
+    }
+
     // Lower a syntactic TypeRef to a TypeId.
     fn lower_type_ref(&mut self, idx: Idx<TypeRef>) -> TypeId {
         let tr = self.hir.type_refs[idx].clone();
@@ -1509,6 +1533,18 @@ impl<'a> Cx<'a> {
                     // bare `Named`, so call-site inference can record
                     // witnesses for it.
                     self.arena.generic_param(name.clone(), owner)
+                } else if let Some(arity) = self.generic_arity_for(&name) {
+                    // Raw-form generic reference: `Tensor` (no params)
+                    // is equivalent to `Tensor<any?, any?>` per the
+                    // language semantics ("`nodeIndex {}` ===
+                    // `nodeIndex<any?, any?> {}`"). Expand at lowering
+                    // time so the body walker and validation pass
+                    // produce the *same* shape for the same source
+                    // token — kills the need for any `Named ↔ Generic`
+                    // raw-form bridge in `is_assignable_to`.
+                    let any_q = self.arena.any();
+                    let args: Vec<TypeId> = vec![any_q; arity];
+                    self.arena.generic(name.clone(), args)
                 } else if let Some(id) = self.out.registry.lookup(&name) {
                     id
                 } else if let Some(enum_id) = self.index.enum_type_for(&name) {
@@ -1524,31 +1560,19 @@ impl<'a> Cx<'a> {
                     // declaration site.
                     enum_id
                 } else if self.index.has_name(&name) {
-                    // P11.5 (+ P35.7): name is a foreign type. Resolve
-                    // via the resolver's `Definition::ProjectDecl` so
-                    // we can mint a `TypeKind::Type(handle)` keyed on
-                    // the foreign decl rather than the SmolStr name.
-                    // Fall back to the legacy `Named { name }` only
-                    // when the resolver has nothing — that path goes
-                    // away in 35.8.
-                    use crate::resolver::Definition;
-                    let foreign_handle = self.res.lookup(tr.name).and_then(|def| match def {
-                        Definition::ProjectDecl { uri, decl } => {
-                            self.decl_registry.lookup(&uri, decl)
-                        }
-                        _ => None,
-                    });
-                    match foreign_handle {
-                        Some(h) => self.arena.alloc_type(h),
-                        None => self.arena.named(name.clone()),
-                    }
+                    // P11.5 — non-generic foreign type. Lower to
+                    // `Named(name)` so receivers typed against it
+                    // carry a name `resolve_member` can defer for the
+                    // cross-module post-pass.
+                    self.arena.named(name.clone())
                 } else {
-                    // P35.3 — unknown type. Was `any()`; now `Unresolved`
-                    // so diagnostics / hover can surface the typo'd
-                    // name verbatim. Semantically behaves like `any`
-                    // (both top and bottom) so downstream type-relation
-                    // checks don't cascade; the resolver's
-                    // "unresolved name" error already pinpoints the cause.
+                    // Unknown type. Lower to `Unresolved` so
+                    // diagnostics / hover surface the typo'd name
+                    // verbatim. Behaves like `any?` for assignability
+                    // (both top and bottom) so downstream
+                    // type-relation checks don't cascade; the
+                    // resolver's "unresolved name" error already
+                    // pinpoints the cause.
                     self.arena
                         .unresolved(name.clone(), (tr.byte_range.start, tr.byte_range.end))
                 }

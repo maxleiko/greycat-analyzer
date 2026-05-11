@@ -771,23 +771,6 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                     is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)
                 })
         }
-        // **P19.14** — `Generic<N, args>` assigns to `Named<N>` (raw
-        // type form). Captures `nodeTime<float>` → `nodeTime` (no
-        // generic args declared) which appears in stdlib / library
-        // signatures as a wildcard receiver.
-        (TypeKind::Generic { name: na, .. }, TypeKind::Named { name: nb }) if na == nb => true,
-        // Symmetric: `Named<N>` (raw form) flows back into a
-        // `Generic<N, args>` slot when every target arg is `any` /
-        // `any?`. Captures the inverse direction needed for the
-        // bidirectional invariance check above: when checking
-        // `Array<nodeIndex<any?, any?>>` → `Array<nodeIndex>`, the
-        // inner arg-pair tests `nodeIndex<any?, any?>` ↔ `nodeIndex`,
-        // and this rule lets `nodeIndex` (Named, raw) flow back to
-        // the `any?`-arg'd Generic side. Runtime accepts this when
-        // (and only when) the args are all `any` shapes.
-        (TypeKind::Named { name: na }, TypeKind::Generic { name: nb, args }) if na == nb => args
-            .iter()
-            .all(|y| matches!(arena.get(*y).kind, TypeKind::Any)),
         // P7.5 anonymous structural compat: a value of `{a: A, b: B}`
         // is assignable to `{a: A}` (width subtyping — source may have
         // *extra* fields). Each shared field's source type must be
@@ -1094,13 +1077,7 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
         return true;
     }
     match (&from_t.kind, &to_t.kind) {
-        (TypeKind::Named { name: na }, TypeKind::Named { name: nb })
-        | (TypeKind::Generic { name: na, .. }, TypeKind::Named { name: nb })
-        | (TypeKind::Named { name: na }, TypeKind::Generic { name: nb, .. })
-            if na == nb =>
-        {
-            true
-        }
+        (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) if na == nb => true,
         (TypeKind::Enum { name: na, .. }, TypeKind::Enum { name: nb, .. }) if na == nb => true,
         (TypeKind::Named { name: na }, TypeKind::Enum { name: nb, .. })
         | (TypeKind::Enum { name: na, .. }, TypeKind::Named { name: nb })

@@ -1063,6 +1063,7 @@ impl ProjectAnalysis {
     fn collect_call_arg_diags_split(
         modules: &FxHashMap<Uri, ModuleAnalysis>,
         index: &ProjectIndex,
+        decl_registry: &crate::well_known::DeclRegistry,
         cur_uri: &Uri,
         arena: &mut greycat_analyzer_types::TypeArena,
     ) -> Vec<crate::analyzer::SemanticDiagnostic> {
@@ -1175,8 +1176,11 @@ impl ProjectAnalysis {
                 };
                 if !is_assignable_to_with_index(index, arena, arg_ty, declared_ty) {
                     let p_name = fn_module.hir.idents[p.name].text.clone();
-                    let arg_display = greycat_analyzer_types::display(arena, arg_ty);
-                    let declared_display = greycat_analyzer_types::display(arena, declared_ty);
+                    let name_for = |h| decl_registry.name(h).map(str::to_string);
+                    let arg_display =
+                        greycat_analyzer_types::display_with_names(arena, arg_ty, &name_for);
+                    let declared_display =
+                        greycat_analyzer_types::display_with_names(arena, declared_ty, &name_for);
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     out.push(SemanticDiagnostic {
                         severity: Severity::Error,
@@ -1316,12 +1320,13 @@ impl ProjectAnalysis {
         // module borrows.
         let arena_mut = &mut self.arena;
         let index = &self.index;
+        let decl_registry = &self.decl_registry;
         for (cur_uri, cur_module) in &self.modules {
             if !in_scope(cur_uri) {
                 continue;
             }
             let mut diags: Vec<SemanticDiagnostic> = Vec::new();
-            validate_module_type_relations(cur_module, index, arena_mut, &mut diags);
+            validate_module_type_relations(cur_module, index, decl_registry, arena_mut, &mut diags);
             // Call-arg validation needs cross-module access (foreign
             // fn signatures), so it lives on `&self` rather than the
             // free walker. Note: we hold `arena_mut` here, so call into
@@ -1330,6 +1335,7 @@ impl ProjectAnalysis {
             diags.extend(Self::collect_call_arg_diags_split(
                 &self.modules,
                 index,
+                decl_registry,
                 cur_uri,
                 arena_mut,
             ));
@@ -1996,6 +2002,7 @@ fn run_typed_lints_for_module(
 fn validate_module_type_relations(
     module: &ModuleAnalysis,
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     arena: &mut greycat_analyzer_types::TypeArena,
     diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
 ) {
@@ -2015,6 +2022,7 @@ fn validate_module_type_relations(
             hir,
             analysis,
             index,
+            decl_registry,
             arena,
             bool_t,
             &hir.decls[*d_id],
@@ -2022,10 +2030,12 @@ fn validate_module_type_relations(
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_decl(
         hir: &greycat_analyzer_hir::Hir,
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        decl_registry: &crate::well_known::DeclRegistry,
         arena: &mut greycat_analyzer_types::TypeArena,
         bool_t: greycat_analyzer_types::TypeId,
         decl: &Decl,
@@ -2033,23 +2043,47 @@ fn validate_module_type_relations(
     ) {
         match decl {
             Decl::Fn(fnd) => {
-                let return_ty = fnd
-                    .return_type
-                    .and_then(|t| lower_type_ref_id(hir, t, &analysis.registry, arena));
+                let return_ty = fnd.return_type.and_then(|t| {
+                    lower_type_ref_id(
+                        hir,
+                        t,
+                        &analysis.registry,
+                        index,
+                        &analysis.type_decls,
+                        arena,
+                    )
+                });
                 if let Some(body) = fnd.body {
-                    validate_stmt(hir, analysis, index, arena, bool_t, body, return_ty, diags);
+                    validate_stmt(
+                        hir,
+                        analysis,
+                        index,
+                        decl_registry,
+                        arena,
+                        bool_t,
+                        body,
+                        return_ty,
+                        diags,
+                    );
                 }
             }
             Decl::Type(td) => {
                 for attr_id in &td.attrs {
                     let attr = &hir.type_attrs[*attr_id];
                     if let (Some(decl_ref), Some(init)) = (attr.ty, attr.init)
-                        && let Some(declared_ty) =
-                            lower_type_ref_id(hir, decl_ref, &analysis.registry, arena)
+                        && let Some(declared_ty) = lower_type_ref_id(
+                            hir,
+                            decl_ref,
+                            &analysis.registry,
+                            index,
+                            &analysis.type_decls,
+                            arena,
+                        )
                     {
                         check_assign(
                             analysis,
                             index,
+                            decl_registry,
                             arena,
                             init,
                             declared_ty,
@@ -2061,17 +2095,33 @@ fn validate_module_type_relations(
                     }
                 }
                 for m in &td.methods {
-                    validate_decl(hir, analysis, index, arena, bool_t, &hir.decls[*m], diags);
+                    validate_decl(
+                        hir,
+                        analysis,
+                        index,
+                        decl_registry,
+                        arena,
+                        bool_t,
+                        &hir.decls[*m],
+                        diags,
+                    );
                 }
             }
             Decl::Var(vd) => {
                 if let (Some(decl_ref), Some(init)) = (vd.ty, vd.init)
-                    && let Some(declared_ty) =
-                        lower_type_ref_id(hir, decl_ref, &analysis.registry, arena)
+                    && let Some(declared_ty) = lower_type_ref_id(
+                        hir,
+                        decl_ref,
+                        &analysis.registry,
+                        index,
+                        &analysis.type_decls,
+                        arena,
+                    )
                 {
                     check_assign(
                         analysis,
                         index,
+                        decl_registry,
                         arena,
                         init,
                         declared_ty,
@@ -2091,6 +2141,7 @@ fn validate_module_type_relations(
         hir: &greycat_analyzer_hir::Hir,
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        decl_registry: &crate::well_known::DeclRegistry,
         arena: &mut greycat_analyzer_types::TypeArena,
         bool_t: greycat_analyzer_types::TypeId,
         block: &greycat_analyzer_hir::types::BlockStmt,
@@ -2098,7 +2149,17 @@ fn validate_module_type_relations(
         diags: &mut Vec<SemanticDiagnostic>,
     ) {
         for s in &block.stmts {
-            validate_stmt(hir, analysis, index, arena, bool_t, *s, return_ty, diags);
+            validate_stmt(
+                hir,
+                analysis,
+                index,
+                decl_registry,
+                arena,
+                bool_t,
+                *s,
+                return_ty,
+                diags,
+            );
         }
     }
 
@@ -2107,6 +2168,7 @@ fn validate_module_type_relations(
         hir: &greycat_analyzer_hir::Hir,
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        decl_registry: &crate::well_known::DeclRegistry,
         arena: &mut greycat_analyzer_types::TypeArena,
         bool_t: greycat_analyzer_types::TypeId,
         stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
@@ -2118,18 +2180,33 @@ fn validate_module_type_relations(
             WhileStmt,
         };
         match &hir.stmts[stmt_id] {
-            Stmt::Block(b) => {
-                validate_block(hir, analysis, index, arena, bool_t, b, return_ty, diags)
-            }
+            Stmt::Block(b) => validate_block(
+                hir,
+                analysis,
+                index,
+                decl_registry,
+                arena,
+                bool_t,
+                b,
+                return_ty,
+                diags,
+            ),
             Stmt::Var(LocalVar { ty, init, .. }) => {
                 if let (Some(decl_ref), Some(init_id)) = (ty, init)
-                    && let Some(declared_ty) =
-                        lower_type_ref_id(hir, *decl_ref, &analysis.registry, arena)
+                    && let Some(declared_ty) = lower_type_ref_id(
+                        hir,
+                        *decl_ref,
+                        &analysis.registry,
+                        index,
+                        &analysis.type_decls,
+                        arena,
+                    )
                 {
                     let r = expr_byte_range(hir, *init_id);
                     check_assign(
                         analysis,
                         index,
+                        decl_registry,
                         arena,
                         *init_id,
                         declared_ty,
@@ -2150,6 +2227,7 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
+                        decl_registry,
                         arena,
                         *value,
                         target_ty,
@@ -2179,6 +2257,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    decl_registry,
                     arena,
                     bool_t,
                     then_branch,
@@ -2186,7 +2265,17 @@ fn validate_module_type_relations(
                     diags,
                 );
                 if let Some(eb) = else_branch {
-                    validate_stmt(hir, analysis, index, arena, bool_t, *eb, return_ty, diags);
+                    validate_stmt(
+                        hir,
+                        analysis,
+                        index,
+                        decl_registry,
+                        arena,
+                        bool_t,
+                        *eb,
+                        return_ty,
+                        diags,
+                    );
                 }
             }
             Stmt::While(WhileStmt {
@@ -2201,7 +2290,17 @@ fn validate_module_type_relations(
                     hir,
                     diags,
                 );
-                validate_block(hir, analysis, index, arena, bool_t, body, return_ty, diags);
+                validate_block(
+                    hir,
+                    analysis,
+                    index,
+                    decl_registry,
+                    arena,
+                    bool_t,
+                    body,
+                    return_ty,
+                    diags,
+                );
             }
             Stmt::DoWhile(DoWhileStmt {
                 condition, body, ..
@@ -2215,7 +2314,17 @@ fn validate_module_type_relations(
                     hir,
                     diags,
                 );
-                validate_block(hir, analysis, index, arena, bool_t, body, return_ty, diags);
+                validate_block(
+                    hir,
+                    analysis,
+                    index,
+                    decl_registry,
+                    arena,
+                    bool_t,
+                    body,
+                    return_ty,
+                    diags,
+                );
             }
             Stmt::For(ForStmt {
                 condition, body, ..
@@ -2223,10 +2332,30 @@ fn validate_module_type_relations(
                 if let Some(c) = condition {
                     check_bool(analysis, arena, *c, bool_t, "for condition", hir, diags);
                 }
-                validate_block(hir, analysis, index, arena, bool_t, body, return_ty, diags);
+                validate_block(
+                    hir,
+                    analysis,
+                    index,
+                    decl_registry,
+                    arena,
+                    bool_t,
+                    body,
+                    return_ty,
+                    diags,
+                );
             }
             Stmt::ForIn(ForInStmt { body, .. }) => {
-                validate_block(hir, analysis, index, arena, bool_t, body, return_ty, diags);
+                validate_block(
+                    hir,
+                    analysis,
+                    index,
+                    decl_registry,
+                    arena,
+                    bool_t,
+                    body,
+                    return_ty,
+                    diags,
+                );
             }
             Stmt::Try(TryStmt {
                 try_block,
@@ -2234,12 +2363,21 @@ fn validate_module_type_relations(
                 ..
             }) => {
                 validate_block(
-                    hir, analysis, index, arena, bool_t, try_block, return_ty, diags,
+                    hir,
+                    analysis,
+                    index,
+                    decl_registry,
+                    arena,
+                    bool_t,
+                    try_block,
+                    return_ty,
+                    diags,
                 );
                 validate_block(
                     hir,
                     analysis,
                     index,
+                    decl_registry,
                     arena,
                     bool_t,
                     catch_block,
@@ -2248,7 +2386,17 @@ fn validate_module_type_relations(
                 );
             }
             Stmt::At(AtStmt { block, .. }) => {
-                validate_block(hir, analysis, index, arena, bool_t, block, return_ty, diags);
+                validate_block(
+                    hir,
+                    analysis,
+                    index,
+                    decl_registry,
+                    arena,
+                    bool_t,
+                    block,
+                    return_ty,
+                    diags,
+                );
             }
             Stmt::Return(Some(v)) => {
                 if let Some(rt) = return_ty {
@@ -2256,6 +2404,7 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
+                        decl_registry,
                         arena,
                         *v,
                         rt,
@@ -2274,6 +2423,7 @@ fn validate_module_type_relations(
     fn check_assign(
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        decl_registry: &crate::well_known::DeclRegistry,
         arena: &greycat_analyzer_types::TypeArena,
         value_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
         declared_ty: greycat_analyzer_types::TypeId,
@@ -2288,8 +2438,13 @@ fn validate_module_type_relations(
         if is_assignable_to_with_index(index, arena, value_ty, declared_ty) {
             return;
         }
-        let got = greycat_analyzer_types::display(arena, value_ty);
-        let want = greycat_analyzer_types::display(arena, declared_ty);
+        // Render with registry-backed name resolution so any
+        // `TypeKind::Type(handle)` value (35.4 sentinels: `function`,
+        // `type`, `field` when std is loaded) shows the real decl
+        // name instead of the `?type#N` placeholder.
+        let name_for = |h| decl_registry.name(h).map(str::to_string);
+        let got = greycat_analyzer_types::display_with_names(arena, value_ty, &name_for);
+        let want = greycat_analyzer_types::display_with_names(arena, declared_ty, &name_for);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             message: format!(
@@ -2377,6 +2532,19 @@ fn lower_type_ref_project(
                 && let Some(owner) = generics_in_scope.get(&sym)
             {
                 arena.generic_param(name.to_string(), owner.clone())
+            } else if let Some(arity) = index
+                .type_members_for(name)
+                .map(|m| m.generics.len())
+                .filter(|n| *n > 0)
+            {
+                // Raw-form generic reference: `Tensor` (no params)
+                // ≡ `Tensor<any?, any?>`. Expand at lowering time so
+                // the body walker and validation pass agree on the
+                // same shape; kills the need for any raw-form bridge
+                // in `is_assignable_to`.
+                let any_q = arena.any();
+                let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
+                arena.generic(name.to_string(), args)
             } else if let Some(enum_id) = index.enum_type_for(name) {
                 // P19.10 — canonical enum TypeId from S7-S11.
                 // Without this, a cross-module enum reference would
@@ -2387,8 +2555,9 @@ fn lower_type_ref_project(
             } else if index.has_name(name) {
                 arena.named(name.to_string())
             } else {
-                // P35.3 — unknown type. Was `any()`; now `Unresolved`
-                // so hover / display surface the typo'd name.
+                // Unknown type: `Unresolved` so hover / display
+                // surface the typo'd name verbatim. Behaves like
+                // `any?` for assignability.
                 arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
             }
         }
@@ -2407,6 +2576,8 @@ fn lower_type_ref_id(
     hir: &greycat_analyzer_hir::Hir,
     type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
     registry: &greycat_analyzer_types::TypeRegistry,
+    index: &ProjectIndex,
+    type_decls: &rustc_hash::FxHashMap<smol_str::SmolStr, greycat_analyzer_hir::arena::Idx<Decl>>,
     arena: &mut greycat_analyzer_types::TypeArena,
 ) -> Option<greycat_analyzer_types::TypeId> {
     use greycat_analyzer_types::Primitive;
@@ -2427,8 +2598,18 @@ fn lower_type_ref_id(
             if !tr.params.is_empty() {
                 let mut args = Vec::with_capacity(tr.params.len());
                 for p in &tr.params {
-                    args.push(lower_type_ref_id(hir, *p, registry, arena)?);
+                    args.push(lower_type_ref_id(
+                        hir, *p, registry, index, type_decls, arena,
+                    )?);
                 }
+                arena.generic(name.to_string(), args)
+            } else if let Some(arity) = generic_arity_for(name, hir, type_decls, index) {
+                // Raw-form generic reference: `Tensor` (no params)
+                // ≡ `Tensor<any?, any?>`. Expand here so the
+                // validation pass and the body walker's
+                // `lower_type_ref` produce the same shape.
+                let any_q = arena.any();
+                let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
                 arena.generic(name.to_string(), args)
             } else if let Some(id) = registry.lookup(name) {
                 id
@@ -2442,6 +2623,27 @@ fn lower_type_ref_id(
     } else {
         base
     })
+}
+
+/// Shared arity lookup used by `lower_type_ref_id` and (via
+/// `Cx::generic_arity_for` in `analyzer.rs`) by `lower_type_ref`.
+/// Resolution order: a local declaration shadows the project-wide
+/// index. Returns `None` for non-generic decls (arity 0) so the
+/// caller can fall through to the non-generic branches.
+fn generic_arity_for(
+    name: &str,
+    hir: &greycat_analyzer_hir::Hir,
+    type_decls: &rustc_hash::FxHashMap<smol_str::SmolStr, greycat_analyzer_hir::arena::Idx<Decl>>,
+    index: &ProjectIndex,
+) -> Option<usize> {
+    if let Some(decl_id) = type_decls.get(name)
+        && let Decl::Type(td) = &hir.decls[*decl_id]
+        && !td.generics.is_empty()
+    {
+        return Some(td.generics.len());
+    }
+    let arity = index.type_members_for(name)?.generics.len();
+    (arity > 0).then_some(arity)
 }
 
 // P15.7

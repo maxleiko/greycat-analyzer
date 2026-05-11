@@ -110,6 +110,48 @@ fn param_node_int_q_set_accepts_int_arg() {
     );
 }
 
+/// Regression for the raw-form lowering: a function declared to
+/// return `Tensor` (no generic args at the use site) used to lower
+/// the declared return type and the body's return value as
+/// different shapes (`Named{Tensor}` on one side, `Type(handle)` on
+/// the other after a partial 35.7 migration), surfacing a false
+/// "return value of type `?type#N` is not assignable to declared
+/// return type `Tensor`" diagnostic.
+///
+/// The fix normalizes raw-form generic references at lowering time:
+/// `Tensor` ≡ `Tensor<any?, any?>` per language semantics. Both
+/// lowering passes produce the same `Generic{Tensor, [any?, any?]}`
+/// shape, the existing `(Generic, Generic)` all-any widening rule
+/// accepts any concrete instantiation flowing into the raw form,
+/// and no diagnostic fires.
+#[test]
+fn raw_form_generic_return_accepts_specialized_body() {
+    let mut mgr = SourceManager::new();
+    let std_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    mgr.add_simple(
+        std_uri,
+        "native type Tensor<K, V> {\n  native fn make(): Tensor<K, V>;\n}\n",
+        "std",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        // Declared return is the raw-form `Tensor`; body produces a
+        // specialized `Tensor<int, float>`. Pre-fix this falsely
+        // flagged "not assignable".
+        "fn build(): Tensor {\n  return Tensor<int, float>::make();\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let diags = assignability_diagnostics(&pa, &user_uri);
+    assert!(
+        diags.is_empty(),
+        "expected raw-form `Tensor` declared return to accept any specialized body; got: {diags:?}"
+    );
+}
+
 /// Two-param method substitution (`nodeIndex<K, V>` shape). Confirms
 /// the fix handles N-ary generics, not just the single-param node case.
 #[test]
