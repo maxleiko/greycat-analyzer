@@ -895,6 +895,86 @@ pub fn cursor_ident_idx(
     idx_for_node(hir, node)
 }
 
+// P31.1
+/// `textDocument/definition` with project context. Mirrors the
+/// dispatcher chain the LSP handler runs:
+///
+/// 1. Module-name segment (`runtime::X`) — jump to that module's file.
+/// 2. In-module [`goto_definition`] — resolver / local member_uses path.
+/// 3. Cross-module fallback via `Definition::ProjectDecl` (foreign
+///    top-level decl).
+/// 4. Cross-module member chain segment (`foreign_decl_lookup`).
+/// 5. Cross-module member access — `foreign_member_uses`, which the
+///    analyzer's `resolve_member_with` populates for inherited members
+///    (`type Sub extends Base` + `s.method` lands on `Base::method`).
+///
+/// Returns `None` if no rule fires.
+pub fn goto_definition_across_project(
+    project: &ProjectAnalysis,
+    manager: &SourceManager,
+    cursor_uri: &Uri,
+    cursor_pos: Position,
+) -> Option<GotoDefinitionResponse> {
+    let cell = manager.get(cursor_uri)?;
+    let doc = cell.borrow();
+    if let Some(loc) = goto_module_segment(&doc.text, doc.root_node(), cursor_pos, manager) {
+        return Some(GotoDefinitionResponse::Scalar(loc));
+    }
+    if let Some(loc) = goto_definition(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos)
+    {
+        return Some(loc);
+    }
+    let module = project.module(cursor_uri)?;
+    let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
+
+    if let Some(Definition::ProjectDecl {
+        uri: foreign_uri,
+        decl,
+    }) = module.resolutions.lookup(cursor_idx)
+    {
+        drop(doc);
+        let foreign_module = project.module(&foreign_uri)?;
+        let foreign_cell = manager.get(&foreign_uri)?;
+        let foreign_doc = foreign_cell.borrow();
+        return cross_module_decl_location(
+            &foreign_uri,
+            &foreign_doc.text,
+            &foreign_module.hir,
+            decl,
+        )
+        .map(GotoDefinitionResponse::Scalar);
+    }
+    if let Some(fdecl) = module.analysis.foreign_decl_lookup(cursor_idx) {
+        let foreign_uri = fdecl.uri.clone();
+        let decl = fdecl.decl;
+        drop(doc);
+        let foreign_module = project.module(&foreign_uri)?;
+        let foreign_cell = manager.get(&foreign_uri)?;
+        let foreign_doc = foreign_cell.borrow();
+        return cross_module_decl_location(
+            &foreign_uri,
+            &foreign_doc.text,
+            &foreign_module.hir,
+            decl,
+        )
+        .map(GotoDefinitionResponse::Scalar);
+    }
+    let foreign = module.analysis.foreign_member_lookup(cursor_idx)?;
+    let foreign_uri = foreign.uri.clone();
+    let member = foreign.member;
+    drop(doc);
+    let foreign_module = project.module(&foreign_uri)?;
+    let foreign_cell = manager.get(&foreign_uri)?;
+    let foreign_doc = foreign_cell.borrow();
+    cross_module_member_location(
+        &foreign_uri,
+        &foreign_doc.text,
+        &foreign_module.hir,
+        &member,
+    )
+    .map(GotoDefinitionResponse::Scalar)
+}
+
 // P8.6
 /// `textDocument/implementation`. For a method-name ident,
 /// returns every concrete (non-`abstract`, non-`native`) method with

@@ -311,80 +311,14 @@ fn goto_definition_handler(
     server: &Backend,
     params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
-    use greycat_analyzer_analysis::resolver::Definition;
-
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    let cell = server.manager.get(&uri)?;
-    let doc = cell.borrow();
-    // P15.9 — module-name segment in a static_expr chain
-    // (`runtime::X::Y`) jumps to the named module's file.
-    if let Some(loc) =
-        capabilities::goto_module_segment(&doc.text, doc.root_node(), pos, &server.manager)
-    {
-        return Some(GotoDefinitionResponse::Scalar(loc));
-    }
-    if let Some(loc) =
-        capabilities::goto_definition(&doc.text, &doc.lib, doc.root_node(), &uri, pos)
-    {
-        return Some(loc);
-    }
-    // P11.3: cross-module fallback. Consult the cached resolutions —
-    // if the cursor binds to a `Definition::ProjectDecl`, resolve the
-    // foreign module's decl-name range out of the project analysis
-    // cache and source manager.
-    let module = server.project_analysis.module(&uri)?;
-    let cursor_idx = capabilities::cursor_ident_idx(&doc.text, doc.root_node(), pos, &module.hir)?;
-    if let Some(Definition::ProjectDecl {
-        uri: foreign_uri,
-        decl,
-    }) = module.resolutions.lookup(cursor_idx)
-    {
-        drop(doc);
-        let foreign_module = server.project_analysis.module(&foreign_uri)?;
-        let foreign_cell = server.manager.get(&foreign_uri)?;
-        let foreign_doc = foreign_cell.borrow();
-        return capabilities::cross_module_decl_location(
-            &foreign_uri,
-            &foreign_doc.text,
-            &foreign_module.hir,
-            decl,
-        )
-        .map(GotoDefinitionResponse::Scalar);
-    }
-    // P15.x: chain-segment binding (e.g. `Identity` in
-    // `runtime::Identity::create` -> the foreign `type Identity`).
-    if let Some(fdecl) = module.analysis.foreign_decl_lookup(cursor_idx) {
-        let foreign_uri = fdecl.uri.clone();
-        let decl = fdecl.decl;
-        drop(doc);
-        let foreign_module = server.project_analysis.module(&foreign_uri)?;
-        let foreign_cell = server.manager.get(&foreign_uri)?;
-        let foreign_doc = foreign_cell.borrow();
-        return capabilities::cross_module_decl_location(
-            &foreign_uri,
-            &foreign_doc.text,
-            &foreign_module.hir,
-            decl,
-        )
-        .map(GotoDefinitionResponse::Scalar);
-    }
-    // P11.5: cross-module member access (`a.b` where the receiver type
-    // lives in another module). Consult the cached `foreign_member_uses`.
-    let foreign = module.analysis.foreign_member_lookup(cursor_idx)?;
-    let foreign_uri = foreign.uri.clone();
-    let member = foreign.member;
-    drop(doc);
-    let foreign_module = server.project_analysis.module(&foreign_uri)?;
-    let foreign_cell = server.manager.get(&foreign_uri)?;
-    let foreign_doc = foreign_cell.borrow();
-    capabilities::cross_module_member_location(
-        &foreign_uri,
-        &foreign_doc.text,
-        &foreign_module.hir,
-        &member,
+    capabilities::goto_definition_across_project(
+        &server.project_analysis,
+        &server.manager,
+        &uri,
+        pos,
     )
-    .map(GotoDefinitionResponse::Scalar)
 }
 
 fn goto_implementation_handler(
