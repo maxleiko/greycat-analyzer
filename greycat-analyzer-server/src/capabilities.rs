@@ -4247,6 +4247,7 @@ fn member_completion(
     let module = project.module(uri)?;
     let arena = project.arena();
     let decl_registry = &project.decl_registry;
+    let well_known = project.well_known();
     let recv_ty = receiver_type_at(text, root, module, recv_end)?;
     let name = type_head_name(arena, decl_registry, recv_ty)?;
 
@@ -4258,6 +4259,14 @@ fn member_completion(
     let inner_head: Option<String> = match (is_arrow, &arena.get(recv_ty).kind) {
         (_, greycat_analyzer_types::TypeKind::Generic { name: tag, args })
             if greycat_analyzer_types::is_node_tag(tag) && args.len() == 1 =>
+        {
+            type_head_name(arena, decl_registry, args[0]).map(|s| s.to_string())
+        }
+        // P36.6 — handle-keyed node-tag completion. Mirrors the
+        // body walker's `arrow_deref_receiver` dispatch via the
+        // well-known node-tag handle set.
+        (_, greycat_analyzer_types::TypeKind::GenericInstance { decl, args })
+            if well_known.is_node_tag(*decl) && args.len() == 1 =>
         {
             type_head_name(arena, decl_registry, args[0]).map(|s| s.to_string())
         }

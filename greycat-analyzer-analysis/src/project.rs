@@ -230,6 +230,14 @@ impl ProjectAnalysis {
         &self.decl_registry
     }
 
+    /// Project-wide well-known std/core decl handles. Capability
+    /// handlers that need to dispatch on the std-core `node` /
+    /// `Array` / etc. identity (rather than the SmolStr name)
+    /// consume this via `WellKnown::is_node_tag(decl)` etc.
+    pub fn well_known(&self) -> &crate::well_known::WellKnown {
+        &self.well_known
+    }
+
     /// One-pass build over every document currently in `manager`.
     pub fn analyze(manager: &SourceManager) -> Self {
         let mut out = Self::new();
