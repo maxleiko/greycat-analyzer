@@ -14,6 +14,10 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Directory names skipped by [`Context::iter_gcl`] — matches the TS
+/// `IGNORE` list in `packages/resolver/src/{fs,sync-fs}.ts`.
+const IGNORED_DIRS: &[&str] = &["node_modules", "gcdata", ".git"];
+
 // =============================================================================
 // Path math (pure, no I/O)
 // =============================================================================
@@ -184,10 +188,6 @@ impl Context for FsContext {
         &self.greycat_home
     }
 }
-
-/// Directory names skipped by [`Context::iter_gcl`] — matches the TS
-/// `IGNORE` list in `packages/resolver/src/{fs,sync-fs}.ts`.
-const IGNORED_DIRS: &[&str] = &["node_modules", "gcdata", ".git"];
 
 fn walk_gcl(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
