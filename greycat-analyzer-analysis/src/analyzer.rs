@@ -378,6 +378,7 @@ pub fn analyze_with_index_into(
         index,
         narrows: Vec::new(),
         member_narrows: Vec::new(),
+        member_typed_narrows: Vec::new(),
         chain_member_ifs: FxHashSet::default(),
         generics_in_scope: Vec::new(),
         this_stack: Vec::new(),
@@ -481,6 +482,16 @@ struct CondNarrows {
     /// `this` literal participate.
     then_member_non_null: Vec<String>,
     else_member_non_null: Vec<String>,
+    /// `(path, type)` pairs from `foo.bar is T` — narrow the member-access
+    /// path to T in the then-branch. Mirrors `then_typed` for member paths.
+    then_member_typed: Vec<(String, Idx<TypeRef>)>,
+    /// `(binding, type)` pairs that hold on the *else* branch. Populated
+    /// only via negation (`!(x is T)`); the post-if `then_terminates`
+    /// path uses these to lift `is`-narrows past an early-throw guard
+    /// like `if (!(x is T)) { throw }; use(x as T);`.
+    else_typed: Vec<(Idx<Ident>, Idx<TypeRef>)>,
+    /// Same as `then_member_typed` but for the else branch (under `!`).
+    else_member_typed: Vec<(String, Idx<TypeRef>)>,
 }
 
 /// One arm in an enum-equality chain.
@@ -551,6 +562,12 @@ struct Cx<'a> {
     /// chains. Best-effort — `foo[i].bar` or `getThing().bar` have
     /// no stable path and skip narrowing.
     member_narrows: Vec<FxHashSet<String>>,
+    /// Parallel typed-narrow stack for member-access paths from
+    /// `foo.bar is T` guards. A path's presence in any frame means the
+    /// member access at that path is *guaranteed of type T* in the
+    /// current scope. Frames are pushed / popped in lockstep with
+    /// `narrows`. Mirrors `then_typed` for member paths.
+    member_typed_narrows: Vec<FxHashMap<String, TypeId>>,
     /// `Stmt::If` ids already accounted for as nested members of an
     /// enclosing exhaustiveness chain. Suppresses duplicate
     /// "non-exhaustive" diagnostics on inner `else if` arms.
@@ -607,10 +624,12 @@ impl<'a> Cx<'a> {
     fn push_narrow(&mut self) {
         self.narrows.push(FxHashMap::default());
         self.member_narrows.push(FxHashSet::default());
+        self.member_typed_narrows.push(FxHashMap::default());
     }
     fn pop_narrow(&mut self) {
         self.narrows.pop();
         self.member_narrows.pop();
+        self.member_typed_narrows.pop();
     }
     fn write_narrow(&mut self, name: Idx<Ident>, ty: TypeId) {
         if let Some(top) = self.narrows.last_mut() {
@@ -638,6 +657,30 @@ impl<'a> Cx<'a> {
     /// (any frame on the member-narrow stack contains it).
     fn member_path_is_non_null(&self, path: &str) -> bool {
         self.member_narrows.iter().any(|f| f.contains(path))
+    }
+    /// Record `path` as guaranteed to be of type `ty` in the current
+    /// scope. Subsequent `Expr::Member` / `Expr::Arrow` evaluations at
+    /// the same path use this type instead of the declared one.
+    fn write_member_typed(&mut self, path: String, ty: TypeId) {
+        if let Some(top) = self.member_typed_narrows.last_mut() {
+            top.insert(path, ty);
+        }
+    }
+    /// Drop any typed narrow recorded for `path`. Call when the path
+    /// is reassigned to a value whose type is unknown.
+    fn drop_member_typed(&mut self, path: &str) {
+        for frame in self.member_typed_narrows.iter_mut().rev() {
+            frame.remove(path);
+        }
+    }
+    /// Innermost-first lookup of the narrowed type for a member path.
+    fn lookup_member_typed(&self, path: &str) -> Option<TypeId> {
+        for frame in self.member_typed_narrows.iter().rev() {
+            if let Some(t) = frame.get(path) {
+                return Some(*t);
+            }
+        }
+        None
     }
     /// Innermost-first lookup of a binding ident's current type:
     /// narrowing frames win over `def_types`, mirroring the way TS
@@ -717,6 +760,9 @@ impl<'a> Cx<'a> {
         if matches!(self.hir.exprs[target], Expr::Member(_) | Expr::Arrow(_))
             && let Some(path) = self.member_path(target)
         {
+            // Re-assigning the path invalidates any prior `is`-narrowed type;
+            // the new value's static type may be the supertype again.
+            self.drop_member_typed(&path);
             if self.arena.get(value_ty).nullable {
                 // RHS may be null → drop any prior non-null narrow
                 // so subsequent reads see the declared (nullable)
@@ -1674,6 +1720,9 @@ impl<'a> Cx<'a> {
                     then_typed,
                     then_member_non_null,
                     else_member_non_null,
+                    then_member_typed,
+                    else_typed,
+                    else_member_typed,
                 } = self.derive_cond_narrows(condition);
 
                 self.push_narrow();
@@ -1689,6 +1738,10 @@ impl<'a> Cx<'a> {
                 }
                 for path in &then_member_non_null {
                     self.write_member_non_null(path.clone());
+                }
+                for (path, ty_ref) in &then_member_typed {
+                    let ty = self.lower_type_ref(*ty_ref);
+                    self.write_member_typed(path.clone(), ty);
                 }
                 // **P19.16** — inline the then-branch's stmts (instead
                 // of `visit_block`) so the narrow frame we just pushed
@@ -1716,6 +1769,14 @@ impl<'a> Cx<'a> {
                         }
                         for path in &else_member_non_null {
                             self.write_member_non_null(path.clone());
+                        }
+                        for (ident, ty_ref) in &else_typed {
+                            let ty = self.lower_type_ref(*ty_ref);
+                            self.write_narrow(*ident, ty);
+                        }
+                        for (path, ty_ref) in &else_member_typed {
+                            let ty = self.lower_type_ref(*ty_ref);
+                            self.write_member_typed(path.clone(), ty);
                         }
                         // P19.16 — same inline pattern for the else
                         // branch. `eb` may be a Block or a nested If
@@ -1756,6 +1817,14 @@ impl<'a> Cx<'a> {
                     for path in &else_member_non_null {
                         self.write_member_non_null(path.clone());
                     }
+                    for (ident, ty_ref) in &else_typed {
+                        let ty = self.lower_type_ref(*ty_ref);
+                        self.write_narrow(*ident, ty);
+                    }
+                    for (path, ty_ref) in &else_member_typed {
+                        let ty = self.lower_type_ref(*ty_ref);
+                        self.write_member_typed(path.clone(), ty);
+                    }
                 }
                 if else_terminates {
                     for ident in &then_non_null {
@@ -1770,6 +1839,10 @@ impl<'a> Cx<'a> {
                     }
                     for path in &then_member_non_null {
                         self.write_member_non_null(path.clone());
+                    }
+                    for (path, ty_ref) in &then_member_typed {
+                        let ty = self.lower_type_ref(*ty_ref);
+                        self.write_member_typed(path.clone(), ty);
                     }
                 }
 
@@ -2087,6 +2160,8 @@ impl<'a> Cx<'a> {
                     out.then_typed.extend(r.then_typed);
                     out.then_member_non_null.extend(l.then_member_non_null);
                     out.then_member_non_null.extend(r.then_member_non_null);
+                    out.then_member_typed.extend(l.then_member_typed);
+                    out.then_member_typed.extend(r.then_member_typed);
                     // Else: at least one failed — can't narrow confidently.
                 }
                 BinOp::Or => {
@@ -2128,16 +2203,42 @@ impl<'a> Cx<'a> {
                 _ => {}
             },
             // P6.5: `x is T` narrows x to T in the then-branch.
+            // Also: `foo.bar is T` / `foo->bar is T` narrows the member
+            // path the same way (record by path string).
             Expr::Is { value, ty, .. } => {
                 if let Expr::Ident(name_idx) = &self.hir.exprs[*value]
                     && let Some(Definition::Param(def) | Definition::Local(def)) =
                         self.res.lookup(*name_idx)
                 {
                     out.then_typed.push((def, *ty));
+                } else if matches!(self.hir.exprs[*value], Expr::Member(_) | Expr::Arrow(_))
+                    && let Some(path) = self.member_path(*value)
+                {
+                    out.then_member_typed.push((path, *ty));
                 }
             }
             // Strip parens before re-deriving.
             Expr::Paren(inner, _) => return self.derive_cond_narrows(*inner),
+            // `!A` swaps then↔else. Note: `&&` / `||` already merge
+            // safely, but a *raw* `!` on a conjunction can't generally
+            // swap (De Morgan would turn it into `||`), so we only
+            // swap atomic narrows. The common `if (!(x is T)) { throw }`
+            // pattern is covered by the swap.
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::Not,
+                operand,
+                ..
+            }) => {
+                let inner = self.derive_cond_narrows(*operand);
+                out.then_non_null = inner.else_non_null;
+                out.else_non_null = inner.then_non_null;
+                out.then_member_non_null = inner.else_member_non_null;
+                out.else_member_non_null = inner.then_member_non_null;
+                out.then_typed = inner.else_typed;
+                out.else_typed = inner.then_typed;
+                out.then_member_typed = inner.else_member_typed;
+                out.else_member_typed = inner.then_member_typed;
+            }
             _ => {}
         }
         out
@@ -2564,9 +2665,16 @@ impl<'a> Cx<'a> {
                 // `Expr::Member` (`.`) and `Expr::Arrow` (`->`); the
                 // path keys carry the operator (`->` vs `.`) so the
                 // two forms don't share narrows.
-                if self.arena.get(result_ty).nullable
-                    && let Some(path) = self.member_path(expr_id)
-                    && self.member_path_is_non_null(&path)
+                // Also: an `x is T` guard on the same path overrides
+                // the declared type with the narrowed type.
+                let path = self.member_path(expr_id);
+                if let Some(p) = path.as_deref()
+                    && let Some(narrowed) = self.lookup_member_typed(p)
+                {
+                    narrowed
+                } else if self.arena.get(result_ty).nullable
+                    && let Some(p) = path.as_deref()
+                    && self.member_path_is_non_null(p)
                 {
                     self.strip_nullable(result_ty)
                 } else {
@@ -2732,10 +2840,20 @@ impl<'a> Cx<'a> {
                             then_typed,
                             then_member_non_null,
                             else_member_non_null,
+                            then_member_typed,
+                            else_typed: _,
+                            else_member_typed: _,
                         } = self.derive_cond_narrows(left);
-                        let (non_null, typed, member_non_null) = match op {
-                            BinOp::And => (then_non_null, then_typed, then_member_non_null),
-                            BinOp::Or => (else_non_null, Vec::new(), else_member_non_null),
+                        let (non_null, typed, member_non_null, member_typed) = match op {
+                            BinOp::And => (
+                                then_non_null,
+                                then_typed,
+                                then_member_non_null,
+                                then_member_typed,
+                            ),
+                            BinOp::Or => {
+                                (else_non_null, Vec::new(), else_member_non_null, Vec::new())
+                            }
                             _ => unreachable!(),
                         };
                         self.push_narrow();
@@ -2751,6 +2869,10 @@ impl<'a> Cx<'a> {
                         }
                         for path in member_non_null {
                             self.write_member_non_null(path);
+                        }
+                        for (path, ty_ref) in member_typed {
+                            let ty = self.lower_type_ref(ty_ref);
+                            self.write_member_typed(path, ty);
                         }
                         let rt = self.visit_expr(right);
                         self.pop_narrow();
