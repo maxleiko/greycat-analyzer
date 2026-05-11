@@ -277,6 +277,12 @@ pub struct TypeMembers {
     /// runtime resolves `this.from` to an inherited `from: time` attr
     /// even when a `static fn from(...)` is declared on the same type.
     pub static_methods: FxHashSet<Symbol>,
+    /// Names of methods declared with the `abstract` modifier.
+    /// Captured at ingest so the LSP `textDocument/declaration`
+    /// handler can walk the supertype chain looking for the abstract
+    /// ancestor of a concrete override without needing to fetch each
+    /// foreign module's HIR.
+    pub abstract_methods: FxHashSet<Symbol>,
     // P19.14
     /// Direct supertype name (the `Super` in
     /// `type Sub extends Super`). Drives inheritance: member
@@ -551,6 +557,34 @@ impl ProjectIndex {
             .map(|id| (members.home_uri.clone(), *id))
     }
 
+    /// Walk the *strict* supertype chain of `type_name` (skipping the
+    /// type itself) looking for an ancestor that declares
+    /// `method_name` with the `abstract` modifier. Returns
+    /// `(home_uri, Idx<Decl>)` of the abstract declaration, or `None`
+    /// if no abstract ancestor exists. Powers
+    /// `textDocument/declaration`: the inverse of
+    /// `textDocument/implementation`.
+    pub fn find_abstract_ancestor_method(
+        &self,
+        type_name: &str,
+        method_name: &str,
+    ) -> Option<(Uri, Idx<Decl>)> {
+        let method_sym = self.symbols.lookup(method_name)?;
+        let start = self.symbols.lookup(type_name)?;
+        let start_members = self.type_members.get(&start)?;
+        let mut cur = start_members.supertype?;
+        for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
+            let members = self.type_members.get(&cur)?;
+            if members.abstract_methods.contains(&method_sym)
+                && let Some(decl_id) = members.methods.get(&method_sym)
+            {
+                return Some((members.home_uri.clone(), *decl_id));
+            }
+            cur = members.supertype?;
+        }
+        None
+    }
+
     // P19.14
     /// Pre-lowered attr type, walking the supertype
     /// chain. The `TypeId` lives in the project arena and may
@@ -718,6 +752,7 @@ impl ProjectIndex {
                             method_returns: FxHashMap::default(),
                             static_attrs: FxHashSet::default(),
                             static_methods: FxHashSet::default(),
+                            abstract_methods: FxHashSet::default(),
                             supertype,
                         };
                         for attr_id in &td.attrs {
@@ -740,6 +775,9 @@ impl ProjectIndex {
                                 m.methods.insert(method_sym, *method_id);
                                 if fnd.modifiers.static_ {
                                     m.static_methods.insert(method_sym);
+                                }
+                                if fnd.modifiers.abstract_ {
+                                    m.abstract_methods.insert(method_sym);
                                 }
                             }
                         }
