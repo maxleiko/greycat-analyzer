@@ -266,3 +266,73 @@ fn rt_generic_param_substitution_through_inference_table() {
     assert!(is_assignable_to(&a, t1, t2));
     assert!(!is_assignable_to(&a, t1, u));
 }
+
+// =============================================================================
+// Node-tag inner-arg bivariance (verified against runtime)
+// =============================================================================
+//
+// The GreyCat runtime stores `node` / `nodeTime` / `nodeIndex` /
+// `nodeList` / `nodeGeo` as 64-bit handles, so passing
+// `nodeTime<float>` where `nodeTime<float?>` is expected (and the
+// reverse) is accepted — the inner type doesn't constrain the wire
+// representation. Verified per probe:
+//
+//   type Holder { ts: nodeTime<float>; }
+//   fn takesNullable(x: nodeTime<float?>?) {}
+//   fn takesNonNullable(x: nodeTime<float?>) {}
+//   ...
+//
+// All directions for the node-tag set pass at runtime. `Array<T>` /
+// `Map<K,V>` stay invariant.
+
+#[test]
+fn rt_nodetime_t_to_nodetime_nullable_t_allowed() {
+    let mut a = arena();
+    let f = a.primitive(Primitive::Float);
+    let f_q = a.nullable(f);
+    let nt_f = a.generic("nodeTime", vec![f]);
+    let nt_fq = a.generic("nodeTime", vec![f_q]);
+    assert!(is_assignable_to(&a, nt_f, nt_fq));
+    assert!(is_assignable_to(&a, nt_fq, nt_f));
+}
+
+#[test]
+fn rt_nodelist_t_to_nodelist_unrelated_t_allowed() {
+    // Runtime probe: `nodeList<node<Foo>>` flows into a
+    // `nodeList<node<Bar>>` slot — the wire shape is a node ref and
+    // the runtime doesn't constrain it further.
+    let mut a = arena();
+    let foo = a.named("Foo");
+    let bar = a.named("Bar");
+    let node_foo = a.generic("node", vec![foo]);
+    let node_bar = a.generic("node", vec![bar]);
+    let nl_foo = a.generic("nodeList", vec![node_foo]);
+    let nl_bar = a.generic("nodeList", vec![node_bar]);
+    assert!(is_assignable_to(&a, nl_foo, nl_bar));
+}
+
+#[test]
+fn rt_nodeindex_args_are_bivariant() {
+    let mut a = arena();
+    let s = a.primitive(Primitive::String);
+    let i = a.primitive(Primitive::Int);
+    let i_q = a.nullable(i);
+    let ni_si = a.generic("nodeIndex", vec![s, i]);
+    let ni_sni = a.generic("nodeIndex", vec![s, i_q]);
+    assert!(is_assignable_to(&a, ni_si, ni_sni));
+    assert!(is_assignable_to(&a, ni_sni, ni_si));
+}
+
+#[test]
+fn rt_array_int_to_array_nullable_int_still_rejected() {
+    // Regression guard: Array is NOT a node tag — the bivariance
+    // relaxation must not leak. `Array<int>` ↔ `Array<int?>` remain
+    // invariant per the runtime.
+    let mut a = arena();
+    let i = a.primitive(Primitive::Int);
+    let i_q = a.nullable(i);
+    let arr_i = a.generic("Array", vec![i]);
+    let arr_iq = a.generic("Array", vec![i_q]);
+    assert!(!is_assignable_to(&a, arr_i, arr_iq));
+    assert!(!is_assignable_to(&a, arr_iq, arr_i));
+}
