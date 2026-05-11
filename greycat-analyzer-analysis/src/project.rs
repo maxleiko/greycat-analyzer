@@ -1626,14 +1626,18 @@ fn collect_chain(
 /// Returns `(Some(foreign_uri), decl_id)` for cross-module callees
 /// and `(None, decl_id)` for in-module callees.
 ///
-/// Covers four callee shapes:
+/// Covers these callee shapes:
 ///   * `Expr::Ident` -> `Definition::Decl(Decl::Fn)` (in-module top-level).
 ///   * `Expr::Ident` -> `Definition::ProjectDecl { uri, decl }` where decl is `Decl::Fn`.
 ///   * `Expr::Static` -> `member_uses` -> `MemberDef::Method(decl_id)` (intra-module).
 ///   * `Expr::Static` -> `foreign_member_uses` -> `MemberDef::Method(decl_id)` (cross-module).
+///   * `Expr::Member` / `Expr::Arrow` -> same `member_uses` / `foreign_member_uses` path
+///     (the analyzer's `resolve_member` populates the same maps for `f.method(...)` and
+///     `n->method(...)`), so method calls go through the same arity / arg-type checks as
+///     bare-fn / static calls.
 ///   * `Expr::QualifiedStatic` -> `resolve_qualified_chain` -> `MemberDef::Method`.
 ///
-/// Other shapes (`Expr::Member` / lambda / etc.) return `None`.
+/// Lambda callees and unresolved member accesses return `None`.
 #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
 fn resolve_call_target(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
@@ -1665,18 +1669,8 @@ fn resolve_call_target(
             }
             _ => None,
         },
-        Expr::Static(s) => {
-            let property = s.property.ident();
-            if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(property) {
-                return Some((None, decl_id));
-            }
-            if let Some(foreign) = cur.analysis.foreign_member_lookup(property)
-                && let MemberDef::Method(decl_id) = foreign.member
-            {
-                return Some((Some(foreign.uri.clone()), decl_id));
-            }
-            None
-        }
+        Expr::Static(s) => resolve_member_call(cur, s.property.ident()),
+        Expr::Member(m) | Expr::Arrow(m) => resolve_member_call(cur, m.property.ident()),
         Expr::QualifiedStatic { chain, .. } => {
             let (uri, _type_decl_id, target) = resolve_qualified_chain(modules, index, cur, chain)?;
             match target {
@@ -1686,6 +1680,25 @@ fn resolve_call_target(
         }
         _ => None,
     }
+}
+
+/// Shared resolution for `Expr::Static` / `Expr::Member` / `Expr::Arrow` callees.
+/// All three populate the same `member_uses` / `foreign_member_uses` maps during
+/// the analyzer's `resolve_member` pass, so dispatch on the property ident.
+fn resolve_member_call(
+    cur: &ModuleAnalysis,
+    property: Idx<greycat_analyzer_hir::types::Ident>,
+) -> Option<(Option<Uri>, Idx<Decl>)> {
+    use crate::analyzer::MemberDef;
+    if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(property) {
+        return Some((None, decl_id));
+    }
+    if let Some(foreign) = cur.analysis.foreign_member_lookup(property)
+        && let MemberDef::Method(decl_id) = foreign.member
+    {
+        return Some((Some(foreign.uri.clone()), decl_id));
+    }
+    None
 }
 
 // P15.8
