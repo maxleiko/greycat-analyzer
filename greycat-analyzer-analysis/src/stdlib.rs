@@ -23,6 +23,18 @@ use greycat_analyzer_types::{
     Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
 };
 
+/// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
+/// declaration whose `extends` chain reaches a 5th level with
+/// `too depth inheritance: <name>` (verified against `greycat build`:
+/// four-level `A <- B <- C <- D` builds clean, five-level
+/// `A <- B <- C <- D <- E` errors out). Walkers that follow
+/// `supertype` cap their iteration at this value both as a defense
+/// against accidental cycles in in-progress source and to match the
+/// runtime's actual limit. Set to the limit itself (4) rather than
+/// `limit - 1` so that legal chains are always reachable even when
+/// the walk starts at the deepest descendant.
+const MAX_SUPERTYPE_CHAIN_DEPTH: usize = 4;
+
 /// Cross-module registry of native-bound function signatures. Keyed by
 /// canonical name (`<lib>::<module>::<fn>` once we wire fully-qualified
 /// resolution; just `<fn>` for now until  multi-module work).
@@ -437,14 +449,15 @@ impl ProjectIndex {
     /// member matched by `pred`. Used to find inherited attrs /
     /// methods (`pvInstallation->timezone` resolves through
     /// `PVInstallation extends PVEntity`'s `timezone: TimeZone`).
-    /// Bounded at 32 hops to defend against accidental cycles in
-    /// in-progress source.
+    /// Bounded at [`MAX_SUPERTYPE_CHAIN_DEPTH`] hops to match the
+    /// runtime's inheritance-depth ceiling and defend against accidental
+    /// cycles in in-progress source.
     fn walk_member_chain<P>(&self, type_name: &str, mut pred: P) -> Option<&TypeMembers>
     where
         P: FnMut(&TypeMembers) -> bool,
     {
         let mut cur = self.symbols.lookup(type_name)?;
-        for _ in 0..32 {
+        for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let members = self.type_members.get(&cur)?;
             if pred(members) {
                 return Some(members);
@@ -545,7 +558,7 @@ impl ProjectIndex {
         let Some(mut cur) = self.symbols.lookup(sub) else {
             return false;
         };
-        for _ in 0..32 {
+        for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let Some(members) = self.type_members.get(&cur) else {
                 return false;
             };
