@@ -467,3 +467,76 @@ fn rt_named_v_matches_generic_param_v_inside_outer_container() {
     assert!(is_assignable_to(&a, tup_named, tup_gp));
     assert!(is_assignable_to(&a, tup_gp, tup_named));
 }
+
+// =============================================================================
+// is_castable strips source nullable on fallthrough
+// =============================================================================
+//
+// `T? as T` is accepted by the runtime: the cast compiles, and the
+// runtime evaluates the actual value's nullity at execution time
+// (rejecting only when the value is null). Verified per probe:
+//
+//   enum PointType { a; b; c; }
+//   var v = (Map<String, PointType>{}).get("foo") as PointType;
+//
+// Build accepts; @test passes when the map entry is non-null.
+// `is_castable` must mirror the runtime: the cast itself is well-
+// typed even when the source is nullable.
+
+#[test]
+fn rt_cast_nullable_named_to_non_nullable_named() {
+    let mut a = arena();
+    let foo = a.named("Foo");
+    let foo_q = a.nullable(foo);
+    assert!(is_castable(&a, foo_q, foo));
+}
+
+#[test]
+fn rt_cast_nullable_enum_shape_to_non_nullable_enum_shape() {
+    use greycat_analyzer_types::{Type, TypeKind};
+    let mut a = arena();
+    let enum_kind = TypeKind::Enum {
+        name: "PointType".into(),
+        variants: vec!["a".into(), "b".into(), "c".into()],
+    };
+    let enum_id = a.alloc(Type {
+        kind: enum_kind.clone(),
+        nullable: false,
+    });
+    let enum_q = a.nullable(enum_id);
+    assert!(is_castable(&a, enum_q, enum_id));
+}
+
+#[test]
+fn rt_cast_nullable_enum_to_named_with_same_name() {
+    // Runtime path for the `Map<String, PointType>.get(...) as PointType`
+    // probe: the source's stored kind may be Enum (when the type is
+    // pre-resolved through the analyzer) and the target may be the
+    // raw `Named{PointType}` shape that `is_castable` falls through to
+    // for cross-module-aware comparisons. Both directions of
+    // Named<->Enum equality must pass when names match, even with
+    // nullable source.
+    use greycat_analyzer_types::{Type, TypeKind};
+    let mut a = arena();
+    let enum_id = a.alloc(Type {
+        kind: TypeKind::Enum {
+            name: "PointType".into(),
+            variants: vec!["a".into()],
+        },
+        nullable: false,
+    });
+    let enum_q = a.nullable(enum_id);
+    let named = a.named("PointType");
+    assert!(is_castable(&a, enum_q, named));
+}
+
+#[test]
+fn rt_cast_non_nullable_path_still_works() {
+    // Regression guard: the fallthrough strip kicks in *only* on a
+    // nullable source. Non-nullable sources fall through to the
+    // standard `is_assignable_to` path; identical shapes (and the
+    // existing Named<->Named rule) must still pass.
+    let mut a = arena();
+    let foo = a.named("Foo");
+    assert!(is_castable(&a, foo, foo));
+}
