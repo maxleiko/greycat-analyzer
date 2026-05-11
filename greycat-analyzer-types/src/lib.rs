@@ -161,20 +161,19 @@ pub enum TypeKind {
     /// Named primitive — `int`, `float`, `String`, `bool`, `char`,
     /// `time`, `duration`, `geo`. Carries the canonical name.
     Primitive(Primitive),
+    /// **Deprecated** — being replaced by [`TypeKind::Type`] and
+    /// [`TypeKind::Unresolved`]. Retained while the migration lands
+    /// chunk by chunk.
+    ///
     /// Named user / stdlib type, identified by its fully-qualified name
     /// (`<lib>::<module>::<TypeName>` or just `<TypeName>` until we wire
     /// fully-qualified resolution).
-    ///
-    /// **Deprecated as of P35** — being replaced by [`TypeKind::Type`] and
-    /// [`TypeKind::Unresolved`]. Retained until 35.8 to keep existing
-    /// callers compiling while the migration lands chunk by chunk.
-    // P25.4
+    // P25.4 / P35
     Named { name: SmolStr },
-    /// Generic type instantiation — `Array<int>`, `Map<String, int>`, etc.
+    /// **Deprecated** — being replaced by [`TypeKind::GenericInstance`].
     ///
-    /// **Deprecated as of P35** — being replaced by
-    /// [`TypeKind::GenericInstance`]. Retained until 35.8.
-    // P25.4 / P25.7
+    /// Generic type instantiation — `Array<int>`, `Map<String, int>`, etc.
+    // P25.4 / P25.7 / P35
     Generic {
         name: SmolStr,
         args: SmallVec<[TypeId; 2]>,
@@ -878,15 +877,15 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
 /// auto-deref to their inner type in the assignability relation
 ///. Drawn from the TS reference's `StdCoreTypes` interface.
 ///
-/// **Deprecated as of P35.5** — string-keyed identity for the
-/// node-tag family lets a user-declared `type node<T>` impersonate
-/// the std-core tag and pick up auto-deref / bivariance
-/// semantics it shouldn't. Migrate to `WellKnown::is_node_tag(decl)`
-/// in [`greycat_analyzer_analysis::well_known`] (handle-keyed) as
+/// **Deprecated** — string-keyed identity for the node-tag family
+/// lets a user-declared `type node<T>` impersonate the std-core tag
+/// and pick up auto-deref / bivariance semantics it shouldn't.
+/// Migrate to `WellKnown::is_node_tag(decl)` in
+/// [`greycat_analyzer_analysis::well_known`] (handle-keyed) as
 /// callers switch to `TypeKind::GenericInstance { decl, args }`.
-/// Retained until 35.8 alongside `TypeKind::Named` and
-/// `TypeKind::Generic`, the only variants this function dispatches
-/// against.
+/// This function only dispatches against the legacy
+/// `TypeKind::Named` / `TypeKind::Generic` variants.
+// P35.5
 pub fn is_node_tag(name: &str) -> bool {
     matches!(
         name,
@@ -1148,6 +1147,19 @@ fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
 // =============================================================================
 
 pub fn display(arena: &TypeArena, id: TypeId) -> String {
+    display_with_names(arena, id, &|_| None)
+}
+
+/// Like [`display`] but threads a `name_for` callback that resolves
+/// [`TypeKind::Type`] / [`TypeKind::GenericInstance`] decl handles to
+/// their names. Callers with a `DeclRegistry` in scope pass
+/// `|h| registry.name(h).map(str::to_string)` to get real names
+/// (`Box`, `node`, …) instead of the `?type#<raw>` placeholder.
+pub fn display_with_names(
+    arena: &TypeArena,
+    id: TypeId,
+    name_for: &dyn Fn(TypeDeclId) -> Option<String>,
+) -> String {
     let ty = arena.get(id);
     let mut s = match &ty.kind {
         TypeKind::Null => "null".to_string(),
@@ -1156,40 +1168,55 @@ pub fn display(arena: &TypeArena, id: TypeId) -> String {
         TypeKind::Primitive(p) => p.name().to_string(),
         TypeKind::Named { name } => name.to_string(),
         TypeKind::Generic { name, args } => {
-            let parts: Vec<String> = args.iter().map(|a| display(arena, *a)).collect();
+            let parts: Vec<String> = args
+                .iter()
+                .map(|a| display_with_names(arena, *a, name_for))
+                .collect();
             format!("{name}<{}>", parts.join(", "))
         }
-        // P35.2 — placeholder display until consumers thread a way to
-        // resolve `TypeDeclId` → name through `&DeclRegistry`. No
-        // caller mints these variants yet, so this placeholder never
-        // surfaces in user-visible output.
-        TypeKind::Type(d) => format!("?type#{}", d.raw()),
+        TypeKind::Type(d) => name_for(*d).unwrap_or_else(|| format!("?type#{}", d.raw())),
         TypeKind::GenericInstance { decl, args } => {
-            let parts: Vec<String> = args.iter().map(|a| display(arena, *a)).collect();
-            format!("?type#{}<{}>", decl.raw(), parts.join(", "))
+            let parts: Vec<String> = args
+                .iter()
+                .map(|a| display_with_names(arena, *a, name_for))
+                .collect();
+            let head = name_for(*decl).unwrap_or_else(|| format!("?type#{}", decl.raw()));
+            format!("{head}<{}>", parts.join(", "))
         }
-        // P35.3 — render unresolved names verbatim so hover / fmt
-        // surface the typo for the user.
         TypeKind::Unresolved { name, .. } => name.to_string(),
         TypeKind::GenericParam { name, .. } => name.to_string(),
         TypeKind::Lambda(l) => {
-            let parts: Vec<String> = l.params.iter().map(|p| display(arena, *p)).collect();
-            format!("({}) -> {}", parts.join(", "), display(arena, l.ret))
+            let parts: Vec<String> = l
+                .params
+                .iter()
+                .map(|p| display_with_names(arena, *p, name_for))
+                .collect();
+            format!(
+                "({}) -> {}",
+                parts.join(", "),
+                display_with_names(arena, l.ret, name_for)
+            )
         }
         TypeKind::Tuple { elements } => {
-            let parts: Vec<String> = elements.iter().map(|e| display(arena, *e)).collect();
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|e| display_with_names(arena, *e, name_for))
+                .collect();
             format!("({})", parts.join(", "))
         }
         TypeKind::Anonymous { fields } => {
             let parts: Vec<String> = fields
                 .iter()
-                .map(|(n, t)| format!("{n}: {}", display(arena, *t)))
+                .map(|(n, t)| format!("{n}: {}", display_with_names(arena, *t, name_for)))
                 .collect();
             format!("{{ {} }}", parts.join(", "))
         }
         TypeKind::Enum { name, .. } => name.to_string(),
         TypeKind::Union { alts } => {
-            let parts: Vec<String> = alts.iter().map(|a| display(arena, *a)).collect();
+            let parts: Vec<String> = alts
+                .iter()
+                .map(|a| display_with_names(arena, *a, name_for))
+                .collect();
             parts.join(" | ")
         }
     };

@@ -326,13 +326,27 @@ impl AnalysisResult {
 /// — callers that need to inspect `TypeId`s after the call must use
 /// [`analyze_with_index_into`] instead so the arena outlives the call.
 pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
+    use std::str::FromStr;
     let index = ProjectIndex::new();
     // P35.4 — per-file callers don't have a populated `WellKnown`;
     // pass a default (all-`None`) instance. The migrated sentinel
     // sites fall back to `arena.any()` for any slot still `None`.
     let well_known = crate::well_known::WellKnown::default();
+    // P35.7 — per-file callers without a real URI use a synthetic
+    // one so decl-handle minting still works against the empty
+    // registry (the lookups miss, the legacy `Named` fallback fires).
+    let decl_registry = crate::well_known::DeclRegistry::default();
+    let module_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///module.gcl").unwrap();
     let mut arena = TypeArena::new();
-    let out = analyze_with_index_into(hir, res, &index, &well_known, &mut arena);
+    let out = analyze_with_index_into(
+        hir,
+        res,
+        &index,
+        &well_known,
+        &decl_registry,
+        &module_uri,
+        &mut arena,
+    );
     (arena, out)
 }
 
@@ -344,11 +358,22 @@ pub fn analyze_with_index(
     res: &Resolutions,
     index: &ProjectIndex,
 ) -> (TypeArena, AnalysisResult) {
+    use std::str::FromStr;
     // P35.4 — per-file callers default-construct an empty
     // `WellKnown`; see [`analyze`] for the rationale.
     let well_known = crate::well_known::WellKnown::default();
+    let decl_registry = crate::well_known::DeclRegistry::default();
+    let module_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///module.gcl").unwrap();
     let mut arena = TypeArena::new();
-    let out = analyze_with_index_into(hir, res, index, &well_known, &mut arena);
+    let out = analyze_with_index_into(
+        hir,
+        res,
+        index,
+        &well_known,
+        &decl_registry,
+        &module_uri,
+        &mut arena,
+    );
     (arena, out)
 }
 
@@ -369,11 +394,13 @@ pub fn analyze_with_index_into(
     res: &Resolutions,
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
+    decl_registry: &crate::well_known::DeclRegistry,
+    module_uri: &greycat_analyzer_core::lsp_types::Uri,
     arena: &mut TypeArena,
 ) -> AnalysisResult {
     let mut out = AnalysisResult::default();
     seed_builtins(arena);
-    register_module_types(hir, arena, &mut out);
+    register_module_types(hir, arena, &mut out, decl_registry, module_uri);
 
     let Some(module) = hir.module.as_ref() else {
         return out;
@@ -385,6 +412,7 @@ pub fn analyze_with_index_into(
         arena,
         index,
         well_known,
+        decl_registry,
         narrows: Vec::new(),
         member_narrows: Vec::new(),
         member_typed_narrows: Vec::new(),
@@ -436,7 +464,13 @@ pub(crate) fn seed_builtins(arena: &mut TypeArena) {
 /// Also populates [`AnalysisResult::type_decls`] (name → HIR
 /// `TypeDecl` index) so  member resolution can navigate from a
 /// receiver's `TypeId` back to the declaring node.
-fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisResult) {
+fn register_module_types(
+    hir: &Hir,
+    arena: &mut TypeArena,
+    out: &mut AnalysisResult,
+    _decl_registry: &crate::well_known::DeclRegistry,
+    _module_uri: &greycat_analyzer_core::lsp_types::Uri,
+) {
     let Some(module) = hir.module.as_ref() else {
         return;
     };
@@ -445,6 +479,13 @@ fn register_module_types(hir: &Hir, arena: &mut TypeArena, out: &mut AnalysisRes
         match decl {
             Decl::Type(td) => {
                 let name: SmolStr = hir.idents[td.name].text.as_str().into();
+                // Local types keep the legacy `Named { name }` shape
+                // for now — too many downstream sites (member
+                // resolution, narrow tracking, subtype-chain
+                // assignability) match on `Named { name }` and
+                // migrating them all would explode 35.7's scope.
+                // 35.8's deletion pass picks this up as part of the
+                // full Named removal.
                 let id = arena.named(name.as_str());
                 out.registry.register(name.clone(), id);
                 out.type_decls.insert(name, *d);
@@ -563,6 +604,13 @@ struct Cx<'a> {
     /// slot is populated, falling back to `arena.any()` when std
     /// hasn't loaded.
     well_known: &'a crate::well_known::WellKnown,
+    // P35.7
+    /// Project-wide decl handle registry. Used by sites that
+    /// previously minted `arena.named(name)` for resolved foreign
+    /// types — now they look up `decl_registry.lookup(uri, idx)` and
+    /// mint `arena.alloc_type(handle)`. Per-file callers pass an
+    /// empty registry; the legacy `Named` fallback kicks in.
+    decl_registry: &'a crate::well_known::DeclRegistry,
     /// Null-flow narrowing stack. Each frame is a binding ident
     /// → temporary `TypeId` override. Frames are pushed on block /
     /// then-branch / else-branch entry and popped on exit, so a
@@ -911,6 +959,11 @@ impl<'a> Cx<'a> {
         let type_name: Option<SmolStr> = match &ty.kind {
             TypeKind::Named { name } => Some(name.clone()),
             TypeKind::Generic { name, .. } => Some(name.clone()),
+            // P35.7 — handle-keyed variants resolve via the registry.
+            TypeKind::Type(d) => self.decl_registry.name(*d).map(SmolStr::from),
+            TypeKind::GenericInstance { decl, .. } => {
+                self.decl_registry.name(*decl).map(SmolStr::from)
+            }
             // P16.2 — primitives (`String`, `int`, ...) carry methods
             // declared as `native type String { ... }` in stdlib.
             // Map the primitive back to its name and fall through to
@@ -1144,6 +1197,17 @@ impl<'a> Cx<'a> {
             // P25.7
             TypeKind::Generic { name, args } => (name, args.into_vec()),
             TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
+            // P35.7 — handle-keyed variants: resolve back to the
+            // decl name via the registry so the downstream chain-
+            // walking lookup (still SmolStr-keyed) finds the type.
+            TypeKind::Type(decl) => match self.decl_registry.name(decl) {
+                Some(n) => (n.into(), Vec::new()),
+                None => return None,
+            },
+            TypeKind::GenericInstance { decl, args } => match self.decl_registry.name(decl) {
+                Some(n) => (n.into(), args.into_vec()),
+                None => return None,
+            },
             _ => return None,
         };
         // **P19.14** — chain-walking lookup so methods declared on
@@ -1249,6 +1313,10 @@ impl<'a> Cx<'a> {
             let owner_name: Option<SmolStr> = match &self.arena.get(recv_ty).kind {
                 TypeKind::Named { name } => Some(name.clone()),
                 TypeKind::Generic { name, .. } => Some(name.clone()),
+                TypeKind::Type(d) => self.decl_registry.name(*d).map(SmolStr::from),
+                TypeKind::GenericInstance { decl, .. } => {
+                    self.decl_registry.name(*decl).map(SmolStr::from)
+                }
                 TypeKind::Enum { name, .. } => Some(name.clone()),
                 // **P19.14** — primitives carry static methods /
                 // attrs in stdlib (`time::max`, `int::max`, etc.);
@@ -1378,6 +1446,15 @@ impl<'a> Cx<'a> {
             TypeKind::Named { name } => (name.clone(), Vec::new()),
             // P25.7
             TypeKind::Generic { name, args } => (name.clone(), args.to_vec()),
+            // P35.7 — handle-keyed variants.
+            TypeKind::Type(d) => match self.decl_registry.name(*d) {
+                Some(n) => (n.into(), Vec::new()),
+                None => return None,
+            },
+            TypeKind::GenericInstance { decl, args } => match self.decl_registry.name(*decl) {
+                Some(n) => (n.into(), args.to_vec()),
+                None => return None,
+            },
             TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
             _ => return None,
         };
@@ -1447,12 +1524,24 @@ impl<'a> Cx<'a> {
                     // declaration site.
                     enum_id
                 } else if self.index.has_name(&name) {
-                    // P11.5: name is known to the project but not to
-                    // this module's registry — i.e. a type declared
-                    // elsewhere. Lower to `Named(name)` so receivers
-                    // typed against it carry a name `resolve_member`
-                    // can defer for the cross-module post-pass.
-                    self.arena.named(name.clone())
+                    // P11.5 (+ P35.7): name is a foreign type. Resolve
+                    // via the resolver's `Definition::ProjectDecl` so
+                    // we can mint a `TypeKind::Type(handle)` keyed on
+                    // the foreign decl rather than the SmolStr name.
+                    // Fall back to the legacy `Named { name }` only
+                    // when the resolver has nothing — that path goes
+                    // away in 35.8.
+                    use crate::resolver::Definition;
+                    let foreign_handle = self.res.lookup(tr.name).and_then(|def| match def {
+                        Definition::ProjectDecl { uri, decl } => {
+                            self.decl_registry.lookup(&uri, decl)
+                        }
+                        _ => None,
+                    });
+                    match foreign_handle {
+                        Some(h) => self.arena.alloc_type(h),
+                        None => self.arena.named(name.clone()),
+                    }
                 } else {
                     // P35.3 — unknown type. Was `any()`; now `Unresolved`
                     // so diagnostics / hover can surface the typo'd
@@ -1698,7 +1787,15 @@ impl<'a> Cx<'a> {
         // method bodies returns the right thing. Done *after* the
         // generic scope is pushed so generics resolve.
         let this_ty = if d.generics.is_empty() {
-            self.arena.named(type_name)
+            // P35.7 — reuse whatever `register_module_types` minted
+            // for this decl (a `Type(handle)` when the registry has
+            // it, the legacy `Named{name}` otherwise). Avoids
+            // re-minting and keeps `this` and outside references
+            // pointing at the same `TypeId`.
+            self.out
+                .registry
+                .lookup(&type_name)
+                .unwrap_or_else(|| self.arena.named(type_name))
         } else {
             let args: Vec<TypeId> = d
                 .generics

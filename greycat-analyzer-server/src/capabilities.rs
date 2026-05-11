@@ -4246,8 +4246,9 @@ fn member_completion(
 
     let module = project.module(uri)?;
     let arena = project.arena();
+    let decl_registry = &project.decl_registry;
     let recv_ty = receiver_type_at(text, root, module, recv_end)?;
-    let name = type_head_name(arena, recv_ty)?;
+    let name = type_head_name(arena, decl_registry, recv_ty)?;
 
     // P16.5 — node-tag receivers auto-deref through their inner type:
     //   `n.|`  → list node's own members PLUS the inner type's members
@@ -4258,7 +4259,7 @@ fn member_completion(
         (_, greycat_analyzer_types::TypeKind::Generic { name: tag, args })
             if greycat_analyzer_types::is_node_tag(tag) && args.len() == 1 =>
         {
-            type_head_name(arena, args[0]).map(|s| s.to_string())
+            type_head_name(arena, decl_registry, args[0]).map(|s| s.to_string())
         }
         _ => None,
     };
@@ -4627,14 +4628,18 @@ fn lookup_name_type_in_stmt(
 /// Read the head name of `id` from `arena` — the bare type name
 /// stripped of nullability / generic args. Returns `None` for shapes
 /// without a single name (lambdas, tuples, anonymous structures).
-fn type_head_name(
-    arena: &greycat_analyzer_types::TypeArena,
+fn type_head_name<'a>(
+    arena: &'a greycat_analyzer_types::TypeArena,
+    decl_registry: &'a greycat_analyzer_analysis::well_known::DeclRegistry,
     id: greycat_analyzer_types::TypeId,
-) -> Option<&str> {
+) -> Option<&'a str> {
     use greycat_analyzer_types::TypeKind;
     let t = arena.get(id);
     match &t.kind {
         TypeKind::Named { name } | TypeKind::Generic { name, .. } => Some(name),
+        // P35.7 — handle-keyed variants resolve via the registry.
+        TypeKind::Type(d) => decl_registry.name(*d),
+        TypeKind::GenericInstance { decl, .. } => decl_registry.name(*decl),
         TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }

@@ -426,16 +426,16 @@ impl ProjectAnalysis {
             for d_id in &module.decls {
                 match &hir.decls[*d_id] {
                     Decl::Type(td) => {
-                        let decl_id = self.decl_registry.get_or_insert(uri, *d_id);
                         let name = hir.idents[td.name].text.as_str();
+                        let decl_id = self.decl_registry.get_or_insert(uri, *d_id, name);
                         self.well_known
                             .record(&module.lib, &module.name, name, decl_id);
                     }
                     Decl::Enum(ed) => {
                         // Enums get a handle too — needed for the
                         // cross-arena Enum↔Named bridge cleanup in P35.7.
-                        let _ = self.decl_registry.get_or_insert(uri, *d_id);
-                        let _ = ed; // name not in well-known set today.
+                        let name = hir.idents[ed.name].text.as_str();
+                        let _ = self.decl_registry.get_or_insert(uri, *d_id, name);
                     }
                     _ => {}
                 }
@@ -973,6 +973,8 @@ impl ProjectAnalysis {
                 &p.resolutions,
                 &self.index,
                 &self.well_known,
+                &self.decl_registry,
+                &p.uri,
                 &mut self.arena,
             );
             timings.analyze = t1.elapsed();
@@ -1220,6 +1222,7 @@ impl ProjectAnalysis {
         // alongside `&mut self.modules`.
         let arena = &self.arena;
         let index = &self.index;
+        let decl_registry = &self.decl_registry;
         let bypass = self.bypass_suppressions;
 
         // P26.3 / P27.1 — every typed-lint pass takes `&arena`
@@ -1251,7 +1254,7 @@ impl ProjectAnalysis {
             .filter(|(uri, _)| in_scope(uri))
             .collect();
         crate::parallel::par_for_each(modules, |(uri, module)| {
-            run_typed_lints_for_module(uri, module, arena, index, bypass, &doc_data);
+            run_typed_lints_for_module(uri, module, arena, index, decl_registry, bypass, &doc_data);
         });
     }
 
@@ -1593,6 +1596,8 @@ impl ProjectAnalysis {
             &resolutions,
             &self.index,
             &self.well_known,
+            &self.decl_registry,
+            uri,
             &mut self.arena,
         );
         timings.analyze = t1.elapsed();
@@ -1883,6 +1888,7 @@ fn run_typed_lints_for_module(
     module: &mut ModuleAnalysis,
     arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     bypass: bool,
     doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
 ) {
@@ -1923,6 +1929,7 @@ fn run_typed_lints_for_module(
         &module.analysis,
         arena,
         index,
+        decl_registry,
         &mut module.lints,
         &mut module.directives,
         bypass,
@@ -2532,10 +2539,10 @@ fn mint_type_shape(
 ///
 /// Lossy on shapes the validation pass doesn't represent
 /// (`Lambda`, `Tuple`, `Anonymous`, `Union`, `GenericParam`,
-/// `Type`/`GenericInstance` from P35); those fall back to `Any` so
-/// the substitution doesn't crash. Refining those mappings is
-/// follow-up work — they're rare in std/core method signatures and
-/// the validation pass already tolerates `Any` widely.
+/// `Type` / `GenericInstance`); those fall back to `Any` so the
+/// substitution doesn't crash. Refining those mappings is follow-up
+/// work — they're rare in std/core method signatures and the
+/// validation pass already tolerates `Any` widely.
 fn type_id_to_shape(
     arena: &greycat_analyzer_types::TypeArena,
     id: greycat_analyzer_types::TypeId,
