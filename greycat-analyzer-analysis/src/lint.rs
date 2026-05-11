@@ -1804,6 +1804,38 @@ fn collect_dead_in_stmt(
     match &hir.stmts[stmt_id] {
         Stmt::Block(b) => collect_dead_in_block(hir, analysis, b, out),
         Stmt::If(i) => {
+            // Trivially-decidable condition: flag the dead branch
+            // and skip the regular passes (outer-island dominance
+            // would otherwise re-flag inner shapes).
+            match analysis.decidable_conditions.get(&stmt_id) {
+                Some(false) => {
+                    // Condition always false → if-keyword through
+                    // end of then-block is dead. The else-branch
+                    // (if any) is live; the quickfix unwraps to it.
+                    let dead_end = i.then_branch.byte_range.end;
+                    out.push(i.byte_range.start..dead_end);
+                    if let Some(eb) = i.else_branch {
+                        collect_dead_in_stmt(hir, analysis, eb, out);
+                    }
+                    return;
+                }
+                Some(true) => {
+                    // Condition always true → the else branch (if
+                    // any) is dead. Range = else block's byte_range,
+                    // matching the existing dead-else shape so
+                    // `unreachable_fix` swallows the leading `else `.
+                    if let Some(eb) = i.else_branch
+                        && let Some(dead) = else_block_range(hir, eb)
+                    {
+                        out.push(dead);
+                    }
+                    // Then-branch is live; recurse into it for
+                    // nested dead-code inside.
+                    collect_dead_in_block(hir, analysis, &i.then_branch, out);
+                    return;
+                }
+                None => {}
+            }
             collect_dead_in_block(hir, analysis, &i.then_branch, out);
             // Dead-else flagging: if THIS if is the head of an
             // exhaustive chain AND has a final `else { … }`, the
@@ -1818,9 +1850,27 @@ fn collect_dead_in_stmt(
                 collect_dead_in_stmt(hir, analysis, eb, out);
             }
         }
-        Stmt::While(w) => collect_dead_in_block(hir, analysis, &w.body, out),
+        Stmt::While(w) => {
+            // Always-false `while` → whole stmt is dead.
+            if analysis.decidable_conditions.get(&stmt_id) == Some(&false) {
+                out.push(w.byte_range.clone());
+                return;
+            }
+            collect_dead_in_block(hir, analysis, &w.body, out);
+        }
         Stmt::DoWhile(w) => collect_dead_in_block(hir, analysis, &w.body, out),
-        Stmt::For(f) => collect_dead_in_block(hir, analysis, &f.body, out),
+        Stmt::For(f) => {
+            // Always-false C-style `for` → whole stmt is dead. The
+            // init-binding's side effect is lost on deletion, but
+            // a `for (var i = 0; false; …)` is so suspect that the
+            // quickfix's slice-delete is the right default; the
+            // user can hoist init manually if needed.
+            if analysis.decidable_conditions.get(&stmt_id) == Some(&false) {
+                out.push(f.byte_range.clone());
+                return;
+            }
+            collect_dead_in_block(hir, analysis, &f.body, out);
+        }
         Stmt::ForIn(f) => collect_dead_in_block(hir, analysis, &f.body, out),
         Stmt::Try(t) => {
             collect_dead_in_block(hir, analysis, &t.try_block, out);
@@ -1828,6 +1878,18 @@ fn collect_dead_in_stmt(
         }
         Stmt::At(a) => collect_dead_in_block(hir, analysis, &a.block, out),
         _ => {}
+    }
+}
+
+/// Byte range of an `else` clause's payload — either the `{ … }`
+/// block (the common case) or a nested `if` (the `else if` chain).
+/// Used by trivially-decidable-condition dead-flagging to match the
+/// existing dead-else range shape `unreachable_fix` already handles.
+fn else_block_range(hir: &Hir, eb: Idx<Stmt>) -> Option<std::ops::Range<usize>> {
+    match &hir.stmts[eb] {
+        Stmt::Block(b) => Some(b.byte_range.clone()),
+        Stmt::If(i) => Some(i.byte_range.clone()),
+        _ => None,
     }
 }
 

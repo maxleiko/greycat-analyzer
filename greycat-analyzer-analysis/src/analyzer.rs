@@ -254,6 +254,13 @@ pub struct AnalysisResult {
     /// (which lacked a rule code), this flow integrates with the
     /// shared directive / quickfix machinery.
     pub non_exhaustive_findings: Vec<NonExhaustiveFinding>,
+    /// Conditional statements (`if` / `while` / `do_while` / `for`)
+    /// whose condition is statically decidable to a constant truth
+    /// value. The key is the statement id; the value is the decided
+    /// outcome (`true` = always taken, `false` = never taken). Drives
+    /// the `unreachable` lint's dead-branch flagging and the
+    /// matching quickfix (delete or unwrap to the live branch).
+    pub decidable_conditions: FxHashMap<Idx<Stmt>, bool>,
 }
 
 /// Where a member-access property name resolves to.
@@ -682,6 +689,34 @@ impl<'a> Cx<'a> {
         self.arena.null()
     }
 
+    /// Emit "always (true|false)" diagnostic on a loop condition
+    /// (`while` / `for`) and record the decided outcome for the
+    /// `unreachable` lint. `while` and `for` with always-false
+    /// conditions have an unreachable body; with always-true they
+    /// are intentional infinite loops (no dead code).
+    fn diagnose_decidable_loop_condition(
+        &mut self,
+        stmt_id: Idx<Stmt>,
+        condition: Idx<Expr>,
+        kind: &str,
+    ) {
+        let Some(b) = self.trivially_decidable(condition) else {
+            return;
+        };
+        let range = self.hir.exprs[condition].byte_range();
+        let msg = if b {
+            format!("{kind} condition is always true (infinite loop)")
+        } else {
+            format!("{kind} condition is always false (body never runs)")
+        };
+        self.diag(Severity::Warning, msg, range);
+        // Only record always-false: the `unreachable` lint only
+        // flags dead bodies. Always-true loops are intentional.
+        if !b {
+            self.out.decidable_conditions.insert(stmt_id, b);
+        }
+    }
+
     /// Compositional "is this condition trivially decidable?" pass.
     /// Returns `Some(true)` / `Some(false)` when the condition's truth
     /// value is statically known from the declared types of its
@@ -784,6 +819,7 @@ impl<'a> Cx<'a> {
         &mut self,
         multi: &FxHashMap<Idx<Ident>, (Option<TypeId>, Vec<TypeId>)>,
         condition: Idx<Expr>,
+        stmt_id: Idx<Stmt>,
     ) {
         let mut emitted = false;
         let mut never_id: Option<TypeId> = None;
@@ -842,6 +878,7 @@ impl<'a> Cx<'a> {
                         let range = self.hir.exprs[condition].byte_range();
                         self.diag(Severity::Warning, msg, range);
                         emitted = true;
+                        self.out.decidable_conditions.insert(stmt_id, false);
                     }
                 }
                 None => {
@@ -873,6 +910,7 @@ impl<'a> Cx<'a> {
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
                                 emitted = true;
+                                self.out.decidable_conditions.insert(stmt_id, true);
                             }
                             self.write_narrow(*ident, asserted);
                             continue;
@@ -895,6 +933,7 @@ impl<'a> Cx<'a> {
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
                                 emitted = true;
+                                self.out.decidable_conditions.insert(stmt_id, false);
                             }
                             continue;
                         }
@@ -2238,6 +2277,7 @@ impl<'a> Cx<'a> {
                         "condition is always false"
                     };
                     self.diag(Severity::Warning, msg, range);
+                    self.out.decidable_conditions.insert(stmt_id, b);
                 }
 
                 self.push_narrow();
@@ -2276,7 +2316,7 @@ impl<'a> Cx<'a> {
                 // is already trivially decidable — it would re-emit a
                 // duplicate "always (true|false)" diag.
                 if decidable.is_none() {
-                    self.diagnose_then_typed_contradictions(&multi_typed, condition);
+                    self.diagnose_then_typed_contradictions(&multi_typed, condition, stmt_id);
                 }
                 for path in &then_member_non_null {
                     self.write_member_non_null(path.clone());
@@ -2522,6 +2562,7 @@ impl<'a> Cx<'a> {
                 condition, body, ..
             }) => {
                 self.expect_bool(condition, "while condition");
+                self.diagnose_decidable_loop_condition(stmt_id, condition, "while");
                 self.visit_block(&body, return_ty);
             }
             Stmt::DoWhile(DoWhileStmt {
@@ -2529,6 +2570,19 @@ impl<'a> Cx<'a> {
             }) => {
                 self.visit_block(&body, return_ty);
                 self.expect_bool(condition, "do-while condition");
+                // Body runs once regardless of the condition, so a
+                // decidable `do-while` is informational only — emit
+                // the diagnostic but do NOT record it for the
+                // `unreachable` lint (no dead code to delete).
+                if let Some(b) = self.trivially_decidable(condition) {
+                    let range = self.hir.exprs[condition].byte_range();
+                    let msg = if b {
+                        "do-while condition is always true (infinite loop)"
+                    } else {
+                        "do-while condition is always false (body runs exactly once)"
+                    };
+                    self.diag(Severity::Warning, msg, range);
+                }
             }
             Stmt::For(ForStmt {
                 init_name,
@@ -2557,6 +2611,7 @@ impl<'a> Cx<'a> {
                 }
                 if let Some(c) = condition {
                     self.expect_bool(c, "for condition");
+                    self.diagnose_decidable_loop_condition(stmt_id, c, "for");
                 }
                 if let Some(i) = increment {
                     let _ = self.visit_expr(i);

@@ -308,6 +308,16 @@ fn unreachable_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
     if end > bytes.len() || start > end {
         return Vec::new();
     }
+    // Detect the trivially-decidable `if` shape: range starts at the
+    // `if` keyword. When the if has an `else` branch, unwrap to its
+    // contents (the else block is the live branch); otherwise plain
+    // delete handles it. The condition's truth value isn't passed
+    // through here — we re-parse to inspect the if_stmt's structure.
+    if range_starts_with_keyword(bytes, start, b"if")
+        && let Some(edit) = trivially_decidable_if_fix(text, start)
+    {
+        return vec![edit];
+    }
     let mut del_start = start;
     // Detect the "dead else block" shape: range starts at a `{`.
     if bytes.get(start) == Some(&b'{') {
@@ -357,6 +367,128 @@ fn unreachable_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
         byte_range: del_start..del_end,
         new_text: String::new(),
     }]
+}
+
+/// Whether `bytes[start..]` begins with `kw` followed by a non-word
+/// byte (or EOF). Used by `unreachable_fix` to distinguish ranges
+/// that start at an `if` / `while` / `for` keyword from ranges that
+/// happen to contain those letters as part of an identifier.
+fn range_starts_with_keyword(bytes: &[u8], start: usize, kw: &[u8]) -> bool {
+    if start + kw.len() > bytes.len() {
+        return false;
+    }
+    if &bytes[start..start + kw.len()] != kw {
+        return false;
+    }
+    match bytes.get(start + kw.len()) {
+        None => true,
+        Some(b) => !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'),
+    }
+}
+
+/// Quickfix shape for a trivially-decidable `if` whose dead range
+/// starts at the `if` keyword. Re-parses to find the enclosing
+/// `if_stmt` node; returns `Some(edit)` when the if has an
+/// `else_branch` (we unwrap to its contents) and `None` when there
+/// is no else (the caller falls back to plain delete).
+fn trivially_decidable_if_fix(text: &str, start: usize) -> Option<TextEdit> {
+    let tree = greycat_analyzer_syntax::parse(text);
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(start, start + 1)?;
+    while node.kind() != "if_stmt" {
+        node = node.parent()?;
+    }
+    let else_branch = find_else_branch(node)?;
+    let if_range = node.byte_range();
+    let new_text = match else_branch.kind() {
+        "block" => unwrap_block_to_outer_indent(text, if_range.start, else_branch.byte_range()),
+        // `else if (…) { … }` → keep the nested if-stmt verbatim.
+        _ => text[else_branch.byte_range()].to_string(),
+    };
+    Some(TextEdit {
+        byte_range: if_range,
+        new_text,
+    })
+}
+
+/// Find the else-branch *payload* of an `if_stmt` — either the
+/// `{ … }` block or a nested `if_stmt` (`else if`). The grammar's
+/// `else_branch` field points at the literal `else` keyword token,
+/// not the payload, so mirror the HIR lowering and walk the named
+/// children after `then_branch` for the first `block` / `if_stmt`.
+fn find_else_branch<'a>(if_node: Node<'a>) -> Option<Node<'a>> {
+    let then_id = if_node.child_by_field_name("then_branch")?.id();
+    let mut cursor = if_node.walk();
+    let mut seen_then = false;
+    for c in if_node.named_children(&mut cursor) {
+        if c.id() == then_id {
+            seen_then = true;
+            continue;
+        }
+        if !seen_then {
+            continue;
+        }
+        if matches!(c.kind(), "block" | "if_stmt") {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Strip the outer `{` / `}` from a block and re-indent its contents
+/// to align with the column where the replaced node started. Leaves
+/// blank lines untouched (any indentation on them is whitespace we
+/// don't want to relocate). The first line keeps no leading indent
+/// (the slot we're filling already sits at the outer column).
+fn unwrap_block_to_outer_indent(
+    text: &str,
+    outer_anchor: usize,
+    block_range: Range<usize>,
+) -> String {
+    let block_text = &text[block_range.clone()];
+    let inner = block_text
+        .strip_prefix('{')
+        .unwrap_or(block_text)
+        .strip_suffix('}')
+        .unwrap_or(block_text);
+    let inner = inner.trim_start_matches(['\n', '\r']);
+    let inner = inner.trim_end_matches([' ', '\t', '\n', '\r']);
+
+    // Outer indent: the whitespace prefix of the line on which
+    // `outer_anchor` sits.
+    let line_start = text[..outer_anchor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let outer_indent: String = text[line_start..outer_anchor]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+
+    // Inner indent: leading whitespace of the first non-blank line.
+    let inner_indent: String = inner
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.chars().take_while(|c| *c == ' ' || *c == '\t').collect())
+        .unwrap_or_default();
+
+    let mut out = String::with_capacity(inner.len());
+    for (i, line) in inner.lines().enumerate() {
+        let stripped = line.strip_prefix(inner_indent.as_str()).unwrap_or(line);
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.trim().is_empty() {
+            // Don't re-indent blank lines.
+            out.push_str(line);
+        } else if i == 0 {
+            // First line slots in at the outer anchor column — no
+            // leading indent (the column is already occupied).
+            out.push_str(stripped);
+        } else {
+            out.push_str(&outer_indent);
+            out.push_str(stripped);
+        }
+    }
+    out
 }
 
 /// Quickfix for `non-exhaustive`: append an `else if (rec == E::V) { … }`
