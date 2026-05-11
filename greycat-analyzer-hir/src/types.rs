@@ -599,8 +599,15 @@ pub struct UnaryExpr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
+    /// `+x` — identity (no-op on numeric operand). Grammar accepts it as
+    /// a unary prefix; typing-wise it returns the operand type unchanged.
+    Pos,
     Not,
     BitNot,
+    /// `++x` / `x++` — increment. Returns the operand type (int / float).
+    Inc,
+    /// `--x` / `x--` — decrement. Returns the operand type (int / float).
+    Dec,
     // P6.4
     /// `!!x` — non-null assertion (narrowing).
     NonNullAssert,

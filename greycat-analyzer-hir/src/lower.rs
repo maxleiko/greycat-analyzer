@@ -1302,8 +1302,11 @@ fn bin_op_for(text: &str) -> BinOp {
 fn unary_op_for(text: &str) -> UnaryOp {
     match text {
         "-" => UnaryOp::Neg,
+        "+" => UnaryOp::Pos,
         "!" => UnaryOp::Not,
         "~" => UnaryOp::BitNot,
+        "++" => UnaryOp::Inc,
+        "--" => UnaryOp::Dec,
         "!!" => UnaryOp::NonNullAssert,
         "*" => UnaryOp::Deref,
         _ => UnaryOp::Not,

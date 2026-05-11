@@ -2775,7 +2775,9 @@ impl<'a> Cx<'a> {
                 let inner = self.visit_expr(operand);
                 match op {
                     UnaryOp::Not => self.primitive(Primitive::Bool),
-                    UnaryOp::Neg | UnaryOp::BitNot => inner,
+                    UnaryOp::Neg | UnaryOp::Pos | UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
+                        inner
+                    }
                     // **P19.14** — `*n` deref. For
                     // `Generic { name: "node", args: [T] }` (and
                     // similar tag shapes) returns `T`; otherwise
