@@ -693,12 +693,16 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // at the top-level `is_assignable_to_with_index`) so it also
         // applies inside the recursive arg-comparison for nested
         // generics like `Tuple<Table<T>, MeasureUnit>`.
-        (TypeKind::Named { name: na }, TypeKind::GenericParam { name: nb, .. })
-        | (TypeKind::GenericParam { name: na, .. }, TypeKind::Named { name: nb })
-            if na == nb =>
-        {
-            true
-        }
+        // P35.6 — `Named ↔ GenericParam` bridge rule removed.
+        // Probe confirmed only the dedicated regression tests
+        // (`rt_named_v_matches_generic_param_v*`) exercised this
+        // arm; no production call path in the analysis crate lights
+        // it up. Those tests were guards for a workaround papering
+        // over `mint_type_shape`'s lack of generic-scope threading;
+        // the proper fix (the cross-module rework in 35.7) routes
+        // foreign type-refs through decl handles instead of names,
+        // so the leak source disappears. Deleted alongside the
+        // gauntlet tests below.
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
             // P12.2: invariant in every generic parameter. The TS
             // reference checker (`GreycatGenericType.isAssignableTo`)

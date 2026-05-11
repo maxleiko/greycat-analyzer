@@ -404,69 +404,26 @@ fn rt_named_does_not_flow_into_generic_with_concrete_args() {
 }
 
 // =============================================================================
-// Named{N} ↔ GenericParam{N} name match
+// Named{N} ↔ GenericParam{N} name match — REMOVED in P35.6
 // =============================================================================
 //
-// The project-pipeline's validation pass lowers TypeRefs *without*
-// threading generic scope, so a declared `V?` parameter / return
-// lowers to `Named{name:"V"}`. The body walker lowers the same
-// source token as `GenericParam{name:"V", owner:Type(...)}`. These
-// must compare equal in `is_assignable_to` (or the validation pass
-// would surface "value of `V?` not assignable to declared return type
-// `V?`" on identical shapes that print the same way).
-
-#[test]
-fn rt_named_v_matches_generic_param_v() {
-    let mut a = arena();
-    let named_v = a.named("V");
-    let gp_v = a.generic_param("V", GenericOwner::Type("Foo".into()));
-    assert!(is_assignable_to(&a, named_v, gp_v));
-    assert!(is_assignable_to(&a, gp_v, named_v));
-}
-
-#[test]
-fn rt_named_v_and_generic_param_v_compatible_through_nullable() {
-    // Same-name compatibility must survive a wrapping nullable on
-    // both sides (the body walker emits `nullable(GenericParam{V})`
-    // for `V?`, validation emits `nullable(Named{V})`).
-    let mut a = arena();
-    let named_v = a.named("V");
-    let gp_v = a.generic_param("V", GenericOwner::Type("Foo".into()));
-    let named_vq = a.nullable(named_v);
-    let gp_vq = a.nullable(gp_v);
-    assert!(is_assignable_to(&a, named_vq, gp_vq));
-    assert!(is_assignable_to(&a, gp_vq, named_vq));
-}
-
-#[test]
-fn rt_named_v_does_not_match_generic_param_u() {
-    // Negative: different names must stay distinct, no matter the
-    // owners.
-    let mut a = arena();
-    let named_v = a.named("V");
-    let gp_u = a.generic_param("U", GenericOwner::Type("Foo".into()));
-    assert!(!is_assignable_to(&a, named_v, gp_u));
-    assert!(!is_assignable_to(&a, gp_u, named_v));
-}
-
-#[test]
-fn rt_named_v_matches_generic_param_v_inside_outer_container() {
-    // The rule has to fire from the recursive arg-comparison inside
-    // an outer container. Build `Tuple<Generic{Table, [Named{V}]},
-    // MeasureUnit>` ↔ `Tuple<Generic{Table, [GenericParam{V, ...}]},
-    // MeasureUnit>` and assert the bidirectional invariance check
-    // succeeds.
-    let mut a = arena();
-    let named_v = a.named("V");
-    let gp_v = a.generic_param("V", GenericOwner::Function("f".into()));
-    let mu = a.named("MeasureUnit");
-    let tbl_named = a.generic("Table", vec![named_v]);
-    let tbl_gp = a.generic("Table", vec![gp_v]);
-    let tup_named = a.generic("Tuple", vec![tbl_named, mu]);
-    let tup_gp = a.generic("Tuple", vec![tbl_gp, mu]);
-    assert!(is_assignable_to(&a, tup_named, tup_gp));
-    assert!(is_assignable_to(&a, tup_gp, tup_named));
-}
+// The four tests in this section guarded a workaround in
+// `is_assignable_to` that papered over `mint_type_shape` not
+// threading generic scope (the validation pass lowered a declared
+// `V?` parameter as `Named{name:"V"}` while the body walker
+// lowered the same token as `GenericParam{name:"V", owner: ...}`).
+// The bridge rule made the two compare equal.
+//
+// P35.6 removes the bridge along with these tests. No production
+// call path lit the arm; the gauntlet tests constructed the pair
+// directly to assert the workaround's shape. After 35.7 routes
+// foreign type-refs through decl handles, the leak source goes
+// away and the workaround becomes unnecessary.
+//
+// The negative test (`rt_named_v_does_not_match_generic_param_u`)
+// also goes: with the bridge rule gone, the answer is trivially
+// `false` for every Named ↔ GenericParam pair regardless of name,
+// so the assertion was already structural rather than semantic.
 
 // =============================================================================
 // is_castable strips source nullable on fallthrough
