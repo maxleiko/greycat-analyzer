@@ -181,6 +181,17 @@ Prints the raw tree-sitter s-expression. Useful when chasing parse anomalies or 
 - **VS Code:** [editors/code/](editors/code/) ships an extension that activates on `.gcl` and calls `greycat-analyzer server` over stdio. After `cargo install`, `Reload Window` in VS Code.
 - **Other editors:** any LSP client pointed at `greycat-analyzer server` works.
 
+### Multi-project workspaces
+
+A single LSP session can host many independent GreyCat projects. Every workspace folder with a `project.gcl` at its root is loaded eagerly on `initialize`; a nested `project.gcl` deeper in the tree is loaded lazily the first time you open a file under it (the server walks parents from that file up to the enclosing workspace folder, picks the nearest `project.gcl`, and spins up an isolated `(SourceManager, ProjectAnalysis, TypeArena)` for it). Projects do not see each other's symbols — that matches the runtime model where each `project.gcl` is its own closure.
+
+Two file-spanning advisory diagnostics may appear, both Information-severity and tagged "unnecessary" (so editors dim the whole file):
+
+- `orphan-module` — a `.gcl` file inside a workspace folder with no `project.gcl` up-tree. Add a `project.gcl` to enable full analysis.
+- `multi-project-owner` — a file reachable from two projects' `@include` closures. Almost always a design error; restructure your `@include` paths so only one project includes each file.
+
+The CLI subcommands (`greycat-analyzer lint`, `greycat-analyzer fmt`) are unaffected — they always operate on one explicit entrypoint at a time.
+
 ## Playground
 
 [playground/](playground/) is an interactive analyzer testbed — Vite + TypeScript + Lit + WebAwesome + Monaco. The wasm crate ([`greycat-analyzer-wasm`](greycat-analyzer-wasm/)) exports every analyzer stage (`parse_tree`, `tokens`, `lower_hir`, `infer_types`, `diagnostics`, `format`); each is rendered in its own tab.

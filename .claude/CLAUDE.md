@@ -34,6 +34,8 @@ GreyCat projects have a single entrypoint (conventionally `project.gcl`) whose `
 
 The CLI (`lint`, `fmt`) and LSP (`Backend::load_workspace`) both go through this. The repo-root [project.gcl](../project.gcl) is the canonical entrypoint and pins the stdlib version.
 
+**LSP hosts N independent projects** (P32). One workspace folder = one project (the `project.gcl` at the folder root, loaded eagerly). A nested `project.gcl` deeper in the tree gets loaded lazily the first time the user opens a `.gcl` file under it — the LSP walks parents from that file up to the enclosing workspace folder, picks the nearest `project.gcl`, and spins up a fresh `(SourceManager, ProjectAnalysis, TypeArena, ProjectIndex)` for it. Each `Project` lives in `Backend::projects` keyed by its root directory; URIs route via `Backend::uri_owner`. Cross-project navigation is intentionally absent — projects are isolated closures, matching the runtime. Two kinds of file-spanning advisory diagnostics surface design issues: `orphan-module` (Information+UNNECESSARY) for `.gcl` files inside a workspace with no `project.gcl` up-tree, and `multi-project-owner` for files reachable from two projects' `@include` closures. The CLI is unaffected — it always operates on one explicit entrypoint at a time.
+
 ## Parsing
 
 Always parse via `greycat-analyzer-syntax::parse(source)`. The tree-sitter grammar is at ABI v15, so the host `tree-sitter` crate must be ≥ `0.26`.
