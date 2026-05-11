@@ -1241,6 +1241,13 @@ impl<'a> Cx<'a> {
                 let name = self.ident_text(chain[1]);
                 if self.index.contains_fn_signature(name) {
                     Some(self.arena.named("function"))
+                } else if self.index.contains_value(name) {
+                    // Non-native fn (`private fn foo()` or fn without
+                    // declared return type) — present in `values` but
+                    // skipped from `fn_signatures`. The runtime still
+                    // treats `module::fn_name` as a function ref, so
+                    // type it as `function` (not `type`).
+                    Some(self.arena.named("function"))
                 } else if self.index.contains_type_member(name) || self.index.has_name(name) {
                     Some(self.arena.named("type"))
                 } else {
