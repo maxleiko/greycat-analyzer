@@ -953,6 +953,29 @@ The `~120 ms` figure is the whole function. The plan above assumes Phase 2 (CST 
 
 ---
 
+### Phase 31 — Inheritance-aware LSP navigation (~3-5 days)
+
+**Goal:** fix three issues with `textDocument/{definition,implementation}` and add `textDocument/declaration` so jumping between abstract methods and their concrete overrides works correctly across the supertype chain. The analyzer already has every piece of information needed (`ProjectIndex::is_subtype_of`, `type_instance_method_id_chain`, `foreign_member_uses`, `static_methods`); the LSP handlers just don't use it consistently.
+
+**The three issues:**
+
+- **Cross-module goto-def silently fails.** [`goto_definition`](../greycat-analyzer-server/src/capabilities.rs) consults `member_lookup` (in-module `member_uses` only) and falls through to `None` when the resolved member lives in another module. The analyzer already populates `foreign_member_uses` with the URI and `Idx<Decl>` / `Idx<TypeAttr>` of the foreign decl; the handler should read it and resolve to a cross-file `Location`. P11.3 left this as a stub.
+- **Goto-implementation over-matches by name.** [`goto_implementation`](../greycat-analyzer-server/src/capabilities.rs) and [`goto_implementation_across_project`](../greycat-analyzer-server/src/capabilities.rs) walk every `TypeDecl::methods`, filter `abstract` / `native`, and return everything that matches by name. From an abstract `process` in `Base`, it returns any concrete `process` from any unrelated type. The receiver's declaring type is never consulted.
+- **No `textDocument/declaration` handler.** The inverse of goto-implementation — jumping from a concrete override to its abstract declaration in the supertype chain — has no path in the current LSP. The `declaration_provider` capability isn't even advertised.
+
+**Chunks:**
+
+- [ ] **31.1 Cross-module goto-def via `foreign_member_uses`** (S) — when the in-module `member_lookup` returns `None`, fall through to `foreign_member_lookup`. The `ForeignMember` carries `uri` + `MemberDef::{Attr, Method}`; resolve the foreign module's text + HIR via `SourceManager` to compute the byte range of the decl's name ident, then return a cross-file `Location`. Routes through `goto_definition_handler` in `server.rs`, not the `capabilities` free-function (which has no `&SourceManager`). Tests: chain `Sub` declared in `mod_a.gcl` with method on `Base` declared in `mod_b.gcl` — cursor on `instance.method()` in `mod_c.gcl` jumps to `mod_b.gcl`'s declaration site.
+- [ ] **31.2 Goto-implementation subtype filter** (M) — when the cursor lands on a method-name ident, first determine its *declaring type* (via `member_uses` / `foreign_member_uses`, or — if the cursor is on the method's own decl site — the enclosing `TypeDecl`). Then filter the candidate-set to types that satisfy `index.is_subtype_of(candidate, declaring_type)` (or are the declaring type itself). The existing abstract / native skip stays. This is a tightening, not a broadening: any returned location is now a true override. Cross-module variant gets the same filter against the project index. Tests: abstract `process` on `Base`, override on `Child extends Base`, unrelated `Bystander::process` — goto-impl returns `Child::process` only.
+- [ ] **31.3 `textDocument/declaration` capability** (M) — advertise `declaration_provider: Some(true)` in the server's capability initialisation. Add a `GotoDeclaration` request handler routing to a new `capabilities::goto_declaration_across_project`. Semantics: cursor on a method-name ident, find the method's *declaring type*, walk the supertype chain via `type_instance_method_id_chain` (or a chain walker that filters by `modifiers.abstract_`), return the first abstract ancestor's location. If the cursor's method is itself abstract, fall through to `goto_definition`. Tests: concrete `Child::process` overrides abstract `Base::process` — goto-declaration jumps to `Base`'s decl, not `Child`'s.
+- [ ] **31.4 Cross-module ancestor walker helper** (S, gated on 31.3) — `ProjectIndex::find_abstract_ancestor_method(type_name, method_name)` that walks the supertype chain (already capped at `MAX_SUPERTYPE_CHAIN_DEPTH`) and returns `(Uri, Idx<Decl>)` for the first ancestor whose method with that name has `modifiers.abstract_`. If no such ancestor exists, return `None`. Shared between 31.3 and any future "Implementations of …" tooling.
+
+**M31:** all three LSP navigation requests return inheritance-aware results. Goto-def works across modules for inherited members; goto-impl returns only true overrides (no unrelated-type false positives); goto-declaration is wired and jumps to the abstract parent. Per-chunk tests cover the cross-module path and the same-module path.
+
+**Out of scope:** "find all implementations" with multi-level chains (Type A → B → C, where B is abstract and C concretes A's method — both A and C are interesting; this phase only returns the *direct* abstract declarer for now). Also: type hierarchy view (`textDocument/typeHierarchy`) is a separate LSP capability worth its own phase if real demand surfaces.
+
+---
+
 ### Phase 30 — `recv.staticName` / `recv->staticName` advisory lint (~2-3 days)
 
 **Goal:** introduce a new lint rule that flags instance-access (`.` / `->`) to a *static* member and proposes rewriting it as `Type::staticName`. The analyzer already has every signal it needs — for a given `Expr::Member` / `Expr::Arrow` binding it knows whether the resolved member is a `static fn` or `static` attr — so the role of this phase is purely advisory: guide developers toward the syntactic form that matches their intent.
