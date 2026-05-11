@@ -876,7 +876,52 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         {
             is_int_target(to_t)
         }
-        _ => is_assignable_to(arena, from, to),
+        _ => is_assignable_to_strip_source_nullable(arena, from, to),
+    }
+}
+
+/// Same as `is_assignable_to` but treats the source as if its nullable
+/// flag were stripped. Used by `is_castable`'s fallthrough: a cast is
+/// permitted to coerce `T?` to a non-nullable target — the runtime
+/// decides at execution time whether the actual value can land there.
+fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
+    let from_t = arena.get(from);
+    if !from_t.nullable {
+        return is_assignable_to(arena, from, to);
+    }
+    // Re-implement the cheap kind-based dispatch from `is_assignable_to`
+    // but skip the `a.nullable && !b.nullable` early-bail. The interesting
+    // shapes for cast-fallthrough are Named/Enum identity and primitive
+    // widening — broader generic / lambda compatibility is rare in the
+    // `as` position but we delegate to `is_assignable_to` after the
+    // shape match.
+    let to_t = arena.get(to);
+    if matches!(from_t.kind, TypeKind::Null) {
+        return to_t.nullable;
+    }
+    if matches!(from_t.kind, TypeKind::Never) {
+        return true;
+    }
+    if matches!(to_t.kind, TypeKind::Any) {
+        return true;
+    }
+    match (&from_t.kind, &to_t.kind) {
+        (TypeKind::Named { name: na }, TypeKind::Named { name: nb })
+        | (TypeKind::Generic { name: na, .. }, TypeKind::Named { name: nb })
+        | (TypeKind::Named { name: na }, TypeKind::Generic { name: nb, .. })
+            if na == nb =>
+        {
+            true
+        }
+        (TypeKind::Enum { name: na, .. }, TypeKind::Enum { name: nb, .. }) if na == nb => true,
+        (TypeKind::Named { name: na }, TypeKind::Enum { name: nb, .. })
+        | (TypeKind::Enum { name: na, .. }, TypeKind::Named { name: nb })
+            if na == nb =>
+        {
+            true
+        }
+        (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
+        _ => false,
     }
 }
 
