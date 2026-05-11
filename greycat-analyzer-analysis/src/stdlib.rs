@@ -940,7 +940,7 @@ impl ProjectIndex {
 /// Extract the module name from a URI (filename without
 /// `.gcl`). Mirrors [`Document::name`](greycat_analyzer_core::Document)
 /// without the borrow on a manager.
-fn module_name_from_uri(uri: &Uri) -> Option<String> {
+pub fn module_name_from_uri(uri: &Uri) -> Option<String> {
     let s = uri.as_str();
     let stripped = s.strip_prefix("file://").unwrap_or(s);
     let last = stripped.rsplit(['/', '\\']).next()?;

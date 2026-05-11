@@ -702,7 +702,7 @@ impl<'a> Cx<'a> {
     /// computed value rather than a stable reference.
     fn member_path(&self, expr_id: Idx<Expr>) -> Option<String> {
         match &self.hir.exprs[expr_id] {
-            Expr::Ident(name_idx) => Some(self.ident_text(*name_idx).to_string()),
+            Expr::Ident { name: name_idx, .. } => Some(self.ident_text(*name_idx).to_string()),
             Expr::Literal(LiteralExpr {
                 kind: LiteralKind::This,
                 ..
@@ -749,7 +749,7 @@ impl<'a> Cx<'a> {
     /// Other LHS shapes (offsets, calls, etc.) don't have a stable
     /// identity and silently no-op.
     fn record_assign_narrow(&mut self, target: Idx<Expr>, value_ty: TypeId) {
-        if let Expr::Ident(name_idx) = &self.hir.exprs[target] {
+        if let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[target] {
             if let Some(Definition::Param(def) | Definition::Local(def)) =
                 self.res.lookup(*name_idx)
             {
@@ -790,7 +790,7 @@ impl<'a> Cx<'a> {
             // narrow; don't drop one either.
             return;
         }
-        if let Expr::Ident(name_idx) = &self.hir.exprs[target] {
+        if let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[target] {
             if let Some(Definition::Param(def) | Definition::Local(def)) =
                 self.res.lookup(*name_idx)
                 && let Some(cur) = self.lookup_def_type(def)
@@ -975,7 +975,7 @@ impl<'a> Cx<'a> {
                 ty: s.ty,
                 property: s.property.ident(),
             },
-            Expr::Ident(name_idx) => CalleeShape::Ident(*name_idx),
+            Expr::Ident { name: name_idx, .. } => CalleeShape::Ident(*name_idx),
             Expr::QualifiedStatic { chain, .. } => CalleeShape::QualifiedStatic(chain.clone()),
             _ => return None,
         };
@@ -1425,7 +1425,7 @@ impl<'a> Cx<'a> {
         // P19.8: peek without cloning the whole `Expr` — `name_idx`
         // is a `Copy` `Idx<Ident>`, no allocation.
         let name_idx = match &self.hir.exprs[callee] {
-            Expr::Ident(idx) => *idx,
+            Expr::Ident { name, .. } => *name,
             _ => return None,
         };
         let def = self.res.lookup(name_idx)?;
@@ -2259,7 +2259,7 @@ impl<'a> Cx<'a> {
             // Also: `foo.bar is T` / `foo->bar is T` narrows the member
             // path the same way (record by path string).
             Expr::Is { value, ty, .. } => {
-                if let Expr::Ident(name_idx) = &self.hir.exprs[*value]
+                if let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[*value]
                     && let Some(Definition::Param(def) | Definition::Local(def)) =
                         self.res.lookup(*name_idx)
                 {
@@ -2434,7 +2434,7 @@ impl<'a> Cx<'a> {
         ident_side: Idx<Expr>,
         static_side: Idx<Expr>,
     ) -> Option<(Idx<Ident>, String, String)> {
-        let Expr::Ident(name_idx) = &self.hir.exprs[ident_side] else {
+        let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[ident_side] else {
             return None;
         };
         let binding = match self.res.lookup(*name_idx)? {
@@ -2455,7 +2455,7 @@ impl<'a> Cx<'a> {
         let le = &self.hir.exprs[l];
         let re = &self.hir.exprs[r];
         if let (
-            Expr::Ident(name),
+            Expr::Ident { name, .. },
             Expr::Literal(LiteralExpr {
                 kind: LiteralKind::Null,
                 ..
@@ -2469,7 +2469,7 @@ impl<'a> Cx<'a> {
                 kind: LiteralKind::Null,
                 ..
             }),
-            Expr::Ident(name),
+            Expr::Ident { name, .. },
         ) = (le, re)
         {
             return Some(*name);
@@ -2523,7 +2523,7 @@ impl<'a> Cx<'a> {
     fn infer_expr(&mut self, expr_id: Idx<Expr>) -> TypeId {
         let expr = self.hir.exprs[expr_id].clone();
         match expr {
-            Expr::Ident(idx) => match self.res.lookup(idx) {
+            Expr::Ident { name: idx, .. } => match self.res.lookup(idx) {
                 Some(Definition::Param(def)) | Some(Definition::Local(def)) => {
                     self.lookup_def_type(def).unwrap_or_else(|| self.any())
                 }
@@ -2980,7 +2980,7 @@ impl<'a> Cx<'a> {
                         // (existing `record_assign_narrow` clears it
                         // when the RHS is nullable).
                         let result = self.strip_nullable(inner);
-                        if let Expr::Ident(name_idx) = self.hir.exprs[operand].clone()
+                        if let Expr::Ident { name: name_idx, .. } = self.hir.exprs[operand].clone()
                             && let Some(Definition::Param(def) | Definition::Local(def)) =
                                 self.res.lookup(name_idx)
                         {

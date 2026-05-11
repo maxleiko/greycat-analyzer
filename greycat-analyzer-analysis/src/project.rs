@@ -108,6 +108,19 @@ pub struct ProjectAnalysis {
     /// `seed_builtins` calls per `analyze_with_index_into` are a
     /// no-op.
     pub arena: greycat_analyzer_types::TypeArena,
+    // P35.1
+    /// Project-wide registry of resolved `(Uri, Idx<Decl>)` →
+    /// [`TypeDeclId`]. Issued during signature lowering; consumed by
+    /// the type system to identify decls without going through their
+    /// SmolStr name.
+    pub decl_registry: crate::well_known::DeclRegistry,
+    // P35.1
+    /// Stable handles for the std/core native types the analyzer
+    /// special-cases (node-tag auto-deref, runtime sentinels,
+    /// collections). Populated during signature lowering. Slots stay
+    /// `None` until the corresponding decl flows through the pipeline
+    /// (or forever, when std isn't loaded).
+    pub well_known: crate::well_known::WellKnown,
     // P23.7
     /// When `true`, lint suppressions (`// gcl-lint-off …`)
     /// are still recorded but never silence emissions. Drives the CLI's
@@ -187,6 +200,8 @@ impl ProjectAnalysis {
         Self {
             index: ProjectIndex::new(),
             arena,
+            decl_registry: crate::well_known::DeclRegistry::new(),
+            well_known: crate::well_known::WellKnown::new(),
             bypass_suppressions: false,
             modules: FxHashMap::default(),
             sig_cache: FxHashMap::default(),
@@ -349,7 +364,14 @@ impl ProjectAnalysis {
         let lowered: Vec<(Uri, Hir, String, Duration, Directives)> =
             crate::parallel::par_map(docs, |(uri, text, lib, tree)| {
                 let lower_start = Instant::now();
-                let hir = lower_module(&text, "module", lib.as_str(), tree.root_node());
+                // P35.1 — pass the real module name (filename minus
+                // `.gcl`) so the well-known recognizer can match
+                // `(lib, module, name)` triples. Default `"module"`
+                // only kicks in for URIs without a recognisable
+                // filename, which the recognizer ignores anyway.
+                let module_name = crate::stdlib::module_name_from_uri(&uri)
+                    .unwrap_or_else(|| "module".to_string());
+                let hir = lower_module(&text, module_name, lib.as_str(), tree.root_node());
                 let lower_took = lower_start.elapsed();
                 let directives = crate::directives::parse_directives(&text, tree.root_node());
                 (uri, hir, lib, lower_took, directives)
@@ -390,6 +412,35 @@ impl ProjectAnalysis {
             &pairs,
             &mut self.sig_cache,
         );
+        // P35.1 — populate decl_registry + well_known. Runs after the
+        // existing signature lowering so we walk the same `Decl::Type` /
+        // `Decl::Enum` set without disturbing the cache hashing above.
+        // Cheap: one decl walk per module, idempotent within a single
+        // `DeclRegistry`. We don't bother with sig-cache parity because
+        // the registry is append-only and slot writes are idempotent on
+        // the same `(lib, module, name)` triple.
+        for (uri, hir) in &pairs {
+            let Some(module) = hir.module.as_ref() else {
+                continue;
+            };
+            for d_id in &module.decls {
+                match &hir.decls[*d_id] {
+                    Decl::Type(td) => {
+                        let decl_id = self.decl_registry.get_or_insert(uri, *d_id);
+                        let name = hir.idents[td.name].text.as_str();
+                        self.well_known
+                            .record(&module.lib, &module.name, name, decl_id);
+                    }
+                    Decl::Enum(ed) => {
+                        // Enums get a handle too — needed for the
+                        // cross-arena Enum↔Named bridge cleanup in P35.7.
+                        let _ = self.decl_registry.get_or_insert(uri, *d_id);
+                        let _ = ed; // name not in well-known set today.
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -1044,10 +1095,7 @@ impl ProjectAnalysis {
             let actual = call.args.len();
             if expected != actual {
                 let fn_name = fn_module.hir.idents[fnd.name].text.clone();
-                let callee_end = match &cur_module.hir.exprs[call.callee] {
-                    Expr::Ident(idx) => cur_module.hir.idents[*idx].byte_range.end,
-                    other => other.byte_range().end,
-                };
+                let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
                 let plural = if expected == 1 { "" } else { "s" };
                 out.push(SemanticDiagnostic {
                     severity: Severity::Error,
@@ -1085,10 +1133,7 @@ impl ProjectAnalysis {
                     let p_name = fn_module.hir.idents[p.name].text.clone();
                     let arg_display = greycat_analyzer_types::display(arena, arg_ty);
                     let declared_display = greycat_analyzer_types::display(arena, declared_ty);
-                    let r = match &cur_module.hir.exprs[call.args[i]] {
-                        Expr::Ident(idx) => cur_module.hir.idents[*idx].byte_range.clone(),
-                        other => other.byte_range(),
-                    };
+                    let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     out.push(SemanticDiagnostic {
                         severity: Severity::Error,
                         message: format!(
@@ -1433,7 +1478,10 @@ impl ProjectAnalysis {
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
             let start = Instant::now();
-            let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
+            // P35.1 — module name from URI for the well-known recogniser.
+            let module_name =
+                crate::stdlib::module_name_from_uri(uri).unwrap_or_else(|| "module".to_string());
+            let hir = lower_module(&doc.text, module_name, &doc.lib, doc.root_node());
             lower_took = start.elapsed();
             changed_lib = Some(doc.lib.clone());
             changed_directives = Some(crate::directives::parse_directives(
@@ -1469,7 +1517,10 @@ impl ProjectAnalysis {
                 continue;
             }
             let doc = cell.borrow();
-            let hir = lower_module(&doc.text, "module", &doc.lib, doc.root_node());
+            // P35.1 — module name from URI for the well-known recogniser.
+            let module_name = crate::stdlib::module_name_from_uri(other_uri)
+                .unwrap_or_else(|| "module".to_string());
+            let hir = lower_module(&doc.text, module_name, &doc.lib, doc.root_node());
             new_index.ingest(other_uri, &hir);
             other_lowered.push((other_uri.clone(), hir, doc.lib.clone(), Duration::ZERO));
         }
@@ -1651,7 +1702,7 @@ fn resolve_call_target(
 
     let callee_expr = &cur.hir.exprs[callee];
     match callee_expr {
-        Expr::Ident(name_idx) => match cur.resolutions.lookup(*name_idx)? {
+        Expr::Ident { name: name_idx, .. } => match cur.resolutions.lookup(*name_idx)? {
             Definition::Decl(decl_id) => {
                 if matches!(cur.hir.decls[decl_id], Decl::Fn(_)) {
                     Some((None, decl_id))
@@ -2222,12 +2273,7 @@ fn validate_module_type_relations(
         hir: &greycat_analyzer_hir::Hir,
         expr_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
     ) -> std::ops::Range<usize> {
-        match &hir.exprs[expr_id] {
-            greycat_analyzer_hir::types::Expr::Ident(name_idx) => {
-                hir.idents[*name_idx].byte_range.clone()
-            }
-            other => other.byte_range(),
-        }
+        hir.exprs[expr_id].byte_range()
     }
 }
 

@@ -170,7 +170,7 @@ fn build(n: String, a: int): Foo {
         };
         assert_eq!(obj.fields.len(), 2, "named fields must be lowered");
         assert!(obj.fields[0].name.is_some(), "name slot is bound");
-        let Expr::Ident(name_use) = &hir.exprs[obj.fields[0].value] else {
+        let Expr::Ident { name: name_use, .. } = &hir.exprs[obj.fields[0].value] else {
             panic!("expected ident use for value")
         };
         assert_eq!(hir.idents[*name_use].text, "n");
@@ -210,7 +210,7 @@ fn make(g: Group) {
             obj.fields[0].name.is_none(),
             "positional values have no name slot"
         );
-        let Expr::Ident(used) = &hir.exprs[obj.fields[0].value] else {
+        let Expr::Ident { name: used, .. } = &hir.exprs[obj.fields[0].value] else {
             panic!("expected ident use")
         };
         assert_eq!(hir.idents[*used].text, "g");

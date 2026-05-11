@@ -266,7 +266,7 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
     let e = &hir.exprs[idx];
     let range: ByteRange = e.byte_range().into();
     let (kind, label, children) = match e {
-        Expr::Ident(name) => ("expr:ident", Some(ident_text(hir, *name)), Vec::new()),
+        Expr::Ident { name, .. } => ("expr:ident", Some(ident_text(hir, *name)), Vec::new()),
         Expr::Literal(l) => (
             "expr:literal",
             Some(format!("{:?} {:?}", l.kind, l.text)),

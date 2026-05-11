@@ -49,3 +49,5 @@ pub mod quickfix;
 pub mod reachability;
 pub mod resolver;
 pub mod stdlib;
+// P35.1
+pub mod well_known;

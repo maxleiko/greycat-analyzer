@@ -756,7 +756,10 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
     let expr = match kind {
         "ident" => {
             let id = cx.alloc_ident(node);
-            Expr::Ident(id)
+            Expr::Ident {
+                name: id,
+                byte_range: node.byte_range(),
+            }
         }
         "number" | "char" | "false" | "true" | "null" | "this" | "iso8601" => {
             // `number` covers every numeric form (int/decimal/scientific/

@@ -1543,14 +1543,10 @@ fn lint_nullability_inner(
     }
 }
 
-/// Byte range of an arbitrary expression. `Expr::byte_range()` returns
-/// `0..0` for `Ident` (it lives in the `Ident` arena), so we resolve
-/// that one shape ourselves before delegating to the enum accessor.
+/// Byte range of an arbitrary expression. Thin wrapper around
+/// [`Expr::byte_range`] kept as a named helper for call-site clarity.
 fn receiver_byte_range(hir: &Hir, expr_id: Idx<Expr>) -> Range<usize> {
-    match &hir.exprs[expr_id] {
-        Expr::Ident(name_idx) => hir.idents[*name_idx].byte_range.clone(),
-        other => other.byte_range(),
-    }
+    hir.exprs[expr_id].byte_range()
 }
 
 /// Render a receiver expression as quoted source-like text for the
@@ -1571,7 +1567,7 @@ fn display_property(hir: &Hir, property: PropertyName) -> String {
 
 fn display_receiver(hir: &Hir, expr_id: Idx<Expr>) -> String {
     match &hir.exprs[expr_id] {
-        Expr::Ident(name_idx) => hir.idents[*name_idx].text.to_string(),
+        Expr::Ident { name: name_idx, .. } => hir.idents[*name_idx].text.to_string(),
         Expr::Literal(l) => match l.kind {
             greycat_analyzer_hir::types::LiteralKind::This => "this".into(),
             _ => "expression".into(),

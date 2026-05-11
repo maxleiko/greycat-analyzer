@@ -2725,3 +2725,145 @@ fn completion_in_module_decl_carries_signature_detail() {
         helper.label_details
     );
 }
+
+/// Repro: `n.` member completion on a module-level `var` receiver.
+///
+/// Mirrors `project.gcl`:
+///
+/// ```gcl
+/// var n: node<int?>;
+///
+/// fn main() {
+///     n.
+/// }
+/// ```
+///
+/// `n` is a top-level (module-scope) var — the resolver records it as
+/// `Definition::Decl(...)`, not `Definition::Local`. Member completion
+/// must still surface the receiver's members (the `node` tag's own
+/// methods + the inner type's members via the `.`→`->` rewrite).
+#[test]
+// P35.9 — unignore once `member_completion` walks runtime-type
+// decls (`node`, `nodeTime`, etc.). Today `member_completion`
+// looks up `module.analysis.type_decls.get("node")` and
+// `project.index.locate_decl("node")`; both miss because the
+// `node` decl lives in `std/core.gcl` and isn't surfaced by either
+// the per-module type-decls map nor by `locate_decl`. Phase 35
+// replaces SmolStr-name lookups with `TypeDeclId` handles
+// resolved through `WellKnown`, after which this just walks the
+// `node` decl's members the same way it walks a user type's.
+#[ignore = "tracked by P35.9 — member_completion needs to consult well_known.node_decl"]
+fn completion_after_dot_on_modvar_node_receiver() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "var n: node<int?>;\nfn main() {\n    n.\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after the `.` on line 2 (0-indexed), col 6.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 6),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("expected a completion list after `n.` on a modvar receiver");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        !labels.is_empty(),
+        "expected at least one member completion for `n.` on `var n: node<int?>;`, got empty list"
+    );
+    // `node` tag's own methods should be reachable through `.`.
+    assert!(
+        labels.iter().any(|l| *l == "resolve" || *l == "set"),
+        "expected `node` tag members (e.g. `resolve` / `set`) in list, got: {labels:?}"
+    );
+}
+
+/// Isolate the modvar from the runtime `node` tag: receiver is a
+/// module-level var of a user-defined type, with a placeholder member
+/// (`p.foo`) to avoid ERROR recovery. Pure modvar behaviour test.
+#[test]
+fn completion_after_dot_on_modvar_user_type_receiver_no_error() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Point { x: int; y: int; }\nvar p: Point;\nfn main() {\n    p.foo;\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Line 3 (0-indexed), col 6: right after `.` in `p.foo`.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(3, 6),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("expected a completion list after `p.` on a user-typed modvar");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"x") && labels.contains(&"y"),
+        "expected `x`/`y` Point attrs after `p.` on `var p: Point;`, got: {labels:?}"
+    );
+}
+
+/// Companion to `completion_after_dot_on_modvar_node_receiver`: same
+/// scenario but with a placeholder member ident (`n.foo`) so the parser
+/// produces a full `member_expr` instead of falling into ERROR
+/// recovery. Lets us pin down whether the modvar bug lives in the
+/// HIR fast path or only in the ERROR-recovery fallback path.
+#[test]
+// P35.9 — unignore once `member_completion` walks runtime-type
+// decls. Same root cause as
+// `completion_after_dot_on_modvar_node_receiver`; this variant
+// has no ERROR-recovery so it isolates the runtime-tag member
+// gap from the `receiver_type_at` modvar gap (which P35.10
+// addresses separately).
+#[ignore = "tracked by P35.9 — member_completion needs to consult well_known.node_decl"]
+fn completion_after_dot_on_modvar_node_receiver_no_error() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "var n: node<int?>;\nfn main() {\n    n.foo;\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after the `.` on line 2 (0-indexed), col 6.
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 6),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("expected a completion list after `n.` on a modvar receiver (no-ERROR variant)");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        !labels.is_empty(),
+        "expected at least one member completion (no-ERROR variant), got empty list"
+    );
+}

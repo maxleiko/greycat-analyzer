@@ -467,8 +467,8 @@ fn push_type_record(
 /// come from the wrapped `Ident` for `Expr::Ident`).
 fn expr_kind_and_range(hir: &Hir, expr: &Expr) -> Option<(&'static str, std::ops::Range<usize>)> {
     let kind: &'static str = match expr {
-        Expr::Ident(id) => {
-            let ident = &hir.idents[*id];
+        Expr::Ident { name, .. } => {
+            let ident = &hir.idents[*name];
             return Some(("Identifier", ident.byte_range.clone()));
         }
         Expr::Literal(l) => match l.kind {
@@ -548,7 +548,7 @@ fn collect_expr_descendants(
         return;
     }
     match &hir.exprs[root] {
-        Expr::Ident(_) | Expr::Literal(_) => {}
+        Expr::Ident { .. } | Expr::Literal(_) => {}
         Expr::String(s) => {
             for part in &s.parts {
                 if let StringPart::Interp { expr, .. } = part {

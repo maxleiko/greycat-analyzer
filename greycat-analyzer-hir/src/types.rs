@@ -303,7 +303,19 @@ pub struct AtStmt {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Ident(Idx<Ident>),
+    /// A bare-ident expression (a name used in expression position).
+    ///
+    /// Carries `byte_range` inline so [`Expr::byte_range`] is honest for
+    /// every variant. The same span lives on the underlying
+    /// `Ident` arena entry (which also serves declaration-site names,
+    /// fn-param names, property names, type-ref names — anywhere an
+    /// `Idx<Ident>` appears without an enclosing `Expr::Ident`); the
+    /// two are written from the same `tree_sitter::Node` at lowering
+    /// time and the Ident arena is grow-only, so they can't drift.
+    Ident {
+        name: Idx<Ident>,
+        byte_range: Span,
+    },
     /// Literal whose textual form is preserved verbatim (numbers, durations,
     /// iso8601, char). The semantic `Type` is computed by the type system.
     Literal(LiteralExpr),
@@ -373,7 +385,7 @@ pub enum Expr {
 impl Expr {
     pub fn byte_range(&self) -> Span {
         match self {
-            Expr::Ident(_) => 0..0, // resolved via the Ident arena entry
+            Expr::Ident { byte_range, .. } => byte_range.clone(),
             Expr::Literal(l) => l.byte_range.clone(),
             Expr::String(s) => s.byte_range.clone(),
             Expr::Tuple(_, r) | Expr::Array(_, r) | Expr::Paren(_, r) => r.clone(),

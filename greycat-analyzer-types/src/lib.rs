@@ -61,6 +61,32 @@ impl Symbol {
     }
 }
 
+// P35.1
+/// Stable, project-wide handle to a resolved type-decl
+/// (`Decl::Type` or `Decl::Enum`). Dense `u32` newtype, `Copy`,
+/// hashable in one register-sized compare. Issued by the project's
+/// `DeclRegistry`; resolves back to its `(Uri, Idx<Decl>)` source
+/// through that registry.
+///
+/// Two `TypeDeclId`s compare equal iff they point at the same decl in
+/// the same module. A user-declared `type node<T>` and the std-core
+/// `node<T>` therefore get different handles — the soundness gap where
+/// the previous SmolStr-keyed identity collapsed them is closed at
+/// the type-system level.
+///
+/// Not comparable across distinct `DeclRegistry` instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeDeclId(u32);
+
+impl TypeDeclId {
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 // P19.9
 /// Append-only string interner. One allocation per unique
 /// name across the project lifetime. Hot lookup paths (analyzer body

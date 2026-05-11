@@ -473,7 +473,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
 fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
     let expr = cx.hir.exprs[expr_id].clone();
     match expr {
-        Expr::Ident(idx) => cx.record_use(idx),
+        Expr::Ident { name, .. } => cx.record_use(name),
         Expr::Literal(_) => {}
         Expr::String(StringExpr { parts, .. }) => {
             // P17.5 — recurse into `${expr}` interpolations so inner

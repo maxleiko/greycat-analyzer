@@ -175,7 +175,7 @@ pub fn hover_with_project(
                 .hir
                 .exprs
                 .iter()
-                .filter(|(_, e)| !matches!(e, Expr::Ident(_)))
+                .filter(|(_, e)| !matches!(e, Expr::Ident { .. }))
                 .find(|(_, e)| {
                     let er = e.byte_range();
                     !er.is_empty() && er == r
@@ -263,7 +263,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
         if let Some((expr_id, expr)) = hir
             .exprs
             .iter()
-            .filter(|(_, e)| !matches!(e, Expr::Ident(_)))
+            .filter(|(_, e)| !matches!(e, Expr::Ident { .. }))
             .find(|(_, e)| {
                 let er = e.byte_range();
                 !er.is_empty() && er == r
@@ -613,7 +613,7 @@ fn hover_from_markdown(markdown: String, range: Range<usize>, text: &str) -> Hov
 
 fn short_expr_label(hir: &Hir, expr: &Expr) -> String {
     match expr {
-        Expr::Ident(idx) => hir.idents[*idx].text.to_string(),
+        Expr::Ident { name: idx, .. } => hir.idents[*idx].text.to_string(),
         Expr::Literal(_) => "literal".into(),
         Expr::String(_) => "string".into(),
         Expr::Call(_) => "call".into(),
@@ -2241,7 +2241,7 @@ fn emit_call_arg_hints_expr(
                 emit_call_arg_hints_expr(hir, resolutions, *a, want, text, out);
             }
             // Look up callee's params.
-            if let Expr::Ident(name_idx) = &hir.exprs[*callee]
+            if let Expr::Ident { name: name_idx, .. } = &hir.exprs[*callee]
                 && let Some(Definition::Decl(decl_id)) = resolutions.lookup(*name_idx)
                 && let Decl::Fn(fnd) = &hir.decls[decl_id]
             {
@@ -2254,10 +2254,7 @@ fn emit_call_arg_hints_expr(
                     if param_name.starts_with('_') {
                         continue;
                     }
-                    let arg_range = match &hir.exprs[*arg] {
-                        Expr::Ident(ident_idx) => hir.idents[*ident_idx].byte_range.clone(),
-                        other => other.byte_range(),
-                    };
+                    let arg_range = hir.exprs[*arg].byte_range();
                     if arg_range.start > want.1 || arg_range.end < want.0 {
                         continue;
                     }
