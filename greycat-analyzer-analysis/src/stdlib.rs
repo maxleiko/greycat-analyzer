@@ -260,6 +260,11 @@ pub struct TypeMembers {
     /// a runtime `field` handle). Empty for types with no static
     /// attrs.
     pub static_attrs: FxHashSet<Symbol>,
+    /// Names of methods declared with the `static` modifier. Lets
+    /// `resolve_member` filter them out of instance access — the
+    /// runtime resolves `this.from` to an inherited `from: time` attr
+    /// even when a `static fn from(...)` is declared on the same type.
+    pub static_methods: FxHashSet<Symbol>,
     // P19.14
     /// Direct supertype name (the `Super` in
     /// `type Sub extends Super`). Drives inheritance: member
@@ -484,6 +489,27 @@ impl ProjectIndex {
             .map(|id| (members.home_uri.clone(), *id))
     }
 
+    /// Like [`type_method_id_chain`] but skips chain levels where the
+    /// candidate is a `static` method. Used by instance-access member
+    /// resolution (`recv.method` / `recv->method`) — the runtime
+    /// resolves those against *instance* methods only, so a parent's
+    /// non-static method should not be shadowed by a subtype's static
+    /// method of the same name.
+    pub fn type_instance_method_id_chain(
+        &self,
+        type_name: &str,
+        method_name: &str,
+    ) -> Option<(Uri, Idx<Decl>)> {
+        let method_sym = self.symbols.lookup(method_name)?;
+        let members = self.walk_member_chain(type_name, |m| {
+            m.methods.contains_key(&method_sym) && !m.static_methods.contains(&method_sym)
+        })?;
+        members
+            .methods
+            .get(&method_sym)
+            .map(|id| (members.home_uri.clone(), *id))
+    }
+
     // P19.14
     /// Pre-lowered attr type, walking the supertype
     /// chain. The `TypeId` lives in the project arena and may
@@ -650,6 +676,7 @@ impl ProjectIndex {
                             attr_types: FxHashMap::default(),
                             method_returns: FxHashMap::default(),
                             static_attrs: FxHashSet::default(),
+                            static_methods: FxHashSet::default(),
                             supertype,
                         };
                         for attr_id in &td.attrs {
@@ -670,6 +697,9 @@ impl ProjectIndex {
                                 let method_sym =
                                     self.symbols.intern(hir.idents[fnd.name].text.as_str());
                                 m.methods.insert(method_sym, *method_id);
+                                if fnd.modifiers.static_ {
+                                    m.static_methods.insert(method_sym);
+                                }
                             }
                         }
                         self.type_members.insert(name_sym, m);

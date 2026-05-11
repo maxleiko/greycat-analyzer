@@ -837,7 +837,18 @@ impl<'a> Cx<'a> {
     /// receivers consult [`crate::stdlib::ProjectIndex::type_members`]
     /// directly and write into `foreign_member_uses` inline
     /// no `deferred_member_uses` deferral.
-    fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
+    /// `instance_access` is `true` for `recv.prop` / `recv->prop` (Member /
+    /// Arrow) and `false` for `Type::prop` (Static). Instance access
+    /// skips `static` methods so a `static fn from(...)` declared on the
+    /// same type as an inherited `from: time` attr doesn't shadow the
+    /// attr — the runtime resolves `this.from` to the attr, not the
+    /// static method.
+    fn resolve_member_with(
+        &mut self,
+        recv_ty: TypeId,
+        property: Idx<Ident>,
+        instance_access: bool,
+    ) {
         let ty = self.arena.get(recv_ty);
         let type_name: Option<SmolStr> = match &ty.kind {
             TypeKind::Named { name } => Some(name.clone()),
@@ -865,11 +876,22 @@ impl<'a> Cx<'a> {
         };
         let prop_text = self.ident_text(property);
 
-        if let Some(decl_id) = self.out.type_decls.get(name.as_str()).copied() {
-            // Local: type declared in this module.
-            let Decl::Type(type_decl) = &self.hir.decls[decl_id] else {
-                return;
-            };
+        // Resolution order: attrs first (local then inherited), methods
+        // second (local then inherited). Attrs always win over methods
+        // of the same name — the runtime resolves `this.from` to an
+        // inherited `from: time` attr even when a `static fn from(...)`
+        // is declared on the receiver type.
+        let local_type_decl = self
+            .out
+            .type_decls
+            .get(name.as_str())
+            .copied()
+            .and_then(|id| match &self.hir.decls[id] {
+                Decl::Type(td) => Some(td.clone()),
+                _ => None,
+            });
+
+        if let Some(type_decl) = local_type_decl.as_ref() {
             for attr_id in &type_decl.attrs {
                 let attr = &self.hir.type_attrs[*attr_id];
                 if self.hir.idents[attr.name].text == prop_text {
@@ -879,30 +901,7 @@ impl<'a> Cx<'a> {
                     return;
                 }
             }
-            for method_id in &type_decl.methods {
-                let Decl::Fn(m) = &self.hir.decls[*method_id] else {
-                    continue;
-                };
-                if self.hir.idents[m.name].text == prop_text {
-                    self.out
-                        .member_uses
-                        .insert(property, MemberDef::Method(*method_id));
-                    return;
-                }
-            }
-            // **P19.14** — fall through to the project index so an
-            // inherited attr / method (declared on a parent type
-            // that may live in another module) still resolves. The
-            // foreign-binding form is correct even when the parent
-            // is in *this* module — `foreign_member_uses` is read
-            // by the same downstream codepaths as `member_uses`.
         }
-        // P21 — type lives in another module. Consult the cross-module
-        // structure index built in S2-S6, write directly to
-        // `foreign_member_uses`. Replaces the old `deferred_member_uses`
-        // → pass-3 drain (which is now deleted).
-        // **P19.14** — chain-walking lookup so attrs / methods
-        // declared on a parent type resolve through a `Sub` receiver.
         if let Some((uri, attr_id)) = self.index.type_attr_id_chain(&name, prop_text) {
             self.out.foreign_member_uses.insert(
                 property,
@@ -913,7 +912,28 @@ impl<'a> Cx<'a> {
             );
             return;
         }
-        if let Some((uri, method_id)) = self.index.type_method_id_chain(&name, prop_text) {
+        if let Some(type_decl) = local_type_decl.as_ref() {
+            for method_id in &type_decl.methods {
+                let Decl::Fn(m) = &self.hir.decls[*method_id] else {
+                    continue;
+                };
+                if instance_access && m.modifiers.static_ {
+                    continue;
+                }
+                if self.hir.idents[m.name].text == prop_text {
+                    self.out
+                        .member_uses
+                        .insert(property, MemberDef::Method(*method_id));
+                    return;
+                }
+            }
+        }
+        let method_lookup = if instance_access {
+            self.index.type_instance_method_id_chain(&name, prop_text)
+        } else {
+            self.index.type_method_id_chain(&name, prop_text)
+        };
+        if let Some((uri, method_id)) = method_lookup {
             self.out.foreign_member_uses.insert(
                 property,
                 ForeignMember {
@@ -922,6 +942,10 @@ impl<'a> Cx<'a> {
                 },
             );
         }
+    }
+
+    fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
+        self.resolve_member_with(recv_ty, property, true);
     }
 
     // P23
@@ -2688,7 +2712,7 @@ impl<'a> Cx<'a> {
                 // then run `resolve_member` on the property.
                 let recv_ty = self.lower_type_ref(s.ty);
                 let property = s.property.ident();
-                self.resolve_member(recv_ty, property);
+                self.resolve_member_with(recv_ty, property, false);
                 // Enum-variant access: `Foo::a` where `Foo` is an enum
                 // and `a` is one of its variants — the value's type is
                 // the enum itself, not `any`.
