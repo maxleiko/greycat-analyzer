@@ -1158,15 +1158,15 @@ fn declaring_type_for_method_cursor(
 
     // Case 2: cursor on a member access bound in the local module.
     use greycat_analyzer_analysis::analyzer::MemberDef;
-    if let Some(MemberDef::Method(decl_id)) = module.analysis.member_lookup(cursor_idx) {
-        if let Some(module_root) = module.hir.module.as_ref() {
-            for type_decl_id in &module_root.decls {
-                let Decl::Type(td) = &module.hir.decls[*type_decl_id] else {
-                    continue;
-                };
-                if td.methods.contains(&decl_id) {
-                    return Some(module.hir.idents[td.name].text.to_string());
-                }
+    if let Some(MemberDef::Method(decl_id)) = module.analysis.member_lookup(cursor_idx)
+        && let Some(module_root) = module.hir.module.as_ref()
+    {
+        for type_decl_id in &module_root.decls {
+            let Decl::Type(td) = &module.hir.decls[*type_decl_id] else {
+                continue;
+            };
+            if td.methods.contains(&decl_id) {
+                return Some(module.hir.idents[td.name].text.to_string());
             }
         }
     }
