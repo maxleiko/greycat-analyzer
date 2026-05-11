@@ -35,7 +35,7 @@ use greycat_analyzer_hir::types::{
 };
 use greycat_analyzer_types::{
     GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_castable, is_node_tag,
+    is_assignable_to, is_castable, is_node_tag,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -542,6 +542,14 @@ struct CondNarrows {
     else_typed: Vec<(Idx<Ident>, Idx<TypeRef>)>,
     /// Same as `then_member_typed` but for the else branch (under `!`).
     else_member_typed: Vec<(String, Idx<TypeRef>)>,
+    /// Disjunctive `is`-narrows: `x is T1 || x is T2` narrows `x` to
+    /// `T1 | T2` in the then-branch. Each entry is `(ident, type-refs)`
+    /// applied as a `TypeKind::Union` narrow. Populated by the `||`
+    /// arm when the same ident is `is`-narrowed on both sides.
+    then_typed_union: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)>,
+    /// Same as `then_typed_union` but for the else branch (populated
+    /// only via negation).
+    else_typed_union: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)>,
 }
 
 /// One arm in an enum-equality chain.
@@ -672,6 +680,250 @@ impl<'a> Cx<'a> {
     }
     fn null(&mut self) -> TypeId {
         self.arena.null()
+    }
+
+    /// Compositional "is this condition trivially decidable?" pass.
+    /// Returns `Some(true)` / `Some(false)` when the condition's truth
+    /// value is statically known from the declared types of its
+    /// operands; returns `None` otherwise.
+    ///
+    /// Recognized shapes:
+    /// - Bool literals (`true` / `false`).
+    /// - `x != null` / `x == null` against an ident whose declared
+    ///   (or already-narrowed) type is non-nullable — always true /
+    ///   always false respectively.
+    /// - Parenthesized sub-expressions (transparent).
+    /// - `!E` (invert).
+    /// - `A && B`: false if either side is false; true if both sides
+    ///   are true; otherwise undecidable.
+    /// - `A || B`: true if either side is true; false if both sides
+    ///   are false; otherwise undecidable.
+    ///
+    /// `is`-narrow contradictions (e.g. `x is int && x is float`) are
+    /// handled separately in
+    /// [`Self::diagnose_then_typed_contradictions`] — they need
+    /// receiver-type intersection analysis that doesn't fit the
+    /// compositional pattern here.
+    fn trivially_decidable(&self, cond_id: Idx<Expr>) -> Option<bool> {
+        match &self.hir.exprs[cond_id] {
+            Expr::Paren(inner, _) => self.trivially_decidable(*inner),
+            Expr::Literal(LiteralExpr {
+                kind: LiteralKind::Bool,
+                text,
+                ..
+            }) => match text.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::Not,
+                operand,
+                ..
+            }) => self.trivially_decidable(*operand).map(|b| !b),
+            Expr::Binary(BinaryExpr {
+                op, left, right, ..
+            }) => match op {
+                BinOp::And => match (
+                    self.trivially_decidable(*left),
+                    self.trivially_decidable(*right),
+                ) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                BinOp::Or => match (
+                    self.trivially_decidable(*left),
+                    self.trivially_decidable(*right),
+                ) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                BinOp::Eq | BinOp::Neq => {
+                    let name = self.ident_compared_to_null(*left, *right)?;
+                    let def = match self.res.lookup(name)? {
+                        Definition::Param(d) | Definition::Local(d) => d,
+                        _ => return None,
+                    };
+                    let ty = self.lookup_def_type(def)?;
+                    if self.arena.get(ty).nullable {
+                        return None;
+                    }
+                    // x : T (non-nullable) vs null —
+                    // `x != null` always true; `x == null` always false.
+                    Some(matches!(op, BinOp::Neq))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Check `is`-narrows in the then-branch for trivially decidable
+    /// outcomes:
+    ///
+    /// - **Always false (contradiction):** two `is`-checks on the
+    ///   same ident with no common subtype, e.g.
+    ///   `x is int && x is float`. The ident is re-narrowed to
+    ///   `never` and the if condition flagged.
+    /// - **Always false (vs declared type):** the asserted type is
+    ///   disjoint from the binding's known type at the if site, e.g.
+    ///   `x: int; if (x is float)`. The ident is re-narrowed to
+    ///   `never` and the condition flagged.
+    /// - **Always true:** the binding's known type is already
+    ///   assignable to the asserted type, e.g.
+    ///   `x: int; if (x is int)`. The narrow is left in place (it
+    ///   matches the existing type) and the condition flagged as a
+    ///   no-op check.
+    ///
+    /// Compatible groups (one asserted type assignable to another,
+    /// e.g. `x is Animal && x is Cat` with `Cat <: Animal`) collapse
+    /// to the most specific type without diagnostics.
+    fn diagnose_then_typed_contradictions(
+        &mut self,
+        multi: &FxHashMap<Idx<Ident>, (Option<TypeId>, Vec<TypeId>)>,
+        condition: Idx<Expr>,
+    ) {
+        let mut emitted = false;
+        let mut never_id: Option<TypeId> = None;
+        for (ident, (known_opt, tys)) in multi {
+            // Find the most specific asserted type (one assignable to
+            // all others). If none → the asserted types may be
+            // pairwise disjoint *or* `is_assignable_to` lacks the
+            // information to compare them (e.g. user types with
+            // inheritance, not yet wired into the subtyping relation).
+            // Only claim "contradiction" when every type in the group
+            // is a primitive, where `primitive_assignable` is a total
+            // identity relation and disjointness is provable.
+            let mut most_specific: Option<TypeId> = None;
+            'outer: for &cand in tys {
+                for &other in tys {
+                    if cand == other {
+                        continue;
+                    }
+                    if !is_assignable_to(self.arena, cand, other) {
+                        continue 'outer;
+                    }
+                }
+                most_specific = Some(cand);
+                break;
+            }
+            let all_primitive = tys
+                .iter()
+                .all(|t| matches!(self.arena.get(*t).kind, TypeKind::Primitive(_)));
+
+            let mk_never = |arena: &mut TypeArena, slot: &mut Option<TypeId>| -> TypeId {
+                match *slot {
+                    Some(id) => id,
+                    None => {
+                        let id = arena.never();
+                        *slot = Some(id);
+                        id
+                    }
+                }
+            };
+
+            match most_specific {
+                None if all_primitive => {
+                    let never = mk_never(self.arena, &mut never_id);
+                    self.write_narrow(*ident, never);
+                    if !emitted {
+                        let name = self.ident_text(*ident).to_string();
+                        let pretty: Vec<String> = tys
+                            .iter()
+                            .map(|t| greycat_analyzer_types::display(self.arena, *t))
+                            .collect();
+                        let msg = format!(
+                            "condition is always false: `{}` cannot simultaneously be {}",
+                            name,
+                            pretty.join(" and "),
+                        );
+                        let range = self.hir.exprs[condition].byte_range();
+                        self.diag(Severity::Warning, msg, range);
+                        emitted = true;
+                    }
+                }
+                None => {
+                    // Asserted types are non-primitive and we can't
+                    // prove pairwise disjointness. Skip the diagnostic
+                    // and fall back to last-write-wins narrow (already
+                    // applied by the caller).
+                }
+                Some(asserted) => {
+                    if let Some(known) = *known_opt {
+                        let known_kind = &self.arena.get(known).kind;
+                        let known_is_top = matches!(known_kind, TypeKind::Any | TypeKind::Never);
+                        // Known type is already a subtype of asserted
+                        // → the check can't filter anything. Skip when
+                        // known is `any` (top, every value passes
+                        // trivially via raw-form widening, but the
+                        // check is a meaningful runtime discriminator)
+                        // and when known is `never` (downstream
+                        // diagnostics already flag the unreachable
+                        // scope).
+                        if !known_is_top && is_assignable_to(self.arena, known, asserted) {
+                            if !emitted {
+                                let name = self.ident_text(*ident).to_string();
+                                let msg = format!(
+                                    "condition is always true: `{}` is already of type `{}`",
+                                    name,
+                                    greycat_analyzer_types::display(self.arena, known),
+                                );
+                                let range = self.hir.exprs[condition].byte_range();
+                                self.diag(Severity::Warning, msg, range);
+                                emitted = true;
+                            }
+                            self.write_narrow(*ident, asserted);
+                            continue;
+                        }
+                        // Known and asserted are disjoint (neither
+                        // assignable to the other) — the check can
+                        // never pass. Skip when known is `any` (top)
+                        // or `never` for the same reasons.
+                        if !known_is_top && !is_assignable_to(self.arena, asserted, known) {
+                            let never = mk_never(self.arena, &mut never_id);
+                            self.write_narrow(*ident, never);
+                            if !emitted {
+                                let name = self.ident_text(*ident).to_string();
+                                let msg = format!(
+                                    "condition is always false: `{}` of type `{}` can never be `{}`",
+                                    name,
+                                    greycat_analyzer_types::display(self.arena, known),
+                                    greycat_analyzer_types::display(self.arena, asserted),
+                                );
+                                let range = self.hir.exprs[condition].byte_range();
+                                self.diag(Severity::Warning, msg, range);
+                                emitted = true;
+                            }
+                            continue;
+                        }
+                    }
+                    self.write_narrow(*ident, asserted);
+                }
+            }
+        }
+    }
+
+    /// Lower a list of `is`-narrow type refs and join them into a
+    /// single `TypeKind::Union`. Single-element lists collapse to
+    /// the lone alt (no union wrapper). Used to apply disjunctive
+    /// `is`-narrows from `x is T1 || x is T2` style guards.
+    fn lower_typed_union(&mut self, ty_refs: &[Idx<TypeRef>]) -> TypeId {
+        let mut alts: Vec<TypeId> = Vec::with_capacity(ty_refs.len());
+        for ty_ref in ty_refs {
+            let id = self.lower_type_ref(*ty_ref);
+            if !alts.contains(&id) {
+                alts.push(id);
+            }
+        }
+        if alts.len() == 1 {
+            return alts[0];
+        }
+        self.arena.alloc(Type {
+            kind: TypeKind::Union { alts },
+            nullable: false,
+        })
     }
 
     // P35.4
@@ -1968,7 +2220,25 @@ impl<'a> Cx<'a> {
                     then_member_typed,
                     else_typed,
                     else_member_typed,
+                    then_typed_union,
+                    else_typed_union,
                 } = self.derive_cond_narrows(condition);
+
+                // Decide triviality BEFORE pushing any narrows — the
+                // null-strip and `is`-narrow application below would
+                // shadow the bindings' declared types and make every
+                // null / type check look trivially decidable against
+                // itself.
+                let decidable = self.trivially_decidable(condition);
+                if let Some(b) = decidable {
+                    let range = self.hir.exprs[condition].byte_range();
+                    let msg = if b {
+                        "condition is always true"
+                    } else {
+                        "condition is always false"
+                    };
+                    self.diag(Severity::Warning, msg, range);
+                }
 
                 self.push_narrow();
                 for ident in &then_non_null {
@@ -1977,9 +2247,36 @@ impl<'a> Cx<'a> {
                         self.write_narrow(*ident, stripped);
                     }
                 }
+                // Capture each `is`-narrowed binding's *pre-narrow*
+                // declared type first — the contradiction pass needs
+                // to compare the asserted `is`-type against the
+                // binding's known type at the if-condition's eval
+                // site. If we wrote the narrows first, `lookup_def_type`
+                // would return the asserted type itself and every
+                // single `is`-check would falsely look "always true".
+                let mut multi_typed: FxHashMap<Idx<Ident>, (Option<TypeId>, Vec<TypeId>)> =
+                    FxHashMap::default();
                 for (ident, ty_ref) in &then_typed {
                     let ty = self.lower_type_ref(*ty_ref);
+                    let entry = multi_typed
+                        .entry(*ident)
+                        .or_insert_with(|| (self.lookup_def_type(*ident), Vec::new()));
+                    entry.1.push(ty);
+                }
+                for (ident, group) in &multi_typed {
+                    for ty in &group.1 {
+                        self.write_narrow(*ident, *ty);
+                    }
+                }
+                for (ident, ty_refs) in &then_typed_union {
+                    let ty = self.lower_typed_union(ty_refs);
                     self.write_narrow(*ident, ty);
+                }
+                // Skip the `is`-contradiction pass when the condition
+                // is already trivially decidable — it would re-emit a
+                // duplicate "always (true|false)" diag.
+                if decidable.is_none() {
+                    self.diagnose_then_typed_contradictions(&multi_typed, condition);
                 }
                 for path in &then_member_non_null {
                     self.write_member_non_null(path.clone());
@@ -2017,6 +2314,10 @@ impl<'a> Cx<'a> {
                         }
                         for (ident, ty_ref) in &else_typed {
                             let ty = self.lower_type_ref(*ty_ref);
+                            self.write_narrow(*ident, ty);
+                        }
+                        for (ident, ty_refs) in &else_typed_union {
+                            let ty = self.lower_typed_union(ty_refs);
                             self.write_narrow(*ident, ty);
                         }
                         for (path, ty_ref) in &else_member_typed {
@@ -2066,6 +2367,10 @@ impl<'a> Cx<'a> {
                         let ty = self.lower_type_ref(*ty_ref);
                         self.write_narrow(*ident, ty);
                     }
+                    for (ident, ty_refs) in &else_typed_union {
+                        let ty = self.lower_typed_union(ty_refs);
+                        self.write_narrow(*ident, ty);
+                    }
                     for (path, ty_ref) in &else_member_typed {
                         let ty = self.lower_type_ref(*ty_ref);
                         self.write_member_typed(path.clone(), ty);
@@ -2080,6 +2385,10 @@ impl<'a> Cx<'a> {
                     }
                     for (ident, ty_ref) in &then_typed {
                         let ty = self.lower_type_ref(*ty_ref);
+                        self.write_narrow(*ident, ty);
+                    }
+                    for (ident, ty_refs) in &then_typed_union {
+                        let ty = self.lower_typed_union(ty_refs);
                         self.write_narrow(*ident, ty);
                     }
                     for path in &then_member_non_null {
@@ -2403,6 +2712,8 @@ impl<'a> Cx<'a> {
                     out.then_non_null.extend(r.then_non_null);
                     out.then_typed.extend(l.then_typed);
                     out.then_typed.extend(r.then_typed);
+                    out.then_typed_union.extend(l.then_typed_union);
+                    out.then_typed_union.extend(r.then_typed_union);
                     out.then_member_non_null.extend(l.then_member_non_null);
                     out.then_member_non_null.extend(r.then_member_non_null);
                     out.then_member_typed.extend(l.then_member_typed);
@@ -2417,7 +2728,32 @@ impl<'a> Cx<'a> {
                     out.else_non_null.extend(r.else_non_null);
                     out.else_member_non_null.extend(l.else_member_non_null);
                     out.else_member_non_null.extend(r.else_member_non_null);
-                    // Then: at least one held — can't narrow either.
+                    // Then: at least one side held. For `is`-narrows on
+                    // the same ident across both sides (e.g.
+                    // `x is int || x is float`), narrow `x` to the union
+                    // of those types in the then-branch. Idents narrowed
+                    // on only one side stay unnarrowed (we don't know
+                    // which side held).
+                    let mut lm: FxHashMap<Idx<Ident>, Vec<Idx<TypeRef>>> = FxHashMap::default();
+                    for (id, ty) in l.then_typed {
+                        lm.entry(id).or_default().push(ty);
+                    }
+                    for (id, tys) in l.then_typed_union {
+                        lm.entry(id).or_default().extend(tys);
+                    }
+                    let mut rm: FxHashMap<Idx<Ident>, Vec<Idx<TypeRef>>> = FxHashMap::default();
+                    for (id, ty) in r.then_typed {
+                        rm.entry(id).or_default().push(ty);
+                    }
+                    for (id, tys) in r.then_typed_union {
+                        rm.entry(id).or_default().extend(tys);
+                    }
+                    for (ident, mut ltys) in lm {
+                        if let Some(rtys) = rm.get(&ident) {
+                            ltys.extend(rtys.iter().copied());
+                            out.then_typed_union.push((ident, ltys));
+                        }
+                    }
                 }
                 BinOp::Eq | BinOp::Neq => {
                     // Ident-vs-null path (P6.4).
@@ -2483,6 +2819,8 @@ impl<'a> Cx<'a> {
                 out.else_typed = inner.then_typed;
                 out.then_member_typed = inner.else_member_typed;
                 out.else_member_typed = inner.then_member_typed;
+                out.then_typed_union = inner.else_typed_union;
+                out.else_typed_union = inner.then_typed_union;
             }
             _ => {}
         }
@@ -3088,17 +3426,25 @@ impl<'a> Cx<'a> {
                             then_member_typed,
                             else_typed: _,
                             else_member_typed: _,
+                            then_typed_union,
+                            else_typed_union: _,
                         } = self.derive_cond_narrows(left);
-                        let (non_null, typed, member_non_null, member_typed) = match op {
+                        let (non_null, typed, typed_union, member_non_null, member_typed) = match op
+                        {
                             BinOp::And => (
                                 then_non_null,
                                 then_typed,
+                                then_typed_union,
                                 then_member_non_null,
                                 then_member_typed,
                             ),
-                            BinOp::Or => {
-                                (else_non_null, Vec::new(), else_member_non_null, Vec::new())
-                            }
+                            BinOp::Or => (
+                                else_non_null,
+                                Vec::new(),
+                                Vec::new(),
+                                else_member_non_null,
+                                Vec::new(),
+                            ),
                             _ => unreachable!(),
                         };
                         self.push_narrow();
@@ -3110,6 +3456,10 @@ impl<'a> Cx<'a> {
                         }
                         for (ident, ty_ref) in &typed {
                             let ty = self.lower_type_ref(*ty_ref);
+                            self.write_narrow(*ident, ty);
+                        }
+                        for (ident, ty_refs) in &typed_union {
+                            let ty = self.lower_typed_union(ty_refs);
                             self.write_narrow(*ident, ty);
                         }
                         for path in member_non_null {
