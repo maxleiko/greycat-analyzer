@@ -449,6 +449,34 @@ impl ProjectIndex {
     /// member matched by `pred`. Used to find inherited attrs /
     /// methods (`pvInstallation->timezone` resolves through
     /// `PVInstallation extends PVEntity`'s `timezone: TimeZone`).
+    /// Number of types in `type_name`'s supertype chain, counting the
+    /// type itself. Returns 0 when `type_name` is unknown. Stops
+    /// counting at [`MAX_SUPERTYPE_CHAIN_DEPTH`] + 1 — the caller only
+    /// needs to distinguish "within limit" from "exceeds limit".
+    pub fn supertype_chain_length(&self, type_name: &str) -> usize {
+        let Some(mut cur) = self.symbols.lookup(type_name) else {
+            return 0;
+        };
+        let mut len: usize = 0;
+        for _ in 0..=MAX_SUPERTYPE_CHAIN_DEPTH {
+            let Some(members) = self.type_members.get(&cur) else {
+                return len;
+            };
+            len += 1;
+            match members.supertype {
+                Some(parent) => cur = parent,
+                None => return len,
+            }
+        }
+        len
+    }
+
+    /// Maximum number of types the runtime accepts in an `extends`
+    /// chain (including the leaf type itself). Re-exported so callers
+    /// in this crate can mention the limit in user-facing messages
+    /// without depending on the private constant.
+    pub const MAX_INHERITANCE_DEPTH: usize = MAX_SUPERTYPE_CHAIN_DEPTH;
+
     /// Bounded at [`MAX_SUPERTYPE_CHAIN_DEPTH`] hops to match the
     /// runtime's inheritance-depth ceiling and defend against accidental
     /// cycles in in-progress source.

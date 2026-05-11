@@ -1604,6 +1604,28 @@ impl<'a> Cx<'a> {
         // P12.1: type-level generics are visible in attrs + method
         // signatures.
         let type_name: SmolStr = self.hir.idents[d.name].text.as_str().into();
+        // Inheritance-depth check: the runtime caps `extends` chains
+        // at MAX_INHERITANCE_DEPTH types (including the leaf). A
+        // declaration past that limit fails to build with
+        // "too depth inheritance: <name>". Surface it as a structural
+        // error at the type's declaration site so the user sees the
+        // problem before they hit `greycat build`.
+        let chain_len = self.index.supertype_chain_length(&type_name);
+        if chain_len > crate::stdlib::ProjectIndex::MAX_INHERITANCE_DEPTH {
+            let limit = crate::stdlib::ProjectIndex::MAX_INHERITANCE_DEPTH;
+            let span = d
+                .supertype
+                .map(|tr| self.hir.type_refs[tr].byte_range.clone())
+                .unwrap_or_else(|| self.hir.idents[d.name].byte_range.clone());
+            self.diag(
+                Severity::Error,
+                format!(
+                    "inheritance chain too deep: `{type_name}` is {chain_len} levels deep; \
+                     greycat allows at most {limit}"
+                ),
+                span,
+            );
+        }
         let owner = GenericOwner::Type(type_name.clone());
         self.push_generic_scope(&d.generics, owner.clone());
         // **P19.11** — build the `this` TypeId. For non-generic
