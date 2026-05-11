@@ -18,7 +18,7 @@ use lsp_types::{
     request::{RegisterCapability, Request as _},
     *,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::Result;
 use crate::capabilities::diagnostics_from_module;
@@ -29,14 +29,53 @@ use crate::capabilities::diagnostics_from_module;
 /// so 500ms catches genuine outliers.
 const SLOW_REBUILD_MS: u128 = 500;
 
+// P32.1
+/// One independent GreyCat project: a `project.gcl` plus the
+/// `@library`/`@include` closure it pulls in, with its own
+/// [`SourceManager`] and [`ProjectAnalysis`] so two projects'
+/// type arenas / decl namespaces never collide.
+pub struct Project {
+    /// Directory holding the `project.gcl` entrypoint. Kept exactly as
+    /// it came in via `uri_to_path` (no eager canonicalize) — comparisons
+    /// canonicalize on demand, see [`Backend::is_project_entrypoint`].
+    pub root: PathBuf,
+    pub manager: SourceManager,
+    pub analysis: ProjectAnalysis,
+}
+
+impl Project {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            manager: SourceManager::new(),
+            analysis: ProjectAnalysis::new(),
+        }
+    }
+}
+
+// P32.1
+/// LSP server state.
+///
+/// Storage shape is multi-project: `projects` keyed by project-root
+/// path, `uri_owner` mapping every loaded document to its owning
+/// project, `workspace_roots` capturing each `workspace/didChangeWorkspaceFolders`
+/// entry (used by the parent-walk in P32.3).
+///
+/// Two server-wide knobs (`lint_libs`, `registry`) live here instead
+/// of on each project — `initializationOptions` is one-shot and the
+/// registry fetcher is the same regardless of project.
 pub struct Backend {
     pub client: Sender<Message>,
-    pub manager: SourceManager,
-    pub project_analysis: ProjectAnalysis,
-    // P15.5 — used to anchor `@include` / `@library` pragma diagnostics.
-    /// Project root (parent of `project.gcl`) captured at workspace
-    /// load time.
-    pub project_root: Option<PathBuf>,
+    /// All loaded projects, keyed by their root directory.
+    pub projects: FxHashMap<PathBuf, Project>,
+    /// URI → owning-project root. Populated eagerly during
+    /// `load_workspace` and on `did_open` for files that aren't part
+    /// of any project's closure.
+    pub uri_owner: FxHashMap<Uri, PathBuf>,
+    /// Workspace folder roots from `initialize` (and later
+    /// `workspace/didChangeWorkspaceFolders`). Bounds the parent-walk
+    /// in P32.3's owner-search.
+    pub workspace_roots: Vec<PathBuf>,
     /// When `true`, lint diagnostics from non-project modules
     /// (`lib/<name>/...`) are surfaced in the editor too. Driven by
     /// the `greycat-analyzer.lintLibs` extension setting via the
@@ -53,6 +92,49 @@ pub struct Backend {
 }
 
 impl Backend {
+    // P32.1
+    /// Look up the [`Project`] that owns `uri`. Returns `None` when
+    /// the URI hasn't been bound to a project yet (P32.3 will fill
+    /// that in via the parent-walk; P32.5 will surface it as an
+    /// orphan).
+    pub fn project_for(&self, uri: &Uri) -> Option<&Project> {
+        let root = self.uri_owner.get(uri)?;
+        self.projects.get(root)
+    }
+
+    pub fn project_for_mut(&mut self, uri: &Uri) -> Option<&mut Project> {
+        let root = self.uri_owner.get(uri)?.clone();
+        self.projects.get_mut(&root)
+    }
+
+    // P32.1 — temporary fallback. Until P32.3 lands proper
+    // owner-search, callers that need *some* project (legacy
+    // single-project behaviour) reach for the first one. The
+    // ordering is unspecified but with a single project loaded —
+    // today's only supported shape — it's deterministic enough.
+    /// First project in `self.projects` (HashMap order). Caller
+    /// guarantees one exists; otherwise returns `None`.
+    pub fn any_project(&self) -> Option<&Project> {
+        self.projects.values().next()
+    }
+
+    pub fn any_project_mut(&mut self) -> Option<&mut Project> {
+        self.projects.values_mut().next()
+    }
+
+    /// Project-or-any: owner if known, else fall back to the first
+    /// loaded project. The plain `_or_any` flavour exists only for
+    /// the intermediate state between P32.1 and P32.3; new code
+    /// should prefer `project_for` and handle `None` explicitly.
+    pub fn project_for_or_any(&self, uri: &Uri) -> Option<&Project> {
+        self.project_for(uri).or_else(|| self.any_project())
+    }
+
+    /// Bind `uri` to `root` in `uri_owner`. Idempotent.
+    fn bind_uri(&mut self, uri: Uri, root: PathBuf) {
+        self.uri_owner.insert(uri, root);
+    }
+
     fn publish_diagnostics(
         &self,
         uri: Uri,
@@ -67,22 +149,27 @@ impl Backend {
     /// [`ProjectAnalysis::analyze`] on workspace load and by
     /// [`ProjectAnalysis::invalidate`] on every `did_open` / `did_change`.
     fn publish_for(&self, uri: &Uri) -> Result<()> {
-        let Some(cell) = self.manager.get(uri) else {
+        let Some(project) = self.project_for_or_any(uri) else {
+            return Ok(());
+        };
+        let Some(cell) = project.manager.get(uri) else {
             return Ok(());
         };
         let doc = cell.borrow();
         let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
-        if let Some(module) = self.project_analysis.module(uri) {
+        if let Some(module) = project.analysis.module(uri) {
             diags.extend(diagnostics_from_module(&doc.text, module, self.lint_libs));
         }
         // P15.5 — pragma resolution diagnostics. Recomputed on every
         // publish so edits to `@include` / `@library` pragmas reflect
-        // immediately. Skipped when no project root is known (single-
-        // file mode).
-        if let Some(root) = self.project_root.as_ref() {
+        // immediately. Anchored to the owning project's root.
+        // Skipped for the implicit empty-root project (P32.1 lazy
+        // fallback) so we don't anchor paths against a meaningless
+        // cwd.
+        if !project.root.as_os_str().is_empty() {
             let desc = parse_module_desc(uri.clone(), &doc.text, doc.root_node());
             if let Ok(ctx) = FsContext::new() {
-                diags.extend(pragma_diagnostics(&doc.text, &desc, root, &ctx));
+                diags.extend(pragma_diagnostics(&doc.text, &desc, &project.root, &ctx));
             }
         }
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
@@ -165,15 +252,23 @@ impl Backend {
     }
 
     // P1.4 — typed diagnostic publication lands here.
+    // P32.1 — per workspace folder, build a fresh `Project` rather
+    // than overwriting a single global one.
     /// Resolve a workspace-folder URI to a local path, look for
     /// `project.gcl` at its root, and recursively load every reachable
-    /// module via [`SourceManager::load_project`]. Errors are logged but
-    /// don't fail the LSP handshake.
+    /// module via [`SourceManager::load_project`] into a fresh
+    /// [`Project`]. Errors are logged but don't fail the LSP handshake.
     fn load_workspace(&mut self, ws_uri: &Uri) {
         let Some(ws_root) = uri_to_path(ws_uri) else {
             warn!("skipping non-file workspace folder: {}", ws_uri.as_str());
             return;
         };
+        // Remember the workspace folder regardless of whether it has a
+        // project.gcl — P32.3's parent walk needs to know its bounds
+        // even when nothing was loaded eagerly.
+        if !self.workspace_roots.contains(&ws_root) {
+            self.workspace_roots.push(ws_root.clone());
+        }
         let project_file = ws_root.join("project.gcl");
         if !project_file.is_file() {
             debug!(
@@ -182,9 +277,10 @@ impl Backend {
             );
             return;
         }
-        self.project_root = Some(ws_root.clone());
+        let project_root = ws_root.clone();
+        let mut project = Project::new(project_root.clone());
         let load_start = Instant::now();
-        let report = self.manager.load_project(&project_file);
+        let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
         for lib in &report.unresolved_libraries {
             warn!("unresolved @library('{lib}') in {}", project_file.display());
@@ -195,14 +291,19 @@ impl Backend {
         // Single project-wide pipeline pass over everything we just
         // loaded — the per-doc analyses land in the cache.
         let rebuild_start = Instant::now();
-        self.project_analysis.rebuild(&self.manager);
+        project.analysis.rebuild(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
             "[load_project] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
             report.loaded.len(),
             project_file.display()
         );
-        for (uri, _) in report.loaded {
+        let loaded = report.loaded.clone();
+        for uri in &report.reachable {
+            self.uri_owner.insert(uri.clone(), project_root.clone());
+        }
+        self.projects.insert(project_root, project);
+        for (uri, _) in loaded {
             if let Err(e) = self.publish_for(&uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
             }
@@ -213,7 +314,33 @@ impl Backend {
         let uri = params.text_document.uri.clone();
         let doc = Document::new(params.text_document);
         debug!("[did_open] {doc}");
-        self.manager.add(doc);
+        // P32.1 — route to the owning project if known; otherwise
+        // fall through to the first loaded project (single-project
+        // semantics preserved). When nothing is loaded — headless
+        // LSP clients that skip `workspace_folders`, the smoke test,
+        // single-file editor sessions — lazily create an implicit
+        // empty-root project so the document still gets analyzed.
+        // P32.3 replaces the lookup with a proper parent-walk
+        // owner-search; P32.5 reroutes truly project-less files into
+        // dedicated orphan handling.
+        let target_root = match self.uri_owner.get(&uri).cloned() {
+            Some(root) => root,
+            None => {
+                let root = match self.projects.keys().next() {
+                    Some(r) => r.clone(),
+                    None => {
+                        let r = PathBuf::new();
+                        self.projects.insert(r.clone(), Project::new(r.clone()));
+                        r
+                    }
+                };
+                self.bind_uri(uri.clone(), root.clone());
+                root
+            }
+        };
+        if let Some(project) = self.projects.get_mut(&target_root) {
+            project.manager.add(doc);
+        }
         self.invalidate_with_slow_warning(&uri, "did_open");
         self.publish_for(&uri)?;
         Ok(())
@@ -221,9 +348,17 @@ impl Backend {
 
     pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
         let uri = params.text_document.uri.clone();
-        let doc = self
-            .manager
-            .update(&uri, params.content_changes, params.text_document.version);
+        let Some(project) = self.project_for_mut(&uri) else {
+            debug!(
+                "[did_change] {} has no owning project — dropping",
+                uri.as_str()
+            );
+            return Ok(());
+        };
+        let doc =
+            project
+                .manager
+                .update(&uri, params.content_changes, params.text_document.version);
         debug!("[did_change] {doc}");
         drop(doc);
         // **P19.22** — pragma edits to the project entrypoint can add /
@@ -234,7 +369,7 @@ impl Backend {
         // re-walk before invalidating so the rebuild sees the full
         // closure.
         if self.is_project_entrypoint(&uri) {
-            self.reload_project_closure();
+            self.reload_project_closure(&uri);
         } else {
             self.invalidate_with_slow_warning(&uri, "did_change");
         }
@@ -242,14 +377,14 @@ impl Backend {
         Ok(())
     }
 
-    /// True when `uri` resolves to `<project_root>/project.gcl`. Used
-    /// to gate the re-walk on `did_change` and to dispatch `lib/installed`
-    /// / `*.gcl` events from the workspace watcher to the right project.
+    /// True when `uri` resolves to its owning project's `project.gcl`.
+    /// Used to gate the re-walk on `did_change` and to dispatch
+    /// `lib/installed` / `*.gcl` events from the workspace watcher.
     fn is_project_entrypoint(&self, uri: &Uri) -> bool {
-        let Some(root) = self.project_root.as_ref() else {
+        let Some(project) = self.project_for(uri) else {
             return false;
         };
-        let entrypoint = root.join("project.gcl");
+        let entrypoint = project.root.join("project.gcl");
         let Ok(canonical) = entrypoint.canonicalize() else {
             return false;
         };
@@ -259,20 +394,28 @@ impl Backend {
         path.canonicalize().map(|p| p == canonical).unwrap_or(false)
     }
 
-    /// Re-walk the project entrypoint's `@library` / `@include`
-    /// closure against the current in-memory `project.gcl` and rebuild
-    /// the analysis. Idempotent: `SourceManager::load_file` skips
-    /// already-loaded files (including the in-editor entrypoint), so
-    /// only newly-referenced modules get parsed. Triggered from
-    /// `did_change` on the entrypoint and from the `lib/installed`
-    /// branch of the workspace watcher.
-    fn reload_project_closure(&mut self) {
-        let Some(root) = self.project_root.as_ref() else {
+    /// Re-walk a project's `@library` / `@include` closure against the
+    /// current in-memory `project.gcl` and rebuild its analysis.
+    /// Idempotent: `SourceManager::load_file` skips already-loaded
+    /// files (including the in-editor entrypoint), so only newly-
+    /// referenced modules get parsed. Triggered from `did_change` on
+    /// the entrypoint and from the `lib/installed` branch of the
+    /// workspace watcher. `trigger_uri` is the URI whose change
+    /// prompted the reload — used only to pick the project to reload.
+    fn reload_project_closure(&mut self, trigger_uri: &Uri) {
+        let Some(project_root) = self.uri_owner.get(trigger_uri).cloned() else {
             return;
         };
-        let project_file = root.join("project.gcl");
+        self.reload_project_closure_for(&project_root);
+    }
+
+    fn reload_project_closure_for(&mut self, project_root: &Path) {
+        let Some(project) = self.projects.get_mut(project_root) else {
+            return;
+        };
+        let project_file = project.root.join("project.gcl");
         let load_start = Instant::now();
-        let report = self.manager.load_project(&project_file);
+        let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
         for lib in &report.unresolved_libraries {
             warn!("unresolved @library('{lib}') in {}", project_file.display());
@@ -289,7 +432,7 @@ impl Backend {
         // user action.
         #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
         let reachable: FxHashSet<Uri> = report.reachable.iter().cloned().collect();
-        let evicted = self.manager.evict_unreachable(&reachable);
+        let evicted = project.manager.evict_unreachable(&reachable);
         if !evicted.is_empty() {
             info!(
                 "[reload_project] evicted {} unreachable file(s):",
@@ -311,7 +454,7 @@ impl Backend {
             }
         }
         let rebuild_start = Instant::now();
-        self.project_analysis.rebuild(&self.manager);
+        project.analysis.rebuild(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
             "[reload_project] {load_took:?} (parse+load) + {rebuild_took:?} (analyze) — closure: {} reachable, {} added, {} evicted",
@@ -319,6 +462,21 @@ impl Backend {
             report.loaded.len(),
             evicted.len(),
         );
+        // Snapshot the report fields we'll need after we drop the
+        // mutable borrow on `self.projects` so we can update
+        // `uri_owner` and publish without overlapping borrows.
+        let reachable_uris = report.reachable.clone();
+        let owner_root = project_root.to_path_buf();
+
+        // Re-index `uri_owner` for everything still reachable, and
+        // drop entries for the evicted URIs.
+        for uri in &evicted {
+            self.uri_owner.remove(uri);
+        }
+        for uri in &reachable_uris {
+            self.uri_owner.insert(uri.clone(), owner_root.clone());
+        }
+
         // Clear diagnostics for evicted URIs so the editor's stale
         // entries disappear.
         for uri in &evicted {
@@ -332,7 +490,7 @@ impl Backend {
         // diagnostics on files that were already loaded (e.g., the
         // project entrypoint goes from "all good" to "unknown library"
         // when an `@library` line is commented out).
-        for uri in &report.reachable {
+        for uri in &reachable_uris {
             if let Err(e) = self.publish_for(uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
             }
@@ -345,8 +503,11 @@ impl Backend {
     /// log level; outliers show up so users can spot project-side hot
     /// spots without flipping into `debug`.
     fn invalidate_with_slow_warning(&mut self, uri: &Uri, source: &str) {
+        let Some(project) = self.project_for_mut(uri) else {
+            return;
+        };
         let start = Instant::now();
-        self.project_analysis.invalidate(&self.manager, uri);
+        project.analysis.invalidate(&project.manager, uri);
         let took = start.elapsed();
         if took.as_millis() >= SLOW_REBUILD_MS {
             info!("[slow-rebuild] {source} for {} took {took:?}", uri.as_str());
@@ -373,7 +534,7 @@ impl Backend {
         Ok(())
     }
 
-    // P19.22
+    // P19.22 / P32.1
     /// Workspace file watcher events. Two flavors of
     /// trigger matter to us:
     ///
@@ -390,7 +551,9 @@ impl Backend {
     ///   pragma); deleted → drop from the manager + reload.
     ///
     /// In-editor edits (`did_change`) are NOT routed through this path
-    /// — they go through the textDocument flow.
+    /// — they go through the textDocument flow. P32.7 will replace the
+    /// "reload every project" fan-out below with per-project routing
+    /// based on which project owns each event's path.
     pub fn did_change_watched_files(&mut self, params: DidChangeWatchedFilesParams) -> Result<()> {
         if params.changes.is_empty() {
             return Ok(());
@@ -420,8 +583,8 @@ impl Backend {
             // Skip files the editor owns the live state of — `did_change`
             // already keeps those fresh. Only refresh closed sources.
             let opened = self
-                .manager
-                .get(uri)
+                .project_for(uri)
+                .and_then(|p| p.manager.get(uri))
                 .map(|cell| cell.borrow().opened)
                 .unwrap_or(false);
             if opened {
@@ -437,8 +600,12 @@ impl Backend {
                     // Refresh the closed source from disk. A change to a
                     // non-pragma module doesn't need a project re-walk;
                     // an `invalidate` is enough.
-                    if let Ok(text) = std::fs::read_to_string(&path) {
-                        self.manager.add_simple(uri.clone(), text, "project", false);
+                    if let Ok(text) = std::fs::read_to_string(&path)
+                        && let Some(project) = self.project_for_mut(uri)
+                    {
+                        project
+                            .manager
+                            .add_simple(uri.clone(), text, "project", false);
                         self.invalidate_with_slow_warning(uri, "watch");
                         if let Err(e) = self.publish_for(uri) {
                             warn!("publish_for({}) failed: {e}", uri.as_str());
@@ -447,7 +614,10 @@ impl Backend {
                 }
                 FileChangeType::DELETED => {
                     debug!("[watch] deleted {}", uri.as_str());
-                    let _ = self.manager.remove(uri);
+                    if let Some(project) = self.project_for_mut(uri) {
+                        let _ = project.manager.remove(uri);
+                    }
+                    self.uri_owner.remove(uri);
                     self.publish_diagnostics(uri.clone(), Vec::new(), None)?;
                     needs_reload = true;
                 }
@@ -455,7 +625,14 @@ impl Backend {
             }
         }
         if needs_reload {
-            self.reload_project_closure();
+            // P32.7 will narrow this to the projects whose closures
+            // actually changed. For now, fan out to every loaded
+            // project so we don't silently miss reloads in a
+            // multi-project workspace.
+            let roots: Vec<PathBuf> = self.projects.keys().cloned().collect();
+            for root in roots {
+                self.reload_project_closure_for(&root);
+            }
         }
         Ok(())
     }
@@ -463,7 +640,7 @@ impl Backend {
 
 /// Convert a `file://` URI to a local path. Returns `None` for non-file
 /// schemes (LSP technically allows `untitled:`, `git:`, etc.).
-fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+pub(crate) fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let s = uri.as_str();
     let stripped = s.strip_prefix("file://")?;
     Some(Path::new(stripped).to_path_buf())
@@ -482,4 +659,65 @@ pub(crate) fn publish_diagnostics(
         params: serde_json::to_value(params).unwrap(),
     }))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::str::FromStr;
+
+    fn uri(s: &str) -> Uri {
+        Uri::from_str(s).unwrap()
+    }
+
+    fn backend() -> Backend {
+        let (tx, _rx) = unbounded();
+        Backend {
+            client: tx,
+            projects: FxHashMap::default(),
+            uri_owner: FxHashMap::default(),
+            workspace_roots: Vec::new(),
+            lint_libs: false,
+            registry: None,
+        }
+    }
+
+    // P32.1
+    /// `project_for` routes by `uri_owner`. Two projects coexist;
+    /// each URI dispatches to its bound root and never bleeds across.
+    #[test]
+    fn project_for_routes_by_uri_owner() {
+        let mut b = backend();
+        let root_a = PathBuf::from("/ws/projA");
+        let root_b = PathBuf::from("/ws/projB");
+        b.projects
+            .insert(root_a.clone(), Project::new(root_a.clone()));
+        b.projects
+            .insert(root_b.clone(), Project::new(root_b.clone()));
+
+        let a1 = uri("file:///ws/projA/main.gcl");
+        let b1 = uri("file:///ws/projB/main.gcl");
+        b.uri_owner.insert(a1.clone(), root_a.clone());
+        b.uri_owner.insert(b1.clone(), root_b.clone());
+
+        assert_eq!(b.project_for(&a1).map(|p| &p.root), Some(&root_a));
+        assert_eq!(b.project_for(&b1).map(|p| &p.root), Some(&root_b));
+
+        // Unowned URI: no routing.
+        let unbound = uri("file:///elsewhere/loose.gcl");
+        assert!(b.project_for(&unbound).is_none());
+    }
+
+    // P32.1
+    #[test]
+    fn project_for_or_any_falls_back_to_first_project() {
+        let mut b = backend();
+        let root = PathBuf::from("/ws/only");
+        b.projects.insert(root.clone(), Project::new(root.clone()));
+
+        // Unbound URI gets routed to the only project loaded.
+        let unbound = uri("file:///ws/only/extra.gcl");
+        assert_eq!(b.project_for_or_any(&unbound).map(|p| &p.root), Some(&root));
+    }
 }

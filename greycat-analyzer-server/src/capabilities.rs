@@ -2040,11 +2040,12 @@ fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
 /// file [`analyzer::analyze`] would miss those — that's the bug we
 /// kept hitting whenever new project-level inference landed.
 ///
-/// Convention: every LSP handler in [`crate::server`] reads from
-/// `Backend::project_analysis` and calls one of these `*_with_project`
-/// variants. The legacy `(text, lib, root)` shims below stay for
-/// unit tests / single-file CLI commands but they must never be
-/// reached from a live LSP session.
+/// Convention: every LSP handler in [`crate::server`] resolves the
+/// owning project for the request URI via `Backend::project_for` and
+/// calls one of these `*_with_project` variants against that project's
+/// analysis. The legacy `(text, lib, root)` shims below stay for unit
+/// tests / single-file CLI commands but they must never be reached
+/// from a live LSP session.
 pub fn inlay_hints_with_project(
     module: &ModuleAnalysis,
     arena: &greycat_analyzer_types::TypeArena,

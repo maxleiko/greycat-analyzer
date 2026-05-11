@@ -118,9 +118,9 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
 
     let mut server = Backend {
         client: conn.sender.clone(),
-        manager: Default::default(),
-        project_analysis: Default::default(),
-        project_root: None,
+        projects: Default::default(),
+        uri_owner: Default::default(),
+        workspace_roots: Vec::new(),
         lint_libs: false,
         // P15.3 — production fetcher (ureq + 5min TTL cache). Native
         // builds always have it; WASM uses a different bridge that
@@ -295,7 +295,8 @@ where
 fn hover_handler(server: &Backend, params: HoverParams) -> Option<Hover> {
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    let cell = server.manager.get(&uri)?;
+    let project = server.project_for_or_any(&uri)?;
+    let cell = project.manager.get(&uri)?;
     let doc = cell.borrow();
     capabilities::hover_with_project(
         &doc.text,
@@ -303,15 +304,16 @@ fn hover_handler(server: &Backend, params: HoverParams) -> Option<Hover> {
         doc.root_node(),
         pos,
         &uri,
-        &server.project_analysis,
-        &server.manager,
+        &project.analysis,
+        &project.manager,
     )
 }
 
 fn signature_help_handler(server: &Backend, params: SignatureHelpParams) -> Option<SignatureHelp> {
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    let cell = server.manager.get(&uri)?;
+    let project = server.project_for_or_any(&uri)?;
+    let cell = project.manager.get(&uri)?;
     let doc = cell.borrow();
     capabilities::signature_help(&doc.text, &doc.lib, doc.root_node(), pos)
 }
@@ -322,12 +324,8 @@ fn goto_definition_handler(
 ) -> Option<GotoDefinitionResponse> {
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    capabilities::goto_definition_across_project(
-        &server.project_analysis,
-        &server.manager,
-        &uri,
-        pos,
-    )
+    let project = server.project_for_or_any(&uri)?;
+    capabilities::goto_definition_across_project(&project.analysis, &project.manager, &uri, pos)
 }
 
 fn goto_declaration_handler(
@@ -336,12 +334,8 @@ fn goto_declaration_handler(
 ) -> Option<lsp_types::request::GotoDeclarationResponse> {
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    capabilities::goto_declaration_across_project(
-        &server.project_analysis,
-        &server.manager,
-        &uri,
-        pos,
-    )
+    let project = server.project_for_or_any(&uri)?;
+    capabilities::goto_declaration_across_project(&project.analysis, &project.manager, &uri, pos)
 }
 
 fn goto_implementation_handler(
@@ -353,19 +347,16 @@ fn goto_implementation_handler(
     // → goto_definition when there's no method match.
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    capabilities::goto_implementation_across_project(
-        &server.project_analysis,
-        &server.manager,
-        &uri,
-        pos,
-    )
+    let project = server.project_for_or_any(&uri)?;
+    capabilities::goto_implementation_across_project(&project.analysis, &project.manager, &uri, pos)
 }
 
 fn document_symbols_handler(
     server: &Backend,
     params: DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     let syms = capabilities::document_symbols(&doc.text, &doc.lib, doc.root_node());
     Some(DocumentSymbolResponse::Nested(syms))
@@ -378,9 +369,10 @@ fn references_handler(server: &Backend, params: ReferenceParams) -> Option<Vec<L
     // (importers) — replaces the prior text-equality fallback.
     let uri = params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
+    let project = server.project_for_or_any(&uri)?;
     Some(capabilities::references_across_project(
-        &server.project_analysis,
-        &server.manager,
+        &project.analysis,
+        &project.manager,
         &uri,
         pos,
     ))
@@ -390,7 +382,8 @@ fn prepare_rename_handler(
     server: &Backend,
     params: TextDocumentPositionParams,
 ) -> Option<PrepareRenameResponse> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     capabilities::prepare_rename(&doc.text, doc.root_node(), params.position)
 }
@@ -399,9 +392,10 @@ fn rename_handler(server: &Backend, params: RenameParams) -> Option<WorkspaceEdi
     // P11.4: scope-aware project-wide rename via cached resolutions.
     let uri = params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
+    let project = server.project_for_or_any(&uri)?;
     capabilities::rename_across_project(
-        &server.project_analysis,
-        &server.manager,
+        &project.analysis,
+        &project.manager,
         &uri,
         pos,
         &params.new_name,
@@ -414,7 +408,8 @@ fn document_highlight_handler(
 ) -> Option<Vec<DocumentHighlight>> {
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
-    let cell = server.manager.get(&uri)?;
+    let project = server.project_for_or_any(&uri)?;
+    let cell = project.manager.get(&uri)?;
     let doc = cell.borrow();
     Some(capabilities::document_highlights(
         &doc.text,
@@ -427,7 +422,8 @@ fn selection_ranges_handler(
     server: &Backend,
     params: SelectionRangeParams,
 ) -> Option<Vec<SelectionRange>> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     Some(capabilities::selection_ranges(
         &doc.text,
@@ -440,19 +436,21 @@ fn folding_ranges_handler(
     server: &Backend,
     params: FoldingRangeParams,
 ) -> Option<Vec<FoldingRange>> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     Some(capabilities::folding_ranges(&doc.text, doc.root_node()))
 }
 
 fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<CodeActionResponse> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     // Read from the cache so cross-module diagnostics (P15.10 arg-type
     // validation) flow into the code-action list. The legacy single-
     // file `capabilities::code_actions` re-runs lower+resolve+analyze
     // and skips the project pipeline.
-    let module = server.project_analysis.module(&params.text_document.uri)?;
+    let module = project.analysis.module(&params.text_document.uri)?;
     Some(capabilities::code_actions_with_project(
         module,
         &doc.text,
@@ -464,15 +462,16 @@ fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<Co
 fn completion_handler(server: &Backend, params: CompletionParams) -> Option<CompletionResponse> {
     let uri = params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
-    let cell = server.manager.get(&uri)?;
+    let project = server.project_for_or_any(&uri)?;
+    let cell = project.manager.get(&uri)?;
     let doc = cell.borrow();
     let list = capabilities::completion_with_project(
         &doc.text,
         doc.root_node(),
         pos,
         &uri,
-        &server.project_analysis,
-        server.project_root.as_deref(),
+        &project.analysis,
+        Some(project.root.as_path()),
     )?;
     // P15.3 — swap the lazy `@library` version placeholder with
     // concrete items. Skipped when no fetcher is configured (WASM
@@ -489,23 +488,25 @@ fn completion_handler(server: &Backend, params: CompletionParams) -> Option<Comp
 }
 
 fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<InlayHint>> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     // Read from the project cache so cross-module fixup passes
     // (P15.7 / P16.3 / P16.4) are reflected in the inferred types.
     // The single-file `capabilities::inlay_hints` shim would miss
     // those — see the doc on `inlay_hints_with_project`.
-    let module = server.project_analysis.module(&params.text_document.uri)?;
+    let module = project.analysis.module(&params.text_document.uri)?;
     Some(capabilities::inlay_hints_with_project(
         module,
-        server.project_analysis.arena(),
+        project.analysis.arena(),
         &doc.text,
         &params.range,
     ))
 }
 
 fn formatting_handler(server: &Backend, params: DocumentFormattingParams) -> Option<Vec<TextEdit>> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     capabilities::formatting(&doc.text, doc.root_node())
 }
@@ -514,7 +515,8 @@ fn range_formatting_handler(
     server: &Backend,
     params: DocumentRangeFormattingParams,
 ) -> Option<Vec<TextEdit>> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     capabilities::range_formatting(&doc.text, doc.root_node(), params.range)
 }
@@ -523,12 +525,17 @@ fn workspace_symbols_handler(
     server: &Backend,
     params: WorkspaceSymbolParams,
 ) -> Option<Vec<WorkspaceSymbol>> {
+    // P32.1 — gather docs across every loaded project. Cross-project
+    // symbol search is the one capability that's intentionally
+    // project-agnostic; everything else routes via `project_for`.
     let docs: Vec<(Uri, String, String)> = server
-        .manager
-        .iter()
-        .map(|(uri, cell)| {
-            let d = cell.borrow();
-            (uri.clone(), d.lib.clone(), d.text.clone())
+        .projects
+        .values()
+        .flat_map(|p| {
+            p.manager.iter().map(|(uri, cell)| {
+                let d = cell.borrow();
+                (uri.clone(), d.lib.clone(), d.text.clone())
+            })
         })
         .collect();
     Some(capabilities::workspace_symbols(docs, &params.query))
@@ -538,7 +545,8 @@ fn semantic_tokens_handler(
     server: &Backend,
     params: SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
-    let cell = server.manager.get(&params.text_document.uri)?;
+    let project = server.project_for_or_any(&params.text_document.uri)?;
+    let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
     Some(SemanticTokensResult::Tokens(capabilities::semantic_tokens(
         &doc.text,
