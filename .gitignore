@@ -1,6 +1,7 @@
 /target
 
 # GreyCat — runtime install destinations
+/project.gcl
 /gcdata
 /files
 /lib
