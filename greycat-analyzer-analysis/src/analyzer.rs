@@ -1228,6 +1228,15 @@ impl<'a> Cx<'a> {
             TypeKind::Generic { name, args } if is_node_tag(name) && args.len() == 1 => {
                 Some(args[0])
             }
+            // P36.3 — handle-keyed node-tag dispatch via WellKnown.
+            // Identical semantics to the string-keyed arm above;
+            // both coexist until P36.7 deletes `Generic` (and the
+            // string-keyed `is_node_tag`).
+            TypeKind::GenericInstance { decl, args }
+                if self.well_known.is_node_tag(*decl) && args.len() == 1 =>
+            {
+                Some(args[0])
+            }
             _ => None,
         }
     }
@@ -3645,10 +3654,20 @@ impl<'a> Cx<'a> {
                 let inheritance_ok = {
                     let from_kind = &self.arena.get(from_ty).kind;
                     let to_kind = &self.arena.get(to_ty).kind;
-                    let extract_name = |k: &TypeKind| match k {
-                        TypeKind::Named { name } => Some(name.clone()),
-                        TypeKind::Generic { name, .. } => Some(name.clone()),
-                        _ => None,
+                    // P36.3 — handle-keyed shapes resolve their name
+                    // via the registry; legacy `Named` / `Generic`
+                    // shapes still flow through their inline name.
+                    let registry = self.decl_registry;
+                    let extract_name = |k: &TypeKind| -> Option<SmolStr> {
+                        match k {
+                            TypeKind::Named { name } => Some(name.clone()),
+                            TypeKind::Generic { name, .. } => Some(name.clone()),
+                            TypeKind::Type(d) => registry.name(*d).map(SmolStr::from),
+                            TypeKind::GenericInstance { decl, .. } => {
+                                registry.name(*decl).map(SmolStr::from)
+                            }
+                            _ => None,
+                        }
                     };
                     match (extract_name(from_kind), extract_name(to_kind)) {
                         (Some(fn_), Some(tn)) => {
