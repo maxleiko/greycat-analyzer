@@ -2332,7 +2332,9 @@ fn lower_type_ref_project(
             } else if index.has_name(name) {
                 arena.named(name.to_string())
             } else {
-                arena.any()
+                // P35.3 — unknown type. Was `any()`; now `Unresolved`
+                // so hover / display surface the typo'd name.
+                arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
             }
         }
     };

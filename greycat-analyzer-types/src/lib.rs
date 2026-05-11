@@ -202,6 +202,26 @@ pub enum TypeKind {
         decl: TypeDeclId,
         args: SmallVec<[TypeId; 2]>,
     },
+    // P35.3
+    /// A type-ref whose name didn't resolve — typo, missing import,
+    /// in-progress code. Carries the source `name` and `byte_range`
+    /// (as a `(start, end)` tuple since `Range<usize>` is not `Hash`,
+    /// and the arena interns by value) so diagnostics can quote and
+    /// locate the offending name verbatim.
+    ///
+    /// Behaviorally an `any`-like sink: satisfies every assignability
+    /// check from both directions so a single unresolved name doesn't
+    /// fan out into a cascade of false "incompatible types"
+    /// diagnostics; the resolver's "unresolved name" error already
+    /// pinpoints the cause.
+    ///
+    /// Distinct from `Any` so consumers that *want* to know "this was
+    /// an unresolved type, render the original name" can — hover and
+    /// display show the typo'd name verbatim.
+    Unresolved {
+        name: SmolStr,
+        byte_range: (usize, usize),
+    },
     /// Generic type *parameter* — the `T` inside a `fn<T>(x: T)` body.
     // P25.4
     GenericParam { name: SmolStr, owner: GenericOwner },
@@ -383,6 +403,23 @@ impl TypeArena {
                 args: args.into(),
             },
             nullable: false,
+        })
+    }
+
+    // P35.3
+    /// Allocate a [`TypeKind::Unresolved`]. Use this in place of the
+    /// `arena.any()` fallback when a type-ref name didn't resolve —
+    /// behaves like `any` for assignability but carries the source
+    /// name + span for diagnostic rendering. Nullable to match
+    /// `any`'s semantics: an unresolved name has no constraint
+    /// against null.
+    pub fn unresolved(&mut self, name: impl Into<SmolStr>, byte_range: (usize, usize)) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Unresolved {
+                name: name.into(),
+                byte_range,
+            },
+            nullable: true,
         })
     }
 
@@ -611,6 +648,16 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     // compiles it; null at runtime would fail the same way a wrong
     // type would).
     if matches!(a.kind, TypeKind::Any) {
+        return true;
+    }
+    // P35.3 — `Unresolved` behaves like `any` (both top and bottom)
+    // so a single unresolved name doesn't cascade into a swarm of
+    // false-positive assignability diagnostics. The resolver's
+    // "unresolved name" error already pinpoints the cause; we
+    // suppress downstream type-relation noise.
+    if matches!(a.kind, TypeKind::Unresolved { .. })
+        || matches!(b.kind, TypeKind::Unresolved { .. })
+    {
         return true;
     }
     // A non-nullable can't widen into a different non-nullable type just
@@ -1107,6 +1154,9 @@ pub fn display(arena: &TypeArena, id: TypeId) -> String {
             let parts: Vec<String> = args.iter().map(|a| display(arena, *a)).collect();
             format!("?type#{}<{}>", decl.raw(), parts.join(", "))
         }
+        // P35.3 — render unresolved names verbatim so hover / fmt
+        // surface the typo for the user.
+        TypeKind::Unresolved { name, .. } => name.to_string(),
         TypeKind::GenericParam { name, .. } => name.to_string(),
         TypeKind::Lambda(l) => {
             let parts: Vec<String> = l.params.iter().map(|p| display(arena, *p)).collect();
@@ -1187,6 +1237,13 @@ pub fn display_fqn(
                 .collect();
             format!("?type#{}<{}>", decl.raw(), parts.join(", "))
         }
+        // P35.3 — unresolved name, render verbatim with the same
+        // `<lib>::` prefix the rest of the resolver would have used.
+        TypeKind::Unresolved { name, .. } => format!(
+            "{}::{}",
+            home_lib(name.as_str()).unwrap_or_else(|| "core".to_string()),
+            name
+        ),
         TypeKind::GenericParam { name, .. } => name.to_string(),
         TypeKind::Lambda(l) => {
             let parts: Vec<String> = l

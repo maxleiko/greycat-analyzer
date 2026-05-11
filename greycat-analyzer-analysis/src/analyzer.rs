@@ -1396,9 +1396,14 @@ impl<'a> Cx<'a> {
                     // can defer for the cross-module post-pass.
                     self.arena.named(name.clone())
                 } else {
-                    // Unknown type — fall back to Any so downstream rules don't
-                    // mass-cascade. Resolver already emitted "unresolved name".
-                    self.any()
+                    // P35.3 — unknown type. Was `any()`; now `Unresolved`
+                    // so diagnostics / hover can surface the typo'd
+                    // name verbatim. Semantically behaves like `any`
+                    // (both top and bottom) so downstream type-relation
+                    // checks don't cascade; the resolver's
+                    // "unresolved name" error already pinpoints the cause.
+                    self.arena
+                        .unresolved(name.clone(), (tr.byte_range.start, tr.byte_range.end))
                 }
             }
         };
