@@ -327,8 +327,12 @@ impl AnalysisResult {
 /// [`analyze_with_index_into`] instead so the arena outlives the call.
 pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
     let index = ProjectIndex::new();
+    // P35.4 — per-file callers don't have a populated `WellKnown`;
+    // pass a default (all-`None`) instance. The migrated sentinel
+    // sites fall back to `arena.any()` for any slot still `None`.
+    let well_known = crate::well_known::WellKnown::default();
     let mut arena = TypeArena::new();
-    let out = analyze_with_index_into(hir, res, &index, &mut arena);
+    let out = analyze_with_index_into(hir, res, &index, &well_known, &mut arena);
     (arena, out)
 }
 
@@ -340,8 +344,11 @@ pub fn analyze_with_index(
     res: &Resolutions,
     index: &ProjectIndex,
 ) -> (TypeArena, AnalysisResult) {
+    // P35.4 — per-file callers default-construct an empty
+    // `WellKnown`; see [`analyze`] for the rationale.
+    let well_known = crate::well_known::WellKnown::default();
     let mut arena = TypeArena::new();
-    let out = analyze_with_index_into(hir, res, index, &mut arena);
+    let out = analyze_with_index_into(hir, res, index, &well_known, &mut arena);
     (arena, out)
 }
 
@@ -361,6 +368,7 @@ pub fn analyze_with_index_into(
     hir: &Hir,
     res: &Resolutions,
     index: &ProjectIndex,
+    well_known: &crate::well_known::WellKnown,
     arena: &mut TypeArena,
 ) -> AnalysisResult {
     let mut out = AnalysisResult::default();
@@ -376,6 +384,7 @@ pub fn analyze_with_index_into(
         out: &mut out,
         arena,
         index,
+        well_known,
         narrows: Vec::new(),
         member_narrows: Vec::new(),
         member_typed_narrows: Vec::new(),
@@ -544,6 +553,16 @@ struct Cx<'a> {
     /// index it just rebuilt. Used by `lower_type_ref` to recognize
     /// type names that aren't declared in this module.
     index: &'a ProjectIndex,
+    // P35.4
+    /// Project-wide well-known std/core decl handles. Per-file
+    /// callers pass a default-constructed (all-`None`) instance; the
+    /// project pipeline passes its populated `&self.well_known`.
+    /// Consumed by callers that previously minted
+    /// `arena.named("function")` / `"type"` / `"field"` sentinels —
+    /// now they mint `arena.alloc_type(well_known.X_decl)` when the
+    /// slot is populated, falling back to `arena.any()` when std
+    /// hasn't loaded.
+    well_known: &'a crate::well_known::WellKnown,
     /// Null-flow narrowing stack. Each frame is a binding ident
     /// → temporary `TypeId` override. Frames are pushed on block /
     /// then-branch / else-branch entry and popped on exit, so a
@@ -602,6 +621,45 @@ impl<'a> Cx<'a> {
     }
     fn null(&mut self) -> TypeId {
         self.arena.null()
+    }
+
+    // P35.4
+    /// Mint a [`TypeKind::Type`] for a well-known std/core native
+    /// type when its slot is populated. Falls back to `any` when
+    /// the slot is `None` (std not loaded, or pipeline running over
+    /// a project without `std/core` yet). The fallback is already
+    /// advertised to the user by the P33 `missing-std` diagnostic;
+    /// suppressing cascading type errors here keeps the rest of the
+    /// analysis usable.
+    ///
+    /// Each well-known slot has its own thin wrapper
+    /// (`function_ty`, `type_ty`, `field_ty`, …) so call sites read
+    /// at a glance which std/core type they're minting and the
+    /// borrow checker sees the slot read happen before the
+    /// `&mut self` arena allocation.
+    fn function_ty(&mut self) -> TypeId {
+        match self.well_known.function_decl {
+            Some(d) => self.arena.alloc_type(d),
+            // Transitional fallback: when std isn't loaded, mint the
+            // legacy `Named { name: "function" }` shape so existing
+            // tests / display callers see the same "function" string
+            // they used to. Removed in 35.8 along with `Named`
+            // itself — by then either tests load a minimal std stub
+            // or assert against `well_known.function_decl` directly.
+            None => self.arena.named("function"),
+        }
+    }
+    fn type_ty(&mut self) -> TypeId {
+        match self.well_known.type_decl {
+            Some(d) => self.arena.alloc_type(d),
+            None => self.arena.named("type"),
+        }
+    }
+    fn field_ty(&mut self) -> TypeId {
+        match self.well_known.field_decl {
+            Some(d) => self.arena.alloc_type(d),
+            None => self.arena.named("field"),
+        }
     }
     fn record(&mut self, expr: Idx<Expr>, ty: TypeId) {
         self.out.expr_types.insert(expr, ty);
@@ -1180,7 +1238,7 @@ impl<'a> Cx<'a> {
                 }
                 return Some(self.any());
             }
-            return Some(self.arena.named("field"));
+            return Some(self.field_ty());
         }
         if let Some(foreign) = self.out.foreign_member_uses.get(&property)
             && matches!(foreign.member, MemberDef::Attr(_))
@@ -1211,7 +1269,7 @@ impl<'a> Cx<'a> {
                     return Some(self.any());
                 }
             }
-            return Some(self.arena.named("field"));
+            return Some(self.field_ty());
         }
         // Method reference (in-module or cross-module).
         let kind = self.out.member_uses.get(&property).copied().or_else(|| {
@@ -1221,8 +1279,8 @@ impl<'a> Cx<'a> {
                 .map(|f| f.member)
         })?;
         Some(match kind {
-            MemberDef::Attr(_) => self.arena.named("field"),
-            MemberDef::Method(_) => self.arena.named("function"),
+            MemberDef::Attr(_) => self.field_ty(),
+            MemberDef::Method(_) => self.function_ty(),
         })
     }
 
@@ -1240,16 +1298,16 @@ impl<'a> Cx<'a> {
             2 => {
                 let name = self.ident_text(chain[1]);
                 if self.index.contains_fn_signature(name) {
-                    Some(self.arena.named("function"))
+                    Some(self.function_ty())
                 } else if self.index.contains_value(name) {
                     // Non-native fn (`private fn foo()` or fn without
                     // declared return type) — present in `values` but
                     // skipped from `fn_signatures`. The runtime still
                     // treats `module::fn_name` as a function ref, so
                     // type it as `function` (not `type`).
-                    Some(self.arena.named("function"))
+                    Some(self.function_ty())
                 } else if self.index.contains_type_member(name) || self.index.has_name(name) {
-                    Some(self.arena.named("type"))
+                    Some(self.type_ty())
                 } else {
                     None
                 }
@@ -1271,7 +1329,7 @@ impl<'a> Cx<'a> {
                     .method_id(&self.index.symbols, &member_name)
                     .is_some()
                 {
-                    Some(self.arena.named("function"))
+                    Some(self.function_ty())
                 } else if members.attr_id(&self.index.symbols, &member_name).is_some() {
                     // P19.13 — static-attr value access from a
                     // `module::Type::name` chain. Returns the
@@ -1286,7 +1344,7 @@ impl<'a> Cx<'a> {
                                 .unwrap_or_else(|| self.any()),
                         )
                     } else {
-                        Some(self.arena.named("field"))
+                        Some(self.field_ty())
                     }
                 } else {
                     None
@@ -1310,7 +1368,7 @@ impl<'a> Cx<'a> {
         // return-type substitution happens at the call site (P22's
         // call-typing path consults `method_returns` directly).
         if matches!(foreign.member, MemberDef::Method(_)) {
-            return Some(self.arena.named("function"));
+            return Some(self.function_ty());
         }
         // Attr — extract receiver shape (need owned name + args because
         // the arena entry borrow has to drop before we re-borrow as
@@ -2541,8 +2599,8 @@ impl<'a> Cx<'a> {
                     // values were typed by pass 3.5 before. Now type
                     // them inline against the runtime "type" /
                     // "function" named shapes.
-                    Decl::Type(_) | Decl::Enum(_) => self.arena.named("type"),
-                    Decl::Fn(_) => self.arena.named("function"),
+                    Decl::Type(_) | Decl::Enum(_) => self.type_ty(),
+                    Decl::Fn(_) => self.function_ty(),
                     _ => self.any(),
                 },
                 Some(Definition::ProjectDecl { .. }) => {
@@ -2559,9 +2617,9 @@ impl<'a> Cx<'a> {
                     if let Some(var_ty) = self.index.var_type_for(name) {
                         var_ty
                     } else if self.index.contains_fn_signature(name) {
-                        self.arena.named("function")
+                        self.function_ty()
                     } else if self.index.contains_type_member(name) || self.index.has_name(name) {
-                        self.arena.named("type")
+                        self.type_ty()
                     } else {
                         self.any()
                     }
@@ -2687,7 +2745,7 @@ impl<'a> Cx<'a> {
                                 .map(|ty| self.lower_type_ref(ty))
                                 .unwrap_or_else(|| self.any())
                         }
-                        MemberDef::Method(_) => self.arena.named("function"),
+                        MemberDef::Method(_) => self.function_ty(),
                     }
                 } else if self.out.foreign_member_uses.contains_key(&property) {
                     // P22 — cross-module attr / method typing inline.

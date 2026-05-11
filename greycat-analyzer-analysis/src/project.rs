@@ -968,8 +968,13 @@ impl ProjectAnalysis {
                 ..ModuleTimings::default()
             };
             let t1 = Instant::now();
-            let analysis =
-                analyze_with_index_into(&p.hir, &p.resolutions, &self.index, &mut self.arena);
+            let analysis = analyze_with_index_into(
+                &p.hir,
+                &p.resolutions,
+                &self.index,
+                &self.well_known,
+                &mut self.arena,
+            );
             timings.analyze = t1.elapsed();
             self.modules.insert(
                 p.uri,
@@ -1566,7 +1571,13 @@ impl ProjectAnalysis {
         let resolutions = resolve_with_index(&hir, &self.index);
         timings.resolve = t0.elapsed();
         let t1 = Instant::now();
-        let analysis = analyze_with_index_into(&hir, &resolutions, &self.index, &mut self.arena);
+        let analysis = analyze_with_index_into(
+            &hir,
+            &resolutions,
+            &self.index,
+            &self.well_known,
+            &mut self.arena,
+        );
         timings.analyze = t1.elapsed();
         let t2 = Instant::now();
         let mut directives = changed_directives.unwrap_or_default();
