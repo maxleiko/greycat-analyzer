@@ -221,6 +221,15 @@ impl ProjectAnalysis {
         &mut self.arena
     }
 
+    /// Project-wide decl-handle registry — needed to resolve a
+    /// `TypeKind::Type(handle)` or `TypeKind::GenericInstance { decl, .. }`
+    /// back to a printable name. Capability handlers that render
+    /// types for hover / completion / inlay-hints / etc. consume
+    /// this via [`greycat_analyzer_types::display_with_names`].
+    pub fn decl_registry(&self) -> &crate::well_known::DeclRegistry {
+        &self.decl_registry
+    }
+
     /// One-pass build over every document currently in `manager`.
     pub fn analyze(manager: &SourceManager) -> Self {
         let mut out = Self::new();
@@ -406,19 +415,20 @@ impl ProjectAnalysis {
     /// being walked resolve to `GenericParam(T, owner=Type(name))`.
     fn stage_lower_signatures(&mut self, lowered: &[(Uri, Hir, String, Duration, Directives)]) {
         let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _, _)| (u, h)).collect();
-        lower_signatures_into(
-            &mut self.arena,
-            &mut self.index,
-            &pairs,
-            &mut self.sig_cache,
-        );
-        // P35.1 — populate decl_registry + well_known. Runs after the
-        // existing signature lowering so we walk the same `Decl::Type` /
-        // `Decl::Enum` set without disturbing the cache hashing above.
-        // Cheap: one decl walk per module, idempotent within a single
-        // `DeclRegistry`. We don't bother with sig-cache parity because
-        // the registry is append-only and slot writes are idempotent on
-        // the same `(lib, module, name)` triple.
+        // P35.1 / P36.2 — populate decl_registry + well_known FIRST
+        // so the signature-lowering pass below can mint handle-keyed
+        // `Type(handle)` shapes (via `lower_type_ref_project`'s
+        // P36.2 path) for local types. Without the pre-pass the
+        // registry would still be empty when signatures lower, and
+        // the analyzer's per-module mint (which DOES see a populated
+        // registry by the time it runs) would diverge from the
+        // signatures — surfacing as spurious assignability errors
+        // on call-arg validation.
+        //
+        // Cheap: one decl walk per module, idempotent on the
+        // `(uri, decl)` pair. Sig-cache parity doesn't change
+        // because the registry is append-only and slot writes are
+        // idempotent on the same `(lib, module, name)` triple.
         for (uri, hir) in &pairs {
             let Some(module) = hir.module.as_ref() else {
                 continue;
@@ -441,6 +451,13 @@ impl ProjectAnalysis {
                 }
             }
         }
+        lower_signatures_into(
+            &mut self.arena,
+            &mut self.index,
+            &self.decl_registry,
+            &pairs,
+            &mut self.sig_cache,
+        );
     }
 }
 
@@ -605,6 +622,7 @@ fn hash_type_ref(
 fn lower_signatures_into(
     arena_mut: &mut greycat_analyzer_types::TypeArena,
     index: &mut ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     lowered: &[(&Uri, &Hir)],
     cache: &mut FxHashMap<Uri, ModuleSigCache>,
 ) {
@@ -628,7 +646,15 @@ fn lower_signatures_into(
             apply_module_contributions(index, c);
             continue;
         }
-        let entry = lower_module_signatures(arena_mut, index, uri, hir, sig_hash, name_set_hash);
+        let entry = lower_module_signatures(
+            arena_mut,
+            index,
+            decl_registry,
+            uri,
+            hir,
+            sig_hash,
+            name_set_hash,
+        );
         apply_module_contributions(index, &entry);
         cache.insert((*uri).clone(), entry);
     }
@@ -649,6 +675,7 @@ fn lower_signatures_into(
 fn lower_module_signatures(
     arena_mut: &mut greycat_analyzer_types::TypeArena,
     index: &mut ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     uri: &Uri,
     hir: &Hir,
     sig_hash: u64,
@@ -681,8 +708,14 @@ fn lower_module_signatures(
                     let Some(tr) = attr.ty else {
                         continue;
                     };
-                    let ty =
-                        lower_type_ref_project(hir, tr, arena_mut, &*index, &generics_in_scope);
+                    let ty = lower_type_ref_project(
+                        hir,
+                        tr,
+                        arena_mut,
+                        &*index,
+                        decl_registry,
+                        &generics_in_scope,
+                    );
                     entry.attrs.push((type_sym, attr_sym, ty));
                 }
                 for method_id in &td.methods {
@@ -708,8 +741,14 @@ fn lower_module_signatures(
                         let prev = generics_in_scope.insert(g_sym, method_owner.clone());
                         saved.push((g_sym, prev));
                     }
-                    let ty =
-                        lower_type_ref_project(hir, ret, arena_mut, &*index, &generics_in_scope);
+                    let ty = lower_type_ref_project(
+                        hir,
+                        ret,
+                        arena_mut,
+                        &*index,
+                        decl_registry,
+                        &generics_in_scope,
+                    );
                     // Restore: undo every push (in reverse so a method
                     // that re-shadows an outer name plays back correctly).
                     for (k, prev) in saved.into_iter().rev() {
@@ -756,8 +795,14 @@ fn lower_module_signatures(
                     generics_in_scope.insert(g_sym, owner.clone());
                     generics.push(g_sym);
                 }
-                let ret_ty =
-                    lower_type_ref_project(hir, ret, arena_mut, &*index, &generics_in_scope);
+                let ret_ty = lower_type_ref_project(
+                    hir,
+                    ret,
+                    arena_mut,
+                    &*index,
+                    decl_registry,
+                    &generics_in_scope,
+                );
                 // **P19.15** — also pre-lower parameter types so the
                 // analyzer's generic-call inference can run on
                 // cross-module callees (`abs`, `min`, `max`, …).
@@ -766,7 +811,14 @@ fn lower_module_signatures(
                 for p_id in &fnd.params {
                     let p = &hir.fn_params[*p_id];
                     let pt = if let Some(tr) = p.ty {
-                        lower_type_ref_project(hir, tr, arena_mut, &*index, &generics_in_scope)
+                        lower_type_ref_project(
+                            hir,
+                            tr,
+                            arena_mut,
+                            &*index,
+                            decl_registry,
+                            &generics_in_scope,
+                        )
                     } else {
                         arena_mut.any_nullable()
                     };
@@ -798,7 +850,8 @@ fn lower_module_signatures(
                 };
                 // Vars never declare generics, so no scope needed.
                 let empty: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
-                let var_ty = lower_type_ref_project(hir, tr, arena_mut, &*index, &empty);
+                let var_ty =
+                    lower_type_ref_project(hir, tr, arena_mut, &*index, decl_registry, &empty);
                 entry.vars.push((var_sym, var_ty));
             }
             _ => {}
@@ -822,6 +875,7 @@ fn lower_module_signatures(
 /// every primitive / nullable / lambda / tuple rule still fires.
 fn is_assignable_to_with_index(
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     arena: &greycat_analyzer_types::TypeArena,
     from: greycat_analyzer_types::TypeId,
     to: greycat_analyzer_types::TypeId,
@@ -837,6 +891,13 @@ fn is_assignable_to_with_index(
     }
     match (&a.kind, &b.kind) {
         (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => index.is_subtype_of(na, nb),
+        // P36.2 — handle-keyed subtype chain. Mirrors the
+        // `(Named, Named)` arm above but via the registry-resolved
+        // decl identity. Both arms coexist during the migration;
+        // 36.7 deletes the Named one.
+        (TypeKind::Type(sub), TypeKind::Type(sup)) => {
+            index.is_subtype_of_decl(decl_registry, *sub, *sup)
+        }
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab })
             if na == "node" && nb == "node" && aa.len() == 1 && ab.len() == 1 =>
         {
@@ -844,7 +905,7 @@ fn is_assignable_to_with_index(
             // identical). Recurse so a chain like
             // node<DeepSub> -> node<MidSub> -> node<Super> still
             // works in one hop.
-            is_assignable_to_with_index(index, arena, aa[0], ab[0])
+            is_assignable_to_with_index(index, decl_registry, arena, aa[0], ab[0])
         }
         _ => false,
     }
@@ -1163,6 +1224,7 @@ impl ProjectAnalysis {
                     declared_ref,
                     arena,
                     index,
+                    decl_registry,
                     &method_generics_in_scope,
                 );
                 let declared_ty = if method_subst.is_empty() {
@@ -1174,7 +1236,7 @@ impl ProjectAnalysis {
                     Some(t) => t,
                     None => continue,
                 };
-                if !is_assignable_to_with_index(index, arena, arg_ty, declared_ty) {
+                if !is_assignable_to_with_index(index, decl_registry, arena, arg_ty, declared_ty) {
                     let p_name = fn_module.hir.idents[p.name].text.clone();
                     let name_for = |h| decl_registry.name(h).map(str::to_string);
                     let arg_display =
@@ -1604,6 +1666,7 @@ impl ProjectAnalysis {
             lower_signatures_into(
                 &mut self.arena,
                 &mut self.index,
+                &self.decl_registry,
                 &pairs,
                 &mut self.sig_cache,
             );
@@ -2435,7 +2498,7 @@ fn validate_module_type_relations(
         let Some(value_ty) = analysis.expr_types.get(&value_id).copied() else {
             return;
         };
-        if is_assignable_to_with_index(index, arena, value_ty, declared_ty) {
+        if is_assignable_to_with_index(index, decl_registry, arena, value_ty, declared_ty) {
             return;
         }
         // Render with registry-backed name resolution so any
@@ -2501,6 +2564,7 @@ fn lower_type_ref_project(
     type_ref: Idx<greycat_analyzer_hir::types::TypeRef>,
     arena: &mut greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     generics_in_scope: &FxHashMap<
         greycat_analyzer_types::Symbol,
         greycat_analyzer_types::GenericOwner,
@@ -2525,7 +2589,16 @@ fn lower_type_ref_project(
                 let args: Vec<greycat_analyzer_types::TypeId> = tr
                     .params
                     .iter()
-                    .map(|p| lower_type_ref_project(hir, *p, arena, index, generics_in_scope))
+                    .map(|p| {
+                        lower_type_ref_project(
+                            hir,
+                            *p,
+                            arena,
+                            index,
+                            decl_registry,
+                            generics_in_scope,
+                        )
+                    })
                     .collect();
                 arena.generic(name.to_string(), args)
             } else if let Some(sym) = index.symbol(name)
@@ -2552,6 +2625,17 @@ fn lower_type_ref_project(
                 // the analyzer's `Static` enum-variant arm
                 // (`if let TypeKind::Enum { variants, .. } = ...`).
                 enum_id
+            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+                // P36.2 — non-generic concrete type with a known
+                // home decl: mint a handle-keyed `Type(handle)` so
+                // it interns equal to whatever
+                // `register_module_types` produced for the same
+                // decl in the per-module analyzer. The `Named`
+                // fallback below remains only for transitional
+                // cases where the registry hasn't seen the decl
+                // (e.g. before its module has been ingested) and
+                // is removed in P36.7.
+                arena.alloc_type(handle)
             } else if index.has_name(name) {
                 arena.named(name.to_string())
             } else {
@@ -2566,6 +2650,25 @@ fn lower_type_ref_project(
         base = arena.nullable(base);
     }
     base
+}
+
+/// P36.2 — resolve a type name to its handle via the project's decl
+/// table and registry. Walks every `(uri, decl)` pair recorded for
+/// `name` and returns the first one already interned in
+/// `decl_registry`. Returns `None` when the name has no recorded
+/// location yet (the per-module analyzer's `register_module_types`
+/// then falls back to `arena.named`).
+fn resolve_decl_handle(
+    index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
+    name: &str,
+) -> Option<greycat_analyzer_types::TypeDeclId> {
+    for (uri, decl) in index.locate_decl(name) {
+        if let Some(h) = decl_registry.lookup(uri, *decl) {
+            return Some(h);
+        }
+    }
+    None
 }
 
 /// Look up a syntactic `TypeRef` and mint a corresponding `TypeId`

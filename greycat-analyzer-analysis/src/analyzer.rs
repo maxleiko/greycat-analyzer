@@ -475,8 +475,8 @@ fn register_module_types(
     hir: &Hir,
     arena: &mut TypeArena,
     out: &mut AnalysisResult,
-    _decl_registry: &crate::well_known::DeclRegistry,
-    _module_uri: &greycat_analyzer_core::lsp_types::Uri,
+    decl_registry: &crate::well_known::DeclRegistry,
+    module_uri: &greycat_analyzer_core::lsp_types::Uri,
 ) {
     let Some(module) = hir.module.as_ref() else {
         return;
@@ -486,14 +486,17 @@ fn register_module_types(
         match decl {
             Decl::Type(td) => {
                 let name: SmolStr = hir.idents[td.name].text.as_str().into();
-                // Local types keep the legacy `Named { name }` shape
-                // for now — too many downstream sites (member
-                // resolution, narrow tracking, subtype-chain
-                // assignability) match on `Named { name }` and
-                // migrating them all would explode 35.7's scope.
-                // 35.8's deletion pass picks this up as part of the
-                // full Named removal.
-                let id = arena.named(name.as_str());
+                // P36.2 — mint `TypeKind::Type(handle)` when the
+                // project pipeline's signature-lowering pass has
+                // already interned this decl into `decl_registry`.
+                // Fall back to the legacy `Named { name }` shape only
+                // when the registry is empty (per-file analyzer tests
+                // that don't run the project pipeline). The fallback
+                // is transitional and gets deleted in P36.7.
+                let id = match decl_registry.lookup(module_uri, *d) {
+                    Some(handle) => arena.alloc_type(handle),
+                    None => arena.named(name.as_str()),
+                };
                 out.registry.register(name.clone(), id);
                 out.type_decls.insert(name, *d);
             }

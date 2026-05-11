@@ -398,7 +398,9 @@ fn cross_module_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let display = greycat_analyzer_types::display(pa.arena(), ty);
+    let registry = pa.decl_registry();
+    let name_for = |h| registry.name(h).map(str::to_string);
+    let display = greycat_analyzer_types::display_with_names(pa.arena(), ty, &name_for);
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
@@ -1520,7 +1522,9 @@ fn qualified_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let display = greycat_analyzer_types::display(pa.arena(), ty);
+    let registry = pa.decl_registry();
+    let name_for = |h| registry.name(h).map(str::to_string);
+    let display = greycat_analyzer_types::display_with_names(pa.arena(), ty, &name_for);
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
