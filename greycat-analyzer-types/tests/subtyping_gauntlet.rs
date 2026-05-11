@@ -336,3 +336,69 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
     assert!(!is_assignable_to(&a, arr_iq, arr_i));
 }
+
+// =============================================================================
+// Raw-form symmetric assignability: Named<N> ↔ Generic<N, any...>
+// =============================================================================
+//
+// `Generic<N, args>` → `Named<N>` (raw type form) was already allowed.
+// The symmetric `Named<N>` → `Generic<N, args>` direction now also
+// passes when every target arg is `any`, mirroring the runtime
+// (`fn takesAnyArgs(refs: Array<nodeIndex<any?, any?>>) {}` accepts a
+// `Array<nodeIndex>` argument).
+
+#[test]
+fn rt_named_flows_into_generic_with_all_any_args() {
+    // `nodeIndex` (raw) → `nodeIndex<any, any>` allowed.
+    let mut a = arena();
+    let any = a.any();
+    let raw = a.named("nodeIndex");
+    let generic = a.generic("nodeIndex", vec![any, any]);
+    assert!(is_assignable_to(&a, raw, generic));
+}
+
+#[test]
+fn rt_named_flows_into_generic_with_nullable_any_args() {
+    // The relaxation accepts `any` regardless of nullability — the
+    // analyzer minted `any?` from `Cx::lower_type_ref` when the source
+    // had `any?`, which still matches the rule.
+    let mut a = arena();
+    let any = a.any();
+    let any_q = a.nullable(any);
+    let raw = a.named("nodeIndex");
+    let generic = a.generic("nodeIndex", vec![any_q, any_q]);
+    assert!(is_assignable_to(&a, raw, generic));
+}
+
+#[test]
+fn rt_array_named_to_array_generic_via_inner_bidirectional() {
+    // The original bug shape: outer `Array<...>` invariant check
+    // recurses into the inner arg pair `Generic{nodeIndex, [any?,any?]}`
+    // ↔ `Named{nodeIndex}`. The forward direction already passed via
+    // the existing raw-form rule; this test pins down that the reverse
+    // direction (added in commit 3) lets the bidirectional check succeed.
+    let mut a = arena();
+    let any = a.any();
+    let any_q = a.nullable(any);
+    let raw = a.named("nodeIndex");
+    let generic = a.generic("nodeIndex", vec![any_q, any_q]);
+    let arr_raw = a.generic("Array", vec![raw]);
+    let arr_generic = a.generic("Array", vec![generic]);
+    assert!(is_assignable_to(&a, arr_generic, arr_raw));
+    assert!(is_assignable_to(&a, arr_raw, arr_generic));
+}
+
+#[test]
+fn rt_named_does_not_flow_into_generic_with_concrete_args() {
+    // Negative: the rule only triggers when *every* target arg is
+    // `any`. A partial-any / concrete-arg shape must stay rejected,
+    // matching the runtime.
+    let mut a = arena();
+    let any = a.any();
+    let i = a.primitive(Primitive::Int);
+    let raw = a.named("nodeIndex");
+    let generic_partial = a.generic("nodeIndex", vec![any, i]);
+    let generic_concrete = a.generic("nodeIndex", vec![i, i]);
+    assert!(!is_assignable_to(&a, raw, generic_partial));
+    assert!(!is_assignable_to(&a, raw, generic_concrete));
+}
