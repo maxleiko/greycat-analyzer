@@ -468,6 +468,138 @@ fn shared_file_publishes_multi_owner_diagnostic() {
     let _ = child.wait();
 }
 
+// P32.8
+/// Adding a workspace folder at runtime eagerly loads its project;
+/// removing one drops the project and clears diagnostics for its
+/// previously-owned URIs.
+#[test]
+fn workspace_folders_add_then_remove() {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lsp_ws_folders");
+    let _ = std::fs::remove_dir_all(&base);
+    let proj_a = base.join("projA");
+    let proj_b = base.join("projB");
+    std::fs::create_dir_all(&proj_a).unwrap();
+    std::fs::create_dir_all(&proj_b).unwrap();
+    let a_gcl = proj_a.join("project.gcl");
+    let b_gcl = proj_b.join("project.gcl");
+    std::fs::write(&a_gcl, "fn a(): int { return 1; }\n").unwrap();
+    std::fs::write(&b_gcl, "fn b(): int { return 2; }\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_greycat-analyzer");
+    let mut child = Command::new(bin)
+        .arg("server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn greycat-analyzer server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+    // Start with only projA in the workspace.
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": null,
+                "workspaceFolders": [
+                    { "uri": uri_for(&proj_a), "name": "projA" },
+                ],
+                "capabilities": {},
+            }
+        }),
+    );
+    let _ = read_msg(&mut stdout, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
+    );
+    // Drain projA's eager publish so the next reads only contain
+    // post-add/remove traffic.
+    let entry_a = uri_for(&a_gcl);
+    let _ = read_until(
+        &mut stdout,
+        |m| {
+            m["method"] == "textDocument/publishDiagnostics"
+                && m["params"]["uri"].as_str() == Some(entry_a.as_str())
+        },
+        Duration::from_secs(10),
+    );
+
+    // Add projB mid-session.
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added":   [ { "uri": uri_for(&proj_b), "name": "projB" } ],
+                    "removed": [],
+                }
+            }
+        }),
+    );
+    let entry_b = uri_for(&b_gcl);
+    let added_msg = read_until(
+        &mut stdout,
+        |m| {
+            m["method"] == "textDocument/publishDiagnostics"
+                && m["params"]["uri"].as_str() == Some(entry_b.as_str())
+        },
+        Duration::from_secs(10),
+    );
+    // Sanity: publish carries projB diagnostics (parse-clean, so the
+    // diagnostics array may be empty — but the publish must exist).
+    assert!(added_msg["params"]["diagnostics"].is_array());
+
+    // Remove projA.
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added":   [],
+                    "removed": [ { "uri": uri_for(&proj_a), "name": "projA" } ],
+                }
+            }
+        }),
+    );
+    // Removing a folder must clear-publish (empty diagnostics) for
+    // every URI it owned. We assert this for projA's entrypoint.
+    let clear_msg = read_until(
+        &mut stdout,
+        |m| {
+            m["method"] == "textDocument/publishDiagnostics"
+                && m["params"]["uri"].as_str() == Some(entry_a.as_str())
+        },
+        Duration::from_secs(10),
+    );
+    let diags = clear_msg["params"]["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.is_empty(),
+        "removing projA must clear-publish its entrypoint, got: {diags:?}"
+    );
+
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "id": 99, "method": "shutdown", "params": null }),
+    );
+    let _ = read_until(&mut stdout, |m| m["id"] == 99, Duration::from_secs(5));
+    write_msg(
+        &mut stdin,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+    );
+    drop(stdin);
+    let _ = child.wait();
+}
+
 fn uri_for(path: &Path) -> String {
     format!("file://{}", path.display())
 }

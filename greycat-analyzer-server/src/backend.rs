@@ -667,6 +667,91 @@ impl Backend {
         Ok(())
     }
 
+    // P32.8
+    /// LSP `workspace/didChangeWorkspaceFolders` notification.
+    ///
+    /// Added folder: rerun the eager discovery (mirrors the initial
+    /// `initialized` handler) — push the folder onto `workspace_roots`,
+    /// try to load `<folder>/project.gcl`.
+    ///
+    /// Removed folder: drop every project whose root is inside (or
+    /// equal to) the removed folder. Clear diagnostics for every URI
+    /// those projects owned, evict the URIs from `uri_owner`, and
+    /// drop matching orphans.
+    pub fn did_change_workspace_folders(
+        &mut self,
+        params: DidChangeWorkspaceFoldersParams,
+    ) -> Result<()> {
+        for ws in &params.event.added {
+            let Some(path) = uri_to_path(&ws.uri) else {
+                warn!("[ws-folders] skipping non-file folder: {}", ws.uri.as_str());
+                continue;
+            };
+            debug!("[ws-folders] + {} ({})", ws.name, path.display());
+            self.load_workspace(&ws.uri);
+        }
+        for ws in &params.event.removed {
+            let Some(path) = uri_to_path(&ws.uri) else {
+                continue;
+            };
+            debug!("[ws-folders] - {} ({})", ws.name, path.display());
+            // Drop every project rooted inside (or at) this folder.
+            let drop_roots: Vec<PathBuf> = self
+                .projects
+                .keys()
+                .filter(|r| r.starts_with(&path))
+                .cloned()
+                .collect();
+            for root in drop_roots {
+                self.drop_project(&root)?;
+            }
+            // Drop matching orphans too — they belonged to this
+            // workspace folder and can't survive its removal.
+            let orphan_uris: Vec<Uri> = self
+                .orphans
+                .iter()
+                .filter_map(|(uri, _)| {
+                    let p = uri_to_path(uri)?;
+                    if p.starts_with(&path) {
+                        Some(uri.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for uri in orphan_uris {
+                let _ = self.orphans.remove(&uri);
+                let _ = self.publish_diagnostics(uri, Vec::new(), None);
+            }
+            // Drop the workspace root itself.
+            self.workspace_roots.retain(|w| w != &path);
+        }
+        Ok(())
+    }
+
+    // P32.8
+    /// Tear down a single project: clear diagnostics for every URI it
+    /// owned, drop the URI bindings, and remove the project from
+    /// `self.projects`. Other projects sharing a URI in the
+    /// multi-owner case keep their binding intact (see `unbind_uri`).
+    fn drop_project(&mut self, root: &Path) -> Result<()> {
+        let Some(project) = self.projects.remove(root) else {
+            return Ok(());
+        };
+        let uris: Vec<Uri> = project.manager.iter().map(|(u, _)| u.clone()).collect();
+        drop(project);
+        for uri in uris {
+            self.unbind_uri(&uri, root);
+            // Only clear the editor's diagnostic list when nothing
+            // else owns the URI; otherwise let the remaining owner's
+            // publish stand.
+            if !self.uri_owner.contains_key(&uri) {
+                let _ = self.publish_diagnostics(uri, Vec::new(), None);
+            }
+        }
+        Ok(())
+    }
+
     // P19.22 / P32.1
     /// Workspace file watcher events. Two flavors of
     /// trigger matter to us:
