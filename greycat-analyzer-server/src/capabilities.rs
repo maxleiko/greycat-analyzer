@@ -1110,10 +1110,67 @@ pub fn goto_implementation_across_project(
     Some(GotoDefinitionResponse::Array(locations))
 }
 
+// P31.3
+/// `textDocument/declaration`. Inverse of
+/// [`goto_implementation_across_project`]: given the cursor on a
+/// concrete method override, jump to the abstract ancestor that
+/// declares the method. Walks the supertype chain of the cursor's
+/// declaring type, returning the first ancestor whose method with
+/// the same name carries the `abstract` modifier.
+///
+/// Falls through to [`goto_definition_across_project`] when:
+/// - no declaring type can be resolved (cursor isn't on a method
+///   ident the analyzer can bind), or
+/// - the declaring type has no abstract ancestor for this method
+///   (the cursor's method has no abstract parent — declaration ==
+///   definition).
+pub fn goto_declaration_across_project(
+    project: &ProjectAnalysis,
+    manager: &SourceManager,
+    cursor_uri: &Uri,
+    cursor_pos: Position,
+) -> Option<GotoDefinitionResponse> {
+    let cell = manager.get(cursor_uri)?;
+    let doc = cell.borrow();
+    let byte = position_to_byte(&doc.text, cursor_pos);
+    let node = node_at_offset(doc.root_node(), byte)?;
+    if node.kind() != "ident" {
+        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos);
+    }
+    let cursor_text = doc.text.get(node.byte_range())?.to_string();
+    drop(doc);
+
+    let Some(declaring_type) =
+        declaring_type_for_method_cursor(project, manager, cursor_uri, cursor_pos)
+    else {
+        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos);
+    };
+
+    let ancestor = project
+        .index
+        .find_abstract_ancestor_method(declaring_type.as_str(), cursor_text.as_str());
+    let Some((foreign_uri, decl_id)) = ancestor else {
+        // No abstract ancestor — fall through to goto-definition so
+        // the client still produces a useful jump for the cursor.
+        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos);
+    };
+
+    let foreign_module = project.module(&foreign_uri)?;
+    let foreign_cell = manager.get(&foreign_uri)?;
+    let foreign_doc = foreign_cell.borrow();
+    let name_id = foreign_module.hir.decls[decl_id].name()?;
+    let range = foreign_module.hir.idents[name_id].byte_range.clone();
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri: foreign_uri.clone(),
+        range: byte_range_to_lsp(&foreign_doc.text, &range),
+    }))
+}
+
 /// Determine the *declaring type* of the method-name ident under the
 /// cursor — the type whose method declaration / binding the cursor
 /// is associated with. Used as the root of the subtype filter for
-/// `textDocument/implementation` (and later `textDocument/declaration`).
+/// `textDocument/implementation` and as the starting point for
+/// `textDocument/declaration`'s supertype walk.
 ///
 /// Resolution order:
 /// 1. Cursor on a method's own declaration site (`type Foo { fn name() {} }`)

@@ -62,6 +62,7 @@ pub fn start_server() -> Result<()> {
                 work_done_progress_options: Default::default(),
             }),
             definition_provider: Some(OneOf::Left(true)),
+            declaration_provider: Some(DeclarationCapability::Simple(true)),
             implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
             references_provider: Some(OneOf::Left(true)),
             document_highlight_provider: Some(OneOf::Left(true)),
@@ -181,6 +182,14 @@ fn handle_request(server: &Backend, req: Request) -> Option<Response> {
         server,
         req,
         goto_implementation_handler,
+    ) {
+        Ok(resp) => return Some(resp),
+        Err(req) => req,
+    };
+    let req = match try_handle::<lsp_types::request::GotoDeclaration, _, _>(
+        server,
+        req,
+        goto_declaration_handler,
     ) {
         Ok(resp) => return Some(resp),
         Err(req) => req,
@@ -314,6 +323,20 @@ fn goto_definition_handler(
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     capabilities::goto_definition_across_project(
+        &server.project_analysis,
+        &server.manager,
+        &uri,
+        pos,
+    )
+}
+
+fn goto_declaration_handler(
+    server: &Backend,
+    params: lsp_types::request::GotoDeclarationParams,
+) -> Option<lsp_types::request::GotoDeclarationResponse> {
+    let uri = params.text_document_position_params.text_document.uri;
+    let pos = params.text_document_position_params.position;
+    capabilities::goto_declaration_across_project(
         &server.project_analysis,
         &server.manager,
         &uri,
