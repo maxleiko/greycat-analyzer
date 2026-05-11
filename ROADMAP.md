@@ -12,30 +12,58 @@ This is the long-arc plan for porting the [GreyCat](https://greycat.io) language
 
 ---
 
-## 2. Source-of-truth map
+## 2. Contents
 
-Each TypeScript subsystem in `packages/lang/src/` (the reference implementation) maps to a target Rust crate. LoC is the TS source line count and indicates relative effort.
+### Phases
 
-| TS subsystem | Path in `packages/lang/src/` | TS LoC | Target Rust crate |
-|---|---|---|---|
-| Lexer / tokenizer | `lexer/` | 1,434 | `tree-sitter-greycat` (external) |
-| Parser (AST + CST, dual tree) | `parser/` | 9,970 | `greycat-analyzer-syntax` |
-| Type system, generics, inference | `analysis/types.ts` | 2,811 | `greycat-analyzer-types` |
-| Analyzer (control flow, narrowing, errors) | `analysis/analyzer.ts` | 4,514 | `greycat-analyzer-analysis` |
-| Resolver (name binding) | `analysis/resolver.ts` | 1,145 | `greycat-analyzer-analysis` |
-| Environments / scopes | `analysis/environment.ts`, `env_manager.ts` | 890 | `greycat-analyzer-analysis` |
-| Analysis utilities | `analysis/utils.ts` | 753 | `greycat-analyzer-types` |
-| Visitors (8 patterns) | `visitor/` | 3,399 | `greycat-analyzer-syntax` (queries) + `greycat-analyzer-hir` |
-| Pretty printer / formatter | `pp/` + `parser/cst/cst_format.ts` | 779 | `greycat-analyzer-fmt` |
-| Project manager (multi-module, dep graph) | `project/` | 3,969 | `greycat-analyzer-core` |
-| LSP capability handlers | `lsp/` (+ 1,527 LoC of tests) | 49 | `greycat-analyzer-server` |
-| LSP server transport | `packages/server/` | 1,228 | `greycat-analyzer-server` |
-| CLI driver | `packages/cli/` | 743 | `greycat-analyzer` (bin) |
-| Linter | `packages/cli/src/lint/` | 242 | `greycat-analyzer-analysis` (rules) + `greycat-analyzer` (CLI) |
-| Module resolver (`@library`, `@include`) | `packages/resolver/` | 92 | `greycat-analyzer-core` |
-| Error infrastructure | `errors.ts` | 145 | `greycat-analyzer-analysis` (or shared) |
-| Highlighter (semantic tokens) | `highlighter.ts` | 141 | `greycat-analyzer-server` |
-| Stdlib (in GreyCat itself) | `lib/std/*.gcl` | 3,314 | vendored corpus (not ported) |
+- [Phase 0 — Foundation reset](#phase-0--foundation-reset-4-6-weeks)
+- [Phase 1 — Project model + parse diagnostics](#phase-1--project-model--parse-diagnostics-2-3-weeks)
+- [Phase 2 — Semantic layer](#phase-2--semantic-layer-10-16-weeks-the-bulk)
+- [Phase 3 — LSP capabilities](#phase-3--lsp-capabilities-4-6-weeks)
+- [Phase 4 — Formatter + linter + CLI parity](#phase-4--formatter--linter--cli-parity-3-4-weeks)
+- [Phase 5 — Distribution](#phase-5--distribution-2-3-weeks)
+- [Phase 6 — Analyzer 1:1 with TS](#phase-6--analyzer-11-with-ts-8-12-weeks)
+- [Phase 7 — Grammar & HIR completion](#phase-7--grammar--hir-completion-3-5-weeks)
+- [Phase 8 — LSP 1:1 with TS server](#phase-8--lsp-11-with-ts-server-4-6-weeks)
+- [Phase 9 — Formatter byte-for-byte parity](#phase-9--formatter-byte-for-byte-parity-4-6-weeks)
+- [Phase 10 — Distribution + quality gates](#phase-10--distribution--quality-gates-4-6-weeks)
+- [Phase 11 — Cross-module identity](#phase-11--cross-module-identity-3-5-weeks)
+- [Phase 12 — Type system completion](#phase-12--type-system-completion-4-6-weeks)
+- [Phase 13 — Analyzer parity closeout](#phase-13--analyzer-parity-closeout-3-4-weeks)
+- [Phase 14 — Final parity gate](#phase-14--final-parity-gate-2-3-weeks)
+- [Phase 15 — Interactive-LSP regression sweep](#phase-15--interactive-lsp-regression-sweep-3-4-weeks)
+- [Phase 16 — Member-flow inference & node-deref](#phase-16--member-flow-inference--node-deref-2-3-weeks)
+- [TS-side dump tooling (oracle for parity work)](#ts-side-dump-tooling-oracle-for-parity-work)
+- [Phase 17 — Real-corpus parity ratchet](#phase-17--real-corpus-parity-ratchet-1-2-weeks)
+- [Phase 18 — Typed-AST parity oracle](#phase-18--typed-ast-parity-oracle-1-2-weeks)
+- [Phase 19 — Staged-pipeline analyzer rewrite](#phase-19--staged-pipeline-analyzer-rewrite-4-6-weeks)
+- [Phase 20 — `pro` dogfood ratchet](#phase-20--pro-dogfood-ratchet-1-week)
+- [Phase 21 — Formatter rewrite: Doc IR + width-aware renderer](#phase-21--formatter-rewrite-doc-ir--width-aware-renderer-2-4-weeks)
+- [Phase 22 — Code-action / quickfix correctness](#phase-22--code-action--quickfix-correctness-1-week)
+- [Phase 23 — Lint relaxation & formatter skip via line directives](#phase-23--lint-relaxation--formatter-skip-via-line-directives-1-2-weeks)
+- [Phase 24 — Reachability analysis & dead-code detection](#phase-24--reachability-analysis--dead-code-detection-2-3-weeks)
+- [Phase 25 — Inline-string + small-vec sweep](#phase-25--inline-string--small-vec-sweep-1-2-weeks)
+- [Phase 26 — Easy-win parallelism (rayon, exploration branch)](#phase-26--easy-win-parallelism-rayon-exploration-branch--1-week)
+- [Phase 27 — Parallelism shim (drop the feature flag)](#phase-27--parallelism-shim-drop-the-feature-flag-half-a-day)
+- [Phase 28 — Parallel body walker — **executed and reverted**](#phase-28--parallel-body-walker-s12-per-thread-arena-merge--executed-and-reverted)
+- [Phase 29 — Parallelize `stage_compute_qualified_refs`](#phase-29--parallelize-stage_compute_qualified_refs-3-5-days)
+- [Phase 31 — Inheritance-aware LSP navigation](#phase-31--inheritance-aware-lsp-navigation-3-5-days)
+- [Phase 30 — `recv.staticName` / `recv->staticName` advisory lint](#phase-30--recvstaticname--recv-staticname-advisory-lint-2-3-days)
+- [Phase 32 — Multi-project LSP workspaces](#phase-32--multi-project-lsp-workspaces-1-2-weeks)
+- [Phase 33 — Runtime-aligned `std` resolution](#phase-33--runtime-aligned-std-resolution-half-a-day)
+- [Phase 34 — Server-side filesystem watcher](#phase-34--server-side-filesystem-watcher-3-5-days-optional)
+- [Phase 35 — Decl-handle type identity](#phase-35--decl-handle-type-identity-1-2-weeks)
+- [Phase 36 — Complete decl-handle identity migration](#phase-36--complete-decl-handle-identity-migration-2-3-weeks)
+
+### Other sections
+
+- [§3 Architectural decisions (locked)](#3-architectural-decisions-locked)
+- [§4 Open questions](#4-open-questions)
+- [§5 Crate layout (target)](#5-crate-layout-target)
+- [§6 Phases](#6-phases)
+- [§7 Test strategy](#7-test-strategy)
+- [§8 Stdlib strategy](#8-stdlib-strategy)
+- [§9 How to update this doc](#9-how-to-update-this-doc)
 
 ---
 
@@ -1246,3 +1274,4 @@ The roadmap moves with the work.
 - When an Open Question (§4) is answered, fold the answer into the relevant Decision (§3) or Phase chunk and remove the question.
 - When a phase finishes, leave the phase in place — keep the milestone, mark all chunks done, link to the commit/PR that delivered M_n.
 - Do **not** rewrite history. New constraints get a new chunk, not an edit to an old one.
+- **Adding, removing, renaming, or reordering a Phase requires a matching update to the [§2 Contents](#2-contents) table of contents.** The TOC is hand-maintained — drifted links and missing entries are silent until a reader hits a 404. When you add a Phase N, add its entry to §2 in the same commit; when you rename a Phase's heading (or change its weeks-estimate suffix), regenerate the anchor slug there too.
