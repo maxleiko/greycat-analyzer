@@ -768,7 +768,7 @@ fn lower_module_signatures(
                     let pt = if let Some(tr) = p.ty {
                         lower_type_ref_project(hir, tr, arena_mut, &*index, &generics_in_scope)
                     } else {
-                        arena_mut.any()
+                        arena_mut.any_nullable()
                     };
                     params.push(pt);
                 }
@@ -2542,7 +2542,7 @@ fn lower_type_ref_project(
                 // the body walker and validation pass agree on the
                 // same shape; kills the need for any raw-form bridge
                 // in `is_assignable_to`.
-                let any_q = arena.any();
+                let any_q = arena.any_nullable();
                 let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
                 arena.generic(name.to_string(), args)
             } else if let Some(enum_id) = index.enum_type_for(name) {
@@ -2608,7 +2608,7 @@ fn lower_type_ref_id(
                 // ≡ `Tensor<any?, any?>`. Expand here so the
                 // validation pass and the body walker's
                 // `lower_type_ref` produce the same shape.
-                let any_q = arena.any();
+                let any_q = arena.any_nullable();
                 let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
                 arena.generic(name.to_string(), args)
             } else if let Some(id) = registry.lookup(name) {

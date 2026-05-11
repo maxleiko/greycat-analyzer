@@ -349,7 +349,28 @@ impl TypeArena {
         })
     }
 
+    /// Strict (non-nullable) `any`. Top of all *non-null* values.
+    /// `null → any` is a type error under GreyCat's strict
+    /// null-checking — only `any_nullable` accepts null.
+    ///
+    /// Most callers in the analyzer want
+    /// [`Self::any_nullable`]; reach for this only when the
+    /// surface syntax was `any` *without* a `?` and you need to
+    /// preserve that non-null guarantee through the type system.
     pub fn any(&mut self) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::Any,
+            nullable: false,
+        })
+    }
+
+    /// Nullable `any` — top of *all* values including null.
+    /// `null → any_nullable` is allowed. Equivalent to writing
+    /// `any?` in source. Used as the fallback for unresolved
+    /// names, for generic raw-form arg slots (`Tensor` ≡
+    /// `Tensor<any?, any?>`), and any other place where a
+    /// universally-permissive type is the right answer.
+    pub fn any_nullable(&mut self) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Any,
             nullable: true,
@@ -1190,35 +1211,53 @@ pub fn display_with_names(
         }
         TypeKind::Enum { name, .. } => name.to_string(),
         TypeKind::Union { alts } => {
-            let parts: Vec<String> = alts
+            // Unions render as `A | B | …`. When the union is also
+            // nullable and no `Null` alt is already present, expand
+            // it with a trailing `| null` — the `?` suffix would
+            // visually attach to only the last alt and read wrong.
+            // Mirrors the TS reference's choice: simple types get
+            // `T?`, narrowing-introduced unions get `T | U | null`.
+            let mut parts: Vec<String> = alts
                 .iter()
                 .map(|a| display_with_names(arena, *a, name_for))
                 .collect();
+            if ty.nullable
+                && !alts
+                    .iter()
+                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
+            {
+                parts.push("null".to_string());
+            }
             parts.join(" | ")
         }
     };
-    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Any) {
+    // `?` suffix for nullable types — except `Null` (redundant) and
+    // `Union` (handled inline above with an explicit `| null` alt
+    // so the suffix doesn't visually bind to the last alt only).
+    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
         s.push('?');
     }
     s
 }
 
 // P18.1
-/// Fully-qualified-name display, matching the TS reference's
-/// canonical printer (e.g. `core::int`, `core::Array<core::int | null>`,
+/// Fully-qualified-name display, matching the GreyCat canonical
+/// printer (e.g. `core::int`, `core::Array<core::int?>`,
 /// `project::Foo`).
 ///
 /// `home_lib` resolves a Named/Generic/Enum's home module (e.g. `Foo →
 /// "project"`, `node → "core"`). Returning `None` falls back to the
-/// `core` library — matches TS's behavior for builtins not in the
-/// project decl table.
+/// `core` library — matches the TS reference's behavior for builtins
+/// not in the project decl table.
 ///
 /// Differences from [`display`]:
 /// - Primitives, builtin runtime types, and unresolved names get a
 ///   `core::` prefix.
 /// - User types resolve to `<lib>::<Name>` via `home_lib`.
-/// - `nullable` is rendered as ` | null` instead of the `?` suffix.
-/// - `any` (always nullable) is rendered as `core::any | null`.
+///
+/// Nullability is rendered with the `?` suffix (same as `display`)
+/// for every kind except `Null`. Strict `any` renders as `core::any`,
+/// nullable `any?` renders as `core::any?`.
 pub fn display_fqn(
     arena: &TypeArena,
     id: TypeId,
@@ -1295,15 +1334,26 @@ pub fn display_fqn(
             name
         ),
         TypeKind::Union { alts } => {
-            let parts: Vec<String> = alts
+            // Same union rule as [`display`]: render with `|`-joined
+            // alts and expand nullability into an explicit `null` alt
+            // rather than appending a `?` suffix (which would read as
+            // "only the last alt is nullable").
+            let mut parts: Vec<String> = alts
                 .iter()
                 .map(|a| display_fqn(arena, *a, home_lib))
                 .collect();
+            if ty.nullable
+                && !alts
+                    .iter()
+                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
+            {
+                parts.push("null".to_string());
+            }
             parts.join(" | ")
         }
     };
-    if ty.nullable && !matches!(ty.kind, TypeKind::Null) {
-        s.push_str(" | null");
+    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
+        s.push('?');
     }
     s
 }

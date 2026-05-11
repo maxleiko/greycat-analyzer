@@ -664,6 +664,9 @@ impl<'a> Cx<'a> {
     fn primitive(&mut self, p: Primitive) -> TypeId {
         self.arena.primitive(p)
     }
+    fn any_nullable(&mut self) -> TypeId {
+        self.arena.any_nullable()
+    }
     fn any(&mut self) -> TypeId {
         self.arena.any()
     }
@@ -1300,7 +1303,7 @@ impl<'a> Cx<'a> {
                 if let Some(tr) = attr.ty {
                     return Some(self.lower_type_ref(tr));
                 }
-                return Some(self.any());
+                return Some(self.any_nullable());
             }
             return Some(self.field_ty());
         }
@@ -1334,7 +1337,7 @@ impl<'a> Cx<'a> {
                     if let Some(ty) = members.attr_ty(&self.index.symbols, prop_text) {
                         return Some(ty);
                     }
-                    return Some(self.any());
+                    return Some(self.any_nullable());
                 }
             }
             return Some(self.field_ty());
@@ -1409,7 +1412,7 @@ impl<'a> Cx<'a> {
                         Some(
                             members
                                 .attr_ty(&self.index.symbols, &member_name)
-                                .unwrap_or_else(|| self.any()),
+                                .unwrap_or_else(|| self.any_nullable()),
                         )
                     } else {
                         Some(self.field_ty())
@@ -1542,7 +1545,7 @@ impl<'a> Cx<'a> {
                     // produce the *same* shape for the same source
                     // token — kills the need for any `Named ↔ Generic`
                     // raw-form bridge in `is_assignable_to`.
-                    let any_q = self.arena.any();
+                    let any_q = self.arena.any_nullable();
                     let args: Vec<TypeId> = vec![any_q; arity];
                     self.arena.generic(name.clone(), args)
                 } else if let Some(id) = self.out.registry.lookup(&name) {
@@ -1632,12 +1635,12 @@ impl<'a> Cx<'a> {
                         self.hir.fn_params[*p_id]
                             .ty
                             .map(|t| self.lower_type_ref(t))
-                            .unwrap_or_else(|| self.any())
+                            .unwrap_or_else(|| self.any_nullable())
                     })
                     .collect();
                 let declared_return = fn_return_type
                     .map(|t| self.lower_type_ref(t))
-                    .unwrap_or_else(|| self.any());
+                    .unwrap_or_else(|| self.any_nullable());
                 self.pop_generic_scope();
 
                 let mut tbl = InferenceTable::new();
@@ -1763,13 +1766,13 @@ impl<'a> Cx<'a> {
             let p = self.hir.fn_params[*p_id].clone();
             let ty =
                 p.ty.map(|t| self.lower_type_ref(t))
-                    .unwrap_or_else(|| self.any());
+                    .unwrap_or_else(|| self.any_nullable());
             self.out.def_types.insert(p.name, ty);
         }
         let return_ty = d
             .return_type
             .map(|t| self.lower_type_ref(t))
-            .unwrap_or_else(|| self.any());
+            .unwrap_or_else(|| self.any_nullable());
         if let Some(body) = d.body {
             self.visit_stmt(body, Some(return_ty));
         }
@@ -1886,7 +1889,7 @@ impl<'a> Cx<'a> {
         // locals; lets capability code (e.g. `receiver_type_at`'s
         // text-based fallback for ERROR-recovery cases) look up a
         // modvar's type by name without re-running `lower_type_ref`.
-        let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any());
+        let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any_nullable());
         self.out.def_types.insert(d.name, var_ty);
     }
 
@@ -1930,7 +1933,7 @@ impl<'a> Cx<'a> {
                 let init_ty = init.map(|i| self.visit_expr(i));
                 // Type-relation diagnostic deferred to
                 // `ProjectAnalysis::validate_type_relations`.
-                let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any());
+                let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any_nullable());
                 self.out.def_types.insert(name, var_ty);
             }
             Stmt::Assign(AssignStmt { target, value, .. }) => {
@@ -2240,7 +2243,7 @@ impl<'a> Cx<'a> {
                     let bound_ty = init_ty
                         .map(|t| self.lower_type_ref(t))
                         .or(init_value_ty)
-                        .unwrap_or_else(|| self.any());
+                        .unwrap_or_else(|| self.any_nullable());
                     self.out.def_types.insert(name, bound_ty);
                 }
                 if let Some(c) = condition {
@@ -2266,7 +2269,7 @@ impl<'a> Cx<'a> {
                 //   - `Set<T>`    -> (index: int, value: T)
                 //   - other       -> all params keep their declared
                 //                    type (if any) or `any`.
-                let any_id = self.any();
+                let any_id = self.any_nullable();
                 let int_id = self.primitive(Primitive::Int);
                 let time_id = self.primitive(Primitive::Time);
                 let geo_id = self.primitive(Primitive::Geo);
@@ -2713,21 +2716,21 @@ impl<'a> Cx<'a> {
         let expr = self.hir.exprs[expr_id].clone();
         match expr {
             Expr::Ident { name: idx, .. } => match self.res.lookup(idx) {
-                Some(Definition::Param(def)) | Some(Definition::Local(def)) => {
-                    self.lookup_def_type(def).unwrap_or_else(|| self.any())
-                }
+                Some(Definition::Param(def)) | Some(Definition::Local(def)) => self
+                    .lookup_def_type(def)
+                    .unwrap_or_else(|| self.any_nullable()),
                 Some(Definition::Decl(decl_id)) => match &self.hir.decls[decl_id] {
                     Decl::Var(vd) => vd
                         .ty
                         .map(|ty_ref| self.lower_type_ref(ty_ref))
-                        .unwrap_or_else(|| self.any()),
+                        .unwrap_or_else(|| self.any_nullable()),
                     // P23 — bare type / enum / fn references used as
                     // values were typed by pass 3.5 before. Now type
                     // them inline against the runtime "type" /
                     // "function" named shapes.
                     Decl::Type(_) | Decl::Enum(_) => self.type_ty(),
                     Decl::Fn(_) => self.function_ty(),
-                    _ => self.any(),
+                    _ => self.any_nullable(),
                 },
                 Some(Definition::ProjectDecl { .. }) => {
                     // P23 — cross-module bare ident value typing via
@@ -2747,7 +2750,7 @@ impl<'a> Cx<'a> {
                     } else if self.index.contains_type_member(name) || self.index.has_name(name) {
                         self.type_ty()
                     } else {
-                        self.any()
+                        self.any_nullable()
                     }
                 }
                 Some(Definition::Project) => {
@@ -2759,9 +2762,9 @@ impl<'a> Cx<'a> {
                     let name = self.ident_text(idx);
                     self.index
                         .runtime_global_for(name)
-                        .unwrap_or_else(|| self.any())
+                        .unwrap_or_else(|| self.any_nullable())
                 }
-                Some(Definition::Generic(_)) | None => self.any(),
+                Some(Definition::Generic(_)) | None => self.any_nullable(),
             },
             Expr::Literal(LiteralExpr { kind, text, .. }) => match kind {
                 LiteralKind::Bool => self.primitive(Primitive::Bool),
@@ -2782,7 +2785,7 @@ impl<'a> Cx<'a> {
                     .this_stack
                     .last()
                     .copied()
-                    .unwrap_or_else(|| self.any()),
+                    .unwrap_or_else(|| self.any_nullable()),
                 LiteralKind::Duration => self.primitive(Primitive::Duration),
                 LiteralKind::Time | LiteralKind::Iso8601 => self.primitive(Primitive::Time),
             },
@@ -2807,7 +2810,7 @@ impl<'a> Cx<'a> {
                 for i in items.iter() {
                     let _ = self.visit_expr(*i);
                 }
-                let any = self.any();
+                let any = self.any_nullable();
                 self.arena.generic("Array", vec![any])
             }
             Expr::Object(ObjectExpr { ty, fields, .. }) => {
@@ -2817,7 +2820,7 @@ impl<'a> Cx<'a> {
                 if let Some(t) = ty {
                     self.lower_type_ref(t)
                 } else {
-                    self.any()
+                    self.any_nullable()
                 }
             }
             Expr::Member(MemberExpr {
@@ -2869,7 +2872,7 @@ impl<'a> Cx<'a> {
                             let attr = self.hir.type_attrs[attr_id].clone();
                             attr.ty
                                 .map(|ty| self.lower_type_ref(ty))
-                                .unwrap_or_else(|| self.any())
+                                .unwrap_or_else(|| self.any_nullable())
                         }
                         MemberDef::Method(_) => self.function_ty(),
                     }
@@ -2879,9 +2882,9 @@ impl<'a> Cx<'a> {
                     // (`stage_lower_signatures`) and applies generic
                     // substitution from the receiver's instantiation.
                     self.foreign_member_type(resolution_ty, property)
-                        .unwrap_or_else(|| self.any())
+                        .unwrap_or_else(|| self.any_nullable())
                 } else {
-                    self.any()
+                    self.any_nullable()
                 };
                 // P16.7 + P19.17 — nullability propagates *up the chain*
                 // whenever the receiver is nullable, regardless of
@@ -2959,7 +2962,7 @@ impl<'a> Cx<'a> {
                 let recv_name = self.hir.type_refs[s.ty].name;
                 let chain = [recv_name, property];
                 self.qualified_static_value_type(&chain)
-                    .unwrap_or_else(|| self.any())
+                    .unwrap_or_else(|| self.any_nullable())
             }
             Expr::QualifiedStatic { chain, .. } => {
                 // P23 — chained `module::name` / `module::Type::name`
@@ -2971,7 +2974,7 @@ impl<'a> Cx<'a> {
                 // the `Expr::Call` branch.)
                 self.bind_qualified_chain_segments(&chain);
                 self.qualified_static_value_type(&chain)
-                    .unwrap_or_else(|| self.any())
+                    .unwrap_or_else(|| self.any_nullable())
             }
             Expr::Offset(OffsetExpr {
                 receiver,
@@ -3025,7 +3028,7 @@ impl<'a> Cx<'a> {
                         {
                             args[0]
                         }
-                        _ => self.any(),
+                        _ => self.any_nullable(),
                     }
                 };
                 let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
@@ -3060,7 +3063,7 @@ impl<'a> Cx<'a> {
                 // would surface false positives for arg shapes whose
                 // type isn't known until pass 3.5 fixes them up.
                 let _ = callee_ty;
-                self.any()
+                self.any_nullable()
             }
             Expr::Binary(BinaryExpr {
                 op, left, right, ..
@@ -3191,7 +3194,7 @@ impl<'a> Cx<'a> {
                     let p = self.hir.fn_params[*p].clone();
                     let pt =
                         p.ty.map(|t| self.lower_type_ref(t))
-                            .unwrap_or_else(|| self.any());
+                            .unwrap_or_else(|| self.any_nullable());
                     param_tys.push(pt);
                 }
                 let body_ty = self.visit_expr(body);
@@ -3214,7 +3217,7 @@ impl<'a> Cx<'a> {
                 if let Some(t) = to {
                     let _ = self.visit_expr(t);
                 }
-                self.any()
+                self.any_nullable()
             }
             Expr::Cast { value, ty, .. } => {
                 let from_ty = self.visit_expr(value);
@@ -3258,7 +3261,7 @@ impl<'a> Cx<'a> {
                 }
                 to_ty
             }
-            Expr::Unsupported { .. } => self.any(),
+            Expr::Unsupported { .. } => self.any_nullable(),
         }
     }
 
@@ -3297,7 +3300,7 @@ impl<'a> Cx<'a> {
                 } else if lt_n == int && rt_n == int {
                     int
                 } else {
-                    self.any()
+                    self.any_nullable()
                 }
             }
             BinOp::Sub => {
@@ -3319,7 +3322,7 @@ impl<'a> Cx<'a> {
                 } else if lt_n == int && rt_n == int {
                     int
                 } else {
-                    self.any()
+                    self.any_nullable()
                 }
             }
             BinOp::Mul => {
@@ -3336,7 +3339,7 @@ impl<'a> Cx<'a> {
                 } else if lt_n == int && rt_n == int {
                     int
                 } else {
-                    self.any()
+                    self.any_nullable()
                 }
             }
             BinOp::Div | BinOp::Mod => {
@@ -3345,7 +3348,7 @@ impl<'a> Cx<'a> {
                 } else if lt == int && rt == int {
                     int
                 } else {
-                    self.any()
+                    self.any_nullable()
                 }
             }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => int,
@@ -3376,7 +3379,7 @@ impl<'a> Cx<'a> {
                     merged
                 }
             }
-            BinOp::Other(_) => self.any(),
+            BinOp::Other(_) => self.any_nullable(),
         }
     }
 }
@@ -4156,6 +4159,9 @@ fn caller(f: Foo?, b: Bar?) {
 }
 "#;
         let display = local_init_ty(src, "x").expect("init type");
-        assert_eq!(display, "Foo | Bar?");
+        // Nullable unions render with an explicit `null` alt — the
+        // `?` suffix would visually bind to only the last alt
+        // (would have looked like `"Foo | Bar?"`).
+        assert_eq!(display, "Foo | Bar | null");
     }
 }
