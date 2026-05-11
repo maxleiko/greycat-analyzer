@@ -873,6 +873,16 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
 /// `true` for any of the runtime "node-tag" generic names that
 /// auto-deref to their inner type in the assignability relation
 ///. Drawn from the TS reference's `StdCoreTypes` interface.
+///
+/// **Deprecated as of P35.5** — string-keyed identity for the
+/// node-tag family lets a user-declared `type node<T>` impersonate
+/// the std-core tag and pick up auto-deref / bivariance
+/// semantics it shouldn't. Migrate to `WellKnown::is_node_tag(decl)`
+/// in [`greycat_analyzer_analysis::well_known`] (handle-keyed) as
+/// callers switch to `TypeKind::GenericInstance { decl, args }`.
+/// Retained until 35.8 alongside `TypeKind::Named` and
+/// `TypeKind::Generic`, the only variants this function dispatches
+/// against.
 pub fn is_node_tag(name: &str) -> bool {
     matches!(
         name,
