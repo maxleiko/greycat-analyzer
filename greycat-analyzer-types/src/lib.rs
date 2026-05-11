@@ -587,6 +587,16 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             {
                 return true;
             }
+            // Node-tag generics (`node`, `nodeTime`, `nodeList`, `nodeIndex`,
+            // `nodeGeo`) are bivariant on their inner args at runtime: a node
+            // ref is a 64-bit handle and the runtime accepts e.g.
+            // `nodeTime<float>` → `nodeTime<float?>` (and the reverse),
+            // `nodeList<node<Dog>>` → `nodeList<node<Animal>>`, etc. Verified
+            // against the runtime oracle. Outer-name equality + arg arity are
+            // still required.
+            if na == nb && aa.len() == ab.len() && is_node_tag(na) {
+                return true;
+            }
             na == nb
                 && aa.len() == ab.len()
                 && aa.iter().zip(ab).all(|(x, y)| {
