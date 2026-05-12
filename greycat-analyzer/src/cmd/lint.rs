@@ -58,6 +58,14 @@ pub struct Lint {
     disable: Vec<String>,
     #[clap(
         long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        help = "Enable advisory lint rule(s) that ship off by default (repeatable / \
+                comma-list, see --list-rules). Today: `no-breakpoint`."
+    )]
+    enable: Vec<String>,
+    #[clap(
+        long,
         value_enum,
         default_value_t = ColorMode::Auto,
         help = "auto    color when stdout is a TTY and `NO_COLOR` is unset (default)\n\
@@ -134,8 +142,16 @@ impl Lint {
                 .max()
                 .unwrap_or(0);
             for rule in greycat_analyzer_analysis::lint::LINT_RULES {
-                println!("{:>width$}  {}", rule.name, rule.summary, width = max_len);
+                let prefix = if rule.default_enabled { " " } else { "*" };
+                println!(
+                    "{prefix} {:>width$}  {}",
+                    rule.name,
+                    rule.summary,
+                    width = max_len
+                );
             }
+            println!();
+            println!("`*` = advisory rule, off by default (enable via `--enable=<rule>`).");
             return Ok(ExitCode::SUCCESS);
         }
 
@@ -162,6 +178,18 @@ impl Lint {
             }
         }
         let disabled: std::collections::HashSet<String> = self.disable.iter().cloned().collect();
+
+        // P37.7 — same shape as `--disable`, applied to advisory rules
+        // that ship off by default. Unknown names fail-hard for parity.
+        for name in &self.enable {
+            if !valid_rules.contains(name.as_str()) {
+                eprintln!(
+                    "error: unknown lint rule `{name}` in --enable \
+                     (see --list-rules for the available set)"
+                );
+                std::process::exit(1);
+            }
+        }
 
         // Convenience: when given a directory, look for `project.gcl`
         // at its root and use that as the entrypoint. Matches what
@@ -220,6 +248,7 @@ impl Lint {
         // ignored and the underlying diagnostics resurface.
         let mut analysis = ProjectAnalysis::new();
         analysis.bypass_suppressions = self.no_suppressions;
+        analysis.enabled_rules.extend(self.enable.iter().cloned());
         analysis.analyze_staged(&mgr);
         let total = total_start.elapsed();
 
@@ -426,6 +455,9 @@ impl Lint {
                 > = new_report.loaded.iter().cloned().collect();
                 let mut new_analysis = ProjectAnalysis::new();
                 new_analysis.bypass_suppressions = self.no_suppressions;
+                new_analysis
+                    .enabled_rules
+                    .extend(self.enable.iter().cloned());
                 new_analysis.analyze_staged(&new_mgr);
                 entries.clear();
                 for (uri, cell) in new_mgr.iter() {

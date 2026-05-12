@@ -52,8 +52,39 @@ pub fn edit_for_diagnostic(
         "catch-empty-parens" => catch_empty_parens_fix(text, start, end),
         "unused-catch-param" => unused_catch_param_fix(text, start),
         "redundant-semicolon" => redundant_semicolon_fix(start, end),
+        "no-breakpoint" => no_breakpoint_fix(text, start, end),
         _ => Vec::new(),
     }
+}
+
+// P37.7
+/// Delete a `breakpoint;` statement. The diagnostic's byte range covers
+/// exactly the `breakpoint_stmt` CST node (`breakpoint;`). If the stmt
+/// occupies a line on its own (only leading whitespace before, only `\n`
+/// after) the fix also eats the leading indent + trailing newline so
+/// no blank line is left behind. Same shape as `unreachable_fix`'s
+/// trailing-line cleanup.
+fn no_breakpoint_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
+    let bytes = text.as_bytes();
+    if end > bytes.len() || start > end {
+        return Vec::new();
+    }
+    let mut del_start = start;
+    let mut del_end = end;
+    if del_end < bytes.len() && bytes[del_end] == b'\n' {
+        let line_start = text[..del_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let pre_only_ws = text[line_start..del_start]
+            .chars()
+            .all(|c| c.is_whitespace());
+        if pre_only_ws {
+            del_end += 1;
+            del_start = line_start;
+        }
+    }
+    vec![TextEdit {
+        byte_range: del_start..del_end,
+        new_text: String::new(),
+    }]
 }
 
 /// Delete the stray trailing `;` (or `;;;`) after a fn / method body.

@@ -28,9 +28,10 @@ use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
 use crate::directives::Directives;
 use crate::lint::{
     LintDiagnostic, lint_arrow_on_non_deref_with_directives, lint_catch_empty_parens,
-    lint_inferred_return_type_with_directives, lint_non_exhaustive_with_directives,
-    lint_nullability_with_directives, lint_redundant_semicolon, lint_unreachable_with_directives,
-    lint_unused_suppressions, run_lints_with_directives,
+    lint_inferred_return_type_with_directives, lint_no_breakpoint,
+    lint_non_exhaustive_with_directives, lint_nullability_with_directives,
+    lint_redundant_semicolon, lint_unreachable_with_directives, lint_unused_suppressions,
+    run_lints_with_directives,
 };
 use crate::resolver::{Resolutions, resolve_with_index};
 use crate::stdlib::{FnSignature, ProjectIndex};
@@ -126,6 +127,13 @@ pub struct ProjectAnalysis {
     /// are still recorded but never silence emissions. Drives the CLI's
     /// `--no-suppressions` flag.
     pub bypass_suppressions: bool,
+    // P37.7
+    /// Names of rules the caller has explicitly enabled. Only matters
+    /// for rules that ship default-off (`default_enabled = false` in
+    /// [`LINT_RULES`]); default-on rules are always active. Drives the
+    /// CLI's `--enable=<rule>` flag and any future LSP / project-config
+    /// equivalent.
+    pub enabled_rules: FxHashSet<String>,
     modules: FxHashMap<Uri, ModuleAnalysis>,
     // P19.6
     /// Per-module signature-stage cache. Records what each
@@ -203,6 +211,7 @@ impl ProjectAnalysis {
             decl_registry: crate::well_known::DeclRegistry::new(),
             well_known: crate::well_known::WellKnown::new(),
             bypass_suppressions: false,
+            enabled_rules: FxHashSet::default(),
             modules: FxHashMap::default(),
             sig_cache: FxHashMap::default(),
         }
@@ -1318,6 +1327,7 @@ impl ProjectAnalysis {
         let index = &self.index;
         let decl_registry = &self.decl_registry;
         let bypass = self.bypass_suppressions;
+        let enabled_rules = &self.enabled_rules;
 
         // P26.3 / P27.1 — every typed-lint pass takes `&arena`
         // (immutable) + `&index` (immutable) and writes only to its
@@ -1348,7 +1358,16 @@ impl ProjectAnalysis {
             .filter(|(uri, _)| in_scope(uri))
             .collect();
         crate::parallel::par_for_each(modules, |(uri, module)| {
-            run_typed_lints_for_module(uri, module, arena, index, decl_registry, bypass, &doc_data);
+            run_typed_lints_for_module(
+                uri,
+                module,
+                arena,
+                index,
+                decl_registry,
+                bypass,
+                enabled_rules,
+                &doc_data,
+            );
         });
     }
 
@@ -1979,7 +1998,7 @@ fn resolve_qualified_chain(
 // P27.1 — the cfg gate is gone; the helper is the canonical body
 // for both native (rayon-driven) and wasm (serial fallback) call
 // sites in `run_typed_lints`.
-#[allow(clippy::mutable_key_type)]
+#[allow(clippy::mutable_key_type, clippy::too_many_arguments)]
 fn run_typed_lints_for_module(
     uri: &Uri,
     module: &mut ModuleAnalysis,
@@ -1987,6 +2006,7 @@ fn run_typed_lints_for_module(
     index: &ProjectIndex,
     decl_registry: &crate::well_known::DeclRegistry,
     bypass: bool,
+    enabled_rules: &FxHashSet<String>,
     doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
 ) {
     module.lints.retain(|l| {
@@ -2003,6 +2023,7 @@ fn run_typed_lints_for_module(
                 | "non-exhaustive"
                 | "catch-empty-parens"
                 | "redundant-semicolon"
+                | "no-breakpoint"
         )
     });
     if let Some((text, tree)) = doc_data.get(uri) {
@@ -2020,6 +2041,18 @@ fn run_typed_lints_for_module(
             bypass,
             &mut module.lints,
         );
+        // P37.7 — advisory, default-off. Only runs when the caller
+        // explicitly enabled it (CLI `--enable=no-breakpoint`); on a
+        // vanilla `lint` / `lint --fix` it never emits, so debug aids
+        // don't get silently deleted.
+        if enabled_rules.contains("no-breakpoint") {
+            lint_no_breakpoint(
+                tree.root_node(),
+                &mut module.directives,
+                bypass,
+                &mut module.lints,
+            );
+        }
     }
     lint_arrow_on_non_deref_with_directives(
         &module.hir,

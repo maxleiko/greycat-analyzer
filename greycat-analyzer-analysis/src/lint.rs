@@ -78,7 +78,8 @@ pub fn default_tag_for(rule: &str) -> Option<DiagTag> {
         | "redundant-nullable-access"
         | "redundant-non-null-assertion"
         | "redundant-coalesce"
-        | "redundant-semicolon" => Some(DiagTag::Unnecessary),
+        | "redundant-semicolon"
+        | "no-breakpoint" => Some(DiagTag::Unnecessary),
         _ => None,
     }
 }
@@ -147,10 +148,50 @@ impl<'a> LintCx<'a> {
 /// One row of the lint registry. Keeps the rule's name, severity, and
 /// one-line summary together in one place so `lint --list-rules`
 /// and the LSP's directive-completion read from the same table.
+///
+/// `default_enabled` controls whether the rule fires on a vanilla
+/// `lint` run. Most rules default `true`. Advisory rules — like
+/// `no-breakpoint`, which would silently delete debug aids on a generic
+/// `lint --fix` if it fired by default — default `false` and require
+/// an opt-in (CLI `--enable=<rule>`, future LSP config) to surface.
 #[derive(Debug, Clone, Copy)]
 pub struct LintRuleInfo {
     pub name: &'static str,
     pub summary: &'static str,
+    pub default_enabled: bool,
+}
+
+/// `true` if `rule` ships enabled by default. Unknown rules (typo /
+/// retired) return `false` — fail-closed.
+pub fn is_rule_default_enabled(rule: &str) -> bool {
+    LINT_RULES
+        .iter()
+        .find(|r| r.name == rule)
+        .map(|r| r.default_enabled)
+        .unwrap_or(false)
+}
+
+/// Default-enabled rule registry entry. Keeps [`LINT_RULES`] readable —
+/// 90%+ of rules ship on, so the field would just be repetitive noise
+/// at the literal site.
+const fn rule(name: &'static str, summary: &'static str) -> LintRuleInfo {
+    LintRuleInfo {
+        name,
+        summary,
+        default_enabled: true,
+    }
+}
+
+/// Advisory rule that defaults to off — caller opts in via CLI
+/// `--enable=<rule>` (or future LSP config). Used for rules that would
+/// silently break user intent if they fired on a vanilla `lint --fix`
+/// (e.g. `no-breakpoint` would delete debug aids).
+const fn advisory_rule(name: &'static str, summary: &'static str) -> LintRuleInfo {
+    LintRuleInfo {
+        name,
+        summary,
+        default_enabled: false,
+    }
 }
 
 /// Project-wide registry of every lint rule the analyzer can emit.
@@ -158,100 +199,106 @@ pub struct LintRuleInfo {
 /// the typed lints driven from the project pipeline (`arrow-on-non-deref`,
 /// the `nullability` family, `infer-return-type`).
 pub const LINT_RULES: &[LintRuleInfo] = &[
-    LintRuleInfo {
-        name: "unused-local",
-        summary: "warn when a `var name = …;` local is bound but never read",
-    },
-    LintRuleInfo {
-        name: "unused-param",
-        summary: "warn when a function parameter is never read in its body",
-    },
-    LintRuleInfo {
-        name: "unused-decl",
-        summary: "warn when a top-level `private` decl is never referenced",
-    },
-    LintRuleInfo {
-        name: "duplicate-decl",
-        summary: "error when two top-level decls share a name",
-    },
-    LintRuleInfo {
-        name: "modvar-must-be-node-tag",
-        summary: "module variable type must be a node tag (`node` / `nodeTime` / …)",
-    },
-    LintRuleInfo {
-        name: "modvar-node-cannot-be-nullable",
-        summary: "module-variable nodes are auto-initialized — drop the trailing `?`",
-    },
-    LintRuleInfo {
-        name: "modvar-node-inner-must-be-nullable",
-        summary: "`node<T>` requires a nullable inner type — use `node<T?>`",
-    },
-    LintRuleInfo {
-        name: "arrow-on-non-deref",
-        summary: "`->` requires a node-tag or `@deref` receiver",
-    },
-    LintRuleInfo {
-        name: "possibly-null",
-        summary: "warn when `.` / `->` / `[…]` is used on a possibly-null receiver",
-    },
-    LintRuleInfo {
-        name: "redundant-nullable-access",
-        summary: "warn when `?.` / `?->` / `?[…]` is used on a non-nullable receiver",
-    },
-    LintRuleInfo {
-        name: "redundant-non-null-assertion",
-        summary: "warn when `!!` is used on an already-non-nullable expression",
-    },
-    LintRuleInfo {
-        name: "redundant-coalesce",
-        summary: "warn when `??` is used on an already-non-nullable left operand",
-    },
-    LintRuleInfo {
-        name: "infer-return-type",
-        summary: "hint when a fn's return type can be inferred from its body",
-    },
-    LintRuleInfo {
-        name: "unreachable",
-        summary: "hint when a statement is unreachable (after a divergent prior statement, \
-                  or the trailing `else` of an exhaustive enum chain)",
-    },
-    LintRuleInfo {
-        name: "non-exhaustive",
-        summary: "warn when an `if (x == E::A) … else if (x == E::B) …` chain over an enum \
-                  doesn't cover every variant (and has no catch-all final `else`)",
-    },
-    LintRuleInfo {
-        name: "unused-suppression",
-        summary: "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
-    },
-    LintRuleInfo {
-        name: "unknown-suppression-rule",
-        summary: "flag a `// gcl-lint-off…` directive that names an unknown rule",
-    },
-    LintRuleInfo {
-        name: "empty-suppression",
-        summary: "flag a `// gcl-lint-off…` directive with an empty rule list",
-    },
-    LintRuleInfo {
-        name: "unbalanced-fmt-off",
-        summary: "flag a `// gcl-fmt-off` with no matching `gcl-fmt-on`",
-    },
-    LintRuleInfo {
-        name: "unbalanced-lint-off",
-        summary: "flag a `// gcl-lint-off …` with no matching `gcl-lint-on`",
-    },
-    LintRuleInfo {
-        name: "catch-empty-parens",
-        summary: "error on `catch ()` — drop the empty parens (`catch { … }` is the no-binding form)",
-    },
-    LintRuleInfo {
-        name: "unused-catch-param",
-        summary: "warn when `catch (e) { … }` binds `e` but never reads it — auto-fix drops `(e)` so the form becomes `catch { … }`",
-    },
-    LintRuleInfo {
-        name: "redundant-semicolon",
-        summary: "error on a stray `;` after a fn or method body (`fn f() {};`) — the runtime rejects it; auto-fix removes the `;`",
-    },
+    rule(
+        "unused-local",
+        "warn when a `var name = …;` local is bound but never read",
+    ),
+    rule(
+        "unused-param",
+        "warn when a function parameter is never read in its body",
+    ),
+    rule(
+        "unused-decl",
+        "warn when a top-level `private` decl is never referenced",
+    ),
+    rule(
+        "duplicate-decl",
+        "error when two top-level decls share a name",
+    ),
+    rule(
+        "modvar-must-be-node-tag",
+        "module variable type must be a node tag (`node` / `nodeTime` / …)",
+    ),
+    rule(
+        "modvar-node-cannot-be-nullable",
+        "module-variable nodes are auto-initialized — drop the trailing `?`",
+    ),
+    rule(
+        "modvar-node-inner-must-be-nullable",
+        "`node<T>` requires a nullable inner type — use `node<T?>`",
+    ),
+    rule(
+        "arrow-on-non-deref",
+        "`->` requires a node-tag or `@deref` receiver",
+    ),
+    rule(
+        "possibly-null",
+        "warn when `.` / `->` / `[…]` is used on a possibly-null receiver",
+    ),
+    rule(
+        "redundant-nullable-access",
+        "warn when `?.` / `?->` / `?[…]` is used on a non-nullable receiver",
+    ),
+    rule(
+        "redundant-non-null-assertion",
+        "warn when `!!` is used on an already-non-nullable expression",
+    ),
+    rule(
+        "redundant-coalesce",
+        "warn when `??` is used on an already-non-nullable left operand",
+    ),
+    rule(
+        "infer-return-type",
+        "hint when a fn's return type can be inferred from its body",
+    ),
+    rule(
+        "unreachable",
+        "hint when a statement is unreachable (after a divergent prior statement, \
+         or the trailing `else` of an exhaustive enum chain)",
+    ),
+    rule(
+        "non-exhaustive",
+        "warn when an `if (x == E::A) … else if (x == E::B) …` chain over an enum \
+         doesn't cover every variant (and has no catch-all final `else`)",
+    ),
+    rule(
+        "unused-suppression",
+        "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
+    ),
+    rule(
+        "unknown-suppression-rule",
+        "flag a `// gcl-lint-off…` directive that names an unknown rule",
+    ),
+    rule(
+        "empty-suppression",
+        "flag a `// gcl-lint-off…` directive with an empty rule list",
+    ),
+    rule(
+        "unbalanced-fmt-off",
+        "flag a `// gcl-fmt-off` with no matching `gcl-fmt-on`",
+    ),
+    rule(
+        "unbalanced-lint-off",
+        "flag a `// gcl-lint-off …` with no matching `gcl-lint-on`",
+    ),
+    rule(
+        "catch-empty-parens",
+        "error on `catch ()` — drop the empty parens (`catch { … }` is the no-binding form)",
+    ),
+    rule(
+        "unused-catch-param",
+        "warn when `catch (e) { … }` binds `e` but never reads it — auto-fix drops `(e)` so the form becomes `catch { … }`",
+    ),
+    rule(
+        "redundant-semicolon",
+        "error on a stray `;` after a fn or method body (`fn f() {};`) — the runtime rejects it; auto-fix removes the `;`",
+    ),
+    advisory_rule(
+        "no-breakpoint",
+        "warn on `breakpoint;` left in committed code — pauses the GreyCat worker for \
+         debugging; auto-fix deletes the statement. Off by default — enable with \
+         `lint --enable=no-breakpoint`.",
+    ),
 ];
 
 /// Run every registered HIR-only rule in order and return the merged
@@ -452,6 +499,49 @@ pub fn lint_redundant_semicolon(
             byte_range,
             tag: None,
         });
+    }
+}
+
+// P37.7
+/// Flag every `breakpoint_stmt` node — `breakpoint;` pauses the GreyCat
+/// worker for debugging. The keyword is real and the runtime honors it,
+/// but committed `breakpoint;` stalls production runs. Same shape of
+/// mistake as a leftover Rust `dbg!()` or JS `debugger;`. Severity
+/// Warning + `UNNECESSARY` tag so editors dim the span; users can opt
+/// out per-site via `// gcl-lint-off no-breakpoint`.
+pub fn lint_no_breakpoint(
+    root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
+    directives: &mut crate::directives::Directives,
+    bypass_suppressions: bool,
+    out: &mut Vec<LintDiagnostic>,
+) {
+    use greycat_analyzer_syntax::tree_sitter::Node;
+    fn walk(node: Node<'_>, hits: &mut Vec<std::ops::Range<usize>>) {
+        if node.kind() == "breakpoint_stmt" {
+            hits.push(node.byte_range());
+        }
+        let mut cur = node.walk();
+        for ch in node.children(&mut cur) {
+            walk(ch, hits);
+        }
+    }
+    let mut hits: Vec<std::ops::Range<usize>> = Vec::new();
+    walk(root, &mut hits);
+    for byte_range in hits {
+        emit_typed(
+            out,
+            Some(directives),
+            bypass_suppressions,
+            LintDiagnostic {
+                rule: "no-breakpoint",
+                severity: LintSeverity::Warning,
+                message: "`breakpoint;` left in committed code — it pauses the worker for \
+                          debugging (suppress with `// gcl-lint-off no-breakpoint` if intentional)"
+                    .to_string(),
+                byte_range,
+                tag: None,
+            },
+        );
     }
 }
 
