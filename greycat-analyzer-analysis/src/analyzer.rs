@@ -2213,27 +2213,18 @@ impl<'a> Cx<'a> {
             return;
         }
         let ak = self.arena.get(arg_ty).clone();
-        if let (
-            TypeKind::Generic { name: pn, args: pa },
-            TypeKind::Generic { name: an, args: aa },
-        ) = (&pk.kind, &ak.kind)
-        {
-            if pn == an && pa.len() == aa.len() {
-                let pa = pa.clone();
-                let aa = aa.clone();
-                for (p, a) in pa.iter().zip(aa.iter()) {
-                    self.collect_witnesses(*p, *a, tbl, call_range);
-                }
-            }
-            return;
-        }
-        if let (TypeKind::Tuple { elements: pe }, TypeKind::Tuple { elements: ae }) =
+        if let (TypeKind::Generic { name: pn, args: pa }, TypeKind::Generic { name: an, args: aa }) =
             (&pk.kind, &ak.kind)
-            && pe.len() == ae.len()
+            && pn == an
+            && pa.len() == aa.len()
         {
-            let pe = pe.clone();
-            let ae = ae.clone();
-            for (p, a) in pe.iter().zip(ae.iter()) {
+            // `Tuple<T, U>` falls under this arm — `(x, y)` literal
+            // typing routes through `arena.tuple(x, y)` which mints
+            // `Generic("Tuple", [x, y])`, same shape source-level
+            // `Tuple<T, U>` produces.
+            let pa = pa.clone();
+            let aa = aa.clone();
+            for (p, a) in pa.iter().zip(aa.iter()) {
                 self.collect_witnesses(*p, *a, tbl, call_range);
             }
         }
@@ -3378,8 +3369,14 @@ impl<'a> Cx<'a> {
                 self.primitive(Primitive::String)
             }
             Expr::Tuple(items, _) => {
-                let elems: Vec<TypeId> = items.iter().map(|i| self.visit_expr(*i)).collect();
-                self.arena.tuple(elems)
+                // The grammar's `tuple_expr` is strictly 2-element
+                // (`( left "," right )`), so HIR always has exactly
+                // two items here. Type the literal as `Tuple<X, Y>`
+                // — the compiler's desugar rule (mirrors `[42]` ≡
+                // `Array<int>{42}`).
+                let x = self.visit_expr(items[0]);
+                let y = self.visit_expr(items[1]);
+                self.arena.tuple(x, y)
             }
             Expr::Array(items, _) => {
                 for i in items.iter() {

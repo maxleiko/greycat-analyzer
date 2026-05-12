@@ -193,8 +193,8 @@ fn rt_tuple_identity_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let s = a.primitive(Primitive::String);
-    let t1 = a.tuple(vec![i, s]);
-    let t2 = a.tuple(vec![i, s]);
+    let t1 = a.tuple(i, s);
+    let t2 = a.tuple(i, s);
     assert!(is_assignable_to(&a, t1, t2));
 }
 
@@ -204,8 +204,8 @@ fn rt_tuple_element_mismatch_rejected() {
     let i = a.primitive(Primitive::Int);
     let s = a.primitive(Primitive::String);
     let f = a.primitive(Primitive::Float);
-    let t1 = a.tuple(vec![i, s]);
-    let t2 = a.tuple(vec![f, s]);
+    let t1 = a.tuple(i, s);
+    let t2 = a.tuple(f, s);
     assert!(!is_assignable_to(&a, t1, t2));
 }
 

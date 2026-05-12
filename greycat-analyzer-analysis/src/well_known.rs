@@ -141,6 +141,12 @@ pub struct WellKnown {
     pub buffer_decl: Option<TypeDeclId>,
     pub table_decl: Option<TypeDeclId>,
     pub tensor_decl: Option<TypeDeclId>,
+    /// `Tuple<T, U>` from `lib/std/core.gcl`. `(x, y)` tuple-literal
+    /// syntax desugars to `Tuple<T, U>{x, y}` per the compiler, so
+    /// the analyzer's `Expr::Tuple` typing mints
+    /// `GenericInstance(tuple_decl, [T, U])` when this slot is
+    /// populated.
+    pub tuple_decl: Option<TypeDeclId>,
 }
 
 impl WellKnown {
@@ -192,6 +198,7 @@ impl WellKnown {
             "Buffer" => &mut self.buffer_decl,
             "Table" => &mut self.table_decl,
             "Tensor" => &mut self.tensor_decl,
+            "Tuple" => &mut self.tuple_decl,
             _ => return,
         };
         *slot = Some(id);

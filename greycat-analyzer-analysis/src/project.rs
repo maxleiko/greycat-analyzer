@@ -612,16 +612,6 @@ fn write_type_qualified(
             f.write_str(") -> ")?;
             write_type_qualified(f, project, l.ret)?;
         }
-        TypeKind::Tuple { elements } => {
-            f.write_str("(")?;
-            for (i, e) in elements.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type_qualified(f, project, *e)?;
-            }
-            f.write_str(")")?;
-        }
         TypeKind::Enum { name, .. } => f.write_str(name.as_str())?,
         TypeKind::Union { alts } => {
             for (i, a) in alts.iter().enumerate() {

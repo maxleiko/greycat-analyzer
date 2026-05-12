@@ -226,8 +226,6 @@ pub enum TypeKind {
     GenericParam { name: SmolStr, owner: GenericOwner },
     /// Function / lambda type.
     Lambda(LambdaType),
-    /// Tuple — `t2`, `t3`, `t4` plus their float variants.
-    Tuple { elements: Vec<TypeId> },
     /// Enum type.
     // P25.4
     Enum {
@@ -516,11 +514,13 @@ impl TypeArena {
         })
     }
 
-    pub fn tuple(&mut self, elements: Vec<TypeId>) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Tuple { elements },
-            nullable: false,
-        })
+    /// `(x, y)` tuple-literal type, modelled as `Tuple<X, Y>` per
+    /// the compiler's desugaring rule (mirrors `[42]` ≡
+    /// `Array<int>{42}`). Strictly 2-element — the grammar's
+    /// `tuple_expr` rule emits exactly `(left, right)` and nothing
+    /// else, so the type is always a pair.
+    pub fn tuple(&mut self, x: TypeId, y: TypeId) -> TypeId {
+        self.generic("Tuple", vec![x, y])
     }
 
     // P19
@@ -579,21 +579,6 @@ impl TypeArena {
                             .expect("decl name registered at first alloc"),
                     );
                     let mut new_t = self.alloc_generic_instance(decl, name, new_args.into_vec());
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            TypeKind::Tuple { elements } => {
-                let new_els: Vec<TypeId> = elements
-                    .iter()
-                    .map(|e| self.substitute(*e, subst))
-                    .collect();
-                if new_els == *elements {
-                    ty
-                } else {
-                    let mut new_t = self.tuple(new_els);
                     if t.nullable {
                         new_t = self.nullable(new_t);
                     }
@@ -819,13 +804,6 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                     is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)
                 })
         }
-        (TypeKind::Tuple { elements: ea }, TypeKind::Tuple { elements: eb }) => {
-            ea.len() == eb.len()
-                && ea
-                    .iter()
-                    .zip(eb)
-                    .all(|(x, y)| is_assignable_to(arena, *x, *y))
-        }
         (TypeKind::Lambda(la), TypeKind::Lambda(lb)) => {
             // Contravariant in params, covariant in return. Same as TS.
             la.params.len() == lb.params.len()
@@ -978,21 +956,6 @@ impl InferenceTable {
                 } else {
                     let name = name.clone();
                     let mut new_t = arena.generic(name, new_args.into_vec());
-                    if t.nullable {
-                        new_t = arena.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            TypeKind::Tuple { elements } => {
-                let new_els: Vec<TypeId> = elements
-                    .iter()
-                    .map(|e| self.substitute(arena, *e))
-                    .collect();
-                if new_els == *elements {
-                    ty
-                } else {
-                    let mut new_t = arena.tuple(new_els);
                     if t.nullable {
                         new_t = arena.nullable(new_t);
                     }
@@ -1225,16 +1188,6 @@ fn write_type(f: &mut std::fmt::Formatter<'_>, arena: &TypeArena, id: TypeId) ->
             f.write_str(") -> ")?;
             write_type(f, arena, l.ret)?;
         }
-        TypeKind::Tuple { elements } => {
-            f.write_str("(")?;
-            for (i, e) in elements.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type(f, arena, *e)?;
-            }
-            f.write_str(")")?;
-        }
         TypeKind::Enum { name, .. } => f.write_str(name.as_str())?,
         TypeKind::Union { alts } => {
             // Unions render as `A | B | …`. When the union is also
@@ -1371,13 +1324,6 @@ pub fn display_fqn(
                 parts.join(", "),
                 display_fqn(arena, l.ret, home_lib)
             )
-        }
-        TypeKind::Tuple { elements } => {
-            let parts: Vec<String> = elements
-                .iter()
-                .map(|e| display_fqn(arena, *e, home_lib))
-                .collect();
-            format!("({})", parts.join(", "))
         }
         TypeKind::Enum { name, .. } => format!(
             "{}::{}",
