@@ -446,7 +446,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 visit_expr(cx, v);
             }
         }
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::Breakpoint => {}
         Stmt::Throw(e) => visit_expr(cx, e),
         Stmt::Try(TryStmt {
             try_block,

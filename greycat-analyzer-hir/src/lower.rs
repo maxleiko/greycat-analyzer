@@ -705,6 +705,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
         }
         "break_stmt" => Stmt::Break,
         "continue_stmt" => Stmt::Continue,
+        "breakpoint_stmt" => Stmt::Breakpoint,
         "throw_stmt" => {
             let e = node
                 .named_children(&mut node.walk())

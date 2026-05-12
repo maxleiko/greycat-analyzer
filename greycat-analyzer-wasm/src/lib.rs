@@ -541,6 +541,12 @@ fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode 
             range: (0..0).into(),
             children: Vec::new(),
         },
+        Stmt::Breakpoint => HirNode {
+            kind: "stmt:breakpoint".into(),
+            label: None,
+            range: (0..0).into(),
+            children: Vec::new(),
+        },
         Stmt::Try(t) => {
             let mut kids = vec![block_node(hir, &t.try_block)];
             kids.push(HirNode {

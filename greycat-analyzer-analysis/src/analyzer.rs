@@ -2739,7 +2739,7 @@ impl<'a> Cx<'a> {
                     let _ = return_ty;
                 }
             }
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break | Stmt::Continue | Stmt::Breakpoint => {}
             Stmt::Throw(e) => {
                 let _ = self.visit_expr(e);
             }

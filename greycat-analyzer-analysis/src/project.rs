@@ -2486,7 +2486,12 @@ fn validate_module_type_relations(
                     );
                 }
             }
-            Stmt::Return(None) | Stmt::Expr(_) | Stmt::Break | Stmt::Continue | Stmt::Throw(_) => {}
+            Stmt::Return(None)
+            | Stmt::Expr(_)
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Breakpoint
+            | Stmt::Throw(_) => {}
         }
     }
 

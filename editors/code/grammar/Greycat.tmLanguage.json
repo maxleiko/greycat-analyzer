@@ -31,11 +31,11 @@
       "patterns": [
         {
           "name": "storage.modifier.gcl",
-          "match": "\\b(abstract|as|at|break|continue|catch|do|else|enum|extends|for|fn|if|in|is|limit|native|private|sampling|skip|static|throw|try|type|use|var|while|without|task)\\b(?![\\(\\)\\]\\.\\;\\:\\=\\>\\}\\{\\-])"
+          "match": "\\b(abstract|as|at|break|breakpoint|continue|catch|do|else|enum|extends|for|fn|if|in|is|limit|native|private|sampling|skip|static|throw|try|type|use|var|while|without|task)\\b(?![\\(\\)\\]\\.\\;\\:\\=\\>\\}\\{\\-])"
         },
         {
           "name": "keyword.control.gcl",
-          "match": "\\b(return|break|continue)\\b"
+          "match": "\\b(return|break|continue|breakpoint)\\b"
         },
         {
           "name": "variable.language.this.gcl",

@@ -817,6 +817,7 @@ fn collect_stmt_decl_idents(
         | Stmt::Return(_)
         | Stmt::Break
         | Stmt::Continue
+        | Stmt::Breakpoint
         | Stmt::Throw(_)
         | Stmt::At(_) => {}
     }

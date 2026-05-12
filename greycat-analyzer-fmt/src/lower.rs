@@ -143,6 +143,7 @@ fn lower_node<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         "throw_stmt" => lower_keyword_expr_stmt(cx, node, "throw"),
         "break_stmt" => Doc::text("break;"),
         "continue_stmt" => Doc::text("continue;"),
+        "breakpoint_stmt" => Doc::text("breakpoint;"),
         "expr_stmt" => lower_expr_stmt(cx, node),
         "if_stmt" => lower_if_stmt(cx, node),
         "while_stmt" => lower_while_stmt(cx, node),

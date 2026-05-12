@@ -1018,3 +1018,33 @@ fn completion_inside_lint_off_rule_list_lists_known_rules() {
         "expected `possibly-null` rule in completion, got {labels:?}"
     );
 }
+
+// P37.5 — `breakpoint`, `break`, and `continue` are all listed in
+// `ALL_KEYWORDS` so the keyword completer surfaces them at statement
+// positions. Regression test against the gap where the slice was
+// originally seeded without `break` / `continue` / `breakpoint`.
+#[test]
+fn completion_at_stmt_position_includes_breakpoint() {
+    // `br;` parses as `expr_stmt (ident)`; cursor at the end of `br`
+    // (before `;`) lands inside the ident and the keyword completer's
+    // prefix filter narrows `ALL_KEYWORDS` to entries starting with
+    // `br` (`break` and `breakpoint`).
+    let src = "fn f() {\n    br;\n}\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    let cursor = src.find("br;").unwrap() + 2;
+    let line = src[..cursor].matches('\n').count() as u32;
+    let col = (cursor - src[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let list = capabilities::completion(src, r, pos(line, col), None)
+        .expect("expected keyword completion at statement position");
+    let labels: Vec<_> = list.items.into_iter().map(|c| c.label).collect();
+    assert!(
+        labels.iter().any(|l| l == "breakpoint"),
+        "expected `breakpoint` in stmt-position keyword completion, got {labels:?}"
+    );
+    // Also verify the previously-missing siblings landed in the same pass.
+    assert!(
+        labels.iter().any(|l| l == "break"),
+        "expected `break` in stmt-position keyword completion, got {labels:?}"
+    );
+}

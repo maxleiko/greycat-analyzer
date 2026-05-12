@@ -180,6 +180,7 @@ pub enum Stmt {
     Return(Option<Idx<Expr>>),
     Break,
     Continue,
+    Breakpoint,
     Throw(Idx<Expr>),
     Try(TryStmt),
     At(AtStmt),

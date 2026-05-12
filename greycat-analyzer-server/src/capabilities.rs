@@ -3611,15 +3611,41 @@ fn static_completion_item(
 /// (`grammar.js`): the modifiers (`private`, `static`, `abstract`,
 /// `native`), decl-level (`fn`, `type`, `enum`, `var`), control-flow
 /// (`if`, `else`, `for`, `while`, `do`, `return`, `throw`, `try`,
-/// `catch`, `at`, `in`, `break`, `continue`), and expression-level
-/// (`is`, `as`, `null`, `true`, `false`, `this`). Context-only keywords
-/// (`extends`, `typeof`) are not listed — they only parse in a single
-/// fixed slot (after a type-decl name / on a fn-param type) and are
-/// completed by the contextual handlers, not the stmt/expr fallback.
+/// `catch`, `at`, `in`, `break`, `continue`, `breakpoint`), and
+/// expression-level (`is`, `as`, `null`, `true`, `false`, `this`).
+/// Context-only keywords (`extends`, `typeof`) are not listed — they
+/// only parse in a single fixed slot (after a type-decl name / on a
+/// fn-param type) and are completed by the contextual handlers, not
+/// the stmt/expr fallback.
 const ALL_KEYWORDS: &[&str] = &[
-    "abstract", "as", "at", "break", "catch", "continue", "do", "else", "enum", "false", "fn",
-    "for", "if", "in", "is", "native", "null", "private", "return", "static", "this", "throw",
-    "true", "try", "type", "var", "while",
+    "abstract",
+    "as",
+    "at",
+    "break",
+    "breakpoint",
+    "catch",
+    "continue",
+    "do",
+    "else",
+    "enum",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "in",
+    "is",
+    "native",
+    "null",
+    "private",
+    "return",
+    "static",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "var",
+    "while",
 ];
 
 // =============================================================================
@@ -4201,7 +4227,7 @@ fn stmt_byte_range(
         HS::Expr(e) => hir.exprs[*e].byte_range(),
         HS::Return(Some(e)) => hir.exprs[*e].byte_range(),
         HS::Throw(e) => hir.exprs[*e].byte_range(),
-        HS::Return(None) | HS::Break | HS::Continue => 0..0,
+        HS::Return(None) | HS::Break | HS::Continue | HS::Breakpoint => 0..0,
     }
 }
 

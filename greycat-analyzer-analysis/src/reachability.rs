@@ -49,8 +49,11 @@ pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
         Stmt::At(a) => block_diverges(hir, &a.block),
         // Loops never diverge from the analyzer's POV — see module docs.
         Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForIn(_) => false,
-        // Pure straight-line statements.
-        Stmt::Expr(_) | Stmt::Var(_) | Stmt::Assign(_) => false,
+        // Pure straight-line statements. `breakpoint;` is intentionally
+        // here — it pauses the worker for debugging, then execution
+        // resumes from the next statement. Treating it as divergent
+        // would mark legitimate post-debug code as unreachable.
+        Stmt::Expr(_) | Stmt::Var(_) | Stmt::Assign(_) | Stmt::Breakpoint => false,
     }
 }
 

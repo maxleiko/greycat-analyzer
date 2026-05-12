@@ -1911,14 +1911,16 @@ fn stmt_byte_range(hir: &Hir, stmt_id: Idx<Stmt>) -> std::ops::Range<usize> {
         Stmt::Try(t) => t.byte_range.clone(),
         Stmt::At(a) => a.byte_range.clone(),
         Stmt::Expr(e) => hir.exprs[*e].byte_range(),
-        Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Throw(_) => {
+        Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Breakpoint | Stmt::Throw(_) => {
             // These keyword-only statements don't carry their own
             // byte_range; fall back to the inner expression's span
-            // (return/throw) or to a zero-width range (break/continue).
-            // The lint never produces a *primary* diagnostic on these
-            // shapes anyway — they're divergent, not dead — so the
-            // 0..0 fallback only fires when one of them is the *first*
-            // dead stmt, which can't happen.
+            // (return/throw) or to a zero-width range (break/continue/
+            // breakpoint). The lint never produces a *primary* diagnostic
+            // on the divergent shapes (return/throw/break/continue) —
+            // they're terminators, not dead — so 0..0 only fires for
+            // the rare path where one of those is the *first* dead stmt,
+            // which can't happen. `breakpoint` isn't divergent, but it
+            // still has no inner expr, so 0..0 is the same fallback.
             match &hir.stmts[stmt_id] {
                 Stmt::Return(Some(e)) => hir.exprs[*e].byte_range(),
                 Stmt::Throw(e) => hir.exprs[*e].byte_range(),

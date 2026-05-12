@@ -105,3 +105,26 @@ fn user_example_quickfix_removes_both_dead_islands() {
         m2.lints
     );
 }
+
+// P37.3 — `breakpoint;` pauses the worker but execution resumes from the
+// next statement after the debugger detaches. The reachability pass must
+// NOT classify it alongside the control-flow terminators (return / throw
+// / break / continue), or every post-breakpoint statement would dim as
+// dead code.
+#[test]
+fn breakpoint_does_not_terminate_control_flow() {
+    let src = "\
+fn f(): int {
+    breakpoint;
+    return 0;
+}
+";
+    let (uri, pa) = analyze(src);
+    let m = pa.module(&uri).unwrap();
+    let unreachable: Vec<_> = m.lints.iter().filter(|l| l.rule == "unreachable").collect();
+    assert!(
+        unreachable.is_empty(),
+        "`breakpoint;` is not a terminator — `return 0;` after it must stay reachable, got: {:?}",
+        unreachable
+    );
+}

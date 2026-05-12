@@ -18,5 +18,9 @@
 	"Try/Catch": {
 		"prefix": ["try"],
 		"body": ["try {", "  $0", "} catch (${1:err}) {", "  ", "}"]
+	},
+	"Breakpoint": {
+		"prefix": ["bp", "breakpoint"],
+		"body": ["breakpoint;"]
 	}
 }
