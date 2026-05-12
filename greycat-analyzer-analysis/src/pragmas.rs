@@ -32,17 +32,22 @@ pub struct LintPragmas {
 }
 
 /// Walk every top-level `mod_pragma` in `root` and collect rule names
-/// from `@lint_off(...)` / `@lint_on(...)` annotations. Multiple
-/// pragmas of the same kind union into one set. Validation:
+/// from `@lint_off(...)` / `@lint_on(...)` annotations.
 ///
-/// - empty argument list (`@lint_off();`) → `empty-suppression` on the
-///   annotation span.
-/// - unknown rule name (`@lint_off("typo");`) → `unknown-suppression-rule`
-///   on the string-literal arg.
-/// - rule named in both `@lint_off` and `@lint_on` within the same
-///   module → `conflicting-lint-pragma` on the offending `@lint_on`
-///   occurrence (Warning, no auto-fix — the user has to decide).
-pub fn parse_lint_pragmas(source: &str, root: Node<'_>) -> LintPragmas {
+/// `is_entrypoint` controls scope: project-wide lint policy lives only
+/// in `project.gcl`. When `false`, every `@lint_off` / `@lint_on` is
+/// rejected as `lint-pragma-outside-entrypoint` (Warning) with a
+/// quickfix that deletes the offending pragma, and the rules are
+/// **not** added to `off` / `on` (so the caller never applies module-
+/// scope pragmas). When `true`, multiple pragmas of the same kind
+/// union; the walker also emits:
+///
+/// - empty argument list (`@lint_off();`) → `empty-suppression`.
+/// - unknown rule name → `unknown-suppression-rule` on the literal.
+/// - rule named in both `@lint_off` and `@lint_on` in the same
+///   entrypoint → `conflicting-lint-pragma` on the offending pragma
+///   (Warning, no auto-fix — the user has to decide).
+pub fn parse_lint_pragmas(source: &str, root: Node<'_>, is_entrypoint: bool) -> LintPragmas {
     let mut out = LintPragmas::default();
     let valid_rules: FxHashSet<&'static str> =
         crate::lint::LINT_RULES.iter().map(|r| r.name).collect();
@@ -51,6 +56,9 @@ pub fn parse_lint_pragmas(source: &str, root: Node<'_>) -> LintPragmas {
         if child.kind() != "mod_pragma" {
             continue;
         }
+        // Remember the pragma's full span — used for the entrypoint-only
+        // quickfix when `is_entrypoint == false`.
+        let pragma_span = child.byte_range();
         let mut sub = child.walk();
         for c in child.named_children(&mut sub) {
             if c.kind() != "annotation" {
@@ -74,6 +82,23 @@ pub fn parse_lint_pragmas(source: &str, root: Node<'_>) -> LintPragmas {
                 "lint_on" => false,
                 _ => continue,
             };
+            // P40.5 — pragma found in a non-entrypoint module. Reject:
+            // emit the new diagnostic, discard the rules, skip the
+            // empty/unknown/conflict validation (those would just stack
+            // on top and confuse the editor).
+            if !is_entrypoint {
+                out.diagnostics.push(LintDiagnostic {
+                    rule: "lint-pragma-outside-entrypoint",
+                    severity: LintSeverity::Warning,
+                    message: format!(
+                        "`@{name}` may only appear in the project's entrypoint (`project.gcl`) so \
+                         lint policy lives in one place — move this pragma there (or delete it)"
+                    ),
+                    byte_range: pragma_span.clone(),
+                    tag: None,
+                });
+                continue;
+            }
             // Collect (rule_name, source_range_of_arg) so we can flag
             // unknown names with precise spans.
             let mut harvested: Vec<(String, std::ops::Range<usize>)> = Vec::new();
@@ -181,7 +206,12 @@ mod tests {
 
     fn parse(src: &str) -> LintPragmas {
         let tree = greycat_analyzer_syntax::parse(src);
-        parse_lint_pragmas(src, tree.root_node())
+        parse_lint_pragmas(src, tree.root_node(), true)
+    }
+
+    fn parse_module(src: &str) -> LintPragmas {
+        let tree = greycat_analyzer_syntax::parse(src);
+        parse_lint_pragmas(src, tree.root_node(), false)
     }
 
     #[test]
@@ -255,5 +285,29 @@ mod tests {
         let p = parse("@lint_on(\"unused-decl\");\n@lint_off(\"unused-decl\");\n");
         assert_eq!(p.diagnostics.len(), 1);
         assert_eq!(p.diagnostics[0].rule, "conflicting-lint-pragma");
+    }
+
+    // P40.5 — in non-entrypoint modules, pragmas are rejected with
+    // `lint-pragma-outside-entrypoint` and do NOT populate the off / on
+    // sets. Empty / unknown / conflict validation is suppressed
+    // (those would just stack on top).
+
+    #[test]
+    fn module_pragma_rejected_with_lint_pragma_outside_entrypoint() {
+        let p = parse_module("@lint_off(\"unused-decl\");\n");
+        assert!(p.off.is_empty(), "module-scope pragma must not apply");
+        assert!(p.on.is_empty());
+        assert_eq!(p.diagnostics.len(), 1);
+        assert_eq!(p.diagnostics[0].rule, "lint-pragma-outside-entrypoint");
+    }
+
+    #[test]
+    fn module_pragma_skips_empty_and_unknown_validation() {
+        // The user moved a stale `@lint_off()` from project.gcl. The
+        // walker should NOT emit empty-suppression on top of the
+        // entrypoint-only warning — only one diagnostic surfaces.
+        let p = parse_module("@lint_off();\n");
+        assert_eq!(p.diagnostics.len(), 1);
+        assert_eq!(p.diagnostics[0].rule, "lint-pragma-outside-entrypoint");
     }
 }

@@ -299,6 +299,11 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
         "flag a `@lint_on(\"…\")` / `@lint_off(\"…\")` pair that names the same rule in the same module \
          — `@lint_off` wins; the other pragma is dead",
     ),
+    rule(
+        "lint-pragma-outside-entrypoint",
+        "flag a `@lint_off(\"…\")` / `@lint_on(\"…\")` pragma in a non-entrypoint module — \
+         project-wide lint policy belongs in `project.gcl`; auto-fix (P40.6) moves the pragma there",
+    ),
     advisory_rule(
         "no-breakpoint",
         "warn on `breakpoint;` left in committed code — pauses the GreyCat worker for \

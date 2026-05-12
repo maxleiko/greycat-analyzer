@@ -63,17 +63,6 @@ pub struct ModuleAnalysis {
     /// and is consulted by the formatter when this module is being
     /// re-rendered.
     pub directives: Directives,
-    // P40.1
-    /// Rules this module has explicitly enabled via `@lint_on("…")`
-    /// pragmas at module head. Only applied to this module's
-    /// diagnostics (use `ProjectAnalysis::enabled_rules` for the
-    /// project-wide cross-section sourced from the entrypoint).
-    pub pragma_enabled_rules: FxHashSet<String>,
-    // P40.1
-    /// Rules this module has explicitly disabled via `@lint_off("…")`
-    /// pragmas at module head. Module-local; entrypoint pragmas
-    /// populate `ProjectAnalysis::disabled_rules` instead.
-    pub pragma_disabled_rules: FxHashSet<String>,
 }
 
 // P14.5
@@ -369,22 +358,23 @@ impl ProjectAnalysis {
         // project index, not the type table.
         self.stage_compute_qualified_refs(manager);
 
-        // P40.1 — apply project-wide and per-module rule policy
-        // (`disabled_rules` + each module's `pragma_disabled_rules`)
+        // P40.1 — apply project-wide rule policy (`disabled_rules`,
+        // sourced from CLI `--off` + the entrypoint's `@lint_off(...)`)
         // at the very end, after every emission site has settled.
         // Earlier filtering would be undone by
         // `stage_compute_qualified_refs`'s `unused-decl` re-emission.
+        // P40.5 — module-level pragmas no longer apply locally; they
+        // emit `lint-pragma-outside-entrypoint` instead. So this sweep
+        // only consults the project-wide set.
         self.apply_rule_policy(None);
     }
 
-    // P40.1
-    /// Drop every diagnostic whose rule is in
-    /// `self.disabled_rules` (project-wide policy: CLI `--off` +
-    /// entrypoint `@lint_off(...)`) or in the module's own
-    /// `pragma_disabled_rules` (`@lint_off(...)` declared in that
-    /// module). Runs at the tail of `analyze_staged` and `invalidate`
-    /// — the single source of truth for the disable-side of the
-    /// precedence stack.
+    // P40.1 + P40.5
+    /// Drop every diagnostic whose rule is in `self.disabled_rules`
+    /// (project-wide policy: CLI `--off` + the entrypoint's
+    /// `@lint_off(...)`). Runs at the tail of `analyze_staged` and
+    /// `invalidate` — the single source of truth for the disable
+    /// side of the precedence stack.
     ///
     /// `restrict = Some(set)` limits the sweep to the listed URIs
     /// (matches the invalidate path); `None` sweeps every cached
@@ -397,10 +387,7 @@ impl ProjectAnalysis {
             {
                 continue;
             }
-            let module_disabled = &module.pragma_disabled_rules;
-            module
-                .lints
-                .retain(|l| !disabled.contains(l.rule) && !module_disabled.contains(l.rule));
+            module.lints.retain(|l| !disabled.contains(l.rule));
         }
     }
 
@@ -444,20 +431,26 @@ impl ProjectAnalysis {
         // boundaries. `Tree::clone` is reference-counted internally,
         // so the only real allocations here are the text + lib
         // strings — both bounded by total source size.
+        // P40.5 — capture the entrypoint URI now so the per-module
+        // pragma walker can flip behavior when it's NOT the entrypoint.
+        let entrypoint_uri: Option<Uri> = manager.entrypoint_uri().cloned();
         let docs: Vec<(
             Uri,
             String,
             String,
             greycat_analyzer_syntax::tree_sitter::Tree,
+            bool,
         )> = manager
             .iter()
             .map(|(uri, cell)| {
                 let doc = cell.borrow();
+                let is_entry = entrypoint_uri.as_ref() == Some(uri);
                 (
                     uri.clone(),
                     doc.text.clone(),
                     doc.lib.clone(),
                     doc.tree.clone(),
+                    is_entry,
                 )
             })
             .collect();
@@ -471,7 +464,7 @@ impl ProjectAnalysis {
             Duration,
             Directives,
             crate::pragmas::LintPragmas,
-        )> = crate::parallel::par_map(docs, |(uri, text, lib, tree)| {
+        )> = crate::parallel::par_map(docs, |(uri, text, lib, tree, is_entry)| {
             let lower_start = Instant::now();
             // P35.1 — pass the real module name (filename minus
             // `.gcl`) so the well-known recognizer can match
@@ -483,10 +476,10 @@ impl ProjectAnalysis {
             let hir = lower_module(&text, module_name, lib.as_str(), tree.root_node());
             let lower_took = lower_start.elapsed();
             let directives = crate::directives::parse_directives(&text, tree.root_node());
-            // P40.1 — walk `@lint_off` / `@lint_on` annotations on the
-            // same CST. The caller (`analyze_staged`) decides
-            // project-wide vs. module-scope using `manager.entrypoint_uri()`.
-            let pragmas = crate::pragmas::parse_lint_pragmas(&text, tree.root_node());
+            // P40.1 + P40.5 — walk `@lint_off` / `@lint_on` annotations.
+            // Entrypoint: collect rules + validate. Other modules: emit
+            // `lint-pragma-outside-entrypoint` and discard the rules.
+            let pragmas = crate::pragmas::parse_lint_pragmas(&text, tree.root_node(), is_entry);
             (uri, hir, lib, lower_took, directives, pragmas)
         });
 
@@ -1102,9 +1095,6 @@ impl ProjectAnalysis {
             lints: Vec<LintDiagnostic>,
             resolve_took: Duration,
             lint_took: Duration,
-            // P40.1
-            pragma_enabled_rules: FxHashSet<String>,
-            pragma_disabled_rules: FxHashSet<String>,
         }
 
         let pass_a_run = |(uri, hir, lib, lower_took, mut directives, mut pragmas): (
@@ -1146,8 +1136,6 @@ impl ProjectAnalysis {
                 lints,
                 resolve_took,
                 lint_took,
-                pragma_enabled_rules: pragmas.on,
-                pragma_disabled_rules: pragmas.off,
             }
         };
 
@@ -1184,8 +1172,6 @@ impl ProjectAnalysis {
                     lib: p.lib,
                     timings,
                     directives: p.directives,
-                    pragma_enabled_rules: p.pragma_enabled_rules,
-                    pragma_disabled_rules: p.pragma_disabled_rules,
                 },
             );
         }
@@ -1749,11 +1735,15 @@ impl ProjectAnalysis {
                 &doc.text,
                 doc.root_node(),
             ));
-            // P40.1 — re-parse the module's `@lint_off` / `@lint_on`
-            // pragmas on every invalidate so edits to them take effect.
+            // P40.1 + P40.5 — re-parse the module's `@lint_off` /
+            // `@lint_on` pragmas on every invalidate. Pass `is_entrypoint`
+            // so the walker emits `lint-pragma-outside-entrypoint` when
+            // pragmas show up in non-entrypoint modules.
+            let is_entry = manager.entrypoint_uri() == Some(uri);
             changed_pragmas = Some(crate::pragmas::parse_lint_pragmas(
                 &doc.text,
                 doc.root_node(),
+                is_entry,
             ));
             hir
         });
@@ -1848,6 +1838,14 @@ impl ProjectAnalysis {
         let mut directives = changed_directives.unwrap_or_default();
         let bypass = self.bypass_suppressions;
         let mut lints = std::mem::take(&mut directives.diagnostics);
+        // P40.3 + P40.5 — seed pragma-walker diagnostics
+        // (`unknown-suppression-rule`, `empty-suppression`,
+        // `conflicting-lint-pragma` for the entrypoint;
+        // `lint-pragma-outside-entrypoint` for other modules) into
+        // the lints stream just like `stage_per_module_analysis` does.
+        if let Some(pragmas) = changed_pragmas.as_mut() {
+            lints.append(&mut pragmas.diagnostics);
+        }
         lints.extend(run_lints_with_directives(
             &hir,
             &resolutions,
@@ -1865,14 +1863,6 @@ impl ProjectAnalysis {
                 lib: changed_lib.unwrap_or_else(|| "project".to_string()),
                 timings,
                 directives,
-                pragma_enabled_rules: changed_pragmas
-                    .as_ref()
-                    .map(|p| p.on.clone())
-                    .unwrap_or_default(),
-                pragma_disabled_rules: changed_pragmas
-                    .as_ref()
-                    .map(|p| p.off.clone())
-                    .unwrap_or_default(),
             },
         );
         // P40.1 — re-fold the entrypoint's pragmas if THIS invalidation
@@ -2162,14 +2152,12 @@ fn run_typed_lints_for_module(
     enabled_rules: &FxHashSet<String>,
     doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
 ) {
-    // P40.1 — a rule fires if any of the project-wide opt-in surfaces
-    // (CLI `--on`, entrypoint `@lint_on`) OR this module's own
-    // `@lint_on` enables it. Reads happen inside the body (`module`
-    // is mutably borrowed for `lints` further down, so we capture the
-    // pragma sets up-front through immutable field accesses before
-    // any `&mut module.lints` borrow exists).
-    let no_breakpoint_on = enabled_rules.contains("no-breakpoint")
-        || module.pragma_enabled_rules.contains("no-breakpoint");
+    // P40.1 + P40.5 — a rule fires if any project-wide opt-in surface
+    // (CLI `--on`, entrypoint `@lint_on`) enables it. Module-scope
+    // pragmas no longer apply: P40.5 rejects them as
+    // `lint-pragma-outside-entrypoint`. So the gate is just the
+    // project-wide set.
+    let no_breakpoint_on = enabled_rules.contains("no-breakpoint");
     module.lints.retain(|l| {
         !matches!(
             l.rule,

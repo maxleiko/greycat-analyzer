@@ -2125,8 +2125,6 @@ pub fn inlay_hints(
         lib: lib.to_string(),
         timings: Default::default(),
         directives: greycat_analyzer_analysis::directives::Directives::default(),
-        pragma_enabled_rules: Default::default(),
-        pragma_disabled_rules: Default::default(),
     };
     inlay_hints_with_project(&module, &arena, text, range)
 }

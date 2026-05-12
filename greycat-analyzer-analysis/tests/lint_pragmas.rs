@@ -121,21 +121,34 @@ fn entrypoint_lint_on_enables_default_off_rule_project_wide() {
     );
 }
 
+// P40.5 — module-scope `@lint_on` is rejected: it emits
+// `lint-pragma-outside-entrypoint` and does NOT enable the rule.
 #[test]
-fn module_lint_on_only_affects_that_module() {
+fn module_lint_on_is_rejected_with_outside_entrypoint_warning() {
     let entry = "fn entry() { breakpoint; }\n";
     let other = "@lint_on(\"no-breakpoint\");\nfn other() { breakpoint; }\n";
     let (entry_uri, other_uri, pa) = analyze_two_modules(entry, other);
+
+    // Entrypoint never enabled the rule, so no warning there.
     assert_eq!(
         lints_for_rule(&pa, &entry_uri, "no-breakpoint"),
         0,
         "entrypoint without @lint_on must not surface no-breakpoint: {:?}",
         pa.module(&entry_uri).unwrap().lints
     );
+    // The other module's @lint_on was rejected — the rule didn't fire
+    // there either.
     assert_eq!(
         lints_for_rule(&pa, &other_uri, "no-breakpoint"),
+        0,
+        "module-scope @lint_on must not enable the rule: {:?}",
+        pa.module(&other_uri).unwrap().lints
+    );
+    // And the rejection itself surfaces as a warning.
+    assert_eq!(
+        lints_for_rule(&pa, &other_uri, "lint-pragma-outside-entrypoint"),
         1,
-        "module-scope @lint_on should surface no-breakpoint there: {:?}",
+        "module-scope @lint_on must surface lint-pragma-outside-entrypoint: {:?}",
         pa.module(&other_uri).unwrap().lints
     );
 }
@@ -159,21 +172,33 @@ fn entrypoint_lint_off_silences_project_wide() {
     );
 }
 
+// P40.5 — module-scope `@lint_off` is rejected: it emits
+// `lint-pragma-outside-entrypoint` and does NOT silence the rule.
 #[test]
-fn module_lint_off_only_affects_that_module() {
+fn module_lint_off_is_rejected_with_outside_entrypoint_warning() {
     let entry = "private fn entry_unused() {}\n";
     let other = "@lint_off(\"unused-decl\");\nprivate fn other_unused() {}\n";
     let (entry_uri, other_uri, pa) = analyze_two_modules(entry, other);
+
     assert_eq!(
         lints_for_rule(&pa, &entry_uri, "unused-decl"),
         1,
         "entrypoint should still surface unused-decl: {:?}",
         pa.module(&entry_uri).unwrap().lints
     );
+    // The other module's @lint_off was rejected — unused-decl still
+    // fires there.
     assert_eq!(
         lints_for_rule(&pa, &other_uri, "unused-decl"),
-        0,
-        "module-scope @lint_off should silence locally: {:?}",
+        1,
+        "module-scope @lint_off must not silence: {:?}",
+        pa.module(&other_uri).unwrap().lints
+    );
+    // And the rejection itself surfaces.
+    assert_eq!(
+        lints_for_rule(&pa, &other_uri, "lint-pragma-outside-entrypoint"),
+        1,
+        "module-scope @lint_off must surface lint-pragma-outside-entrypoint: {:?}",
         pa.module(&other_uri).unwrap().lints
     );
 }
