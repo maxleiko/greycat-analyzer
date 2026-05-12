@@ -43,7 +43,7 @@ impl Default for FmtOptions {
 }
 
 /// Format `source` and return the canonical text under the default
-/// [`FmtOptions`], overlaid with whatever `@format_*` pragmas the source
+/// [`FmtOptions`], overlaid with whatever `@fmt_*` pragmas the source
 /// carries.
 pub fn format(source: &str) -> String {
     let opts = parse_pragma_options(source, FmtOptions::default());
@@ -92,10 +92,13 @@ pub fn format_tree_with(source: &str, root: Node<'_>, opts: FmtOptions) -> Strin
     render::render(&doc, &opts)
 }
 
-/// Parse `@format_line_width(N)` / `@format_indent(N)` /
-/// `@format_eol_last(bool)` pragmas off the source's mod_pragma chain
+/// Parse `@fmt_line_width(N)` / `@fmt_indent(N)` /
+/// `@fmt_eol_last(bool)` pragmas off the source's mod_pragma chain
 /// and overlay them on `defaults`. Mirrors the TS reference at
-/// `parser/cst/cst_format.ts:138-172`.
+/// `parser/cst/cst_format.ts:138-172` (the TS port still uses
+/// `@format_*`; the Rust port normalized to `@fmt_*` in P39.2 so all
+/// formatter-touching pragmas share one prefix with the
+/// `// gcl-fmt-*` comment-directive family).
 pub fn parse_pragma_options(source: &str, mut defaults: FmtOptions) -> FmtOptions {
     let tree = greycat_analyzer_syntax::parse(source);
     let root = tree.root_node();
@@ -128,17 +131,17 @@ pub fn parse_pragma_options(source: &str, mut defaults: FmtOptions) -> FmtOption
             let Some(arg) = arg else { continue };
             let arg_text = source[arg.byte_range()].trim();
             match name {
-                "format_line_width" => {
+                "fmt_line_width" => {
                     if let Ok(n) = arg_text.parse::<usize>() {
                         defaults.line_width = n;
                     }
                 }
-                "format_indent" => {
+                "fmt_indent" => {
                     if let Ok(n) = arg_text.parse::<usize>() {
                         defaults.indent = n;
                     }
                 }
-                "format_eol_last" => match arg_text {
+                "fmt_eol_last" => match arg_text {
                     "true" => defaults.eol_last = true,
                     "false" => defaults.eol_last = false,
                     _ => {}
@@ -212,28 +215,28 @@ type Foo {
 
     #[test]
     fn pragma_indent_overrides_default() {
-        let src = "@format_indent(2);\nfn f() { var x = 1; }\n";
+        let src = "@fmt_indent(2);\nfn f() { var x = 1; }\n";
         let opts = parse_pragma_options(src, FmtOptions::default());
         assert_eq!(opts.indent, 2);
     }
 
     #[test]
     fn pragma_line_width_overrides_default() {
-        let src = "@format_line_width(40);\nfn f() {}\n";
+        let src = "@fmt_line_width(40);\nfn f() {}\n";
         let opts = parse_pragma_options(src, FmtOptions::default());
         assert_eq!(opts.line_width, 40);
     }
 
     #[test]
     fn pragma_eol_last_overrides_default() {
-        let src = "@format_eol_last(true);\nfn f() {}\n";
+        let src = "@fmt_eol_last(true);\nfn f() {}\n";
         let opts = parse_pragma_options(src, FmtOptions::default());
         assert!(opts.eol_last);
     }
 
     #[test]
     fn pragma_line_width_drives_break_decision() {
-        let src = "@format_line_width(5);\nfn long_name(a: int, b: int) {}\n";
+        let src = "@fmt_line_width(5);\nfn long_name(a: int, b: int) {}\n";
         let out = format(src);
         // Width=5 forces every Group to break; fn_params must split.
         assert!(
@@ -289,7 +292,7 @@ fn normal(a: int): int { return a; }
 
     #[test]
     fn pragma_indent_drives_indent_step() {
-        let src = "@format_indent(2);\ntype Foo {\n  a: int;\n}\n";
+        let src = "@fmt_indent(2);\ntype Foo {\n  a: int;\n}\n";
         let out = format(src);
         assert!(
             out.contains("\n  a: int;"),
