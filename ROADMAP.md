@@ -55,8 +55,8 @@ This is the long-arc plan for porting the [GreyCat](https://greycat.io) language
 - [Phase 35 — Decl-handle type identity](#phase-35--decl-handle-type-identity-1-2-weeks)
 - [Phase 36 — Complete decl-handle identity migration](#phase-36--complete-decl-handle-identity-migration-2-3-weeks)
 - [Phase 37 — `breakpoint` keyword end-to-end](#phase-37--breakpoint-keyword-end-to-end-2-3-days)
-- [Phase 38 — Directive vocabulary normalization (off/on suffix)](#phase-38--directive-vocabulary-normalization-offon-suffix-1-2-days)
-- [Phase 39 — Project-pragma lint / fmt control (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`)](#phase-39--project-pragma-lint--fmt-control-lint_off--lint_on--fmt_off--fmt_on-2-3-days)
+- [Phase 39 — Directive vocabulary normalization (off/on suffix)](#phase-39--directive-vocabulary-normalization-offon-suffix-1-2-days)
+- [Phase 40 — Project-pragma lint / fmt control (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`)](#phase-40--project-pragma-lint--fmt-control-lint_off--lint_on--fmt_off--fmt_on-2-3-days)
 
 ### Other sections
 
@@ -1301,9 +1301,9 @@ The chunks below group these by file. Each match arm typically needs *either* a 
 
 ---
 
-### Phase 38 — Directive vocabulary normalization (off/on suffix) (~1-2 days)
+### Phase 39 — Directive vocabulary normalization (off/on suffix) (~1-2 days)
 
-**Goal:** unify every lint/fmt scope-gating mechanism around a single rule: **`off` / `on` is always the trailing verb**, with the scope name slotted between the namespace and the action. The current mix (`gcl-lint-off-next`, `gcl-lint-off-file`, `--disable`, `--enable`) is two taxonomies talking past each other; collapse them into one so the line directives, CLI flags, and (in P39) project pragmas all read identically.
+**Goal:** unify every lint/fmt scope-gating mechanism around a single rule: **`off` / `on` is always the trailing verb**, with the scope name slotted between the namespace and the action. The current mix (`gcl-lint-off-next`, `gcl-lint-off-file`, `--disable`, `--enable`) is two taxonomies talking past each other; collapse them into one so the line directives, CLI flags, and (in P40) project pragmas all read identically.
 
 **Trigger:** user-reported on 2026-05-12 while landing the `no-breakpoint` lint. The `--enable` / `--disable` CLI flags from P37.7 reuse one vocabulary; the existing `// gcl-lint-off-next` / `gcl-lint-off-file` directives reuse another. Two right answers is one too many.
 
@@ -1316,8 +1316,13 @@ The chunks below group these by file. Each match arm typically needs *either* a 
 | `// gcl-lint-off-next <rules>` | `// gcl-lint-next-off <rules>` |
 | `// gcl-lint-off-file <rules>` | `// gcl-lint-file-off <rules>` |
 | `// gcl-fmt-off-file` | `// gcl-fmt-file-off` |
+| `@format_line_width(N)` | `@fmt_line_width(N)` |
+| `@format_indent(N)` | `@fmt_indent(N)` |
+| `@format_eol_last(bool)` | `@fmt_eol_last(bool)` |
 | `lint --disable=<rule>` | `lint --off=<rule>` |
 | `lint --enable=<rule>` | `lint --on=<rule>` |
+
+The `@format_*` → `@fmt_*` rename aligns the existing formatter-config pragmas with the `// gcl-fmt-*` comment directive family and with the upcoming P40 `@fmt_off` / `@fmt_on` rule pragmas — one namespace prefix (`fmt`) for everything the formatter cares about.
 
 Unchanged (already obey the rule): `// gcl-lint-off` / `// gcl-lint-on` / `// gcl-fmt-off` / `// gcl-fmt-on` / `// gcl-fmt-skip` (the `skip` family is a separate action, not an off/on toggle, and stays as-is).
 
@@ -1327,6 +1332,7 @@ Unchanged (already obey the rule): `// gcl-lint-off` / `// gcl-lint-on` / `// gc
 |---|---|---|
 | Directive parser (lint) | [`greycat-analyzer-analysis/src/directives.rs`](../greycat-analyzer-analysis/src/directives.rs) | The `match` at line 204-211 that recognizes `gcl-lint-off-next` / `gcl-lint-off-file` literals — flip to the new spelling. `Directive::LintOffNext` / `LintOffFile` variant names stay (they're internal; the externally-visible label is the only thing that changes). |
 | Directive parser (fmt) | [`greycat-analyzer-fmt/src/directives.rs`](../greycat-analyzer-fmt/src/directives.rs) | Same — flip `gcl-fmt-off-file` to `gcl-fmt-file-off`. |
+| Fmt config pragmas | [`greycat-analyzer-fmt/src/lib.rs`](../greycat-analyzer-fmt/src/lib.rs) (`parse_pragma_options`) | Rename the three `format_*` match arms to `fmt_*`. Inline unit tests in the same file flip their `@format_*` source snippets to `@fmt_*` in lockstep. |
 | Quickfix dispatch | [`greycat-analyzer-analysis/src/quickfix.rs`](../greycat-analyzer-analysis/src/quickfix.rs) | Two literal sites (the match arm and the suppression-comment delete logic). |
 | LSP completion | [`greycat-analyzer-server/src/capabilities.rs`](../greycat-analyzer-server/src/capabilities.rs) | The `// gcl-` directive completion list: change the four affected labels + their `insert_text`. The known-directive recognizer at line 3284 also needs the new spellings. |
 | CLI lint flags | [`greycat-analyzer/src/cmd/lint.rs`](../greycat-analyzer/src/cmd/lint.rs) | Rename `disable` → `off`, `enable` → `on` (both the clap field name and the `long` attribute). Help text, error messages (`error: unknown lint rule \`X\` in --off`), and the `--list-rules` footer (`enable via \`--on=<rule>\``) all follow. |
@@ -1335,24 +1341,25 @@ Unchanged (already obey the rule): `// gcl-lint-off` / `// gcl-lint-on` / `// gc
 
 **Chunks:**
 
-- [ ] **38.1 Rename comment directives (lint + fmt)** (S) — flip the literal strings in both `directives.rs` files plus the quickfix dispatch and LSP completion list. Internal Rust `Directive::*` variant names stay; only the externally-visible label changes. Inline tests in `directives.rs` update in the same diff. After: `cargo test --workspace` clean.
-- [ ] **38.2 Rename CLI flags `--disable` / `--enable` → `--off` / `--on`** (S) — rename the clap fields, the help text, the error messages, and the `--list-rules` footer. Two call sites in [`lint.rs`](../greycat-analyzer/src/cmd/lint.rs) for each flag (initial analysis + post-fix re-hydration at line ~460). After: `cargo run -p greycat-analyzer -- lint project.gcl --on=no-breakpoint` works; `--enable=...` errors at the clap layer.
-- [ ] **38.3 README + CLAUDE.md sweep** (XS) — two CLI examples in [`README.md`](../README.md) using `--disable`; any directive-vocab prose using the old long-form names. Update inline.
+- [ ] **39.1 Rename comment directives (lint + fmt)** (S) — flip the literal strings in both `directives.rs` files plus the quickfix dispatch and LSP completion list. Internal Rust `Directive::*` variant names stay; only the externally-visible label changes. Inline tests in `directives.rs` update in the same diff. After: `cargo test --workspace` clean.
+- [ ] **39.2 Rename `@format_*` fmt-config pragmas to `@fmt_*`** (XS) — three match arms in [`greycat-analyzer-fmt/src/lib.rs`](../greycat-analyzer-fmt/src/lib.rs) (`parse_pragma_options`) flip from `format_line_width` / `format_indent` / `format_eol_last` to `fmt_line_width` / `fmt_indent` / `fmt_eol_last`. Inline test fixtures in the same file (six call sites using `@format_*` source snippets) flip in lockstep. Doc comment on `parse_pragma_options` updates to reflect the new names. After: `cargo test -p greycat-analyzer-fmt` clean.
+- [ ] **39.3 Rename CLI flags `--disable` / `--enable` → `--off` / `--on`** (S) — rename the clap fields, the help text, the error messages, and the `--list-rules` footer. Two call sites in [`lint.rs`](../greycat-analyzer/src/cmd/lint.rs) for each flag (initial analysis + post-fix re-hydration at line ~460). After: `cargo run -p greycat-analyzer -- lint project.gcl --on=no-breakpoint` works; `--enable=...` errors at the clap layer.
+- [ ] **39.4 README + CLAUDE.md sweep** (XS) — two CLI examples in [`README.md`](../README.md) using `--disable`; any directive-vocab prose using the old long-form names; any `@format_*` examples. Update inline.
 
-**M38:** `git grep -E "gcl-(lint|fmt)-off-(next|file)|--disable|--enable" -- '*.rs' '*.gcl' '*.md' '*.json'` returns zero hits (modulo this very phase entry, which describes the rename). Tests still green. `cargo run -p greycat-analyzer -- lint --list-rules` prints `enable via \`--on=<rule>\`` in the footer. P37's `--enable=no-breakpoint` smoke flow now reads `--on=no-breakpoint`.
+**M39:** `git grep -E "gcl-(lint|fmt)-off-(next|file)|@format_(line_width|indent|eol_last)|--disable|--enable" -- '*.rs' '*.gcl' '*.json' README.md '.claude/**'` returns zero hits (the `ROADMAP.md` scope is intentionally excluded — P21's historical entries record the names as they were when that phase shipped and shouldn't be rewritten per the doc's own rules at §9). Tests still green. `cargo run -p greycat-analyzer -- lint --list-rules` prints `enable via \`--on=<rule>\`` in the footer. P37's `--enable=no-breakpoint` smoke flow now reads `--on=no-breakpoint`.
 
 **Out of scope:**
-- Adding the project pragmas (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`) — those are P39. P38 is *only* the rename of existing surface so the pragma vocabulary lands on a clean foundation.
+- Adding the project pragmas (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`) — those are P40. P39 is *only* the rename of existing surface so the pragma vocabulary lands on a clean foundation.
 - Renaming internal Rust identifiers (`Directive::LintOffNext`, `analysis.enabled_rules`, etc.). The externally-visible vocabulary is what's getting normalized; the in-code names can churn separately if they ever feel misleading.
 - Touching `// gcl-fmt-skip` — `skip` is a different action verb (one-shot suppression of a specific node, not a scope toggle), and forcing it into the off/on grammar would break the action's meaning.
 
 ---
 
-### Phase 39 — Project-pragma lint / fmt control (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`) (~2-3 days)
+### Phase 40 — Project-pragma lint / fmt control (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`) (~2-3 days)
 
 **Goal:** make lint / fmt rule enforcement *declarative at the project level* via four annotation-shaped pragmas at the top of `project.gcl` (or any module), so CI-relevant decisions ("this project enables `no-breakpoint`," "this project silences `unused-decl` everywhere") live in source instead of in a CLI invocation flag that has to be remembered.
 
-**Trigger:** user proposal on 2026-05-12 after locking the P38 vocabulary. The CLI's `--off` / `--on` is per-invocation; a project pragma is per-project, version-controlled, and discoverable to anyone opening the project.
+**Trigger:** user proposal on 2026-05-12 after locking the P39 vocabulary. The CLI's `--off` / `--on` is per-invocation; a project pragma is per-project, version-controlled, and discoverable to anyone opening the project.
 
 **Shape (locked):**
 
@@ -1383,7 +1390,7 @@ Read bottom-up: start from the default, layer module pragmas, then project pragm
 
 **Grammar / parser surface:**
 
-`@lint_off(...)` and friends are already parseable as `annotation` nodes — the existing pragma machinery (`@library`, `@include`, `@format_*`) handles `@name("string", "string", ...)`. The grammar **does not** need a new rule. What changes is:
+`@lint_off(...)` and friends are already parseable as `annotation` nodes — the existing pragma machinery (`@library`, `@include`, `@fmt_*` after P39.2) handles `@name("string", "string", ...)`. The grammar **does not** need a new rule. What changes is:
 
 - The pragma *recognizer* in [`greycat-analyzer-analysis/src/`](../greycat-analyzer-analysis/src/) — gain four new pragma-name match arms alongside `library` / `include`.
 - The pragma *consumer* — wires the recognized name+rules into the analyzer's `enabled_rules` / a new `disabled_rules` set, and into the formatter's directive state.
@@ -1409,14 +1416,14 @@ Read bottom-up: start from the default, layer module pragmas, then project pragm
 
 **Chunks:**
 
-- [ ] **39.1 Lint pragma recognizer + `disabled_rules` field** (M) — walk top-level `mod_pragma` nodes in [`project.rs`](../greycat-analyzer-analysis/src/project.rs); add `@lint_off` / `@lint_on` arms; populate `ProjectAnalysis::enabled_rules` / new `disabled_rules`. Project vs. module scope via `manager.entrypoint_uri()` comparison. Unit tests: `@lint_off("unused-decl")` in entrypoint silences project-wide; in a non-entrypoint module silences just that module.
-- [ ] **39.2 Fmt pragma recognizer** (S) — same shape as 39.1 in [`greycat-analyzer-fmt/src/directives.rs`](../greycat-analyzer-fmt/src/directives.rs). Reuse the lint recognizer's pragma-walking helper if 39.1 extracts it.
-- [ ] **39.3 Diagnostic validation** (S) — `unknown-suppression-rule` on bad rule names in pragma args; new `conflicting-lint-pragma` rule in `LINT_RULES`. Reuse the existing diagnostic surface — no new severity / tag needed.
-- [ ] **39.4 LSP auto-apply on workspace load** (S) — `Backend::load_workspace` already builds the project graph; just call into the new recognizer before the first `run_typed_lints` pass. Smoke test in [`greycat-analyzer-server/tests/`](../greycat-analyzer-server/tests/): a workspace with `@lint_on("no-breakpoint")` in `project.gcl` surfaces the diagnostic in `textDocument/publishDiagnostics` without any CLI flag.
-- [ ] **39.5 CLI flag layering** (S) — `--off` / `--on` populate `enabled_rules` / `disabled_rules` *after* the pragma walk, so flags always win against pragmas. Smoke test: `@lint_on("no-breakpoint")` in project.gcl + `lint --off=no-breakpoint` → silenced.
-- [ ] **39.6 Docs + checklist update** (XS) — `README.md` gets a "Project-wide lint policy" section; CLAUDE.md's lint-rule and grammar-keyword checklists gain a "pragma recognizer" row if pragma support is rule-specific (probably not — the recognizer is rule-agnostic, so no per-rule churn).
+- [ ] **40.1 Lint pragma recognizer + `disabled_rules` field** (M) — walk top-level `mod_pragma` nodes in [`project.rs`](../greycat-analyzer-analysis/src/project.rs); add `@lint_off` / `@lint_on` arms; populate `ProjectAnalysis::enabled_rules` / new `disabled_rules`. Project vs. module scope via `manager.entrypoint_uri()` comparison. Unit tests: `@lint_off("unused-decl")` in entrypoint silences project-wide; in a non-entrypoint module silences just that module.
+- [ ] **40.2 Fmt pragma recognizer** (S) — same shape as 40.1 in [`greycat-analyzer-fmt/src/directives.rs`](../greycat-analyzer-fmt/src/directives.rs). Reuse the lint recognizer's pragma-walking helper if 40.1 extracts it.
+- [ ] **40.3 Diagnostic validation** (S) — `unknown-suppression-rule` on bad rule names in pragma args; new `conflicting-lint-pragma` rule in `LINT_RULES`. Reuse the existing diagnostic surface — no new severity / tag needed.
+- [ ] **40.4 LSP auto-apply on workspace load** (S) — `Backend::load_workspace` already builds the project graph; just call into the new recognizer before the first `run_typed_lints` pass. Smoke test in [`greycat-analyzer-server/tests/`](../greycat-analyzer-server/tests/): a workspace with `@lint_on("no-breakpoint")` in `project.gcl` surfaces the diagnostic in `textDocument/publishDiagnostics` without any CLI flag.
+- [ ] **40.5 CLI flag layering** (S) — `--off` / `--on` populate `enabled_rules` / `disabled_rules` *after* the pragma walk, so flags always win against pragmas. Smoke test: `@lint_on("no-breakpoint")` in project.gcl + `lint --off=no-breakpoint` → silenced.
+- [ ] **40.6 Docs + checklist update** (XS) — `README.md` gets a "Project-wide lint policy" section; CLAUDE.md's lint-rule and grammar-keyword checklists gain a "pragma recognizer" row if pragma support is rule-specific (probably not — the recognizer is rule-agnostic, so no per-rule churn).
 
-**M39:** A `project.gcl` containing `@lint_on("no-breakpoint");` plus a `breakpoint;` somewhere in the closure produces one `no-breakpoint` Warning from a bare `lint project.gcl` invocation — no CLI flag needed. `@lint_off("unused-decl");` in `project.gcl` suppresses `unused-decl` project-wide on the same invocation. The LSP picks both up automatically on workspace load. `cargo test --workspace` + `cargo clippy --workspace --all-targets` clean.
+**M40:** A `project.gcl` containing `@lint_on("no-breakpoint");` plus a `breakpoint;` somewhere in the closure produces one `no-breakpoint` Warning from a bare `lint project.gcl` invocation — no CLI flag needed. `@lint_off("unused-decl");` in `project.gcl` suppresses `unused-decl` project-wide on the same invocation. The LSP picks both up automatically on workspace load. `cargo test --workspace` + `cargo clippy --workspace --all-targets` clean.
 
 **Out of scope:**
 - Pragmas modulating per-rule severity (`@lint_severity("no-breakpoint", "error")`). The default severity in `LINT_RULES` is canonical; if a project wants to escalate, the CI gate on the diagnostic count is the right knob.
