@@ -63,6 +63,17 @@ pub struct ModuleAnalysis {
     /// and is consulted by the formatter when this module is being
     /// re-rendered.
     pub directives: Directives,
+    // P40.1
+    /// Rules this module has explicitly enabled via `@lint_on("…")`
+    /// pragmas at module head. Only applied to this module's
+    /// diagnostics (use `ProjectAnalysis::enabled_rules` for the
+    /// project-wide cross-section sourced from the entrypoint).
+    pub pragma_enabled_rules: FxHashSet<String>,
+    // P40.1
+    /// Rules this module has explicitly disabled via `@lint_off("…")`
+    /// pragmas at module head. Module-local; entrypoint pragmas
+    /// populate `ProjectAnalysis::disabled_rules` instead.
+    pub pragma_disabled_rules: FxHashSet<String>,
 }
 
 // P14.5
@@ -131,9 +142,17 @@ pub struct ProjectAnalysis {
     /// Names of rules the caller has explicitly enabled. Only matters
     /// for rules that ship default-off (`default_enabled = false` in
     /// [`LINT_RULES`]); default-on rules are always active. Drives the
-    /// CLI's `--on=<rule>` flag and any future LSP / project-config
-    /// equivalent.
+    /// CLI's `--on=<rule>` flag, the entrypoint's `@lint_on("…")`
+    /// project pragmas (P40), and any future LSP config equivalent.
     pub enabled_rules: FxHashSet<String>,
+    // P40.1
+    /// Names of rules disabled project-wide. Populated by the
+    /// entrypoint's `@lint_off("…")` pragmas. `enabled_rules` and
+    /// `disabled_rules` together describe project-wide policy; when
+    /// both name the same rule, `disabled_rules` wins (explicit
+    /// silence beats explicit enable — matches the CLI precedent of
+    /// `--off=X --on=X` silencing X).
+    pub disabled_rules: FxHashSet<String>,
     modules: FxHashMap<Uri, ModuleAnalysis>,
     // P19.6
     /// Per-module signature-stage cache. Records what each
@@ -212,6 +231,7 @@ impl ProjectAnalysis {
             well_known: crate::well_known::WellKnown::new(),
             bypass_suppressions: false,
             enabled_rules: FxHashSet::default(),
+            disabled_rules: FxHashSet::default(),
             modules: FxHashMap::default(),
             sig_cache: FxHashMap::default(),
         }
@@ -308,6 +328,22 @@ impl ProjectAnalysis {
         // forward pass, no per-module dependency.
         let lowered = self.stage_lower(manager);
 
+        // P40.1 — fold the entrypoint's `@lint_off("…")` / `@lint_on("…")`
+        // pragmas into the project-wide policy. CLI flags (`--off` /
+        // `--on`) have already been merged into `enabled_rules` /
+        // `disabled_rules` before `analyze_staged` ran, so this is
+        // additive: pragmas widen the sets, CLI flags can also widen
+        // them, conflicts within one source aren't resolved here (P40.3
+        // adds `conflicting-lint-pragma`). Per-module pragmas in
+        // non-entrypoint modules land on `ModuleAnalysis` further down.
+        if let Some(entry_uri) = manager.entrypoint_uri()
+            && let Some((_, _, _, _, _, pragmas)) =
+                lowered.iter().find(|(uri, _, _, _, _, _)| uri == entry_uri)
+        {
+            self.disabled_rules.extend(pragmas.off.iter().cloned());
+            self.enabled_rules.extend(pragmas.on.iter().cloned());
+        }
+
         // S7-S11 (signatures) — lower every type's attr `TypeRef`s and
         // method return-`TypeRef`s into the shared arena project-wide,
         // populating `ProjectIndex::type_members.{attr_types,
@@ -332,6 +368,40 @@ impl ProjectAnalysis {
         // lint. Lives outside the 12 stages because it mutates the
         // project index, not the type table.
         self.stage_compute_qualified_refs(manager);
+
+        // P40.1 — apply project-wide and per-module rule policy
+        // (`disabled_rules` + each module's `pragma_disabled_rules`)
+        // at the very end, after every emission site has settled.
+        // Earlier filtering would be undone by
+        // `stage_compute_qualified_refs`'s `unused-decl` re-emission.
+        self.apply_rule_policy(None);
+    }
+
+    // P40.1
+    /// Drop every diagnostic whose rule is in
+    /// `self.disabled_rules` (project-wide policy: CLI `--off` +
+    /// entrypoint `@lint_off(...)`) or in the module's own
+    /// `pragma_disabled_rules` (`@lint_off(...)` declared in that
+    /// module). Runs at the tail of `analyze_staged` and `invalidate`
+    /// — the single source of truth for the disable-side of the
+    /// precedence stack.
+    ///
+    /// `restrict = Some(set)` limits the sweep to the listed URIs
+    /// (matches the invalidate path); `None` sweeps every cached
+    /// module.
+    fn apply_rule_policy(&mut self, restrict: Option<&FxHashSet<&str>>) {
+        let disabled = &self.disabled_rules;
+        for (uri, module) in &mut self.modules {
+            if let Some(set) = restrict
+                && !set.contains(uri.as_str())
+            {
+                continue;
+            }
+            let module_disabled = &module.pragma_disabled_rules;
+            module
+                .lints
+                .retain(|l| !disabled.contains(l.rule) && !module_disabled.contains(l.rule));
+        }
     }
 
     /// Reset every cached field so a `rebuild` / `analyze_staged`
@@ -355,7 +425,14 @@ impl ProjectAnalysis {
     fn stage_lower(
         &mut self,
         manager: &SourceManager,
-    ) -> Vec<(Uri, Hir, String, Duration, Directives)> {
+    ) -> Vec<(
+        Uri,
+        Hir,
+        String,
+        Duration,
+        Directives,
+        crate::pragmas::LintPragmas,
+    )> {
         // P27.1 — three phases. The middle one runs through the
         // `parallel` shim so native targets get rayon and wasm gets
         // a serial fallback; both branches live in `crate::parallel`.
@@ -387,27 +464,37 @@ impl ProjectAnalysis {
 
         // Phase B (parallel on native, serial on wasm): lower each
         // module + parse its directives. No shared mutable state.
-        let lowered: Vec<(Uri, Hir, String, Duration, Directives)> =
-            crate::parallel::par_map(docs, |(uri, text, lib, tree)| {
-                let lower_start = Instant::now();
-                // P35.1 — pass the real module name (filename minus
-                // `.gcl`) so the well-known recognizer can match
-                // `(lib, module, name)` triples. Default `"module"`
-                // only kicks in for URIs without a recognisable
-                // filename, which the recognizer ignores anyway.
-                let module_name = crate::stdlib::module_name_from_uri(&uri)
-                    .unwrap_or_else(|| "module".to_string());
-                let hir = lower_module(&text, module_name, lib.as_str(), tree.root_node());
-                let lower_took = lower_start.elapsed();
-                let directives = crate::directives::parse_directives(&text, tree.root_node());
-                (uri, hir, lib, lower_took, directives)
-            });
+        let lowered: Vec<(
+            Uri,
+            Hir,
+            String,
+            Duration,
+            Directives,
+            crate::pragmas::LintPragmas,
+        )> = crate::parallel::par_map(docs, |(uri, text, lib, tree)| {
+            let lower_start = Instant::now();
+            // P35.1 — pass the real module name (filename minus
+            // `.gcl`) so the well-known recognizer can match
+            // `(lib, module, name)` triples. Default `"module"`
+            // only kicks in for URIs without a recognisable
+            // filename, which the recognizer ignores anyway.
+            let module_name =
+                crate::stdlib::module_name_from_uri(&uri).unwrap_or_else(|| "module".to_string());
+            let hir = lower_module(&text, module_name, lib.as_str(), tree.root_node());
+            let lower_took = lower_start.elapsed();
+            let directives = crate::directives::parse_directives(&text, tree.root_node());
+            // P40.1 — walk `@lint_off` / `@lint_on` annotations on the
+            // same CST. The caller (`analyze_staged`) decides
+            // project-wide vs. module-scope using `manager.entrypoint_uri()`.
+            let pragmas = crate::pragmas::parse_lint_pragmas(&text, tree.root_node());
+            (uri, hir, lib, lower_took, directives, pragmas)
+        });
 
         // Phase C (serial): ingest into the project-wide index. This
         // mutates `self.index.symbols` etc., which is `!Send` on
         // purpose — it owns interner state that's amortised across
         // the whole project.
-        for (uri, hir, _lib, _lower_took, _directives) in &lowered {
+        for (uri, hir, _lib, _lower_took, _directives, _pragmas) in &lowered {
             self.index.ingest(uri, hir);
         }
         lowered
@@ -430,8 +517,18 @@ impl ProjectAnalysis {
     /// in the shared arena — directly comparable to anything else
     /// minted into the same arena. Generic params owned by the type
     /// being walked resolve to `GenericParam(T, owner=Type(name))`.
-    fn stage_lower_signatures(&mut self, lowered: &[(Uri, Hir, String, Duration, Directives)]) {
-        let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _, _)| (u, h)).collect();
+    fn stage_lower_signatures(
+        &mut self,
+        lowered: &[(
+            Uri,
+            Hir,
+            String,
+            Duration,
+            Directives,
+            crate::pragmas::LintPragmas,
+        )],
+    ) {
+        let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _, _, _)| (u, h)).collect();
         // P35.1 / P36.2 — populate decl_registry + well_known FIRST
         // so the signature-lowering pass below can mint handle-keyed
         // `Type(handle)` shapes (via `lower_type_ref_project`'s
@@ -966,7 +1063,17 @@ impl ProjectAnalysis {
     /// inside `Cx::visit_decl`. Subsequent extraction passes will split
     /// out S2-S6, S7-S11, and S12 — at which point this stage shrinks
     /// to a thin "wire it all together" call.
-    fn stage_per_module_analysis(&mut self, hirs: Vec<(Uri, Hir, String, Duration, Directives)>) {
+    fn stage_per_module_analysis(
+        &mut self,
+        hirs: Vec<(
+            Uri,
+            Hir,
+            String,
+            Duration,
+            Directives,
+            crate::pragmas::LintPragmas,
+        )>,
+    ) {
         let bypass = self.bypass_suppressions;
         let index = &self.index;
 
@@ -995,14 +1102,18 @@ impl ProjectAnalysis {
             lints: Vec<LintDiagnostic>,
             resolve_took: Duration,
             lint_took: Duration,
+            // P40.1
+            pragma_enabled_rules: FxHashSet<String>,
+            pragma_disabled_rules: FxHashSet<String>,
         }
 
-        let pass_a_run = |(uri, hir, lib, lower_took, mut directives): (
+        let pass_a_run = |(uri, hir, lib, lower_took, mut directives, pragmas): (
             Uri,
             Hir,
             String,
             Duration,
             Directives,
+            crate::pragmas::LintPragmas,
         )|
          -> PassAOut {
             let t0 = Instant::now();
@@ -1030,6 +1141,8 @@ impl ProjectAnalysis {
                 lints,
                 resolve_took,
                 lint_took,
+                pragma_enabled_rules: pragmas.on,
+                pragma_disabled_rules: pragmas.off,
             }
         };
 
@@ -1066,6 +1179,8 @@ impl ProjectAnalysis {
                     lib: p.lib,
                     timings,
                     directives: p.directives,
+                    pragma_enabled_rules: p.pragma_enabled_rules,
+                    pragma_disabled_rules: p.pragma_disabled_rules,
                 },
             );
         }
@@ -1615,6 +1730,7 @@ impl ProjectAnalysis {
         let mut lower_took = Duration::ZERO;
         let mut changed_lib: Option<String> = None;
         let mut changed_directives: Option<Directives> = None;
+        let mut changed_pragmas: Option<crate::pragmas::LintPragmas> = None;
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
             let start = Instant::now();
@@ -1625,6 +1741,12 @@ impl ProjectAnalysis {
             lower_took = start.elapsed();
             changed_lib = Some(doc.lib.clone());
             changed_directives = Some(crate::directives::parse_directives(
+                &doc.text,
+                doc.root_node(),
+            ));
+            // P40.1 — re-parse the module's `@lint_off` / `@lint_on`
+            // pragmas on every invalidate so edits to them take effect.
+            changed_pragmas = Some(crate::pragmas::parse_lint_pragmas(
                 &doc.text,
                 doc.root_node(),
             ));
@@ -1738,8 +1860,30 @@ impl ProjectAnalysis {
                 lib: changed_lib.unwrap_or_else(|| "project".to_string()),
                 timings,
                 directives,
+                pragma_enabled_rules: changed_pragmas
+                    .as_ref()
+                    .map(|p| p.on.clone())
+                    .unwrap_or_default(),
+                pragma_disabled_rules: changed_pragmas
+                    .as_ref()
+                    .map(|p| p.off.clone())
+                    .unwrap_or_default(),
             },
         );
+        // P40.1 — re-fold the entrypoint's pragmas if THIS invalidation
+        // hit the entrypoint, so a project-wide policy edit flows in
+        // immediately. The LSP path (the only `invalidate` caller)
+        // doesn't populate `enabled_rules` / `disabled_rules` from any
+        // other source, so wholesale replacement is sound. When LSP
+        // config eventually feeds these sets, a `Project::cli_enabled`
+        // sibling field will let the union be recomputed without
+        // losing external state — but that's not on the P40.1 path.
+        if manager.entrypoint_uri() == Some(uri)
+            && let Some(pragmas) = changed_pragmas
+        {
+            self.disabled_rules = pragmas.off;
+            self.enabled_rules = pragmas.on;
+        }
         // P22-P23 — passes 3.4 / 3.45 / 3.5 / 3.52 are gone; cross-
         // module typing happens inline in the analyzer's body walker.
         // Only the typed-lint pass and type-relation validation remain
@@ -1749,6 +1893,10 @@ impl ProjectAnalysis {
         self.run_typed_lints(manager, Some(&touched));
         self.validate_type_relations(Some(&touched));
         self.compute_qualified_refs(manager);
+        // P40.1 — same rule-policy sweep as `analyze_staged` does at
+        // the tail. Restricted to `touched` so the incremental cost
+        // stays per-edit.
+        self.apply_rule_policy(Some(&touched));
     }
 
     pub fn module(&self, uri: &Uri) -> Option<&ModuleAnalysis> {
@@ -2009,6 +2157,14 @@ fn run_typed_lints_for_module(
     enabled_rules: &FxHashSet<String>,
     doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
 ) {
+    // P40.1 — a rule fires if any of the project-wide opt-in surfaces
+    // (CLI `--on`, entrypoint `@lint_on`) OR this module's own
+    // `@lint_on` enables it. Reads happen inside the body (`module`
+    // is mutably borrowed for `lints` further down, so we capture the
+    // pragma sets up-front through immutable field accesses before
+    // any `&mut module.lints` borrow exists).
+    let no_breakpoint_on = enabled_rules.contains("no-breakpoint")
+        || module.pragma_enabled_rules.contains("no-breakpoint");
     module.lints.retain(|l| {
         !matches!(
             l.rule,
@@ -2041,11 +2197,10 @@ fn run_typed_lints_for_module(
             bypass,
             &mut module.lints,
         );
-        // P37.7 — advisory, default-off. Only runs when the caller
-        // explicitly enabled it (CLI `--on=no-breakpoint`); on a
-        // vanilla `lint` / `lint --fix` it never emits, so debug aids
-        // don't get silently deleted.
-        if enabled_rules.contains("no-breakpoint") {
+        // P37.7 + P40.1 — advisory, default-off. Runs when any opt-in
+        // surface (CLI `--on=no-breakpoint`, entrypoint `@lint_on(...)`,
+        // or this module's own `@lint_on(...)`) has enabled it.
+        if no_breakpoint_on {
             lint_no_breakpoint(
                 tree.root_node(),
                 &mut module.directives,
@@ -2096,6 +2251,14 @@ fn run_typed_lints_for_module(
     if !bypass {
         lint_unused_suppressions(&mut module.directives, &mut module.lints);
     }
+
+    // P40.1 — final project / module-pragma filter.
+    // P40.1 — the `disabled_rules` / `pragma_disabled_rules` filter
+    // doesn't live in this function. Subsequent passes
+    // (`stage_compute_qualified_refs`) re-emit lints, so the policy
+    // filter has to land in one place after every emission settles —
+    // see [`ProjectAnalysis::apply_rule_policy`], called at the tail
+    // of `analyze_staged` and `invalidate`.
 }
 
 /// the analyzer's per-module pass deferred. Reads only — never

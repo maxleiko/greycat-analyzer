@@ -24,6 +24,14 @@ use crate::{
 pub struct SourceManager {
     documents: FxHashMap<Uri, RefCell<Document>>,
     ctx: Arc<dyn Context>,
+    // P40.1
+    /// URI of the project's entrypoint (`project.gcl` at the project
+    /// root). Set by `load_project`, mirrors `LoadReport::entrypoint_uri`
+    /// so downstream consumers (the analyzer's pragma walker, in
+    /// particular) can distinguish the entrypoint from any other
+    /// reachable module without threading the report through every
+    /// call site.
+    entrypoint_uri: Option<Uri>,
 }
 
 impl SourceManager {
@@ -43,11 +51,20 @@ impl SourceManager {
         Self {
             documents: FxHashMap::default(),
             ctx,
+            entrypoint_uri: None,
         }
     }
 
     pub fn ctx(&self) -> &Arc<dyn Context> {
         &self.ctx
+    }
+
+    // P40.1
+    /// Entrypoint URI captured by the most recent `load_project` call,
+    /// or `None` if the manager was populated through `add` / `add_simple`
+    /// only (the LSP / test paths). Cheap accessor — `O(1)`.
+    pub fn entrypoint_uri(&self) -> Option<&Uri> {
+        self.entrypoint_uri.as_ref()
     }
 
     pub fn add(&mut self, doc: Document) {
@@ -138,6 +155,10 @@ impl SourceManager {
         // Load the project.gcl itself first.
         if let Some(uri) = self.load_file(project_filepath, "project", &mut visited, &mut report) {
             report.entrypoint_uri = Some(uri.clone());
+            // P40.1 — mirror into the manager so the analyzer's pragma
+            // walker can identify the entrypoint without threading the
+            // LoadReport through every call.
+            self.entrypoint_uri = Some(uri.clone());
             // Walk its mod_pragmas to find @library / @include.
             let desc = self.module_desc_for(&uri);
             self.process_includes(&project_dir, &desc, &mut visited, &mut report);

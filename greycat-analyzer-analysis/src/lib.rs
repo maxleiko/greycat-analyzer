@@ -44,6 +44,7 @@ pub mod directives;
 pub mod lint;
 // P27.1
 pub mod parallel;
+pub mod pragmas;
 pub mod project;
 pub mod quickfix;
 pub mod reachability;
