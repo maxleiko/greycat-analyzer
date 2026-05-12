@@ -36,21 +36,24 @@ fn first_var_init_kind(src: &str, idx: usize) -> LiteralKind {
 #[test]
 fn time_suffix_lowers_to_time_kind() {
     let src = "fn f() {\n    var t = 100_time;\n}\n";
-    assert_eq!(first_var_init_kind(src, 0), LiteralKind::Time);
+    assert!(matches!(
+        first_var_init_kind(src, 0),
+        LiteralKind::Time(100)
+    ));
 }
 
 #[test]
 fn duration_unit_suffix_lowers_to_duration_kind() {
-    let src = "fn f() {\n    var d = 5h_30m;\n}\n";
-    assert_eq!(first_var_init_kind(src, 0), LiteralKind::Duration);
+    // 5h → 5 * 3600 * 1e6 µs (GreyCat stores durations in µs).
+    let src = "fn f() {\n    var d = 5h;\n}\n";
+    let expected_us: i64 = 5 * 3_600 * 1_000_000;
+    assert!(matches!(first_var_init_kind(src, 0), LiteralKind::Duration(us) if us == expected_us));
 }
 
 #[test]
-fn float_suffix_stays_number_for_text_inspection() {
-    // P13.3 keeps `_f` floats as `LiteralKind::Number`; the analyzer's
-    // `numeric_literal_kind` text-inspector decides int-vs-float.
+fn float_suffix_lowers_to_float_kind() {
     let src = "fn f() {\n    var x = 1.5_f;\n}\n";
-    assert_eq!(first_var_init_kind(src, 0), LiteralKind::Number);
+    assert!(matches!(first_var_init_kind(src, 0), LiteralKind::Float(_)));
 }
 
 #[test]
@@ -77,7 +80,7 @@ fn map_two_generic_params_lower_both() {
 }
 
 #[test]
-fn plain_number_stays_number() {
+fn plain_int_lowers_to_int_kind() {
     let src = "fn f() {\n    var i = 42;\n}\n";
-    assert_eq!(first_var_init_kind(src, 0), LiteralKind::Number);
+    assert!(matches!(first_var_init_kind(src, 0), LiteralKind::Int(42)));
 }

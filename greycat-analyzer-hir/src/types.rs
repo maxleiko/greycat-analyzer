@@ -5,7 +5,6 @@
 
 use std::ops::Range;
 
-use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::arena::Idx;
@@ -18,7 +17,7 @@ pub type Span = Range<usize>;
 pub struct Module {
     pub name: String,
     pub lib: String,
-    pub decls: Vec<Idx<Decl>>,
+    pub decls: Box<[Idx<Decl>]>,
     pub byte_range: Span,
 }
 
@@ -43,16 +42,13 @@ pub struct Modifiers {
     /// args: ["renamed"] }`). Non-string arguments are dropped —
     /// the consumers we have today (`@expose` rename capture, the
     /// `unused-decl` exposure check) only need string args.
-    // P25.7
-    pub annotations: SmallVec<[Annotation; 1]>,
+    pub annotations: Box<[Annotation]>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Annotation {
-    // P25.6
     pub name: SmolStr,
-    // P25.6 / P25.7
-    pub args: SmallVec<[SmolStr; 1]>,
+    pub args: Box<[SmolStr]>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,9 +85,11 @@ impl Decl {
 pub struct FnDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    // P25.7
-    pub generics: SmallVec<[Idx<Ident>; 2]>,
-    pub params: Vec<Idx<FnParam>>,
+    /// Generic type parameters (`fn foo<T, U>(...)`). The grammar
+    /// allows any arity; the analyzer rejects >2 to match the runtime
+    /// (`Map<K, V>` is the widest the runtime supports).
+    pub generics: Box<[Idx<Ident>]>,
+    pub params: Box<[Idx<FnParam>]>,
     pub return_type: Option<Idx<TypeRef>>,
     /// `None` for native / abstract functions.
     pub body: Option<Idx<Stmt>>, // a Block stmt
@@ -110,11 +108,15 @@ pub struct FnParam {
 pub struct TypeDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    // P25.7
-    pub generics: SmallVec<[Idx<Ident>; 2]>,
+    /// Generic type parameters (`type Foo<T, U> {}`). Same arity
+    /// caveat as [`FnDecl::generics`] — grammar accepts any number,
+    /// analyzer rejects >2.
+    pub generics: Box<[Idx<Ident>]>,
     pub supertype: Option<Idx<TypeRef>>,
-    pub attrs: Vec<Idx<TypeAttr>>,
-    pub methods: Vec<Idx<Decl>>, // each is a Decl::Fn (FnDecl with `static_` / `abstract_` etc.)
+    pub attrs: Box<[Idx<TypeAttr>]>,
+    /// Methods declared on the type. Each entry is a `Decl::Fn`
+    /// (with `static_` / `abstract_` etc.).
+    pub methods: Box<[Idx<Decl>]>,
     pub doc: Option<String>,
     pub byte_range: Span,
 }
@@ -133,7 +135,7 @@ pub struct TypeAttr {
 pub struct EnumDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    pub fields: Vec<Idx<EnumField>>,
+    pub fields: Box<[Idx<EnumField>]>,
     pub doc: Option<String>,
     pub byte_range: Span,
 }
@@ -158,7 +160,7 @@ pub struct VarDeclTop {
 #[derive(Debug, Clone)]
 pub struct Pragma {
     pub name: Idx<Ident>,
-    pub args: Vec<Idx<Expr>>,
+    pub args: Box<[Idx<Expr>]>,
     pub byte_range: Span,
 }
 
@@ -194,7 +196,7 @@ pub enum Stmt {
 /// branches.
 #[derive(Debug, Clone)]
 pub struct BlockStmt {
-    pub stmts: Vec<Idx<Stmt>>,
+    pub stmts: Box<[Idx<Stmt>]>,
     pub byte_range: Span,
 }
 
@@ -271,7 +273,7 @@ pub struct ForInStmt {
     /// Binders introduced by this for-in. The grammar's `sepBy2`
     /// guarantees `params.len() >= 2` — typically `(index, value)` or
     /// `(key, value)`.
-    pub params: Vec<ForInParam>,
+    pub params: Box<[ForInParam]>,
     pub range: Idx<Expr>,
     pub body: BlockStmt,
     pub byte_range: Span,
@@ -317,12 +319,22 @@ pub enum Expr {
         name: Idx<Ident>,
         byte_range: Span,
     },
-    /// Literal whose textual form is preserved verbatim (numbers, durations,
-    /// iso8601, char). The semantic `Type` is computed by the type system.
+    /// Literal value — numeric, char, bool, duration, time, iso8601.
+    /// Each carries its parsed value directly (see [`LiteralKind`]);
+    /// the source text is no longer kept in the HIR.
     Literal(LiteralExpr),
+    /// `null` keyword literal.
+    Null {
+        byte_range: Span,
+    },
+    /// `this` keyword reference. Types as the enclosing
+    /// `TypeDecl`'s self type during analysis.
+    This {
+        byte_range: Span,
+    },
     String(StringExpr),
-    Tuple(Vec<Idx<Expr>>, Span),
-    Array(Vec<Idx<Expr>>, Span),
+    Tuple(Box<[Idx<Expr>]>, Span),
+    Array(Box<[Idx<Expr>]>, Span),
     Object(ObjectExpr),
     Member(MemberExpr),
     Arrow(MemberExpr), // `n->name` — same shape, different access semantics
@@ -335,7 +347,7 @@ pub enum Expr {
     /// this flat-`Vec<Idx<Ident>>` shape instead. Each segment is
     /// an `ident` from the source. Length is always >= 2.
     QualifiedStatic {
-        chain: Vec<Idx<Ident>>,
+        chain: Box<[Idx<Ident>]>,
         byte_range: Span,
     },
     Offset(OffsetExpr),
@@ -388,6 +400,8 @@ impl Expr {
         match self {
             Expr::Ident { byte_range, .. } => byte_range.clone(),
             Expr::Literal(l) => l.byte_range.clone(),
+            Expr::Null { byte_range } => byte_range.clone(),
+            Expr::This { byte_range } => byte_range.clone(),
             Expr::String(s) => s.byte_range.clone(),
             Expr::Tuple(_, r) | Expr::Array(_, r) | Expr::Paren(_, r) => r.clone(),
             Expr::Object(o) => o.byte_range.clone(),
@@ -409,24 +423,41 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub struct LiteralExpr {
     pub kind: LiteralKind,
-    pub text: String,
     pub byte_range: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Typed literal value. Each variant carries the parsed value
+/// directly — lowering does the parsing once; downstream stages
+/// dispatch on the variant tag without touching source text.
+///
+/// `null` and `this` are *not* literals — they're keyword tokens
+/// with no value to inline. They live as dedicated [`Expr::Null`] /
+/// [`Expr::This`] variants instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LiteralKind {
-    Number,
-    Char,
-    Bool,
-    Null,
-    This,
-    Duration,
-    // P13.3
-    /// Typed-suffix `123_time` literals. Distinct from
-    /// [`Self::Iso8601`], which only covers ISO-8601 string-shaped
-    /// time literals.
-    Time,
-    Iso8601,
+    Int(i64),
+    Float(f64),
+    Char(char),
+    Bool(bool),
+    /// Duration in microseconds — GreyCat's canonical unit for
+    /// `duration`. Sub-microsecond suffixes (`ns`, `nanosecond`)
+    /// are truncated toward zero by the lowering.
+    Duration(i64),
+    /// Time in microseconds since the Unix epoch — matches the
+    /// GreyCat runtime's storage for `time`.
+    Time(i64),
+    /// ISO-8601 time literal, eager-parsed to µs-since-epoch.
+    /// Variant preserved (rather than folded into [`Self::Time`])
+    /// so the analyzer can run ISO-specific diagnostics (deprecated
+    /// forms, suspicious timezone offsets, etc.) that wouldn't make
+    /// sense for a raw numeric `time` literal.
+    Iso8601(i64),
+    /// Parse failure at lowering time (numeric overflow, malformed
+    /// char, malformed ISO date, …). The HIR lowering pass emits
+    /// the user-facing diagnostic with the offending source text;
+    /// downstream stages treat this variant as `any` so cascades
+    /// don't double-flag already-reported input.
+    Invalid,
 }
 
 #[derive(Debug, Clone)]
@@ -441,7 +472,7 @@ pub struct StringExpr {
     /// emit per-fragment records (`RawStringExpr` /
     /// `InterpolationExpr`) and the resolver / analyzer can recurse
     /// into each `Interp.expr`.
-    pub parts: Vec<StringPart>,
+    pub parts: Box<[StringPart]>,
     pub byte_range: Span,
 }
 
@@ -485,7 +516,7 @@ pub enum StringPart {
 #[derive(Debug, Clone)]
 pub struct ObjectExpr {
     pub ty: Option<Idx<TypeRef>>,
-    pub fields: Vec<ObjectField>,
+    pub fields: Box<[ObjectField]>,
     pub byte_range: Span,
 }
 
@@ -564,7 +595,7 @@ pub struct OffsetExpr {
 #[derive(Debug, Clone)]
 pub struct CallExpr {
     pub callee: Idx<Expr>,
-    pub args: Vec<Idx<Expr>>,
+    pub args: Box<[Idx<Expr>]>,
     pub byte_range: Span,
 }
 
@@ -633,7 +664,7 @@ pub enum UnaryOp {
 
 #[derive(Debug, Clone)]
 pub struct LambdaExpr {
-    pub params: Vec<Idx<FnParam>>,
+    pub params: Box<[Idx<FnParam>]>,
     pub body: Idx<Expr>,
     pub byte_range: Span,
 }
@@ -642,10 +673,29 @@ pub struct LambdaExpr {
 // Type references (syntactic)
 // =============================================================================
 
+/// A syntactic type reference. Models the grammar's `type_ident` rule
+/// faithfully: `(ident "::")* ident <generics>? "?"?`.
+///
+/// `qualifier` carries the module path prefix (zero or more segments,
+/// leftmost-first). Empty slice = bare reference. `Box<[_]>` rather
+/// than `Vec` because the path is fixed after lowering — `Vec`'s
+/// capacity word would just be waste.
 #[derive(Debug, Clone)]
 pub struct TypeRef {
+    /// Module-qualifier segments before the leaf name.
+    /// `Foo` → `[]`; `b::Foo` → `[b]`; `a::b::Foo` → `[a, b]`.
+    pub qualifier: Box<[Idx<Ident>]>,
+    /// Leaf decl name (the final `field("name", $.ident)` segment).
     pub name: Idx<Ident>,
-    pub params: Vec<Idx<TypeRef>>,
+    /// Generic args (`Map<K, V>` → `[K, V]`). Empty for non-generic.
+    pub params: Box<[Idx<TypeRef>]>,
     pub optional: bool,
     pub byte_range: Span,
+}
+
+impl TypeRef {
+    /// `true` iff this ref carries a module path prefix.
+    pub fn is_qualified(&self) -> bool {
+        !self.qualifier.is_empty()
+    }
 }

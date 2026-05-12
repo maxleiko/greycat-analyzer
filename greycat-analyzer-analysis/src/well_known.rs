@@ -18,7 +18,6 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_types::TypeDeclId;
 use rustc_hash::FxHashMap;
-use smol_str::SmolStr;
 
 /// Append-only registry mapping `(Uri, Idx<Decl>)` pairs to dense
 /// [`TypeDeclId`]s. Idempotent — the same pair always resolves to the
@@ -27,16 +26,18 @@ use smol_str::SmolStr;
 /// Two `TypeDeclId`s from the same registry compare equal iff they
 /// were issued for the same `(uri, decl)` pair. Across registry
 /// instances, handles are not comparable.
+///
+/// Decl *names* aren't stored here — the arena owns them via
+/// [`greycat_analyzer_types::TypeArena::decl_name`], registered at
+/// `alloc_type` / `alloc_generic_instance` time. This keeps the
+/// registry to a single responsibility (handle identity) and lets
+/// downstream consumers render types through `arena.display(id)` with
+/// no registry borrow.
 /// One entry per resolved `(Uri, Idx<Decl>)` pair.
 #[derive(Debug, Clone)]
 struct DeclEntry {
     uri: Uri,
     decl: Idx<Decl>,
-    // P35.7
-    /// Decl name (interned). Cached so consumers that today walk
-    /// `TypeKind::Named { name }` can resolve a `TypeKind::Type(handle)`
-    /// back to a name without holding the foreign module's `Hir`.
-    name: SmolStr,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -50,17 +51,9 @@ impl DeclRegistry {
         Self::default()
     }
 
-    /// Intern `(uri, decl, name)`. Idempotent on the `(uri, decl)`
-    /// pair — re-calling with a different name on the same pair
-    /// keeps the original name (a decl's name is stable for its
-    /// lifetime; renaming via edit produces a fresh `Idx<Decl>`
-    /// in the rebuilt HIR).
-    pub fn get_or_insert(
-        &mut self,
-        uri: &Uri,
-        decl: Idx<Decl>,
-        name: impl Into<SmolStr>,
-    ) -> TypeDeclId {
+    /// Intern `(uri, decl)`. Idempotent — re-calling with the same
+    /// pair returns the previously-issued handle.
+    pub fn get_or_insert(&mut self, uri: &Uri, decl: Idx<Decl>) -> TypeDeclId {
         let key = (uri.clone(), decl);
         if let Some(&id) = self.intern.get(&key) {
             return id;
@@ -69,7 +62,6 @@ impl DeclRegistry {
         self.items.push(DeclEntry {
             uri: uri.clone(),
             decl,
-            name: name.into(),
         });
         self.intern.insert(key, id);
         id
@@ -84,16 +76,6 @@ impl DeclRegistry {
     /// Resolve a handle back to its `(uri, decl)` source.
     pub fn resolve(&self, id: TypeDeclId) -> Option<(&Uri, Idx<Decl>)> {
         self.items.get(id.raw() as usize).map(|e| (&e.uri, e.decl))
-    }
-
-    // P35.7
-    /// Resolve a handle to the decl's name. Returns `None` when the
-    /// handle isn't from this registry. Used by lints / hover / etc.
-    /// to recover a printable name from a `TypeKind::Type(handle)` or
-    /// `TypeKind::GenericInstance { decl, .. }` without holding a
-    /// borrow on the foreign module's `Hir`.
-    pub fn name(&self, id: TypeDeclId) -> Option<&str> {
-        self.items.get(id.raw() as usize).map(|e| e.name.as_str())
     }
 
     pub fn len(&self) -> usize {
@@ -319,8 +301,8 @@ mod tests {
         let mut r = DeclRegistry::new();
         let uri = Uri::from_str("file:///x.gcl").unwrap();
         let decl = Idx::<Decl>::from_raw(0u32);
-        let a = r.get_or_insert(&uri, decl, "Foo");
-        let b = r.get_or_insert(&uri, decl, "Foo");
+        let a = r.get_or_insert(&uri, decl);
+        let b = r.get_or_insert(&uri, decl);
         assert_eq!(a, b);
         assert_eq!(r.len(), 1);
     }

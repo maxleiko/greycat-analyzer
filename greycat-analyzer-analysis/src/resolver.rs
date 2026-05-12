@@ -36,8 +36,8 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     AssignStmt, AtStmt, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt, ForStmt,
-    Ident, IfStmt, LambdaExpr, LiteralExpr, LocalVar, MemberExpr, ObjectExpr, OffsetExpr, Pragma,
-    Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, VarDeclTop, WhileStmt,
+    Ident, IfStmt, LambdaExpr, LocalVar, MemberExpr, ObjectExpr, OffsetExpr, Pragma, Stmt,
+    StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, VarDeclTop, WhileStmt,
 };
 
 use crate::stdlib::ProjectIndex;
@@ -308,6 +308,49 @@ impl<'a> Cx<'a> {
             return;
         }
         self.res.unresolved.push(idx);
+    }
+
+    /// Bind the leaf ident of a qualified `TypeRef` (`b::Foo`,
+    /// `a::b::Foo`, …) to the foreign decl named by its rightmost
+    /// qualifier segment. Skips the bare-name resolution ladder
+    /// entirely — qualified leaves never participate in the
+    /// `ambiguous-symbol` collapse, since the user has already
+    /// disambiguated by writing the qualifier.
+    ///
+    /// Outcomes:
+    /// - module exists AND exports leaf → `ProjectDecl { uri, decl }`.
+    /// - module exists, leaf not in module → leaf marked unresolved
+    ///   (the regular "unresolved name" diagnostic surfaces).
+    /// - module name unknown → leaf marked unresolved; the qualifier
+    ///   ident's own `record_use` will have flagged the unknown name.
+    fn bind_qualified_type_leaf(&mut self, ty: &TypeRef) {
+        let module_segment = *ty
+            .qualifier
+            .last()
+            .expect("bind_qualified_type_leaf called with empty qualifier");
+        let module_name = self.ident_text(module_segment).to_string();
+        let leaf = ty.name;
+        let leaf_name = self.ident_text(leaf).to_string();
+        let Some(module_uri) = self.index.module_uri(&module_name).cloned() else {
+            self.res.unresolved.push(leaf);
+            return;
+        };
+        let hit = self
+            .index
+            .locate_decl(&leaf_name)
+            .iter()
+            .find(|(uri, _)| uri == &module_uri)
+            .map(|(uri, decl)| (uri.clone(), *decl));
+        match hit {
+            Some((uri, decl)) => {
+                self.res
+                    .uses
+                    .insert(leaf, Definition::ProjectDecl { uri, decl });
+            }
+            None => {
+                self.res.unresolved.push(leaf);
+            }
+        }
     }
 }
 
@@ -707,18 +750,30 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
         Expr::Unsupported { .. } => {
             // Lowering hasn't expanded this shape yet; nothing to bind.
         }
+        Expr::Null { .. } | Expr::This { .. } => {
+            // Keyword literals with no name to resolve.
+        }
     }
-    // Suppress unused-import-of-LiteralExpr warning if never used.
-    let _ = LiteralExpr {
-        kind: greycat_analyzer_hir::types::LiteralKind::Null,
-        text: String::new(),
-        byte_range: 0..0,
-    };
 }
 
 fn visit_type_ref(cx: &mut Cx, ty_id: Idx<TypeRef>) {
     let ty = cx.hir.type_refs[ty_id].clone();
-    cx.record_use(ty.name);
+    if ty.qualifier.is_empty() {
+        // Bare reference: full bare-name resolution, including the
+        // `ambiguous-symbol` collapse when ≥2 modules export the leaf.
+        cx.record_use(ty.name);
+    } else {
+        // Qualified reference (`b::Foo`, `a::b::Foo`, …): the user has
+        // already disambiguated. Bind each qualifier segment as a
+        // normal use (so module names get a binding for hover / goto)
+        // and resolve the leaf in the named module specifically — the
+        // bare-name path's ambiguous-symbol collapse must NOT fire on
+        // a leaf the user explicitly qualified.
+        for q in ty.qualifier.iter() {
+            cx.record_use(*q);
+        }
+        cx.bind_qualified_type_leaf(&ty);
+    }
     for p in ty.params {
         visit_type_ref(cx, p);
     }

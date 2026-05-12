@@ -670,14 +670,14 @@ impl ProjectIndex {
     /// `Named` -> `Type(handle)` cascade and deleted in P36.7.
     pub fn is_subtype_of_decl(
         &self,
-        registry: &crate::well_known::DeclRegistry,
+        arena: &greycat_analyzer_types::TypeArena,
         sub: TypeDeclId,
         sup: TypeDeclId,
     ) -> bool {
         if sub == sup {
             return true;
         }
-        let (Some(sub_name), Some(sup_name)) = (registry.name(sub), registry.name(sup)) else {
+        let (Some(sub_name), Some(sup_name)) = (arena.decl_name(sub), arena.decl_name(sup)) else {
             return false;
         };
         self.is_subtype_of(sub_name, sup_name)
@@ -1352,12 +1352,14 @@ fn helper(): int { return 1; }
     #[test]
     fn is_subtype_of_decl_resolves_handles_then_delegates_to_name_keyed() {
         // Inheritance graph: `Cat extends Animal`. `is_subtype_of_decl`
-        // takes handles, looks each up in the registry, and asks the
-        // existing name-keyed walker. Equal handles short-circuit
-        // without registry access; missing handles return false.
+        // takes handles, looks each up in the arena's decl-names table,
+        // and asks the existing name-keyed walker. Equal handles
+        // short-circuit without arena access; missing handles return
+        // false.
         use crate::well_known::DeclRegistry;
         use greycat_analyzer_hir::arena::Idx;
         use greycat_analyzer_hir::types::Decl;
+        use greycat_analyzer_types::TypeArena;
 
         let hir = lower(
             "type Animal { name: String; }\n\
@@ -1368,15 +1370,18 @@ fn helper(): int { return 1; }
         idx.ingest(&u, &hir);
 
         // Mint handles into a DeclRegistry by re-walking the HIR decls
-        // (mirrors the project pipeline's bootstrap order).
+        // (mirrors the project pipeline's bootstrap order), then mirror
+        // the names into a TypeArena via `alloc_type`.
         let mut registry = DeclRegistry::new();
+        let mut arena = TypeArena::new();
         let module = hir.module.as_ref().unwrap();
         let mut animal = None;
         let mut cat = None;
         for decl_id in &module.decls {
             if let Decl::Type(td) = &hir.decls[*decl_id] {
                 let name = hir.idents[td.name].text.as_str();
-                let id = registry.get_or_insert(&u, *decl_id, name);
+                let id = registry.get_or_insert(&u, *decl_id);
+                arena.alloc_type(id, name);
                 match name {
                     "Animal" => animal = Some(id),
                     "Cat" => cat = Some(id),
@@ -1387,15 +1392,15 @@ fn helper(): int { return 1; }
         let animal = animal.unwrap();
         let cat = cat.unwrap();
 
-        assert!(idx.is_subtype_of_decl(&registry, cat, animal));
-        assert!(!idx.is_subtype_of_decl(&registry, animal, cat));
-        // Reflexivity short-circuits regardless of registry membership.
-        assert!(idx.is_subtype_of_decl(&registry, animal, animal));
+        assert!(idx.is_subtype_of_decl(&arena, cat, animal));
+        assert!(!idx.is_subtype_of_decl(&arena, animal, cat));
+        // Reflexivity short-circuits regardless of arena membership.
+        assert!(idx.is_subtype_of_decl(&arena, animal, animal));
 
-        // A handle not in the registry returns false (no panic).
-        let dangling =
-            registry.get_or_insert(&uri("/other.gcl"), Idx::<Decl>::from_raw(99u32), "Ghost");
-        assert!(!idx.is_subtype_of_decl(&registry, dangling, animal));
+        // A handle whose name was never registered in the arena returns
+        // false (no panic).
+        let dangling = registry.get_or_insert(&uri("/other.gcl"), Idx::<Decl>::from_raw(99u32));
+        assert!(!idx.is_subtype_of_decl(&arena, dangling, animal));
     }
 
     #[test]

@@ -249,7 +249,12 @@ fn type_ref_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::TypeRef>) -> H
     for &p in &tr.params {
         children.push(type_ref_node(hir, p));
     }
-    let mut label = ident_text(hir, tr.name);
+    let mut label = String::new();
+    for q in tr.qualifier.iter() {
+        label.push_str(&ident_text(hir, *q));
+        label.push_str("::");
+    }
+    label.push_str(&ident_text(hir, tr.name));
     if tr.optional {
         label.push('?');
     }
@@ -267,11 +272,9 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
     let range: ByteRange = e.byte_range().into();
     let (kind, label, children) = match e {
         Expr::Ident { name, .. } => ("expr:ident", Some(ident_text(hir, *name)), Vec::new()),
-        Expr::Literal(l) => (
-            "expr:literal",
-            Some(format!("{:?} {:?}", l.kind, l.text)),
-            Vec::new(),
-        ),
+        Expr::Literal(l) => ("expr:literal", Some(format!("{:?}", l.kind)), Vec::new()),
+        Expr::Null { .. } => ("expr:null", None, Vec::new()),
+        Expr::This { .. } => ("expr:this", None, Vec::new()),
         Expr::String(s) => {
             let mut kids = Vec::new();
             for part in &s.parts {
@@ -721,7 +724,7 @@ fn full_hir(hir: &Hir) -> HirRoot {
         .unwrap_or_else(|| greycat_analyzer_hir::types::Module {
             name: "<empty>".into(),
             lib: "project".into(),
-            decls: Vec::new(),
+            decls: Box::default(),
             byte_range: 0..0,
         });
     let decls = module.decls.iter().map(|&d| decl_node(hir, d)).collect();
@@ -781,7 +784,7 @@ pub fn infer_types(source: &str) -> Result<JsValue, JsValue> {
         let range = module.hir.exprs[*idx].byte_range();
         out.push(ExprType {
             range: range.into(),
-            ty: greycat_analyzer_types::display(pa.arena(), *ty),
+            ty: pa.arena().display(*ty).to_string(),
         });
     }
     to_js(&out)

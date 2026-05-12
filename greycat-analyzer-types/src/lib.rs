@@ -292,10 +292,20 @@ pub enum GenericOwner {
 /// Append-only interning arena for `Type`. Two equal `Type` values get
 /// the same [`TypeId`]; comparing for equality is then just an integer
 /// comparison.
+///
+/// The arena also owns a parallel `decl_names` table indexed by
+/// `TypeDeclId.raw()`. Every `alloc_type` / `alloc_generic_instance`
+/// records the decl's source name there, so `arena.display(id)` can
+/// recover a printable name without a callback or a borrow on the
+/// project's `DeclRegistry`. The duplication is a deliberate
+/// denormalisation: `DeclRegistry` stays the canonical `(uri, decl) →
+/// handle` interner; `decl_names` is a read-path view scoped to one
+/// arena.
 #[derive(Debug, Default, Clone)]
 pub struct TypeArena {
     items: Vec<Type>,
     intern: FxHashMap<Type, TypeId>,
+    decl_names: Vec<SmolStr>,
 }
 
 impl TypeArena {
@@ -403,8 +413,12 @@ impl TypeArena {
     }
 
     // P35.2
-    /// Allocate a resolved non-generic [`TypeKind::Type`].
-    pub fn alloc_type(&mut self, decl: TypeDeclId) -> TypeId {
+    /// Allocate a resolved non-generic [`TypeKind::Type`]. Registers
+    /// `name` with the arena so [`Self::display`] can render the type
+    /// without a callback or a `DeclRegistry` borrow. Name registration
+    /// is idempotent on `decl`.
+    pub fn alloc_type(&mut self, decl: TypeDeclId, name: impl Into<SmolStr>) -> TypeId {
+        self.register_decl_name(decl, name.into());
         self.alloc(Type {
             kind: TypeKind::Type(decl),
             nullable: false,
@@ -414,9 +428,17 @@ impl TypeArena {
     // P35.2
     /// Allocate a [`TypeKind::GenericInstance`]. Caller guarantees
     /// `args` is non-empty — zero-arg uses of a generic decl are an
-    /// upstream lowering error, not a value-shaped concept.
-    pub fn alloc_generic_instance(&mut self, decl: TypeDeclId, args: Vec<TypeId>) -> TypeId {
+    /// upstream lowering error, not a value-shaped concept. `name` is
+    /// registered with the arena (same idempotency as
+    /// [`Self::alloc_type`]).
+    pub fn alloc_generic_instance(
+        &mut self,
+        decl: TypeDeclId,
+        name: impl Into<SmolStr>,
+        args: Vec<TypeId>,
+    ) -> TypeId {
         debug_assert!(!args.is_empty(), "GenericInstance must have non-empty args");
+        self.register_decl_name(decl, name.into());
         self.alloc(Type {
             kind: TypeKind::GenericInstance {
                 decl,
@@ -424,6 +446,43 @@ impl TypeArena {
             },
             nullable: false,
         })
+    }
+
+    /// Idempotently record `name` as the printable source name for
+    /// `decl`. First call wins; subsequent calls with a matching name
+    /// no-op, conflicting names trip a debug-assert (the decl identity
+    /// is supposed to be 1:1 with its name).
+    fn register_decl_name(&mut self, decl: TypeDeclId, name: SmolStr) {
+        let i = decl.raw() as usize;
+        if i >= self.decl_names.len() {
+            self.decl_names.resize(i + 1, SmolStr::default());
+        }
+        if self.decl_names[i].is_empty() {
+            self.decl_names[i] = name;
+        } else {
+            debug_assert_eq!(
+                self.decl_names[i],
+                name,
+                "TypeDeclId {} re-registered with a different name",
+                decl.raw()
+            );
+        }
+    }
+
+    /// Recover the source name for `decl`, or `None` if no
+    /// `alloc_type` / `alloc_generic_instance` has interned it yet.
+    pub fn decl_name(&self, decl: TypeDeclId) -> Option<&str> {
+        self.decl_names
+            .get(decl.raw() as usize)
+            .filter(|s| !s.is_empty())
+            .map(SmolStr::as_str)
+    }
+
+    /// Return a [`Display`]-implementing wrapper that renders the type
+    /// at `id`. Reads decl names from this arena's `decl_names` table —
+    /// no callback, no registry borrow.
+    pub fn display(&self, id: TypeId) -> TypeDisplay<'_> {
+        TypeDisplay { arena: self, id }
     }
 
     // P35.3
@@ -515,7 +574,14 @@ impl TypeArena {
                     ty
                 } else {
                     let decl = *decl;
-                    let mut new_t = self.alloc_generic_instance(decl, new_args.into_vec());
+                    // Re-use the name already registered for `decl` when
+                    // we minted the original `GenericInstance` — no
+                    // caller-side bookkeeping needed.
+                    let name = SmolStr::from(
+                        self.decl_name(decl)
+                            .expect("decl name registered at first alloc"),
+                    );
+                    let mut new_t = self.alloc_generic_instance(decl, name, new_args.into_vec());
                     if t.nullable {
                         new_t = self.nullable(new_t);
                     }
@@ -1144,100 +1210,129 @@ fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
 // Display
 // =============================================================================
 
-pub fn display(arena: &TypeArena, id: TypeId) -> String {
-    display_with_names(arena, id, &|_| None)
+/// `Display`-implementing wrapper returned by [`TypeArena::display`].
+///
+/// Renders a [`TypeId`] using the arena's `decl_names` table to recover
+/// printable names for [`TypeKind::Type`] / [`TypeKind::GenericInstance`].
+/// When a decl handle hasn't been registered yet (an internal invariant
+/// violation, since every alloc registers a name), falls back to the
+/// `?type#<raw>` placeholder so the output stays distinguishable.
+///
+/// Writes straight into the formatter — no intermediate `String`.
+pub struct TypeDisplay<'a> {
+    arena: &'a TypeArena,
+    id: TypeId,
 }
 
-/// Like [`display`] but threads a `name_for` callback that resolves
-/// [`TypeKind::Type`] / [`TypeKind::GenericInstance`] decl handles to
-/// their names. Callers with a `DeclRegistry` in scope pass
-/// `|h| registry.name(h).map(str::to_string)` to get real names
-/// (`Box`, `node`, …) instead of the `?type#<raw>` placeholder.
-pub fn display_with_names(
-    arena: &TypeArena,
-    id: TypeId,
-    name_for: &dyn Fn(TypeDeclId) -> Option<String>,
-) -> String {
+impl std::fmt::Display for TypeDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_type(f, self.arena, self.id)
+    }
+}
+
+fn write_type(f: &mut std::fmt::Formatter<'_>, arena: &TypeArena, id: TypeId) -> std::fmt::Result {
     let ty = arena.get(id);
-    let mut s = match &ty.kind {
-        TypeKind::Null => "null".to_string(),
-        TypeKind::Any => "any".to_string(),
-        TypeKind::Never => "never".to_string(),
-        TypeKind::Primitive(p) => p.name().to_string(),
-        TypeKind::Named { name } => name.to_string(),
+    match &ty.kind {
+        TypeKind::Null => f.write_str("null")?,
+        TypeKind::Any => f.write_str("any")?,
+        TypeKind::Never => f.write_str("never")?,
+        TypeKind::Primitive(p) => f.write_str(p.name())?,
+        TypeKind::Named { name } => f.write_str(name.as_str())?,
         TypeKind::Generic { name, args } => {
-            let parts: Vec<String> = args
-                .iter()
-                .map(|a| display_with_names(arena, *a, name_for))
-                .collect();
-            format!("{name}<{}>", parts.join(", "))
+            f.write_str(name.as_str())?;
+            write_args(f, arena, args)?;
         }
-        TypeKind::Type(d) => name_for(*d).unwrap_or_else(|| format!("?type#{}", d.raw())),
+        TypeKind::Type(d) => match arena.decl_name(*d) {
+            Some(name) => f.write_str(name)?,
+            None => write!(f, "?type#{}", d.raw())?,
+        },
         TypeKind::GenericInstance { decl, args } => {
-            let parts: Vec<String> = args
-                .iter()
-                .map(|a| display_with_names(arena, *a, name_for))
-                .collect();
-            let head = name_for(*decl).unwrap_or_else(|| format!("?type#{}", decl.raw()));
-            format!("{head}<{}>", parts.join(", "))
+            match arena.decl_name(*decl) {
+                Some(name) => f.write_str(name)?,
+                None => write!(f, "?type#{}", decl.raw())?,
+            }
+            write_args(f, arena, args)?;
         }
-        TypeKind::Unresolved { name, .. } => name.to_string(),
-        TypeKind::GenericParam { name, .. } => name.to_string(),
+        TypeKind::Unresolved { name, .. } => f.write_str(name.as_str())?,
+        TypeKind::GenericParam { name, .. } => f.write_str(name.as_str())?,
         TypeKind::Lambda(l) => {
-            let parts: Vec<String> = l
-                .params
-                .iter()
-                .map(|p| display_with_names(arena, *p, name_for))
-                .collect();
-            format!(
-                "({}) -> {}",
-                parts.join(", "),
-                display_with_names(arena, l.ret, name_for)
-            )
+            f.write_str("(")?;
+            for (i, p) in l.params.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type(f, arena, *p)?;
+            }
+            f.write_str(") -> ")?;
+            write_type(f, arena, l.ret)?;
         }
         TypeKind::Tuple { elements } => {
-            let parts: Vec<String> = elements
-                .iter()
-                .map(|e| display_with_names(arena, *e, name_for))
-                .collect();
-            format!("({})", parts.join(", "))
+            f.write_str("(")?;
+            for (i, e) in elements.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type(f, arena, *e)?;
+            }
+            f.write_str(")")?;
         }
         TypeKind::Anonymous { fields } => {
-            let parts: Vec<String> = fields
-                .iter()
-                .map(|(n, t)| format!("{n}: {}", display_with_names(arena, *t, name_for)))
-                .collect();
-            format!("{{ {} }}", parts.join(", "))
+            f.write_str("{ ")?;
+            for (i, (n, t)) in fields.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(n.as_str())?;
+                f.write_str(": ")?;
+                write_type(f, arena, *t)?;
+            }
+            f.write_str(" }")?;
         }
-        TypeKind::Enum { name, .. } => name.to_string(),
+        TypeKind::Enum { name, .. } => f.write_str(name.as_str())?,
         TypeKind::Union { alts } => {
             // Unions render as `A | B | …`. When the union is also
-            // nullable and no `Null` alt is already present, expand
-            // it with a trailing `| null` — the `?` suffix would
-            // visually attach to only the last alt and read wrong.
-            // Mirrors the TS reference's choice: simple types get
-            // `T?`, narrowing-introduced unions get `T | U | null`.
-            let mut parts: Vec<String> = alts
-                .iter()
-                .map(|a| display_with_names(arena, *a, name_for))
-                .collect();
+            // nullable and no `Null` alt is already present, append
+            // an explicit `| null` — the `?` suffix would visually
+            // bind to the last alt only and read wrong. Mirrors the
+            // TS reference: simple types get `T?`, narrowing-introduced
+            // unions get `T | U | null`.
+            for (i, a) in alts.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" | ")?;
+                }
+                write_type(f, arena, *a)?;
+            }
             if ty.nullable
                 && !alts
                     .iter()
                     .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
             {
-                parts.push("null".to_string());
+                f.write_str(" | null")?;
             }
-            parts.join(" | ")
         }
-    };
+    }
     // `?` suffix for nullable types — except `Null` (redundant) and
     // `Union` (handled inline above with an explicit `| null` alt
     // so the suffix doesn't visually bind to the last alt only).
     if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
-        s.push('?');
+        f.write_str("?")?;
     }
-    s
+    Ok(())
+}
+
+fn write_args(
+    f: &mut std::fmt::Formatter<'_>,
+    arena: &TypeArena,
+    args: &[TypeId],
+) -> std::fmt::Result {
+    f.write_str("<")?;
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write_type(f, arena, *a)?;
+    }
+    f.write_str(">")
 }
 
 // P18.1
@@ -1284,15 +1379,31 @@ pub fn display_fqn(
                 .collect();
             format!("{lib}::{name}<{}>", parts.join(", "))
         }
-        // P35.2 — placeholder until consumers thread `&DeclRegistry`
-        // through. Same rationale as in [`display`].
-        TypeKind::Type(d) => format!("?type#{}", d.raw()),
+        // P35.2 — decl names come from the arena (registered at alloc
+        // time). `home_lib` is still threaded for the legacy `Named` /
+        // `Generic` shapes where the name isn't keyed by a decl handle.
+        TypeKind::Type(d) => match arena.decl_name(*d) {
+            Some(name) => format!(
+                "{}::{}",
+                home_lib(name).unwrap_or_else(|| "core".to_string()),
+                name
+            ),
+            None => format!("?type#{}", d.raw()),
+        },
         TypeKind::GenericInstance { decl, args } => {
             let parts: Vec<String> = args
                 .iter()
                 .map(|a| display_fqn(arena, *a, home_lib))
                 .collect();
-            format!("?type#{}<{}>", decl.raw(), parts.join(", "))
+            match arena.decl_name(*decl) {
+                Some(name) => format!(
+                    "{}::{}<{}>",
+                    home_lib(name).unwrap_or_else(|| "core".to_string()),
+                    name,
+                    parts.join(", ")
+                ),
+                None => format!("?type#{}<{}>", decl.raw(), parts.join(", ")),
+            }
         }
         // P35.3 — unresolved name, render verbatim with the same
         // `<lib>::` prefix the rest of the resolver would have used.
@@ -1569,8 +1680,8 @@ mod tests {
         let int_q = a.nullable(int);
         let str_t = a.primitive(Primitive::String);
         let arr = a.generic("Array", vec![str_t]);
-        assert_eq!(display(&a, int_q), "int?");
-        assert_eq!(display(&a, arr), "Array<String>");
+        assert_eq!(a.display(int_q).to_string(), "int?");
+        assert_eq!(a.display(arr).to_string(), "Array<String>");
     }
 
     #[test]

@@ -472,15 +472,16 @@ fn expr_kind_and_range(hir: &Hir, expr: &Expr) -> Option<(&'static str, std::ops
             return Some(("Identifier", ident.byte_range.clone()));
         }
         Expr::Literal(l) => match l.kind {
-            LiteralKind::Number => "NumLit",
-            LiteralKind::Char => "CharLit",
-            LiteralKind::Bool => "BoolLit",
-            LiteralKind::Null => "NullLit",
-            LiteralKind::This => "ThisLit",
-            LiteralKind::Duration => "NumLit",
-            LiteralKind::Time => "NumLit",
-            LiteralKind::Iso8601 => "StringLit",
+            LiteralKind::Int(_) | LiteralKind::Float(_) => "NumLit",
+            LiteralKind::Char(_) => "CharLit",
+            LiteralKind::Bool(_) => "BoolLit",
+            LiteralKind::Duration(_) => "NumLit",
+            LiteralKind::Time(_) => "NumLit",
+            LiteralKind::Iso8601(_) => "StringLit",
+            LiteralKind::Invalid => "NumLit",
         },
+        Expr::Null { byte_range } => return Some(("NullLit", byte_range.clone())),
+        Expr::This { byte_range } => return Some(("ThisLit", byte_range.clone())),
         Expr::String(s) => {
             if s.has_interpolation() {
                 "TemplateExpr"
@@ -548,7 +549,7 @@ fn collect_expr_descendants(
         return;
     }
     match &hir.exprs[root] {
-        Expr::Ident { .. } | Expr::Literal(_) => {}
+        Expr::Ident { .. } | Expr::Literal(_) | Expr::Null { .. } | Expr::This { .. } => {}
         Expr::String(s) => {
             for part in &s.parts {
                 if let StringPart::Interp { expr, .. } = part {

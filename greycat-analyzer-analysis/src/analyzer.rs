@@ -75,47 +75,6 @@ fn block_terminates(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -
     block.stmts.last().is_some_and(|s| stmt_terminates(hir, *s))
 }
 
-// P12.4
-/// Classify a numeric literal's source text as `int` or
-/// `float`. Returns `Primitive::Float` for literals that contain a
-/// decimal point, scientific notation (`1e3`, `1.5E-2`), or trailing
-/// `f` / `_f` suffix; everything else falls back to `Primitive::Int`.
-/// Other typed suffixes (`_time`, `_duration`, …) leave `LiteralKind::Number`
-/// untyped today;  promotes those to dedicated `LiteralKind`
-/// variants so this helper only sees float / int candidates.
-fn numeric_literal_kind(text: &str) -> Primitive {
-    // Bare `f` is the float suffix; the leading `_` (`_f`) is a
-    // formatter convention, not a grammar requirement, so both forms
-    // must classify identically. `time` / duration suffixes have
-    // already been split off into `LiteralKind::Time` /
-    // `LiteralKind::Duration` by HIR lowering's `classify_number`,
-    // and none of them end in `f`, so this check has no false
-    // positives.
-    if text.ends_with('f') {
-        return Primitive::Float;
-    }
-    if text.contains('.') {
-        return Primitive::Float;
-    }
-    // Scientific notation: an `e` / `E` immediately preceded by an
-    // ASCII digit and followed by `+` / `-` or another digit. Guards
-    // against false positives on typed suffixes like `_time` (contains
-    // 'e' but not at a digit-anchored position).
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if (b == b'e' || b == b'E') && i > 0 {
-            let prev = bytes[i - 1];
-            if prev.is_ascii_digit()
-                && let Some(&next) = bytes.get(i + 1)
-                && (next == b'+' || next == b'-' || next.is_ascii_digit())
-            {
-                return Primitive::Float;
-            }
-        }
-    }
-    Primitive::Int
-}
-
 /// Severity sketch for analyzer diagnostics. Maps onto `lsp_types::DiagnosticSeverity`
 /// at the LSP boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,7 +487,7 @@ fn register_module_types(
                 // that don't run the project pipeline). The fallback
                 // is transitional and gets deleted in P36.7.
                 let id = match decl_registry.lookup(module_uri, *d) {
-                    Some(handle) => arena.alloc_type(handle),
+                    Some(handle) => arena.alloc_type(handle, name.clone()),
                     None => arena.named(name.as_str()),
                 };
                 out.registry.register(name.clone(), id);
@@ -628,7 +587,7 @@ enum CalleeShape {
         property: Idx<Ident>,
     },
     Ident(Idx<Ident>),
-    QualifiedStatic(Vec<Idx<Ident>>),
+    QualifiedStatic(Box<[Idx<Ident>]>),
 }
 
 struct Cx<'a> {
@@ -780,14 +739,9 @@ impl<'a> Cx<'a> {
         match &self.hir.exprs[cond_id] {
             Expr::Paren(inner, _) => self.trivially_decidable(*inner),
             Expr::Literal(LiteralExpr {
-                kind: LiteralKind::Bool,
-                text,
+                kind: LiteralKind::Bool(b),
                 ..
-            }) => match text.as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            },
+            }) => Some(*b),
             Expr::Unary(UnaryExpr {
                 op: UnaryOp::Not,
                 operand,
@@ -905,7 +859,7 @@ impl<'a> Cx<'a> {
                         let name = self.ident_text(*ident).to_string();
                         let pretty: Vec<String> = tys
                             .iter()
-                            .map(|t| greycat_analyzer_types::display(self.arena, *t))
+                            .map(|t| self.arena.display(*t).to_string())
                             .collect();
                         let msg = format!(
                             "condition is always false: `{}` cannot simultaneously be {}",
@@ -942,7 +896,7 @@ impl<'a> Cx<'a> {
                                 let msg = format!(
                                     "condition is always true: `{}` is already of type `{}`",
                                     name,
-                                    greycat_analyzer_types::display(self.arena, known),
+                                    self.arena.display(known),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
@@ -964,8 +918,8 @@ impl<'a> Cx<'a> {
                                 let msg = format!(
                                     "condition is always false: `{}` of type `{}` can never be `{}`",
                                     name,
-                                    greycat_analyzer_types::display(self.arena, known),
-                                    greycat_analyzer_types::display(self.arena, asserted),
+                                    self.arena.display(known),
+                                    self.arena.display(asserted),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
@@ -1018,7 +972,7 @@ impl<'a> Cx<'a> {
     /// `&mut self` arena allocation.
     fn function_ty(&mut self) -> TypeId {
         match self.well_known.function_decl {
-            Some(d) => self.arena.alloc_type(d),
+            Some(d) => self.arena.alloc_type(d, "function"),
             // Transitional fallback: when std isn't loaded, mint the
             // legacy `Named { name: "function" }` shape so existing
             // tests / display callers see the same "function" string
@@ -1030,13 +984,13 @@ impl<'a> Cx<'a> {
     }
     fn type_ty(&mut self) -> TypeId {
         match self.well_known.type_decl {
-            Some(d) => self.arena.alloc_type(d),
+            Some(d) => self.arena.alloc_type(d, "type"),
             None => self.arena.named("type"),
         }
     }
     fn field_ty(&mut self) -> TypeId {
         match self.well_known.field_decl {
-            Some(d) => self.arena.alloc_type(d),
+            Some(d) => self.arena.alloc_type(d, "field"),
             None => self.arena.named("field"),
         }
     }
@@ -1140,10 +1094,7 @@ impl<'a> Cx<'a> {
     fn member_path(&self, expr_id: Idx<Expr>) -> Option<String> {
         match &self.hir.exprs[expr_id] {
             Expr::Ident { name: name_idx, .. } => Some(self.ident_text(*name_idx).to_string()),
-            Expr::Literal(LiteralExpr {
-                kind: LiteralKind::This,
-                ..
-            }) => Some("this".to_string()),
+            Expr::This { .. } => Some("this".to_string()),
             Expr::Member(MemberExpr {
                 receiver, property, ..
             }) => {
@@ -1299,10 +1250,11 @@ impl<'a> Cx<'a> {
         let type_name: Option<SmolStr> = match &ty.kind {
             TypeKind::Named { name } => Some(name.clone()),
             TypeKind::Generic { name, .. } => Some(name.clone()),
-            // P35.7 — handle-keyed variants resolve via the registry.
-            TypeKind::Type(d) => self.decl_registry.name(*d).map(SmolStr::from),
+            // P35.7 — handle-keyed variants read the name from the
+            // arena's parallel decl-names table.
+            TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
             TypeKind::GenericInstance { decl, .. } => {
-                self.decl_registry.name(*decl).map(SmolStr::from)
+                self.arena.decl_name(*decl).map(SmolStr::from)
             }
             // P16.2 — primitives (`String`, `int`, ...) carry methods
             // declared as `native type String { ... }` in stdlib.
@@ -1538,13 +1490,14 @@ impl<'a> Cx<'a> {
             TypeKind::Generic { name, args } => (name, args.into_vec()),
             TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
             // P35.7 — handle-keyed variants: resolve back to the
-            // decl name via the registry so the downstream chain-
-            // walking lookup (still SmolStr-keyed) finds the type.
-            TypeKind::Type(decl) => match self.decl_registry.name(decl) {
+            // decl name via the arena's decl-names table so the
+            // downstream chain-walking lookup (still SmolStr-keyed)
+            // finds the type.
+            TypeKind::Type(decl) => match self.arena.decl_name(decl) {
                 Some(n) => (n.into(), Vec::new()),
                 None => return None,
             },
-            TypeKind::GenericInstance { decl, args } => match self.decl_registry.name(decl) {
+            TypeKind::GenericInstance { decl, args } => match self.arena.decl_name(decl) {
                 Some(n) => (n.into(), args.into_vec()),
                 None => return None,
             },
@@ -1653,9 +1606,9 @@ impl<'a> Cx<'a> {
             let owner_name: Option<SmolStr> = match &self.arena.get(recv_ty).kind {
                 TypeKind::Named { name } => Some(name.clone()),
                 TypeKind::Generic { name, .. } => Some(name.clone()),
-                TypeKind::Type(d) => self.decl_registry.name(*d).map(SmolStr::from),
+                TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
                 TypeKind::GenericInstance { decl, .. } => {
-                    self.decl_registry.name(*decl).map(SmolStr::from)
+                    self.arena.decl_name(*decl).map(SmolStr::from)
                 }
                 TypeKind::Enum { name, .. } => Some(name.clone()),
                 // **P19.14** — primitives carry static methods /
@@ -1787,11 +1740,11 @@ impl<'a> Cx<'a> {
             // P25.7
             TypeKind::Generic { name, args } => (name.clone(), args.to_vec()),
             // P35.7 — handle-keyed variants.
-            TypeKind::Type(d) => match self.decl_registry.name(*d) {
+            TypeKind::Type(d) => match self.arena.decl_name(*d) {
                 Some(n) => (n.into(), Vec::new()),
                 None => return None,
             },
-            TypeKind::GenericInstance { decl, args } => match self.decl_registry.name(*decl) {
+            TypeKind::GenericInstance { decl, args } => match self.arena.decl_name(*decl) {
                 Some(n) => (n.into(), args.to_vec()),
                 None => return None,
             },
@@ -1850,6 +1803,15 @@ impl<'a> Cx<'a> {
     // Lower a syntactic TypeRef to a TypeId.
     fn lower_type_ref(&mut self, idx: Idx<TypeRef>) -> TypeId {
         let tr = self.hir.type_refs[idx].clone();
+        // Qualified refs (`b::Foo`) bind to the decl in the named
+        // module specifically — bypass the bare-name resolution ladder
+        // so a leaf that exists in multiple modules doesn't bind to
+        // the wrong one. Primitives, generic-param scope, and the
+        // current module's registry don't apply on the right side of
+        // `::`, so the qualified path is much shorter.
+        if !tr.qualifier.is_empty() {
+            return self.lower_qualified_type_ref(&tr);
+        }
         let name = self.ident_text(tr.name).to_string();
         let mut base = match name.as_str() {
             "bool" => self.primitive(Primitive::Bool),
@@ -1920,7 +1882,7 @@ impl<'a> Cx<'a> {
                     // the runtime nonetheless recognises (which
                     // `has_name` covers via the seeded primitives /
                     // runtime-implemented types).
-                    self.arena.alloc_type(handle)
+                    self.arena.alloc_type(handle, name.clone())
                 } else if self.index.has_name(&name) {
                     // P11.5 — non-generic foreign type without an
                     // interned decl handle (typically runtime-
@@ -1939,6 +1901,75 @@ impl<'a> Cx<'a> {
                         .unresolved(name.clone(), (tr.byte_range.start, tr.byte_range.end))
                 }
             }
+        };
+        if tr.optional {
+            base = self.arena.nullable(base);
+        }
+        base
+    }
+
+    /// Lower a module-qualified `TypeRef` (`b::Foo`, `b::Map<int>`, …)
+    /// to a `TypeId`. The rightmost qualifier names the module; the
+    /// leaf decl is resolved within that module specifically. Mirrors
+    /// the runtime's qualified-name resolution and matches the
+    /// resolver-side binding emitted by `bind_qualified_type_leaf`.
+    fn lower_qualified_type_ref(&mut self, tr: &TypeRef) -> TypeId {
+        let module_segment = *tr
+            .qualifier
+            .last()
+            .expect("lower_qualified_type_ref called with empty qualifier");
+        let module_name = self.ident_text(module_segment).to_string();
+        let leaf_name = self.ident_text(tr.name).to_string();
+        let byte_span = (tr.byte_range.start, tr.byte_range.end);
+
+        let Some(module_uri) = self.index.module_uri(&module_name).cloned() else {
+            // Qualifier doesn't name a known module — the resolver
+            // already flagged it as unresolved. Surface the leaf as
+            // an Unresolved type so downstream typing doesn't cascade.
+            let mut base = self.arena.unresolved(leaf_name, byte_span);
+            if tr.optional {
+                base = self.arena.nullable(base);
+            }
+            return base;
+        };
+
+        let in_module = |index: &crate::stdlib::ProjectIndex| -> Option<Idx<Decl>> {
+            index
+                .locate_decl(&leaf_name)
+                .iter()
+                .find(|(uri, _)| uri == &module_uri)
+                .map(|(_, d)| *d)
+        };
+
+        // Generic instantiation: `b::Map<int>` etc. Recurse on params
+        // first, then mint via the registry handle when we have one;
+        // fall back to the legacy `Generic { name, args }` shape if
+        // the foreign module hasn't been ingested yet.
+        if !tr.params.is_empty() {
+            let args: Vec<TypeId> = tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
+            let mut base = match in_module(self.index)
+                .and_then(|decl| self.decl_registry.lookup(&module_uri, decl))
+            {
+                Some(handle) => self
+                    .arena
+                    .alloc_generic_instance(handle, leaf_name.clone(), args),
+                None => self.arena.generic(leaf_name.clone(), args),
+            };
+            if tr.optional {
+                base = self.arena.nullable(base);
+            }
+            return base;
+        }
+
+        // Non-generic. Prefer the handle-keyed shape so cross-module
+        // identity collapses to the same TypeDeclId both sides of the
+        // call boundary.
+        let mut base = match in_module(self.index) {
+            Some(decl) => match self.decl_registry.lookup(&module_uri, decl) {
+                Some(handle) => self.arena.alloc_type(handle, leaf_name.clone()),
+                None => self.arena.named(leaf_name.clone()),
+            },
+            None => self.arena.unresolved(leaf_name, byte_span),
         };
         if tr.optional {
             base = self.arena.nullable(base);
@@ -2065,8 +2096,8 @@ impl<'a> Cx<'a> {
                     let msg = format!(
                         "cannot infer `{}`: `{}` conflicts with `{}`",
                         name,
-                        greycat_analyzer_types::display(self.arena, prior),
-                        greycat_analyzer_types::display(self.arena, witness),
+                        self.arena.display(prior),
+                        self.arena.display(witness),
                     );
                     self.diag(Severity::Error, msg, call_range.clone());
                 }
@@ -3107,24 +3138,10 @@ impl<'a> Cx<'a> {
     fn ident_compared_to_null(&self, l: Idx<Expr>, r: Idx<Expr>) -> Option<Idx<Ident>> {
         let le = &self.hir.exprs[l];
         let re = &self.hir.exprs[r];
-        if let (
-            Expr::Ident { name, .. },
-            Expr::Literal(LiteralExpr {
-                kind: LiteralKind::Null,
-                ..
-            }),
-        ) = (le, re)
-        {
+        if let (Expr::Ident { name, .. }, Expr::Null { .. }) = (le, re) {
             return Some(*name);
         }
-        if let (
-            Expr::Literal(LiteralExpr {
-                kind: LiteralKind::Null,
-                ..
-            }),
-            Expr::Ident { name, .. },
-        ) = (le, re)
-        {
+        if let (Expr::Null { .. }, Expr::Ident { name, .. }) = (le, re) {
             return Some(*name);
         }
         None
@@ -3139,15 +3156,7 @@ impl<'a> Cx<'a> {
     /// other shape (so e.g. `foo.bar == baz.qux` or `f().x != null`
     /// don't participate).
     fn member_compared_to_null(&self, l: Idx<Expr>, r: Idx<Expr>) -> Option<String> {
-        let is_null_lit = |id: Idx<Expr>| {
-            matches!(
-                &self.hir.exprs[id],
-                Expr::Literal(LiteralExpr {
-                    kind: LiteralKind::Null,
-                    ..
-                })
-            )
-        };
+        let is_null_lit = |id: Idx<Expr>| matches!(&self.hir.exprs[id], Expr::Null { .. });
         let is_member_or_arrow =
             |id: Idx<Expr>| matches!(self.hir.exprs[id], Expr::Member(_) | Expr::Arrow(_));
         if is_member_or_arrow(l) && is_null_lit(r) {
@@ -3235,29 +3244,24 @@ impl<'a> Cx<'a> {
                 }
                 Some(Definition::Generic(_)) | None => self.any_nullable(),
             },
-            Expr::Literal(LiteralExpr { kind, text, .. }) => match kind {
-                LiteralKind::Bool => self.primitive(Primitive::Bool),
-                LiteralKind::Number => {
-                    // P12.4: differentiate int vs float numeric literals
-                    // by inspecting the source text. `1`, `42`, `0xff`,
-                    // `0b10` lower to `int`; literals with a decimal
-                    // point, scientific exponent, or trailing `_f`
-                    // suffix lower to `float`. Other typed suffixes
-                    // (`_time`, `_duration`, …) keep `Number`-shaped
-                    // text but the lowering layer should mint a typed
-                    // `LiteralKind` for them (P13.3 deepens this).
-                    self.primitive(numeric_literal_kind(text.as_str()))
-                }
-                LiteralKind::Char => self.primitive(Primitive::Char),
-                LiteralKind::Null => self.null(),
-                LiteralKind::This => self
-                    .this_stack
-                    .last()
-                    .copied()
-                    .unwrap_or_else(|| self.any_nullable()),
-                LiteralKind::Duration => self.primitive(Primitive::Duration),
-                LiteralKind::Time | LiteralKind::Iso8601 => self.primitive(Primitive::Time),
+            Expr::Literal(LiteralExpr { kind, .. }) => match kind {
+                LiteralKind::Bool(_) => self.primitive(Primitive::Bool),
+                LiteralKind::Int(_) => self.primitive(Primitive::Int),
+                LiteralKind::Float(_) => self.primitive(Primitive::Float),
+                LiteralKind::Char(_) => self.primitive(Primitive::Char),
+                LiteralKind::Duration(_) => self.primitive(Primitive::Duration),
+                LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.primitive(Primitive::Time),
+                // Parse failure at lowering — type as `any` so
+                // cascades stay quiet. The lowering already emitted
+                // the user-facing diagnostic.
+                LiteralKind::Invalid => self.any_nullable(),
             },
+            Expr::Null { .. } => self.null(),
+            Expr::This { .. } => self
+                .this_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.any_nullable()),
             Expr::String(StringExpr { parts, .. }) => {
                 // P17.5 — visit each `${expr}` interpolation so the
                 // analyzer types and binds the inner identifiers
@@ -3719,16 +3723,17 @@ impl<'a> Cx<'a> {
                     let from_kind = &self.arena.get(from_ty).kind;
                     let to_kind = &self.arena.get(to_ty).kind;
                     // P36.3 — handle-keyed shapes resolve their name
-                    // via the registry; legacy `Named` / `Generic`
-                    // shapes still flow through their inline name.
-                    let registry = self.decl_registry;
+                    // via the arena's decl-names table; legacy `Named`
+                    // / `Generic` shapes still flow through their
+                    // inline name.
+                    let arena = &*self.arena;
                     let extract_name = |k: &TypeKind| -> Option<SmolStr> {
                         match k {
                             TypeKind::Named { name } => Some(name.clone()),
                             TypeKind::Generic { name, .. } => Some(name.clone()),
-                            TypeKind::Type(d) => registry.name(*d).map(SmolStr::from),
+                            TypeKind::Type(d) => arena.decl_name(*d).map(SmolStr::from),
                             TypeKind::GenericInstance { decl, .. } => {
-                                registry.name(*decl).map(SmolStr::from)
+                                arena.decl_name(*decl).map(SmolStr::from)
                             }
                             _ => None,
                         }
@@ -3745,8 +3750,8 @@ impl<'a> Cx<'a> {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",
-                        greycat_analyzer_types::display(self.arena, from_ty),
-                        greycat_analyzer_types::display(self.arena, to_ty),
+                        self.arena.display(from_ty),
+                        self.arena.display(to_ty),
                     );
                     self.diag(Severity::Error, msg, r);
                 }
@@ -4030,26 +4035,12 @@ fn caller() { pair(1, "s"); }
         assert!(r.diagnostics.is_empty(), "unexpected: {:?}", r.diagnostics);
     }
 
-    /// Regression: `2f` (bare `f` suffix, no leading underscore) must
-    /// classify as `float`. The leading `_` is a formatter convention,
-    /// not a grammar requirement — both `42f` and `42_f` are valid
-    /// GreyCat syntax and the analyzer must agree with the runtime
-    /// that they're float literals. Earlier code only matched `_f`,
-    /// so `foo(2f)` against `fn foo(_: float)` lit up a spurious
-    /// `int → float` assignability error.
-    #[test]
-    fn numeric_literal_kind_recognizes_bare_and_underscored_f_suffix() {
-        assert_eq!(super::numeric_literal_kind("2f"), Primitive::Float);
-        assert_eq!(super::numeric_literal_kind("2_f"), Primitive::Float);
-        assert_eq!(super::numeric_literal_kind("1.5f"), Primitive::Float);
-        assert_eq!(super::numeric_literal_kind("1.79e+308_f"), Primitive::Float);
-        assert_eq!(super::numeric_literal_kind("2"), Primitive::Int);
-        assert_eq!(super::numeric_literal_kind("42"), Primitive::Int);
-    }
-
-    /// End-to-end anchor for the same fix: a bare-`f` float literal
-    /// flowing into a `float`-typed parameter must not raise an
-    /// assignability diagnostic.
+    /// End-to-end anchor: a bare-`f` float literal flowing into a
+    /// `float`-typed parameter must not raise an assignability
+    /// diagnostic. (Old `numeric_literal_kind` unit tests were
+    /// retired when the float-vs-int dispatch moved into HIR lowering
+    /// alongside the typed [`LiteralKind`] variants — this end-to-end
+    /// check now anchors the same invariant.)
     #[test]
     fn bare_f_suffix_assigns_to_float_parameter() {
         let src = "fn main() { foo(2f); }\nnative fn foo(_: float) {}\n";
@@ -4549,7 +4540,7 @@ fn f(p: Point): int { return p.bogus; }
             {
                 let _ = stmt_id;
                 let ty = analysis.expr_types.get(&init).copied()?;
-                return Some(greycat_analyzer_types::display(&arena, ty));
+                return Some(arena.display(ty).to_string());
             }
         }
         None

@@ -99,7 +99,7 @@ pub fn lower_module(
     cx.hir.module = Some(Module {
         name: name.into(),
         lib: lib.into(),
-        decls: decl_ids,
+        decls: decl_ids.into_boxed_slice(),
         byte_range: root.byte_range(),
     });
     cx.hir
@@ -157,18 +157,15 @@ fn lower_modifiers(cx: &LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Modifi
 /// string-literal argument the source provided (other arg shapes are
 /// dropped — call-site consumers we have today only read string args).
 // P25.7
-fn lower_annotations(
-    cx: &LowerCtx,
-    decl_node: tree_sitter::Node<'_>,
-) -> smallvec::SmallVec<[Annotation; 1]> {
+fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[Annotation]> {
     let mut cursor = decl_node.walk();
     let Some(annots_node) = decl_node
         .named_children(&mut cursor)
         .find(|c| c.kind() == "annotations")
     else {
-        return smallvec::SmallVec::new();
+        return Box::default();
     };
-    let mut out = smallvec::SmallVec::new();
+    let mut out: Vec<Annotation> = Vec::new();
     let mut c2 = annots_node.walk();
     for ann in annots_node.named_children(&mut c2) {
         if ann.kind() != "annotation" {
@@ -178,10 +175,8 @@ fn lower_annotations(
         let Some(ident) = ann.named_children(&mut c3).find(|n| n.kind() == "ident") else {
             continue;
         };
-        // P25.6
         let name: smol_str::SmolStr = cx.text(ident).into();
-        // P25.6 / P25.7
-        let mut args: smallvec::SmallVec<[smol_str::SmolStr; 1]> = smallvec::SmallVec::new();
+        let mut args: Vec<smol_str::SmolStr> = Vec::new();
         let mut c4 = ann.walk();
         if let Some(args_node) = ann.named_children(&mut c4).find(|n| n.kind() == "args") {
             let mut c5 = args_node.walk();
@@ -193,9 +188,12 @@ fn lower_annotations(
                 }
             }
         }
-        out.push(Annotation { name, args });
+        out.push(Annotation {
+            name,
+            args: args.into_boxed_slice(),
+        });
     }
-    out
+    out.into_boxed_slice()
 }
 
 fn string_literal_value(cx: &LowerCtx, string_node: tree_sitter::Node<'_>) -> Option<String> {
@@ -253,27 +251,25 @@ fn lower_fn_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<FnDec
     })
 }
 
-// P25.7
-fn lower_generics(
-    cx: &mut LowerCtx,
-    node: Option<tree_sitter::Node<'_>>,
-) -> smallvec::SmallVec<[Idx<Ident>; 2]> {
+fn lower_generics(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Box<[Idx<Ident>]> {
     let Some(node) = node else {
-        return smallvec::SmallVec::new();
+        return Box::default();
     };
-    let mut out = smallvec::SmallVec::new();
+    let mut out: Vec<Idx<Ident>> = Vec::new();
     let mut cursor = node.walk();
     for c in node.named_children(&mut cursor) {
         if c.kind() == "ident" {
             out.push(cx.alloc_ident(c));
         }
     }
-    out
+    out.into_boxed_slice()
 }
 
-fn lower_fn_params(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Vec<Idx<FnParam>> {
-    let Some(node) = node else { return Vec::new() };
-    let mut out = Vec::new();
+fn lower_fn_params(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Box<[Idx<FnParam>]> {
+    let Some(node) = node else {
+        return Box::default();
+    };
+    let mut out: Vec<Idx<FnParam>> = Vec::new();
     let mut cursor = node.walk();
     for c in node.named_children(&mut cursor) {
         if c.kind() == "fn_param" {
@@ -292,7 +288,7 @@ fn lower_fn_params(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Ve
             out.push(param);
         }
     }
-    out
+    out.into_boxed_slice()
 }
 
 fn lower_type_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<TypeDecl> {
@@ -332,8 +328,8 @@ fn lower_type_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Typ
         modifiers,
         generics,
         supertype,
-        attrs,
-        methods,
+        attrs: attrs.into_boxed_slice(),
+        methods: methods.into_boxed_slice(),
         doc: doc_text(cx, node),
         byte_range: node.byte_range(),
     })
@@ -406,7 +402,7 @@ fn lower_enum_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Enu
     Some(EnumDecl {
         name,
         modifiers,
-        fields,
+        fields: fields.into_boxed_slice(),
         doc: doc_text(cx, node),
         byte_range: node.byte_range(),
     })
@@ -459,7 +455,7 @@ fn lower_pragma(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Pragma
     }
     Some(Pragma {
         name: name?,
-        args,
+        args: args.into_boxed_slice(),
         byte_range: node.byte_range(),
     })
 }
@@ -493,7 +489,7 @@ fn lower_block_inline(
         }
     }
     Some(crate::types::BlockStmt {
-        stmts,
+        stmts: stmts.into_boxed_slice(),
         byte_range: node.byte_range(),
     })
 }
@@ -690,7 +686,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .child_by_field_name("block")
                 .and_then(|n| lower_block_inline(cx, n))?;
             Stmt::ForIn(ForInStmt {
-                params,
+                params: params.into_boxed_slice(),
                 range,
                 body,
                 byte_range: node.byte_range(),
@@ -762,26 +758,29 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 byte_range: node.byte_range(),
             }
         }
-        "number" | "char" | "false" | "true" | "null" | "this" | "iso8601" => {
-            // `number` covers every numeric form (int/decimal/scientific/
-            // suffixed). P13.3: dispatch typed-suffix literals to their
-            // own `LiteralKind` so the analyzer doesn't have to inspect
-            // raw text for `_time` / `_duration` / unit suffixes. Plain
-            // numeric / `_f` float literals stay `LiteralKind::Number`
-            // (float vs int dispatch happens in the analyzer via
-            // `numeric_literal_kind`).
+        "null" => Expr::Null {
+            byte_range: node.byte_range(),
+        },
+        "this" => Expr::This {
+            byte_range: node.byte_range(),
+        },
+        "number" | "char" | "false" | "true" | "iso8601" => {
+            // Eager-parse every literal into its typed value. The
+            // source text is no longer kept in the HIR — the parsed
+            // value is the source of truth, the CST owns the
+            // original bytes for diagnostics, and the formatter
+            // walks the CST directly so round-trip stays exact.
+            let raw = cx.text(node);
             let lit_kind = match kind {
-                "number" => classify_number(cx, node),
-                "char" => LiteralKind::Char,
-                "false" | "true" => LiteralKind::Bool,
-                "null" => LiteralKind::Null,
-                "this" => LiteralKind::This,
-                "iso8601" => LiteralKind::Iso8601,
+                "number" => classify_and_parse_number(cx, node, raw),
+                "char" => parse_char(raw),
+                "false" => LiteralKind::Bool(false),
+                "true" => LiteralKind::Bool(true),
+                "iso8601" => parse_iso8601(raw),
                 _ => unreachable!(),
             };
             Expr::Literal(LiteralExpr {
                 kind: lit_kind,
-                text: cx.text(node).to_string(),
                 byte_range: node.byte_range(),
             })
         }
@@ -820,17 +819,17 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 }
             }
             Expr::String(StringExpr {
-                parts,
+                parts: parts.into_boxed_slice(),
                 byte_range: node.byte_range(),
             })
         }
         "tuple_expr" => {
             let parts = lower_expr_list(cx, node);
-            Expr::Tuple(parts, node.byte_range())
+            Expr::Tuple(parts.into_boxed_slice(), node.byte_range())
         }
         "array_expr" => {
             let parts = lower_expr_list(cx, node);
-            Expr::Array(parts, node.byte_range())
+            Expr::Array(parts.into_boxed_slice(), node.byte_range())
         }
         "paren_expr" => {
             let inner = node
@@ -881,7 +880,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                     return None;
                 }
                 Expr::QualifiedStatic {
-                    chain,
+                    chain: chain.into_boxed_slice(),
                     byte_range: node.byte_range(),
                 }
             } else {
@@ -949,7 +948,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 .unwrap_or_default();
             Expr::Call(CallExpr {
                 callee,
-                args,
+                args: args.into_boxed_slice(),
                 byte_range: node.byte_range(),
             })
         }
@@ -1082,7 +1081,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             }
             Expr::Object(ObjectExpr {
                 ty,
-                fields,
+                fields: fields.into_boxed_slice(),
                 byte_range: node.byte_range(),
             })
         }
@@ -1111,40 +1110,190 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
     Some(cx.hir.exprs.alloc(expr))
 }
 
-// P13.3
-/// Classify a `number` CST node by its typed suffix.
+/// Classify a `number` CST node by its typed suffix AND parse its
+/// numeric body in one pass. Returns the typed [`LiteralKind`]
+/// variant (or `Invalid` on parse failure / out-of-range).
 ///
-/// Walks `(number_suffixed (number_int|number_decimal|number_scientific)
-/// (number_suffix) ...)` and inspects each suffix lexeme:
-/// - `time` → [`LiteralKind::Time`].
-/// - any duration-unit suffix (`y`, `d`, `h`, `m`, `s`, `ms`, `us`,
-///   `ns`, `min`, `sec`, `hour`, `day`, `week`, `month`, `year`) or
-///   the explicit `_duration` form → [`LiteralKind::Duration`].
-/// - everything else (including `_f` float, `_node*` casts, plain
-///   numbers) → [`LiteralKind::Number`]. The analyzer's
-///   `numeric_literal_kind` then dispatches `_f`/`.`/scientific
-///   between `int` and `float`.
-fn classify_number(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> LiteralKind {
-    let mut c = node.walk();
-    for child in node.named_children(&mut c) {
-        if child.kind() != "number_suffixed" {
-            continue;
+/// Grammar shape: `(number (number_suffixed (number_int |
+/// number_decimal | number_scientific) (number_suffix)?))`.
+///
+/// Suffix dispatch:
+/// - `time` → [`LiteralKind::Time`] (value parsed as i64 ns).
+/// - `duration` / unit suffixes (`y`, `d`, `h`, `m`, `s`, `ms`, `us`,
+///   `ns`, `min`, `sec`, `hour`, `day`, `week`, `month`, `year` and
+///   their long forms) → [`LiteralKind::Duration`] with value
+///   converted to ns.
+/// - bare `f` / `_f` suffix → [`LiteralKind::Float`].
+/// - no suffix:
+///   * `.` or scientific `e`/`E` exponent → [`LiteralKind::Float`].
+///   * otherwise → [`LiteralKind::Int`].
+fn classify_and_parse_number(cx: &LowerCtx, node: tree_sitter::Node<'_>, raw: &str) -> LiteralKind {
+    // Find the numeric body + optional suffix by walking the
+    // `number_suffixed` wrapper. Some forms (plain `42`) skip the
+    // wrapper and the body is the only child.
+    let (body_text, suffix_text) = extract_number_parts(cx, node);
+    let suffix = suffix_text.as_deref().map(|s| s.trim_start_matches('_'));
+    match suffix {
+        Some(s) if s.eq_ignore_ascii_case("time") => {
+            match parse_integer(body_text.as_deref().unwrap_or(raw)) {
+                Some(n) => LiteralKind::Time(n),
+                None => LiteralKind::Invalid,
+            }
         }
-        let mut sc = child.walk();
-        for sub in child.named_children(&mut sc) {
-            if sub.kind() != "number_suffix" {
-                continue;
+        Some(s) if is_duration_suffix(s) => {
+            let Some(body) = body_text.as_deref() else {
+                return LiteralKind::Invalid;
+            };
+            match parse_integer(body).and_then(|n| duration_to_us(n, s)) {
+                Some(us) => LiteralKind::Duration(us),
+                None => LiteralKind::Invalid,
             }
-            let raw = cx.text(sub).trim_matches('_');
-            if raw.eq_ignore_ascii_case("time") {
-                return LiteralKind::Time;
+        }
+        Some(s) if s.eq_ignore_ascii_case("f") => {
+            match parse_float(body_text.as_deref().unwrap_or(raw)) {
+                Some(f) => LiteralKind::Float(f),
+                None => LiteralKind::Invalid,
             }
-            if is_duration_suffix(raw) {
-                return LiteralKind::Duration;
+        }
+        _ => {
+            // No (recognized) suffix — int or float based on form.
+            let text = body_text.as_deref().unwrap_or(raw);
+            if looks_like_float(text) {
+                match parse_float(text) {
+                    Some(f) => LiteralKind::Float(f),
+                    None => LiteralKind::Invalid,
+                }
+            } else {
+                match parse_integer(text) {
+                    Some(n) => LiteralKind::Int(n),
+                    None => LiteralKind::Invalid,
+                }
             }
         }
     }
-    LiteralKind::Number
+}
+
+/// Walk a `number` CST node to recover its body text (the numeric
+/// digits without suffix) and the suffix text (if any). Returns
+/// `(None, None)` if the structure doesn't match — caller falls back
+/// to the full `raw` token.
+fn extract_number_parts(
+    cx: &LowerCtx,
+    node: tree_sitter::Node<'_>,
+) -> (Option<String>, Option<String>) {
+    let mut body: Option<String> = None;
+    let mut suffix: Option<String> = None;
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        if child.kind() == "number_suffixed" {
+            let mut sc = child.walk();
+            for sub in child.named_children(&mut sc) {
+                match sub.kind() {
+                    "number_int" | "number_decimal" | "number_scientific" => {
+                        body = Some(cx.text(sub).to_string());
+                    }
+                    "number_suffix" => {
+                        suffix = Some(cx.text(sub).to_string());
+                    }
+                    _ => {}
+                }
+            }
+        } else if matches!(
+            child.kind(),
+            "number_int" | "number_decimal" | "number_scientific"
+        ) {
+            body = Some(cx.text(child).to_string());
+        }
+    }
+    (body, suffix)
+}
+
+/// Test whether a numeric body text reads as a float — has a decimal
+/// point or a scientific exponent. Mirrors the old analyzer-side
+/// `numeric_literal_kind` heuristic.
+fn looks_like_float(text: &str) -> bool {
+    if text.contains('.') {
+        return true;
+    }
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if (b == b'e' || b == b'E')
+            && i > 0
+            && bytes[i - 1].is_ascii_digit()
+            && let Some(&next) = bytes.get(i + 1)
+            && (next == b'+' || next == b'-' || next.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_integer(s: &str) -> Option<i64> {
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    if let Some(rest) = cleaned.strip_prefix("0x").or(cleaned.strip_prefix("0X")) {
+        i64::from_str_radix(rest, 16).ok()
+    } else if let Some(rest) = cleaned.strip_prefix("0b").or(cleaned.strip_prefix("0B")) {
+        i64::from_str_radix(rest, 2).ok()
+    } else if let Some(rest) = cleaned.strip_prefix("0o").or(cleaned.strip_prefix("0O")) {
+        i64::from_str_radix(rest, 8).ok()
+    } else {
+        cleaned.parse::<i64>().ok()
+    }
+}
+
+fn parse_float(s: &str) -> Option<f64> {
+    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+    cleaned.parse::<f64>().ok()
+}
+
+fn parse_char(raw: &str) -> LiteralKind {
+    // Char tokens come wrapped in single quotes. Strip them, then
+    // decode the (possibly-escaped) inner content. A well-formed
+    // single-char source produces exactly one Unicode scalar.
+    let inner = raw.trim_matches('\'');
+    let decoded: Option<char> = if let Some(esc) = inner.strip_prefix('\\') {
+        match esc {
+            "n" => Some('\n'),
+            "r" => Some('\r'),
+            "t" => Some('\t'),
+            "\\" => Some('\\'),
+            "'" => Some('\''),
+            "\"" => Some('"'),
+            "0" => Some('\0'),
+            _ => None,
+        }
+    } else {
+        let mut chars = inner.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
+    };
+    match decoded {
+        Some(c) => LiteralKind::Char(c),
+        None => LiteralKind::Invalid,
+    }
+}
+
+fn parse_iso8601(raw: &str) -> LiteralKind {
+    // Eager ISO-8601 parsing isn't wired up yet — the GreyCat
+    // runtime translates these to `time` values, but a full
+    // chrono dep would balloon this crate. Store the variant tag
+    // with a 0 placeholder so the analyzer can run its
+    // ISO-specific validation pass; real parsing lands when
+    // chrono / a hand-rolled parser is introduced. Shape-only
+    // sanity check: a well-formed ISO literal starts with four
+    // digits.
+    let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+    let looks_iso = trimmed.len() >= 10
+        && trimmed.as_bytes()[..4].iter().all(|b| b.is_ascii_digit())
+        && trimmed.as_bytes()[4] == b'-';
+    if looks_iso {
+        LiteralKind::Iso8601(0)
+    } else {
+        LiteralKind::Invalid
+    }
 }
 
 fn is_duration_suffix(s: &str) -> bool {
@@ -1172,6 +1321,35 @@ fn is_duration_suffix(s: &str) -> bool {
             | "microsecond"
             | "nanosecond"
     )
+}
+
+/// Convert `value <suffix>` to microseconds — GreyCat's canonical
+/// unit for `duration`. Returns `None` on overflow or unknown
+/// suffix. `month` / `year` use the conventional 30-day / 365-day
+/// approximations. The `ns` / `nanosecond` suffix is sub-microsecond
+/// and truncates toward zero (`999ns` → `0us`, `1000ns` → `1us`)
+/// rather than multiplying.
+fn duration_to_us(value: i64, suffix: &str) -> Option<i64> {
+    const MS: i64 = 1_000;
+    const SEC: i64 = 1_000_000;
+    const MIN: i64 = 60 * SEC;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    match suffix {
+        "ns" | "nanosecond" => Some(value / 1_000),
+        "us" | "microsecond" => Some(value),
+        "ms" | "millisecond" => value.checked_mul(MS),
+        "s" | "sec" | "second" => value.checked_mul(SEC),
+        "m" | "min" | "minute" => value.checked_mul(MIN),
+        "h" | "hour" => value.checked_mul(HOUR),
+        "d" | "day" => value.checked_mul(DAY),
+        "week" => value.checked_mul(7 * DAY),
+        "month" => value.checked_mul(30 * DAY),
+        "y" | "year" => value.checked_mul(365 * DAY),
+        // Explicit `_duration` form: value already in µs.
+        "duration" => Some(value),
+        _ => None,
+    }
 }
 
 fn lower_expr_list(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Vec<Idx<Expr>> {
@@ -1348,28 +1526,42 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
     }
     let name_node = inner.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
-    // Collect every `type_ident` child (other than the head `name`) as
-    // a generic param. The grammar emits one `params:`-tagged child per
-    // arg (`Map<K, V>` yields two `params: type_ident` nodes), so we
-    // can't rely on `child_by_field_name("params")` — that returns
-    // only the first. Walking the named children directly captures
-    // them all.
-    let mut params = Vec::new();
+    // Walk named children once and bucket by kind:
+    //   - `ident` siblings BEFORE the name field tag → module qualifier
+    //     segments (`(ident "::")*` in the grammar, leftmost-first).
+    //   - `type_ident` siblings → generic params.
+    // The grammar emits one `params:`-tagged child per arg
+    // (`Map<K, V>` → two `params: type_ident` nodes), so we can't rely
+    // on `child_by_field_name("params")` — that returns only the
+    // first. Walking the named children directly captures them all.
+    let mut qualifier: Vec<Idx<Ident>> = Vec::new();
+    let mut params: Vec<Idx<TypeRef>> = Vec::new();
     let mut cursor = inner.walk();
     for c in inner.named_children(&mut cursor) {
-        if c.kind() == "type_ident"
-            && c.id() != name_node.id()
-            && let Some(tp) = lower_type_ref(cx, c)
-        {
-            params.push(tp);
+        if c.id() == name_node.id() {
+            continue;
+        }
+        match c.kind() {
+            "ident" => {
+                // Module-qualifier segment. The grammar produces them
+                // in source order before the field-tagged `name`.
+                qualifier.push(cx.alloc_ident(c));
+            }
+            "type_ident" => {
+                if let Some(tp) = lower_type_ref(cx, c) {
+                    params.push(tp);
+                }
+            }
+            _ => {}
         }
     }
     let optional = inner
         .named_children(&mut inner.walk())
         .any(|c| c.kind() == "optional");
     Some(cx.hir.type_refs.alloc(TypeRef {
+        qualifier: qualifier.into_boxed_slice(),
         name,
-        params,
+        params: params.into_boxed_slice(),
         optional,
         // P18.1 — store the `type_ident`'s own byte range, not the
         // wrapper's (`attr_type` / `type_decorator` include the leading

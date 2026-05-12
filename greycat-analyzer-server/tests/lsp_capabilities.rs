@@ -398,9 +398,7 @@ fn cross_module_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let registry = pa.decl_registry();
-    let name_for = |h| registry.name(h).map(str::to_string);
-    let display = greycat_analyzer_types::display_with_names(pa.arena(), ty, &name_for);
+    let display = pa.arena().display(ty).to_string();
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
@@ -1522,9 +1520,7 @@ fn qualified_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let registry = pa.decl_registry();
-    let name_for = |h| registry.name(h).map(str::to_string);
-    let display = greycat_analyzer_types::display_with_names(pa.arena(), ty, &name_for);
+    let display = pa.arena().display(ty).to_string();
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
@@ -1567,7 +1563,7 @@ fn qualified_static_method_ref_infers_function() {
         .get(&y_local)
         .copied()
         .expect("def_type for y");
-    let display = greycat_analyzer_types::display(pa.arena(), ty);
+    let display = pa.arena().display(ty).to_string();
     assert_eq!(
         display, "function",
         "y should infer as `function`, got `{display}`"
@@ -1606,7 +1602,7 @@ fn module_prefixed_type_ref_infers_type() {
         .get(&w_local)
         .copied()
         .expect("def_type for w");
-    let display = greycat_analyzer_types::display(pa.arena(), ty);
+    let display = pa.arena().display(ty).to_string();
     assert_eq!(display, "type", "w should infer as `type`, got `{display}`");
 }
 
@@ -1646,7 +1642,7 @@ fn cross_module_static_method_ref_infers_function() {
         .get(&y_local)
         .copied()
         .expect("def_type for y");
-    let display = greycat_analyzer_types::display(pa.arena(), ty);
+    let display = pa.arena().display(ty).to_string();
     assert_eq!(
         display, "function",
         "y should infer as `function`, got `{display}`"
@@ -1684,7 +1680,7 @@ fn cross_module_static_attr_ref_infers_field() {
         .get(&z_local)
         .copied()
         .expect("def_type for z");
-    let display = greycat_analyzer_types::display(pa.arena(), ty);
+    let display = pa.arena().display(ty).to_string();
     assert_eq!(
         display, "field",
         "z should infer as `field`, got `{display}`"

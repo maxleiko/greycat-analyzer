@@ -239,11 +239,11 @@ impl ProjectAnalysis {
         &mut self.arena
     }
 
-    /// Project-wide decl-handle registry — needed to resolve a
-    /// `TypeKind::Type(handle)` or `TypeKind::GenericInstance { decl, .. }`
-    /// back to a printable name. Capability handlers that render
-    /// types for hover / completion / inlay-hints / etc. consume
-    /// this via [`greycat_analyzer_types::display_with_names`].
+    /// Project-wide decl-handle registry — the canonical
+    /// `(Uri, Idx<Decl>) → TypeDeclId` interner. Decl *names* for
+    /// rendering are owned by `TypeArena` (registered at alloc time
+    /// alongside the handle), so capability handlers go through
+    /// `arena.display(id)` rather than this registry.
     pub fn decl_registry(&self) -> &crate::well_known::DeclRegistry {
         &self.decl_registry
     }
@@ -544,15 +544,14 @@ impl ProjectAnalysis {
                 match &hir.decls[*d_id] {
                     Decl::Type(td) => {
                         let name = hir.idents[td.name].text.as_str();
-                        let decl_id = self.decl_registry.get_or_insert(uri, *d_id, name);
+                        let decl_id = self.decl_registry.get_or_insert(uri, *d_id);
                         self.well_known
                             .record(&module.lib, &module.name, name, decl_id);
                     }
-                    Decl::Enum(ed) => {
+                    Decl::Enum(_) => {
                         // Enums get a handle too — needed for the
                         // cross-arena Enum↔Named bridge cleanup in P35.7.
-                        let name = hir.idents[ed.name].text.as_str();
-                        let _ = self.decl_registry.get_or_insert(uri, *d_id, name);
+                        let _ = self.decl_registry.get_or_insert(uri, *d_id);
                     }
                     _ => {}
                 }
@@ -982,7 +981,6 @@ fn lower_module_signatures(
 /// every primitive / nullable / lambda / tuple rule still fires.
 fn is_assignable_to_with_index(
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
     arena: &greycat_analyzer_types::TypeArena,
     from: greycat_analyzer_types::TypeId,
     to: greycat_analyzer_types::TypeId,
@@ -1002,9 +1000,7 @@ fn is_assignable_to_with_index(
         // `(Named, Named)` arm above but via the registry-resolved
         // decl identity. Both arms coexist during the migration;
         // 36.7 deletes the Named one.
-        (TypeKind::Type(sub), TypeKind::Type(sup)) => {
-            index.is_subtype_of_decl(decl_registry, *sub, *sup)
-        }
+        (TypeKind::Type(sub), TypeKind::Type(sup)) => index.is_subtype_of_decl(arena, *sub, *sup),
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab })
             if na == "node" && nb == "node" && aa.len() == 1 && ab.len() == 1 =>
         {
@@ -1012,7 +1008,7 @@ fn is_assignable_to_with_index(
             // identical). Recurse so a chain like
             // node<DeepSub> -> node<MidSub> -> node<Super> still
             // works in one hop.
-            is_assignable_to_with_index(index, decl_registry, arena, aa[0], ab[0])
+            is_assignable_to_with_index(index, arena, aa[0], ab[0])
         }
         _ => false,
     }
@@ -1359,19 +1355,16 @@ impl ProjectAnalysis {
                     Some(t) => t,
                     None => continue,
                 };
-                if !is_assignable_to_with_index(index, decl_registry, arena, arg_ty, declared_ty) {
+                if !is_assignable_to_with_index(index, arena, arg_ty, declared_ty) {
                     let p_name = fn_module.hir.idents[p.name].text.clone();
-                    let name_for = |h| decl_registry.name(h).map(str::to_string);
-                    let arg_display =
-                        greycat_analyzer_types::display_with_names(arena, arg_ty, &name_for);
-                    let declared_display =
-                        greycat_analyzer_types::display_with_names(arena, declared_ty, &name_for);
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     out.push(SemanticDiagnostic {
                         severity: Severity::Error,
                         message: format!(
                             "value of type `{}` is not assignable to parameter `{}: {}`",
-                            arg_display, p_name, declared_display
+                            arena.display(arg_ty),
+                            p_name,
+                            arena.display(declared_ty),
                         ),
                         byte_range: r,
                         category: DiagCategory::TypeRelation,
@@ -1431,7 +1424,6 @@ impl ProjectAnalysis {
         // alongside `&mut self.modules`.
         let arena = &self.arena;
         let index = &self.index;
-        let decl_registry = &self.decl_registry;
         let bypass = self.bypass_suppressions;
         let enabled_rules = &self.enabled_rules;
 
@@ -1464,16 +1456,7 @@ impl ProjectAnalysis {
             .filter(|(uri, _)| in_scope(uri))
             .collect();
         crate::parallel::par_for_each(modules, |(uri, module)| {
-            run_typed_lints_for_module(
-                uri,
-                module,
-                arena,
-                index,
-                decl_registry,
-                bypass,
-                enabled_rules,
-                &doc_data,
-            );
+            run_typed_lints_for_module(uri, module, arena, index, bypass, enabled_rules, &doc_data);
         });
     }
 
@@ -2147,7 +2130,6 @@ fn run_typed_lints_for_module(
     module: &mut ModuleAnalysis,
     arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
     bypass: bool,
     enabled_rules: &FxHashSet<String>,
     doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
@@ -2207,7 +2189,6 @@ fn run_typed_lints_for_module(
         &module.analysis,
         arena,
         index,
-        decl_registry,
         &mut module.lints,
         &mut module.directives,
         bypass,
@@ -2343,7 +2324,6 @@ fn validate_module_type_relations(
                         check_assign(
                             analysis,
                             index,
-                            decl_registry,
                             arena,
                             init,
                             declared_ty,
@@ -2381,7 +2361,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        decl_registry,
                         arena,
                         init,
                         declared_ty,
@@ -2466,7 +2445,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        decl_registry,
                         arena,
                         *init_id,
                         declared_ty,
@@ -2487,7 +2465,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        decl_registry,
                         arena,
                         *value,
                         target_ty,
@@ -2664,7 +2641,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        decl_registry,
                         arena,
                         *v,
                         rt,
@@ -2688,7 +2664,6 @@ fn validate_module_type_relations(
     fn check_assign(
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
-        decl_registry: &crate::well_known::DeclRegistry,
         arena: &greycat_analyzer_types::TypeArena,
         value_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
         declared_ty: greycat_analyzer_types::TypeId,
@@ -2700,16 +2675,11 @@ fn validate_module_type_relations(
         let Some(value_ty) = analysis.expr_types.get(&value_id).copied() else {
             return;
         };
-        if is_assignable_to_with_index(index, decl_registry, arena, value_ty, declared_ty) {
+        if is_assignable_to_with_index(index, arena, value_ty, declared_ty) {
             return;
         }
-        // Render with registry-backed name resolution so any
-        // `TypeKind::Type(handle)` value (35.4 sentinels: `function`,
-        // `type`, `field` when std is loaded) shows the real decl
-        // name instead of the `?type#N` placeholder.
-        let name_for = |h| decl_registry.name(h).map(str::to_string);
-        let got = greycat_analyzer_types::display_with_names(arena, value_ty, &name_for);
-        let want = greycat_analyzer_types::display_with_names(arena, declared_ty, &name_for);
+        let got = arena.display(value_ty);
+        let want = arena.display(declared_ty);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             message: format!(
@@ -2735,7 +2705,7 @@ fn validate_module_type_relations(
         if greycat_analyzer_types::is_assignable_to(arena, ty, bool_t) {
             return;
         }
-        let got = greycat_analyzer_types::display(arena, ty);
+        let got = arena.display(ty);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             message: format!("{label} must be `bool`, got `{got}`"),
@@ -2774,6 +2744,20 @@ fn lower_type_ref_project(
 ) -> greycat_analyzer_types::TypeId {
     use greycat_analyzer_types::Primitive;
     let tr = hir.type_refs[type_ref].clone();
+    // Qualified ref (`b::Foo`, …): bypass the bare-name ladder. The
+    // resolver-side `bind_qualified_type_leaf` and the body walker's
+    // `lower_qualified_type_ref` use the same module-scoped lookup;
+    // signature lowering does too so all three agree on the shape.
+    if !tr.qualifier.is_empty() {
+        return lower_qualified_type_ref_project(
+            hir,
+            &tr,
+            arena,
+            index,
+            decl_registry,
+            generics_in_scope,
+        );
+    }
     let name = hir.idents[tr.name].text.as_str();
     let mut base = match name {
         "bool" => arena.primitive(Primitive::Bool),
@@ -2837,7 +2821,7 @@ fn lower_type_ref_project(
                 // cases where the registry hasn't seen the decl
                 // (e.g. before its module has been ingested) and
                 // is removed in P36.7.
-                arena.alloc_type(handle)
+                arena.alloc_type(handle, name.to_string())
             } else if index.has_name(name) {
                 arena.named(name.to_string())
             } else {
@@ -2875,6 +2859,74 @@ pub(crate) fn resolve_decl_handle(
         }
     }
     None
+}
+
+/// Signature-side counterpart of [`crate::analyzer::Cx::lower_qualified_type_ref`].
+/// Same module-scoped resolution shape — the three lowering paths
+/// (signature, body walker, resolver) must agree on which decl a
+/// qualified ref binds to, or cross-arena identity breaks.
+fn lower_qualified_type_ref_project(
+    hir: &Hir,
+    tr: &greycat_analyzer_hir::types::TypeRef,
+    arena: &mut greycat_analyzer_types::TypeArena,
+    index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
+    generics_in_scope: &FxHashMap<
+        greycat_analyzer_types::Symbol,
+        greycat_analyzer_types::GenericOwner,
+    >,
+) -> greycat_analyzer_types::TypeId {
+    let module_segment = *tr
+        .qualifier
+        .last()
+        .expect("lower_qualified_type_ref_project called with empty qualifier");
+    let module_name = hir.idents[module_segment].text.as_str();
+    let leaf_name = hir.idents[tr.name].text.to_string();
+    let byte_span = (tr.byte_range.start, tr.byte_range.end);
+
+    let Some(module_uri) = index.module_uri(module_name).cloned() else {
+        let mut base = arena.unresolved(leaf_name, byte_span);
+        if tr.optional {
+            base = arena.nullable(base);
+        }
+        return base;
+    };
+
+    let decl_in_module: Option<Idx<Decl>> = index
+        .locate_decl(&leaf_name)
+        .iter()
+        .find(|(uri, _)| uri == &module_uri)
+        .map(|(_, d)| *d);
+
+    if !tr.params.is_empty() {
+        let args: Vec<greycat_analyzer_types::TypeId> = tr
+            .params
+            .iter()
+            .map(|p| {
+                lower_type_ref_project(hir, *p, arena, index, decl_registry, generics_in_scope)
+            })
+            .collect();
+        let mut base = match decl_in_module.and_then(|d| decl_registry.lookup(&module_uri, d)) {
+            Some(handle) => arena.alloc_generic_instance(handle, leaf_name.clone(), args),
+            None => arena.generic(leaf_name.clone(), args),
+        };
+        if tr.optional {
+            base = arena.nullable(base);
+        }
+        return base;
+    }
+
+    let mut base = match decl_in_module {
+        Some(d) => match decl_registry.lookup(&module_uri, d) {
+            Some(handle) => arena.alloc_type(handle, leaf_name.clone()),
+            None => arena.named(leaf_name.clone()),
+        },
+        None => arena.unresolved(leaf_name, byte_span),
+    };
+    if tr.optional {
+        base = arena.nullable(base);
+    }
+    base
 }
 
 /// Look up a syntactic `TypeRef` and mint a corresponding `TypeId`
@@ -3288,7 +3340,7 @@ mod tests {
             .index
             .fn_signature_for("a")
             .expect("a sig present after invalidate");
-        let display = greycat_analyzer_types::display(&pa.arena, sig.return_ty);
+        let display = pa.arena.display(sig.return_ty).to_string();
         assert!(
             display.contains("String"),
             "expected refreshed return type to be String, got {display:?}"

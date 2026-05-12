@@ -1017,21 +1017,18 @@ pub fn lint_arrow_on_non_deref(
     analysis: &AnalysisResult,
     arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
 ) {
-    lint_arrow_on_non_deref_inner(hir, analysis, arena, index, decl_registry, out, None, false);
+    lint_arrow_on_non_deref_inner(hir, analysis, arena, index, out, None, false);
 }
 
 /// Directive-aware variant of [`lint_arrow_on_non_deref`]. Drops
 /// suppressed emissions before they land in `out`.
-#[allow(clippy::too_many_arguments)]
 pub fn lint_arrow_on_non_deref_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut crate::directives::Directives,
     bypass_suppressions: bool,
@@ -1041,20 +1038,17 @@ pub fn lint_arrow_on_non_deref_with_directives(
         analysis,
         arena,
         index,
-        decl_registry,
         out,
         Some(directives),
         bypass_suppressions,
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lint_arrow_on_non_deref_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut crate::directives::Directives>,
     bypass_suppressions: bool,
@@ -1071,7 +1065,7 @@ fn lint_arrow_on_non_deref_inner(
         let Some(recv_ty) = analysis.expr_types.get(receiver).copied() else {
             continue;
         };
-        let head = receiver_head_name(arena, decl_registry, recv_ty);
+        let head = receiver_head_name(arena, recv_ty);
         let Some(name) = head else {
             // Conservative: receiver is `any` / lambda / tuple / etc. —
             // no head name to classify. Skip.
@@ -1087,9 +1081,7 @@ fn lint_arrow_on_non_deref_inner(
             continue;
         }
         let _ = expr_id;
-        let display = greycat_analyzer_types::display_with_names(arena, recv_ty, &|h| {
-            decl_registry.name(h).map(|s| s.to_string())
-        });
+        let display = arena.display(recv_ty);
         emit_typed(
             out,
             directives.as_deref_mut(),
@@ -1135,18 +1127,16 @@ fn emit_typed(
 /// anonymous / union / enum / generic-param).
 fn receiver_head_name(
     arena: &greycat_analyzer_types::TypeArena,
-    decl_registry: &crate::well_known::DeclRegistry,
     ty: greycat_analyzer_types::TypeId,
 ) -> Option<String> {
     let t = arena.get(ty);
     match &t.kind {
         TypeKind::Named { name } => Some(name.to_string()),
         TypeKind::Generic { name, .. } => Some(name.to_string()),
-        // P35.7 — `TypeKind::Type(handle)` and
-        // `TypeKind::GenericInstance { decl, .. }` resolve to a
-        // decl name through the registry.
-        TypeKind::Type(decl) => decl_registry.name(*decl).map(|s| s.to_string()),
-        TypeKind::GenericInstance { decl, .. } => decl_registry.name(*decl).map(|s| s.to_string()),
+        // P35.7 — `TypeKind::Type(handle)` / `GenericInstance` recover
+        // their decl name from the arena's parallel name table.
+        TypeKind::Type(decl) => arena.decl_name(*decl).map(str::to_string),
+        TypeKind::GenericInstance { decl, .. } => arena.decl_name(*decl).map(str::to_string),
         TypeKind::Primitive(p) => Some(p.name().to_string()),
         _ => None,
     }
@@ -1372,7 +1362,7 @@ fn check_fn_inferred_return(
     if matches!(kind, TypeKind::Any | TypeKind::Never) {
         return;
     }
-    let display = greycat_analyzer_types::display(arena, ret_ty);
+    let display = arena.display(ret_ty);
     let name = &hir.idents[fnd.name];
     emit_typed(
         out,
@@ -1683,10 +1673,8 @@ fn display_property(hir: &Hir, property: PropertyName) -> String {
 fn display_receiver(hir: &Hir, expr_id: Idx<Expr>) -> String {
     match &hir.exprs[expr_id] {
         Expr::Ident { name: name_idx, .. } => hir.idents[*name_idx].text.to_string(),
-        Expr::Literal(l) => match l.kind {
-            greycat_analyzer_hir::types::LiteralKind::This => "this".into(),
-            _ => "expression".into(),
-        },
+        Expr::This { .. } => "this".into(),
+        Expr::Literal(_) | Expr::Null { .. } => "expression".into(),
         Expr::Member(m) => {
             let recv = display_receiver(hir, m.receiver);
             let prop = display_property(hir, m.property);

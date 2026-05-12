@@ -185,7 +185,7 @@ pub fn hover_with_project(
                 let label = format!(
                     "{}: {}",
                     short_expr_label(&module.hir, expr),
-                    greycat_analyzer_types::display(project.arena(), *ty),
+                    project.arena().display(*ty),
                 );
                 return Some(hover_from_markdown(wrap_code(&label), r, text));
             }
@@ -270,11 +270,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
             })
             && let Some(ty) = analysis.expr_types.get(&expr_id)
         {
-            let label = format!(
-                "{}: {}",
-                short_expr_label(&hir, expr),
-                greycat_analyzer_types::display(&arena, *ty),
-            );
+            let label = format!("{}: {}", short_expr_label(&hir, expr), arena.display(*ty),);
             return Some(hover_from_markdown(wrap_code(&label), r, text));
         }
     }
@@ -329,15 +325,10 @@ fn ident_hover_markdown(
         ));
     }
     match resolutions.lookup(ident_idx)? {
-        Definition::Param(name) | Definition::Local(name) => {
-            analysis.def_types.get(&name).map(|ty| {
-                wrap_code(&format!(
-                    "{}: {}",
-                    ident.text,
-                    greycat_analyzer_types::display(arena, *ty),
-                ))
-            })
-        }
+        Definition::Param(name) | Definition::Local(name) => analysis
+            .def_types
+            .get(&name)
+            .map(|ty| wrap_code(&format!("{}: {}", ident.text, arena.display(*ty)))),
         Definition::Decl(decl_id) => {
             Some(render_decl_hover_markdown(hir, &hir.decls[decl_id], None))
         }
@@ -560,7 +551,12 @@ fn render_type_ref(
     type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
 ) -> String {
     let tr = &hir.type_refs[type_ref];
-    let mut out = hir.idents[tr.name].text.to_string();
+    let mut out = String::new();
+    for q in tr.qualifier.iter() {
+        out.push_str(&hir.idents[*q].text);
+        out.push_str("::");
+    }
+    out.push_str(&hir.idents[tr.name].text);
     if !tr.params.is_empty() {
         out.push('<');
         for (i, p) in tr.params.iter().enumerate() {
@@ -664,12 +660,8 @@ pub fn signature_help(
         let label_start = label.len();
         let mut piece = pname.clone();
         if let Some(ty_id) = p.ty {
-            let ty = &hir.type_refs[ty_id];
             piece.push_str(": ");
-            piece.push_str(&hir.idents[ty.name].text);
-            if ty.optional {
-                piece.push('?');
-            }
+            piece.push_str(&render_type_ref(&hir, ty_id));
         }
         label.push_str(&piece);
         params.push(ParameterInformation {
@@ -682,12 +674,8 @@ pub fn signature_help(
     }
     label.push(')');
     if let Some(rt) = fnd.return_type {
-        let r = &hir.type_refs[rt];
         label.push_str(": ");
-        label.push_str(&hir.idents[r.name].text);
-        if r.optional {
-            label.push('?');
-        }
+        label.push_str(&render_type_ref(&hir, rt));
     }
 
     Some(SignatureHelp {
@@ -2078,7 +2066,7 @@ pub fn inlay_hints_with_project(
             {
                 let name_range = &hir.idents[fnd.name].byte_range;
                 if name_range.start <= want.1 && name_range.end >= want.0 {
-                    let label = format!(": {}", greycat_analyzer_types::display(arena, ty));
+                    let label = format!(": {}", arena.display(ty));
                     out.push(InlayHint {
                         position: byte_to_position(text, name_range.end),
                         label: InlayHintLabel::String(label),
@@ -2344,7 +2332,7 @@ fn emit_var_hints(
             let Some(ty) = analysis.expr_types.get(&init_id).copied() else {
                 return;
             };
-            let label = format!(": {}", greycat_analyzer_types::display(arena, ty));
+            let label = format!(": {}", arena.display(ty));
             // Anchor right after the variable name.
             let name_range = &hir.idents[v.name].byte_range;
             out.push(InlayHint {
@@ -3937,7 +3925,7 @@ fn scope_name_meta(
                 .analysis
                 .def_types
                 .get(name_idx)
-                .map(|ty| greycat_analyzer_types::display(arena, *ty));
+                .map(|ty| arena.display(*ty).to_string());
             (detail, None)
         }
         NameSource::Generic => (None, None),
@@ -4276,10 +4264,9 @@ fn member_completion(
 
     let module = project.module(uri)?;
     let arena = project.arena();
-    let decl_registry = &project.decl_registry;
     let well_known = project.well_known();
     let recv_ty = receiver_type_at(text, root, module, recv_end)?;
-    let name = type_head_name(arena, decl_registry, recv_ty)?;
+    let name = type_head_name(arena, recv_ty)?;
 
     // P16.5 — node-tag receivers auto-deref through their inner type:
     //   `n.|`  → list node's own members PLUS the inner type's members
@@ -4290,7 +4277,7 @@ fn member_completion(
         (_, greycat_analyzer_types::TypeKind::Generic { name: tag, args })
             if greycat_analyzer_types::is_node_tag(tag) && args.len() == 1 =>
         {
-            type_head_name(arena, decl_registry, args[0]).map(|s| s.to_string())
+            type_head_name(arena, args[0]).map(|s| s.to_string())
         }
         // P36.6 — handle-keyed node-tag completion. Mirrors the
         // body walker's `arrow_deref_receiver` dispatch via the
@@ -4298,7 +4285,7 @@ fn member_completion(
         (_, greycat_analyzer_types::TypeKind::GenericInstance { decl, args })
             if well_known.is_node_tag(*decl) && args.len() == 1 =>
         {
-            type_head_name(arena, decl_registry, args[0]).map(|s| s.to_string())
+            type_head_name(arena, args[0]).map(|s| s.to_string())
         }
         _ => None,
     };
@@ -4667,18 +4654,18 @@ fn lookup_name_type_in_stmt(
 /// Read the head name of `id` from `arena` — the bare type name
 /// stripped of nullability / generic args. Returns `None` for shapes
 /// without a single name (lambdas, tuples, anonymous structures).
-fn type_head_name<'a>(
-    arena: &'a greycat_analyzer_types::TypeArena,
-    decl_registry: &'a greycat_analyzer_analysis::well_known::DeclRegistry,
+fn type_head_name(
+    arena: &greycat_analyzer_types::TypeArena,
     id: greycat_analyzer_types::TypeId,
-) -> Option<&'a str> {
+) -> Option<&str> {
     use greycat_analyzer_types::TypeKind;
     let t = arena.get(id);
     match &t.kind {
         TypeKind::Named { name } | TypeKind::Generic { name, .. } => Some(name),
-        // P35.7 — handle-keyed variants resolve via the registry.
-        TypeKind::Type(d) => decl_registry.name(*d),
-        TypeKind::GenericInstance { decl, .. } => decl_registry.name(*decl),
+        // P35.7 — handle-keyed variants read the name from the arena's
+        // parallel decl-names table.
+        TypeKind::Type(d) => arena.decl_name(*d),
+        TypeKind::GenericInstance { decl, .. } => arena.decl_name(*decl),
         TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }

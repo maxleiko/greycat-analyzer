@@ -403,7 +403,7 @@ fn enum_variant_access_types_as_enum_in_every_form() {
             .get(&idx)
             .copied()
             .unwrap_or_else(|| panic!("static expr at idx {idx:?} has no expr_types entry"));
-        let display = greycat_analyzer_types::display(pa.arena(), ty);
+        let display = pa.arena().display(ty).to_string();
         assert_eq!(
             display, "Foo",
             "static expression should type as `Foo` (enum), got `{display}`"
