@@ -22,7 +22,7 @@ use greycat_analyzer_hir::types::{
     BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, PropertyName, Stmt,
     TypeDecl, UnaryExpr, UnaryOp,
 };
-use greycat_analyzer_types::{TypeKind, is_node_tag};
+use greycat_analyzer_types::TypeKind;
 
 use crate::analyzer::AnalysisResult;
 use crate::resolver::{Definition, Resolutions};
@@ -995,10 +995,15 @@ fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
 // Rule: arrow-on-non-deref (P16.6 — typed lint)
 // =============================================================================
 
-/// Walk every `Expr::Arrow` and emit an error when the receiver's type is
-/// neither a node tag (`is_node_tag`) nor declared with `@deref(...)` in
-/// the `ProjectIndex::type_flags` table. Mirrors the GreyCat runtime's
+/// Walk every `Expr::Arrow` and emit an error when the receiver's type
+/// is not declared with `@deref("methodName")` in the
+/// `ProjectIndex::type_flags` table. Mirrors the GreyCat runtime's
 /// "cannot deref" rejection — caught at edit time rather than at run.
+/// The runtime types `node<T>` / `nodeTime<T>` / `nodeList<T>` /
+/// `nodeGeo<T>` carry `@deref("resolve")` on their `lib/std/core.gcl`
+/// decl, so once the stdlib is ingested they participate just like
+/// any user-declared `@deref`-annotated type — no hard-coded
+/// name-keyed allowlist needed.
 ///
 /// This is a *typed* lint: it depends on the per-module
 /// [`AnalysisResult`] (for `expr_types`) and the project-wide
@@ -1071,9 +1076,6 @@ fn lint_arrow_on_non_deref_inner(
             // no head name to classify. Skip.
             continue;
         };
-        if is_node_tag(&name) {
-            continue;
-        }
         if index
             .type_flags_for(&name)
             .is_some_and(|f| f.deref.is_some())
@@ -1182,7 +1184,15 @@ impl LintRule for ModVarShape {
             };
             let ty = &cx.hir.type_refs[ty_ref];
             let head = cx.hir.idents[ty.name].text.as_str();
-            if !is_node_tag(head) {
+            // Syntactic-level lint: rejects everything except the
+            // five node-tag head names. Pure source-level pattern,
+            // no decl handle involved (the lint fires before
+            // signature lowering populates type tables).
+            let is_node_tag_head = matches!(
+                head,
+                "node" | "nodeTime" | "nodeGeo" | "nodeList" | "nodeIndex"
+            );
+            if !is_node_tag_head {
                 candidates.push(LintDiagnostic {
                     rule: "modvar-must-be-node-tag",
                     severity: LintSeverity::Error,
@@ -2214,11 +2224,56 @@ fn f(): int {
         pa.module(&uri).unwrap().lints.clone()
     }
 
+    /// Synthetic stdlib + user-source variant of `project_lints` for
+    /// tests that exercise typed lints depending on annotations on
+    /// `lib/std/core.gcl` decls (`@deref("resolve")` on node tags,
+    /// `@iterable` on `Array<T>`, …). Without the stdlib in scope,
+    /// those flags are missing from `ProjectIndex::type_flags` and
+    /// the dependent lints fire spuriously.
+    fn project_lints_with_stdlib(stdlib_src: &str, src: &str) -> Vec<LintDiagnostic> {
+        use crate::project::ProjectAnalysis;
+        use greycat_analyzer_core::SourceManager;
+        use greycat_analyzer_core::lsp_types::Uri;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let stdlib_uri = Uri::from_str("file:///std/core.gcl").unwrap();
+        mgr.add_simple(stdlib_uri, stdlib_src, "std", false);
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(uri.clone(), src, "project", false);
+        let pa = ProjectAnalysis::analyze(&mgr);
+        pa.module(&uri).unwrap().lints.clone()
+    }
+
+    /// Minimal `lib/std/core.gcl` shape carrying `node<T>` +
+    /// `@deref("resolve")` so the arrow-on-non-deref lint can see
+    /// node tags as legitimately derefable.
+    fn synthetic_std_core() -> &'static str {
+        "native type any {}\n\
+         native type bool {}\n\
+         native type int {}\n\
+         native type float {}\n\
+         native type String {}\n\
+         @deref(\"resolve\")\n\
+         native type node<T> {\n    fn resolve(): T;\n}\n\
+         @deref(\"resolve\")\n\
+         native type nodeTime<T> {\n    fn resolve(): T;\n}\n\
+         @deref(\"resolve\")\n\
+         native type nodeList<T> {\n    fn resolve(): T;\n}\n\
+         @deref(\"resolve\")\n\
+         native type nodeGeo<T> {\n    fn resolve(): T;\n}\n\
+         native type nodeIndex<K, V> {}\n\
+         native type Array<T> {}\n"
+    }
+
     #[test]
     fn arrow_on_node_tag_receiver_is_silent() {
-        // P16.6 — `n->name` where `n: node<Foo>` is the canonical OK
-        // shape: `node` is a node-tag, the lint should not fire.
-        let diags = project_lints(
+        // `n->name` where `n: node<Foo>` is the canonical OK shape:
+        // `node<T>` carries `@deref("resolve")` in stdlib so the
+        // lint recognises it as derefable. Synthetic stdlib loaded
+        // because the lint reads `TypeFlags::deref` and that table
+        // only gets populated from real `.gcl` annotations.
+        let diags = project_lints_with_stdlib(
+            synthetic_std_core(),
             r#"
 type Foo {
     name: String;

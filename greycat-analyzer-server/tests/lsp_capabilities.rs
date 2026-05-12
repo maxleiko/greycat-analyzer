@@ -2164,7 +2164,9 @@ fn completion_dot_on_node_tag_receiver_offers_inner_with_arrow_rewrite() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
     let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(
         user_uri.clone(),
         "type Foo {\n  name: String;\n}\nfn caller(n: node<Foo>) {\n  n.\n}\n",

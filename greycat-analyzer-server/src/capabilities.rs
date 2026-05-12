@@ -4292,27 +4292,52 @@ fn member_completion(
     let recv_ty = receiver_type_at(text, root, module, recv_end)?;
     let name = type_head_name(arena, recv_ty)?;
 
-    // P16.5 — node-tag receivers auto-deref through their inner type:
-    //   `n.|`  → list node's own members PLUS the inner type's members
-    //            with a `.` → `->` rewrite edit.
-    //   `n->|` → list the inner type's members directly.
-    // The criterion mirrors the analyzer: single-arg node-tag generic.
-    let inner_head: Option<String> = match (is_arrow, &arena.get(recv_ty).kind) {
-        (_, greycat_analyzer_types::TypeKind::Generic { name: tag, args })
-            if greycat_analyzer_types::is_node_tag(tag) && args.len() == 1 =>
-        {
-            type_head_name(arena, args[0]).map(|s| s.to_string())
+    // `@deref`-driven completion: when the receiver's type declares
+    // `@deref("methodName")`, the `*` / `->` deref desugars to a call
+    // through that method, and member completion on `n->|` lists the
+    // *deref target*'s members (not the tag's own). Read the cached
+    // `TypeMembers::deref_return_ty` (populated by
+    // `crate::project::populate_deref_caches` once signature lowering
+    // settles), substitute the receiver's instantiation, and pull the
+    // head name of the resulting type.
+    let _ = well_known;
+    let inner_head: Option<String> = (|| {
+        let (recv_name, recv_args): (String, Vec<greycat_analyzer_types::TypeId>) =
+            match &arena.get(recv_ty).kind {
+                greycat_analyzer_types::TypeKind::Type(d) => {
+                    (arena.decl_name(*d)?.to_string(), Vec::new())
+                }
+                greycat_analyzer_types::TypeKind::GenericInstance { decl, args } => {
+                    (arena.decl_name(*decl)?.to_string(), args.to_vec())
+                }
+                greycat_analyzer_types::TypeKind::Generic { name, args } => {
+                    (name.to_string(), args.to_vec())
+                }
+                _ => return None,
+            };
+        let members = project.index.type_members_for(&recv_name)?;
+        let deref_ret = members.deref_return_ty?;
+        // Substitute the receiver's generic args into the cached
+        // (still-abstract) deref-method return type.
+        if recv_args.is_empty() {
+            return type_head_name(arena, deref_ret).map(|s| s.to_string());
         }
-        // P36.6 — handle-keyed node-tag completion. Mirrors the
-        // body walker's `arrow_deref_receiver` dispatch via the
-        // well-known node-tag handle set.
-        (_, greycat_analyzer_types::TypeKind::GenericInstance { decl, args })
-            if well_known.is_node_tag(*decl) && args.len() == 1 =>
-        {
-            type_head_name(arena, args[0]).map(|s| s.to_string())
+        let mut subst: rustc_hash::FxHashMap<String, greycat_analyzer_types::TypeId> =
+            rustc_hash::FxHashMap::default();
+        for (i, gp_sym) in members.generics.iter().enumerate() {
+            if let Some(arg) = recv_args.get(i)
+                && let Some(gp_name) = project.index.symbols.resolve(*gp_sym)
+            {
+                subst.insert(gp_name.to_string(), *arg);
+            }
         }
-        _ => None,
-    };
+        // Read-only completion path — clone the arena once, do the
+        // substitution against the clone so the project's shared
+        // arena stays untouched.
+        let mut working_arena = arena.clone();
+        let resolved = working_arena.substitute(deref_ret, &subst);
+        type_head_name(&working_arena, resolved).map(|s| s.to_string())
+    })();
 
     let mut items: Vec<CompletionItem> = Vec::new();
 

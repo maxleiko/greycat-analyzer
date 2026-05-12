@@ -782,16 +782,11 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             {
                 return true;
             }
-            // Node-tag generics (`node`, `nodeTime`, `nodeList`, `nodeIndex`,
-            // `nodeGeo`) are bivariant on their inner args at runtime: a node
-            // ref is a 64-bit handle and the runtime accepts e.g.
-            // `nodeTime<float>` → `nodeTime<float?>` (and the reverse),
-            // `nodeList<node<Dog>>` → `nodeList<node<Animal>>`, etc. Verified
-            // against the runtime oracle. Outer-name equality + arg arity are
-            // still required.
-            if na == nb && aa.len() == ab.len() && is_node_tag(na) {
-                return true;
-            }
+            // Node-tag bivariance (`nodeTime<X> ↔ nodeTime<X?>` etc.)
+            // lives in `is_assignable_to_with_index` (analysis
+            // crate) now, where `WellKnown::is_node_tag(decl)` can
+            // dispatch by decl identity instead of name string. The
+            // pure types crate keeps only invariant arg comparison.
             na == nb
                 && aa.len() == ab.len()
                 && aa.iter().zip(ab).all(|(x, y)| {
@@ -866,27 +861,14 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     }
 }
 
-/// Primitive widening lattice: `int -> float`, plus identity. Strings,
-/// chars, bools etc. don't widen.
-/// `true` for any of the runtime "node-tag" generic names that
-/// auto-deref to their inner type in the assignability relation
-///. Drawn from the TS reference's `StdCoreTypes` interface.
-///
-/// **Deprecated** — string-keyed identity for the node-tag family
-/// lets a user-declared `type node<T>` impersonate the std-core tag
-/// and pick up auto-deref / bivariance semantics it shouldn't.
-/// Migrate to `WellKnown::is_node_tag(decl)` in
-/// [`greycat_analyzer_analysis::well_known`] (handle-keyed) as
-/// callers switch to `TypeKind::GenericInstance { decl, args }`.
-/// This function only dispatches against the legacy
-/// `TypeKind::Named` / `TypeKind::Generic` variants.
-// P35.5
-pub fn is_node_tag(name: &str) -> bool {
-    matches!(
-        name,
-        "node" | "nodeTime" | "nodeGeo" | "nodeList" | "nodeIndex"
-    )
-}
+// `is_node_tag(name: &str)` removed. Name-keyed dispatch let a
+// user-declared `type node<T> {}` impersonate the std-core tag and
+// pick up bivariance / cast semantics it shouldn't. The handle-keyed
+// `WellKnown::is_node_tag(decl)` in
+// [`greycat_analyzer_analysis::well_known`] is the only correct
+// dispatch — node-tag-specific rules now live in
+// `is_assignable_to_with_index` / `is_castable_with_index` in the
+// analysis crate, where `WellKnown` is reachable.
 
 // =============================================================================
 // Inference table (P7.4 — foundational pass)
@@ -1041,18 +1023,12 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                 || is_primitive(to_t, Primitive::Int)
         }
         TypeKind::Primitive(Primitive::Bool) => is_primitive(to_t, Primitive::Bool),
-        // node-tag heads: cast to int or to themselves (covariant
-        // generic args via the `same head name` branch — narrows are
-        // P12.4 territory).
-        TypeKind::Generic { name, .. } | TypeKind::Named { name } if is_node_tag(name) => {
-            is_int_target(to_t) || matches!(to_head.as_deref(), Some(n) if n == name)
-        }
-        // Tuple primitives → int.
-        TypeKind::Generic { name, .. } | TypeKind::Named { name }
-            if matches!(name.as_str(), "t2" | "t3" | "t4" | "t2f" | "t3f" | "t4f") =>
-        {
-            is_int_target(to_t)
-        }
+        // Node-tag heads casting to int (the underlying 64-bit
+        // handle representation) moved to `is_castable_with_index`
+        // in the analysis crate — handle-keyed dispatch via
+        // `WellKnown::is_node_tag(decl)`. Same-head identity is
+        // covered by the `is_assignable_to_strip_source_nullable`
+        // fallthrough below.
         _ => is_assignable_to_strip_source_nullable(arena, from, to),
     }
 }

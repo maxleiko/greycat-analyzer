@@ -526,30 +526,30 @@ fn literal_parse_issue_diagnostic(
     match (kind, issue) {
         (LiteralKind::Int(_), ParseIssue::Overflow) => (
             Severity::Warning,
-            "integer literal exceeds `int` range (i64); value saturated to i64::MAX".to_string(),
+            "integer literal exceeds `int` range: overflow".to_string(),
         ),
         (LiteralKind::Float(_), ParseIssue::PrecisionLoss) => (
             Severity::Warning,
-            "float literal has more significant digits than `float` (f64) can represent; \
+            "float literal has more significant digits than `float` can represent: \
              precision lost"
                 .to_string(),
         ),
         (LiteralKind::Float(_), ParseIssue::Overflow) => (
             Severity::Warning,
-            "float literal exceeds `float` (f64) range; value rounded to infinity".to_string(),
+            "float literal exceeds `float` range: value rounded to infinity".to_string(),
         ),
         (LiteralKind::Duration(_), ParseIssue::Overflow) => (
             Severity::Warning,
-            "duration literal exceeds the representable range (i64 µs); value saturated"
+            "duration literal exceeds the representable `duration` range (µs): value saturated"
                 .to_string(),
         ),
         (LiteralKind::Time(_), ParseIssue::Overflow) => (
             Severity::Warning,
-            "time literal exceeds the representable range (i64 µs); value saturated".to_string(),
+            "time literal exceeds the representable `time` range (µs): value saturated".to_string(),
         ),
         (LiteralKind::Char(_), ParseIssue::Malformed) => (
             Severity::Error,
-            "malformed char literal — unrecognised escape sequence".to_string(),
+            "malformed char literal: unrecognised escape sequence".to_string(),
         ),
         (LiteralKind::Iso8601(_), ParseIssue::Malformed) => {
             (Severity::Error, "malformed ISO-8601 literal".to_string())

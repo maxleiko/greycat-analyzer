@@ -1121,6 +1121,7 @@ fn lower_module_signatures(
 /// every primitive / nullable / lambda / tuple rule still fires.
 fn is_assignable_to_with_index(
     index: &ProjectIndex,
+    well_known: &crate::well_known::WellKnown,
     arena: &greycat_analyzer_types::TypeArena,
     from: greycat_analyzer_types::TypeId,
     to: greycat_analyzer_types::TypeId,
@@ -1142,6 +1143,28 @@ fn is_assignable_to_with_index(
         // and they're already absorbed by the `Unresolved` arm in
         // `is_assignable_to`.
         (TypeKind::Type(sub), TypeKind::Type(sup)) => index.is_subtype_of_decl(arena, *sub, *sup),
+        // Node-tag bivariance (handle-keyed): `nodeTime<X> ↔
+        // nodeTime<X?>`, `nodeList<node<Dog>> → nodeList<node<Animal>>`,
+        // etc. Verified against the runtime oracle: node handles are
+        // 64-bit ints so T-nullability / T-subtyping flow both ways
+        // through any node-tag generic. Outer-decl equality + arg
+        // arity still required. Dispatch by decl identity via
+        // `WellKnown::is_node_tag(decl)` — a user-declared
+        // `type node<T>` would have its own (different) handle and
+        // wouldn't pick up the rule.
+        (
+            TypeKind::GenericInstance { decl: da, args: aa },
+            TypeKind::GenericInstance { decl: db, args: ab },
+        ) if da == db && aa.len() == ab.len() && well_known.is_node_tag(*da) => true,
+        (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab })
+            if na == nb && aa.len() == ab.len() && is_legacy_node_tag_name(na) =>
+        {
+            // Legacy `Generic { name, args }` shape (no decl handle):
+            // accept bivariance using a hard-coded node-tag name
+            // list. Disappears once `lower_type_ref*` migrates the
+            // generic-with-args path to `GenericInstance`.
+            true
+        }
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab })
             if na == "node" && nb == "node" && aa.len() == 1 && ab.len() == 1 =>
         {
@@ -1149,8 +1172,54 @@ fn is_assignable_to_with_index(
             // identical). Recurse so a chain like
             // node<DeepSub> -> node<MidSub> -> node<Super> still
             // works in one hop.
-            is_assignable_to_with_index(index, arena, aa[0], ab[0])
+            is_assignable_to_with_index(index, well_known, arena, aa[0], ab[0])
         }
+        _ => false,
+    }
+}
+
+/// Legacy node-tag-name allowlist. Used only by the
+/// `Generic { name, args }` arms of `is_assignable_to_with_index` /
+/// `is_castable_with_index` while generic-with-args lowering still
+/// produces the name-keyed shape for stdlib types. Disappears when
+/// `lower_type_ref*` mints `GenericInstance { decl, args }` for
+/// every stdlib reference and the bivariance / cast rules can
+/// dispatch on `WellKnown::is_node_tag(decl)` only.
+fn is_legacy_node_tag_name(name: &str) -> bool {
+    matches!(
+        name,
+        "node" | "nodeTime" | "nodeGeo" | "nodeList" | "nodeIndex"
+    )
+}
+
+/// Index-aware extension of [`greycat_analyzer_types::is_castable`].
+/// Adds the node-tag-handle-to-int cast rule (handles are 64-bit
+/// ints at runtime, so `nodeTime<T> as int` succeeds) using
+/// `WellKnown::is_node_tag(decl)` for decl-keyed dispatch. The
+/// legacy `Generic { name, args }` arm uses `is_legacy_node_tag_name`
+/// for the same reason as the assignability path.
+fn is_castable_with_index(
+    well_known: &crate::well_known::WellKnown,
+    arena: &greycat_analyzer_types::TypeArena,
+    from: greycat_analyzer_types::TypeId,
+    to: greycat_analyzer_types::TypeId,
+) -> bool {
+    use greycat_analyzer_types::{Primitive, TypeKind};
+    if greycat_analyzer_types::is_castable(arena, from, to) {
+        return true;
+    }
+    // `*node as int`, `*nodeTime<T> as int`, … — the runtime handle
+    // is a 64-bit int. Source-side: any node-tag (handle-keyed or
+    // legacy-name-keyed) on the lhs, plain `int` on the rhs.
+    let from_t = arena.get(from);
+    let to_t = arena.get(to);
+    let to_is_int = matches!(to_t.kind, TypeKind::Primitive(Primitive::Int));
+    if !to_is_int {
+        return false;
+    }
+    match &from_t.kind {
+        TypeKind::GenericInstance { decl, .. } if well_known.is_node_tag(*decl) => true,
+        TypeKind::Generic { name, .. } if is_legacy_node_tag_name(name) => true,
         _ => false,
     }
 }
@@ -1381,6 +1450,7 @@ impl ProjectAnalysis {
     fn collect_call_arg_diags_split(
         modules: &FxHashMap<Uri, ModuleAnalysis>,
         index: &ProjectIndex,
+        well_known: &crate::well_known::WellKnown,
         decl_registry: &crate::well_known::DeclRegistry,
         cur_uri: &Uri,
         arena: &mut greycat_analyzer_types::TypeArena,
@@ -1493,7 +1563,7 @@ impl ProjectAnalysis {
                     Some(t) => t,
                     None => continue,
                 };
-                if !is_assignable_to_with_index(index, arena, arg_ty, declared_ty) {
+                if !is_assignable_to_with_index(index, well_known, arena, arg_ty, declared_ty) {
                     let p_name = fn_module.hir.idents[p.name].text.clone();
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     out.push(SemanticDiagnostic {
@@ -1636,13 +1706,21 @@ impl ProjectAnalysis {
         // module borrows.
         let arena_mut = &mut self.arena;
         let index = &self.index;
+        let well_known = &self.well_known;
         let decl_registry = &self.decl_registry;
         for (cur_uri, cur_module) in &self.modules {
             if !in_scope(cur_uri) {
                 continue;
             }
             let mut diags: Vec<SemanticDiagnostic> = Vec::new();
-            validate_module_type_relations(cur_module, index, decl_registry, arena_mut, &mut diags);
+            validate_module_type_relations(
+                cur_module,
+                index,
+                well_known,
+                decl_registry,
+                arena_mut,
+                &mut diags,
+            );
             // Call-arg validation needs cross-module access (foreign
             // fn signatures), so it lives on `&self` rather than the
             // free walker. Note: we hold `arena_mut` here, so call into
@@ -1651,6 +1729,7 @@ impl ProjectAnalysis {
             diags.extend(Self::collect_call_arg_diags_split(
                 &self.modules,
                 index,
+                well_known,
                 decl_registry,
                 cur_uri,
                 arena_mut,
@@ -2399,6 +2478,7 @@ fn run_typed_lints_for_module(
 fn validate_module_type_relations(
     module: &ModuleAnalysis,
     index: &ProjectIndex,
+    well_known: &crate::well_known::WellKnown,
     decl_registry: &crate::well_known::DeclRegistry,
     arena: &mut greycat_analyzer_types::TypeArena,
     diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
@@ -2419,6 +2499,7 @@ fn validate_module_type_relations(
             hir,
             analysis,
             index,
+            well_known,
             decl_registry,
             arena,
             bool_t,
@@ -2432,6 +2513,7 @@ fn validate_module_type_relations(
         hir: &greycat_analyzer_hir::Hir,
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        well_known: &crate::well_known::WellKnown,
         decl_registry: &crate::well_known::DeclRegistry,
         arena: &mut greycat_analyzer_types::TypeArena,
         bool_t: greycat_analyzer_types::TypeId,
@@ -2456,6 +2538,7 @@ fn validate_module_type_relations(
                         hir,
                         analysis,
                         index,
+                        well_known,
                         decl_registry,
                         arena,
                         bool_t,
@@ -2482,6 +2565,7 @@ fn validate_module_type_relations(
                         check_assign(
                             analysis,
                             index,
+                            well_known,
                             arena,
                             init,
                             declared_ty,
@@ -2497,6 +2581,7 @@ fn validate_module_type_relations(
                         hir,
                         analysis,
                         index,
+                        well_known,
                         decl_registry,
                         arena,
                         bool_t,
@@ -2520,6 +2605,7 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
+                        well_known,
                         arena,
                         init,
                         declared_ty,
@@ -2539,6 +2625,7 @@ fn validate_module_type_relations(
         hir: &greycat_analyzer_hir::Hir,
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        well_known: &crate::well_known::WellKnown,
         decl_registry: &crate::well_known::DeclRegistry,
         arena: &mut greycat_analyzer_types::TypeArena,
         bool_t: greycat_analyzer_types::TypeId,
@@ -2551,6 +2638,7 @@ fn validate_module_type_relations(
                 hir,
                 analysis,
                 index,
+                well_known,
                 decl_registry,
                 arena,
                 bool_t,
@@ -2566,6 +2654,7 @@ fn validate_module_type_relations(
         hir: &greycat_analyzer_hir::Hir,
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        well_known: &crate::well_known::WellKnown,
         decl_registry: &crate::well_known::DeclRegistry,
         arena: &mut greycat_analyzer_types::TypeArena,
         bool_t: greycat_analyzer_types::TypeId,
@@ -2582,6 +2671,7 @@ fn validate_module_type_relations(
                 hir,
                 analysis,
                 index,
+                well_known,
                 decl_registry,
                 arena,
                 bool_t,
@@ -2605,6 +2695,7 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
+                        well_known,
                         arena,
                         *init_id,
                         declared_ty,
@@ -2625,6 +2716,7 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
+                        well_known,
                         arena,
                         *value,
                         target_ty,
@@ -2654,6 +2746,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2666,6 +2759,7 @@ fn validate_module_type_relations(
                         hir,
                         analysis,
                         index,
+                        well_known,
                         decl_registry,
                         arena,
                         bool_t,
@@ -2691,6 +2785,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2715,6 +2810,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2733,6 +2829,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2746,6 +2843,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2763,6 +2861,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2774,6 +2873,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2787,6 +2887,7 @@ fn validate_module_type_relations(
                     hir,
                     analysis,
                     index,
+                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -2801,6 +2902,7 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
+                        well_known,
                         arena,
                         *v,
                         rt,
@@ -2824,6 +2926,7 @@ fn validate_module_type_relations(
     fn check_assign(
         analysis: &crate::analyzer::AnalysisResult,
         index: &ProjectIndex,
+        well_known: &crate::well_known::WellKnown,
         arena: &greycat_analyzer_types::TypeArena,
         value_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
         declared_ty: greycat_analyzer_types::TypeId,
@@ -2835,7 +2938,7 @@ fn validate_module_type_relations(
         let Some(value_ty) = analysis.expr_types.get(&value_id).copied() else {
             return;
         };
-        if is_assignable_to_with_index(index, arena, value_ty, declared_ty) {
+        if is_assignable_to_with_index(index, well_known, arena, value_ty, declared_ty) {
             return;
         }
         let got = arena.display(value_ty);

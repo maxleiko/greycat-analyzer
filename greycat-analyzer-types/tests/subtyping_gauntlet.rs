@@ -223,15 +223,13 @@ fn rt_cast_int_to_node_tags_allowed() {
     }
 }
 
-#[test]
-fn rt_cast_node_tags_to_int_allowed() {
-    let mut a = arena();
-    let i = a.primitive(Primitive::Int);
-    for tag in ["node", "nodeTime", "nodeList", "nodeIndex", "nodeGeo"] {
-        let tagged = a.named(tag);
-        assert!(is_castable(&a, tagged, i), "{tag} as int should be allowed",);
-    }
-}
+// `rt_cast_node_tags_to_int_allowed` removed: the
+// `node<T> as int` cast rule moved to
+// `crate::project::is_castable_with_index` (analysis crate) where
+// `WellKnown::is_node_tag(decl)` provides handle-keyed dispatch.
+// The pure `is_castable` in this crate no longer knows about node
+// tags — coverage lives in the analysis crate's cross-module
+// fixtures now.
 
 #[test]
 fn rt_cast_string_to_int_rejected() {
@@ -285,43 +283,14 @@ fn rt_generic_param_substitution_through_inference_table() {
 // All directions for the node-tag set pass at runtime. `Array<T>` /
 // `Map<K,V>` stay invariant.
 
-#[test]
-fn rt_nodetime_t_to_nodetime_nullable_t_allowed() {
-    let mut a = arena();
-    let f = a.primitive(Primitive::Float);
-    let f_q = a.nullable(f);
-    let nt_f = a.generic("nodeTime", vec![f]);
-    let nt_fq = a.generic("nodeTime", vec![f_q]);
-    assert!(is_assignable_to(&a, nt_f, nt_fq));
-    assert!(is_assignable_to(&a, nt_fq, nt_f));
-}
-
-#[test]
-fn rt_nodelist_t_to_nodelist_unrelated_t_allowed() {
-    // Runtime probe: `nodeList<node<Foo>>` flows into a
-    // `nodeList<node<Bar>>` slot — the wire shape is a node ref and
-    // the runtime doesn't constrain it further.
-    let mut a = arena();
-    let foo = a.named("Foo");
-    let bar = a.named("Bar");
-    let node_foo = a.generic("node", vec![foo]);
-    let node_bar = a.generic("node", vec![bar]);
-    let nl_foo = a.generic("nodeList", vec![node_foo]);
-    let nl_bar = a.generic("nodeList", vec![node_bar]);
-    assert!(is_assignable_to(&a, nl_foo, nl_bar));
-}
-
-#[test]
-fn rt_nodeindex_args_are_bivariant() {
-    let mut a = arena();
-    let s = a.primitive(Primitive::String);
-    let i = a.primitive(Primitive::Int);
-    let i_q = a.nullable(i);
-    let ni_si = a.generic("nodeIndex", vec![s, i]);
-    let ni_sni = a.generic("nodeIndex", vec![s, i_q]);
-    assert!(is_assignable_to(&a, ni_si, ni_sni));
-    assert!(is_assignable_to(&a, ni_sni, ni_si));
-}
+// `rt_nodetime_t_to_nodetime_nullable_t_allowed`,
+// `rt_nodelist_t_to_nodelist_unrelated_t_allowed`,
+// `rt_nodeindex_args_are_bivariant` — all three node-tag bivariance
+// tests removed. The rule moved to
+// `crate::project::is_assignable_to_with_index` (analysis crate),
+// dispatching by decl identity via `WellKnown::is_node_tag(decl)`.
+// The pure `is_assignable_to` in this crate keeps strict invariance
+// on generic args.
 
 #[test]
 fn rt_array_int_to_array_nullable_int_still_rejected() {
