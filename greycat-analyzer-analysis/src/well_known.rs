@@ -29,10 +29,10 @@ use rustc_hash::FxHashMap;
 ///
 /// Decl *names* aren't stored here — the arena owns them via
 /// [`greycat_analyzer_types::TypeArena::decl_name`], registered at
-/// `alloc_type` / `alloc_generic_instance` time. This keeps the
-/// registry to a single responsibility (handle identity) and lets
-/// downstream consumers render types through `arena.display(id)` with
-/// no registry borrow.
+/// `alloc_type` / `generic` time. This keeps the registry to a
+/// single responsibility (handle identity) and lets downstream
+/// consumers render types through `arena.display(id)` with no
+/// registry borrow.
 /// One entry per resolved `(Uri, Idx<Decl>)` pair.
 #[derive(Debug, Clone)]
 struct DeclEntry {
@@ -144,8 +144,7 @@ pub struct WellKnown {
     /// `Tuple<T, U>` from `lib/std/core.gcl`. `(x, y)` tuple-literal
     /// syntax desugars to `Tuple<T, U>{x, y}` per the compiler, so
     /// the analyzer's `Expr::Tuple` typing mints
-    /// `GenericInstance(tuple_decl, [T, U])` when this slot is
-    /// populated.
+    /// `Generic(tuple_decl, [T, U])` when this slot is populated.
     pub tuple_decl: Option<TypeDeclId>,
 }
 

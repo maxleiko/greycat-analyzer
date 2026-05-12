@@ -151,6 +151,7 @@ fn run_dump(target: &Path, filter: Option<&str>, mode: Mode) -> Result<ExitCode,
                     module,
                     analysis.arena(),
                     &analysis.index,
+                    analysis.decl_registry(),
                     &mut records,
                 );
             }
@@ -329,6 +330,7 @@ fn collect_type_records(
     module: &ModuleAnalysis,
     project_arena: &greycat_analyzer_types::TypeArena,
     index: &ProjectIndex,
+    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
     out: &mut Vec<Record>,
 ) {
     let file = path_to_string(rel);
@@ -410,7 +412,7 @@ fn collect_type_records(
     // 2. Per-type-ref records (`TypeIdent` in TS).
     for (idx, _) in hir.type_refs.iter() {
         let tref = &hir.type_refs[idx];
-        let ty = lower_type_ref_local(hir, idx, &mut arena);
+        let ty = lower_type_ref_local(hir, idx, &mut arena, index, decl_registry);
         push_type_record(
             out,
             &file,
@@ -607,7 +609,13 @@ fn collect_expr_descendants(
 }
 
 /// Local copy of `analysis::stdlib::lower_type_ref` (private upstream).
-fn lower_type_ref_local(hir: &Hir, idx: Idx<TypeRef>, arena: &mut TypeArena) -> TypeId {
+fn lower_type_ref_local(
+    hir: &Hir,
+    idx: Idx<TypeRef>,
+    arena: &mut TypeArena,
+    index: &ProjectIndex,
+    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
+) -> TypeId {
     let tr = &hir.type_refs[idx];
     let name = hir.idents[tr.name].text.to_string();
     let mut base = match name.as_str() {
@@ -622,13 +630,22 @@ fn lower_type_ref_local(hir: &Hir, idx: Idx<TypeRef>, arena: &mut TypeArena) -> 
         "any" => arena.any(),
         "null" => arena.null(),
         _ => {
+            // Resolve the decl handle once — drives both branches below.
+            let handle = greycat_analyzer_analysis::project::resolve_decl_handle(
+                index,
+                decl_registry,
+                &name,
+            );
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
                     .params
                     .iter()
-                    .map(|p| lower_type_ref_local(hir, *p, arena))
+                    .map(|p| lower_type_ref_local(hir, *p, arena, index, decl_registry))
                     .collect();
-                arena.generic(name, args)
+                match handle {
+                    Some(h) => arena.generic(h, name, args),
+                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                }
             } else {
                 arena.named(name)
             }

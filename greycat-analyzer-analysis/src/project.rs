@@ -590,12 +590,8 @@ fn write_type_qualified(
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Named { name } => f.write_str(name.as_str())?,
-        TypeKind::Generic { name, args } => {
-            f.write_str(name.as_str())?;
-            write_args_qualified(f, project, args)?;
-        }
         TypeKind::Type(d) => write_decl_qualified(f, project, *d)?,
-        TypeKind::GenericInstance { decl, args } => {
+        TypeKind::Generic { decl, args } => {
             write_decl_qualified(f, project, *decl)?;
             write_args_qualified(f, project, args)?;
         }
@@ -1152,21 +1148,16 @@ fn is_assignable_to_with_index(
         // `WellKnown::is_node_tag(decl)` — a user-declared
         // `type node<T>` would have its own (different) handle and
         // wouldn't pick up the rule.
-        (
-            TypeKind::GenericInstance { decl: da, args: aa },
-            TypeKind::GenericInstance { decl: db, args: ab },
-        ) if da == db && aa.len() == ab.len() && well_known.is_node_tag(*da) => true,
-        (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab })
-            if na == nb && aa.len() == ab.len() && is_legacy_node_tag_name(na) =>
+        (TypeKind::Generic { decl: da, args: aa }, TypeKind::Generic { decl: db, args: ab })
+            if da == db && aa.len() == ab.len() && well_known.is_node_tag(*da) =>
         {
-            // Legacy `Generic { name, args }` shape (no decl handle):
-            // accept bivariance using a hard-coded node-tag name
-            // list. Disappears once `lower_type_ref*` migrates the
-            // generic-with-args path to `GenericInstance`.
             true
         }
-        (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab })
-            if na == "node" && nb == "node" && aa.len() == 1 && ab.len() == 1 =>
+        (TypeKind::Generic { decl: da, args: aa }, TypeKind::Generic { decl: db, args: ab })
+            if da == db
+                && aa.len() == 1
+                && ab.len() == 1
+                && well_known.node_decl.is_some_and(|nd| nd == *da) =>
         {
             // node<Sub> -> node<Super> when Sub extends Super (or
             // identical). Recurse so a chain like
@@ -1178,27 +1169,11 @@ fn is_assignable_to_with_index(
     }
 }
 
-/// Legacy node-tag-name allowlist. Used only by the
-/// `Generic { name, args }` arms of `is_assignable_to_with_index` /
-/// `is_castable_with_index` while generic-with-args lowering still
-/// produces the name-keyed shape for stdlib types. Disappears when
-/// `lower_type_ref*` mints `GenericInstance { decl, args }` for
-/// every stdlib reference and the bivariance / cast rules can
-/// dispatch on `WellKnown::is_node_tag(decl)` only.
-fn is_legacy_node_tag_name(name: &str) -> bool {
-    matches!(
-        name,
-        "node" | "nodeTime" | "nodeGeo" | "nodeList" | "nodeIndex"
-    )
-}
-
 /// Index-aware extension of [`greycat_analyzer_types::is_castable`].
 /// Adds the node-tag-handle-to-int cast rule (handles are 64-bit
 /// ints at runtime, so `nodeTime<T> as int` succeeds) using
-/// `WellKnown::is_node_tag(decl)` for decl-keyed dispatch. The
-/// legacy `Generic { name, args }` arm uses `is_legacy_node_tag_name`
-/// for the same reason as the assignability path.
-fn is_castable_with_index(
+/// `WellKnown::is_node_tag(decl)` for decl-keyed dispatch.
+pub(crate) fn is_castable_with_index(
     well_known: &crate::well_known::WellKnown,
     arena: &greycat_analyzer_types::TypeArena,
     from: greycat_analyzer_types::TypeId,
@@ -1209,19 +1184,14 @@ fn is_castable_with_index(
         return true;
     }
     // `*node as int`, `*nodeTime<T> as int`, … — the runtime handle
-    // is a 64-bit int. Source-side: any node-tag (handle-keyed or
-    // legacy-name-keyed) on the lhs, plain `int` on the rhs.
+    // is a 64-bit int.
     let from_t = arena.get(from);
     let to_t = arena.get(to);
     let to_is_int = matches!(to_t.kind, TypeKind::Primitive(Primitive::Int));
     if !to_is_int {
         return false;
     }
-    match &from_t.kind {
-        TypeKind::GenericInstance { decl, .. } if well_known.is_node_tag(*decl) => true,
-        TypeKind::Generic { name, .. } if is_legacy_node_tag_name(name) => true,
-        _ => false,
-    }
+    matches!(&from_t.kind, TypeKind::Generic { decl, .. } if well_known.is_node_tag(*decl))
 }
 
 // P19.6
@@ -3022,72 +2992,81 @@ fn lower_type_ref_project(
         );
     }
     let name = hir.idents[tr.name].text.as_str();
-    let mut base = match name {
-        "bool" => arena.primitive(Primitive::Bool),
-        "int" => arena.primitive(Primitive::Int),
-        "float" => arena.primitive(Primitive::Float),
-        "char" => arena.primitive(Primitive::Char),
-        "String" => arena.primitive(Primitive::String),
-        "time" => arena.primitive(Primitive::Time),
-        "duration" => arena.primitive(Primitive::Duration),
-        "geo" => arena.primitive(Primitive::Geo),
-        "any" => arena.any(),
-        "null" => arena.null(),
-        _ => {
-            if !tr.params.is_empty() {
-                let args: Vec<greycat_analyzer_types::TypeId> = tr
-                    .params
-                    .iter()
-                    .map(|p| {
-                        lower_type_ref_project(
-                            hir,
-                            *p,
-                            arena,
-                            index,
-                            decl_registry,
-                            generics_in_scope,
-                        )
-                    })
-                    .collect();
-                arena.generic(name.to_string(), args)
-            } else if let Some(sym) = index.symbol(name)
-                && let Some(owner) = generics_in_scope.get(&sym)
-            {
-                arena.generic_param(name.to_string(), owner.clone())
-            } else if let Some(arity) = index
-                .type_members_for(name)
-                .map(|m| m.generics.len())
-                .filter(|n| *n > 0)
-            {
-                // Raw-form generic reference: `Tensor` (no params)
-                // ≡ `Tensor<any?, any?>`. Expand at lowering time so
-                // the body walker and validation pass agree on the
-                // same shape; kills the need for any raw-form bridge
-                // in `is_assignable_to`.
-                let any_q = arena.any_nullable();
-                let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
-                arena.generic(name.to_string(), args)
-            } else if let Some(enum_id) = index.enum_type_for(name) {
-                // P19.10 — canonical enum TypeId from S7-S11.
-                // Without this, a cross-module enum reference would
-                // mint `Named(name)` (kind != Enum), which breaks
-                // the analyzer's `Static` enum-variant arm
-                // (`if let TypeKind::Enum { variants, .. } = ...`).
-                enum_id
-            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
-                // Non-generic concrete type with a known home decl:
-                // mint a handle-keyed `Type(handle)` so it interns
-                // equal to whatever `register_module_types` produced
-                // for the same decl in the per-module analyzer.
-                arena.alloc_type(handle, name.to_string())
-            } else {
-                // No reachable decl: `Unresolved` so hover / display
-                // surface the typo'd name verbatim, behaves like
-                // `any?` for assignability.
-                arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
+    let mut base =
+        match name {
+            "bool" => arena.primitive(Primitive::Bool),
+            "int" => arena.primitive(Primitive::Int),
+            "float" => arena.primitive(Primitive::Float),
+            "char" => arena.primitive(Primitive::Char),
+            "String" => arena.primitive(Primitive::String),
+            "time" => arena.primitive(Primitive::Time),
+            "duration" => arena.primitive(Primitive::Duration),
+            "geo" => arena.primitive(Primitive::Geo),
+            "any" => arena.any(),
+            "null" => arena.null(),
+            _ => {
+                if !tr.params.is_empty() {
+                    let args: Vec<greycat_analyzer_types::TypeId> = tr
+                        .params
+                        .iter()
+                        .map(|p| {
+                            lower_type_ref_project(
+                                hir,
+                                *p,
+                                arena,
+                                index,
+                                decl_registry,
+                                generics_in_scope,
+                            )
+                        })
+                        .collect();
+                    match resolve_decl_handle(index, decl_registry, name) {
+                        Some(handle) => arena.generic(handle, name.to_string(), args),
+                        None => arena
+                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
+                    }
+                } else if let Some(sym) = index.symbol(name)
+                    && let Some(owner) = generics_in_scope.get(&sym)
+                {
+                    arena.generic_param(name.to_string(), owner.clone())
+                } else if let Some(arity) = index
+                    .type_members_for(name)
+                    .map(|m| m.generics.len())
+                    .filter(|n| *n > 0)
+                {
+                    // Raw-form generic reference: `Tensor` (no params)
+                    // ≡ `Tensor<any?, any?>`. Expand at lowering time so
+                    // the body walker and validation pass agree on the
+                    // same shape; kills the need for any raw-form bridge
+                    // in `is_assignable_to`.
+                    let any_q = arena.any_nullable();
+                    let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
+                    match resolve_decl_handle(index, decl_registry, name) {
+                        Some(handle) => arena.generic(handle, name.to_string(), args),
+                        None => arena
+                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
+                    }
+                } else if let Some(enum_id) = index.enum_type_for(name) {
+                    // P19.10 — canonical enum TypeId from S7-S11.
+                    // Without this, a cross-module enum reference would
+                    // mint `Named(name)` (kind != Enum), which breaks
+                    // the analyzer's `Static` enum-variant arm
+                    // (`if let TypeKind::Enum { variants, .. } = ...`).
+                    enum_id
+                } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+                    // Non-generic concrete type with a known home decl:
+                    // mint a handle-keyed `Type(handle)` so it interns
+                    // equal to whatever `register_module_types` produced
+                    // for the same decl in the per-module analyzer.
+                    arena.alloc_type(handle, name.to_string())
+                } else {
+                    // No reachable decl: `Unresolved` so hover / display
+                    // surface the typo'd name verbatim, behaves like
+                    // `any?` for assignability.
+                    arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
+                }
             }
-        }
-    };
+        };
     if tr.optional {
         base = arena.nullable(base);
     }
@@ -3104,7 +3083,7 @@ fn lower_type_ref_project(
 // `lower_type_ref` can mint `Type(handle)` for foreign non-generic
 // types, completing the `Named` → `Type` migration at the cross-
 // module body-walker site.
-pub(crate) fn resolve_decl_handle(
+pub fn resolve_decl_handle(
     index: &ProjectIndex,
     decl_registry: &crate::well_known::DeclRegistry,
     name: &str,
@@ -3163,8 +3142,8 @@ fn lower_qualified_type_ref_project(
             })
             .collect();
         let mut base = match decl_in_module.and_then(|d| decl_registry.lookup(&module_uri, d)) {
-            Some(handle) => arena.alloc_generic_instance(handle, leaf_name.clone(), args),
-            None => arena.generic(leaf_name.clone(), args),
+            Some(handle) => arena.generic(handle, leaf_name.clone(), args),
+            None => arena.unresolved(leaf_name.clone(), byte_span),
         };
         if tr.optional {
             base = arena.nullable(base);
@@ -3215,65 +3194,74 @@ fn lower_type_ref_id(
         ));
     }
     let name = hir.idents[tr.name].text.as_str();
-    let base = match name {
-        "bool" => arena.primitive(Primitive::Bool),
-        "int" => arena.primitive(Primitive::Int),
-        "float" => arena.primitive(Primitive::Float),
-        "char" => arena.primitive(Primitive::Char),
-        "String" => arena.primitive(Primitive::String),
-        "time" => arena.primitive(Primitive::Time),
-        "duration" => arena.primitive(Primitive::Duration),
-        "geo" => arena.primitive(Primitive::Geo),
-        "any" => arena.any(),
-        "null" => arena.null(),
-        _ => {
-            if !tr.params.is_empty() {
-                let mut args = Vec::with_capacity(tr.params.len());
-                for p in &tr.params {
-                    args.push(lower_type_ref_id(
-                        hir,
-                        *p,
-                        registry,
-                        index,
-                        decl_registry,
-                        type_decls,
-                        arena,
-                    )?);
+    let base =
+        match name {
+            "bool" => arena.primitive(Primitive::Bool),
+            "int" => arena.primitive(Primitive::Int),
+            "float" => arena.primitive(Primitive::Float),
+            "char" => arena.primitive(Primitive::Char),
+            "String" => arena.primitive(Primitive::String),
+            "time" => arena.primitive(Primitive::Time),
+            "duration" => arena.primitive(Primitive::Duration),
+            "geo" => arena.primitive(Primitive::Geo),
+            "any" => arena.any(),
+            "null" => arena.null(),
+            _ => {
+                if !tr.params.is_empty() {
+                    let mut args = Vec::with_capacity(tr.params.len());
+                    for p in &tr.params {
+                        args.push(lower_type_ref_id(
+                            hir,
+                            *p,
+                            registry,
+                            index,
+                            decl_registry,
+                            type_decls,
+                            arena,
+                        )?);
+                    }
+                    match resolve_decl_handle(index, decl_registry, name) {
+                        Some(handle) => arena.generic(handle, name.to_string(), args),
+                        None => arena
+                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
+                    }
+                } else if let Some(arity) = generic_arity_for(name, hir, type_decls, index) {
+                    // Raw-form generic reference: `Tensor` (no params)
+                    // ≡ `Tensor<any?, any?>`. Expand here so the
+                    // validation pass and the body walker's
+                    // `lower_type_ref` produce the same shape.
+                    let any_q = arena.any_nullable();
+                    let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
+                    match resolve_decl_handle(index, decl_registry, name) {
+                        Some(handle) => arena.generic(handle, name.to_string(), args),
+                        None => arena
+                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
+                    }
+                } else if let Some(id) = registry.lookup(name) {
+                    id
+                } else if let Some(enum_id) = index.enum_type_for(name) {
+                    // Canonical enum TypeId from S7-S11. The body walker's
+                    // `lower_type_ref` and `lower_type_ref_project` both
+                    // hit this branch ahead of `resolve_decl_handle`; the
+                    // validation pass has to agree or `Generic("Array",
+                    // [Enum{...}])` (body) vs `Generic("Array",
+                    // [Type(handle)])` (validation) fails invariant
+                    // arg-equality.
+                    enum_id
+                } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+                    // Foreign non-generic decl: mint `Type(handle)` to
+                    // match what the body walker's `lower_type_ref` and
+                    // the signature pass's `lower_type_ref_project`
+                    // produce. Without this, the validation pass would
+                    // mint a different shape than the body walker for
+                    // the same source token — surfacing as a self-named
+                    // "T is not assignable to T" diagnostic.
+                    arena.alloc_type(handle, name.to_string())
+                } else {
+                    arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
                 }
-                arena.generic(name.to_string(), args)
-            } else if let Some(arity) = generic_arity_for(name, hir, type_decls, index) {
-                // Raw-form generic reference: `Tensor` (no params)
-                // ≡ `Tensor<any?, any?>`. Expand here so the
-                // validation pass and the body walker's
-                // `lower_type_ref` produce the same shape.
-                let any_q = arena.any_nullable();
-                let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
-                arena.generic(name.to_string(), args)
-            } else if let Some(id) = registry.lookup(name) {
-                id
-            } else if let Some(enum_id) = index.enum_type_for(name) {
-                // Canonical enum TypeId from S7-S11. The body walker's
-                // `lower_type_ref` and `lower_type_ref_project` both
-                // hit this branch ahead of `resolve_decl_handle`; the
-                // validation pass has to agree or `Generic("Array",
-                // [Enum{...}])` (body) vs `Generic("Array",
-                // [Type(handle)])` (validation) fails invariant
-                // arg-equality.
-                enum_id
-            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
-                // Foreign non-generic decl: mint `Type(handle)` to
-                // match what the body walker's `lower_type_ref` and
-                // the signature pass's `lower_type_ref_project`
-                // produce. Without this, the validation pass would
-                // mint a different shape than the body walker for
-                // the same source token — surfacing as a self-named
-                // "T is not assignable to T" diagnostic.
-                arena.alloc_type(handle, name.to_string())
-            } else {
-                arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
             }
-        }
-    };
+        };
     Some(if tr.optional {
         arena.nullable(base)
     } else {
@@ -3351,7 +3339,10 @@ fn method_subst_from_receiver(
     };
     let recv = arena.get(receiver_ty);
     let (recv_name, recv_args): (&str, &[greycat_analyzer_types::TypeId]) = match &recv.kind {
-        TypeKind::Generic { name, args } => (name.as_str(), args.as_slice()),
+        TypeKind::Generic { decl, args } => match arena.decl_name(*decl) {
+            Some(n) => (n, args.as_slice()),
+            None => return empty(),
+        },
         _ => return empty(),
     };
     let Some(module) = fn_module.hir.module.as_ref() else {

@@ -1197,7 +1197,7 @@ fn native_signature_for(
 /// Native-fn signature counterpart of
 /// [`crate::project::lower_type_ref_project`]. Same handle-keyed
 /// resolution shape — every reference to a `.gcl`-declared type
-/// mints `Type(handle)` / `GenericInstance(handle, args)` via the
+/// mints `Type(handle)` / `Generic(handle, args)` via the
 /// project's `decl_registry`, never the legacy `Named` fallback.
 /// Falls back to `Unresolved` when the referenced decl hasn't been
 /// ingested yet (rare — native fns typically reference primitives
@@ -1224,6 +1224,15 @@ fn lower_native_type_ref(
         "any" => arena.any(),
         "null" => arena.null(),
         _ => {
+            // Resolve the decl handle once (the same lookup powers both
+            // the generic and non-generic branches).
+            let handle = symbols
+                .lookup(&name)
+                .and_then(|s| locate_decl.get(&s))
+                .and_then(|locs| {
+                    locs.iter()
+                        .find_map(|(uri, decl)| decl_registry.lookup(uri, *decl))
+                });
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
                     .params
@@ -1232,18 +1241,14 @@ fn lower_native_type_ref(
                         lower_native_type_ref(hir, *p, arena, decl_registry, locate_decl, symbols)
                     })
                     .collect();
-                arena.generic(name, args)
+                match handle {
+                    Some(h) => arena.generic(h, name, args),
+                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                }
             } else {
                 // Try to mint a handle-keyed `Type(handle)` so native
                 // signatures intern equal to whatever the body-walker
                 // / signature pass produces for the same source token.
-                let handle = symbols
-                    .lookup(&name)
-                    .and_then(|s| locate_decl.get(&s))
-                    .and_then(|locs| {
-                        locs.iter()
-                            .find_map(|(uri, decl)| decl_registry.lookup(uri, *decl))
-                    });
                 match handle {
                     Some(h) => arena.alloc_type(h, name),
                     None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),

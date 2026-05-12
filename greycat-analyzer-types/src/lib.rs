@@ -170,14 +170,6 @@ pub enum TypeKind {
     /// fully-qualified resolution).
     // P25.4 / P35
     Named { name: SmolStr },
-    /// **Deprecated** — being replaced by [`TypeKind::GenericInstance`].
-    ///
-    /// Generic type instantiation — `Array<int>`, `Map<String, int>`, etc.
-    // P25.4 / P25.7 / P35
-    Generic {
-        name: SmolStr,
-        args: SmallVec<[TypeId; 2]>,
-    },
     // P35.2
     /// A resolved non-generic type — user-defined `type Foo {...}` or
     /// a non-generic native type from `std/core`. The decl handle is
@@ -185,7 +177,7 @@ pub enum TypeKind {
     /// the same `TypeDeclId`, so equality is one register-sized
     /// compare.
     ///
-    /// Distinct from [`TypeKind::GenericInstance`] with empty args.
+    /// Distinct from [`TypeKind::Generic`] with empty args.
     /// Non-generic types and zero-arg instantiations are different
     /// concepts — separating them by variant lets the substitution /
     /// variance / node-tag-dispatch machinery match only the latter
@@ -197,7 +189,7 @@ pub enum TypeKind {
     /// `args` are the per-use-site type arguments and are guaranteed
     /// non-empty by the lowering pass (zero-arg uses of a generic
     /// decl are an analysis error caught upstream).
-    GenericInstance {
+    Generic {
         decl: TypeDeclId,
         args: SmallVec<[TypeId; 2]>,
     },
@@ -289,8 +281,8 @@ pub enum GenericOwner {
 /// comparison.
 ///
 /// The arena also owns a parallel `decl_names` table indexed by
-/// `TypeDeclId.raw()`. Every `alloc_type` / `alloc_generic_instance`
-/// records the decl's source name there, so `arena.display(id)` can
+/// `TypeDeclId.raw()`. Every `alloc_type` / `generic` records the
+/// decl's source name there, so `arena.display(id)` can
 /// recover a printable name without a callback or a borrow on the
 /// project's `DeclRegistry`. The duplication is a deliberate
 /// denormalisation: `DeclRegistry` stays the canonical `(uri, decl) →
@@ -396,17 +388,6 @@ impl TypeArena {
         })
     }
 
-    pub fn generic(&mut self, name: impl Into<SmolStr>, args: Vec<TypeId>) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Generic {
-                name: name.into(),
-                // P25.7
-                args: args.into(),
-            },
-            nullable: false,
-        })
-    }
-
     // P35.2
     /// Allocate a resolved non-generic [`TypeKind::Type`]. Registers
     /// `name` with the arena so [`Self::display`] can render the type
@@ -421,21 +402,21 @@ impl TypeArena {
     }
 
     // P35.2
-    /// Allocate a [`TypeKind::GenericInstance`]. Caller guarantees
-    /// `args` is non-empty — zero-arg uses of a generic decl are an
-    /// upstream lowering error, not a value-shaped concept. `name` is
-    /// registered with the arena (same idempotency as
-    /// [`Self::alloc_type`]).
-    pub fn alloc_generic_instance(
+    /// Allocate a [`TypeKind::Generic`] (decl-keyed generic
+    /// instantiation). Caller guarantees `args` is non-empty —
+    /// zero-arg uses of a generic decl are an upstream lowering
+    /// error, not a value-shaped concept. `name` is registered with
+    /// the arena (same idempotency as [`Self::alloc_type`]).
+    pub fn generic(
         &mut self,
         decl: TypeDeclId,
         name: impl Into<SmolStr>,
         args: Vec<TypeId>,
     ) -> TypeId {
-        debug_assert!(!args.is_empty(), "GenericInstance must have non-empty args");
+        debug_assert!(!args.is_empty(), "Generic must have non-empty args");
         self.register_decl_name(decl, name.into());
         self.alloc(Type {
-            kind: TypeKind::GenericInstance {
+            kind: TypeKind::Generic {
                 decl,
                 args: args.into(),
             },
@@ -465,7 +446,7 @@ impl TypeArena {
     }
 
     /// Recover the source name for `decl`, or `None` if no
-    /// `alloc_type` / `alloc_generic_instance` has interned it yet.
+    /// `alloc_type` / `generic` has interned it yet.
     pub fn decl_name(&self, decl: TypeDeclId) -> Option<&str> {
         self.decl_names
             .get(decl.raw() as usize)
@@ -518,9 +499,11 @@ impl TypeArena {
     /// the compiler's desugaring rule (mirrors `[42]` ≡
     /// `Array<int>{42}`). Strictly 2-element — the grammar's
     /// `tuple_expr` rule emits exactly `(left, right)` and nothing
-    /// else, so the type is always a pair.
-    pub fn tuple(&mut self, x: TypeId, y: TypeId) -> TypeId {
-        self.generic("Tuple", vec![x, y])
+    /// else, so the type is always a pair. `decl` is the std-core
+    /// `Tuple` decl handle the caller has pulled from
+    /// `WellKnown::tuple_decl`.
+    pub fn tuple(&mut self, decl: TypeDeclId, x: TypeId, y: TypeId) -> TypeId {
+        self.generic(decl, "Tuple", vec![x, y])
     }
 
     // P19
@@ -546,25 +529,9 @@ impl TypeArena {
                 Some(&witness) => witness,
                 None => ty,
             },
-            TypeKind::Generic { name, args } => {
-                // P25.7
-                let new_args: SmallVec<[TypeId; 2]> =
-                    args.iter().map(|a| self.substitute(*a, subst)).collect();
-                if new_args == *args {
-                    ty
-                } else {
-                    let name = name.clone();
-                    let mut new_t = self.generic(name, new_args.into_vec());
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
-            // P35.2 — `Type(decl)` is non-generic, no params to
-            // substitute. `GenericInstance` mirrors `Generic`.
+            // P35.2 — `Type(decl)` is non-generic, no params to substitute.
             TypeKind::Type(_) => ty,
-            TypeKind::GenericInstance { decl, args } => {
+            TypeKind::Generic { decl, args } => {
                 let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(*a, subst)).collect();
                 if new_args == *args {
@@ -572,13 +539,13 @@ impl TypeArena {
                 } else {
                     let decl = *decl;
                     // Re-use the name already registered for `decl` when
-                    // we minted the original `GenericInstance` — no
-                    // caller-side bookkeeping needed.
+                    // we minted the original `Generic` — no caller-side
+                    // bookkeeping needed.
                     let name = SmolStr::from(
                         self.decl_name(decl)
                             .expect("decl name registered at first alloc"),
                     );
-                    let mut new_t = self.alloc_generic_instance(decl, name, new_args.into_vec());
+                    let mut new_t = self.generic(decl, name, new_args.into_vec());
                     if t.nullable {
                         new_t = self.nullable(new_t);
                     }
@@ -732,70 +699,6 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // `ProjectIndex::ingest`, so `Named` only survives for
         // genuinely-unknown names — which `is_assignable_to`'s
         // Unresolved arm already handles upstream.
-        (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
-            // P12.2: invariant in every generic parameter. The TS
-            // reference checker (`GreycatGenericType.isAssignableTo`)
-            // implements covariance, but the GreyCat runtime — the
-            // true oracle — rejects covariant assignment (e.g.
-            // `Array<float>` is *not* assignable to `Array<int>`).
-            // We follow the runtime, not the TS checker. Supertype-
-            // chain assignability across different generic names
-            // (`type Child<T> extends Parent<T>`) is a later phase.
-            //
-            // **P19.10** — invariance is checked by *bidirectional*
-            // `is_assignable_to` rather than raw `TypeId ==`. The
-            // two are equivalent for primitives and Named-vs-Named
-            // (the only widening rule is `int <: float`, which is
-            // not symmetric, so primitives still test as distinct
-            // unless their `TypeId`s are identical). The bidirectional
-            // form is what lets `Map<Enum{Target,...}, V>` and
-            // `Map<Named{Target}, V>` count as the same outer type
-            // — the Named<->Enum identity at lines 565-566 returns
-            // `true` in both directions, so arg-equality recovers.
-            // Without this, two paths that lower the same enum-typed
-            // arg differently (analyzer's `lower_type_ref` produces
-            // `Enum{...}`, the validation pass's `mint_type_shape`
-            // produces `Named{...}`) would diverge in the containing
-            // `Generic` and surface false-positive
-            // "value of `Map<Target, V>` not assignable to parameter
-            // `_: Map<Target, V>`" diagnostics.
-            //
-            // **P19.14** — when *every* target arg is `any`
-            // (`Foo<X,Y>` → `Foo<any,any>`), the target acts as a
-            // raw-form wildcard and accepts. This matches the
-            // runtime, which accepts `Array<int>` → `Array<any>`,
-            // `Map<S,int>` → `Map<any,any>`, etc.
-            //
-            // Per-arg `any` widening (e.g. `Map<S,int>` →
-            // `Map<S,any>`) is NOT generally accepted by the
-            // runtime — for user-defined `Pair<A,B>` and the
-            // V-slot of `Map<K,V>` the runtime rejects partial
-            // wildcards. We follow the runtime conservatively
-            // and only accept when *all* target args are `any`.
-            // Otherwise, args are invariant (P12.2).
-            if na == nb
-                && aa.len() == ab.len()
-                && !ab.is_empty()
-                && ab
-                    .iter()
-                    .all(|y| matches!(arena.get(*y).kind, TypeKind::Any))
-            {
-                return true;
-            }
-            // Node-tag bivariance (`nodeTime<X> ↔ nodeTime<X?>` etc.)
-            // lives in `is_assignable_to_with_index` (analysis
-            // crate) now, where `WellKnown::is_node_tag(decl)` can
-            // dispatch by decl identity instead of name string. The
-            // pure types crate keeps only invariant arg comparison.
-            na == nb
-                && aa.len() == ab.len()
-                && aa.iter().zip(ab).all(|(x, y)| {
-                    if *x == *y {
-                        return true;
-                    }
-                    is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)
-                })
-        }
         (TypeKind::Lambda(la), TypeKind::Lambda(lb)) => {
             // Contravariant in params, covariant in return. Same as TS.
             la.params.len() == lb.params.len()
@@ -827,18 +730,45 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         (TypeKind::Enum { name: na, .. }, TypeKind::Named { name: nb })
         | (TypeKind::Named { name: nb }, TypeKind::Enum { name: na, .. }) => na == nb,
         // P35.2 — decl-handle identity. `Type(decl)` and
-        // `GenericInstance { decl, .. }` compare by handle equality;
-        // generic args reuse the same invariance / node-tag bivariance
-        // / all-any-wildcard rules as the SmolStr `Generic` arm above.
-        // Node-tag dispatch here still goes through `is_node_tag(name)`
-        // because no caller mints `GenericInstance` yet — 35.5 switches
-        // the node-tag check to a handle comparison once `WellKnown` is
-        // threaded into this fn.
+        // `Generic { decl, .. }` compare by handle equality;
+        // generic args follow runtime-oracle invariance with an
+        // "all-any wildcard" escape.
+        //
+        // P12.2: invariant in every generic parameter. The TS
+        // reference checker (`GreycatGenericType.isAssignableTo`)
+        // implements covariance, but the GreyCat runtime — the
+        // true oracle — rejects covariant assignment (e.g.
+        // `Array<float>` is *not* assignable to `Array<int>`).
+        // We follow the runtime, not the TS checker. Supertype-
+        // chain assignability across different generic names
+        // (`type Child<T> extends Parent<T>`) is a later phase.
+        //
+        // **P19.10** — invariance is checked by *bidirectional*
+        // `is_assignable_to` rather than raw `TypeId ==`, so cross-
+        // arena lowering variations that produce different but
+        // mutually-assignable arg shapes still match.
+        //
+        // **P19.14** — when *every* target arg is `any`
+        // (`Foo<X,Y>` → `Foo<any,any>`), the target acts as a
+        // raw-form wildcard and accepts. This matches the
+        // runtime, which accepts `Array<int>` → `Array<any>`,
+        // `Map<S,int>` → `Map<any,any>`, etc.
+        //
+        // Per-arg `any` widening (e.g. `Map<S,int>` →
+        // `Map<S,any>`) is NOT generally accepted by the
+        // runtime — for user-defined `Pair<A,B>` and the
+        // V-slot of `Map<K,V>` the runtime rejects partial
+        // wildcards. We follow the runtime conservatively
+        // and only accept when *all* target args are `any`.
+        // Otherwise, args are invariant (P12.2).
+        //
+        // Node-tag bivariance (`nodeTime<X> ↔ nodeTime<X?>` etc.)
+        // lives in `is_assignable_to_with_index` (analysis crate)
+        // where `WellKnown::is_node_tag(decl)` provides handle-
+        // keyed dispatch. The pure types crate keeps only
+        // invariant arg comparison.
         (TypeKind::Type(da), TypeKind::Type(db)) => da == db,
-        (
-            TypeKind::GenericInstance { decl: da, args: aa },
-            TypeKind::GenericInstance { decl: db, args: ab },
-        ) => {
+        (TypeKind::Generic { decl: da, args: aa }, TypeKind::Generic { decl: db, args: ab }) => {
             if da == db
                 && aa.len() == ab.len()
                 && !ab.is_empty()
@@ -926,15 +856,22 @@ impl InferenceTable {
                     ty
                 }
             }
-            TypeKind::Generic { name, args } => {
+            TypeKind::Generic { decl, args } => {
                 // P25.7
                 let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(arena, *a)).collect();
                 if new_args == *args {
                     ty
                 } else {
-                    let name = name.clone();
-                    let mut new_t = arena.generic(name, new_args.into_vec());
+                    let decl = *decl;
+                    // Re-use the name already registered for `decl` when
+                    // we minted the original `Generic`.
+                    let name = SmolStr::from(
+                        arena
+                            .decl_name(decl)
+                            .expect("decl name registered at first alloc"),
+                    );
+                    let mut new_t = arena.generic(decl, name, new_args.into_vec());
                     if t.nullable {
                         new_t = arena.nullable(new_t);
                     }
@@ -999,7 +936,7 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         return true;
     }
 
-    let to_head = generic_or_named_name(to_t);
+    let to_head = generic_or_named_name(arena, to_t);
     match &from_t.kind {
         TypeKind::Any => true,
         // **P19.14** — `T as Foo` (where `T` is a generic param)
@@ -1072,9 +1009,13 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
     }
 }
 
-fn generic_or_named_name(t: &Type) -> Option<SmolStr> {
+fn generic_or_named_name(arena: &TypeArena, t: &Type) -> Option<SmolStr> {
     match &t.kind {
-        TypeKind::Generic { name, .. } | TypeKind::Named { name } => Some(name.clone()),
+        TypeKind::Named { name } => Some(name.clone()),
+        // P35.2 — decl-keyed shapes recover their name from the arena's
+        // parallel decl-names table.
+        TypeKind::Type(d) => arena.decl_name(*d).map(SmolStr::from),
+        TypeKind::Generic { decl, .. } => arena.decl_name(*decl).map(SmolStr::from),
         TypeKind::Primitive(p) => Some(p.name().into()),
         _ => None,
     }
@@ -1108,7 +1049,7 @@ fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
 /// `Display`-implementing wrapper returned by [`TypeArena::display`].
 ///
 /// Renders a [`TypeId`] using the arena's `decl_names` table to recover
-/// printable names for [`TypeKind::Type`] / [`TypeKind::GenericInstance`].
+/// printable names for [`TypeKind::Type`] / [`TypeKind::Generic`].
 /// When a decl handle hasn't been registered yet (an internal invariant
 /// violation, since every alloc registers a name), falls back to the
 /// `?type#<raw>` placeholder so the output stays distinguishable.
@@ -1133,15 +1074,11 @@ fn write_type(f: &mut std::fmt::Formatter<'_>, arena: &TypeArena, id: TypeId) ->
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Named { name } => f.write_str(name.as_str())?,
-        TypeKind::Generic { name, args } => {
-            f.write_str(name.as_str())?;
-            write_args(f, arena, args)?;
-        }
         TypeKind::Type(d) => match arena.decl_name(*d) {
             Some(name) => f.write_str(name)?,
             None => write!(f, "?type#{}", d.raw())?,
         },
-        TypeKind::GenericInstance { decl, args } => {
+        TypeKind::Generic { decl, args } => {
             match arena.decl_name(*decl) {
                 Some(name) => f.write_str(name)?,
                 None => write!(f, "?type#{}", decl.raw())?,
@@ -1244,17 +1181,9 @@ pub fn display_fqn(
             home_lib(name.as_str()).unwrap_or_else(|| "core".to_string()),
             name
         ),
-        TypeKind::Generic { name, args } => {
-            let lib = home_lib(name.as_str()).unwrap_or_else(|| "core".to_string());
-            let parts: Vec<String> = args
-                .iter()
-                .map(|a| display_fqn(arena, *a, home_lib))
-                .collect();
-            format!("{lib}::{name}<{}>", parts.join(", "))
-        }
         // P35.2 — decl names come from the arena (registered at alloc
-        // time). `home_lib` is still threaded for the legacy `Named` /
-        // `Generic` shapes where the name isn't keyed by a decl handle.
+        // time). `home_lib` is still threaded for the legacy `Named`
+        // shape where the name isn't keyed by a decl handle.
         TypeKind::Type(d) => match arena.decl_name(*d) {
             Some(name) => format!(
                 "{}::{}",
@@ -1263,7 +1192,7 @@ pub fn display_fqn(
             ),
             None => format!("?type#{}", d.raw()),
         },
-        TypeKind::GenericInstance { decl, args } => {
+        TypeKind::Generic { decl, args } => {
             let parts: Vec<String> = args
                 .iter()
                 .map(|a| display_fqn(arena, *a, home_lib))
@@ -1366,8 +1295,9 @@ mod tests {
         assert_eq!(from_smol, from_str);
 
         let arg_string = a.primitive(Primitive::Int);
-        let g_a = a.generic(String::from("Array"), vec![arg_string]);
-        let g_b = a.generic(SmolStr::from("Array"), vec![arg_string]);
+        let array_decl = TypeDeclId::from_raw(0);
+        let g_a = a.generic(array_decl, String::from("Array"), vec![arg_string]);
+        let g_b = a.generic(array_decl, SmolStr::from("Array"), vec![arg_string]);
         assert_eq!(g_a, g_b);
     }
 
@@ -1436,8 +1366,9 @@ mod tests {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
         let float = a.primitive(Primitive::Float);
-        let arr_int = a.generic("Array", vec![int]);
-        let arr_float = a.generic("Array", vec![float]);
+        let array_decl = TypeDeclId::from_raw(0);
+        let arr_int = a.generic(array_decl, "Array", vec![int]);
+        let arr_float = a.generic(array_decl, "Array", vec![float]);
         // P12.2 (matches the GreyCat runtime, *not* the TS reference
         // checker): generic args are invariant. Even though `int`
         // widens to `float`, `Array<int>` is **not** assignable to
@@ -1452,8 +1383,10 @@ mod tests {
     fn generic_name_mismatch_stays_unassignable() {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
-        let arr_int = a.generic("Array", vec![int]);
-        let set_int = a.generic("Set", vec![int]);
+        let array_decl = TypeDeclId::from_raw(0);
+        let set_decl = TypeDeclId::from_raw(1);
+        let arr_int = a.generic(array_decl, "Array", vec![int]);
+        let set_int = a.generic(set_decl, "Set", vec![int]);
         // Different generic names with the same args still mismatch.
         // Inheritance-aware assignability (`type Child<T> extends
         // Parent<T>`) is a later phase.
@@ -1538,7 +1471,8 @@ mod tests {
         let int = a.primitive(Primitive::Int);
         let int_q = a.nullable(int);
         let str_t = a.primitive(Primitive::String);
-        let arr = a.generic("Array", vec![str_t]);
+        let array_decl = TypeDeclId::from_raw(0);
+        let arr = a.generic(array_decl, "Array", vec![str_t]);
         assert_eq!(a.display(int_q).to_string(), "int?");
         assert_eq!(a.display(arr).to_string(), "Array<String>");
     }
@@ -1554,7 +1488,8 @@ mod tests {
         // runtime oracle disagreed.
         let mut a = fresh();
         let person = a.named("Person");
-        let node_person = a.generic("node", vec![person]);
+        let node_decl = TypeDeclId::from_raw(0);
+        let node_person = a.generic(node_decl, "node", vec![person]);
         assert!(!is_assignable_to(&a, node_person, person));
         assert!(!is_assignable_to(&a, person, node_person));
     }
@@ -1570,17 +1505,18 @@ mod tests {
             },
             nullable: false,
         });
-        let arr_t = a.generic("Array", vec![t_param]);
+        let array_decl = TypeDeclId::from_raw(0);
+        let arr_t = a.generic(array_decl, "Array", vec![t_param]);
 
         let mut tbl = InferenceTable::new();
         tbl.bind("T", int);
 
         let resolved = tbl.substitute(&mut a, arr_t);
         let resolved_kind = &a.get(resolved).kind;
-        let TypeKind::Generic { name, args } = resolved_kind else {
+        let TypeKind::Generic { decl, args } = resolved_kind else {
             panic!("expected Array<int>, got {resolved_kind:?}");
         };
-        assert_eq!(name, "Array");
+        assert_eq!(*decl, array_decl);
         // P25.7: args is `SmallVec<[TypeId; 2]>` — compare via slices.
         assert_eq!(args.as_slice(), &[int]);
     }
@@ -1604,17 +1540,19 @@ mod tests {
             },
             nullable: false,
         });
-        let map_tu = a.generic("Map", vec![t_param, u_param]);
+        let array_decl = TypeDeclId::from_raw(0);
+        let map_decl = TypeDeclId::from_raw(1);
+        let map_tu = a.generic(map_decl, "Map", vec![t_param, u_param]);
 
         let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
         subst.insert("T".into(), int);
         subst.insert("U".into(), str_t);
 
         let resolved = a.substitute(map_tu, &subst);
-        let TypeKind::Generic { name, args } = &a.get(resolved).kind else {
+        let TypeKind::Generic { decl, args } = &a.get(resolved).kind else {
             panic!("expected Map<int, String>");
         };
-        assert_eq!(name, "Map");
+        assert_eq!(*decl, map_decl);
         // P25.7: args is `SmallVec<[TypeId; 2]>` — compare via slices.
         assert_eq!(args.as_slice(), &[int, str_t]);
 
@@ -1624,7 +1562,7 @@ mod tests {
 
         // Nullability preserved: Array<T?> with T → int gives Array<int?>.
         let t_param_q = a.nullable(t_param);
-        let arr_t_q = a.generic("Array", vec![t_param_q]);
+        let arr_t_q = a.generic(array_decl, "Array", vec![t_param_q]);
         let resolved_q = a.substitute(arr_t_q, &subst);
         let TypeKind::Generic { args: q_args, .. } = &a.get(resolved_q).kind else {
             panic!();
@@ -1636,7 +1574,8 @@ mod tests {
     fn arena_substitute_no_op_on_empty_subst() {
         let mut a = fresh();
         let int = a.primitive(Primitive::Int);
-        let arr = a.generic("Array", vec![int]);
+        let array_decl = TypeDeclId::from_raw(0);
+        let arr = a.generic(array_decl, "Array", vec![int]);
         let empty: FxHashMap<String, TypeId> = FxHashMap::default();
         assert_eq!(a.substitute(arr, &empty), arr);
     }

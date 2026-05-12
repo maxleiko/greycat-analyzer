@@ -19,11 +19,18 @@
 //! ```
 //! against the live stdlib. Tests below assert the runtime outcome.
 
-use greycat_analyzer_types::{GenericOwner, Primitive, TypeArena, is_assignable_to, is_castable};
+use greycat_analyzer_types::{
+    GenericOwner, Primitive, TypeArena, TypeDeclId, is_assignable_to, is_castable,
+};
 
 fn arena() -> TypeArena {
     TypeArena::new()
 }
+
+// Synthetic decl handles for tests: the pure `types` crate has no
+// `DeclRegistry`, so we mint stable raw ids per generic name.
+const ARRAY_DECL: TypeDeclId = TypeDeclId::from_raw(0);
+const TUPLE_DECL: TypeDeclId = TypeDeclId::from_raw(2);
 
 // =============================================================================
 // Primitive widening (none — runtime rejects every cross-primitive flow)
@@ -152,7 +159,7 @@ fn rt_null_to_nullable_allowed() {
 fn rt_array_int_to_array_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
-    let arr_i = a.generic("Array", vec![i]);
+    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
     assert!(is_assignable_to(&a, arr_i, arr_i));
 }
 
@@ -163,8 +170,8 @@ fn rt_array_int_to_array_float_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let f = a.primitive(Primitive::Float);
-    let arr_i = a.generic("Array", vec![i]);
-    let arr_f = a.generic("Array", vec![f]);
+    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
+    let arr_f = a.generic(ARRAY_DECL, "Array", vec![f]);
     assert!(!is_assignable_to(&a, arr_i, arr_f));
     assert!(!is_assignable_to(&a, arr_f, arr_i));
 }
@@ -179,8 +186,8 @@ fn rt_array_int_to_array_nullable_int_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic("Array", vec![i]);
-    let arr_iq = a.generic("Array", vec![i_q]);
+    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
+    let arr_iq = a.generic(ARRAY_DECL, "Array", vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
 }
 
@@ -193,8 +200,8 @@ fn rt_tuple_identity_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let s = a.primitive(Primitive::String);
-    let t1 = a.tuple(i, s);
-    let t2 = a.tuple(i, s);
+    let t1 = a.tuple(TUPLE_DECL, i, s);
+    let t2 = a.tuple(TUPLE_DECL, i, s);
     assert!(is_assignable_to(&a, t1, t2));
 }
 
@@ -204,8 +211,8 @@ fn rt_tuple_element_mismatch_rejected() {
     let i = a.primitive(Primitive::Int);
     let s = a.primitive(Primitive::String);
     let f = a.primitive(Primitive::Float);
-    let t1 = a.tuple(i, s);
-    let t2 = a.tuple(f, s);
+    let t1 = a.tuple(TUPLE_DECL, i, s);
+    let t2 = a.tuple(TUPLE_DECL, f, s);
     assert!(!is_assignable_to(&a, t1, t2));
 }
 
@@ -300,8 +307,8 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic("Array", vec![i]);
-    let arr_iq = a.generic("Array", vec![i_q]);
+    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
+    let arr_iq = a.generic(ARRAY_DECL, "Array", vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
     assert!(!is_assignable_to(&a, arr_iq, arr_i));
 }

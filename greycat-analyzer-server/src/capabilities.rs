@@ -4307,11 +4307,8 @@ fn member_completion(
                 greycat_analyzer_types::TypeKind::Type(d) => {
                     (arena.decl_name(*d)?.to_string(), Vec::new())
                 }
-                greycat_analyzer_types::TypeKind::GenericInstance { decl, args } => {
+                greycat_analyzer_types::TypeKind::Generic { decl, args } => {
                     (arena.decl_name(*decl)?.to_string(), args.to_vec())
-                }
-                greycat_analyzer_types::TypeKind::Generic { name, args } => {
-                    (name.to_string(), args.to_vec())
                 }
                 _ => return None,
             };
@@ -4710,11 +4707,11 @@ fn type_head_name(
     use greycat_analyzer_types::TypeKind;
     let t = arena.get(id);
     match &t.kind {
-        TypeKind::Named { name } | TypeKind::Generic { name, .. } => Some(name),
+        TypeKind::Named { name } => Some(name),
         // P35.7 — handle-keyed variants read the name from the arena's
         // parallel decl-names table.
         TypeKind::Type(d) => arena.decl_name(*d),
-        TypeKind::GenericInstance { decl, .. } => arena.decl_name(*decl),
+        TypeKind::Generic { decl, .. } => arena.decl_name(*decl),
         TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }

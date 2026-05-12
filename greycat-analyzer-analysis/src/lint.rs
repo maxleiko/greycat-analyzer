@@ -1134,11 +1134,10 @@ fn receiver_head_name(
     let t = arena.get(ty);
     match &t.kind {
         TypeKind::Named { name } => Some(name.to_string()),
-        TypeKind::Generic { name, .. } => Some(name.to_string()),
-        // P35.7 — `TypeKind::Type(handle)` / `GenericInstance` recover
+        // P35.7 — `TypeKind::Type(handle)` / `Generic` recover
         // their decl name from the arena's parallel name table.
         TypeKind::Type(decl) => arena.decl_name(*decl).map(str::to_string),
-        TypeKind::GenericInstance { decl, .. } => arena.decl_name(*decl).map(str::to_string),
+        TypeKind::Generic { decl, .. } => arena.decl_name(*decl).map(str::to_string),
         TypeKind::Primitive(p) => Some(p.name().to_string()),
         _ => None,
     }
@@ -2262,7 +2261,8 @@ fn f(): int {
          @deref(\"resolve\")\n\
          native type nodeGeo<T> {\n    fn resolve(): T;\n}\n\
          native type nodeIndex<K, V> {}\n\
-         native type Array<T> {}\n"
+         native type Array<T> { fn size(): int; }\n\
+         native type Map<K, V> { fn size(): int; }\n"
     }
 
     #[test]
@@ -2581,7 +2581,8 @@ fn f(x: String?) {
         // non-null after the op. Subsequent reads must NOT flag
         // `possibly-null`. Mirrors the dominant pattern in the
         // solarleb corpus (`country->governorates ?= nodeIndex<…> {};`).
-        let diags = project_lints(
+        let diags = project_lints_with_stdlib(
+            synthetic_std_core(),
             r#"
 type Bag { items: Map<String, int>?; }
 fn f(b: Bag) {
@@ -2599,7 +2600,8 @@ fn f(b: Bag) {
     #[test]
     fn coalesce_assign_narrows_arrow_lhs() {
         // Same as above but with the `->` form on a node-tag receiver.
-        let diags = project_lints(
+        let diags = project_lints_with_stdlib(
+            synthetic_std_core(),
             r#"
 type Inner { v: int; }
 type Outer { items: Map<String, int>?; }
@@ -2620,7 +2622,8 @@ fn f(x: node<Outer>) {
         // `if (x->y == null) { ... } else { x->y.foo() }` — the else
         // branch should see `x->y` as non-null. Required Arrow support
         // in `member_compared_to_null` and `member_path`.
-        let diags = project_lints(
+        let diags = project_lints_with_stdlib(
+            synthetic_std_core(),
             r#"
 type Inner { fn ping(): int { return 0; } }
 type Outer { y: Inner?; }
@@ -2642,7 +2645,8 @@ fn f(x: node<Outer>) {
     fn arrow_path_short_circuit_and_narrows_rhs() {
         // `x->y != null && x->y.foo()` — the right operand of `&&`
         // sees the LHS narrows applied (P13.2-followup).
-        let diags = project_lints(
+        let diags = project_lints_with_stdlib(
+            synthetic_std_core(),
             r#"
 type Inner { fn ping(): int { return 0; } }
 type Outer { y: Inner?; }
@@ -2685,7 +2689,8 @@ fn f(meta: Meta) {
         // **P20.2** — same shape as the dot case but for `->`. Path
         // keys carry the operator, so dot-narrows and arrow-narrows
         // don't share state.
-        let diags = project_lints(
+        let diags = project_lints_with_stdlib(
+            synthetic_std_core(),
             r#"
 type Inner { items: Array<int>?; }
 type Outer { inner: Inner?; }
