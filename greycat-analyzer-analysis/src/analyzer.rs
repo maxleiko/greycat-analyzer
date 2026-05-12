@@ -433,12 +433,46 @@ pub fn analyze_with_index_into(
 
     // Surface resolver's unresolved-name list as analyzer diagnostics so
     // P2.7 (LSP publish) only needs one list per file.
+    // P38.4 — idents flagged `ambiguous` get a richer diagnostic (with
+    // candidate modules + FQN quick-fixes); skip them here to avoid a
+    // duplicate generic "unresolved name" alongside the helpful one.
     let unresolved = res.unresolved.clone();
     for ident_idx in unresolved {
+        if res.ambiguous.contains_key(&ident_idx) {
+            continue;
+        }
         let ident = &hir.idents[ident_idx];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             format!("unresolved name `{}`", ident.text),
+            ident.byte_range.clone(),
+        ));
+    }
+
+    // P38.4 — `ambiguous-symbol` Severity::Error: the bare name is
+    // exported publicly by ≥2 distinct modules, with no local hit to
+    // resolve it. Matches the GreyCat runtime's "unresolved function"
+    // exit-2 outcome on the same shape, but names the candidates so
+    // the user can pick an FQN. Quick-fix emission lives in
+    // [`crate::quickfix`].
+    for (ident_idx, candidates) in &res.ambiguous {
+        let ident = &hir.idents[*ident_idx];
+        let module_names: Vec<String> = candidates
+            .iter()
+            .map(|(uri, _)| {
+                crate::stdlib::module_name_from_uri(uri).unwrap_or_else(|| "<unknown>".to_string())
+            })
+            .collect();
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            format!(
+                "ambiguous-symbol: `{}` is exported by {} modules ({}); use a fully-qualified name like `{}::{}`",
+                ident.text,
+                module_names.len(),
+                module_names.join(", "),
+                module_names.first().map(String::as_str).unwrap_or("<module>"),
+                ident.text,
+            ),
             ident.byte_range.clone(),
         ));
     }
@@ -1865,11 +1899,33 @@ impl<'a> Cx<'a> {
                     // recognise it as the same type as the foreign
                     // declaration site.
                     enum_id
+                } else if let Some(handle) =
+                    crate::project::resolve_decl_handle(self.index, self.decl_registry, &name)
+                {
+                    // P38.2 — non-generic foreign concrete type with
+                    // an interned decl handle: mint `Type(handle)` so
+                    // the shape matches what `lower_type_ref_project`
+                    // produces for the same decl on the fn-signature
+                    // side. Without this, `ObjectExpr { ty: Sub }` in
+                    // the current module mints `Named("Sub")` while
+                    // the foreign fn parameter `b: Base` lowers to
+                    // `Type(handle_for_Base)`, and the asymmetric
+                    // pair defeats `is_assignable_to_with_index`'s
+                    // `(Type, Type)` extends-walk arm — surfacing
+                    // false `not assignable` diagnostics on cross-
+                    // module subtype assignment. The `Named` fallback
+                    // below remains for the transitional case where
+                    // the decl handle isn't yet interned in
+                    // `decl_registry` and for genuinely-unknown names
+                    // the runtime nonetheless recognises (which
+                    // `has_name` covers via the seeded primitives /
+                    // runtime-implemented types).
+                    self.arena.alloc_type(handle)
                 } else if self.index.has_name(&name) {
-                    // P11.5 — non-generic foreign type. Lower to
-                    // `Named(name)` so receivers typed against it
-                    // carry a name `resolve_member` can defer for the
-                    // cross-module post-pass.
+                    // P11.5 — non-generic foreign type without an
+                    // interned decl handle (typically runtime-
+                    // implemented types the project knows by name
+                    // only — they have no `.gcl` decl).
                     self.arena.named(name.clone())
                 } else {
                     // Unknown type. Lower to `Unresolved` so
@@ -3150,7 +3206,15 @@ impl<'a> Cx<'a> {
                     let name = self.ident_text(idx);
                     if let Some(var_ty) = self.index.var_type_for(name) {
                         var_ty
-                    } else if self.index.contains_fn_signature(name) {
+                    } else if self.index.contains_fn_signature(name)
+                        || self.index.contains_non_native_fn(name)
+                    {
+                        // P38.1 — native fns live in `fn_signatures`,
+                        // non-native (user / stdlib `.gcl`) fns in
+                        // `non_native_fn_names`. Both shapes are
+                        // `function`-typed values when referenced
+                        // bare; only the `type_ty()` fallback below
+                        // remains for genuine type / enum names.
                         self.function_ty()
                     } else if self.index.contains_type_member(name) || self.index.has_name(name) {
                         self.type_ty()

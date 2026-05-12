@@ -55,6 +55,7 @@ This is the long-arc plan for porting the [GreyCat](https://greycat.io) language
 - [Phase 35 — Decl-handle type identity](#phase-35--decl-handle-type-identity-1-2-weeks)
 - [Phase 36 — Complete decl-handle identity migration](#phase-36--complete-decl-handle-identity-migration-2-3-weeks)
 - [Phase 37 — `breakpoint` keyword end-to-end](#phase-37--breakpoint-keyword-end-to-end-2-3-days)
+- [Phase 38 — Runtime-conformant cross-module symbol resolution](#phase-38--runtime-conformant-cross-module-symbol-resolution-3-5-days)
 - [Phase 39 — Directive vocabulary normalization (off/on suffix)](#phase-39--directive-vocabulary-normalization-offon-suffix-1-2-days)
 - [Phase 40 — Project-pragma lint / fmt control (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`)](#phase-40--project-pragma-lint--fmt-control-lint_off--lint_on--fmt_off--fmt_on-2-3-days)
 
@@ -1298,6 +1299,89 @@ The chunks below group these by file. Each match arm typically needs *either* a 
 - Plumbing a `byte_range` onto `Stmt::Breakpoint` (or onto `Stmt::Break` / `Continue`). Capability handlers fall back to the CST when they need precise positioning; HIR keeps the unit-variant shape consistent.
 - Updating the external `/greycat:greycat` skill or the upstream TS reference docs. The runtime already accepts the keyword; nothing in this phase asks us to publish a language-reference change. Flag the gap to the user if it matters.
 - Adding `break` / `continue` to `ALL_KEYWORDS` (separate completion-keyword gap, not what was reported).
+
+---
+---
+
+### Phase 38 — Runtime-conformant cross-module symbol resolution (~3-5 days)
+
+**Goal:** make the Rust analyzer's bare-name resolution match the GreyCat runtime's behavior 1:1 across cross-module value-typing, cross-module subtyping, and the local-private fallback ordering. Three concrete defects today, all triggered only at the cross-module boundary; one of them is a model-level gap whose fix is intentional even though the chosen behavior is design-questionable (see 38.3).
+
+**Trigger:** user-reported on 2026-05-12 via the repo-root [project.gcl](../project.gcl): `Scheduler::add(fetch_stuff, FixedPeriodicity { every: 2s }, null)` reports two false-positive errors (`fetch_stuff` typed as `type` not `function`; `FixedPeriodicity` not assignable to `Periodicity` cross-module). Same shapes pass the GreyCat runtime (`greycat build` exit 0). Subsequent probe of the runtime's bare-name resolution semantics revealed a third gap: the analyzer treats local `private` as a first-tier hit, while the runtime treats it as a last-resort fallback.
+
+**Semantics (verified against `greycat 8.0.291-dev`, oracle for this phase; probes at `/tmp/gc-scope/p1..p15`):**
+
+Bare-name resolution order — **`(1) module-local public → (2) global public, fail on cross-module clash → (3) module-local private → (4) Project fallback / unresolved`**:
+
+| Probe | Setup | Runtime result |
+|---|---|---|
+| p1 | bare cross-module call, public target | resolves |
+| p2 | bare cross-module call, private target | unresolved (exit 2) |
+| p3 | bare same-module call, private target | resolves |
+| p4 | `mod::fn` FQN, public target | resolves |
+| p5 | `mod::fn` FQN, private target | resolves (private is reachable via FQN, just not via bare) |
+| p7 | two modules each `public greeting()`, bare ref from a third module | unresolved |
+| p8 | local `public greeting()` + remote `public greeting()`, bare from local module | local wins |
+| p9 | local `private greeting()` + remote `public greeting()`, bare from local module | **remote wins** — local-private is last-resort, not first-tier |
+| p10 | two modules clash on public name, bare ref from yet another | unresolved |
+| p11 | `Scheduler::add(fetch_stuff, FixedPeriodicity { … }, null)` cross-module | `greycat build` exit 0 |
+| p12 | bare fn ident as `function` value, cross-module | exit 0 |
+| p13 | `Sub extends Base` cross-module, pass `Sub {}` to `fn takes_base(b: Base)` | exit 0 |
+| p14/p15 | same as p12/p13 but same-module | exit 0 (control — same-module already works) |
+
+**Behavioral contract:**
+
+1. **Cross-module bare fn ident as a value:** an `Ident` resolving to `Definition::ProjectDecl { uri, decl }` where `decl` is a non-native `Decl::Fn` types as `function`, not `type`. Today the value-typing path at [analyzer.rs:3140-3158](../greycat-analyzer-analysis/src/analyzer.rs#L3140-L3158) only routes through `function_ty()` for *native* fns (those in `fn_signatures`); user-declared fns are in `values` only and fall through to `type_ty()`.
+2. **Cross-module subtype:** `lower_type_ref` in [analyzer.rs:1817-1893](../greycat-analyzer-analysis/src/analyzer.rs#L1817-L1893) mints `arena.alloc_type(handle)` (not `arena.named`) for foreign non-generic concrete types. Removes the `Named ↔ Type` asymmetric pair that today defeats `is_assignable_to_with_index`'s `(Type, Type)` arm in [project.rs:884-922](../greycat-analyzer-analysis/src/project.rs#L884-L922). Completes a P36.4-shaped step for the in-module foreign-ref site.
+3. **Local-private as last-resort fallback:** resolver's `record_use` in [resolver.rs:163-191](../greycat-analyzer-analysis/src/resolver.rs#L163-L191) splits module-scope bindings by visibility and tries module-public + non-module scopes first, then `ProjectIndex::locate_decl`, then module-private, then `Project` fallback / unresolved. The site carries a multi-line commentary stating the order matches the runtime oracle (p9) and flagging that the design is questionable — local-public shadows remote-public (p8) but local-private does NOT shadow remote-public (p9), an asymmetry that would surprise most language designers.
+4. **`ambiguous-symbol` semantic error:** when `ProjectIndex::locate_decl(name)` returns ≥2 hits across distinct modules AND no local hit exists (neither public nor private), the bare use surfaces as a Severity::Error diagnostic — same severity as the runtime's "unresolved function: greeting" (exit 2), but with more helpful text naming each module candidate. Quick-fixes: one `module::name` rewrite per candidate. Not a lint (no `LINT_RULES` entry); emitted in the same lane as the existing unresolved-name errors.
+
+**Chunks:**
+
+- [x] **38.1 Cross-module fn-as-value typing** (S) — extend [`ProjectIndex`](../greycat-analyzer-analysis/src/stdlib.rs) with a `non_native_fn_names: FxHashSet<Symbol>` set populated at ingest for `Decl::Fn` where `!modifiers.native` (natives keep going to `fn_signatures`). In [analyzer.rs:3140-3158](../greycat-analyzer-analysis/src/analyzer.rs#L3140-L3158), inside the `Definition::ProjectDecl` branch, route `non_native_fn_names`-hits to `function_ty()` before the `type_ty()` fallback. Integration test: [`/tmp/gc-scope/p12-just-fn-value`](/tmp/gc-scope/p12-just-fn-value) (also vendored as a fixture under `greycat-analyzer-analysis/tests/`) — assert the bare cross-module fn ident has expr type `function`. Re-run analyzer on the repo-root `project.gcl` and confirm the first of the two false positives is gone.
+
+- [x] **38.2 Foreign type ref mints `Type(handle)`** (S) — in the in-module [analyzer.rs:1817-1893 `lower_type_ref`](../greycat-analyzer-analysis/src/analyzer.rs#L1817-L1893), before the `arena.named(name)` fallback at the `has_name` branch, attempt `resolve_decl_handle(index, decl_registry, name)` (the same helper [project.rs:2675-…](../greycat-analyzer-analysis/src/project.rs#L2675) uses) and mint `arena.alloc_type(handle)` when it returns `Some`. The `arena.named` branch survives only for the transitional case where the decl handle isn't yet interned. Integration test: [`/tmp/gc-scope/p13-just-subtype`](/tmp/gc-scope/p13-just-subtype) — `Sub extends Base` cross-module, `takes_base(Sub {})` clean. Confirm the second false positive on `project.gcl` is gone.
+
+- [x] **38.3 Local-private as last-resort fallback + runtime-conformance commentary** (M) — tag module-scope bindings with `is_private` at seed time (in [resolver.rs:243-249 `seed_module_decl`](../greycat-analyzer-analysis/src/resolver.rs#L243-L249), reading the HIR decl's `modifiers.private`). Split `Scope` (or introduce a parallel `module_private` map on `Cx`) so `lookup_local` consults only module-public + nested-scope bindings on its first pass. Two-pass `record_use`: (i) `lookup_local` for public + non-module scopes, (ii) if missing, `ProjectIndex::locate_decl` for global publics with the clash rule (38.4 picks up the multi-hit case), (iii) if still missing, the deferred module-private map, (iv) else `Project` fallback / unresolved. The lookup site carries the doubting commentary — see body of the chunk. Integration test: [`/tmp/gc-scope/p9-local-private-vs-remote-public`](/tmp/gc-scope/p9-local-private-vs-remote-public) — bare ref from inside the module with a local private resolves to the *remote public*, not the local private; plus p3 (no public conflict → local private wins inside its module) and p6 (existing local-public + remote-public case stays passing). Snapshot tests pin the resolution `Definition` for each.
+
+  Commentary (verbatim text to land in `record_use`):
+
+  ```rust
+  // P38.3 — Bare-name resolution order matches the GreyCat runtime
+  // oracle (8.0.291-dev), validated against `greycat build` on a
+  // multi-module project. The order is:
+  //
+  //   1. Module-local PUBLIC + non-module scopes (params, locals).
+  //   2. Global PUBLIC across the project closure. Multiple hits
+  //      collapse to *unresolved* (38.4 emits the helpful diagnostic
+  //      naming each candidate); the runtime reports plain
+  //      "unresolved function: <name>" — we surface the modules and
+  //      offer FQN quick-fixes, but the severity is the same Error.
+  //   3. Module-local PRIVATE — LAST-RESORT FALLBACK.
+  //   4. `Project` placeholder (runtime-implemented types, primitives
+  //      by name, native fns) / unresolved.
+  //
+  // We intentionally match the runtime even though step 3 is design-
+  // questionable: a local PUBLIC same-named decl WILL shadow a remote
+  // public (step 1 wins), but a local PRIVATE same-named decl will
+  // NOT shadow it (step 2 fires before step 3). The asymmetry would
+  // surprise most language designers — most expect "module-local
+  // first, regardless of visibility." We doubted this choice loudly
+  // before implementing it; the runtime is the oracle and we conform.
+  // If the runtime ever flips the order to "local-private shadows
+  // remote-public," this is the single place to swap steps 2 and 3.
+  ```
+
+- [x] **38.4 `ambiguous-symbol` semantic error** (S) — `Resolutions` carries an `ambiguous: FxHashMap<Idx<Ident>, Vec<(Uri, Idx<Decl>)>>` populated by `record_use` when `ProjectIndex::locate_decl(name)` returns ≥2 public hits from distinct modules AND neither step 1 (local-public + nested) nor step 3 (local-private) found anything. The `ProjectIndex` tracks per-decl visibility in `private_locations: FxHashSet<(Uri, Idx<Decl>)>` so cross-module candidates are visibility-filtered (private decls stay reachable only via FQN — probe p5). A Severity::Error `ambiguous-symbol` diagnostic is emitted from `analyze_with_index_into` in the same lane as the existing unresolved-name errors, listing every candidate module so the user can pick an FQN. The matching unresolved-name diagnostic is suppressed to avoid duplication. **Not a lint** — no `LINT_RULES` entry, no `default_tag_for`. FQN quick-fix synthesis (one CodeAction per candidate) deferred — the current `code_actions_from_diagnostics` shape maps 1 fix per diagnostic and surfacing N alternatives requires a small extension; tracked as a follow-up. Integration tests in [`cross_module_ambiguous_symbol.rs`](../greycat-analyzer-analysis/tests/cross_module_ambiguous_symbol.rs) cover p7-style two-public-clash, the local-public-shadows-remote case, and the private-doesn't-count-toward-clash case.
+
+**M38:** the repo-root [project.gcl](../project.gcl) (`Scheduler::add(fetch_stuff, FixedPeriodicity { every: 2s }, null)`) reports zero errors. `/tmp/gc-scope/p1..p15` probe set produces analyzer diagnostics that match the runtime's outcome on each (p2/p7/p10 emit `ambiguous-symbol` or `unresolved`; p1/p3/p4/p5/p6/p8/p11..p15 emit zero errors; p9 binds the bare ref to the remote public via the `Definition` shape, not to the local private). `cargo test --workspace` + `cargo clippy --workspace --all-targets` clean. No `validate_type_relations` fix-up, no post-S12 monkey-patch — every fix lives in the stage that originates the (mis)typing.
+
+**Out of scope:**
+- Completion-side ambiguity hints (suggesting FQN candidates *before* the user has finished typing). Separate UX phase.
+- FQN quick-fix CodeActions on the `ambiguous-symbol` diagnostic (one per candidate). The current `code_actions_from_diagnostics` infrastructure maps 1 fix per diagnostic; surfacing N alternatives requires a small extension to flat-map / expand. Tracked as a follow-up; the diagnostic itself names every candidate module so users can manually type the FQN today.
+- Migrating `lower_type_ref_project`'s `arena.named` fallback at [project.rs:2655](../greycat-analyzer-analysis/src/project.rs#L2655). Already covered by P36.4's plan; 38.2 only fixes the in-module mirror site.
+- Surfacing `private` symbols as completion candidates under their FQN. The current completion machinery filters by visibility from a bare-name view; surfacing them under `<module>::` is a follow-up.
+- Re-examining whether step 3 should run *before* step 2 (local-private shadowing remote-public). The commentary in 38.3 documents the runtime's choice; revisiting it requires a runtime-side change first.
 
 ---
 
