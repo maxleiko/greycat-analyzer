@@ -50,20 +50,20 @@ pub struct Lint {
     )]
     no_suppressions: bool,
     #[clap(
-        long,
+        long = "off",
         value_name = "RULE",
         value_delimiter = ',',
         help = "Silence specific lint rule(s) globally (repeatable / comma-list, see --list-rules)"
     )]
-    disable: Vec<String>,
+    off: Vec<String>,
     #[clap(
-        long,
+        long = "on",
         value_name = "RULE",
         value_delimiter = ',',
         help = "Enable advisory lint rule(s) that ship off by default (repeatable / \
                 comma-list, see --list-rules). Today: `no-breakpoint`."
     )]
-    enable: Vec<String>,
+    on: Vec<String>,
     #[clap(
         long,
         value_enum,
@@ -151,11 +151,11 @@ impl Lint {
                 );
             }
             println!();
-            println!("`*` = advisory rule, off by default (enable via `--enable=<rule>`).");
+            println!("`*` = advisory rule, off by default (enable via `--on=<rule>`).");
             return Ok(ExitCode::SUCCESS);
         }
 
-        // Build the `--disable` set up-front and warn (fail-soft) on
+        // Build the `--off` set up-front and warn (fail-soft) on
         // any unknown rule name. Unknown names don't abort the run —
         // a typo in a CI invocation shouldn't crash the lint; the
         // warning to stderr tells the operator to fix it. The set is
@@ -168,23 +168,23 @@ impl Lint {
                 .iter()
                 .map(|r| r.name)
                 .collect();
-        for name in &self.disable {
+        for name in &self.off {
             if !valid_rules.contains(name.as_str()) {
                 eprintln!(
-                    "error: unknown lint rule `{name}` in --disable \
+                    "error: unknown lint rule `{name}` in --off \
                      (see --list-rules for the available set)"
                 );
                 std::process::exit(1);
             }
         }
-        let disabled: std::collections::HashSet<String> = self.disable.iter().cloned().collect();
+        let disabled: std::collections::HashSet<String> = self.off.iter().cloned().collect();
 
-        // P37.7 — same shape as `--disable`, applied to advisory rules
+        // P37.7 — same shape as `--off`, applied to advisory rules
         // that ship off by default. Unknown names fail-hard for parity.
-        for name in &self.enable {
+        for name in &self.on {
             if !valid_rules.contains(name.as_str()) {
                 eprintln!(
-                    "error: unknown lint rule `{name}` in --enable \
+                    "error: unknown lint rule `{name}` in --on \
                      (see --list-rules for the available set)"
                 );
                 std::process::exit(1);
@@ -248,7 +248,7 @@ impl Lint {
         // ignored and the underlying diagnostics resurface.
         let mut analysis = ProjectAnalysis::new();
         analysis.bypass_suppressions = self.no_suppressions;
-        analysis.enabled_rules.extend(self.enable.iter().cloned());
+        analysis.enabled_rules.extend(self.on.iter().cloned());
         analysis.analyze_staged(&mgr);
         let total = total_start.elapsed();
 
@@ -455,9 +455,7 @@ impl Lint {
                 > = new_report.loaded.iter().cloned().collect();
                 let mut new_analysis = ProjectAnalysis::new();
                 new_analysis.bypass_suppressions = self.no_suppressions;
-                new_analysis
-                    .enabled_rules
-                    .extend(self.enable.iter().cloned());
+                new_analysis.enabled_rules.extend(self.on.iter().cloned());
                 new_analysis.analyze_staged(&new_mgr);
                 entries.clear();
                 for (uri, cell) in new_mgr.iter() {
