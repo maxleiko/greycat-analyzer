@@ -2671,7 +2671,11 @@ fn lower_type_ref_project(
 /// `decl_registry`. Returns `None` when the name has no recorded
 /// location yet (the per-module analyzer's `register_module_types`
 /// then falls back to `arena.named`).
-fn resolve_decl_handle(
+// P38.2 — exposed crate-wide so the analyzer's in-module
+// `lower_type_ref` can mint `Type(handle)` for foreign non-generic
+// types, completing the `Named` → `Type` migration at the cross-
+// module body-walker site.
+pub(crate) fn resolve_decl_handle(
     index: &ProjectIndex,
     decl_registry: &crate::well_known::DeclRegistry,
     name: &str,

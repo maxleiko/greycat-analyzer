@@ -1865,11 +1865,33 @@ impl<'a> Cx<'a> {
                     // recognise it as the same type as the foreign
                     // declaration site.
                     enum_id
+                } else if let Some(handle) =
+                    crate::project::resolve_decl_handle(self.index, self.decl_registry, &name)
+                {
+                    // P38.2 — non-generic foreign concrete type with
+                    // an interned decl handle: mint `Type(handle)` so
+                    // the shape matches what `lower_type_ref_project`
+                    // produces for the same decl on the fn-signature
+                    // side. Without this, `ObjectExpr { ty: Sub }` in
+                    // the current module mints `Named("Sub")` while
+                    // the foreign fn parameter `b: Base` lowers to
+                    // `Type(handle_for_Base)`, and the asymmetric
+                    // pair defeats `is_assignable_to_with_index`'s
+                    // `(Type, Type)` extends-walk arm — surfacing
+                    // false `not assignable` diagnostics on cross-
+                    // module subtype assignment. The `Named` fallback
+                    // below remains for the transitional case where
+                    // the decl handle isn't yet interned in
+                    // `decl_registry` and for genuinely-unknown names
+                    // the runtime nonetheless recognises (which
+                    // `has_name` covers via the seeded primitives /
+                    // runtime-implemented types).
+                    self.arena.alloc_type(handle)
                 } else if self.index.has_name(&name) {
-                    // P11.5 — non-generic foreign type. Lower to
-                    // `Named(name)` so receivers typed against it
-                    // carry a name `resolve_member` can defer for the
-                    // cross-module post-pass.
+                    // P11.5 — non-generic foreign type without an
+                    // interned decl handle (typically runtime-
+                    // implemented types the project knows by name
+                    // only — they have no `.gcl` decl).
                     self.arena.named(name.clone())
                 } else {
                     // Unknown type. Lower to `Unresolved` so
