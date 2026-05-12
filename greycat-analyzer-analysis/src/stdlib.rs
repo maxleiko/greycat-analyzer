@@ -20,7 +20,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as HirTypeRef};
 use greycat_analyzer_types::{
-    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeDeclId, TypeId, TypeKind, TypeRegistry,
+    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeDeclId, TypeId, TypeKind,
 };
 
 /// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
@@ -75,9 +75,19 @@ impl NativeRegistry {
     }
 }
 
-/// Cross-module project context: the shared arena / registry / native
-/// table that survives across module ingestion. Distinct from
-/// [`crate::analyzer::AnalysisResult`], which is per-module.
+/// Cross-module project context: name tables / structure indices /
+/// native-fn signatures that survive across module ingestion. Distinct
+/// from [`crate::analyzer::AnalysisResult`], which is per-module.
+///
+/// The shared `TypeArena` does NOT live here — it's owned by
+/// [`crate::project::ProjectAnalysis`] and threaded through `ingest`
+/// at construction time so type/enum allocations land in the *one*
+/// arena every downstream stage reads. Earlier revisions kept a
+/// second `TypeArena` on `ProjectIndex`, but its TypeIds were
+/// orphans (no consumer ever read them) and the duplication forced
+/// `lower_module_signatures` to re-allocate every enum, which made
+/// `enum_types` lag the actual signature pass and surface as a
+/// self-named `T not assignable to T` regression class.
 ///
 // P19.9
 /// Every project-wide map keys on [`Symbol`] instead of
@@ -87,10 +97,7 @@ impl NativeRegistry {
 /// [`Self::fn_signature_for`], [`Self::enum_type_for`],
 /// [`Self::native_for`], [`Self::type_flags_for`], …) keep the
 /// historical `&str` API surface — they translate via `symbols`
-/// internally. The `registry: TypeRegistry` *deliberately* stays
-/// String-keyed because the same struct is also used per-module on
-/// [`crate::analyzer::AnalysisResult`], where there is no
-/// project-wide interner to share.
+/// internally.
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
     // P19.9
@@ -98,8 +105,12 @@ pub struct ProjectIndex {
     /// storage for every type / fn / attr / method / enum-variant /
     /// global / module name the analyzer looks up across modules.
     pub symbols: SymbolTable,
-    pub types: TypeArena,
-    pub registry: TypeRegistry,
+    /// Set of [`Symbol`]s the analyzer recognises as a *type* name:
+    /// every primitive, every runtime-implemented type
+    /// ([`BUILTIN_RUNTIME_TYPES`]), and every `type` / `enum` decl
+    /// ingested from a `.gcl` file. Drives [`Self::has_name`] and the
+    /// signature-cache fingerprint ([`project_name_set_hash`]).
+    pub type_names: FxHashSet<Symbol>,
     pub natives: NativeRegistry,
     /// Top-level value-position names from every ingested module —
     /// non-native `fn` declarations, top-level `var` declarations.
@@ -391,8 +402,14 @@ pub struct ExposureSite {
 }
 
 impl ProjectIndex {
-    pub fn new() -> Self {
-        Self::with_symbols(SymbolTable::new())
+    /// Construct an empty index with builtin type / runtime-global
+    /// names seeded into the symbol table. The shared `TypeArena`
+    /// receives the primitive / global TypeIds — primitives only need
+    /// interning so subsequent `arena.primitive(p)` calls return the
+    /// canonical IDs, and runtime globals (`Infinity`, `NaN`) need a
+    /// concrete `TypeId` so the body walker can consume them.
+    pub fn new(arena: &mut TypeArena) -> Self {
+        Self::with_symbols(SymbolTable::new(), arena)
     }
 
     // P19.9
@@ -400,22 +417,19 @@ impl ProjectIndex {
     /// [`SymbolTable`]. Lets `ProjectAnalysis::invalidate` rebuild
     /// the per-module index without invalidating the `Symbol`s held
     /// elsewhere (notably the per-stage signature cache).
-    /// `seed_builtin_names` is idempotent against the symbol table
-    /// the builtin names are already interned after the first call.
-    pub fn with_symbols(symbols: SymbolTable) -> Self {
+    pub fn with_symbols(symbols: SymbolTable, arena: &mut TypeArena) -> Self {
         let mut idx = Self {
             symbols,
             ..Self::default()
         };
-        seed_builtin_primitives(&mut idx.types);
-        seed_builtin_names(&mut idx.types, &mut idx.registry, &mut idx.symbols);
+        seed_builtin_names(&mut idx.symbols, &mut idx.type_names);
         // **P19.16** — runtime-exposed value-position globals
         // (`Infinity`, `NaN`). Registered here (not in
         // `seed_builtin_names`) because they're values, not types,
-        // and they need a typed entry the body walker can consume.
+        // and they need a typed `TypeId` the body walker can consume.
         for (name, prim) in BUILTIN_RUNTIME_GLOBALS {
             let sym = idx.symbols.intern(name);
-            let ty = idx.types.primitive(*prim);
+            let ty = arena.primitive(*prim);
             idx.runtime_globals.insert(sym, ty);
             idx.values.insert(sym);
         }
@@ -727,12 +741,26 @@ impl ProjectIndex {
         self.private_locations.contains(&(uri.clone(), decl_id))
     }
 
-    /// Walk a HIR module's top-level decls and register everything that's
-    /// a type-name (type / enum) or a native function, recording each
-    /// named decl into [`Self::decl_locations`] keyed by `uri`. Re-entrant:
-    /// calling twice with the same `(uri, hir)` is a no-op apart from the
-    /// counter — duplicate `(uri, decl_id)` pairs are not appended.
-    pub fn ingest(&mut self, uri: &Uri, hir: &Hir) {
+    /// Walk a HIR module's top-level decls and register everything
+    /// that's a type-name (type / enum) or a native function. Mints
+    /// every encountered decl into `decl_registry` (the project-wide
+    /// `(uri, decl_id) → TypeDeclId` interner) and well-known
+    /// `(lib, module, name)` slots, allocates the enum's
+    /// `TypeKind::Enum` shape into the shared [`TypeArena`], and
+    /// publishes the canonical enum `TypeId` to [`Self::enum_types`]
+    /// — so by the time any signature-lowering pass runs,
+    /// `enum_type_for(name)` returns the same `TypeId` every
+    /// downstream stage will see. Re-entrant: calling twice with the
+    /// same `(uri, hir)` is a no-op apart from the counter —
+    /// duplicate `(uri, decl_id)` pairs are not appended.
+    pub fn ingest(
+        &mut self,
+        uri: &Uri,
+        hir: &Hir,
+        arena: &mut TypeArena,
+        decl_registry: &mut crate::well_known::DeclRegistry,
+        well_known: &mut crate::well_known::WellKnown,
+    ) {
         let Some(module) = hir.module.as_ref() else {
             return;
         };
@@ -748,14 +776,16 @@ impl ProjectIndex {
                 Decl::Type(td) => {
                     let name_str = hir.idents[td.name].text.as_str();
                     let name_sym = self.symbols.intern(name_str);
-                    if self.registry.lookup(name_str).is_none() {
-                        // If the type has generic params, we register a
-                        // GenericParam-shaped entry pre-instantiated as
-                        // Named(name); P2.4's generic instantiation logic
-                        // takes over at use sites.
-                        let id = self.types.named(name_str);
-                        self.registry.register(name_str, id);
-                    }
+                    // Recognised type name (drives `has_name` and the
+                    // sig-cache fingerprint).
+                    self.type_names.insert(name_sym);
+                    // Project-wide handle for this decl + well-known
+                    // slot recording. Folded in from the former
+                    // standalone pre-pass in
+                    // `stage_lower_signatures` so the project has a
+                    // single decl-registration point.
+                    let handle = decl_registry.get_or_insert(uri, *decl_id);
+                    well_known.record(&module.lib, &module.name, name_str, handle);
                     // P13.5: capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
                     let flags = derive_type_flags(&td.modifiers.annotations);
@@ -856,22 +886,34 @@ impl ProjectIndex {
                 Decl::Enum(ed) => {
                     let name_str = hir.idents[ed.name].text.as_str();
                     let name_sym = self.symbols.intern(name_str);
-                    if self.registry.lookup(name_str).is_none() {
+                    self.type_names.insert(name_sym);
+                    // Project-wide decl handle (enums get one too — the
+                    // resolver / lowering paths route foreign enum refs
+                    // through `Type(handle)` for some shapes).
+                    let _ = decl_registry.get_or_insert(uri, *decl_id);
+                    // Alloc the canonical `TypeKind::Enum` into the
+                    // shared arena and publish to `enum_types`
+                    // immediately. Doing it here (rather than as a
+                    // side effect of `lower_module_signatures`'
+                    // `apply_module_contributions`) ensures every
+                    // downstream lowering pass — including method
+                    // return-type lowering for methods declared in
+                    // the same module — sees the canonical TypeId.
+                    self.enum_types.entry(name_sym).or_insert_with(|| {
                         let name_owned: SmolStr = name_str.into();
                         let variants: Vec<SmolStr> = ed
                             .fields
                             .iter()
                             .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str().into())
                             .collect();
-                        let id = self.types.alloc(Type {
+                        arena.alloc(Type {
                             kind: TypeKind::Enum {
-                                name: name_owned.clone(),
+                                name: name_owned,
                                 variants,
                             },
                             nullable: false,
-                        });
-                        self.registry.register(name_owned, id);
-                    }
+                        })
+                    });
                     self.record_decl_location(name_sym, uri, *decl_id);
                     Some(&ed.modifiers)
                 }
@@ -879,7 +921,7 @@ impl ProjectIndex {
                     let name_str = hir.idents[fnd.name].text.as_str();
                     let name_sym = self.symbols.intern(name_str);
                     if fnd.modifiers.native {
-                        let sig = native_signature_for(hir, fnd, &mut self.types);
+                        let sig = native_signature_for(hir, fnd, arena);
                         self.natives.register(name_sym, sig);
                     } else {
                         self.values.insert(name_sym);
@@ -988,13 +1030,12 @@ impl ProjectIndex {
     /// non-native fn / var. Resolver uses this as the post-local-scope
     /// fallback.
     pub fn has_name(&self, name: &str) -> bool {
-        if self.registry.lookup(name).is_some() {
-            return true;
-        }
         let Some(sym) = self.symbols.lookup(name) else {
             return false;
         };
-        self.natives.signatures.contains_key(&sym) || self.values.contains(&sym)
+        self.type_names.contains(&sym)
+            || self.natives.signatures.contains_key(&sym)
+            || self.values.contains(&sym)
     }
 
     // P15.x
@@ -1033,67 +1074,26 @@ pub fn module_name_from_uri(uri: &Uri) -> Option<String> {
     }
 }
 
-fn seed_builtin_primitives(arena: &mut TypeArena) {
-    for p in [
-        Primitive::Bool,
-        Primitive::Int,
-        Primitive::Float,
-        Primitive::Char,
-        Primitive::String,
-        Primitive::Time,
-        Primitive::Duration,
-        Primitive::Geo,
-    ] {
-        let _ = arena.primitive(p);
-    }
-    let _ = arena.null();
-    let _ = arena.any();
-    let _ = arena.never();
-}
-
 /// Names the analyzer treats as known without an `.gcl` declaration in
 /// scope: the GreyCat primitives plus the runtime-implemented types
-/// (collections, node tags, function/tuple/field markers). Registering
-/// them here is what lets the resolver retire its hard-coded
-/// `BUILTIN_TYPES` allowlist — every name a user can write
-/// resolves through one path now.
-///
-// P19.9
-/// The project-wide [`SymbolTable`] is also seeded here
-/// so `index.symbols.lookup("int")` answers `Some(_)` from the
-/// moment `ProjectIndex::new()` returns. `TypeRegistry` itself stays
-/// String-keyed (it's reused per-module on `AnalysisResult` where no
-/// project-wide interner is in scope).
-fn seed_builtin_names(
-    arena: &mut TypeArena,
-    registry: &mut TypeRegistry,
-    symbols: &mut SymbolTable,
-) {
-    // Primitives — registered by name so the resolver's project-index
-    // fallback finds them. The TypeIds returned here are the same ones
-    // `arena.primitive(...)` allocated in seed_builtin_primitives.
-    for (name, id) in [
-        ("bool", arena.primitive(Primitive::Bool)),
-        ("int", arena.primitive(Primitive::Int)),
-        ("float", arena.primitive(Primitive::Float)),
-        ("char", arena.primitive(Primitive::Char)),
-        ("String", arena.primitive(Primitive::String)),
-        ("time", arena.primitive(Primitive::Time)),
-        ("duration", arena.primitive(Primitive::Duration)),
-        ("geo", arena.primitive(Primitive::Geo)),
-        ("any", arena.any()),
-        ("null", arena.null()),
-    ] {
-        registry.register(name, id);
-        symbols.intern(name);
-    }
-
-    // Runtime-implemented named types — no `.gcl` decl. Drawn from the
-    // TS `StdCoreTypes` interface plus the t<n> / t<n>f tuple shapes.
-    for &name in BUILTIN_RUNTIME_TYPES {
-        let id = arena.named(name);
-        registry.register(name, id);
-        symbols.intern(name);
+/// (collections, node tags, function/tuple/field markers). Seeded
+/// straight into the project's [`SymbolTable`] + `type_names` set so
+/// the resolver's "is this a known type?" fallback and
+/// `lower_type_ref*`'s `arena.named` / primitive minting paths both
+/// recognise them. No `TypeArena` writes — `seed_builtins`
+/// (in `project.rs`) is the canonical seed for primitive TypeIds, and
+/// `arena.named("Array")` is intern-by-value so a caller can mint the
+/// runtime-type shape on demand without needing a pre-allocated
+/// `TypeId` here.
+fn seed_builtin_names(symbols: &mut SymbolTable, type_names: &mut FxHashSet<Symbol>) {
+    for &name in [
+        "bool", "int", "float", "char", "String", "time", "duration", "geo", "any", "null",
+    ]
+    .iter()
+    .chain(BUILTIN_RUNTIME_TYPES.iter())
+    {
+        let sym = symbols.intern(name);
+        type_names.insert(sym);
     }
 }
 
@@ -1217,6 +1217,24 @@ mod tests {
         Uri::from_str(&format!("file://{path}")).unwrap()
     }
 
+    /// Spin up the four pieces of state a real `ProjectAnalysis`
+    /// threads through `ingest` — the shared `TypeArena`, the
+    /// decl-handle interner, the well-known-slot table, and the
+    /// index itself. Returned by-value so each test owns an
+    /// independent copy.
+    fn fresh_index() -> (
+        TypeArena,
+        crate::well_known::DeclRegistry,
+        crate::well_known::WellKnown,
+        ProjectIndex,
+    ) {
+        let mut arena = TypeArena::new();
+        let decl_registry = crate::well_known::DeclRegistry::default();
+        let well_known = crate::well_known::WellKnown::default();
+        let idx = ProjectIndex::new(&mut arena);
+        (arena, decl_registry, well_known, idx)
+    }
+
     #[test]
     fn ingest_registers_type_decls() {
         let hir = lower(
@@ -1231,20 +1249,32 @@ type Company {
 }
 "#,
         );
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&uri("/proj/people.gcl"), &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(
+            &uri("/proj/people.gcl"),
+            &hir,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
         assert_eq!(idx.modules_ingested, 1);
-        assert!(idx.registry.lookup("Person").is_some());
-        assert!(idx.registry.lookup("Company").is_some());
+        assert!(idx.has_name("Person"));
+        assert!(idx.has_name("Company"));
     }
 
     #[test]
     fn ingest_registers_enum_decls() {
         let hir = lower("enum Color { Red, Green, Blue }\n");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&uri("/proj/color.gcl"), &hir);
-        let id = idx.registry.lookup("Color").expect("Color registered");
-        let ty = idx.types.get(id);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(
+            &uri("/proj/color.gcl"),
+            &hir,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
+        let id = idx.enum_type_for("Color").expect("Color registered");
+        let ty = arena.get(id);
         let TypeKind::Enum { variants, .. } = &ty.kind else {
             panic!("expected enum, got {ty:?}");
         };
@@ -1259,8 +1289,14 @@ private native fn read_file(path: String): String;
 private native fn now(): time;
 "#,
         );
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&uri("/proj/io.gcl"), &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(
+            &uri("/proj/io.gcl"),
+            &hir,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
         let read = idx.native_for("read_file").expect("read_file present");
         assert_eq!(read.params.len(), 1);
         let now = idx.native_for("now").expect("now present");
@@ -1271,15 +1307,11 @@ private native fn now(): time;
     fn ingest_is_idempotent_on_repeated_calls() {
         let hir = lower("type T {}\n");
         let u = uri("/proj/t.gcl");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&u, &hir);
-        let len_after_first = idx.types.len();
-        idx.ingest(&u, &hir);
-        assert_eq!(
-            idx.types.len(),
-            len_after_first,
-            "duplicate type registrations"
-        );
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
+        let len_after_first = arena.len();
+        idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
+        assert_eq!(arena.len(), len_after_first, "duplicate type registrations");
         assert_eq!(idx.modules_ingested, 2);
         // decl_locations is also idempotent — the same (uri, decl_id)
         // pair shouldn't be appended twice.
@@ -1295,8 +1327,14 @@ private native fn now(): time;
         // install` having been run.
         let hir = lower("private type Permission {}\n");
         let permission_uri = uri("/proj/lib/std/runtime.gcl");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&permission_uri, &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(
+            &permission_uri,
+            &hir,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
 
         let hits = idx.locate_decl("Permission");
         assert_eq!(hits.len(), 1, "exactly one Permission decl across project");
@@ -1326,8 +1364,14 @@ enum Color { Red, Green }
 fn helper(): int { return 1; }
 "#,
         );
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&uri("/proj/m.gcl"), &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(
+            &uri("/proj/m.gcl"),
+            &hir,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
 
         // Each top-level decl name is interned.
         for n in ["Bag", "Color", "helper"] {
@@ -1366,12 +1410,19 @@ fn helper(): int { return 1; }
              type Cat extends Animal { whiskers: int; }\n",
         );
         let u = uri("/proj/m.gcl");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&u, &hir);
+        let (mut idx_arena, mut idx_decl_registry, mut idx_well_known, mut idx) = fresh_index();
+        idx.ingest(
+            &u,
+            &hir,
+            &mut idx_arena,
+            &mut idx_decl_registry,
+            &mut idx_well_known,
+        );
 
-        // Mint handles into a DeclRegistry by re-walking the HIR decls
-        // (mirrors the project pipeline's bootstrap order), then mirror
-        // the names into a TypeArena via `alloc_type`.
+        // Mint handles into a fresh `DeclRegistry` / `TypeArena` pair
+        // so the test exercises `is_subtype_of_decl` against a
+        // freshly-built name table — independent of whatever ingest
+        // chose to mint into `idx_arena`.
         let mut registry = DeclRegistry::new();
         let mut arena = TypeArena::new();
         let module = hir.module.as_ref().unwrap();
@@ -1410,9 +1461,21 @@ fn helper(): int { return 1; }
         // closure, but the table itself keeps every hit.
         let hir_a = lower("type Helper {}\n");
         let hir_b = lower("type Helper {}\n");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&uri("/proj/a.gcl"), &hir_a);
-        idx.ingest(&uri("/proj/b.gcl"), &hir_b);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(
+            &uri("/proj/a.gcl"),
+            &hir_a,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
+        idx.ingest(
+            &uri("/proj/b.gcl"),
+            &hir_b,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
         let hits = idx.locate_decl("Helper");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, uri("/proj/a.gcl"));
@@ -1437,8 +1500,8 @@ fn ignored() {}
 "#,
         );
         let u = uri("/proj/api.gcl");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&u, &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
         let alpha_sym = idx.symbol("public_alpha").expect("public_alpha interned");
         let alpha_hits = idx.exposed.get(&alpha_sym).expect("public_alpha");
@@ -1475,8 +1538,8 @@ type Plain {}
 "#,
         );
         let u = uri("/proj/m.gcl");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&u, &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
         let bag = idx.type_flags_for("Bag").expect("Bag flags");
         assert!(bag.iterable);
@@ -1497,8 +1560,8 @@ type Plain {}
         // ProjectIndex::module_permissions[uri].
         let hir = lower("@permission(\"admin\");\n@permission(\"user\");\nfn handler() {}\n");
         let u = uri("/proj/api.gcl");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&u, &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
         let perms = idx.module_permissions.get(&u).expect("permissions tracked");
         let admin_sym = idx.symbol("admin").expect("admin interned");
@@ -1517,8 +1580,8 @@ var TOP: int = 1;
 "#,
         );
         let u = uri("/proj/m.gcl");
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&u, &hir);
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
         assert_eq!(idx.locate_decl("helper").len(), 1);
         assert_eq!(idx.locate_decl("TOP").len(), 1);
         assert!(idx.locate_decl("missing").is_empty());

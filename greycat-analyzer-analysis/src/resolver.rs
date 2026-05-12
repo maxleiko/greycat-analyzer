@@ -363,7 +363,8 @@ impl<'a> Cx<'a> {
 /// the current module's own entries are excluded from the global
 /// public-lookup tier.
 pub fn resolve(hir: &Hir) -> Resolutions {
-    let index = ProjectIndex::new();
+    let mut arena = greycat_analyzer_types::TypeArena::new();
+    let index = ProjectIndex::new(&mut arena);
     resolve_inner(hir, &index, None)
 }
 
@@ -963,8 +964,17 @@ fn f(p: Foo): Foo { return p; }
         let other_hir = lower_module(other_src, "a", "p", other_tree.root_node());
 
         let other_uri = Uri::from_str("file:///proj/a.gcl").unwrap();
-        let mut idx = ProjectIndex::new();
-        idx.ingest(&other_uri, &other_hir);
+        let mut arena = greycat_analyzer_types::TypeArena::new();
+        let mut decl_registry = crate::well_known::DeclRegistry::default();
+        let mut well_known = crate::well_known::WellKnown::default();
+        let mut idx = ProjectIndex::new(&mut arena);
+        idx.ingest(
+            &other_uri,
+            &other_hir,
+            &mut arena,
+            &mut decl_registry,
+            &mut well_known,
+        );
 
         let user_src = "fn use_helper(h: Helper) {}\n";
         let user_tree = parse(user_src);
@@ -1053,7 +1063,8 @@ fn f(p: Foo): Foo { return p; }
         let src = "fn f(a: Array<int>) {}\n";
         let tree = parse(src);
         let hir = lower_module(src, "m", "p", tree.root_node());
-        let idx = crate::stdlib::ProjectIndex::new();
+        let mut arena = greycat_analyzer_types::TypeArena::new();
+        let idx = crate::stdlib::ProjectIndex::new(&mut arena);
         let res = resolve_with_index(&hir, &idx);
         let array_uses: Vec<_> = hir
             .idents

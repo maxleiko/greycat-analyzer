@@ -16,7 +16,6 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use smol_str::SmolStr;
 
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
@@ -191,12 +190,6 @@ struct ModuleSigCache {
     // P19.9
     /// `(fn_sym, signature)`.
     fns: Vec<(greycat_analyzer_types::Symbol, FnSignature)>,
-    // P19.9
-    /// `(enum_sym, ty)`.
-    enums: Vec<(
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::TypeId,
-    )>,
     // P19.10
     /// `(var_sym, ty)`. Top-level `var` declared types.
     /// Lowered alongside the other signatures in
@@ -213,8 +206,9 @@ impl ProjectAnalysis {
     pub fn new() -> Self {
         let mut arena = greycat_analyzer_types::TypeArena::new();
         seed_builtins(&mut arena);
+        let index = ProjectIndex::new(&mut arena);
         Self {
-            index: ProjectIndex::new(),
+            index,
             arena,
             decl_registry: crate::well_known::DeclRegistry::new(),
             well_known: crate::well_known::WellKnown::new(),
@@ -409,10 +403,10 @@ impl ProjectAnalysis {
     /// run starts from a known-empty state. Re-seeding builtins is
     /// idempotent (the arena interns them on the second insert).
     fn reset_state(&mut self) {
-        self.index = ProjectIndex::new();
         self.modules.clear();
         self.arena = greycat_analyzer_types::TypeArena::new();
         seed_builtins(&mut self.arena);
+        self.index = ProjectIndex::new(&mut self.arena);
         // P19.6 — cached `TypeId`s reference the old arena, which
         // we just replaced. Drop the cache so the next
         // `lower_signatures_into` rebuilds against the fresh arena.
@@ -500,9 +494,20 @@ impl ProjectAnalysis {
         // Phase C (serial): ingest into the project-wide index. This
         // mutates `self.index.symbols` etc., which is `!Send` on
         // purpose — it owns interner state that's amortised across
-        // the whole project.
+        // the whole project. `ingest` also mints decl handles into
+        // `self.decl_registry`, records well-known runtime slots,
+        // and allocates enum TypeIds into the shared arena —
+        // folded in so every decl-registration step happens in one
+        // place rather than spread across `stage_lower` +
+        // `stage_lower_signatures`.
         for (uri, hir, _lib, _lower_took, _directives, _pragmas) in &lowered {
-            self.index.ingest(uri, hir);
+            self.index.ingest(
+                uri,
+                hir,
+                &mut self.arena,
+                &mut self.decl_registry,
+                &mut self.well_known,
+            );
         }
         lowered
     }
@@ -536,41 +541,14 @@ impl ProjectAnalysis {
         )],
     ) {
         let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _, _, _)| (u, h)).collect();
-        // P35.1 / P36.2 — populate decl_registry + well_known FIRST
-        // so the signature-lowering pass below can mint handle-keyed
-        // `Type(handle)` shapes (via `lower_type_ref_project`'s
-        // P36.2 path) for local types. Without the pre-pass the
-        // registry would still be empty when signatures lower, and
-        // the analyzer's per-module mint (which DOES see a populated
-        // registry by the time it runs) would diverge from the
-        // signatures — surfacing as spurious assignability errors
-        // on call-arg validation.
-        //
-        // Cheap: one decl walk per module, idempotent on the
-        // `(uri, decl)` pair. Sig-cache parity doesn't change
-        // because the registry is append-only and slot writes are
-        // idempotent on the same `(lib, module, name)` triple.
-        for (uri, hir) in &pairs {
-            let Some(module) = hir.module.as_ref() else {
-                continue;
-            };
-            for d_id in &module.decls {
-                match &hir.decls[*d_id] {
-                    Decl::Type(td) => {
-                        let name = hir.idents[td.name].text.as_str();
-                        let decl_id = self.decl_registry.get_or_insert(uri, *d_id);
-                        self.well_known
-                            .record(&module.lib, &module.name, name, decl_id);
-                    }
-                    Decl::Enum(_) => {
-                        // Enums get a handle too — needed for the
-                        // cross-arena Enum↔Named bridge cleanup in P35.7.
-                        let _ = self.decl_registry.get_or_insert(uri, *d_id);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // P35.1 / P36.2 — `decl_registry` + `well_known` slot
+        // recording happen during [`ProjectIndex::ingest`] now, so
+        // the signature-lowering pass below sees a fully-populated
+        // registry from its first call. (Previously this stage owned
+        // a redundant decl pre-pass; the architectural rework folded
+        // it into ingest so every decl-registration step lives in
+        // one place and `enum_types` is populated before any method
+        // return type that references an enum is lowered.)
         lower_signatures_into(
             &mut self.arena,
             &mut self.index,
@@ -723,11 +701,14 @@ fn write_decl_qualified(
 fn project_name_set_hash(index: &ProjectIndex) -> u64 {
     use std::collections::BTreeSet;
     let mut names: BTreeSet<&str> = BTreeSet::new();
-    for n in index.registry.iter_names() {
-        names.insert(n);
+    // P19.9 — type_names / natives / values are Symbol-keyed; resolve
+    // back to text through the project's symbol table for stable
+    // string hashing.
+    for sym in &index.type_names {
+        if let Some(s) = index.symbols.resolve(*sym) {
+            names.insert(s);
+        }
     }
-    // P19.9 — natives + values are Symbol-keyed; resolve back to text
-    // through the project's symbol table for stable string hashing.
     for sym in index.natives.signatures.keys() {
         if let Some(s) = index.symbols.resolve(*sym) {
             names.insert(s);
@@ -1015,22 +996,20 @@ fn lower_module_signatures(
                     entry.methods.push((type_sym, method_sym, ty));
                 }
             }
-            Decl::Enum(ed) => {
-                let name_text = hir.idents[ed.name].text.as_str();
-                let name_sym = index.symbols.intern(name_text);
-                let variants: Vec<SmolStr> = ed
-                    .fields
-                    .iter()
-                    .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str().into())
-                    .collect();
-                let enum_id = arena_mut.alloc(greycat_analyzer_types::Type {
-                    kind: greycat_analyzer_types::TypeKind::Enum {
-                        name: name_text.into(),
-                        variants,
-                    },
-                    nullable: false,
-                });
-                entry.enums.push((name_sym, enum_id));
+            Decl::Enum(_) => {
+                // No-op: enum TypeIds are minted by
+                // [`ProjectIndex::ingest`] now and published into
+                // `index.enum_types` immediately, so the signature
+                // pass has nothing to do here. The previous
+                // implementation re-allocated the same Enum into
+                // the shared arena and pushed to the cache; the
+                // intern-by-value behaviour made it redundant
+                // *and* it ran in source order, leaving
+                // `enum_type_for(name)` returning `None` for any
+                // method signature lowered earlier in the same
+                // module that referenced the enum — surfacing as
+                // a `T not assignable to T` regression at the
+                // validation stage.
             }
             Decl::Fn(fnd) => {
                 let fn_text = hir.idents[fnd.name].text.as_str();
@@ -1181,9 +1160,6 @@ fn apply_module_contributions(index: &mut ProjectIndex, c: &ModuleSigCache) {
             .fn_signatures
             .entry(*fn_sym)
             .or_insert_with(|| sig.clone());
-    }
-    for (sym, ty) in &c.enums {
-        index.enum_types.entry(*sym).or_insert(*ty);
     }
     for (sym, ty) in &c.vars {
         index.var_types.entry(*sym).or_insert(*ty);
@@ -1883,15 +1859,27 @@ impl ProjectAnalysis {
         // inside `sig_cache`) remain valid; only the per-module
         // index data gets wiped.
         let preserved_symbols = std::mem::take(&mut self.index.symbols);
-        let mut new_index = ProjectIndex::with_symbols(preserved_symbols);
+        let mut new_index = ProjectIndex::with_symbols(preserved_symbols, &mut self.arena);
         if let Some(hir) = &changed_hir {
-            new_index.ingest(uri, hir);
+            new_index.ingest(
+                uri,
+                hir,
+                &mut self.arena,
+                &mut self.decl_registry,
+                &mut self.well_known,
+            );
         }
         for (other_uri, ma) in &self.modules {
             if other_uri == uri {
                 continue;
             }
-            new_index.ingest(other_uri, &ma.hir);
+            new_index.ingest(
+                other_uri,
+                &ma.hir,
+                &mut self.arena,
+                &mut self.decl_registry,
+                &mut self.well_known,
+            );
         }
         // For docs that are in the manager but not yet in the cache,
         // lower them so the index sees their decls. Per-module analysis
@@ -1906,7 +1894,13 @@ impl ProjectAnalysis {
             let module_name = crate::stdlib::module_name_from_uri(other_uri)
                 .unwrap_or_else(|| "module".to_string());
             let hir = lower_module(&doc.text, module_name, &doc.lib, doc.root_node());
-            new_index.ingest(other_uri, &hir);
+            new_index.ingest(
+                other_uri,
+                &hir,
+                &mut self.arena,
+                &mut self.decl_registry,
+                &mut self.well_known,
+            );
             other_lowered.push((other_uri.clone(), hir, doc.lib.clone(), Duration::ZERO));
         }
         self.index = new_index;
@@ -2435,6 +2429,7 @@ fn validate_module_type_relations(
                         t,
                         &analysis.registry,
                         index,
+                        decl_registry,
                         &analysis.type_decls,
                         arena,
                     )
@@ -2462,6 +2457,7 @@ fn validate_module_type_relations(
                             decl_ref,
                             &analysis.registry,
                             index,
+                            decl_registry,
                             &analysis.type_decls,
                             arena,
                         )
@@ -2499,6 +2495,7 @@ fn validate_module_type_relations(
                         decl_ref,
                         &analysis.registry,
                         index,
+                        decl_registry,
                         &analysis.type_decls,
                         arena,
                     )
@@ -2582,6 +2579,7 @@ fn validate_module_type_relations(
                         *decl_ref,
                         &analysis.registry,
                         index,
+                        decl_registry,
                         &analysis.type_decls,
                         arena,
                     )
@@ -3083,11 +3081,26 @@ fn lower_type_ref_id(
     type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
     registry: &greycat_analyzer_types::TypeRegistry,
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     type_decls: &rustc_hash::FxHashMap<smol_str::SmolStr, greycat_analyzer_hir::arena::Idx<Decl>>,
     arena: &mut greycat_analyzer_types::TypeArena,
 ) -> Option<greycat_analyzer_types::TypeId> {
     use greycat_analyzer_types::Primitive;
     let tr = &hir.type_refs[type_ref];
+    // Qualified ref (`b::Foo`, …) — route through the same
+    // module-scoped lookup the resolver and the body walker use, so
+    // all four lowering paths agree on the leaf decl identity.
+    if !tr.qualifier.is_empty() {
+        let generics_in_scope = FxHashMap::default();
+        return Some(lower_qualified_type_ref_project(
+            hir,
+            tr,
+            arena,
+            index,
+            decl_registry,
+            &generics_in_scope,
+        ));
+    }
     let name = hir.idents[tr.name].text.as_str();
     let base = match name {
         "bool" => arena.primitive(Primitive::Bool),
@@ -3105,7 +3118,13 @@ fn lower_type_ref_id(
                 let mut args = Vec::with_capacity(tr.params.len());
                 for p in &tr.params {
                     args.push(lower_type_ref_id(
-                        hir, *p, registry, index, type_decls, arena,
+                        hir,
+                        *p,
+                        registry,
+                        index,
+                        decl_registry,
+                        type_decls,
+                        arena,
                     )?);
                 }
                 arena.generic(name.to_string(), args)
@@ -3119,6 +3138,25 @@ fn lower_type_ref_id(
                 arena.generic(name.to_string(), args)
             } else if let Some(id) = registry.lookup(name) {
                 id
+            } else if let Some(enum_id) = index.enum_type_for(name) {
+                // Canonical enum TypeId from S7-S11. The body walker's
+                // `lower_type_ref` and `lower_type_ref_project` both
+                // hit this branch ahead of `resolve_decl_handle`; the
+                // validation pass has to agree or `Generic("Array",
+                // [Enum{...}])` (body) vs `Generic("Array",
+                // [Type(handle)])` (validation) fails invariant
+                // arg-equality.
+                enum_id
+            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+                // Foreign non-generic decl: mint `Type(handle)` to
+                // match what the body walker's `lower_type_ref` and
+                // the signature pass's `lower_type_ref_project`
+                // produce. Without this, the validation pass would
+                // mint `Named { name }` while the body walker
+                // already minted `Type(handle)` for the same source
+                // token — surfacing as a self-named
+                // "T is not assignable to T" diagnostic.
+                arena.alloc_type(handle, name.to_string())
             } else {
                 arena.named(name.to_string())
             }
@@ -3314,7 +3352,7 @@ mod tests {
 
         let pa = ProjectAnalysis::analyze(&mgr);
         assert!(
-            pa.index.registry.lookup("Point").is_some(),
+            pa.index.has_name("Point"),
             "shared index should know about Point declared in another module"
         );
     }

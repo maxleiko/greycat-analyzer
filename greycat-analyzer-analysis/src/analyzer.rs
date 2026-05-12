@@ -293,7 +293,8 @@ impl AnalysisResult {
 /// [`analyze_with_index_into`] instead so the arena outlives the call.
 pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
     use std::str::FromStr;
-    let index = ProjectIndex::new();
+    let mut arena = TypeArena::new();
+    let index = ProjectIndex::new(&mut arena);
     // P35.4 — per-file callers don't have a populated `WellKnown`;
     // pass a default (all-`None`) instance. The migrated sentinel
     // sites fall back to `arena.any()` for any slot still `None`.
@@ -303,7 +304,6 @@ pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
     // registry (the lookups miss, the legacy `Named` fallback fires).
     let decl_registry = crate::well_known::DeclRegistry::default();
     let module_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///module.gcl").unwrap();
-    let mut arena = TypeArena::new();
     let out = analyze_with_index_into(
         hir,
         res,
