@@ -423,6 +423,11 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub struct LiteralExpr {
     pub kind: LiteralKind,
+    /// Source-side parse anomaly (overflow, precision loss, …). The
+    /// `kind` field still carries a best-effort value so downstream
+    /// typing proceeds normally; the analyzer reads this field
+    /// separately to emit user-facing warnings / errors.
+    pub parse_issue: Option<ParseIssue>,
     pub byte_range: Span,
 }
 
@@ -433,6 +438,12 @@ pub struct LiteralExpr {
 /// `null` and `this` are *not* literals — they're keyword tokens
 /// with no value to inline. They live as dedicated [`Expr::Null`] /
 /// [`Expr::This`] variants instead.
+///
+/// When the source text fails to parse (overflow, precision loss,
+/// malformed escape, …) the variant still commits to a kind and the
+/// best-effort value (`i64::MAX` saturation, `'\0'`, `0` µs, …); the
+/// failure is reported via [`LiteralExpr::parse_issue`]. This keeps
+/// type inference unaffected by parse anomalies.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LiteralKind {
     Int(i64),
@@ -452,12 +463,24 @@ pub enum LiteralKind {
     /// forms, suspicious timezone offsets, etc.) that wouldn't make
     /// sense for a raw numeric `time` literal.
     Iso8601(i64),
-    /// Parse failure at lowering time (numeric overflow, malformed
-    /// char, malformed ISO date, …). The HIR lowering pass emits
-    /// the user-facing diagnostic with the offending source text;
-    /// downstream stages treat this variant as `any` so cascades
-    /// don't double-flag already-reported input.
-    Invalid,
+}
+
+/// Parse anomaly recorded at HIR-lowering time. The literal's
+/// [`LiteralKind`] carries a best-effort value alongside; the
+/// analyzer emits the user-facing diagnostic from this tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseIssue {
+    /// Numeric exceeded the representable range of its kind
+    /// (`Int` → i64, `Duration` / `Time` / `Iso8601` → i64 µs after
+    /// suffix scaling). The kind's value is saturated.
+    Overflow,
+    /// Float has more significant decimal digits than f64 can
+    /// represent exactly. The kind's value is the nearest f64.
+    PrecisionLoss,
+    /// Char escape unrecognised, ISO-8601 shape malformed, or
+    /// similar structural defect. The kind's value is a placeholder
+    /// (`'\0'`, `0` µs, …).
+    Malformed,
 }
 
 #[derive(Debug, Clone)]

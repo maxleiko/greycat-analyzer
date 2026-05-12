@@ -436,7 +436,75 @@ pub fn analyze_with_index_into(
         ));
     }
 
+    // Surface literal parse anomalies recorded at HIR lowering time:
+    // numeric overflow, float precision loss, malformed char escape /
+    // ISO-8601 shape. The literal still types by its declared kind so
+    // downstream inference is unaffected — this pass only emits the
+    // user-facing warning / error.
+    for (_, expr) in hir.exprs.iter() {
+        let Expr::Literal(LiteralExpr {
+            kind,
+            parse_issue: Some(issue),
+            byte_range,
+        }) = expr
+        else {
+            continue;
+        };
+        let (severity, message) = literal_parse_issue_diagnostic(*kind, *issue);
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            severity,
+            message,
+            byte_range.clone(),
+        ));
+    }
+
     out
+}
+
+/// Map a `(LiteralKind, ParseIssue)` pair to a user-facing diagnostic.
+/// Overflow / precision-loss surface as warnings — the literal still
+/// has a usable best-effort value, so the rest of the program type-
+/// checks. Malformed shape (char escape, ISO date) is an error.
+fn literal_parse_issue_diagnostic(
+    kind: LiteralKind,
+    issue: greycat_analyzer_hir::types::ParseIssue,
+) -> (Severity, String) {
+    use greycat_analyzer_hir::types::ParseIssue;
+    match (kind, issue) {
+        (LiteralKind::Int(_), ParseIssue::Overflow) => (
+            Severity::Warning,
+            "integer literal exceeds `int` range (i64); value saturated to i64::MAX".to_string(),
+        ),
+        (LiteralKind::Float(_), ParseIssue::PrecisionLoss) => (
+            Severity::Warning,
+            "float literal has more significant digits than `float` (f64) can represent; \
+             precision lost"
+                .to_string(),
+        ),
+        (LiteralKind::Float(_), ParseIssue::Overflow) => (
+            Severity::Warning,
+            "float literal exceeds `float` (f64) range; value rounded to infinity".to_string(),
+        ),
+        (LiteralKind::Duration(_), ParseIssue::Overflow) => (
+            Severity::Warning,
+            "duration literal exceeds the representable range (i64 µs); value saturated"
+                .to_string(),
+        ),
+        (LiteralKind::Time(_), ParseIssue::Overflow) => (
+            Severity::Warning,
+            "time literal exceeds the representable range (i64 µs); value saturated".to_string(),
+        ),
+        (LiteralKind::Char(_), ParseIssue::Malformed) => (
+            Severity::Error,
+            "malformed char literal — unrecognised escape sequence".to_string(),
+        ),
+        (LiteralKind::Iso8601(_), ParseIssue::Malformed) => {
+            (Severity::Error, "malformed ISO-8601 literal".to_string())
+        }
+        // Other combinations are unreachable at lowering, but stay
+        // conservative rather than panic if a future variant slips in.
+        _ => (Severity::Warning, "literal parse anomaly".to_string()),
+    }
 }
 
 /// Seed primitive type ids in the arena so cx.{int, bool, ...} are cheap.
@@ -3251,10 +3319,6 @@ impl<'a> Cx<'a> {
                 LiteralKind::Char(_) => self.primitive(Primitive::Char),
                 LiteralKind::Duration(_) => self.primitive(Primitive::Duration),
                 LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.primitive(Primitive::Time),
-                // Parse failure at lowering — type as `any` so
-                // cascades stay quiet. The lowering already emitted
-                // the user-facing diagnostic.
-                LiteralKind::Invalid => self.any_nullable(),
             },
             Expr::Null { .. } => self.null(),
             Expr::This { .. } => self

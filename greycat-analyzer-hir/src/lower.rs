@@ -764,23 +764,41 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         "this" => Expr::This {
             byte_range: node.byte_range(),
         },
-        "number" | "char" | "false" | "true" | "iso8601" => {
+        "number" | "char" | "false" | "true" => {
             // Eager-parse every literal into its typed value. The
             // source text is no longer kept in the HIR — the parsed
             // value is the source of truth, the CST owns the
             // original bytes for diagnostics, and the formatter
             // walks the CST directly so round-trip stays exact.
+            //
+            // Each parser also returns an optional `ParseIssue` so
+            // the analyzer can surface overflow / precision-loss /
+            // malformed-escape diagnostics without the literal
+            // losing its typed kind (typing proceeds normally).
+            //
+            // `char` is special: the grammar nests `iso8601` inside
+            // the surrounding single quotes (`'2024-01-01T00:00Z'`),
+            // so we peek at the first named child before deciding
+            // between a real char and an ISO-8601 literal.
             let raw = cx.text(node);
-            let lit_kind = match kind {
+            let (lit_kind, parse_issue) = match kind {
                 "number" => classify_and_parse_number(cx, node, raw),
-                "char" => parse_char(raw),
-                "false" => LiteralKind::Bool(false),
-                "true" => LiteralKind::Bool(true),
-                "iso8601" => parse_iso8601(raw),
+                "char" => {
+                    let iso_child = node
+                        .named_children(&mut node.walk())
+                        .find(|c| c.kind() == "iso8601");
+                    match iso_child {
+                        Some(iso) => parse_iso8601(cx.text(iso)),
+                        None => parse_char(raw),
+                    }
+                }
+                "false" => (LiteralKind::Bool(false), None),
+                "true" => (LiteralKind::Bool(true), None),
                 _ => unreachable!(),
             };
             Expr::Literal(LiteralExpr {
                 kind: lit_kind,
+                parse_issue,
                 byte_range: node.byte_range(),
             })
         }
@@ -1112,62 +1130,57 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
 
 /// Classify a `number` CST node by its typed suffix AND parse its
 /// numeric body in one pass. Returns the typed [`LiteralKind`]
-/// variant (or `Invalid` on parse failure / out-of-range).
+/// variant plus an optional [`ParseIssue`] when the source token
+/// overflowed / lost precision / etc.
 ///
 /// Grammar shape: `(number (number_suffixed (number_int |
 /// number_decimal | number_scientific) (number_suffix)?))`.
 ///
 /// Suffix dispatch:
-/// - `time` → [`LiteralKind::Time`] (value parsed as i64 ns).
+/// - `time` → [`LiteralKind::Time`] (value parsed as i64 µs).
 /// - `duration` / unit suffixes (`y`, `d`, `h`, `m`, `s`, `ms`, `us`,
 ///   `ns`, `min`, `sec`, `hour`, `day`, `week`, `month`, `year` and
-///   their long forms) → [`LiteralKind::Duration`] with value
-///   converted to ns.
+///   their long forms) → [`LiteralKind::Duration`] with the value
+///   scaled to µs.
 /// - bare `f` / `_f` suffix → [`LiteralKind::Float`].
 /// - no suffix:
 ///   * `.` or scientific `e`/`E` exponent → [`LiteralKind::Float`].
 ///   * otherwise → [`LiteralKind::Int`].
-fn classify_and_parse_number(cx: &LowerCtx, node: tree_sitter::Node<'_>, raw: &str) -> LiteralKind {
-    // Find the numeric body + optional suffix by walking the
-    // `number_suffixed` wrapper. Some forms (plain `42`) skip the
-    // wrapper and the body is the only child.
+fn classify_and_parse_number(
+    cx: &LowerCtx,
+    node: tree_sitter::Node<'_>,
+    raw: &str,
+) -> (LiteralKind, Option<ParseIssue>) {
     let (body_text, suffix_text) = extract_number_parts(cx, node);
     let suffix = suffix_text.as_deref().map(|s| s.trim_start_matches('_'));
+    let body = body_text.as_deref().unwrap_or(raw);
     match suffix {
         Some(s) if s.eq_ignore_ascii_case("time") => {
-            match parse_integer(body_text.as_deref().unwrap_or(raw)) {
-                Some(n) => LiteralKind::Time(n),
-                None => LiteralKind::Invalid,
-            }
+            let (n, issue) = parse_integer_sat(body);
+            (LiteralKind::Time(n), issue)
         }
         Some(s) if is_duration_suffix(s) => {
-            let Some(body) = body_text.as_deref() else {
-                return LiteralKind::Invalid;
+            let (n, mut issue) = parse_integer_sat(body);
+            let us = match duration_to_us(n, s) {
+                Some(us) => us,
+                None => {
+                    issue.get_or_insert(ParseIssue::Overflow);
+                    i64::MAX
+                }
             };
-            match parse_integer(body).and_then(|n| duration_to_us(n, s)) {
-                Some(us) => LiteralKind::Duration(us),
-                None => LiteralKind::Invalid,
-            }
+            (LiteralKind::Duration(us), issue)
         }
         Some(s) if s.eq_ignore_ascii_case("f") => {
-            match parse_float(body_text.as_deref().unwrap_or(raw)) {
-                Some(f) => LiteralKind::Float(f),
-                None => LiteralKind::Invalid,
-            }
+            let (f, issue) = parse_float_sat(body);
+            (LiteralKind::Float(f), issue)
         }
         _ => {
-            // No (recognized) suffix — int or float based on form.
-            let text = body_text.as_deref().unwrap_or(raw);
-            if looks_like_float(text) {
-                match parse_float(text) {
-                    Some(f) => LiteralKind::Float(f),
-                    None => LiteralKind::Invalid,
-                }
+            if looks_like_float(body) {
+                let (f, issue) = parse_float_sat(body);
+                (LiteralKind::Float(f), issue)
             } else {
-                match parse_integer(text) {
-                    Some(n) => LiteralKind::Int(n),
-                    None => LiteralKind::Invalid,
-                }
+                let (n, issue) = parse_integer_sat(body);
+                (LiteralKind::Int(n), issue)
             }
         }
     }
@@ -1229,25 +1242,148 @@ fn looks_like_float(text: &str) -> bool {
     false
 }
 
-fn parse_integer(s: &str) -> Option<i64> {
-    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
-    if let Some(rest) = cleaned.strip_prefix("0x").or(cleaned.strip_prefix("0X")) {
-        i64::from_str_radix(rest, 16).ok()
-    } else if let Some(rest) = cleaned.strip_prefix("0b").or(cleaned.strip_prefix("0B")) {
-        i64::from_str_radix(rest, 2).ok()
-    } else if let Some(rest) = cleaned.strip_prefix("0o").or(cleaned.strip_prefix("0O")) {
-        i64::from_str_radix(rest, 8).ok()
-    } else {
-        cleaned.parse::<i64>().ok()
+/// Saturating decimal integer parse. The grammar's `number_int` only
+/// accepts `[0-9][0-9_]*` — no hex/binary/octal prefixes — so this
+/// only handles base-10 with optional `_` separators. Walks bytes
+/// directly with `checked_mul` / `checked_add`, so no allocation and
+/// the overflow is detected exactly when the accumulator can no
+/// longer absorb the next digit. Returns the saturated value
+/// alongside [`ParseIssue::Overflow`] on overflow. Negatives never
+/// reach here (unary `-` is a separate expression), so saturation is
+/// always toward `i64::MAX`.
+fn parse_integer_sat(s: &str) -> (i64, Option<ParseIssue>) {
+    let mut acc: i64 = 0;
+    let mut overflow = false;
+    for &b in s.as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        if !b.is_ascii_digit() {
+            // The grammar guarantees this can't happen; stay safe
+            // anyway and surface as an overflow-style anomaly.
+            return (i64::MAX, Some(ParseIssue::Overflow));
+        }
+        if overflow {
+            continue;
+        }
+        let d = (b - b'0') as i64;
+        match acc.checked_mul(10).and_then(|v| v.checked_add(d)) {
+            Some(v) => acc = v,
+            None => {
+                overflow = true;
+                acc = i64::MAX;
+            }
+        }
     }
+    (acc, overflow.then_some(ParseIssue::Overflow))
 }
 
-fn parse_float(s: &str) -> Option<f64> {
-    let cleaned: String = s.chars().filter(|c| *c != '_').collect();
-    cleaned.parse::<f64>().ok()
+/// f64 parse — byte-walker, zero allocation. Accumulates digits into
+/// a u64 mantissa with an `i32` exponent adjustment for the fractional
+/// position, then folds in any `e`/`E` exponent. The final value is
+/// `mantissa * 10^total_exp`.
+///
+/// Flags:
+/// - [`ParseIssue::Overflow`] when the final value is `±∞` (the
+///   exponent pushed past f64::MAX).
+/// - [`ParseIssue::PrecisionLoss`] when the digit stream overflowed
+///   the u64 mantissa — anything past ~19 significant digits silently
+///   drops below the floor of f64's representable precision.
+fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut mantissa: u64 = 0;
+    let mut mantissa_overflowed = false;
+    // -1 per fractional digit accumulated; +1 per integer digit
+    // dropped after overflow. Combined with the explicit exponent
+    // below, this is what scales `mantissa` back to the source value.
+    let mut frac_exp: i32 = 0;
+    let mut seen_dot = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'_' => {}
+            b'.' => seen_dot = true,
+            b'e' | b'E' => break,
+            b'0'..=b'9' => {
+                let d = (b - b'0') as u64;
+                if !mantissa_overflowed {
+                    match mantissa.checked_mul(10).and_then(|v| v.checked_add(d)) {
+                        Some(v) => {
+                            mantissa = v;
+                            if seen_dot {
+                                frac_exp -= 1;
+                            }
+                        }
+                        None => {
+                            mantissa_overflowed = true;
+                            // Lost an integer-part digit — bump exp
+                            // so magnitude is preserved.
+                            if !seen_dot {
+                                frac_exp += 1;
+                            }
+                        }
+                    }
+                } else if !seen_dot {
+                    // Still in integer part after overflow: each
+                    // dropped digit also bumps the exponent.
+                    frac_exp += 1;
+                }
+                // Overflowed + seen_dot: digit silently dropped
+                // (it's well past f64 precision).
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+
+    // Optional exponent.
+    let mut exp: i32 = 0;
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        let mut neg = false;
+        if let Some(&sign) = bytes.get(i) {
+            match sign {
+                b'-' => {
+                    neg = true;
+                    i += 1;
+                }
+                b'+' => i += 1,
+                _ => {}
+            }
+        }
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'_' {
+                i += 1;
+                continue;
+            }
+            if !b.is_ascii_digit() {
+                break;
+            }
+            exp = exp.saturating_mul(10).saturating_add((b - b'0') as i32);
+            i += 1;
+        }
+        if neg {
+            exp = -exp;
+        }
+    }
+
+    let total_exp = exp.saturating_add(frac_exp);
+    let value = (mantissa as f64) * 10f64.powi(total_exp);
+
+    let issue = if value.is_infinite() {
+        Some(ParseIssue::Overflow)
+    } else if mantissa_overflowed {
+        Some(ParseIssue::PrecisionLoss)
+    } else {
+        None
+    };
+    (value, issue)
 }
 
-fn parse_char(raw: &str) -> LiteralKind {
+fn parse_char(raw: &str) -> (LiteralKind, Option<ParseIssue>) {
     // Char tokens come wrapped in single quotes. Strip them, then
     // decode the (possibly-escaped) inner content. A well-formed
     // single-char source produces exactly one Unicode scalar.
@@ -1271,29 +1407,222 @@ fn parse_char(raw: &str) -> LiteralKind {
         }
     };
     match decoded {
-        Some(c) => LiteralKind::Char(c),
-        None => LiteralKind::Invalid,
+        Some(c) => (LiteralKind::Char(c), None),
+        None => (LiteralKind::Char('\0'), Some(ParseIssue::Malformed)),
     }
 }
 
-fn parse_iso8601(raw: &str) -> LiteralKind {
-    // Eager ISO-8601 parsing isn't wired up yet — the GreyCat
-    // runtime translates these to `time` values, but a full
-    // chrono dep would balloon this crate. Store the variant tag
-    // with a 0 placeholder so the analyzer can run its
-    // ISO-specific validation pass; real parsing lands when
-    // chrono / a hand-rolled parser is introduced. Shape-only
-    // sanity check: a well-formed ISO literal starts with four
-    // digits.
-    let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
-    let looks_iso = trimmed.len() >= 10
-        && trimmed.as_bytes()[..4].iter().all(|b| b.is_ascii_digit())
-        && trimmed.as_bytes()[4] == b'-';
-    if looks_iso {
-        LiteralKind::Iso8601(0)
-    } else {
-        LiteralKind::Invalid
+/// Parse an ISO-8601 literal to µs since the Unix epoch.
+///
+/// Accepted shapes (the date prefix is mandatory; everything after
+/// is optional and parsed greedily):
+///   - `YYYY-MM-DD`
+///   - `YYYY-MM-DD[T| ]HH:MM:SS`
+///   - `…HH:MM:SS.f{1..9}`  (fractional seconds, truncated to µs)
+///   - `…Z`                  (UTC marker, no-op)
+///   - `…±HH:MM` or `…±HHMM` (timezone offset; subtracted to get UTC)
+///
+/// No allocation — byte walker only. Returns
+/// [`ParseIssue::Malformed`] on any structural mismatch (out-of-range
+/// component, unrecognised trailing bytes, …) and
+/// [`ParseIssue::Overflow`] when the resulting µs count doesn't fit
+/// i64 (year well outside the ~±292,277-year representable window).
+fn parse_iso8601(raw: &str) -> (LiteralKind, Option<ParseIssue>) {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+
+    let malformed = || (LiteralKind::Iso8601(0), Some(ParseIssue::Malformed));
+
+    let Some(year) = read_digits(bytes, &mut i, 4) else {
+        return malformed();
+    };
+    if bytes.get(i) != Some(&b'-') {
+        return malformed();
     }
+    i += 1;
+    let Some(month) = read_digits(bytes, &mut i, 2) else {
+        return malformed();
+    };
+    if !(1..=12).contains(&month) {
+        return malformed();
+    }
+    if bytes.get(i) != Some(&b'-') {
+        return malformed();
+    }
+    i += 1;
+    let Some(day) = read_digits(bytes, &mut i, 2) else {
+        return malformed();
+    };
+    if day == 0 || day > days_in_month(year as i32, month as u32) as u64 {
+        return malformed();
+    }
+
+    let mut hour = 0u64;
+    let mut minute = 0u64;
+    let mut second = 0u64;
+    let mut frac_us: i64 = 0;
+    let mut tz_offset_minutes: i32 = 0;
+
+    if matches!(bytes.get(i), Some(b'T') | Some(b' ')) {
+        i += 1;
+        let Some(h) = read_digits(bytes, &mut i, 2) else {
+            return malformed();
+        };
+        hour = h;
+        if hour > 23 || bytes.get(i) != Some(&b':') {
+            return malformed();
+        }
+        i += 1;
+        let Some(m) = read_digits(bytes, &mut i, 2) else {
+            return malformed();
+        };
+        minute = m;
+        if minute > 59 || bytes.get(i) != Some(&b':') {
+            return malformed();
+        }
+        i += 1;
+        let Some(s) = read_digits(bytes, &mut i, 2) else {
+            return malformed();
+        };
+        second = s;
+        // Leap second (`60`) is tolerated by the runtime; cap there.
+        if second > 60 {
+            return malformed();
+        }
+
+        // Fractional seconds, capped at 6 digits = µs precision. Extra
+        // digits are valid ISO-8601 but quietly truncated; the parser
+        // doesn't flag those — they're just below the runtime's
+        // representable precision.
+        if bytes.get(i) == Some(&b'.') {
+            i += 1;
+            let mut frac = 0i64;
+            let mut k = 0;
+            while k < 6 && bytes.get(i).copied().is_some_and(|b| b.is_ascii_digit()) {
+                frac = frac * 10 + (bytes[i] - b'0') as i64;
+                i += 1;
+                k += 1;
+            }
+            for _ in k..6 {
+                frac *= 10;
+            }
+            while bytes.get(i).copied().is_some_and(|b| b.is_ascii_digit()) {
+                i += 1;
+            }
+            frac_us = frac;
+        }
+
+        // Timezone marker.
+        match bytes.get(i).copied() {
+            Some(b'Z') => i += 1,
+            Some(sign @ (b'+' | b'-')) => {
+                i += 1;
+                let Some(tz_h) = read_digits(bytes, &mut i, 2) else {
+                    return malformed();
+                };
+                if tz_h > 14 {
+                    return malformed();
+                }
+                let tz_m = if bytes.get(i) == Some(&b':') {
+                    i += 1;
+                    let Some(m) = read_digits(bytes, &mut i, 2) else {
+                        return malformed();
+                    };
+                    m
+                } else if bytes.get(i).copied().is_some_and(|b| b.is_ascii_digit()) {
+                    // `±HHMM` form: two more digits directly.
+                    let Some(m) = read_digits(bytes, &mut i, 2) else {
+                        return malformed();
+                    };
+                    m
+                } else {
+                    0
+                };
+                if tz_m > 59 {
+                    return malformed();
+                }
+                let total = (tz_h as i32) * 60 + tz_m as i32;
+                tz_offset_minutes = if sign == b'-' { -total } else { total };
+            }
+            None => {}
+            _ => return malformed(),
+        }
+    }
+
+    // Reject trailing garbage.
+    if i != bytes.len() {
+        return malformed();
+    }
+
+    let days = days_from_civil(year as i32, month as u32, day as u32);
+    let Some(secs) = days
+        .checked_mul(86_400)
+        .and_then(|v| v.checked_add(hour as i64 * 3600))
+        .and_then(|v| v.checked_add(minute as i64 * 60))
+        .and_then(|v| v.checked_add(second as i64))
+    else {
+        return (LiteralKind::Iso8601(0), Some(ParseIssue::Overflow));
+    };
+    let Some(mut us) = secs
+        .checked_mul(1_000_000)
+        .and_then(|v| v.checked_add(frac_us))
+    else {
+        return (LiteralKind::Iso8601(0), Some(ParseIssue::Overflow));
+    };
+    // Local time → UTC: subtract the offset.
+    let tz_us = tz_offset_minutes as i64 * 60 * 1_000_000;
+    us = match us.checked_sub(tz_us) {
+        Some(v) => v,
+        None => return (LiteralKind::Iso8601(0), Some(ParseIssue::Overflow)),
+    };
+    (LiteralKind::Iso8601(us), None)
+}
+
+/// Read exactly `n` ascii digits starting at `*i`, advance `*i` past
+/// them, and return the parsed integer. Returns `None` if the bytes
+/// at `[*i..*i+n]` aren't all digits (or the slice runs short).
+fn read_digits(bytes: &[u8], i: &mut usize, n: usize) -> Option<u64> {
+    if *i + n > bytes.len() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for k in 0..n {
+        let b = bytes[*i + k];
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (b - b'0') as u64;
+    }
+    *i += n;
+    Some(v)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Howard Hinnant's days-from-civil — days from `1970-01-01` to
+/// `(year, month, day)`. Negative for dates before the epoch. Valid
+/// for the full proleptic Gregorian range that fits an i64 day count.
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let y = (year as i64) - i64::from(month <= 2);
+    let m = month as i64;
+    let d = day as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe as i64 * 365 + (yoe / 4) as i64 - (yoe / 100) as i64 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn is_duration_suffix(s: &str) -> bool {

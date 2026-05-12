@@ -84,3 +84,37 @@ fn plain_int_lowers_to_int_kind() {
     let src = "fn f() {\n    var i = 42;\n}\n";
     assert!(matches!(first_var_init_kind(src, 0), LiteralKind::Int(42)));
 }
+
+#[test]
+fn iso8601_utc_lowers_to_us_since_epoch() {
+    // 2024-01-01T00:00:00Z → 1_704_067_200 seconds since Unix epoch
+    // → 1_704_067_200_000_000 µs. Grammar wraps ISO literals in `'…'`.
+    let src = "fn f() {\n    var t = '2024-01-01T00:00:00Z';\n}\n";
+    let expected: i64 = 1_704_067_200 * 1_000_000;
+    assert!(matches!(
+        first_var_init_kind(src, 0),
+        LiteralKind::Iso8601(us) if us == expected
+    ));
+}
+
+#[test]
+fn iso8601_positive_offset_is_subtracted_for_utc() {
+    // 2024-01-01T01:00:00+01:00 == 2024-01-01T00:00:00Z.
+    let src = "fn f() {\n    var t = '2024-01-01T01:00:00+01:00';\n}\n";
+    let expected: i64 = 1_704_067_200 * 1_000_000;
+    assert!(matches!(
+        first_var_init_kind(src, 0),
+        LiteralKind::Iso8601(us) if us == expected
+    ));
+}
+
+#[test]
+fn iso8601_fractional_seconds_truncate_to_microseconds() {
+    // .123456789 → 123_456 µs (the trailing 789 is sub-µs).
+    let src = "fn f() {\n    var t = '2024-01-01T00:00:00.123456789Z';\n}\n";
+    let expected: i64 = 1_704_067_200 * 1_000_000 + 123_456;
+    assert!(matches!(
+        first_var_init_kind(src, 0),
+        LiteralKind::Iso8601(us) if us == expected
+    ));
+}

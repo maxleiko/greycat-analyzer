@@ -478,7 +478,6 @@ fn expr_kind_and_range(hir: &Hir, expr: &Expr) -> Option<(&'static str, std::ops
             LiteralKind::Duration(_) => "NumLit",
             LiteralKind::Time(_) => "NumLit",
             LiteralKind::Iso8601(_) => "StringLit",
-            LiteralKind::Invalid => "NumLit",
         },
         Expr::Null { byte_range } => return Some(("NullLit", byte_range.clone())),
         Expr::This { byte_range } => return Some(("ThisLit", byte_range.clone())),
