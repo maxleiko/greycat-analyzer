@@ -1107,7 +1107,7 @@ impl ProjectAnalysis {
             pragma_disabled_rules: FxHashSet<String>,
         }
 
-        let pass_a_run = |(uri, hir, lib, lower_took, mut directives, pragmas): (
+        let pass_a_run = |(uri, hir, lib, lower_took, mut directives, mut pragmas): (
             Uri,
             Hir,
             String,
@@ -1121,9 +1121,14 @@ impl ProjectAnalysis {
             let resolve_took = t0.elapsed();
             let t2 = Instant::now();
             // Seed `lints` with the directive parser's own diagnostics
-            // (`unknown-suppression-rule`, `empty-suppression`, …) so
-            // they ride alongside regular lints into LSP / CLI surfaces.
+            // (`unknown-suppression-rule`, `empty-suppression`, …) and
+            // the pragma walker's validation diagnostics (P40.3:
+            // `conflicting-lint-pragma`, plus mirrored
+            // `unknown-suppression-rule` / `empty-suppression` for the
+            // `@lint_off` / `@lint_on` annotation form) so all of them
+            // ride alongside regular lints into LSP / CLI surfaces.
             let mut lints = std::mem::take(&mut directives.diagnostics);
+            lints.append(&mut pragmas.diagnostics);
             lints.extend(run_lints_with_directives(
                 &hir,
                 &resolutions,

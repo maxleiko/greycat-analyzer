@@ -177,3 +177,47 @@ fn module_lint_off_only_affects_that_module() {
         pa.module(&other_uri).unwrap().lints
     );
 }
+
+// P40.3 — pragma validation surfaces through the regular lints
+// channel, so CLI + LSP see `unknown-suppression-rule`,
+// `empty-suppression`, and `conflicting-lint-pragma` without extra
+// wiring.
+
+#[test]
+fn unknown_pragma_rule_surfaces_via_module_lints() {
+    let entry = "@lint_off(\"bogus-rule\");\nfn main() {}\n";
+    let (entry_uri, _, pa) = analyze_two_modules(entry, "");
+    let hits: Vec<_> = pa
+        .module(&entry_uri)
+        .unwrap()
+        .lints
+        .iter()
+        .filter(|l| l.rule == "unknown-suppression-rule")
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "@lint_off with unknown rule must produce unknown-suppression-rule: {:?}",
+        pa.module(&entry_uri).unwrap().lints
+    );
+}
+
+#[test]
+fn conflicting_lint_pragmas_surfaces_via_module_lints() {
+    // Same rule named in @lint_off and @lint_on in the same module.
+    let entry = "@lint_off(\"unused-decl\");\n@lint_on(\"unused-decl\");\nfn main() {}\n";
+    let (entry_uri, _, pa) = analyze_two_modules(entry, "");
+    let hits: Vec<_> = pa
+        .module(&entry_uri)
+        .unwrap()
+        .lints
+        .iter()
+        .filter(|l| l.rule == "conflicting-lint-pragma")
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "@lint_off + @lint_on on same rule must surface conflicting-lint-pragma: {:?}",
+        pa.module(&entry_uri).unwrap().lints
+    );
+}

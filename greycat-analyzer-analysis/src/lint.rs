@@ -79,7 +79,8 @@ pub fn default_tag_for(rule: &str) -> Option<DiagTag> {
         | "redundant-non-null-assertion"
         | "redundant-coalesce"
         | "redundant-semicolon"
-        | "no-breakpoint" => Some(DiagTag::Unnecessary),
+        | "no-breakpoint"
+        | "conflicting-lint-pragma" => Some(DiagTag::Unnecessary),
         _ => None,
     }
 }
@@ -292,6 +293,11 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
     rule(
         "redundant-semicolon",
         "error on a stray `;` after a fn or method body (`fn f() {};`) — the runtime rejects it; auto-fix removes the `;`",
+    ),
+    rule(
+        "conflicting-lint-pragma",
+        "flag a `@lint_on(\"…\")` / `@lint_off(\"…\")` pair that names the same rule in the same module \
+         — `@lint_off` wins; the other pragma is dead",
     ),
     advisory_rule(
         "no-breakpoint",
