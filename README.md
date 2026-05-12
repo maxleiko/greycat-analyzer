@@ -49,7 +49,7 @@ greycat-analyzer lint path/to/project.gcl                      # explicit entryp
 greycat-analyzer lint path/to/standalone.gcl                   # single-file project
 greycat-analyzer lint --fix                                    # apply auto-fixable lint suggestions in place
 greycat-analyzer lint --list-rules                             # dump registered rule namespace and exit
-greycat-analyzer lint --disable=unused-local,redundant-coalesce  # silence specific rules globally
+greycat-analyzer lint --disable=unused-local,non-exhaustive    # silence specific rules globally
 greycat-analyzer lint --no-suppressions                        # CI: re-emit every `// gcl-lint-off`-silenced diagnostic
 greycat-analyzer lint --lint-libs                              # also surface lints from `lib/<name>/` modules
 ```

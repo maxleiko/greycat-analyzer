@@ -128,8 +128,13 @@ impl Lint {
         // `lint::LINT_RULES`, so the listing never goes out of sync
         // with the live rule set.
         if self.list_rules {
+            let max_len = greycat_analyzer_analysis::lint::LINT_RULES
+                .iter()
+                .map(|r| r.name.len())
+                .max()
+                .unwrap_or(0);
             for rule in greycat_analyzer_analysis::lint::LINT_RULES {
-                println!("{}\t{}", rule.name, rule.summary);
+                println!("{:>width$}  {}", rule.name, rule.summary, width = max_len);
             }
             return Ok(ExitCode::SUCCESS);
         }

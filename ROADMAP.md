@@ -54,6 +54,7 @@ This is the long-arc plan for porting the [GreyCat](https://greycat.io) language
 - [Phase 34 — Server-side filesystem watcher](#phase-34--server-side-filesystem-watcher-3-5-days-optional)
 - [Phase 35 — Decl-handle type identity](#phase-35--decl-handle-type-identity-1-2-weeks)
 - [Phase 36 — Complete decl-handle identity migration](#phase-36--complete-decl-handle-identity-migration-2-3-weeks)
+- [Phase 37 — `breakpoint` keyword end-to-end](#phase-37--breakpoint-keyword-end-to-end-2-3-days)
 
 ### Other sections
 
@@ -1240,6 +1241,61 @@ The chunks below group these by file. Each match arm typically needs *either* a 
 - Migrating `TypeKind::Primitive` to also key off a decl handle. Primitives don't have user-overridable decls.
 - Re-keying narrow-tracking paths on `(TypeDeclId, SmolStr)` tuples instead of the current "display string" form. 36.3 normalizes paths via the registry-backed name to keep the migration mechanical; the structural rework belongs to a future phase if profiling shows it matters.
 - Removing `Unresolved`. It's a deliberate kept variant — the only diagnostic-shaped type kind.
+
+---
+
+### Phase 37 — `breakpoint` keyword end-to-end (~2-3 days)
+
+**Goal:** add first-class support for the GreyCat `breakpoint` statement — a no-op-shaped control statement that signals the runtime to pause the current worker for debugging. The keyword exists in the runtime (`8.0.291-dev` build accepts `fn main() { breakpoint; }`; `greycat run main` pauses on entry) but was missing from the grammar and every downstream stage of the Rust port. Today an `.gcl` containing `breakpoint;` parses as `ERROR` in tree-sitter, which cascades into `Expr::Unsupported` / parse diagnostics, breaking lint, format, and LSP on any file using the construct.
+
+**Trigger:** user-reported gap on 2026-05-12. The keyword was never ported because no stdlib / corpus file uses it; the analyzer didn't surface it until someone wrote `breakpoint;` in their own project.
+
+**Semantics (confirmed against the runtime, oracle for this phase):**
+
+- `breakpoint` is a **statement-level keyword**, parsed as `seq("breakpoint", $._semi)` — same shape family as `break_stmt` / `continue_stmt`.
+- It is **not loop-scoped** — `fn main() { breakpoint; }` is valid GreyCat (unlike `break` / `continue`). Allowed anywhere a statement is.
+- It is **not a control-flow terminator** — execution resumes from the next statement after the debugger detaches. Code after `breakpoint;` is reachable; the reachability / unreachable-code lint must NOT flag it.
+- The runtime ident probe (`breakpoints;` → "unresolved identifier breakpoints") confirms exact spelling: singular, no trailing `s`. `breakpoint` matches the ident regex like every other keyword (`word: $.ident`), so the grammar literal token preempts the ident match.
+
+**Behavioral contract:**
+
+- `breakpoint;` parses to a `breakpoint_stmt` CST node, lowers to `Stmt::Breakpoint`, and round-trips through `cargo run -p greycat-analyzer -- fmt` byte-identical (modulo surrounding-statement formatting).
+- `cargo run -p greycat-analyzer -- lint project.gcl` on a file using `breakpoint;` produces exactly one `no-breakpoint` Warning (the advisory lint from 37.7); `lint --fix` deletes the statement.
+- LSP keyword completion at a statement position offers `breakpoint`.
+- The reachability pass treats `breakpoint;` as a non-terminating statement: a `return` after it is *not* dead code; a function whose only statement is `breakpoint;` still fails missing-return analysis if a value-returning signature demands one.
+- The `unsupported_audit` HIR test stays clean (no new `Expr::Unsupported` shapes; `breakpoint_stmt` is a stmt-level node so it never goes through expression lowering anyway).
+
+**Surface map (touchpoints, in dependency order):**
+
+| Layer | Files | What changes |
+|---|---|---|
+| Grammar | [`tree-sitter-greycat/grammar.js`](../tree-sitter-greycat/grammar.js), [`queries/highlights.scm`](../tree-sitter-greycat/queries/highlights.scm), `src/parser.c` + `src/node-types.json` (regenerated), [`test/corpus/`](../tree-sitter-greycat/test/corpus/) | New `breakpoint_stmt` rule; added to `_stmt` choice; highlight as `@keyword.control`; corpus test pinning shape. |
+| HIR | [`greycat-analyzer-hir/src/types.rs`](../greycat-analyzer-hir/src/types.rs), [`src/lower.rs`](../greycat-analyzer-hir/src/lower.rs) | `Stmt::Breakpoint` unit variant (mirror `Break` / `Continue`); `"breakpoint_stmt"` arm in `lower_stmt`. |
+| Analysis | [`analyzer.rs`](../greycat-analyzer-analysis/src/analyzer.rs), [`reachability.rs`](../greycat-analyzer-analysis/src/reachability.rs), [`resolver.rs`](../greycat-analyzer-analysis/src/resolver.rs), [`lint.rs`](../greycat-analyzer-analysis/src/lint.rs), [`project.rs`](../greycat-analyzer-analysis/src/project.rs) | Add `Stmt::Breakpoint` arm to every `match stmt` site. **Critical:** in `reachability.rs:40` and `analyzer.rs:54`, `breakpoint` is NOT in the "terminates" set (unlike `Break` / `Continue` / `Return` / `Throw`). |
+| Formatter | [`greycat-analyzer-fmt/src/lower.rs`](../greycat-analyzer-fmt/src/lower.rs) | `"breakpoint_stmt" => Doc::text("breakpoint;")` — matches the `break_stmt` / `continue_stmt` shape. |
+| CLI dump | [`greycat-analyzer/src/cmd/dump_types.rs`](../greycat-analyzer/src/cmd/dump_types.rs) | Add to the no-op exhaustive arm alongside `Break` / `Continue` / `Throw(_)`. |
+| WASM bridge | [`greycat-analyzer-wasm/src/lib.rs`](../greycat-analyzer-wasm/src/lib.rs) | `Stmt::Breakpoint => HirNode { kind: "stmt:breakpoint", … }` — mirror the `Break` / `Continue` shapes. |
+| LSP | [`capabilities.rs`](../greycat-analyzer-server/src/capabilities.rs) | `ALL_KEYWORDS` registry: add `"breakpoint"`. `stmt_byte_range` helper: add `HS::Breakpoint => 0..0` arm (matches `Break` / `Continue`). Hover text optional but worth adding: "Pauses the GreyCat worker for debugging." |
+| VSCode TM grammar | [`editors/code/grammar/Greycat.tmLanguage.json`](../editors/code/grammar/Greycat.tmLanguage.json) | Add `breakpoint` to both keyword.control alternations (lines 34 and 38 today). |
+| VSCode snippets (optional) | [`editors/code/snippets/snippets.json`](../editors/code/snippets/snippets.json) | `bp` → `breakpoint;` snippet for ergonomic insertion. |
+
+**Chunks:**
+
+- [ ] **37.1 Grammar + corpus test + queries (submodule)** (S) — edit `tree-sitter-greycat/grammar.js`: add `breakpoint_stmt: ($) => seq("breakpoint", $._semi)` and append it to the `_stmt` choice (next to `break_stmt`). Run `npx tree-sitter generate` to refresh `src/parser.c`, `src/grammar.json`, `src/node-types.json`. Add a corpus test in `tree-sitter-greycat/test/corpus/breakpoint_stmt.txt` exercising both standalone (`fn main() { breakpoint; }`) and trailing-after-breakpoint shapes (`fn f() { breakpoint; return 0; }`) to lock the not-a-terminator parse and prove the next statement still attaches as a sibling, not as an ERROR child. Update `queries/highlights.scm`: add `breakpoint` to the keyword alternation (line 6 today) and add `(breakpoint_stmt "breakpoint" @keyword.control)`. Run `npx tree-sitter test` + `npx tree-sitter parse project.gcl` (the submodule's smoke file — add a `breakpoint;` line first) to verify no `ERROR` nodes. Commit inside submodule, push to `maxleiko/tree-sitter-greycat`. **Submodule pointer bump lands in 37.2.**
+- [ ] **37.2 Bump submodule pointer + HIR variant + lowering** (S) — bump `tree-sitter-greycat` SHA in the parent repo to the 37.1 commit. Add `Stmt::Breakpoint` to [`types.rs`](../greycat-analyzer-hir/src/types.rs) (unit variant alongside `Break` / `Continue` — no byte_range, mirroring those two; if the user later wants hover positioning beyond the CST fallback, plumbing a `byte_range` field is a separate, mechanical pass). Add `"breakpoint_stmt" => Stmt::Breakpoint` to `lower_stmt` in [`lower.rs`](../greycat-analyzer-hir/src/lower.rs). Smoke test in `greycat-analyzer-hir/tests/`: parse `fn f() { breakpoint; }`, lower, assert the function body's first stmt is `Stmt::Breakpoint`.
+- [ ] **37.3 Analysis stages: non-exhaustive match audit + reachability semantics** (M) — add `Stmt::Breakpoint` to every `match stmt` site in `greycat-analyzer-analysis`. Six sites today: `resolver.rs:449`, `analyzer.rs:54`, `analyzer.rs:2742`, `reachability.rs:40`, `lint.rs:1914`, `project.rs:2489`. The **load-bearing decision** is in `reachability.rs:40` and `analyzer.rs:54` — both currently group `Break | Continue | Return | Throw` as "terminates control flow." `Breakpoint` does NOT belong in that group; it goes in the no-op arm next to `Expr` / `Var` / `Assign`. Add a `tests/reachability_breakpoint.rs` integration test asserting `fn f(): int { breakpoint; return 0; }` produces no `unreachable` diagnostic on the return.
+- [ ] **37.4 Formatter + CLI dump + WASM bridge** (S) — three mechanical mirrors of the `Break` / `Continue` pattern. (a) [`greycat-analyzer-fmt/src/lower.rs:144`](../greycat-analyzer-fmt/src/lower.rs): add `"breakpoint_stmt" => Doc::text("breakpoint;")`. (b) [`greycat-analyzer/src/cmd/dump_types.rs:818`](../greycat-analyzer/src/cmd/dump_types.rs): add `Stmt::Breakpoint` to the no-op exhaustive arm. (c) [`greycat-analyzer-wasm/src/lib.rs:532`](../greycat-analyzer-wasm/src/lib.rs): add `Stmt::Breakpoint => HirNode { kind: "stmt:breakpoint".into(), label: None, range: (0..0).into(), children: Vec::new() }`. Add a formatter snapshot test pinning the round-trip.
+- [ ] **37.5 LSP keyword completion + `stmt_byte_range` arm** (S) — [`capabilities.rs:3616`](../greycat-analyzer-server/src/capabilities.rs): add `"breakpoint"` to `ALL_KEYWORDS` (alphabetic position between `at` and `catch`). `break` and `continue` were added to the same list in a prior `chore:` commit, so the only insert in this chunk is `breakpoint`. [`capabilities.rs:4200`](../greycat-analyzer-server/src/capabilities.rs): extend the `0..0` fallback to include `HS::Breakpoint`. Optional: when hover lands on a `breakpoint` keyword (cursor inside the CST keyword token), return a fixed markdown string explaining the semantics ("Pauses the GreyCat worker for debugging. Resumes from the next statement after the debugger detaches."). Integration test in `greycat-analyzer-server/tests/`: assert `textDocument/completion` at a fresh stmt position includes `breakpoint`.
+- [ ] **37.6 VSCode TextMate grammar + snippet** (S) — [`editors/code/grammar/Greycat.tmLanguage.json`](../editors/code/grammar/Greycat.tmLanguage.json) line 34: insert `breakpoint` into the main keyword alternation. Line 38: insert into the `return|break|continue` group (the "control-flow exit-shape" group). Optional: snippet `bp` → `breakpoint;` in [`snippets.json`](../editors/code/snippets/snippets.json). Smoke-test by opening a `.gcl` file with `breakpoint;` in the bundled VSCode extension dev host.
+- [ ] **37.7 Advisory lint: `no-breakpoint`** (S) — lint that flags every `Stmt::Breakpoint` in committed source, default severity Warning, LSP DiagnosticTag `UNNECESSARY` for the dimmed-text rendering. Rationale: `breakpoint` is a debug aid that pauses the worker; leaving one in committed code stalls production runs and is almost always unintended — the same shape of mistake as committing a Rust `dbg!()` or a JS `debugger;`. The lint is intentionally *not* a hard error (Warning, not Error) so users can still iterate freely; suppression via `// gcl-lint-off no-breakpoint` for the rare intentional case (e.g. a `breakpoint;` inside an `@test` that is meant to attach a debugger). Touchpoints (per the [CLAUDE.md "Adding / removing a lint rule"](../../greycat-analyzer/.claude/CLAUDE.md#adding--removing-a-lint-rule) checklist — all four touched in the same commit, removal-side grep deferred until the rule is retired): (1) `LINT_RULES` registry entry with the one-line summary — drives `lint --list-rules` and LSP rule-name completion in `// gcl-lint-off` suppressions; (2) emission wiring — HIR-only rule, add the struct to `default_rules()` in [`lint.rs`](../greycat-analyzer-analysis/src/lint.rs) (no typed-pass filter retain needed); (3) auto-fix dispatch in [`quickfix.rs`](../greycat-analyzer-analysis/src/quickfix.rs) — the fix is "delete this statement (and the trailing newline if it occupies a line on its own)," wired through both `lint --fix` and the LSP `textDocument/codeAction` path; (4) `default_tag_for` returning `Some(DiagnosticTag::UNNECESSARY)` for editor-side dimming. Fixture test in `greycat-analyzer-analysis/tests/` snapshotting the diagnostic on a `fn f() { breakpoint; }` input and the fix's resulting edit.
+
+**M37:** `cargo run -p greycat-analyzer -- lint project.gcl` on a file containing `breakpoint;` produces exactly one `no-breakpoint` Warning (dimmed in editors); `lint --fix` deletes the statement; `... fmt project.gcl` round-trips byte-identical; LSP completion offers `breakpoint` at stmt position; reachability doesn't flag `return` after `breakpoint;` as dead. `cargo test --workspace` + `cargo clippy --workspace --all-targets` clean. Tree-sitter corpus regression test pins the parse shape.
+
+**Out of scope:**
+- Wiring the analyzer to anything debugger-protocol-shaped (DAP). The analyzer's job ends at "this statement parses, lowers, types-checks, and round-trips." Whether the runtime actually pauses on it is the runtime's contract.
+- Plumbing a `byte_range` onto `Stmt::Breakpoint` (or onto `Stmt::Break` / `Continue`). Capability handlers fall back to the CST when they need precise positioning; HIR keeps the unit-variant shape consistent.
+- Updating the external `/greycat:greycat` skill or the upstream TS reference docs. The runtime already accepts the keyword; nothing in this phase asks us to publish a language-reference change. Flag the gap to the user if it matters.
+- Adding `break` / `continue` to `ALL_KEYWORDS` (separate completion-keyword gap, not what was reported).
 
 ---
 

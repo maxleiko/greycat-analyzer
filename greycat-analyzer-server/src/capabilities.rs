@@ -436,11 +436,12 @@ fn foreign_member_hover_markdown(
 /// cross-module idents — intra-module uses pass `None`.
 fn render_decl_hover_markdown(hir: &Hir, decl: &Decl, provenance: Option<&str>) -> String {
     let mut out = String::new();
-    push_doc_section(&mut out, decl_doc(decl));
     let signature = render_decl_signature(hir, decl);
     out.push_str(&wrap_code(&signature));
+    out.push('\n');
+    push_doc_section(&mut out, decl_doc(decl));
     if let Some(prov) = provenance {
-        out.push_str("\n\n*defined in `");
+        out.push_str("\n*defined in `");
         out.push_str(prov);
         out.push_str("`*");
     }
@@ -3610,12 +3611,15 @@ fn static_completion_item(
 /// (`grammar.js`): the modifiers (`private`, `static`, `abstract`,
 /// `native`), decl-level (`fn`, `type`, `enum`, `var`), control-flow
 /// (`if`, `else`, `for`, `while`, `do`, `return`, `throw`, `try`,
-/// `catch`, `at`, `in`), and expression-level (`is`, `as`, `null`,
-/// `true`, `false`, `this`).
+/// `catch`, `at`, `in`, `break`, `continue`), and expression-level
+/// (`is`, `as`, `null`, `true`, `false`, `this`). Context-only keywords
+/// (`extends`, `typeof`) are not listed — they only parse in a single
+/// fixed slot (after a type-decl name / on a fn-param type) and are
+/// completed by the contextual handlers, not the stmt/expr fallback.
 const ALL_KEYWORDS: &[&str] = &[
-    "abstract", "as", "at", "catch", "do", "else", "enum", "false", "fn", "for", "if", "in", "is",
-    "native", "null", "private", "return", "static", "this", "throw", "true", "try", "type", "var",
-    "while",
+    "abstract", "as", "at", "break", "catch", "continue", "do", "else", "enum", "false", "fn",
+    "for", "if", "in", "is", "native", "null", "private", "return", "static", "this", "throw",
+    "true", "try", "type", "var", "while",
 ];
 
 // =============================================================================
