@@ -35,7 +35,7 @@ use greycat_analyzer_hir::types::{
 };
 use greycat_analyzer_types::{
     GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_assignable_to, is_castable, is_node_tag,
+    is_assignable_to, is_castable,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -1317,34 +1317,61 @@ impl<'a> Cx<'a> {
     }
 
     // P16.5
-    /// When an `Expr::Arrow` receiver is a single-arg node-tag
-    /// generic (`node<T>`, `nodeTime<T>`, `nodeList<T>`, `nodeGeo<T>`),
-    /// `n->field` resolves against the inner type's members rather
-    /// than the tag's own. Mirrors the runtime's `*n.field` semantics:
-    /// `->` is sugar for "deref then access", so members are searched
-    /// on the deref'd type, not on the tag. Tag-owned methods stay
-    /// reachable via the dot syntax (`n.resolve()`, `n.size()`) — the
-    /// `Expr::Member` path in the caller is unchanged.
-    /// Multi-arg shapes (`nodeIndex<K, V>`) don't match — there's no
-    /// canonical `inner` to redirect to. Returns `None` for non-tag
-    /// receivers so the caller resolves against the receiver itself.
-    fn arrow_deref_receiver(&self, recv_ty: TypeId) -> Option<TypeId> {
-        let ty = self.arena.get(recv_ty);
-        match &ty.kind {
-            TypeKind::Generic { name, args } if is_node_tag(name) && args.len() == 1 => {
-                Some(args[0])
+    /// Resolve the deref-target type for an `Expr::Arrow` receiver:
+    /// `n->field` desugars to `n.<deref_method>().field`, where the
+    /// deref method is named by the `@deref("methodName")` annotation
+    /// on the receiver's type declaration. The deref-target is the
+    /// *return type* of that method, with the receiver's generic args
+    /// substituted in.
+    ///
+    /// Returns `None` when:
+    /// - the receiver's type has no `@deref` annotation,
+    /// - the named method doesn't exist on the type, or
+    /// - the receiver's type isn't a `Type` / `GenericInstance` /
+    ///   `Generic` shape with a discoverable name.
+    ///
+    /// Mirrors the compiler: `*n` / `n->m()` are syntactic sugar
+    /// driven entirely by metadata on the type decl. There is no
+    /// hard-coded list of "deref-able" types in the analyzer.
+    fn arrow_deref_receiver(&mut self, recv_ty: TypeId) -> Option<TypeId> {
+        // Pull the receiver's name + generic-arg instantiation. Three
+        // shapes carry a discoverable type name:
+        //   - `Type(decl)`           — non-generic concrete decl.
+        //   - `GenericInstance{decl, args}` — handle-keyed generic.
+        //   - `Generic { name, args }` — name-keyed generic (legacy
+        //     lowering for stdlib references, still in flight pending
+        //     the full handle migration).
+        let (type_name, instantiation): (SmolStr, Vec<TypeId>) = {
+            let ty = self.arena.get(recv_ty);
+            match &ty.kind {
+                TypeKind::Type(d) => (self.arena.decl_name(*d)?.into(), Vec::new()),
+                TypeKind::GenericInstance { decl, args } => {
+                    (self.arena.decl_name(*decl)?.into(), args.to_vec())
+                }
+                TypeKind::Generic { name, args } => (name.clone(), args.to_vec()),
+                _ => return None,
             }
-            // P36.3 — handle-keyed node-tag dispatch via WellKnown.
-            // Identical semantics to the string-keyed arm above;
-            // both coexist until P36.7 deletes `Generic` (and the
-            // string-keyed `is_node_tag`).
-            TypeKind::GenericInstance { decl, args }
-                if self.well_known.is_node_tag(*decl) && args.len() == 1 =>
-            {
-                Some(args[0])
-            }
-            _ => None,
+        };
+        // Single lookup: signature-lowering's
+        // `populate_deref_caches` already resolved the `@deref`
+        // method's return TypeId (chain-walked through supertypes if
+        // needed) and stashed it on `TypeMembers::deref_return_ty`.
+        // The cached `TypeId` is in abstract `GenericParam(T, …)`
+        // form — substitute the receiver's instantiation here.
+        let members = self.index.type_members_for(&type_name)?;
+        let method_ret = members.deref_return_ty?;
+        if instantiation.is_empty() {
+            return Some(method_ret);
         }
+        let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
+        for (i, gp_sym) in members.generics.iter().enumerate() {
+            if let Some(arg) = instantiation.get(i)
+                && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
+            {
+                subst.insert(gp_name.to_string(), *arg);
+            }
+        }
+        Some(self.arena.substitute(method_ret, &subst))
     }
 
     // P6.3
@@ -4645,6 +4672,68 @@ fn f(p: Point): int { return p.bogus; }
         None
     }
 
+    /// Project-pipeline variant of [`local_init_ty`] that loads a
+    /// synthetic stdlib fixture before analyzing `src`. Use it when
+    /// the test exercises behavior gated on stdlib annotations
+    /// (`@deref("resolve")` on `node<T>`, `@iterable` on `Array<T>`,
+    /// …) — those flags only land in the project index after the
+    /// declaring module is ingested.
+    fn local_init_ty_with_stdlib(stdlib_src: &str, src: &str, name: &str) -> Option<String> {
+        use greycat_analyzer_core::SourceManager;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let stdlib_uri =
+            greycat_analyzer_core::lsp_types::Uri::from_str("file:///std/core.gcl").unwrap();
+        mgr.add_simple(stdlib_uri, stdlib_src, "std", false);
+        let src_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(src_uri.clone(), src, "project", false);
+        let pa = crate::project::ProjectAnalysis::analyze(&mgr);
+        let module = pa.module(&src_uri)?;
+        for (_id, stmt) in module.hir.stmts.iter() {
+            if let Stmt::Var(v) = stmt
+                && module.hir.idents[v.name].text == name
+                && let Some(init) = v.init
+            {
+                let ty = module.analysis.expr_types.get(&init).copied()?;
+                return Some(pa.display_type(ty).to_string());
+            }
+        }
+        None
+    }
+
+    /// Minimal synthetic `lib/std/core.gcl` covering the runtime
+    /// names that show up in test fixtures: primitives + `node<T>`
+    /// with its `@deref("resolve")` annotation + `resolve(): T`.
+    /// Use with [`local_init_ty_with_stdlib`] when the test
+    /// exercises arrow-deref / `@deref`-driven typing.
+    fn synthetic_std_core() -> &'static str {
+        "native type any {}\n\
+         native type null {}\n\
+         native type bool {}\n\
+         native type char {}\n\
+         native type int {}\n\
+         native type float {}\n\
+         native type String {}\n\
+         native type time {}\n\
+         native type duration {}\n\
+         native type geo {}\n\
+         native type type {}\n\
+         native type field {}\n\
+         native type function {}\n\
+         @deref(\"resolve\")\n\
+         native type node<T> {\n    fn resolve(): T;\n}\n\
+         @deref(\"resolve\")\n\
+         native type nodeTime<T> {\n    fn resolve(): T;\n}\n\
+         @deref(\"resolve\")\n\
+         native type nodeList<T> {\n    fn resolve(): T;\n}\n\
+         @deref(\"resolve\")\n\
+         native type nodeGeo<T> {\n    fn resolve(): T;\n}\n\
+         native type nodeIndex<K, V> {}\n\
+         native type Array<T> {}\n\
+         native type Map<K, V> {}\n\
+         type Tuple<T, U> { a: T; b: U; }\n"
+    }
+
     #[test]
     fn p16_7_question_dot_on_nullable_lifts_result() {
         // `f?.name` where `f: Foo?` — result is `String?`. The receiver
@@ -4688,14 +4777,20 @@ fn caller(f: Foo) {
     fn p16_7_question_arrow_on_nullable_node_lifts() {
         // `n?->name` for `n: node<Foo>?` — null-safe access through
         // the deref. Result lifts to `String?` because the receiver
-        // is nullable.
+        // is nullable. Needs stdlib loaded because the analyzer
+        // looks up the `@deref("resolve")` annotation on `node<T>`'s
+        // decl (in `lib/std/core.gcl`) to know that `*n` / `n->m`
+        // desugars to `n.resolve().m`.
         let src = r#"
 type Foo { name: String; }
 fn caller(n: node<Foo>?) {
     var s = n?->name;
 }
 "#;
-        assert_eq!(local_init_ty(src, "s").as_deref(), Some("String?"));
+        assert_eq!(
+            local_init_ty_with_stdlib(synthetic_std_core(), src, "s").as_deref(),
+            Some("String?"),
+        );
     }
 
     #[test]

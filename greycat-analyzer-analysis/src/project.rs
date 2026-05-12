@@ -868,6 +868,44 @@ fn lower_signatures_into(
         apply_module_contributions(index, &entry);
         cache.insert((*uri).clone(), entry);
     }
+
+    // Post-pass: cache the deref-method return type on every type
+    // whose decl carried `@deref("methodName")`. Runs after every
+    // module's `method_returns` is in place so the lookup never
+    // misses. The cached `TypeId` is still in the abstract
+    // `GenericParam(T, …)` form — `arrow_deref_receiver` applies
+    // the receiver's instantiation via `arena.substitute` at the
+    // call site.
+    populate_deref_caches(index);
+}
+
+fn populate_deref_caches(index: &mut ProjectIndex) {
+    use rustc_hash::FxHashMap;
+    // Two-pass: build a snapshot of (type_sym → method_sym) pairs
+    // from `type_flags`, then resolve each via the chain-walking
+    // method-return lookup. Avoids holding `&type_members` + `&mut
+    // type_members` borrows simultaneously.
+    let mut resolutions: FxHashMap<greycat_analyzer_types::Symbol, greycat_analyzer_types::TypeId> =
+        FxHashMap::default();
+    for (type_sym, flags) in &index.type_flags {
+        let Some(method_name) = flags.deref.as_deref() else {
+            continue;
+        };
+        if method_name.is_empty() {
+            continue;
+        }
+        let Some(type_name) = index.symbols.resolve(*type_sym) else {
+            continue;
+        };
+        if let Some(ret) = index.type_method_return_chain(type_name, method_name) {
+            resolutions.insert(*type_sym, ret);
+        }
+    }
+    for (type_sym, ret_ty) in resolutions {
+        if let Some(tm) = index.type_members.get_mut(&type_sym) {
+            tm.deref_return_ty = Some(ret_ty);
+        }
+    }
 }
 
 // P19.6

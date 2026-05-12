@@ -716,17 +716,14 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         return false;
     }
 
-    // P7.3 node tagging: `node<T>` / `nodeTime<T>` / etc. auto-deref to
-    // their inner `T`. The reverse direction stays asymmetric — a bare
-    // `T` cannot promote to a tagged-node form without an explicit
-    // constructor call.
-    if let TypeKind::Generic { name, args } = &a.kind
-        && is_node_tag(name)
-        && args.len() == 1
-        && is_assignable_to(arena, args[0], to)
-    {
-        return true;
-    }
+    // P7.3 (REMOVED): there is no `node<T> → T` auto-deref subtype
+    // rule. The runtime rejects `var x: T = some_node<T>();` — the
+    // arrow operator (`*n` / `n->m()`) is the *syntactic* desugar for
+    // `n.resolve().m()`, dispatched by the `@deref("resolve")`
+    // annotation on the receiver's type decl, not by an assignability
+    // rule baked into the type system. The check survives for the
+    // arrow / star handlers in the analyzer (where it reads
+    // `TypeFlags::deref` to decide what method to call), not here.
 
     match (&a.kind, &b.kind) {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
@@ -1571,13 +1568,18 @@ mod tests {
     }
 
     #[test]
-    fn node_tag_auto_derefs_to_inner() {
+    fn node_tag_does_not_auto_deref_into_inner() {
+        // The runtime rejects `var x: T = some_node<T>();` — node
+        // dereferencing is a *syntactic* deref (`*n` / `n->m()`
+        // desugars to `n.resolve().m()` via the `@deref("resolve")`
+        // annotation on `node<T>`'s decl), not an assignability rule.
+        // Earlier ports of this analyzer baked an `is_node_tag(name) &&
+        // args[0] assigns to to` rule into `is_assignable_to`; the
+        // runtime oracle disagreed.
         let mut a = fresh();
         let person = a.named("Person");
         let node_person = a.generic("node", vec![person]);
-        // node<Person> → Person  (auto-deref)
-        assert!(is_assignable_to(&a, node_person, person));
-        // Person → node<Person>  is NOT auto-promoted.
+        assert!(!is_assignable_to(&a, node_person, person));
         assert!(!is_assignable_to(&a, person, node_person));
     }
 

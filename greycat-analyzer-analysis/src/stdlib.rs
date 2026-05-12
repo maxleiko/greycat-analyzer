@@ -324,6 +324,16 @@ pub struct TypeMembers {
     /// `node<Super>`) when `Sub` is a descendant of `Super`.
     /// `None` for types without an explicit `extends` clause.
     pub supertype: Option<Symbol>,
+    /// Pre-resolved deref-target TypeId for types carrying a
+    /// `@deref("methodName")` annotation. Captured during signature
+    /// lowering: the `@deref` annotation names a method, and this
+    /// field caches the method's pre-lowered return TypeId (still in
+    /// the abstract `GenericParam(T, …)` form — call-site
+    /// substitution applies the receiver's instantiation). Lets
+    /// `arrow_deref_receiver` answer `*n` / `n->m()` typing with a
+    /// single field read instead of a name lookup + chain walk per
+    /// access. `None` when the type has no `@deref` annotation.
+    pub deref_return_ty: Option<TypeId>,
 }
 
 impl TypeMembers {
@@ -851,6 +861,11 @@ impl ProjectIndex {
                             static_methods: FxHashSet::default(),
                             abstract_methods: FxHashSet::default(),
                             supertype,
+                            // Filled in by `apply_module_contributions`
+                            // after signature lowering — see
+                            // `populate_deref_caches` in
+                            // [`crate::project`].
+                            deref_return_ty: None,
                         };
                         for attr_id in &td.attrs {
                             let attr = &hir.type_attrs[*attr_id];

@@ -26,6 +26,45 @@ fn uri() -> Uri {
     Uri::from_str("file:///test.gcl").unwrap()
 }
 
+/// Minimal synthetic `lib/std/core.gcl` shape carrying the runtime
+/// types the deref-tests rely on: `node<T>`, `nodeTime<T>`,
+/// `nodeList<T>`, `nodeGeo<T>`, all annotated `@deref("resolve")`
+/// with a `resolve(): T` method. The analyzer's
+/// `arrow_deref_receiver` reads the `@deref` annotation off the
+/// declaring type's `TypeFlags` to know that `n->m` desugars to
+/// `n.resolve().m`; without a real stdlib decl in scope, that
+/// metadata is absent and arrow dispatch falls through. Tests that
+/// exercise arrow semantics seed this synthetic stdlib into the
+/// `SourceManager` so the project pipeline ingests it before
+/// analyzing the user source.
+fn synthetic_std_core_with_node() -> &'static str {
+    "native type any {}\n\
+     native type null {}\n\
+     native type bool {}\n\
+     native type char {}\n\
+     native type int {}\n\
+     native type float {}\n\
+     native type String {}\n\
+     native type time {}\n\
+     native type duration {}\n\
+     native type geo {}\n\
+     native type type {}\n\
+     native type field {}\n\
+     native type function {}\n\
+     @deref(\"resolve\")\n\
+     native type node<T> {\n    fn resolve(): T;\n}\n\
+     @deref(\"resolve\")\n\
+     native type nodeTime<T> {\n    fn resolve(): T;\n}\n\
+     @deref(\"resolve\")\n\
+     native type nodeList<T> {\n    fn resolve(): T;\n}\n\
+     @deref(\"resolve\")\n\
+     native type nodeGeo<T> {\n    fn resolve(): T;\n}\n\
+     native type nodeIndex<K, V> {}\n\
+     native type Array<T> {}\n\
+     native type Map<K, V> {}\n\
+     type Tuple<T, U> { a: T; b: U; }\n"
+}
+
 #[test]
 fn hover_renders_param_type() {
     let src = "fn add(a: int, b: int): int { return a + b; }\n";
@@ -2174,7 +2213,9 @@ fn completion_arrow_on_node_tag_receiver_lists_inner_directly() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
     let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(
         user_uri.clone(),
         "type Foo {\n  name: String;\n}\nfn caller(n: node<Foo>) {\n  n->\n}\n",
@@ -2221,7 +2262,9 @@ fn hover_arrow_on_node_tag_resolves_inner_member() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
     let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(
         user_uri.clone(),
         "type Foo {\n  /// the inner name\n  name: String;\n}\nfn caller(n: node<Foo>) {\n  var s = n->name;\n}\n",
