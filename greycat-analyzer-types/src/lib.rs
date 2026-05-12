@@ -228,9 +228,6 @@ pub enum TypeKind {
     Lambda(LambdaType),
     /// Tuple — `t2`, `t3`, `t4` plus their float variants.
     Tuple { elements: Vec<TypeId> },
-    /// Anonymous object literal type — `{ a: int, b: String }`.
-    // P25.4
-    Anonymous { fields: Vec<(SmolStr, TypeId)> },
     /// Enum type.
     // P25.4
     Enum {
@@ -620,24 +617,6 @@ impl TypeArena {
                     new_t
                 }
             }
-            TypeKind::Anonymous { fields } => {
-                let new_fields: Vec<(SmolStr, TypeId)> = fields
-                    .iter()
-                    .map(|(n, t)| (n.clone(), self.substitute(*t, subst)))
-                    .collect();
-                if new_fields == *fields {
-                    ty
-                } else {
-                    let mut new_t = self.alloc(Type {
-                        kind: TypeKind::Anonymous { fields: new_fields },
-                        nullable: false,
-                    });
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
-                }
-            }
             TypeKind::Union { alts } => {
                 let new_alts: Vec<TypeId> =
                     alts.iter().map(|a| self.substitute(*a, subst)).collect();
@@ -839,17 +818,6 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                     }
                     is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)
                 })
-        }
-        // P7.5 anonymous structural compat: a value of `{a: A, b: B}`
-        // is assignable to `{a: A}` (width subtyping — source may have
-        // *extra* fields). Each shared field's source type must be
-        // assignable to the target's field type.
-        (TypeKind::Anonymous { fields: fa }, TypeKind::Anonymous { fields: fb }) => {
-            fb.iter().all(|(name, want)| {
-                fa.iter()
-                    .find(|(n, _)| n == name)
-                    .is_some_and(|(_, got)| is_assignable_to(arena, *got, *want))
-            })
         }
         (TypeKind::Tuple { elements: ea }, TypeKind::Tuple { elements: eb }) => {
             ea.len() == eb.len()
@@ -1267,18 +1235,6 @@ fn write_type(f: &mut std::fmt::Formatter<'_>, arena: &TypeArena, id: TypeId) ->
             }
             f.write_str(")")?;
         }
-        TypeKind::Anonymous { fields } => {
-            f.write_str("{ ")?;
-            for (i, (n, t)) in fields.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                f.write_str(n.as_str())?;
-                f.write_str(": ")?;
-                write_type(f, arena, *t)?;
-            }
-            f.write_str(" }")?;
-        }
         TypeKind::Enum { name, .. } => f.write_str(name.as_str())?,
         TypeKind::Union { alts } => {
             // Unions render as `A | B | …`. When the union is also
@@ -1422,13 +1378,6 @@ pub fn display_fqn(
                 .map(|e| display_fqn(arena, *e, home_lib))
                 .collect();
             format!("({})", parts.join(", "))
-        }
-        TypeKind::Anonymous { fields } => {
-            let parts: Vec<String> = fields
-                .iter()
-                .map(|(n, t)| format!("{n}: {}", display_fqn(arena, *t, home_lib)))
-                .collect();
-            format!("{{ {} }}", parts.join(", "))
         }
         TypeKind::Enum { name, .. } => format!(
             "{}::{}",
@@ -1766,28 +1715,5 @@ mod tests {
         let arr = a.generic("Array", vec![int]);
         let empty: FxHashMap<String, TypeId> = FxHashMap::default();
         assert_eq!(a.substitute(arr, &empty), arr);
-    }
-
-    #[test]
-    fn anonymous_width_subtyping() {
-        let mut a = fresh();
-        let int = a.primitive(Primitive::Int);
-        let str_t = a.primitive(Primitive::String);
-        let two = a.alloc(Type {
-            kind: TypeKind::Anonymous {
-                fields: vec![("a".into(), int), ("b".into(), str_t)],
-            },
-            nullable: false,
-        });
-        let one = a.alloc(Type {
-            kind: TypeKind::Anonymous {
-                fields: vec![("a".into(), int)],
-            },
-            nullable: false,
-        });
-        // {a, b} → {a}  (width subtyping: extra field b is fine)
-        assert!(is_assignable_to(&a, two, one));
-        // {a} → {a, b}  is NOT — would be missing field b.
-        assert!(!is_assignable_to(&a, one, two));
     }
 }

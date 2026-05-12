@@ -1383,16 +1383,6 @@ impl<'a> Cx<'a> {
             // the same `type_decls` / `decl_locations` lookup path so
             // `"hello".size()` and friends bind correctly.
             TypeKind::Primitive(p) => Some(p.name().into()),
-            TypeKind::Anonymous { fields } => {
-                // Anonymous types don't have a backing TypeDecl, so we
-                // resolve their fields directly from the type shape.
-                let prop = &*self.hir.idents[property].text;
-                if fields.iter().any(|(n, _)| *n == prop) {
-                    // No TypeAttr / Decl to point to — capabilities
-                    // gracefully no-op without a member_uses entry.
-                }
-                None
-            }
             _ => None,
         };
         let Some(name) = type_name else {
