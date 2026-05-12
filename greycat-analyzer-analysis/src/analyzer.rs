@@ -436,6 +436,34 @@ pub fn analyze_with_index_into(
         ));
     }
 
+    // Reject `type Foo<A, B, C> {}` / `fn f<A, B, C>(...)` — the
+    // GreyCat runtime supports at most 2 generic parameters
+    // (`Map<K, V>` is the widest). The grammar accepts any arity (the
+    // `type_params` rule is `sepBy1(",", ident)`), so this is the
+    // analyzer's job. Point the diagnostic at the first over-limit
+    // generic so quick-fix tooling can target it precisely.
+    const MAX_GENERICS: usize = 2;
+    for d in &module.decls {
+        let (name_ident, generics, kind_label) = match &hir.decls[*d] {
+            Decl::Fn(fnd) => (fnd.name, &*fnd.generics, "function"),
+            Decl::Type(td) => (td.name, &*td.generics, "type"),
+            _ => continue,
+        };
+        if generics.len() > MAX_GENERICS {
+            let first_over_limit = generics[MAX_GENERICS];
+            out.diagnostics.push(SemanticDiagnostic::structural(
+                Severity::Error,
+                format!(
+                    "{kind_label} `{}` has {} generic parameters; \
+                     the GreyCat runtime supports at most {MAX_GENERICS}",
+                    hir.idents[name_ident].text,
+                    generics.len(),
+                ),
+                hir.idents[first_over_limit].byte_range.clone(),
+            ));
+        }
+    }
+
     // Surface literal parse anomalies recorded at HIR lowering time:
     // numeric overflow, float precision loss, malformed char escape /
     // ISO-8601 shape. The literal still types by its declared kind so
