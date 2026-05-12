@@ -118,6 +118,16 @@ pub struct ProjectIndex {
     /// (which carries the lowered signature) — this set is for the
     /// "decl exists, type as `function`" question, nothing more.
     pub non_native_fn_names: FxHashSet<Symbol>,
+    // P38.4
+    /// `(Uri, Idx<Decl>)` pairs whose decl carries the `private`
+    /// modifier. Mirrors the entries in [`Self::decl_locations`] —
+    /// every private decl that goes through `record_decl_location`
+    /// also gets recorded here so the resolver's bare-name lookup
+    /// can filter cross-module candidates by visibility (private
+    /// decls don't participate in bare cross-module resolution; they
+    /// stay reachable only via FQN). Empty by default; populated by
+    /// [`Self::ingest`].
+    pub private_locations: FxHashSet<(Uri, Idx<Decl>)>,
     /// Cross-module decl table: name → every `(Uri, Idx<Decl>)`
     /// pair that introduces a top-level decl with this name across the
     /// project. Collisions are kept; disambiguation happens at the use
@@ -708,6 +718,14 @@ impl ProjectIndex {
             .lookup(name)
             .is_some_and(|s| self.non_native_fn_names.contains(&s))
     }
+    // P38.4
+    /// `true` iff the decl at `(uri, decl_id)` was ingested with the
+    /// `private` modifier. Lets the resolver filter cross-module
+    /// candidates by visibility for bare-name lookup while leaving
+    /// the FQN path unaffected.
+    pub fn is_decl_private(&self, uri: &Uri, decl_id: Idx<Decl>) -> bool {
+        self.private_locations.contains(&(uri.clone(), decl_id))
+    }
 
     /// Walk a HIR module's top-level decls and register everything that's
     /// a type-name (type / enum) or a native function, recording each
@@ -901,6 +919,14 @@ impl ProjectIndex {
             // and capture the rename target into the project-wide
             // exposed map.
             if let Some(modifiers) = modifiers {
+                // P38.4 — tag private decls so the resolver's
+                // bare-name lookup can filter them out of the
+                // cross-module candidate set. The decl stays in
+                // `decl_locations` (the FQN path still needs to
+                // reach it — see probe p5).
+                if modifiers.private {
+                    self.private_locations.insert((uri.clone(), *decl_id));
+                }
                 let local_name = hir.decls[*decl_id]
                     .name()
                     .map(|n| hir.idents[n].text.clone())

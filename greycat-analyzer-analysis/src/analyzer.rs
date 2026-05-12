@@ -433,12 +433,46 @@ pub fn analyze_with_index_into(
 
     // Surface resolver's unresolved-name list as analyzer diagnostics so
     // P2.7 (LSP publish) only needs one list per file.
+    // P38.4 — idents flagged `ambiguous` get a richer diagnostic (with
+    // candidate modules + FQN quick-fixes); skip them here to avoid a
+    // duplicate generic "unresolved name" alongside the helpful one.
     let unresolved = res.unresolved.clone();
     for ident_idx in unresolved {
+        if res.ambiguous.contains_key(&ident_idx) {
+            continue;
+        }
         let ident = &hir.idents[ident_idx];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             format!("unresolved name `{}`", ident.text),
+            ident.byte_range.clone(),
+        ));
+    }
+
+    // P38.4 — `ambiguous-symbol` Severity::Error: the bare name is
+    // exported publicly by ≥2 distinct modules, with no local hit to
+    // resolve it. Matches the GreyCat runtime's "unresolved function"
+    // exit-2 outcome on the same shape, but names the candidates so
+    // the user can pick an FQN. Quick-fix emission lives in
+    // [`crate::quickfix`].
+    for (ident_idx, candidates) in &res.ambiguous {
+        let ident = &hir.idents[*ident_idx];
+        let module_names: Vec<String> = candidates
+            .iter()
+            .map(|(uri, _)| {
+                crate::stdlib::module_name_from_uri(uri).unwrap_or_else(|| "<unknown>".to_string())
+            })
+            .collect();
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            format!(
+                "ambiguous-symbol: `{}` is exported by {} modules ({}); use a fully-qualified name like `{}::{}`",
+                ident.text,
+                module_names.len(),
+                module_names.join(", "),
+                module_names.first().map(String::as_str).unwrap_or("<module>"),
+                ident.text,
+            ),
             ident.byte_range.clone(),
         ));
     }

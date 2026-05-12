@@ -92,6 +92,14 @@ pub struct Resolutions {
     // P2.5 — surface as "unresolved name" diagnostics.
     /// Idents the resolver couldn't bind.
     pub unresolved: Vec<Idx<Ident>>,
+    // P38.4
+    /// Idents that matched a name exported publicly by ≥2 distinct
+    /// modules (with no local hit to resolve them). The runtime
+    /// reports plain "unresolved function: <name>" on this shape; we
+    /// surface a more helpful `ambiguous-symbol` Severity::Error
+    /// diagnostic naming each candidate, with quick-fixes that
+    /// rewrite the bare ident to one of `<module>::<name>`.
+    pub ambiguous: FxHashMap<Idx<Ident>, Vec<(Uri, Idx<Decl>)>>,
 }
 
 impl Resolutions {
@@ -225,33 +233,55 @@ impl<'a> Cx<'a> {
             self.res.uses.insert(idx, def);
             return;
         }
-        // P11.2: prefer a concrete cross-module decl pointer over the
-        // unit `Project` placeholder. `locate_decl` may return multiple
-        // hits for collisions across modules; pick the first — lib/
-        // include-aware disambiguation lives on later phases. Names
-        // that the project knows but that have no `.gcl` decl
-        // (runtime types, primitives by name, native fns) fall through
-        // to the unit `Project` variant below.
+        // P11.2 + P38.3 + P38.4 — global PUBLIC lookup across
+        // distinct modules. Filters in order:
+        //   - exclude entries from the current module (so a same-
+        //     module decl reaches the local-private fallback below
+        //     rather than self-referring via `ProjectDecl`);
+        //   - exclude entries flagged `private` by the index (private
+        //     decls don't participate in bare cross-module lookup —
+        //     the FQN form is the runtime-allowed escape hatch).
         //
-        // P38.3 — filter out the current module's own entries.
-        // `decl_locations` indexes EVERY decl ingested (public AND
-        // private — the FQN form `module::private_sym` needs them
-        // there, see probe p5). So a same-module private decl would
-        // otherwise win at step 2; we want step 3 to catch it instead.
-        let cross_module_hit = self
+        // Outcomes:
+        //   - exactly 1 hit          → `ProjectDecl { uri, decl }`.
+        //   - ≥2 hits across modules → record in `ambiguous` for
+        //                              `ambiguous-symbol` Severity::Error
+        //                              emission; bare ident does NOT
+        //                              fall through to local-private
+        //                              (the runtime treats the clash
+        //                              as unresolved at this layer).
+        //   - 0 hits                 → continue to the last-resort
+        //                              local-private step below.
+        let cross_module_hits: Vec<(Uri, Idx<Decl>)> = self
             .index
             .locate_decl(&name)
             .iter()
-            .find(|(uri, _)| self.current_uri.map(|cur| uri != cur).unwrap_or(true));
-        if let Some((uri, decl)) = cross_module_hit {
-            self.res.uses.insert(
-                idx,
-                Definition::ProjectDecl {
-                    uri: uri.clone(),
-                    decl: *decl,
-                },
-            );
-            return;
+            .filter(|(uri, decl)| {
+                let from_other_module = self.current_uri.map(|cur| uri != cur).unwrap_or(true);
+                from_other_module && !self.index.is_decl_private(uri, *decl)
+            })
+            .map(|(uri, decl)| (uri.clone(), *decl))
+            .collect();
+        match cross_module_hits.len() {
+            0 => {}
+            1 => {
+                let (uri, decl) = cross_module_hits.into_iter().next().unwrap();
+                self.res
+                    .uses
+                    .insert(idx, Definition::ProjectDecl { uri, decl });
+                return;
+            }
+            _ => {
+                // ≥2 distinct-module public hits. Record the
+                // candidates so the project pipeline can emit
+                // `ambiguous-symbol` with FQN quick-fixes; mark the
+                // ident as unresolved so downstream typing doesn't
+                // arbitrarily pick one of the candidates and mask
+                // the error.
+                self.res.ambiguous.insert(idx, cross_module_hits);
+                self.res.unresolved.push(idx);
+                return;
+            }
         }
         // P38.3 — module-private last-resort fallback. Reached only
         // when both step 1 (nested + module-public) and step 2 (global
