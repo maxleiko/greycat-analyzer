@@ -766,29 +766,11 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
 
     match (&a.kind, &b.kind) {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
-        (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => na == nb,
-        // Named-vs-GenericParam name match. The project-pipeline's
-        // validation pass lowers TypeRefs without threading generic
-        // scope, so a declared `V?` return / parameter type lowers to
-        // `Named{name:"V"}`, while the body walker — which does have
-        // generic scope — produced `GenericParam{name:"V", owner:…}`
-        // for the same source token. Treat the two as compatible when
-        // their names match so the validation pass doesn't surface
-        // false `value of `V?` is not assignable to declared return
-        // type `V?`` diagnostics. The rule has to live here (not just
-        // at the top-level `is_assignable_to_with_index`) so it also
-        // applies inside the recursive arg-comparison for nested
-        // generics like `Tuple<Table<T>, MeasureUnit>`.
-        // P35.6 — `Named ↔ GenericParam` bridge rule removed.
-        // Probe confirmed only the dedicated regression tests
-        // (`rt_named_v_matches_generic_param_v*`) exercised this
-        // arm; no production call path in the analysis crate lights
-        // it up. Those tests were guards for a workaround papering
-        // over `mint_type_shape`'s lack of generic-scope threading;
-        // the proper fix (the cross-module rework in 35.7) routes
-        // foreign type-refs through decl handles instead of names,
-        // so the leak source disappears. Deleted alongside the
-        // gauntlet tests below.
+        // `(Named, Named)` arm removed: production paths now mint
+        // `Type(handle)` for every `.gcl`-declared type via
+        // `ProjectIndex::ingest`, so `Named` only survives for
+        // genuinely-unknown names — which `is_assignable_to`'s
+        // Unresolved arm already handles upstream.
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab }) => {
             // P12.2: invariant in every generic parameter. The TS
             // reference checker (`GreycatGenericType.isAssignableTo`)
@@ -1084,6 +1066,15 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     // **P19.14** — casting *to* a generic-param target also passes;
     // runtime checks at instantiation time.
     if matches!(to_t.kind, TypeKind::GenericParam { .. }) {
+        return true;
+    }
+    // `Unresolved` (and `Any` as a source) propagate the "behaves
+    // like any" rule from `is_assignable_to` — the resolver has
+    // already flagged the unresolved name, downstream cast checks
+    // shouldn't cascade.
+    if matches!(to_t.kind, TypeKind::Unresolved { .. } | TypeKind::Any)
+        || matches!(from_t.kind, TypeKind::Unresolved { .. } | TypeKind::Any)
+    {
         return true;
     }
 

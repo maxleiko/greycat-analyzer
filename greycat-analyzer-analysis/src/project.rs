@@ -1119,11 +1119,12 @@ fn is_assignable_to_with_index(
         return false;
     }
     match (&a.kind, &b.kind) {
-        (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) => index.is_subtype_of(na, nb),
-        // P36.2 — handle-keyed subtype chain. Mirrors the
-        // `(Named, Named)` arm above but via the registry-resolved
-        // decl identity. Both arms coexist during the migration;
-        // 36.7 deletes the Named one.
+        // Handle-keyed subtype chain — the only representation
+        // production paths produce for `.gcl`-declared types after
+        // the `Named` removal. The legacy `(Named, Named)` arm is
+        // gone; `Named` only survives for genuinely-unknown names
+        // and they're already absorbed by the `Unresolved` arm in
+        // `is_assignable_to`.
         (TypeKind::Type(sub), TypeKind::Type(sup)) => index.is_subtype_of_decl(arena, *sub, *sup),
         (TypeKind::Generic { name: na, args: aa }, TypeKind::Generic { name: nb, args: ab })
             if na == "node" && nb == "node" && aa.len() == 1 && ab.len() == 1 =>
@@ -2955,21 +2956,14 @@ fn lower_type_ref_project(
                 // (`if let TypeKind::Enum { variants, .. } = ...`).
                 enum_id
             } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
-                // P36.2 — non-generic concrete type with a known
-                // home decl: mint a handle-keyed `Type(handle)` so
-                // it interns equal to whatever
-                // `register_module_types` produced for the same
-                // decl in the per-module analyzer. The `Named`
-                // fallback below remains only for transitional
-                // cases where the registry hasn't seen the decl
-                // (e.g. before its module has been ingested) and
-                // is removed in P36.7.
+                // Non-generic concrete type with a known home decl:
+                // mint a handle-keyed `Type(handle)` so it interns
+                // equal to whatever `register_module_types` produced
+                // for the same decl in the per-module analyzer.
                 arena.alloc_type(handle, name.to_string())
-            } else if index.has_name(name) {
-                arena.named(name.to_string())
             } else {
-                // Unknown type: `Unresolved` so hover / display
-                // surface the typo'd name verbatim. Behaves like
+                // No reachable decl: `Unresolved` so hover / display
+                // surface the typo'd name verbatim, behaves like
                 // `any?` for assignability.
                 arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
             }
@@ -3062,7 +3056,7 @@ fn lower_qualified_type_ref_project(
     let mut base = match decl_in_module {
         Some(d) => match decl_registry.lookup(&module_uri, d) {
             Some(handle) => arena.alloc_type(handle, leaf_name.clone()),
-            None => arena.named(leaf_name.clone()),
+            None => arena.unresolved(leaf_name, byte_span),
         },
         None => arena.unresolved(leaf_name, byte_span),
     };
@@ -3152,13 +3146,12 @@ fn lower_type_ref_id(
                 // match what the body walker's `lower_type_ref` and
                 // the signature pass's `lower_type_ref_project`
                 // produce. Without this, the validation pass would
-                // mint `Named { name }` while the body walker
-                // already minted `Type(handle)` for the same source
-                // token — surfacing as a self-named
+                // mint a different shape than the body walker for
+                // the same source token — surfacing as a self-named
                 // "T is not assignable to T" diagnostic.
                 arena.alloc_type(handle, name.to_string())
             } else {
-                arena.named(name.to_string())
+                arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
             }
         }
     };

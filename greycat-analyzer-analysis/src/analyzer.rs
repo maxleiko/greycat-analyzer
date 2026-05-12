@@ -299,11 +299,24 @@ pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
     // pass a default (all-`None`) instance. The migrated sentinel
     // sites fall back to `arena.any()` for any slot still `None`.
     let well_known = crate::well_known::WellKnown::default();
-    // P35.7 — per-file callers without a real URI use a synthetic
-    // one so decl-handle minting still works against the empty
-    // registry (the lookups miss, the legacy `Named` fallback fires).
-    let decl_registry = crate::well_known::DeclRegistry::default();
     let module_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///module.gcl").unwrap();
+    // Pre-mint a decl handle for every `Decl::Type` / `Decl::Enum`
+    // in this module so `register_module_types` and `lower_type_ref`
+    // can route every local type ref through the handle-keyed shape
+    // — same path the project pipeline uses. Per-file tests don't
+    // run `ProjectAnalysis`, so this is the standalone equivalent
+    // of `ProjectIndex::ingest`'s decl-registration step.
+    let mut decl_registry = crate::well_known::DeclRegistry::default();
+    if let Some(module) = hir.module.as_ref() {
+        for d_id in &module.decls {
+            match &hir.decls[*d_id] {
+                Decl::Type(_) | Decl::Enum(_) => {
+                    let _ = decl_registry.get_or_insert(&module_uri, *d_id);
+                }
+                _ => {}
+            }
+        }
+    }
     let out = analyze_with_index_into(
         hir,
         res,
@@ -328,9 +341,21 @@ pub fn analyze_with_index(
     // P35.4 — per-file callers default-construct an empty
     // `WellKnown`; see [`analyze`] for the rationale.
     let well_known = crate::well_known::WellKnown::default();
-    let decl_registry = crate::well_known::DeclRegistry::default();
     let module_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///module.gcl").unwrap();
     let mut arena = TypeArena::new();
+    // Standalone equivalent of `ProjectIndex::ingest`'s decl
+    // registration step — see [`analyze`] for the rationale.
+    let mut decl_registry = crate::well_known::DeclRegistry::default();
+    if let Some(module) = hir.module.as_ref() {
+        for d_id in &module.decls {
+            match &hir.decls[*d_id] {
+                Decl::Type(_) | Decl::Enum(_) => {
+                    let _ = decl_registry.get_or_insert(&module_uri, *d_id);
+                }
+                _ => {}
+            }
+        }
+    }
     let out = analyze_with_index_into(
         hir,
         res,
@@ -575,16 +600,16 @@ fn register_module_types(
         match decl {
             Decl::Type(td) => {
                 let name: SmolStr = hir.idents[td.name].text.as_str().into();
-                // P36.2 — mint `TypeKind::Type(handle)` when the
-                // project pipeline's signature-lowering pass has
-                // already interned this decl into `decl_registry`.
-                // Fall back to the legacy `Named { name }` shape only
-                // when the registry is empty (per-file analyzer tests
-                // that don't run the project pipeline). The fallback
-                // is transitional and gets deleted in P36.7.
+                // Mint `TypeKind::Type(handle)` for the local decl.
+                // The project pipeline's `ingest` always pre-pop'd
+                // the registry; the standalone `analyze` /
+                // `analyze_with_index` test entries do the same
+                // pre-walk. A missing handle here would mean the
+                // caller bypassed both — `Unresolved` is the
+                // safest fallback (behaves like `any?`).
                 let id = match decl_registry.lookup(module_uri, *d) {
                     Some(handle) => arena.alloc_type(handle, name.clone()),
-                    None => arena.named(name.as_str()),
+                    None => arena.unresolved(name.clone(), (0, 0)),
                 };
                 out.registry.register(name.clone(), id);
                 out.type_decls.insert(name, *d);
@@ -1979,20 +2004,15 @@ impl<'a> Cx<'a> {
                     // `has_name` covers via the seeded primitives /
                     // runtime-implemented types).
                     self.arena.alloc_type(handle, name.clone())
-                } else if self.index.has_name(&name) {
-                    // P11.5 — non-generic foreign type without an
-                    // interned decl handle (typically runtime-
-                    // implemented types the project knows by name
-                    // only — they have no `.gcl` decl).
-                    self.arena.named(name.clone())
                 } else {
-                    // Unknown type. Lower to `Unresolved` so
-                    // diagnostics / hover surface the typo'd name
-                    // verbatim. Behaves like `any?` for assignability
-                    // (both top and bottom) so downstream
-                    // type-relation checks don't cascade; the
-                    // resolver's "unresolved name" error already
-                    // pinpoints the cause.
+                    // No decl handle reachable. Either the name is
+                    // genuinely unknown (typo, missing import) or it
+                    // names a runtime-internal type the user can't
+                    // actually write in source. Either way, mint
+                    // `Unresolved` — it surfaces the name verbatim in
+                    // hover / diagnostics and behaves like `any?` for
+                    // assignability so downstream type-relation
+                    // checks don't cascade.
                     self.arena
                         .unresolved(name.clone(), (tr.byte_range.start, tr.byte_range.end))
                 }
@@ -2063,7 +2083,7 @@ impl<'a> Cx<'a> {
         let mut base = match in_module(self.index) {
             Some(decl) => match self.decl_registry.lookup(&module_uri, decl) {
                 Some(handle) => self.arena.alloc_type(handle, leaf_name.clone()),
-                None => self.arena.named(leaf_name.clone()),
+                None => self.arena.unresolved(leaf_name, byte_span),
             },
             None => self.arena.unresolved(leaf_name, byte_span),
         };

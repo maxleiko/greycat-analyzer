@@ -921,7 +921,14 @@ impl ProjectIndex {
                     let name_str = hir.idents[fnd.name].text.as_str();
                     let name_sym = self.symbols.intern(name_str);
                     if fnd.modifiers.native {
-                        let sig = native_signature_for(hir, fnd, arena);
+                        let sig = native_signature_for(
+                            hir,
+                            fnd,
+                            arena,
+                            decl_registry,
+                            &self.decl_locations,
+                            &self.symbols,
+                        );
                         self.natives.register(name_sym, sig);
                     } else {
                         self.values.insert(name_sym);
@@ -1107,13 +1114,21 @@ pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
     &[("Infinity", Primitive::Float), ("NaN", Primitive::Float)];
 
 /// Type names whose declaration lives in the GreyCat runtime, not in
-/// any `.gcl` file. The resolver treats a hit against this list (via
-/// the project index registry) as a successful binding.  refines
-/// the subtyping rules these tags participate in.
+/// any `.gcl` file. The resolver treats a hit against this list as
+/// "definitely a type name." With stdlib ingested, every entry here
+/// also has a `.gcl` decl in `lib/std/core.gcl` (`native type Array
+/// {}`, …) and resolves through the normal decl_registry path; this
+/// list survives only as a fallback that lets the resolver answer
+/// `has_name("Array")` truthfully in unit tests that don't load
+/// stdlib.
+///
+/// Vestigial entries (`Set`, `tuple`, `t2`-`t4`, `t2f`-`t4f`) were
+/// removed: GreyCat has no `Set` runtime type, tuple literals desugar
+/// to `core::Tuple<T, U>`, and the `t<n>` / `t<n>f` names aren't
+/// user-writable syntax — they only appeared on stale dispatch arms.
 pub const BUILTIN_RUNTIME_TYPES: &[&str] = &[
     "Array",
     "Map",
-    "Set",
     "node",
     "nodeTime",
     "nodeGeo",
@@ -1121,14 +1136,7 @@ pub const BUILTIN_RUNTIME_TYPES: &[&str] = &[
     "nodeIndex",
     "function",
     "type",
-    "tuple",
     "field",
-    "t2",
-    "t3",
-    "t4",
-    "t2f",
-    "t3f",
-    "t4f",
 ];
 
 // P13.5
@@ -1147,56 +1155,89 @@ fn derive_type_flags(annotations: &[Annotation]) -> TypeFlags {
     flags
 }
 
-fn native_signature_for(hir: &Hir, fnd: &FnDecl, types: &mut TypeArena) -> NativeSignature {
+fn native_signature_for(
+    hir: &Hir,
+    fnd: &FnDecl,
+    arena: &mut TypeArena,
+    decl_registry: &crate::well_known::DeclRegistry,
+    locate_decl: &FxHashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
+    symbols: &SymbolTable,
+) -> NativeSignature {
     let params = fnd
         .params
         .iter()
         .map(|p_id| {
             let p = &hir.fn_params[*p_id];
-            p.ty.map(|t| lower_type_ref(hir, t, types))
-                .unwrap_or_else(|| types.any())
+            p.ty.map(|t| lower_native_type_ref(hir, t, arena, decl_registry, locate_decl, symbols))
+                .unwrap_or_else(|| arena.any())
         })
         .collect();
     let return_ty = fnd
         .return_type
-        .map(|t| lower_type_ref(hir, t, types))
-        .unwrap_or_else(|| types.any());
+        .map(|t| lower_native_type_ref(hir, t, arena, decl_registry, locate_decl, symbols))
+        .unwrap_or_else(|| arena.any());
     NativeSignature { params, return_ty }
 }
 
-fn lower_type_ref(
+/// Native-fn signature counterpart of
+/// [`crate::project::lower_type_ref_project`]. Same handle-keyed
+/// resolution shape — every reference to a `.gcl`-declared type
+/// mints `Type(handle)` / `GenericInstance(handle, args)` via the
+/// project's `decl_registry`, never the legacy `Named` fallback.
+/// Falls back to `Unresolved` when the referenced decl hasn't been
+/// ingested yet (rare — native fns typically reference primitives
+/// or stdlib types declared earlier in the same module).
+fn lower_native_type_ref(
     hir: &Hir,
     idx: greycat_analyzer_hir::arena::Idx<HirTypeRef>,
-    types: &mut TypeArena,
+    arena: &mut TypeArena,
+    decl_registry: &crate::well_known::DeclRegistry,
+    locate_decl: &FxHashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
+    symbols: &SymbolTable,
 ) -> TypeId {
     let tr = &hir.type_refs[idx];
     let name = hir.idents[tr.name].text.clone();
     let mut base = match name.as_str() {
-        "bool" => types.primitive(Primitive::Bool),
-        "int" => types.primitive(Primitive::Int),
-        "float" => types.primitive(Primitive::Float),
-        "char" => types.primitive(Primitive::Char),
-        "String" => types.primitive(Primitive::String),
-        "time" => types.primitive(Primitive::Time),
-        "duration" => types.primitive(Primitive::Duration),
-        "geo" => types.primitive(Primitive::Geo),
-        "any" => types.any(),
-        "null" => types.null(),
+        "bool" => arena.primitive(Primitive::Bool),
+        "int" => arena.primitive(Primitive::Int),
+        "float" => arena.primitive(Primitive::Float),
+        "char" => arena.primitive(Primitive::Char),
+        "String" => arena.primitive(Primitive::String),
+        "time" => arena.primitive(Primitive::Time),
+        "duration" => arena.primitive(Primitive::Duration),
+        "geo" => arena.primitive(Primitive::Geo),
+        "any" => arena.any(),
+        "null" => arena.null(),
         _ => {
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
                     .params
                     .iter()
-                    .map(|p| lower_type_ref(hir, *p, types))
+                    .map(|p| {
+                        lower_native_type_ref(hir, *p, arena, decl_registry, locate_decl, symbols)
+                    })
                     .collect();
-                types.generic(name, args)
+                arena.generic(name, args)
             } else {
-                types.named(name)
+                // Try to mint a handle-keyed `Type(handle)` so native
+                // signatures intern equal to whatever the body-walker
+                // / signature pass produces for the same source token.
+                let handle = symbols
+                    .lookup(&name)
+                    .and_then(|s| locate_decl.get(&s))
+                    .and_then(|locs| {
+                        locs.iter()
+                            .find_map(|(uri, decl)| decl_registry.lookup(uri, *decl))
+                    });
+                match handle {
+                    Some(h) => arena.alloc_type(h, name),
+                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                }
             }
         }
     };
     if tr.optional {
-        base = types.nullable(base);
+        base = arena.nullable(base);
     }
     base
 }
