@@ -153,7 +153,7 @@ impl<'a> LintCx<'a> {
 /// `lint` run. Most rules default `true`. Advisory rules — like
 /// `no-breakpoint`, which would silently delete debug aids on a generic
 /// `lint --fix` if it fired by default — default `false` and require
-/// an opt-in (CLI `--enable=<rule>`, future LSP config) to surface.
+/// an opt-in (CLI `--on=<rule>`, future LSP config) to surface.
 #[derive(Debug, Clone, Copy)]
 pub struct LintRuleInfo {
     pub name: &'static str,
@@ -183,7 +183,7 @@ const fn rule(name: &'static str, summary: &'static str) -> LintRuleInfo {
 }
 
 /// Advisory rule that defaults to off — caller opts in via CLI
-/// `--enable=<rule>` (or future LSP config). Used for rules that would
+/// `--on=<rule>` (or future LSP config). Used for rules that would
 /// silently break user intent if they fired on a vanilla `lint --fix`
 /// (e.g. `no-breakpoint` would delete debug aids).
 const fn advisory_rule(name: &'static str, summary: &'static str) -> LintRuleInfo {
@@ -297,7 +297,7 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
         "no-breakpoint",
         "warn on `breakpoint;` left in committed code — pauses the GreyCat worker for \
          debugging; auto-fix deletes the statement. Off by default — enable with \
-         `lint --enable=no-breakpoint`.",
+         `lint --on=no-breakpoint`.",
     ),
 ];
 

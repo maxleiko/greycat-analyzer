@@ -16,7 +16,7 @@ fn analyze(src: &str) -> (Uri, ProjectAnalysis) {
     mgr.add_simple(uri.clone(), src, "project", false);
     // `no-breakpoint` is advisory + default-off (P37.7). Tests flip
     // it on explicitly via `enabled_rules` — same surface the CLI's
-    // `--enable=<rule>` flag uses.
+    // `--on=<rule>` flag uses.
     let mut pa = ProjectAnalysis::new();
     pa.enabled_rules.insert("no-breakpoint".to_string());
     pa.analyze_staged(&mgr);
@@ -87,13 +87,13 @@ fn default_off_does_not_emit_without_explicit_enable() {
     // The critical invariant: a vanilla `lint` run produces no
     // `no-breakpoint` warnings, so `lint --fix` cannot silently delete
     // committed `breakpoint;` debug aids. Users opt in via
-    // `lint --enable=no-breakpoint`.
+    // `lint --on=no-breakpoint`.
     let src = "fn f() {\n    breakpoint;\n    return;\n}\n";
     let (uri, pa) = analyze_without_enable(src);
     let m = pa.module(&uri).unwrap();
     assert!(
         !m.lints.iter().any(|l| l.rule == "no-breakpoint"),
-        "default-off rule must not emit without --enable: {:?}",
+        "default-off rule must not emit without --on: {:?}",
         m.lints
     );
 }

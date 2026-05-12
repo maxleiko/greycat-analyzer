@@ -49,7 +49,7 @@ greycat-analyzer lint path/to/project.gcl                      # explicit entryp
 greycat-analyzer lint path/to/standalone.gcl                   # single-file project
 greycat-analyzer lint --fix                                    # apply auto-fixable lint suggestions in place
 greycat-analyzer lint --list-rules                             # dump registered rule namespace and exit
-greycat-analyzer lint --disable=unused-local,non-exhaustive    # silence specific rules globally
+greycat-analyzer lint --off=unused-local,non-exhaustive        # silence specific rules globally
 greycat-analyzer lint --no-suppressions                        # CI: re-emit every `// gcl-lint-off`-silenced diagnostic
 greycat-analyzer lint --lint-libs                              # also surface lints from `lib/<name>/` modules
 ```
@@ -79,31 +79,32 @@ The `unreachable` rule (severity Hint) flags two shapes:
 - **Post-divergent siblings** — code that follows a `return` / `throw` / `break` / `continue` (or any block / if / try chain that recursively diverges). Conservative on loops: `while (cond) { return; } var _ = 0;` does NOT flag the post-loop `var _` since we can't prove the loop body executed.
 - **Dead `else` arms on exhaustive enum chains** — `if (x == E::A) { … } else if (x == E::B) { … } else { … }` where `A` + `B` exhaust `E`. The trailing `else` is unreachable and gets greyed-out. When every variant arm also diverges (e.g., both return), the post-chain code is flagged too.
 
-Contiguous dead siblings inside one block coalesce into a single diagnostic spanning the whole island. `lint --fix` removes the dead range as one edit; for the dead-`else` shape the fix also swallows the leading `else` keyword so the result parses cleanly. Suppress via `// gcl-lint-off-next unreachable` or the file/range variants below.
+Contiguous dead siblings inside one block coalesce into a single diagnostic spanning the whole island. `lint --fix` removes the dead range as one edit; for the dead-`else` shape the fix also swallows the leading `else` keyword so the result parses cleanly. Suppress via `// gcl-lint-next-off unreachable` or the file/range variants below.
 
 #### Silencing rules
 
 Three knobs, increasing in scope:
 
 - **Per-region directives** (source-level, fine-grained). Comment forms with the `gcl-` prefix so they sort together in completion and don't collide with prose. Apply to one AST item, one toggle range, or one whole file — see the table and examples below.
-- **`--disable=<rule>[,<rule>...]`** (CLI, project-wide). Repeatable / comma-list; same effect as `// gcl-lint-off-file <rule>` in every file at once, without source edits. For CI invocations that need to silence a noisy rule across the whole project. Unknown rule names print a fail-soft stderr warning and the lint continues.
+- **`--off=<rule>[,<rule>...]`** (CLI, project-wide). Repeatable / comma-list; same effect as `// gcl-lint-file-off <rule>` in every file at once, without source edits. For CI invocations that need to silence a noisy rule across the whole project. Unknown rule names print a fail-soft stderr warning and the lint continues.
+- **`--on=<rule>[,<rule>...]`** (CLI, project-wide). Repeatable / comma-list; flips advisory rules that ship default-off (today: `no-breakpoint`). Same fail-soft validation as `--off`.
 - **`--no-suppressions`** (CLI, nuclear). Ignores every `// gcl-lint-off`-style directive and re-emits the underlying diagnostics. For auditing "what's hidden behind suppressions in this codebase."
 
 | Directive                                | Scope                                  |
 |------------------------------------------|----------------------------------------|
 | `// gcl-lint-off <rule0> <rule1> ...`    | Until matching `gcl-lint-on` (or EOF)  |
 | `// gcl-lint-on <rule0> <rule1> ...`     | Closes a prior `gcl-lint-off`          |
-| `// gcl-lint-off-next <rule0> ...`       | Next AST item (decl / stmt) only       |
-| `// gcl-lint-off-file <rule0> ...`       | Whole file (must be at module head)    |
+| `// gcl-lint-next-off <rule0> ...`       | Next AST item (decl / stmt) only       |
+| `// gcl-lint-file-off <rule0> ...`       | Whole file (must be at module head)    |
 | `// gcl-fmt-off`                         | Until matching `gcl-fmt-on` (or EOF)   |
 | `// gcl-fmt-on`                          | Closes a prior `gcl-fmt-off`           |
 | `// gcl-fmt-skip`                        | Next AST node only                     |
-| `// gcl-fmt-off-file`                    | Whole file (must be at module head)    |
+| `// gcl-fmt-file-off`                    | Whole file (must be at module head)    |
 
 Worked examples:
 
 ```gcl
-// gcl-lint-off-next unused-decl
+// gcl-lint-next-off unused-decl
 private fn _scratch_pad() { }
 
 // gcl-lint-off possibly-null
@@ -114,7 +115,7 @@ fn explore(x: Foo?) { x.bar(); x.baz(); }
 fn  weirdly_spaced(  a:int  ){ return  a;  }
 ```
 
-Wildcards (`*`) aren't supported on purpose — explicit rule names only. Misspelled rule names surface `unknown-suppression-rule`; empty rule lists surface `empty-suppression`; toggles that didn't actually drop anything surface `unused-suppression` (per-rule granularity, so `gcl-lint-off-next A B C` where only A fired flags B and C separately). The LSP autocompletes the directive forms when you type `// gcl-…`, and the rule-name slots autocomplete from the same registry as `--list-rules` / `--disable`.
+Wildcards (`*`) aren't supported on purpose — explicit rule names only. Misspelled rule names surface `unknown-suppression-rule`; empty rule lists surface `empty-suppression`; toggles that didn't actually drop anything surface `unused-suppression` (per-rule granularity, so `gcl-lint-next-off A B C` where only A fired flags B and C separately). The LSP autocompletes the directive forms when you type `// gcl-…`, and the rule-name slots autocomplete from the same registry as `--list-rules` / `--off`.
 
 ### `fmt` — format a project
 
@@ -135,7 +136,7 @@ Modes are mutually exclusive (`--mode=write|check|stdout|diff`, default `write`)
 
 Library files (`module.lib != "project"`) are skipped by default; pass `--fmt-libs` to opt in. Mirrors `lint --lint-libs`.
 
-Foundational printer — output is guaranteed to re-parse cleanly and is idempotent on simple inputs. Byte-for-byte parity with the TS prettifier is the M5 follow-up milestone. The `gcl-fmt-off` / `gcl-fmt-on` / `gcl-fmt-skip` / `gcl-fmt-off-file` directives above preserve marked regions verbatim through both `fmt` and `lint --fix`.
+Foundational printer — output is guaranteed to re-parse cleanly and is idempotent on simple inputs. Byte-for-byte parity with the TS prettifier is the M5 follow-up milestone. The `gcl-fmt-off` / `gcl-fmt-on` / `gcl-fmt-skip` / `gcl-fmt-file-off` directives above preserve marked regions verbatim through both `fmt` and `lint --fix`.
 
 ### `server` — language server
 

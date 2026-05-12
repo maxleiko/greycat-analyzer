@@ -131,7 +131,7 @@ pub struct ProjectAnalysis {
     /// Names of rules the caller has explicitly enabled. Only matters
     /// for rules that ship default-off (`default_enabled = false` in
     /// [`LINT_RULES`]); default-on rules are always active. Drives the
-    /// CLI's `--enable=<rule>` flag and any future LSP / project-config
+    /// CLI's `--on=<rule>` flag and any future LSP / project-config
     /// equivalent.
     pub enabled_rules: FxHashSet<String>,
     modules: FxHashMap<Uri, ModuleAnalysis>,
@@ -2042,7 +2042,7 @@ fn run_typed_lints_for_module(
             &mut module.lints,
         );
         // P37.7 — advisory, default-off. Only runs when the caller
-        // explicitly enabled it (CLI `--enable=no-breakpoint`); on a
+        // explicitly enabled it (CLI `--on=no-breakpoint`); on a
         // vanilla `lint` / `lint --fix` it never emits, so debug aids
         // don't get silently deleted.
         if enabled_rules.contains("no-breakpoint") {
