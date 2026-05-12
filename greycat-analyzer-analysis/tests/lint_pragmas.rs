@@ -221,3 +221,33 @@ fn conflicting_lint_pragmas_surfaces_via_module_lints() {
         pa.module(&entry_uri).unwrap().lints
     );
 }
+
+// P40.4 — `ProjectAnalysis::analyze(&mgr)` is the same call path the
+// LSP's `Backend::load_workspace` exercises after `mgr.load_project(...)`
+// returns. The pragma policy therefore lands in `module.lints` without
+// any LSP-side wiring: `publish_for` just translates each lint into an
+// LSP `Diagnostic`. This test gates the no-CLI-flag, no-config path
+// from the editor user's perspective.
+#[test]
+fn lsp_workspace_load_auto_applies_entrypoint_pragma_policy() {
+    // Without `@lint_on("no-breakpoint")`, the warning would NOT
+    // surface (advisory, default-off). With the pragma in project.gcl,
+    // the LSP would receive exactly one no-breakpoint warning on the
+    // entrypoint and one on every other reachable module that uses
+    // `breakpoint;`.
+    let entry = "@lint_on(\"no-breakpoint\");\nfn main() { breakpoint; }\n";
+    let other = "fn other() { breakpoint; }\n";
+    let (entry_uri, other_uri, pa) = analyze_two_modules(entry, other);
+    assert_eq!(
+        lints_for_rule(&pa, &entry_uri, "no-breakpoint"),
+        1,
+        "LSP workspace-load path: entrypoint pragma must enable rule on the entrypoint: {:?}",
+        pa.module(&entry_uri).unwrap().lints
+    );
+    assert_eq!(
+        lints_for_rule(&pa, &other_uri, "no-breakpoint"),
+        1,
+        "LSP workspace-load path: entrypoint pragma must enable rule project-wide: {:?}",
+        pa.module(&other_uri).unwrap().lints
+    );
+}
