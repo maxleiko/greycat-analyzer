@@ -331,12 +331,12 @@ pub fn run_lints_with_directives(
 
 /// Walk `directives.lint_suppressions` and emit `unused-suppression`
 /// diagnostics for every (suppression × rule) pair that didn't actually
-/// drop a diagnostic. Per-rule granularity: a `// gcl-lint-off-next A B
+/// drop a diagnostic. Per-rule granularity: a `// gcl-lint-next-off A B
 /// C` whose A fired but B / C didn't surfaces two diagnostics, one per
 /// dead rule.
 ///
 /// `unused-suppression` itself is suppressible only via
-/// `// gcl-lint-off-file unused-suppression` (narrower scopes would be
+/// `// gcl-lint-file-off unused-suppression` (narrower scopes would be
 /// circular). Folds findings directly into `out`.
 pub fn lint_unused_suppressions(
     directives: &mut crate::directives::Directives,
@@ -365,7 +365,7 @@ pub fn lint_unused_suppressions(
             }
             // Per-rule diagnostic placement: point at the rule word
             // inside the directive comment, not the whole comment line.
-            // So `// gcl-lint-off-next A B C` where only A fires gets
+            // So `// gcl-lint-next-off A B C` where only A fires gets
             // two diagnostics — one underlining "B", one underlining
             // "C".
             emissions.push(LintDiagnostic {
@@ -378,7 +378,7 @@ pub fn lint_unused_suppressions(
         }
     }
     for d in emissions {
-        // Honor `gcl-lint-off-file unused-suppression` (the only valid
+        // Honor `gcl-lint-file-off unused-suppression` (the only valid
         // way to silence this rule per spec).
         if directives.suppresses_lint(d.byte_range.start, d.rule) {
             continue;
@@ -2686,7 +2686,7 @@ fn f(x: Outer) {
         let uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(
             uri.clone(),
-            "// gcl-lint-off-next unused-decl\nprivate fn foo() {}\n",
+            "// gcl-lint-next-off unused-decl\nprivate fn foo() {}\n",
             "project",
             false,
         );
@@ -2701,7 +2701,7 @@ fn f(x: Outer) {
 
     #[test]
     fn lint_off_next_unused_when_no_diagnostic_to_suppress() {
-        // P23.3 — `gcl-lint-off-next unused-decl` on a non-private fn
+        // P23.3 — `gcl-lint-next-off unused-decl` on a non-private fn
         // (which `unused-decl` never fires on) is a dead toggle and
         // should surface `unused-suppression`.
         use crate::project::ProjectAnalysis;
@@ -2712,7 +2712,7 @@ fn f(x: Outer) {
         let uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(
             uri.clone(),
-            "// gcl-lint-off-next unused-decl\nfn callable() {}\n",
+            "// gcl-lint-next-off unused-decl\nfn callable() {}\n",
             "project",
             false,
         );
@@ -2735,7 +2735,7 @@ fn f(x: Outer) {
         let uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(
             uri.clone(),
-            "// gcl-lint-off-next not-a-rule\nfn foo() {}\n",
+            "// gcl-lint-next-off not-a-rule\nfn foo() {}\n",
             "project",
             false,
         );
@@ -2775,14 +2775,14 @@ fn pick(c: Color) {
 
     #[test]
     fn non_exhaustive_lint_respects_lint_off_next() {
-        // `// gcl-lint-off-next non-exhaustive` directly above the head
+        // `// gcl-lint-next-off non-exhaustive` directly above the head
         // if drops the diagnostic. The directive must not also surface
         // an `unused-suppression` (it actually suppressed something).
         let diags = project_lints(
             r#"
 enum Color { Red, Green, Blue }
 fn pick(c: Color) {
-    // gcl-lint-off-next non-exhaustive
+    // gcl-lint-next-off non-exhaustive
     if (c == Color::Red) {
     } else if (c == Color::Green) {
     }
@@ -2808,7 +2808,7 @@ fn pick(c: Color) {
             r#"
 enum Color { Red, Green, Blue }
 fn pick(c: Color) {
-    // gcl-lint-off-next non-exhaustive
+    // gcl-lint-next-off non-exhaustive
     if (c == Color::Red) {
     } else if (c == Color::Green) {
     } else if (c == Color::Blue) {
@@ -3010,7 +3010,7 @@ fn f(x: int): int {
             r#"
 fn f(): int {
     return 1;
-    // gcl-lint-off-next unreachable
+    // gcl-lint-next-off unreachable
     var _ = 0;
 }
 "#,
@@ -3114,11 +3114,11 @@ fn f() {
 
     #[test]
     fn redundant_semicolon_respects_lint_off_next() {
-        // `// gcl-lint-off-next redundant-semicolon` directly above
+        // `// gcl-lint-next-off redundant-semicolon` directly above
         // the offending fn drops the diagnostic — proves the rule
         // plugs into the standard suppression machinery.
         let diags =
-            project_lints("// gcl-lint-off-next redundant-semicolon\nfn n(): int { return 1; };\n");
+            project_lints("// gcl-lint-next-off redundant-semicolon\nfn n(): int { return 1; };\n");
         assert!(!diags.iter().any(|d| d.rule == "redundant-semicolon"));
     }
 }

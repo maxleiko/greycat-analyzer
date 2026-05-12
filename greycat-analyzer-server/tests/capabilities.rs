@@ -995,8 +995,8 @@ fn completion_inside_gcl_directive_comment_lists_directives() {
         "expected `gcl-lint-off` in directive completion, got {labels:?}"
     );
     assert!(
-        labels.iter().any(|l| l == "gcl-fmt-off-file"),
-        "expected `gcl-fmt-off-file` in directive completion, got {labels:?}"
+        labels.iter().any(|l| l == "gcl-fmt-file-off"),
+        "expected `gcl-fmt-file-off` in directive completion, got {labels:?}"
     );
 }
 

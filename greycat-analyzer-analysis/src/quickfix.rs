@@ -648,12 +648,12 @@ fn leading_whitespace_at(text: &str, byte: usize) -> &str {
 /// `byte_range` points at the dead rule word inside a `// gcl-lint-…`
 /// directive comment. Two shapes:
 ///
-/// - **Multi-rule directive** (`// gcl-lint-off-next A B`, B is dead):
+/// - **Multi-rule directive** (`// gcl-lint-next-off A B`, B is dead):
 ///   delete `B` plus its leading whitespace separator → leaves
-///   `// gcl-lint-off-next A`. If `B` was the *first* rule, eat the
-///   trailing whitespace instead so the result is `// gcl-lint-off-next
+///   `// gcl-lint-next-off A`. If `B` was the *first* rule, eat the
+///   trailing whitespace instead so the result is `// gcl-lint-next-off
 ///   …rest…`.
-/// - **Sole rule** (`// gcl-lint-off-next B`, B is dead): the directive
+/// - **Sole rule** (`// gcl-lint-next-off B`, B is dead): the directive
 ///   becomes useless when its only rule is removed; delete the entire
 ///   comment line (including any leading whitespace and the trailing
 ///   newline if the comment was the only content on the line).
@@ -739,7 +739,7 @@ fn comment_rule_word_ranges(comment: &str) -> Option<Vec<Range<usize>>> {
     let name = &comment[name_start..i];
     if !matches!(
         name,
-        "gcl-lint-off" | "gcl-lint-on" | "gcl-lint-off-next" | "gcl-lint-off-file"
+        "gcl-lint-off" | "gcl-lint-on" | "gcl-lint-next-off" | "gcl-lint-file-off"
     ) {
         return None;
     }
@@ -947,9 +947,9 @@ mod tests {
     #[test]
     fn unused_suppression_drops_dead_rule_from_multi_rule_directive() {
         // `unused-param` is dead → fix should remove just that word
-        // plus its leading space, leaving `// gcl-lint-off-next unused-local`.
+        // plus its leading space, leaving `// gcl-lint-next-off unused-local`.
         let src =
-            "fn main() {\n    // gcl-lint-off-next unused-local unused-param\n    var x = 42;\n}\n";
+            "fn main() {\n    // gcl-lint-next-off unused-local unused-param\n    var x = 42;\n}\n";
         let dead = src.find("unused-param").unwrap();
         let edits = fix(
             "unused-suppression",
@@ -960,7 +960,7 @@ mod tests {
         let mut after = src.to_string();
         after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
         assert!(
-            after.contains("// gcl-lint-off-next unused-local\n"),
+            after.contains("// gcl-lint-next-off unused-local\n"),
             "after = {after:?}"
         );
         assert!(!after.contains("unused-param"), "after = {after:?}");
@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn unused_suppression_drops_first_rule_eats_trailing_space() {
         let src =
-            "fn main() {\n    // gcl-lint-off-next unused-local unused-param\n    var y = 0;\n}\n";
+            "fn main() {\n    // gcl-lint-next-off unused-local unused-param\n    var y = 0;\n}\n";
         let dead = src.find("unused-local").unwrap();
         let edits = fix(
             "unused-suppression",
@@ -980,14 +980,14 @@ mod tests {
         let mut after = src.to_string();
         after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
         assert!(
-            after.contains("// gcl-lint-off-next unused-param\n"),
+            after.contains("// gcl-lint-next-off unused-param\n"),
             "after = {after:?}"
         );
     }
 
     #[test]
     fn unused_suppression_on_sole_rule_deletes_whole_comment_line() {
-        let src = "fn main() {\n    // gcl-lint-off-next unused-param\n    var y = 0;\n}\n";
+        let src = "fn main() {\n    // gcl-lint-next-off unused-param\n    var y = 0;\n}\n";
         let dead = src.find("unused-param").unwrap();
         let edits = fix(
             "unused-suppression",
@@ -998,7 +998,7 @@ mod tests {
         let mut after = src.to_string();
         after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
         assert!(
-            !after.contains("gcl-lint-off-next"),
+            !after.contains("gcl-lint-next-off"),
             "expected the whole directive line gone, after = {after:?}"
         );
         // The leading 4-space indent should also be eaten so no blank

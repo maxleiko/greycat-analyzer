@@ -23,7 +23,7 @@ pub struct FmtDirectives {
     /// `gcl-fmt-off`/`gcl-fmt-on` block, etc.); membership is checked
     /// with [`Self::is_skipped`].
     pub skip_ranges: Vec<Range<usize>>,
-    /// `true` when a `gcl-fmt-off-file` was seen at module head — the
+    /// `true` when a `gcl-fmt-file-off` was seen at module head — the
     /// caller should emit `source.to_string()` directly without lowering.
     pub fmt_off_file: bool,
 }
@@ -63,7 +63,7 @@ impl FmtDirectives {
                         skip_ranges.push(next);
                     }
                 }
-                "gcl-fmt-off-file" if is_at_module_head(raw.node) => {
+                "gcl-fmt-file-off" if is_at_module_head(raw.node) => {
                     fmt_off_file = true;
                 }
                 _ => {}
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn fmt_off_file_at_module_head_sets_flag() {
-        let src = "// gcl-fmt-off-file\nfn foo() {}\n";
+        let src = "// gcl-fmt-file-off\nfn foo() {}\n";
         let tree = parse(src);
         let d = FmtDirectives::parse(src, tree.root_node());
         assert!(d.fmt_off_file);
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn fmt_off_file_after_decl_is_ignored() {
-        let src = "fn x() {}\n// gcl-fmt-off-file\n";
+        let src = "fn x() {}\n// gcl-fmt-file-off\n";
         let tree = parse(src);
         let d = FmtDirectives::parse(src, tree.root_node());
         assert!(!d.fmt_off_file);

@@ -4,14 +4,14 @@
 //! `gcl-` prefix. Two directive families:
 //!
 //! - **Lint suppressions** — `gcl-lint-off <rule>...` /
-//!   `gcl-lint-on <rule>...` / `gcl-lint-off-next <rule>...` /
-//!   `gcl-lint-off-file <rule>...`. Each carries an explicit rule list
-//!   (no wildcard). `-off` and `-on` form pairs; `-off-next` covers the
-//!   next AST item; `-off-file` covers the whole file (only at module
+//!   `gcl-lint-on <rule>...` / `gcl-lint-next-off <rule>...` /
+//!   `gcl-lint-file-off <rule>...`. Each carries an explicit rule list
+//!   (no wildcard). `-off` and `-on` form pairs; `-next-off` covers the
+//!   next AST item; `-file-off` covers the whole file (only at module
 //!   head).
 //! - **Formatter skip** — `gcl-fmt-off` / `gcl-fmt-on` / `gcl-fmt-skip`
-//!   / `gcl-fmt-off-file`. `-off`/`-on` form pairs (verbatim region);
-//!   `-skip` covers the next AST node only; `-off-file` covers the
+//!   / `gcl-fmt-file-off`. `-off`/`-on` form pairs (verbatim region);
+//!   `-skip` covers the next AST node only; `-file-off` covers the
 //!   whole file (only at module head).
 //!
 //! Built once per source. Lint emission consults
@@ -19,7 +19,7 @@
 //! formatter consults [`Directives::fmt_skips`] when lowering nodes.
 //!
 //! Misspelled rule names emit `unknown-suppression-rule`; empty rule
-//! lists on `-off` / `-off-next` / `-off-file` emit `empty-suppression`.
+//! lists on `-off` / `-next-off` / `-file-off` emit `empty-suppression`.
 
 use std::ops::Range;
 
@@ -70,9 +70,9 @@ pub struct LintSuppression {
 pub enum LintSuppressionKind {
     /// `gcl-lint-off <rules>` paired with `gcl-lint-on <rules>` (or EOF).
     Range,
-    /// `gcl-lint-off-next <rules>` covering the next AST item.
+    /// `gcl-lint-next-off <rules>` covering the next AST item.
     NextItem,
-    /// `gcl-lint-off-file <rules>` covering the whole file.
+    /// `gcl-lint-file-off <rules>` covering the whole file.
     File,
 }
 
@@ -93,7 +93,7 @@ pub enum FmtSkipKind {
     Range,
     /// `gcl-fmt-skip` covering the next AST node.
     NextNode,
-    /// `gcl-fmt-off-file` covering the whole file.
+    /// `gcl-fmt-file-off` covering the whole file.
     File,
 }
 
@@ -134,7 +134,7 @@ impl Directives {
     }
 
     /// True when the whole file should be emitted verbatim (a
-    /// `gcl-fmt-off-file` was seen at module head).
+    /// `gcl-fmt-file-off` was seen at module head).
     pub fn fmt_off_file(&self) -> bool {
         self.fmt_skips
             .iter()
@@ -203,12 +203,12 @@ fn parse_directive(comment_text: &str, comment_start: usize) -> Option<Directive
     match head {
         "gcl-lint-off" => Some(Directive::LintOff(rest)),
         "gcl-lint-on" => Some(Directive::LintOn(rest)),
-        "gcl-lint-off-next" => Some(Directive::LintOffNext(rest)),
-        "gcl-lint-off-file" => Some(Directive::LintOffFile(rest)),
+        "gcl-lint-next-off" => Some(Directive::LintOffNext(rest)),
+        "gcl-lint-file-off" => Some(Directive::LintOffFile(rest)),
         "gcl-fmt-off" if rest_empty => Some(Directive::FmtOff),
         "gcl-fmt-on" if rest_empty => Some(Directive::FmtOn),
         "gcl-fmt-skip" if rest_empty => Some(Directive::FmtSkip),
-        "gcl-fmt-off-file" if rest_empty => Some(Directive::FmtOffFile),
+        "gcl-fmt-file-off" if rest_empty => Some(Directive::FmtOffFile),
         _ => None,
     }
 }
@@ -432,7 +432,7 @@ fn parse_with_collected(
                     out.diagnostics.push(LintDiagnostic {
                         rule: "empty-suppression",
                         severity: LintSeverity::Warning,
-                        message: "`gcl-lint-off-next` requires at least one rule name".into(),
+                        message: "`gcl-lint-next-off` requires at least one rule name".into(),
                         byte_range: raw.byte_range.clone(),
                         tag: None,
                     });
@@ -464,7 +464,7 @@ fn parse_with_collected(
                     out.diagnostics.push(LintDiagnostic {
                         rule: "empty-suppression",
                         severity: LintSeverity::Warning,
-                        message: "`gcl-lint-off-file` requires at least one rule name".into(),
+                        message: "`gcl-lint-file-off` requires at least one rule name".into(),
                         byte_range: raw.byte_range.clone(),
                         tag: None,
                     });
@@ -474,7 +474,7 @@ fn parse_with_collected(
                     out.diagnostics.push(LintDiagnostic {
                         rule: "empty-suppression",
                         severity: LintSeverity::Warning,
-                        message: "`gcl-lint-off-file` must appear before any decl at module head"
+                        message: "`gcl-lint-file-off` must appear before any decl at module head"
                             .into(),
                         byte_range: raw.byte_range.clone(),
                         tag: None,
@@ -547,7 +547,7 @@ fn parse_with_collected(
                     out.diagnostics.push(LintDiagnostic {
                         rule: "empty-suppression",
                         severity: LintSeverity::Warning,
-                        message: "`gcl-fmt-off-file` must appear before any decl at module head"
+                        message: "`gcl-fmt-file-off` must appear before any decl at module head"
                             .into(),
                         byte_range: raw.byte_range.clone(),
                         tag: None,
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn lint_off_next_resolves_to_next_decl() {
-        let src = "// gcl-lint-off-next unused-decl\nprivate fn foo() {}\n";
+        let src = "// gcl-lint-next-off unused-decl\nprivate fn foo() {}\n";
         let d = dirs(src);
         assert_eq!(d.lint_suppressions.len(), 1);
         let s = &d.lint_suppressions[0];
@@ -654,7 +654,7 @@ mod tests {
         // Multiple rules in one comment: each rule's byte range points
         // at *that* rule word, not the whole comment. Drives
         // unused-suppression's per-rule diagnostic placement.
-        let src = "// gcl-lint-off-next unused-local unused-param\nfn foo() {}\n";
+        let src = "// gcl-lint-next-off unused-local unused-param\nfn foo() {}\n";
         let d = dirs(src);
         assert_eq!(d.lint_suppressions.len(), 1);
         let s = &d.lint_suppressions[0];
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn unknown_rule_emits_diagnostic() {
-        let src = "// gcl-lint-off-next not-a-rule\nfn foo() {}\n";
+        let src = "// gcl-lint-next-off not-a-rule\nfn foo() {}\n";
         let d = dirs(src);
         assert!(
             d.diagnostics
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn lint_off_file_must_be_at_module_head() {
-        let src = "fn foo() {}\n// gcl-lint-off-file unused-decl\n";
+        let src = "fn foo() {}\n// gcl-lint-file-off unused-decl\n";
         let d = dirs(src);
         assert!(d.lint_suppressions.is_empty());
         assert!(d.diagnostics.iter().any(|x| x.rule == "empty-suppression"));
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn lint_off_file_at_module_head_covers_whole_file() {
-        let src = "// gcl-lint-off-file unused-decl\nfn foo() {}\n";
+        let src = "// gcl-lint-file-off unused-decl\nfn foo() {}\n";
         let d = dirs(src);
         assert_eq!(d.lint_suppressions.len(), 1);
         let s = &d.lint_suppressions[0];
@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn suppresses_lint_marks_used_rule() {
-        let src = "// gcl-lint-off-next unused-decl\nprivate fn foo() {}\n";
+        let src = "// gcl-lint-next-off unused-decl\nprivate fn foo() {}\n";
         let mut d = dirs(src);
         let foo_byte = src.find("private").unwrap() + 1;
         assert!(d.suppresses_lint(foo_byte, "unused-decl"));
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn suppresses_lint_unknown_rule_returns_false() {
-        let src = "// gcl-lint-off-next unused-decl\nprivate fn foo() {}\n";
+        let src = "// gcl-lint-next-off unused-decl\nprivate fn foo() {}\n";
         let mut d = dirs(src);
         let foo_byte = src.find("private").unwrap() + 1;
         assert!(!d.suppresses_lint(foo_byte, "unused-local"));

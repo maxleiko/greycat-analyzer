@@ -64,7 +64,7 @@ pub fn format_with(source: &str, opts: FmtOptions) -> String {
 }
 
 // P23.4
-/// `// gcl-fmt-off-file` short-circuit. When the source's
+/// `// gcl-fmt-file-off` short-circuit. When the source's
 /// module head carries this directive, return `source.to_string()`
 /// without lowering. Centralized here so every public entry point
 /// honors it.
@@ -248,10 +248,10 @@ type Foo {
 
     #[test]
     fn fmt_off_file_short_circuits_to_verbatim() {
-        // `// gcl-fmt-off-file` at module head: the formatter must
+        // `// gcl-fmt-file-off` at module head: the formatter must
         // return the source unchanged, even when it'd otherwise
         // reformat heavily.
-        let src = "// gcl-fmt-off-file\nfn  weirdly_spaced(  a:int  ){ return  a;  }\n";
+        let src = "// gcl-fmt-file-off\nfn  weirdly_spaced(  a:int  ){ return  a;  }\n";
         let out = format(src);
         assert_eq!(out, src);
     }

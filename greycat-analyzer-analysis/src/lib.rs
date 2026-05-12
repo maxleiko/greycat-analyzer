@@ -19,8 +19,8 @@
 //!    suppressions (`// gcl-lint-off <rule>`) configured via
 //!    [`directives::Directives`] silence them at the source.
 //! 5. [`directives`] — comment-driven user opt-out. Walks every
-//!    `line_comment` for `gcl-lint-off` / `gcl-lint-off-next` /
-//!    `gcl-lint-off-file` / `gcl-lint-on` / `gcl-fmt-…` directives and
+//!    `line_comment` for `gcl-lint-off` / `gcl-lint-next-off` /
+//!    `gcl-lint-file-off` / `gcl-lint-on` / `gcl-fmt-…` directives and
 //!    builds the suppression / fmt-skip tables that downstream stages
 //!    consult. Misspellings emit `unknown-suppression-rule`; dead
 //!    toggles emit `unused-suppression`.

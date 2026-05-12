@@ -3212,7 +3212,7 @@ fn pragma_items() -> Vec<CompletionItem> {
 ///
 /// - **Directive name** — when the cursor sits on the directive name
 ///   itself (`// gcl-` / `// gcl-lint-o<cursor>`), emit one item per
-///   directive form (`gcl-lint-off`, `gcl-lint-off-next`, …) with
+///   directive form (`gcl-lint-off`, `gcl-lint-next-off`, …) with
 ///   snippet bodies that include placeholder rule lists for the lint
 ///   forms.
 /// - **Rule name** — when the cursor sits in a `// gcl-lint-off-* `
@@ -3274,14 +3274,14 @@ fn directive_completion(text: &str, cursor_byte: usize) -> Option<Vec<Completion
     }
 
     // Cursor is in the rule-list slot (after the first whitespace).
-    // Only fire for `gcl-lint-off`, `gcl-lint-off-next`,
-    // `gcl-lint-off-file`, `gcl-lint-on` — the four forms that accept
+    // Only fire for `gcl-lint-off`, `gcl-lint-next-off`,
+    // `gcl-lint-file-off`, `gcl-lint-on` — the four forms that accept
     // a rule list.
     let idx = first_ws?;
     let directive_name = &payload_trimmed[..idx];
     if !matches!(
         directive_name,
-        "gcl-lint-off" | "gcl-lint-on" | "gcl-lint-off-next" | "gcl-lint-off-file"
+        "gcl-lint-off" | "gcl-lint-on" | "gcl-lint-next-off" | "gcl-lint-file-off"
     ) {
         return None;
     }
@@ -3326,17 +3326,17 @@ fn directive_items() -> Vec<CompletionItem> {
             ..Default::default()
         },
         CompletionItem {
-            label: "gcl-lint-off-next".into(),
+            label: "gcl-lint-next-off".into(),
             kind: Some(CompletionItemKind::KEYWORD),
-            insert_text: Some("gcl-lint-off-next ${1:rule}".into()),
+            insert_text: Some("gcl-lint-next-off ${1:rule}".into()),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             detail: Some("silence the named rule(s) for the next AST item only".into()),
             ..Default::default()
         },
         CompletionItem {
-            label: "gcl-lint-off-file".into(),
+            label: "gcl-lint-file-off".into(),
             kind: Some(CompletionItemKind::KEYWORD),
-            insert_text: Some("gcl-lint-off-file ${1:rule}".into()),
+            insert_text: Some("gcl-lint-file-off ${1:rule}".into()),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             detail: Some(
                 "silence the named rule(s) for the whole file (must appear at module head)".into(),
@@ -3365,9 +3365,9 @@ fn directive_items() -> Vec<CompletionItem> {
             ..Default::default()
         },
         CompletionItem {
-            label: "gcl-fmt-off-file".into(),
+            label: "gcl-fmt-file-off".into(),
             kind: Some(CompletionItemKind::KEYWORD),
-            insert_text: Some("gcl-fmt-off-file".into()),
+            insert_text: Some("gcl-fmt-file-off".into()),
             detail: Some("preserve the whole file verbatim (must appear at module head)".into()),
             ..Default::default()
         },
