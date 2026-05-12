@@ -339,7 +339,7 @@ fn inlay_hints_with_project_use_cross_module_call_return_types() {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints_with_project(module, pa.arena(), &user_doc.text, &range);
+    let hints = capabilities::inlay_hints_with_project(module, &pa, &user_doc.text, &range);
     assert_eq!(
         hints.len(),
         1,
@@ -352,6 +352,55 @@ fn inlay_hints_with_project_use_cross_module_call_return_types() {
     assert_eq!(
         s, ": int",
         "method-call return type should propagate to the inlay hint, got `{s}`"
+    );
+}
+
+/// Inlay hints render qualified type names when the bare name is
+/// ambiguous across modules. `var f = b::Foo {};` against a project
+/// where three modules each declare a `Foo` must surface `: b::Foo`,
+/// not the misleading `: Foo`.
+#[test]
+fn inlay_hints_qualify_ambiguous_type_names() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    use std::str::FromStr;
+
+    let a_uri = Uri::from_str("file:///a.gcl").unwrap();
+    let b_uri = Uri::from_str("file:///b.gcl").unwrap();
+    let c_uri = Uri::from_str("file:///c.gcl").unwrap();
+    let main_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(a_uri, "type Foo { fn a() {} }\n", "p", false);
+    mgr.add_simple(b_uri, "type Foo { fn b() {} }\n", "p", false);
+    mgr.add_simple(c_uri, "type Foo { fn c() {} }\n", "p", false);
+    mgr.add_simple(
+        main_uri.clone(),
+        "fn main() {\n    var f = b::Foo {};\n}\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let main_cell = mgr.get(&main_uri).expect("main doc");
+    let main_doc = main_cell.borrow();
+    let module = pa.module(&main_uri).expect("main module cached");
+
+    let range = lsp_types::Range {
+        start: pos(0, 0),
+        end: pos(99, 0),
+    };
+    let hints = capabilities::inlay_hints_with_project(module, &pa, &main_doc.text, &range);
+    assert_eq!(
+        hints.len(),
+        1,
+        "expected 1 inlay hint for `var f`, got {}: {hints:?}",
+        hints.len()
+    );
+    let InlayHintLabel::String(s) = &hints[0].label else {
+        panic!("expected string label, got {:?}", hints[0].label);
+    };
+    assert_eq!(
+        s, ": b::Foo",
+        "ambiguous `Foo` should render with module qualifier, got `{s}`"
     );
 }
 
@@ -693,7 +742,7 @@ fn inlay_hints_with_project_use_bare_ident_call_return_types() {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints_with_project(module, pa.arena(), &doc.text, &range);
+    let hints = capabilities::inlay_hints_with_project(module, &pa, &doc.text, &range);
     let var_hint = hints
         .iter()
         .find(|h| {

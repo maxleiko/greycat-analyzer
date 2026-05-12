@@ -256,6 +256,20 @@ impl ProjectAnalysis {
         &self.well_known
     }
 
+    /// Project-aware type display. Renders the type with a
+    /// `<module>::` qualifier prefix whenever the bare decl name is
+    /// ambiguous within the project (≥2 modules export it). When the
+    /// name is unique, behaves identically to `arena.display(id)`.
+    ///
+    /// Used by inlay hints so the user reading `var f = b::Foo {};`
+    /// sees `: b::Foo` rather than the ambiguous bare `: Foo`.
+    pub fn display_type(&self, ty: greycat_analyzer_types::TypeId) -> ProjectTypeDisplay<'_> {
+        ProjectTypeDisplay {
+            project: self,
+            id: ty,
+        }
+    }
+
     /// One-pass build over every document currently in `manager`.
     pub fn analyze(manager: &SourceManager) -> Self {
         let mut out = Self::new();
@@ -565,6 +579,137 @@ impl ProjectAnalysis {
             &mut self.sig_cache,
         );
     }
+}
+
+/// `Display`-implementing wrapper returned by
+/// [`ProjectAnalysis::display_type`]. Walks the type structure the
+/// same way `TypeArena::display` does, but prefixes `<module>::`
+/// whenever the bare decl name is ambiguous within the project (≥2
+/// modules export it). When the name is unique the output matches
+/// the bare renderer byte-for-byte.
+pub struct ProjectTypeDisplay<'a> {
+    project: &'a ProjectAnalysis,
+    id: greycat_analyzer_types::TypeId,
+}
+
+impl std::fmt::Display for ProjectTypeDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_type_qualified(f, self.project, self.id)
+    }
+}
+
+fn write_type_qualified(
+    f: &mut std::fmt::Formatter<'_>,
+    project: &ProjectAnalysis,
+    id: greycat_analyzer_types::TypeId,
+) -> std::fmt::Result {
+    use greycat_analyzer_types::TypeKind;
+    let arena = project.arena();
+    let ty = arena.get(id);
+    match &ty.kind {
+        TypeKind::Null => f.write_str("null")?,
+        TypeKind::Any => f.write_str("any")?,
+        TypeKind::Never => f.write_str("never")?,
+        TypeKind::Primitive(p) => f.write_str(p.name())?,
+        TypeKind::Named { name } => f.write_str(name.as_str())?,
+        TypeKind::Generic { name, args } => {
+            f.write_str(name.as_str())?;
+            write_args_qualified(f, project, args)?;
+        }
+        TypeKind::Type(d) => write_decl_qualified(f, project, *d)?,
+        TypeKind::GenericInstance { decl, args } => {
+            write_decl_qualified(f, project, *decl)?;
+            write_args_qualified(f, project, args)?;
+        }
+        TypeKind::Unresolved { name, .. } => f.write_str(name.as_str())?,
+        TypeKind::GenericParam { name, .. } => f.write_str(name.as_str())?,
+        TypeKind::Lambda(l) => {
+            f.write_str("(")?;
+            for (i, p) in l.params.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type_qualified(f, project, *p)?;
+            }
+            f.write_str(") -> ")?;
+            write_type_qualified(f, project, l.ret)?;
+        }
+        TypeKind::Tuple { elements } => {
+            f.write_str("(")?;
+            for (i, e) in elements.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type_qualified(f, project, *e)?;
+            }
+            f.write_str(")")?;
+        }
+        TypeKind::Anonymous { fields } => {
+            f.write_str("{ ")?;
+            for (i, (n, t)) in fields.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(n.as_str())?;
+                f.write_str(": ")?;
+                write_type_qualified(f, project, *t)?;
+            }
+            f.write_str(" }")?;
+        }
+        TypeKind::Enum { name, .. } => f.write_str(name.as_str())?,
+        TypeKind::Union { alts } => {
+            for (i, a) in alts.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" | ")?;
+                }
+                write_type_qualified(f, project, *a)?;
+            }
+            if ty.nullable
+                && !alts
+                    .iter()
+                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
+            {
+                f.write_str(" | null")?;
+            }
+        }
+    }
+    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
+        f.write_str("?")?;
+    }
+    Ok(())
+}
+
+fn write_args_qualified(
+    f: &mut std::fmt::Formatter<'_>,
+    project: &ProjectAnalysis,
+    args: &[greycat_analyzer_types::TypeId],
+) -> std::fmt::Result {
+    f.write_str("<")?;
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write_type_qualified(f, project, *a)?;
+    }
+    f.write_str(">")
+}
+
+fn write_decl_qualified(
+    f: &mut std::fmt::Formatter<'_>,
+    project: &ProjectAnalysis,
+    decl: greycat_analyzer_types::TypeDeclId,
+) -> std::fmt::Result {
+    let Some(name) = project.arena().decl_name(decl) else {
+        return write!(f, "?type#{}", decl.raw());
+    };
+    if project.index.locate_decl(name).len() > 1
+        && let Some((uri, _)) = project.decl_registry.resolve(decl)
+        && let Some(module) = crate::stdlib::module_name_from_uri(uri)
+    {
+        f.write_str(&module)?;
+        f.write_str("::")?;
+    }
+    f.write_str(name)
 }
 
 // P19.6

@@ -2037,7 +2037,56 @@ fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
 /// from a live LSP session.
 pub fn inlay_hints_with_project(
     module: &ModuleAnalysis,
-    arena: &greycat_analyzer_types::TypeArena,
+    project: &ProjectAnalysis,
+    text: &str,
+    range: &lsp_types::Range,
+) -> Vec<InlayHint> {
+    // Render types via the project's `display_type`, which prefixes
+    // `<module>::` whenever the bare decl name is ambiguous across
+    // modules — so the user reading `var f = b::Foo {};` sees
+    // `: b::Foo`, not the misleading bare `: Foo`.
+    let render: &dyn Fn(greycat_analyzer_types::TypeId) -> String =
+        &|ty| project.display_type(ty).to_string();
+    inlay_hints_inner(module, render, text, range)
+}
+
+/// Single-file shim — only used by unit tests / single-file CLI
+/// commands. **The LSP server never calls this directly**; it goes
+/// through [`inlay_hints_with_project`] so the cross-module fixup
+/// passes apply. Marked `#[doc(hidden)]` to keep external consumers
+/// pointed at the project-aware path. Renders types with the bare
+/// arena printer — there's no project closure to consult for
+/// ambiguity.
+#[doc(hidden)]
+pub fn inlay_hints(
+    text: &str,
+    lib: &str,
+    root: tree_sitter::Node<'_>,
+    range: &lsp_types::Range,
+) -> Vec<InlayHint> {
+    let hir = lower_module(text, "module", lib, root);
+    let resolutions = resolve(&hir);
+    let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let module = ModuleAnalysis {
+        hir,
+        resolutions,
+        analysis,
+        lints: Vec::new(),
+        lib: lib.to_string(),
+        timings: Default::default(),
+        directives: greycat_analyzer_analysis::directives::Directives::default(),
+    };
+    let render: &dyn Fn(greycat_analyzer_types::TypeId) -> String =
+        &|ty| arena.display(ty).to_string();
+    inlay_hints_inner(&module, render, text, range)
+}
+
+/// Shared emitter — takes a type-rendering closure so the
+/// project-aware path can prefix qualifiers while the single-file
+/// shim falls back to the bare arena printer.
+fn inlay_hints_inner(
+    module: &ModuleAnalysis,
+    render_ty: &dyn Fn(greycat_analyzer_types::TypeId) -> String,
     text: &str,
     range: &lsp_types::Range,
 ) -> Vec<InlayHint> {
@@ -2066,7 +2115,7 @@ pub fn inlay_hints_with_project(
             {
                 let name_range = &hir.idents[fnd.name].byte_range;
                 if name_range.start <= want.1 && name_range.end >= want.0 {
-                    let label = format!(": {}", arena.display(ty));
+                    let label = format!(": {}", render_ty(ty));
                     out.push(InlayHint {
                         position: byte_to_position(text, name_range.end),
                         label: InlayHintLabel::String(label),
@@ -2081,40 +2130,13 @@ pub fn inlay_hints_with_project(
             }
             // Walk the body for `var name = expr;` shapes (no declared type).
             if let Some(body) = fnd.body {
-                emit_var_hints(hir, analysis, arena, body, want, text, &mut out);
+                emit_var_hints(hir, analysis, render_ty, body, want, text, &mut out);
                 // P13.7: argument-name hints inside the body.
                 emit_call_arg_hints(hir, resolutions, body, want, text, &mut out);
             }
         }
     }
     out
-}
-
-/// Single-file shim — only used by unit tests / single-file CLI
-/// commands. **The LSP server never calls this directly**; it goes
-/// through [`inlay_hints_with_project`] so the cross-module fixup
-/// passes apply. Marked `#[doc(hidden)]` to keep external consumers
-/// pointed at the project-aware path.
-#[doc(hidden)]
-pub fn inlay_hints(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-    range: &lsp_types::Range,
-) -> Vec<InlayHint> {
-    let hir = lower_module(text, "module", lib, root);
-    let resolutions = resolve(&hir);
-    let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
-    let module = ModuleAnalysis {
-        hir,
-        resolutions,
-        analysis,
-        lints: Vec::new(),
-        lib: lib.to_string(),
-        timings: Default::default(),
-        directives: greycat_analyzer_analysis::directives::Directives::default(),
-    };
-    inlay_hints_with_project(&module, &arena, text, range)
 }
 
 // P13.7
@@ -2299,21 +2321,21 @@ fn emit_call_arg_hints_expr(
 fn emit_var_hints_block(
     hir: &Hir,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    render_ty: &dyn Fn(greycat_analyzer_types::TypeId) -> String,
     block: &greycat_analyzer_hir::types::BlockStmt,
     want: (usize, usize),
     text: &str,
     out: &mut Vec<InlayHint>,
 ) {
     for s in &block.stmts {
-        emit_var_hints(hir, analysis, arena, *s, want, text, out);
+        emit_var_hints(hir, analysis, render_ty, *s, want, text, out);
     }
 }
 
 fn emit_var_hints(
     hir: &Hir,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    render_ty: &dyn Fn(greycat_analyzer_types::TypeId) -> String,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     want: (usize, usize),
     text: &str,
@@ -2322,7 +2344,7 @@ fn emit_var_hints(
     use greycat_analyzer_hir::types::Stmt;
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(b) => emit_var_hints_block(hir, analysis, arena, b, want, text, out),
+        Stmt::Block(b) => emit_var_hints_block(hir, analysis, render_ty, b, want, text, out),
         Stmt::Var(v) if v.ty.is_none() && v.init.is_some() => {
             let r = &v.byte_range;
             if r.end < want.0 || r.start > want.1 {
@@ -2332,7 +2354,7 @@ fn emit_var_hints(
             let Some(ty) = analysis.expr_types.get(&init_id).copied() else {
                 return;
             };
-            let label = format!(": {}", arena.display(ty));
+            let label = format!(": {}", render_ty(ty));
             // Anchor right after the variable name.
             let name_range = &hir.idents[v.name].byte_range;
             out.push(InlayHint {
@@ -2347,20 +2369,22 @@ fn emit_var_hints(
             });
         }
         Stmt::If(i) => {
-            emit_var_hints_block(hir, analysis, arena, &i.then_branch, want, text, out);
+            emit_var_hints_block(hir, analysis, render_ty, &i.then_branch, want, text, out);
             if let Some(eb) = i.else_branch {
-                emit_var_hints(hir, analysis, arena, eb, want, text, out);
+                emit_var_hints(hir, analysis, render_ty, eb, want, text, out);
             }
         }
-        Stmt::While(w) => emit_var_hints_block(hir, analysis, arena, &w.body, want, text, out),
-        Stmt::DoWhile(w) => emit_var_hints_block(hir, analysis, arena, &w.body, want, text, out),
-        Stmt::For(f) => emit_var_hints_block(hir, analysis, arena, &f.body, want, text, out),
-        Stmt::ForIn(f) => emit_var_hints_block(hir, analysis, arena, &f.body, want, text, out),
-        Stmt::Try(t) => {
-            emit_var_hints_block(hir, analysis, arena, &t.try_block, want, text, out);
-            emit_var_hints_block(hir, analysis, arena, &t.catch_block, want, text, out);
+        Stmt::While(w) => emit_var_hints_block(hir, analysis, render_ty, &w.body, want, text, out),
+        Stmt::DoWhile(w) => {
+            emit_var_hints_block(hir, analysis, render_ty, &w.body, want, text, out)
         }
-        Stmt::At(a) => emit_var_hints_block(hir, analysis, arena, &a.block, want, text, out),
+        Stmt::For(f) => emit_var_hints_block(hir, analysis, render_ty, &f.body, want, text, out),
+        Stmt::ForIn(f) => emit_var_hints_block(hir, analysis, render_ty, &f.body, want, text, out),
+        Stmt::Try(t) => {
+            emit_var_hints_block(hir, analysis, render_ty, &t.try_block, want, text, out);
+            emit_var_hints_block(hir, analysis, render_ty, &t.catch_block, want, text, out);
+        }
+        Stmt::At(a) => emit_var_hints_block(hir, analysis, render_ty, &a.block, want, text, out),
         _ => {}
     }
 }
