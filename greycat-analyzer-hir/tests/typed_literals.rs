@@ -86,6 +86,139 @@ fn plain_int_lowers_to_int_kind() {
 }
 
 #[test]
+fn negated_int_literal_reaches_i64_min() {
+    // `-9223372036854775808` is `i64::MIN`. The unary `-` is a
+    // separate CST node from the magnitude literal, but the HIR
+    // lowering folds the negation into the literal so the
+    // magnitude `2^63` is allowed (it's `i64::MIN`'s absolute
+    // value, exactly representable as a negated `i64`).
+    let src = "fn f() {\n    var i = -9223372036854775808;\n}\n";
+    let kind = first_var_init_kind(src, 0);
+    assert!(
+        matches!(kind, LiteralKind::Int(v) if v == i64::MIN),
+        "expected i64::MIN, got {kind:?}",
+    );
+    // Look up the parse_issue on the literal to confirm the
+    // boundary case carries NO overflow flag.
+    let tree = parse(src);
+    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let module = hir.module.as_ref().unwrap();
+    let fnd = module
+        .decls
+        .iter()
+        .find_map(|d| match &hir.decls[*d] {
+            Decl::Fn(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let body = hir.stmts[fnd.body.unwrap()].clone();
+    let stmts = match body {
+        Stmt::Block(b) => b.stmts,
+        _ => panic!(),
+    };
+    let init = match &hir.stmts[stmts[0]] {
+        Stmt::Var(v) => v.init.unwrap(),
+        _ => panic!(),
+    };
+    let issue = match &hir.exprs[init] {
+        Expr::Literal(l) => l.parse_issue,
+        _ => panic!(),
+    };
+    assert!(
+        issue.is_none(),
+        "i64::MIN must not flag overflow: {issue:?}"
+    );
+}
+
+#[test]
+fn positive_int_literal_at_i64_max_is_clean() {
+    let src = "fn f() {\n    var i = 9223372036854775807;\n}\n";
+    assert!(matches!(
+        first_var_init_kind(src, 0),
+        LiteralKind::Int(v) if v == i64::MAX,
+    ));
+}
+
+#[test]
+fn positive_int_literal_one_past_i64_max_overflows() {
+    // `9223372036854775808` is `i64::MIN`'s magnitude — valid as
+    // negated, but as a *positive* literal it exceeds `i64::MAX`
+    // and must saturate with the overflow flag set.
+    let src = "fn f() {\n    var i = 9223372036854775808;\n}\n";
+    let tree = parse(src);
+    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let module = hir.module.as_ref().unwrap();
+    let fnd = module
+        .decls
+        .iter()
+        .find_map(|d| match &hir.decls[*d] {
+            Decl::Fn(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let body = hir.stmts[fnd.body.unwrap()].clone();
+    let stmts = match body {
+        Stmt::Block(b) => b.stmts,
+        _ => panic!(),
+    };
+    let init = match &hir.stmts[stmts[0]] {
+        Stmt::Var(v) => v.init.unwrap(),
+        _ => panic!(),
+    };
+    let lit = match &hir.exprs[init] {
+        Expr::Literal(l) => l,
+        _ => panic!(),
+    };
+    assert!(matches!(lit.kind, LiteralKind::Int(v) if v == i64::MAX));
+    assert!(
+        lit.parse_issue.is_some(),
+        "magnitude > i64::MAX must overflow"
+    );
+}
+
+#[test]
+fn negated_int_literal_one_past_i64_min_overflows() {
+    // `-9223372036854775809` would be `i64::MIN - 1` — out of
+    // range even with the negative-asymmetry rule.
+    let src = "fn f() {\n    var i = -9223372036854775809;\n}\n";
+    let tree = parse(src);
+    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let module = hir.module.as_ref().unwrap();
+    let fnd = module
+        .decls
+        .iter()
+        .find_map(|d| match &hir.decls[*d] {
+            Decl::Fn(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let body = hir.stmts[fnd.body.unwrap()].clone();
+    let stmts = match body {
+        Stmt::Block(b) => b.stmts,
+        _ => panic!(),
+    };
+    let init = match &hir.stmts[stmts[0]] {
+        Stmt::Var(v) => v.init.unwrap(),
+        _ => panic!(),
+    };
+    let lit = match &hir.exprs[init] {
+        Expr::Literal(l) => l,
+        _ => panic!(),
+    };
+    assert!(matches!(lit.kind, LiteralKind::Int(v) if v == i64::MIN));
+    assert!(
+        lit.parse_issue.is_some(),
+        "magnitude > 2^63 must overflow even when negated",
+    );
+}
+
+#[test]
+fn negated_small_int_literal_folds_cleanly() {
+    let src = "fn f() {\n    var i = -42;\n}\n";
+    assert!(matches!(first_var_init_kind(src, 0), LiteralKind::Int(-42)));
+}
+
+#[test]
 fn iso8601_utc_lowers_to_us_since_epoch() {
     // 2024-01-01T00:00:00Z → 1_704_067_200 seconds since Unix epoch
     // → 1_704_067_200_000_000 µs. Grammar wraps ISO literals in `'…'`.

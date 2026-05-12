@@ -782,7 +782,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             // between a real char and an ISO-8601 literal.
             let raw = cx.text(node);
             let (lit_kind, parse_issue) = match kind {
-                "number" => classify_and_parse_number(cx, node, raw),
+                "number" => classify_and_parse_number(cx, node, raw, false),
                 "char" => {
                     let iso_child = node
                         .named_children(&mut node.walk())
@@ -1013,16 +1013,37 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "unary_expr" => {
-            let operand = node
-                .named_children(&mut node.walk())
-                .next()
-                .and_then(|n| lower_expr(cx, n))?;
             let op = unary_op_for(operator_text(cx, node));
-            Expr::Unary(UnaryExpr {
-                op,
-                operand,
-                byte_range: node.byte_range(),
-            })
+            // Fold `-<number>` into a single negated literal so the
+            // i64-boundary asymmetry (magnitude up to `2^63` is valid
+            // when the result is `i64::MIN`, only up to `i64::MAX`
+            // when the result is positive) is applied at the right
+            // place. Without this, `-9223372036854775808` would
+            // parse the magnitude, saturate to `i64::MAX` with an
+            // overflow warning, then unary-`-` would negate to
+            // `-i64::MAX` — silently wrong by one. Same logic for
+            // `time` / `duration` / `float` suffixes (the magnitude
+            // bounds carry over).
+            let operand_node = node.named_children(&mut node.walk()).next();
+            if matches!(op, UnaryOp::Neg)
+                && let Some(child) = operand_node
+                && child.kind() == "number"
+            {
+                let raw = cx.text(child);
+                let (kind, parse_issue) = classify_and_parse_number(cx, child, raw, true);
+                Expr::Literal(LiteralExpr {
+                    kind,
+                    parse_issue,
+                    byte_range: node.byte_range(),
+                })
+            } else {
+                let operand = operand_node.and_then(|n| lower_expr(cx, n))?;
+                Expr::Unary(UnaryExpr {
+                    op,
+                    operand,
+                    byte_range: node.byte_range(),
+                })
+            }
         }
         "lambda_expr" => {
             let params = lower_fn_params(cx, node.child_by_field_name("params"));
@@ -1150,36 +1171,45 @@ fn classify_and_parse_number(
     cx: &LowerCtx,
     node: tree_sitter::Node<'_>,
     raw: &str,
+    negate: bool,
 ) -> (LiteralKind, Option<ParseIssue>) {
     let (body_text, suffix_text) = extract_number_parts(cx, node);
     let suffix = suffix_text.as_deref().map(|s| s.trim_start_matches('_'));
     let body = body_text.as_deref().unwrap_or(raw);
+    let to_signed = if negate {
+        magnitude_to_i64_negated
+    } else {
+        magnitude_to_i64_positive
+    };
     match suffix {
         Some(s) if s.eq_ignore_ascii_case("time") => {
-            let (n, issue) = parse_integer_sat(body);
+            let (m, issue) = parse_integer_magnitude_sat(body);
+            let (n, issue) = to_signed(m, issue);
             (LiteralKind::Time(n), issue)
         }
         Some(s) if is_duration_suffix(s) => {
-            let (n, mut issue) = parse_integer_sat(body);
+            let (m, issue) = parse_integer_magnitude_sat(body);
+            let (n, mut issue) = to_signed(m, issue);
             let us = match duration_to_us(n, s) {
                 Some(us) => us,
                 None => {
                     issue.get_or_insert(ParseIssue::Overflow);
-                    i64::MAX
+                    if negate { i64::MIN } else { i64::MAX }
                 }
             };
             (LiteralKind::Duration(us), issue)
         }
         Some(s) if s.eq_ignore_ascii_case("f") => {
             let (f, issue) = parse_float_sat(body);
-            (LiteralKind::Float(f), issue)
+            (LiteralKind::Float(if negate { -f } else { f }), issue)
         }
         _ => {
             if looks_like_float(body) {
                 let (f, issue) = parse_float_sat(body);
-                (LiteralKind::Float(f), issue)
+                (LiteralKind::Float(if negate { -f } else { f }), issue)
             } else {
-                let (n, issue) = parse_integer_sat(body);
+                let (m, issue) = parse_integer_magnitude_sat(body);
+                let (n, issue) = to_signed(m, issue);
                 (LiteralKind::Int(n), issue)
             }
         }
@@ -1242,17 +1272,19 @@ fn looks_like_float(text: &str) -> bool {
     false
 }
 
-/// Saturating decimal integer parse. The grammar's `number_int` only
-/// accepts `[0-9][0-9_]*` — no hex/binary/octal prefixes — so this
-/// only handles base-10 with optional `_` separators. Walks bytes
-/// directly with `checked_mul` / `checked_add`, so no allocation and
-/// the overflow is detected exactly when the accumulator can no
-/// longer absorb the next digit. Returns the saturated value
-/// alongside [`ParseIssue::Overflow`] on overflow. Negatives never
-/// reach here (unary `-` is a separate expression), so saturation is
-/// always toward `i64::MAX`.
-fn parse_integer_sat(s: &str) -> (i64, Option<ParseIssue>) {
-    let mut acc: i64 = 0;
+/// Saturating decimal integer magnitude parse. The grammar's
+/// `number_int` only accepts `[0-9][0-9_]*` — no hex/binary/octal
+/// prefixes — so this only handles base-10 with optional `_`
+/// separators. Walks bytes directly with `checked_mul` /
+/// `checked_add`, so no allocation and overflow is detected exactly
+/// when the accumulator can no longer absorb the next digit. Returns
+/// the absolute magnitude as `u64`; the `i64` boundary (and its
+/// asymmetry between positive max and negative min) is applied by
+/// [`magnitude_to_i64_positive`] / [`magnitude_to_i64_negated`] at
+/// the literal-lowering site, which knows whether a unary `-` is
+/// folding into the literal.
+fn parse_integer_magnitude_sat(s: &str) -> (u64, Option<ParseIssue>) {
+    let mut acc: u64 = 0;
     let mut overflow = false;
     for &b in s.as_bytes() {
         if b == b'_' {
@@ -1261,21 +1293,50 @@ fn parse_integer_sat(s: &str) -> (i64, Option<ParseIssue>) {
         if !b.is_ascii_digit() {
             // The grammar guarantees this can't happen; stay safe
             // anyway and surface as an overflow-style anomaly.
-            return (i64::MAX, Some(ParseIssue::Overflow));
+            return (u64::MAX, Some(ParseIssue::Overflow));
         }
         if overflow {
             continue;
         }
-        let d = (b - b'0') as i64;
+        let d = (b - b'0') as u64;
         match acc.checked_mul(10).and_then(|v| v.checked_add(d)) {
             Some(v) => acc = v,
             None => {
                 overflow = true;
-                acc = i64::MAX;
+                acc = u64::MAX;
             }
         }
     }
     (acc, overflow.then_some(ParseIssue::Overflow))
+}
+
+/// Convert a magnitude to a positive `i64`, saturating at `i64::MAX`.
+/// Magnitudes greater than `i64::MAX` flag [`ParseIssue::Overflow`].
+fn magnitude_to_i64_positive(m: u64, mut issue: Option<ParseIssue>) -> (i64, Option<ParseIssue>) {
+    if m > i64::MAX as u64 {
+        issue.get_or_insert(ParseIssue::Overflow);
+        (i64::MAX, issue)
+    } else {
+        (m as i64, issue)
+    }
+}
+
+/// Convert a magnitude to its negation as `i64`. `i64::MIN` has
+/// magnitude `2^63`, which is exactly representable as the negated
+/// value even though it's `i64::MAX + 1` in unsigned terms — that
+/// asymmetry is the whole reason for splitting the positive /
+/// negated converters. Magnitudes strictly greater than `2^63` flag
+/// [`ParseIssue::Overflow`] and saturate at `i64::MIN`.
+fn magnitude_to_i64_negated(m: u64, mut issue: Option<ParseIssue>) -> (i64, Option<ParseIssue>) {
+    const I64_MIN_MAG: u64 = i64::MIN.unsigned_abs();
+    match m.cmp(&I64_MIN_MAG) {
+        std::cmp::Ordering::Less => ((m as i64).wrapping_neg(), issue),
+        std::cmp::Ordering::Equal => (i64::MIN, issue),
+        std::cmp::Ordering::Greater => {
+            issue.get_or_insert(ParseIssue::Overflow);
+            (i64::MIN, issue)
+        }
+    }
 }
 
 /// f64 parse — byte-walker, zero allocation. Accumulates digits into
