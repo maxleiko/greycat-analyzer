@@ -2685,8 +2685,8 @@ pub fn completion(
 /// [`completion`], but the ident-position branch enumerates scope-
 /// visible names (locals / params / generics / in-module decls) plus
 /// the cross-module project surface (`ProjectIndex::values` /
-/// `decl_locations` / `BUILTIN_RUNTIME_TYPES` / primitives) alongside
-/// the keyword list. Typed prefix filters all of them.
+/// `decl_locations` / primitives) alongside the keyword list. Typed
+/// prefix filters all of them.
 pub fn completion_with_project(
     text: &str,
     root: tree_sitter::Node<'_>,
@@ -3809,21 +3809,6 @@ fn ident_or_keyword_completion(
             ..Default::default()
         });
     }
-    for name in greycat_analyzer_analysis::stdlib::BUILTIN_RUNTIME_TYPES {
-        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
-            continue;
-        }
-        if !seen.insert((*name).into()) {
-            continue;
-        }
-        items.push(CompletionItem {
-            label: (*name).into(),
-            kind: Some(CompletionItemKind::CLASS),
-            insert_text: Some((*name).into()),
-            sort_text: Some(format!("y_{name}")),
-            ..Default::default()
-        });
-    }
 
     if items.is_empty() {
         return None;
@@ -4707,7 +4692,6 @@ fn type_head_name(
     use greycat_analyzer_types::TypeKind;
     let t = arena.get(id);
     match &t.kind {
-        TypeKind::Named { name } => Some(name),
         // P35.7 — handle-keyed variants read the name from the arena's
         // parallel decl-names table.
         TypeKind::Type(d) => arena.decl_name(*d),
@@ -5116,10 +5100,6 @@ fn type_position_completion(
             };
             push(&mut items, &mut seen, name, kind);
         }
-    }
-    // Runtime types.
-    for &name in greycat_analyzer_analysis::stdlib::BUILTIN_RUNTIME_TYPES {
-        push(&mut items, &mut seen, name, CompletionItemKind::CLASS);
     }
     // Primitives.
     for &p in &[

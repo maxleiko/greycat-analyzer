@@ -119,9 +119,9 @@ pub struct WellKnown {
     pub any_decl: Option<TypeDeclId>,
     pub null_decl: Option<TypeDeclId>,
 
-    // Runtime sentinels — `type`, `field`, `function`. The 15+
-    // `arena.named("function")` / `"type"` / `"field"` sites in
-    // [`crate::analyzer`] swap onto these handles in P35.4.
+    // Runtime sentinels — `type`, `field`, `function`. The
+    // `function_ty()` / `type_ty()` / `field_ty()` minter sites in
+    // [`crate::analyzer`] read from these handles.
     pub type_decl: Option<TypeDeclId>,
     pub field_decl: Option<TypeDeclId>,
     pub function_decl: Option<TypeDeclId>,

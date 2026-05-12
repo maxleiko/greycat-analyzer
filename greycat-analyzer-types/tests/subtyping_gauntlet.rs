@@ -224,8 +224,15 @@ fn rt_tuple_element_mismatch_rejected() {
 fn rt_cast_int_to_node_tags_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
-    for tag in ["node", "nodeTime", "nodeList", "nodeIndex", "nodeGeo"] {
-        let tagged = a.named(tag);
+    for (raw, tag) in [
+        (10u32, "node"),
+        (11, "nodeTime"),
+        (12, "nodeList"),
+        (13, "nodeIndex"),
+        (14, "nodeGeo"),
+    ] {
+        let tag_decl = TypeDeclId::from_raw(raw);
+        let tagged = a.alloc_type(tag_decl, tag);
         assert!(is_castable(&a, i, tagged), "int as {tag} should be allowed",);
     }
 }
@@ -373,9 +380,10 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
 // typed even when the source is nullable.
 
 #[test]
-fn rt_cast_nullable_named_to_non_nullable_named() {
+fn rt_cast_nullable_decl_to_non_nullable_decl() {
     let mut a = arena();
-    let foo = a.named("Foo");
+    let foo_decl = TypeDeclId::from_raw(20);
+    let foo = a.alloc_type(foo_decl, "Foo");
     let foo_q = a.nullable(foo);
     assert!(is_castable(&a, foo_q, foo));
 }
@@ -397,35 +405,13 @@ fn rt_cast_nullable_enum_shape_to_non_nullable_enum_shape() {
 }
 
 #[test]
-fn rt_cast_nullable_enum_to_named_with_same_name() {
-    // Runtime path for the `Map<String, PointType>.get(...) as PointType`
-    // probe: the source's stored kind may be Enum (when the type is
-    // pre-resolved through the analyzer) and the target may be the
-    // raw `Named{PointType}` shape that `is_castable` falls through to
-    // for cross-module-aware comparisons. Both directions of
-    // Named<->Enum equality must pass when names match, even with
-    // nullable source.
-    use greycat_analyzer_types::{Type, TypeKind};
-    let mut a = arena();
-    let enum_id = a.alloc(Type {
-        kind: TypeKind::Enum {
-            name: "PointType".into(),
-            variants: vec!["a".into()],
-        },
-        nullable: false,
-    });
-    let enum_q = a.nullable(enum_id);
-    let named = a.named("PointType");
-    assert!(is_castable(&a, enum_q, named));
-}
-
-#[test]
-fn rt_cast_non_nullable_path_still_works() {
+fn rt_cast_non_nullable_decl_to_self_still_works() {
     // Regression guard: the fallthrough strip kicks in *only* on a
     // nullable source. Non-nullable sources fall through to the
-    // standard `is_assignable_to` path; identical shapes (and the
-    // existing Named<->Named rule) must still pass.
+    // standard `is_assignable_to` path; identical decl-keyed shapes
+    // must still pass.
     let mut a = arena();
-    let foo = a.named("Foo");
+    let foo_decl = TypeDeclId::from_raw(21);
+    let foo = a.alloc_type(foo_decl, "Foo");
     assert!(is_castable(&a, foo, foo));
 }

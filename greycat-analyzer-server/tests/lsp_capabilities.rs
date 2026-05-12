@@ -876,8 +876,10 @@ fn completion_scope_excludes_later_locals() {
 fn completion_lists_runtime_types() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(user_uri.clone(), "fn main() {\n  A\n}\n", "p", false);
     let pa = ProjectAnalysis::analyze(&mgr);
     let cell = mgr.get(&user_uri).unwrap();
@@ -1160,8 +1162,10 @@ fn completion_inside_object_literal_lists_attrs() {
 fn completion_at_type_position_lists_types_only() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(
         user_uri.clone(),
         "type MyShape { x: int; }\nfn helper() {}\nfn use_() { var v: M = nil; }\n",
@@ -1504,9 +1508,11 @@ fn call_arg_type_mismatch_emits_diagnostic() {
 fn bare_type_ident_used_as_value_is_type() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(runtime_uri, "type Identity {}\n", "p", false);
     mgr.add_simple(
         user_uri.clone(),
@@ -1572,9 +1578,11 @@ fn qualified_static_call_infers_return_type() {
 fn qualified_static_method_ref_infers_function() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(
         runtime_uri,
         "type Identity { static native fn create(name: String, role: String): Identity; }\n",
@@ -1616,9 +1624,11 @@ fn qualified_static_method_ref_infers_function() {
 fn module_prefixed_type_ref_infers_type() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(runtime_uri, "type Identity { id: int; }\n", "p", false);
     mgr.add_simple(
         user_uri.clone(),
@@ -1651,9 +1661,11 @@ fn module_prefixed_type_ref_infers_type() {
 fn cross_module_static_method_ref_infers_function() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(
         runtime_uri,
         "type Identity { static native fn create(name: String, role: String): Identity; }\n",
@@ -1694,9 +1706,11 @@ fn cross_module_static_method_ref_infers_function() {
 fn cross_module_static_attr_ref_infers_field() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
+    let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
     let runtime_uri = Uri::from_str("file:///runtime.gcl").unwrap();
     let user_uri = Uri::from_str("file:///main.gcl").unwrap();
     let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
     mgr.add_simple(runtime_uri, "type Identity { id: int; }\n", "p", false);
     mgr.add_simple(
         user_uri.clone(),

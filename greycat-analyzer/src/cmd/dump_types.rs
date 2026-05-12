@@ -647,7 +647,10 @@ fn lower_type_ref_local(
                     None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else {
-                arena.named(name)
+                match handle {
+                    Some(h) => arena.alloc_type(h, name),
+                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                }
             }
         }
     };

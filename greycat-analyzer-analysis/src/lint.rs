@@ -1123,7 +1123,7 @@ fn emit_typed(
 }
 
 /// Extract the head name of `recv_ty` for `arrow-on-non-deref` dispatch.
-/// Strips top-level nullability and reduces `Named` / `Generic` /
+/// Strips top-level nullability and reduces `Type` / `Generic` /
 /// `Primitive` to their canonical name. Returns `None` for shapes the
 /// lint conservatively skips (any / never / null / lambda / tuple /
 /// anonymous / union / enum / generic-param).
@@ -1133,7 +1133,6 @@ fn receiver_head_name(
 ) -> Option<String> {
     let t = arena.get(ty);
     match &t.kind {
-        TypeKind::Named { name } => Some(name.to_string()),
         // P35.7 — `TypeKind::Type(handle)` / `Generic` recover
         // their decl name from the arena's parallel name table.
         TypeKind::Type(decl) => arena.decl_name(*decl).map(str::to_string),

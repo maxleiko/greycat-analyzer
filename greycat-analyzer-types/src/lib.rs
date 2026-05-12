@@ -5,10 +5,10 @@
 //! the `Type` enum, type interning, and subtyping rules.
 //!
 //! What's here:
-//! - [`Type`]: the central enum (primitives, named, generic, lambda, etc.)
+//! - [`Type`]: the central enum (primitives, decl-keyed types, generics, lambda, etc.)
 //! - [`TypeId`]: a `Copy` handle into the [`TypeArena`].
 //! - Primitive type ids (`null_t()`, `int_t()`, ...) for cheap comparisons.
-//! - [`TypeRegistry`]: holds per-module declared types so Named lookups
+//! - [`TypeRegistry`]: holds per-module declared types so lookups
 //!   work without walking the HIR every time.
 //! - Subtyping (`is_assignable_to`) covering the cases the analyzer needs
 //!   in primitive widening, null-into-nullable, generic invariance,
@@ -161,15 +161,6 @@ pub enum TypeKind {
     /// Named primitive — `int`, `float`, `String`, `bool`, `char`,
     /// `time`, `duration`, `geo`. Carries the canonical name.
     Primitive(Primitive),
-    /// **Deprecated** — being replaced by [`TypeKind::Type`] and
-    /// [`TypeKind::Unresolved`]. Retained while the migration lands
-    /// chunk by chunk.
-    ///
-    /// Named user / stdlib type, identified by its fully-qualified name
-    /// (`<lib>::<module>::<TypeName>` or just `<TypeName>` until we wire
-    /// fully-qualified resolution).
-    // P25.4 / P35
-    Named { name: SmolStr },
     // P35.2
     /// A resolved non-generic type — user-defined `type Foo {...}` or
     /// a non-generic native type from `std/core`. The decl handle is
@@ -381,13 +372,6 @@ impl TypeArena {
         })
     }
 
-    pub fn named(&mut self, name: impl Into<SmolStr>) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Named { name: name.into() },
-            nullable: false,
-        })
-    }
-
     // P35.2
     /// Allocate a resolved non-generic [`TypeKind::Type`]. Registers
     /// `name` with the arena so [`Self::display`] can render the type
@@ -516,8 +500,9 @@ impl TypeArena {
     /// route witnesses through an `InferenceTable`.
     ///
     /// Recurses through `Generic`, `Tuple`, `Lambda`, `Anonymous`, and
-    /// `Union` shapes. Non-substitutable kinds (`Named`, `Primitive`,
-    /// `Null`, `Any`, `Never`, `Enum`) return `ty` unchanged.
+    /// `Union` shapes. Non-substitutable kinds (`Type`, `Primitive`,
+    /// `Null`, `Any`, `Never`, `Enum`, `Unresolved`) return `ty`
+    /// unchanged.
     pub fn substitute(&mut self, ty: TypeId, subst: &FxHashMap<String, TypeId>) -> TypeId {
         if subst.is_empty() {
             return ty;
@@ -597,7 +582,7 @@ impl TypeArena {
 /// Looks up named types. / will populate this from HIR + stdlib.
 #[derive(Debug, Default)]
 pub struct TypeRegistry {
-    /// Maps simple type name -> a Named TypeId in the arena.
+    /// Maps simple type name -> a TypeId in the arena.
     // P25.2
     named: FxHashMap<SmolStr, TypeId>,
 }
@@ -694,11 +679,6 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
 
     match (&a.kind, &b.kind) {
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
-        // `(Named, Named)` arm removed: production paths now mint
-        // `Type(handle)` for every `.gcl`-declared type via
-        // `ProjectIndex::ingest`, so `Named` only survives for
-        // genuinely-unknown names — which `is_assignable_to`'s
-        // Unresolved arm already handles upstream.
         (TypeKind::Lambda(la), TypeKind::Lambda(lb)) => {
             // Contravariant in params, covariant in return. Same as TS.
             la.params.len() == lb.params.len()
@@ -718,17 +698,6 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             alts.iter().any(|b| is_assignable_to(arena, from, *b))
         }
         (TypeKind::Enum { name: na, .. }, TypeKind::Enum { name: nb, .. }) => na == nb,
-        // Cross-arena enum identity: when one side resolves to the
-        // registered `Enum { name, variants }` shape and the other
-        // crossed an arena boundary as a bare `Named { name }` (the
-        // post-pass mints param types via `mint_type_shape`, which
-        // produces `Named` for any non-builtin name without consulting
-        // the home module's registry), treat them as the same type
-        // when names agree. Otherwise an enum value flowing into an
-        // enum-typed slot lights up "value of type `Foo` is not
-        // assignable to parameter `_: Foo`" false positives.
-        (TypeKind::Enum { name: na, .. }, TypeKind::Named { name: nb })
-        | (TypeKind::Named { name: nb }, TypeKind::Enum { name: na, .. }) => na == nb,
         // P35.2 — decl-handle identity. `Type(decl)` and
         // `Generic { decl, .. }` compare by handle equality;
         // generic args follow runtime-oracle invariance with an
@@ -981,10 +950,10 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
     }
     // Re-implement the cheap kind-based dispatch from `is_assignable_to`
     // but skip the `a.nullable && !b.nullable` early-bail. The interesting
-    // shapes for cast-fallthrough are Named/Enum identity and primitive
-    // widening — broader generic / lambda compatibility is rare in the
-    // `as` position but we delegate to `is_assignable_to` after the
-    // shape match.
+    // shapes for cast-fallthrough are decl-handle / Enum identity and
+    // primitive widening — broader generic / lambda compatibility is
+    // rare in the `as` position but we delegate to `is_assignable_to`
+    // after the shape match.
     let to_t = arena.get(to);
     if matches!(from_t.kind, TypeKind::Null) {
         return to_t.nullable;
@@ -996,14 +965,8 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
         return true;
     }
     match (&from_t.kind, &to_t.kind) {
-        (TypeKind::Named { name: na }, TypeKind::Named { name: nb }) if na == nb => true,
+        (TypeKind::Type(da), TypeKind::Type(db)) if da == db => true,
         (TypeKind::Enum { name: na, .. }, TypeKind::Enum { name: nb, .. }) if na == nb => true,
-        (TypeKind::Named { name: na }, TypeKind::Enum { name: nb, .. })
-        | (TypeKind::Enum { name: na, .. }, TypeKind::Named { name: nb })
-            if na == nb =>
-        {
-            true
-        }
         (TypeKind::Primitive(pa), TypeKind::Primitive(pb)) => primitive_assignable(*pa, *pb),
         _ => false,
     }
@@ -1011,7 +974,6 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
 
 fn generic_or_named_name(arena: &TypeArena, t: &Type) -> Option<SmolStr> {
     match &t.kind {
-        TypeKind::Named { name } => Some(name.clone()),
         // P35.2 — decl-keyed shapes recover their name from the arena's
         // parallel decl-names table.
         TypeKind::Type(d) => arena.decl_name(*d).map(SmolStr::from),
@@ -1073,7 +1035,6 @@ fn write_type(f: &mut std::fmt::Formatter<'_>, arena: &TypeArena, id: TypeId) ->
         TypeKind::Any => f.write_str("any")?,
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
-        TypeKind::Named { name } => f.write_str(name.as_str())?,
         TypeKind::Type(d) => match arena.decl_name(*d) {
             Some(name) => f.write_str(name)?,
             None => write!(f, "?type#{}", d.raw())?,
@@ -1150,7 +1111,7 @@ fn write_args(
 /// printer (e.g. `core::int`, `core::Array<core::int?>`,
 /// `project::Foo`).
 ///
-/// `home_lib` resolves a Named/Generic/Enum's home module (e.g. `Foo →
+/// `home_lib` resolves a Type/Generic/Enum's home module (e.g. `Foo →
 /// "project"`, `node → "core"`). Returning `None` falls back to the
 /// `core` library — matches the TS reference's behavior for builtins
 /// not in the project decl table.
@@ -1176,14 +1137,9 @@ pub fn display_fqn(
         TypeKind::Any => "core::any".to_string(),
         TypeKind::Never => "core::never".to_string(),
         TypeKind::Primitive(p) => format!("core::{}", p.name()),
-        TypeKind::Named { name } => format!(
-            "{}::{}",
-            home_lib(name.as_str()).unwrap_or_else(|| "core".to_string()),
-            name
-        ),
         // P35.2 — decl names come from the arena (registered at alloc
-        // time). `home_lib` is still threaded for the legacy `Named`
-        // shape where the name isn't keyed by a decl handle.
+        // time). `home_lib` resolves the home library for each decl
+        // by name.
         TypeKind::Type(d) => match arena.decl_name(*d) {
             Some(name) => format!(
                 "{}::{}",
@@ -1279,21 +1235,13 @@ mod tests {
     /// keys on `Type` (which derives Hash + Eq), so two equivalent
     /// `Type` values constructed via different name-source paths must
     /// hash and compare equal. `SmolStr::hash` and `String::hash` both
-    /// delegate to `str::hash`, so `arena.named("Foo")` from a
-    /// `String`-flavoured callsite (`String::from("Foo").into()`) and
-    /// from a `SmolStr`-flavoured callsite (`SmolStr::from("Foo")`)
-    /// must collapse to the same TypeId. This test anchors that
-    /// invariant so a future refactor that accidentally introduces a
-    /// hashing-asymmetric variant gets caught.
+    /// delegate to `str::hash`, so generic instantiations minted from
+    /// a `String`-flavoured callsite (`String::from("Array").into()`)
+    /// and from a `SmolStr`-flavoured callsite (`SmolStr::from("Array")`)
+    /// must collapse to the same TypeId.
     #[test]
     fn typekind_name_dedups_across_smolstr_and_string_paths() {
         let mut a = fresh();
-        let from_string = a.named(String::from("Foo"));
-        let from_smol = a.named(SmolStr::from("Foo"));
-        let from_str = a.named("Foo");
-        assert_eq!(from_string, from_smol);
-        assert_eq!(from_smol, from_str);
-
         let arg_string = a.primitive(Primitive::Int);
         let array_decl = TypeDeclId::from_raw(0);
         let g_a = a.generic(array_decl, String::from("Array"), vec![arg_string]);
@@ -1445,7 +1393,8 @@ mod tests {
     fn registry_lookup() {
         let mut a = fresh();
         let mut reg = TypeRegistry::new();
-        let foo = a.named("Foo");
+        let foo_decl = TypeDeclId::from_raw(0);
+        let foo = a.alloc_type(foo_decl, "Foo");
         reg.register("Foo", foo);
         assert_eq!(reg.lookup("Foo"), Some(foo));
         assert!(reg.lookup("Bar").is_none());
@@ -1487,7 +1436,8 @@ mod tests {
         // args[0] assigns to to` rule into `is_assignable_to`; the
         // runtime oracle disagreed.
         let mut a = fresh();
-        let person = a.named("Person");
+        let person_decl = TypeDeclId::from_raw(1);
+        let person = a.alloc_type(person_decl, "Person");
         let node_decl = TypeDeclId::from_raw(0);
         let node_person = a.generic(node_decl, "node", vec![person]);
         assert!(!is_assignable_to(&a, node_person, person));

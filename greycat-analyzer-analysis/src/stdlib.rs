@@ -106,10 +106,12 @@ pub struct ProjectIndex {
     /// global / module name the analyzer looks up across modules.
     pub symbols: SymbolTable,
     /// Set of [`Symbol`]s the analyzer recognises as a *type* name:
-    /// every primitive, every runtime-implemented type
-    /// ([`BUILTIN_RUNTIME_TYPES`]), and every `type` / `enum` decl
-    /// ingested from a `.gcl` file. Drives [`Self::has_name`] and the
-    /// signature-cache fingerprint ([`project_name_set_hash`]).
+    /// every primitive plus every `type` / `enum` / `native type`
+    /// decl ingested from a `.gcl` file (the runtime-implemented
+    /// types all have `native type` decls in `lib/std/core.gcl` and
+    /// land here through the normal ingest path). Drives
+    /// [`Self::has_name`] and the signature-cache fingerprint
+    /// ([`project_name_set_hash`]).
     pub type_names: FxHashSet<Symbol>,
     pub natives: NativeRegistry,
     /// Top-level value-position names from every ingested module —
@@ -1097,23 +1099,20 @@ pub fn module_name_from_uri(uri: &Uri) -> Option<String> {
 }
 
 /// Names the analyzer treats as known without an `.gcl` declaration in
-/// scope: the GreyCat primitives plus the runtime-implemented types
-/// (collections, node tags, function/tuple/field markers). Seeded
-/// straight into the project's [`SymbolTable`] + `type_names` set so
-/// the resolver's "is this a known type?" fallback and
-/// `lower_type_ref*`'s `arena.named` / primitive minting paths both
-/// recognise them. No `TypeArena` writes — `seed_builtins`
-/// (in `project.rs`) is the canonical seed for primitive TypeIds, and
-/// `arena.named("Array")` is intern-by-value so a caller can mint the
-/// runtime-type shape on demand without needing a pre-allocated
-/// `TypeId` here.
+/// scope: the GreyCat primitives. Seeded straight into the project's
+/// [`SymbolTable`] + `type_names` set so the resolver's "is this a
+/// known type?" fallback and `lower_type_ref*`'s primitive minting
+/// paths both recognise them. No `TypeArena` writes — `seed_builtins`
+/// (in `project.rs`) is the canonical seed for primitive TypeIds.
+///
+/// Runtime-implemented types (collections, node tags,
+/// `function` / `type` / `field` markers) are no longer seeded here:
+/// they all have `native type` decls in `lib/std/core.gcl` and land
+/// in `type_names` through the normal stdlib ingest path.
 fn seed_builtin_names(symbols: &mut SymbolTable, type_names: &mut FxHashSet<Symbol>) {
-    for &name in [
+    for &name in &[
         "bool", "int", "float", "char", "String", "time", "duration", "geo", "any", "null",
-    ]
-    .iter()
-    .chain(BUILTIN_RUNTIME_TYPES.iter())
-    {
+    ] {
         let sym = symbols.intern(name);
         type_names.insert(sym);
     }
@@ -1127,32 +1126,6 @@ fn seed_builtin_names(symbols: &mut SymbolTable, type_names: &mut FxHashSet<Symb
 /// confirmed against `greycat run`.
 pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
     &[("Infinity", Primitive::Float), ("NaN", Primitive::Float)];
-
-/// Type names whose declaration lives in the GreyCat runtime, not in
-/// any `.gcl` file. The resolver treats a hit against this list as
-/// "definitely a type name." With stdlib ingested, every entry here
-/// also has a `.gcl` decl in `lib/std/core.gcl` (`native type Array
-/// {}`, …) and resolves through the normal decl_registry path; this
-/// list survives only as a fallback that lets the resolver answer
-/// `has_name("Array")` truthfully in unit tests that don't load
-/// stdlib.
-///
-/// Vestigial entries (`Set`, `tuple`, `t2`-`t4`, `t2f`-`t4f`) were
-/// removed: GreyCat has no `Set` runtime type, tuple literals desugar
-/// to `core::Tuple<T, U>`, and the `t<n>` / `t<n>f` names aren't
-/// user-writable syntax — they only appeared on stale dispatch arms.
-pub const BUILTIN_RUNTIME_TYPES: &[&str] = &[
-    "Array",
-    "Map",
-    "node",
-    "nodeTime",
-    "nodeGeo",
-    "nodeList",
-    "nodeIndex",
-    "function",
-    "type",
-    "field",
-];
 
 // P13.5
 /// Read `@iterable` / `@deref` / `@primitive` annotations on a

@@ -69,10 +69,12 @@ pub enum Definition {
     /// resolver picks the first; lib/include-aware disambiguation
     /// rides on later phases.
     ProjectDecl { uri: Uri, decl: Idx<Decl> },
-    /// A name the project knows but that has no `.gcl` decl: runtime-
-    /// implemented types (`Array`, `Map`, `Set`, `node*`, `function`,
-    /// `tuple`, `field`, `t2`-`t4f`), language primitives by name, and
-    /// native fn signatures.
+    /// A name the project knows but that has no `.gcl` decl in
+    /// `decl_locations`: language primitives by name, native fn
+    /// signatures, runtime globals (`Infinity`, `NaN`). Runtime
+    /// types like `Array` / `Map` / `node` are no longer in this
+    /// bucket — they have `native type` decls in `lib/std/core.gcl`
+    /// and resolve through `ProjectDecl` once stdlib is loaded.
     Project,
 }
 
@@ -356,12 +358,12 @@ impl<'a> Cx<'a> {
 
 /// Run name resolution against `hir` with no cross-module context — the
 /// fallback index is just [`ProjectIndex::new`], which knows the
-/// language primitives and runtime-implemented type names but no
-/// user-declared decls. Per-file callers (tests, per-request
-/// capabilities) use this; the project pipeline uses
-/// [`resolve_with_index_for`] so cross-module names also resolve and
-/// the current module's own entries are excluded from the global
-/// public-lookup tier.
+/// language primitives but no user-declared decls and no runtime
+/// types (those come through the stdlib `.gcl` ingest). Per-file
+/// callers (tests, per-request capabilities) use this; the project
+/// pipeline uses [`resolve_with_index_for`] so cross-module names
+/// also resolve and the current module's own entries are excluded
+/// from the global public-lookup tier.
 pub fn resolve(hir: &Hir) -> Resolutions {
     let mut arena = greycat_analyzer_types::TypeArena::new();
     let index = ProjectIndex::new(&mut arena);
@@ -796,11 +798,13 @@ mod tests {
 
     #[test]
     fn forward_ref_to_type_in_nested_generic_param() {
-        // P14.9 regression: `type T { paths: Map<String, Inner>?; }`
-        // followed by `type Inner {}` — the forward reference to
-        // `Inner` in the second generic-param slot should resolve via
-        // the two-pass module-scope seed.
-        let src = "type T { paths: Map<String, Inner>?; }\ntype Inner {}\n";
+        // P14.9 regression: `type T { paths: Wrap<String, Inner>?; }`
+        // followed by `type Inner {}` and `type Wrap<K, V> {}` — the
+        // forward reference to `Inner` in the second generic-param
+        // slot should resolve via the two-pass module-scope seed.
+        // Uses a local `Wrap` rather than the runtime `Map` so the
+        // per-file resolver (no stdlib ingest) recognises the head.
+        let src = "type T { paths: Wrap<String, Inner>?; }\ntype Inner {}\ntype Wrap<K, V> {}\n";
         let (hir, res) = analyze(src);
         let inner_uses: Vec<_> = hir
             .idents
@@ -1004,7 +1008,10 @@ fn f(p: Foo): Foo { return p; }
     /// non-existent `name` field returned `None`).
     #[test]
     fn for_in_tuple_form_binds_both_params() {
-        let src = "fn f(xs: Array<int>) { for (i, x in xs) { var s = i + x; } }\n";
+        // `Xs` is a local type so the per-file resolver (no stdlib
+        // ingest) can still recognise the iterator's type — runtime
+        // types like `Array` only land in scope through stdlib.
+        let src = "type Xs {}\nfn f(xs: Xs) { for (i, x in xs) { var s = i + x; } }\n";
         let (hir, res) = analyze(src);
         for name in ["i", "x"] {
             let uses: Vec<_> = hir
@@ -1055,24 +1062,13 @@ fn f(p: Foo): Foo { return p; }
         assert!(res.unresolved.is_empty(), "no idents should be unresolved");
     }
 
-    #[test]
-    fn project_index_fallback_keeps_unit_project_for_runtime_types() {
-        // `Array` / `Map` / `node` etc. are seeded into the project
-        // index by name but have no `.gcl` decl. They should still
-        // resolve — to the unit `Project` placeholder, not ProjectDecl.
-        let src = "fn f(a: Array<int>) {}\n";
-        let tree = parse(src);
-        let hir = lower_module(src, "m", "p", tree.root_node());
-        let mut arena = greycat_analyzer_types::TypeArena::new();
-        let idx = crate::stdlib::ProjectIndex::new(&mut arena);
-        let res = resolve_with_index(&hir, &idx);
-        let array_uses: Vec<_> = hir
-            .idents
-            .iter()
-            .filter(|(_, i)| i.text == "Array")
-            .filter_map(|(idx, _)| res.uses.get(&idx))
-            .collect();
-        assert_eq!(array_uses.len(), 1);
-        assert!(matches!(array_uses[0], Definition::Project));
-    }
+    // P35.8 removed `project_index_fallback_keeps_unit_project_for_runtime_types`:
+    // the previous behavior seeded runtime-type names (`Array`, `Map`,
+    // `node`, …) into `type_names` without an `.gcl` decl, so the
+    // resolver answered `Definition::Project` for them in unit tests
+    // that skipped stdlib ingest. After the seeding list was deleted,
+    // those names only become known when stdlib is loaded — the
+    // `ProjectDecl` answer is then richer than `Project`. Coverage
+    // for the cross-module fallback lives in
+    // `project_index_fallback_resolves_cross_module_name`.
 }

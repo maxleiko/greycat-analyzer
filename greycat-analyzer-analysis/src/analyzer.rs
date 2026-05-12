@@ -730,18 +730,16 @@ struct Cx<'a> {
     /// Project-wide well-known std/core decl handles. Per-file
     /// callers pass a default-constructed (all-`None`) instance; the
     /// project pipeline passes its populated `&self.well_known`.
-    /// Consumed by callers that previously minted
-    /// `arena.named("function")` / `"type"` / `"field"` sentinels —
-    /// now they mint `arena.alloc_type(well_known.X_decl)` when the
-    /// slot is populated, falling back to `arena.any()` when std
+    /// Consumed by `function_ty()` / `type_ty()` / `field_ty()` which
+    /// mint `arena.alloc_type(well_known.X_decl)` when the slot is
+    /// populated, falling back to `arena.unresolved(...)` when std
     /// hasn't loaded.
     well_known: &'a crate::well_known::WellKnown,
     // P35.7
-    /// Project-wide decl handle registry. Used by sites that
-    /// previously minted `arena.named(name)` for resolved foreign
-    /// types — now they look up `decl_registry.lookup(uri, idx)` and
-    /// mint `arena.alloc_type(handle)`. Per-file callers pass an
-    /// empty registry; the legacy `Named` fallback kicks in.
+    /// Project-wide decl handle registry. Used by sites that resolve
+    /// foreign types — they look up `decl_registry.lookup(uri, idx)`
+    /// and mint `arena.alloc_type(handle)`. Per-file callers pass an
+    /// empty registry; sites then fall back to `Unresolved`.
     decl_registry: &'a crate::well_known::DeclRegistry,
     /// Null-flow narrowing stack. Each frame is a binding ident
     /// → temporary `TypeId` override. Frames are pushed on block /
@@ -1094,25 +1092,24 @@ impl<'a> Cx<'a> {
     fn function_ty(&mut self) -> TypeId {
         match self.well_known.function_decl {
             Some(d) => self.arena.alloc_type(d, "function"),
-            // Transitional fallback: when std isn't loaded, mint the
-            // legacy `Named { name: "function" }` shape so existing
-            // tests / display callers see the same "function" string
-            // they used to. Removed in 35.8 along with `Named`
-            // itself — by then either tests load a minimal std stub
-            // or assert against `well_known.function_decl` directly.
-            None => self.arena.named("function"),
+            // P35.8 — when std isn't loaded, the runtime sentinel
+            // names (`function` / `type` / `field`) have no decl
+            // handle. Mint `Unresolved` so display still renders the
+            // name verbatim and assignability behaves like `any?`
+            // (no cascading diagnostics).
+            None => self.arena.unresolved("function", (0, 0)),
         }
     }
     fn type_ty(&mut self) -> TypeId {
         match self.well_known.type_decl {
             Some(d) => self.arena.alloc_type(d, "type"),
-            None => self.arena.named("type"),
+            None => self.arena.unresolved("type", (0, 0)),
         }
     }
     fn field_ty(&mut self) -> TypeId {
         match self.well_known.field_decl {
             Some(d) => self.arena.alloc_type(d, "field"),
-            None => self.arena.named("field"),
+            None => self.arena.unresolved("field", (0, 0)),
         }
     }
     fn record(&mut self, expr: Idx<Expr>, ty: TypeId) {
@@ -1392,7 +1389,6 @@ impl<'a> Cx<'a> {
     ) {
         let ty = self.arena.get(recv_ty);
         let type_name: Option<SmolStr> = match &ty.kind {
-            TypeKind::Named { name } => Some(name.clone()),
             // P35.7 — handle-keyed variants read the name from the
             // arena's parallel decl-names table.
             TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
@@ -1616,7 +1612,6 @@ impl<'a> Cx<'a> {
         };
         let recv = self.arena.get(lookup_ty).clone();
         let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match recv.kind {
-            TypeKind::Named { name } => (name, Vec::new()),
             TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
             // P35.7 — handle-keyed variants: resolve back to the
             // decl name via the arena's decl-names table so the
@@ -1734,7 +1729,6 @@ impl<'a> Cx<'a> {
             // receiver's type. The receiver is the `Type::` part
             // of the static expr; we have its lowered TypeId.
             let owner_name: Option<SmolStr> = match &self.arena.get(recv_ty).kind {
-                TypeKind::Named { name } => Some(name.clone()),
                 TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
                 TypeKind::Generic { decl, .. } => self.arena.decl_name(*decl).map(SmolStr::from),
                 TypeKind::Enum { name, .. } => Some(name.clone()),
@@ -1863,7 +1857,6 @@ impl<'a> Cx<'a> {
         // mutable for `substitute`).
         let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match &self.arena.get(recv_ty).kind
         {
-            TypeKind::Named { name } => (name.clone(), Vec::new()),
             // P35.7 — handle-keyed variants.
             TypeKind::Type(d) => match self.arena.decl_name(*d) {
                 Some(n) => (n.into(), Vec::new()),
@@ -2328,13 +2321,13 @@ impl<'a> Cx<'a> {
         let this_ty = if d.generics.is_empty() {
             // P35.7 — reuse whatever `register_module_types` minted
             // for this decl (a `Type(handle)` when the registry has
-            // it, the legacy `Named{name}` otherwise). Avoids
-            // re-minting and keeps `this` and outside references
-            // pointing at the same `TypeId`.
-            self.out
-                .registry
-                .lookup(&type_name)
-                .unwrap_or_else(|| self.arena.named(type_name))
+            // it, otherwise an `Unresolved` sink). Avoids re-minting
+            // and keeps `this` and outside references pointing at
+            // the same `TypeId`.
+            self.out.registry.lookup(&type_name).unwrap_or_else(|| {
+                let span = self.hir.idents[d.name].byte_range.clone();
+                self.arena.unresolved(type_name, (span.start, span.end))
+            })
         } else {
             let args: Vec<TypeId> = d
                 .generics
@@ -2890,7 +2883,15 @@ impl<'a> Cx<'a> {
                         .map(|n| (SmolStr::from(n), args.to_vec())),
                     _ => None,
                 };
-                let inferred: Vec<TypeId> = match (generic_name_and_args, &underlying_kind) {
+                // **P19.15** — bare (raw) collection forms with no
+                // generic args lower to `Type(decl)` rather than
+                // `Generic`. Recover the name so the no-args
+                // fallback arms still fire for the collection set.
+                let non_generic_name: Option<SmolStr> = match &underlying_kind {
+                    TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
+                    _ => None,
+                };
+                let inferred: Vec<TypeId> = match (generic_name_and_args, non_generic_name) {
                     (Some((name, args)), _)
                         if name == "Array" || name == "Set" || name == "nodeList" =>
                     {
@@ -2930,7 +2931,7 @@ impl<'a> Cx<'a> {
                     // generic args declared) bind keys but the
                     // value type stays `any` because the element
                     // type is unknown.
-                    (_, TypeKind::Named { name })
+                    (_, Some(name))
                         if matches!(
                             name.as_str(),
                             "Array" | "Set" | "nodeList" | "nodeTime" | "nodeGeo"
@@ -2947,9 +2948,7 @@ impl<'a> Cx<'a> {
                             vec![any_id; params.len()]
                         }
                     }
-                    (_, TypeKind::Named { name })
-                        if matches!(name.as_str(), "Map" | "nodeIndex") =>
-                    {
+                    (_, Some(name)) if matches!(name.as_str(), "Map" | "nodeIndex") => {
                         vec![any_id; params.len()]
                     }
                     _ => vec![any_id; params.len()],
@@ -3887,13 +3886,10 @@ impl<'a> Cx<'a> {
                     let from_kind = &self.arena.get(from_ty).kind;
                     let to_kind = &self.arena.get(to_ty).kind;
                     // P36.3 — handle-keyed shapes resolve their name
-                    // via the arena's decl-names table; legacy `Named`
-                    // / `Generic` shapes still flow through their
-                    // inline name.
+                    // via the arena's decl-names table.
                     let arena = &*self.arena;
                     let extract_name = |k: &TypeKind| -> Option<SmolStr> {
                         match k {
-                            TypeKind::Named { name } => Some(name.clone()),
                             TypeKind::Type(d) => arena.decl_name(*d).map(SmolStr::from),
                             TypeKind::Generic { decl, .. } => {
                                 arena.decl_name(*decl).map(SmolStr::from)
@@ -4661,7 +4657,12 @@ fn f(x: Foo): String { return x.s; }
     /// `function`-typed (gcl's first-class function type).
     #[test]
     fn member_method_ref_types_as_function() {
+        // `function` is a runtime type — declared as `native type
+        // function` in `lib/std/core.gcl`. The per-file resolver
+        // (no stdlib ingest) needs an inline declaration so the
+        // name resolves.
         let src = r#"
+native type function {}
 type Foo { fn run(): int { return 0; } }
 fn caller(x: Foo): function { return x.run; }
 "#;
