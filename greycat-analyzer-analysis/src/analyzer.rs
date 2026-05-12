@@ -3150,7 +3150,15 @@ impl<'a> Cx<'a> {
                     let name = self.ident_text(idx);
                     if let Some(var_ty) = self.index.var_type_for(name) {
                         var_ty
-                    } else if self.index.contains_fn_signature(name) {
+                    } else if self.index.contains_fn_signature(name)
+                        || self.index.contains_non_native_fn(name)
+                    {
+                        // P38.1 — native fns live in `fn_signatures`,
+                        // non-native (user / stdlib `.gcl`) fns in
+                        // `non_native_fn_names`. Both shapes are
+                        // `function`-typed values when referenced
+                        // bare; only the `type_ty()` fallback below
+                        // remains for genuine type / enum names.
                         self.function_ty()
                     } else if self.index.contains_type_member(name) || self.index.has_name(name) {
                         self.type_ty()

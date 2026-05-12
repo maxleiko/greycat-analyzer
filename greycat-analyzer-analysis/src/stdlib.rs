@@ -107,6 +107,17 @@ pub struct ProjectIndex {
     /// project?" without needing the cross-module decl pointer
     /// (a later deliverable).
     pub values: FxHashSet<Symbol>,
+    // P38.1
+    /// Names of non-native top-level `fn` declarations from every
+    /// ingested module. Subset of `values` — `values` also contains
+    /// top-level `var` names with no way to distinguish them from
+    /// non-native fns by membership alone. Lets the analyzer's
+    /// `Definition::ProjectDecl` value-typing arm route bare fn
+    /// idents to `function_ty()` instead of falling through to
+    /// `type_ty()` via `has_name`. Natives stay in `fn_signatures`
+    /// (which carries the lowered signature) — this set is for the
+    /// "decl exists, type as `function`" question, nothing more.
+    pub non_native_fn_names: FxHashSet<Symbol>,
     /// Cross-module decl table: name → every `(Uri, Idx<Decl>)`
     /// pair that introduces a top-level decl with this name across the
     /// project. Collisions are kept; disambiguation happens at the use
@@ -686,6 +697,17 @@ impl ProjectIndex {
             .lookup(name)
             .is_some_and(|s| self.fn_signatures.contains_key(&s))
     }
+    // P38.1
+    /// `true` iff `name` was ingested as a non-native top-level `fn`
+    /// in any module. Distinct from [`Self::contains_fn_signature`]
+    /// (natives only). Lets the analyzer's `Definition::ProjectDecl`
+    /// value-typing arm produce `function` for cross-module bare fn
+    /// idents without first walking the foreign HIR.
+    pub fn contains_non_native_fn(&self, name: &str) -> bool {
+        self.symbols
+            .lookup(name)
+            .is_some_and(|s| self.non_native_fn_names.contains(&s))
+    }
 
     /// Walk a HIR module's top-level decls and register everything that's
     /// a type-name (type / enum) or a native function, recording each
@@ -843,6 +865,12 @@ impl ProjectIndex {
                         self.natives.register(name_sym, sig);
                     } else {
                         self.values.insert(name_sym);
+                        // P38.1 — tag non-native fn names so the
+                        // analyzer's `Definition::ProjectDecl`
+                        // value-typing arm can route them to
+                        // `function_ty()` instead of falling through
+                        // to `type_ty()` via `has_name`.
+                        self.non_native_fn_names.insert(name_sym);
                     }
                     self.record_decl_location(name_sym, uri, *decl_id);
                     Some(&fnd.modifiers)
