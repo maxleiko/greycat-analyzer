@@ -114,21 +114,44 @@ impl Scope {
 
 struct Cx<'a> {
     hir: &'a Hir,
+    // P38.3 — module-scope bindings split by visibility. `module_public`
+    // participates in normal bare-name lookup (first-tier, alongside
+    // nested scopes); `module_private` is a LAST-RESORT fallback,
+    // consulted only after the global-public lookup misses. See the
+    // commentary in `record_use` for the runtime-conformance rationale.
+    /// Module-level decls without a `private` modifier.
+    module_public: FxHashMap<String, Definition>,
+    /// Module-level decls with a `private` modifier.
+    module_private: FxHashMap<String, Definition>,
+    /// Nested lexical scopes (fn / type / block / loop / try / catch).
+    /// The module-level scope is *not* held here — see
+    /// `module_public` / `module_private` above.
     scopes: Vec<Scope>,
     // P6.1 — project pipeline passes the rebuilt index.
     /// Project-level fallback for names that miss every local scope.
     /// Per-file callers pass an empty [`ProjectIndex::new`]; the project
     /// pipeline passes the index it just rebuilt.
     index: &'a ProjectIndex,
+    // P38.3 — current module's URI, when known. The project pipeline
+    // passes the module's URI through; per-file callers (tests, lint
+    // pipeline without project context) pass `None`. Lets the global-
+    // public lookup filter out the current module's own entries from
+    // `ProjectIndex::locate_decl` so a same-module private decl
+    // doesn't accidentally win at step 2 (it should reach the
+    // last-resort step 3 instead).
+    current_uri: Option<&'a Uri>,
     res: Resolutions,
 }
 
 impl<'a> Cx<'a> {
-    fn new(hir: &'a Hir, index: &'a ProjectIndex) -> Self {
+    fn new(hir: &'a Hir, index: &'a ProjectIndex, current_uri: Option<&'a Uri>) -> Self {
         Self {
             hir,
-            scopes: vec![Scope::default()],
+            module_public: FxHashMap::default(),
+            module_private: FxHashMap::default(),
+            scopes: Vec::new(),
             index,
+            current_uri,
             res: Resolutions::default(),
         }
     }
@@ -143,16 +166,22 @@ impl<'a> Cx<'a> {
     fn current_mut(&mut self) -> &mut Scope {
         self.scopes
             .last_mut()
-            .expect("at least one scope is always live")
+            .expect("at least one nested scope is live (push_scope must precede insert)")
     }
 
-    fn lookup_local(&self, name: &str) -> Option<Definition> {
+    // P38.3 — first-tier lookup: nested scopes (params / locals /
+    // generics / for-in bindings / catch params) innermost-first,
+    // falling through to module-level *public* decls. Module-level
+    // private decls are NOT consulted here — they live in
+    // `module_private` and are reached only via the last-resort
+    // fallback in `record_use`.
+    fn lookup_nested_or_public(&self, name: &str) -> Option<Definition> {
         for scope in self.scopes.iter().rev() {
             if let Some(d) = scope.names.get(name) {
                 return Some(d.clone());
             }
         }
-        None
+        self.module_public.get(name).cloned()
     }
 
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
@@ -161,7 +190,34 @@ impl<'a> Cx<'a> {
 
     fn record_use(&mut self, idx: Idx<Ident>) {
         let name = self.ident_text(idx).to_string();
-        if let Some(def) = self.lookup_local(&name) {
+        // P38.3 — Bare-name resolution order matches the GreyCat
+        // runtime oracle (8.0.291-dev), validated against
+        // `greycat build` on a multi-module project. The order is:
+        //
+        //   1. Non-module scopes + module-level PUBLIC decls.
+        //   2. Global PUBLIC across the project closure
+        //      (`ProjectIndex::locate_decl`). Multiple hits collapse to
+        //      *unresolved* — 38.4 emits the helpful diagnostic naming
+        //      each candidate; the runtime reports plain "unresolved
+        //      function: <name>" and we surface the modules with FQN
+        //      quick-fixes, but the severity stays Error.
+        //   3. Module-level PRIVATE decls — LAST-RESORT FALLBACK.
+        //   4. `Project` placeholder (runtime-implemented types,
+        //      primitives by name, native fns), known module names
+        //      (left segment of a `module::Decl` chain), or unresolved.
+        //
+        // We intentionally match the runtime even though step 3 is
+        // design-questionable: a local PUBLIC same-named decl WILL
+        // shadow a remote public (step 1 wins), but a local PRIVATE
+        // same-named decl will NOT shadow it (step 2 fires before
+        // step 3). The asymmetry would surprise most language
+        // designers — most expect "module-local first, regardless of
+        // visibility." We doubted this choice loudly before
+        // implementing it; the runtime is the oracle and we conform.
+        // If the runtime ever flips the order to "local-private
+        // shadows remote-public," this is the single place to swap
+        // steps 2 and 3.
+        if let Some(def) = self.lookup_nested_or_public(&name) {
             // P6.7: bump the reverse-reference count for top-level decls.
             if let Definition::Decl(decl_id) = &def {
                 *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
@@ -176,7 +232,18 @@ impl<'a> Cx<'a> {
         // that the project knows but that have no `.gcl` decl
         // (runtime types, primitives by name, native fns) fall through
         // to the unit `Project` variant below.
-        if let Some((uri, decl)) = self.index.locate_decl(&name).first() {
+        //
+        // P38.3 — filter out the current module's own entries.
+        // `decl_locations` indexes EVERY decl ingested (public AND
+        // private — the FQN form `module::private_sym` needs them
+        // there, see probe p5). So a same-module private decl would
+        // otherwise win at step 2; we want step 3 to catch it instead.
+        let cross_module_hit = self
+            .index
+            .locate_decl(&name)
+            .iter()
+            .find(|(uri, _)| self.current_uri.map(|cur| uri != cur).unwrap_or(true));
+        if let Some((uri, decl)) = cross_module_hit {
             self.res.uses.insert(
                 idx,
                 Definition::ProjectDecl {
@@ -184,6 +251,18 @@ impl<'a> Cx<'a> {
                     decl: *decl,
                 },
             );
+            return;
+        }
+        // P38.3 — module-private last-resort fallback. Reached only
+        // when both step 1 (nested + module-public) and step 2 (global
+        // public) missed. A local `private` decl shadows nothing
+        // outside its module; inside its module it's reachable only
+        // when no public match exists anywhere.
+        if let Some(def) = self.module_private.get(&name).cloned() {
+            if let Definition::Decl(decl_id) = &def {
+                *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
+            }
+            self.res.uses.insert(idx, def);
             return;
         }
         if self.index.has_name(&name) {
@@ -207,22 +286,37 @@ impl<'a> Cx<'a> {
 /// language primitives and runtime-implemented type names but no
 /// user-declared decls. Per-file callers (tests, per-request
 /// capabilities) use this; the project pipeline uses
-/// [`resolve_with_index`] so cross-module names also resolve.
+/// [`resolve_with_index_for`] so cross-module names also resolve and
+/// the current module's own entries are excluded from the global
+/// public-lookup tier.
 pub fn resolve(hir: &Hir) -> Resolutions {
     let index = ProjectIndex::new();
-    resolve_inner(hir, &index)
+    resolve_inner(hir, &index, None)
 }
 
 // P6.2
 /// Run name resolution against `hir`, falling back to `index` for names
-/// that aren't satisfied by any local scope. Entry point used by
-/// the project pipeline.
+/// that aren't satisfied by any local scope. Project-pipeline callers
+/// should prefer [`resolve_with_index_for`] so the current module's
+/// own decls can be filtered out of the global-public lookup; this
+/// shim survives for callers that don't have a URI handy.
 pub fn resolve_with_index(hir: &Hir, index: &ProjectIndex) -> Resolutions {
-    resolve_inner(hir, index)
+    resolve_inner(hir, index, None)
 }
 
-fn resolve_inner(hir: &Hir, index: &ProjectIndex) -> Resolutions {
-    let mut cx = Cx::new(hir, index);
+// P38.3
+/// Run name resolution with both cross-module context and the
+/// current module's URI. The URI lets the global-public lookup at
+/// step 2 of `record_use` skip entries declared in the current
+/// module, so same-module private decls fall through to the
+/// last-resort step 3 instead of accidentally binding to themselves
+/// via `ProjectDecl`.
+pub fn resolve_with_index_for(hir: &Hir, index: &ProjectIndex, current_uri: &Uri) -> Resolutions {
+    resolve_inner(hir, index, Some(current_uri))
+}
+
+fn resolve_inner(hir: &Hir, index: &ProjectIndex, current_uri: Option<&Uri>) -> Resolutions {
+    let mut cx = Cx::new(hir, index, current_uri);
 
     let Some(module) = hir.module.as_ref() else {
         return cx.res;
@@ -246,7 +340,30 @@ fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
         return;
     };
     let name = cx.ident_text(name_id).to_string();
-    cx.current_mut().insert(name, Definition::Decl(decl_id));
+    // P38.3 — route on visibility. Public decls join the first-tier
+    // lookup namespace alongside nested scopes; private decls go to
+    // the last-resort fallback table. See the order doctrine in
+    // `record_use`.
+    if decl_is_private(decl) {
+        cx.module_private.insert(name, Definition::Decl(decl_id));
+    } else {
+        cx.module_public.insert(name, Definition::Decl(decl_id));
+    }
+}
+
+// P38.3
+/// Returns `true` iff the decl carries the `private` modifier.
+/// Pragmas have no visibility concept; they're treated as public so
+/// they continue to participate in normal name resolution (unchanged
+/// from pre-P38 behavior).
+fn decl_is_private(decl: &Decl) -> bool {
+    match decl {
+        Decl::Fn(d) => d.modifiers.private,
+        Decl::Type(d) => d.modifiers.private,
+        Decl::Enum(d) => d.modifiers.private,
+        Decl::Var(d) => d.modifiers.private,
+        Decl::Pragma(_) => false,
+    }
 }
 
 fn visit_decl(cx: &mut Cx, decl_id: Idx<Decl>) {

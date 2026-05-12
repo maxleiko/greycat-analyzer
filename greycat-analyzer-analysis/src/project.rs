@@ -32,7 +32,7 @@ use crate::lint::{
     lint_nullability_with_directives, lint_redundant_semicolon, lint_unreachable_with_directives,
     lint_unused_suppressions, run_lints_with_directives,
 };
-use crate::resolver::{Resolutions, resolve_with_index};
+use crate::resolver::{Resolutions, resolve_with_index_for};
 use crate::stdlib::{FnSignature, ProjectIndex};
 
 /// Per-document outputs of the analyzer pipeline. Held by
@@ -997,7 +997,7 @@ impl ProjectAnalysis {
         )|
          -> PassAOut {
             let t0 = Instant::now();
-            let resolutions = resolve_with_index(&hir, index);
+            let resolutions = resolve_with_index_for(&hir, index, &uri);
             let resolve_took = t0.elapsed();
             let t2 = Instant::now();
             // Seed `lints` with the directive parser's own diagnostics
@@ -1685,7 +1685,7 @@ impl ProjectAnalysis {
             ..ModuleTimings::default()
         };
         let t0 = Instant::now();
-        let resolutions = resolve_with_index(&hir, &self.index);
+        let resolutions = resolve_with_index_for(&hir, &self.index, uri);
         timings.resolve = t0.elapsed();
         let t1 = Instant::now();
         let analysis = analyze_with_index_into(
