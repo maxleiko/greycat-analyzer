@@ -4,11 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use line_index::{LineCol, LineIndex};
+use line_index::{LineCol, LineIndex, WideEncoding, WideLineCol};
 use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
 use tree_sitter::{InputEdit, Parser, Point, Tree};
 
 use greycat_analyzer_syntax as syntax;
+
+use crate::SourceEncoding;
 
 pub struct Document {
     pub uri: Uri,
@@ -75,15 +77,13 @@ impl Document {
         &mut self,
         mut changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
+        encoding: SourceEncoding,
     ) {
         if self.version >= version {
             return;
         }
         self.version = version;
 
-        // If any change is a full-document replace, reset text from the last
-        // such change and process only the changes after it as incremental
-        // edits. Mirrors rust-analyzer's behavior.
         let changes = match changes.iter().rposition(|c| c.range.is_none()) {
             Some(idx) => {
                 self.text = std::mem::take(&mut changes[idx].text);
@@ -101,34 +101,42 @@ impl Document {
         for change in changes {
             let Some(range) = change.range else { continue };
 
-            // Recompute LineIndex per change because earlier edits in the
-            // same batch may have shifted the text.
             let index = LineIndex::new(&self.text);
-            let Some(start_byte) = index.offset(LineCol {
-                line: range.start.line,
-                col: range.start.character,
-            }) else {
+
+            let Some(start_byte) =
+                lsp_pos_to_offset(&index, range.start.line, range.start.character, encoding)
+            else {
                 continue;
             };
-            let Some(old_end_byte) = index.offset(LineCol {
-                line: range.end.line,
-                col: range.end.character,
-            }) else {
+            let Some(old_end_byte) =
+                lsp_pos_to_offset(&index, range.end.line, range.end.character, encoding)
+            else {
                 continue;
             };
-            let start_byte = usize::from(start_byte);
-            let old_end_byte = usize::from(old_end_byte);
-            let new_end_byte = start_byte + change.text.len();
+
+            // Guard against landing mid-codepoint (defensive; to_utf8 should
+            // always return char boundaries, but replace_range panics if not).
+            if !self.text.is_char_boundary(start_byte) || !self.text.is_char_boundary(old_end_byte)
+            {
+                continue;
+            }
+
+            // Tree-sitter Points use byte-offset-within-row for `column`.
+            let start_line_byte =
+                lsp_pos_to_offset(&index, range.start.line, 0, encoding).unwrap_or(start_byte);
+            let end_line_byte =
+                lsp_pos_to_offset(&index, range.end.line, 0, encoding).unwrap_or(old_end_byte);
 
             let start_position = Point {
                 row: range.start.line as usize,
-                column: range.start.character as usize,
+                column: start_byte - start_line_byte,
             };
             let old_end_position = Point {
                 row: range.end.line as usize,
-                column: range.end.character as usize,
+                column: old_end_byte - end_line_byte,
             };
 
+            let new_end_byte = start_byte + change.text.len();
             self.text
                 .replace_range(start_byte..old_end_byte, &change.text);
 
@@ -146,11 +154,37 @@ impl Document {
         }
 
         if any_edit {
-            // Incremental reparse, reusing the edited tree as a hint.
             let new_tree = parse(&mut self.parser, &self.text, Some(&self.tree));
             self.tree = new_tree;
         }
     }
+}
+
+fn lsp_pos_to_offset(
+    index: &LineIndex,
+    line: u32,
+    character: u32,
+    encoding: SourceEncoding,
+) -> Option<usize> {
+    let offset = match encoding {
+        SourceEncoding::UTF8 => {
+            // LSP col is already a UTF-8 byte offset within the line.
+            index.offset(LineCol {
+                line,
+                col: character,
+            })?
+        }
+        SourceEncoding::UTF16 => {
+            // LSP col is a UTF-16 code-unit offset; convert via to_utf8 first.
+            let wide = WideLineCol {
+                line,
+                col: character,
+            };
+            let line_col = index.to_utf8(WideEncoding::Utf16, wide)?;
+            index.offset(line_col)?
+        }
+    };
+    Some(usize::from(offset))
 }
 
 fn parse(parser: &mut Parser, text: &str, old_tree: Option<&Tree>) -> Tree {
@@ -233,6 +267,7 @@ mod tests {
                 text: new_text.clone(),
             }],
             2,
+            SourceEncoding::UTF8,
         );
         assert_eq!(d.text, new_text);
         assert_eq!(d.version, 2);
@@ -262,6 +297,7 @@ mod tests {
                 text: "foo".into(),
             }],
             2,
+            SourceEncoding::UTF8,
         );
         assert_eq!(d.text, "fn foo() {}\n");
         let root = d.root_node();
@@ -279,6 +315,7 @@ mod tests {
                 text: "fn b() {}\n".into(),
             }],
             0, // older than current version 1
+            SourceEncoding::UTF8,
         );
         assert_eq!(d.text, "fn a() {}\n");
         assert_eq!(d.version, 1);
@@ -310,6 +347,7 @@ mod tests {
                 },
             ],
             2,
+            SourceEncoding::UTF8,
         );
         assert_eq!(d.text, "fn final_text() {}\n");
     }

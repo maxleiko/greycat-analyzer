@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::module_desc::parse_module_desc;
 use greycat_analyzer_core::registry::RegistryFetcher;
 use greycat_analyzer_core::resolver::FsContext;
@@ -187,6 +188,8 @@ pub struct Backend {
     /// and the WASM bridge until the playground wires its own
     /// JS-side fetcher).
     pub registry: Option<Arc<dyn RegistryFetcher>>,
+    /// Negociated encoding between the client and the server
+    pub encoding: SourceEncoding,
 }
 
 impl Backend {
@@ -577,12 +580,16 @@ impl Backend {
         // them is parse-only, no invalidate.
         if self.orphans.get(&uri).is_some() {
             debug!("[{ORPHAN_LOG_TAG}][did_change] {}", uri.as_str());
-            let _ = self
-                .orphans
-                .update(&uri, params.content_changes, params.text_document.version);
+            let _ = self.orphans.update(
+                &uri,
+                params.content_changes,
+                params.text_document.version,
+                self.encoding,
+            );
             self.publish_for(&uri)?;
             return Ok(());
         }
+        let encoding = self.encoding;
         let Some(project) = self.project_for_mut(&uri) else {
             debug!(
                 "[{SERVER_LOG_TAG}][did_change] {} has no owning project — dropping",
@@ -590,12 +597,13 @@ impl Backend {
             );
             return Ok(());
         };
-        let tag = project.tag.clone();
-        let doc =
-            project
-                .manager
-                .update(&uri, params.content_changes, params.text_document.version);
-        debug!("[{tag}][did_change] {doc}");
+        let doc = project.manager.update(
+            &uri,
+            params.content_changes,
+            params.text_document.version,
+            encoding,
+        );
+        debug!("[{}][did_change] {doc}", project.tag);
         drop(doc);
         // **P19.22** — pragma edits to the project entrypoint can add /
         // remove `@library` / `@include`, which changes the closure of
@@ -654,7 +662,6 @@ impl Backend {
         let Some(project) = self.projects.get_mut(project_root) else {
             return;
         };
-        let tag = project.tag.clone();
         let project_file = project.root.join("project.gcl");
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
@@ -662,16 +669,20 @@ impl Backend {
         project.std_resolution = report.std_resolution;
         project.entrypoint_uri = report.entrypoint_uri.clone();
         if report.std_resolution == StdResolution::Missing {
-            warn!("[{tag}][reload_project] std not found (local or $HOME/.greycat)");
+            warn!(
+                "[{tag}][reload_project] std not found (local or $HOME/.greycat)",
+                tag = project.tag
+            );
         }
         for lib in &report.unresolved_libraries {
             warn!(
                 "[{tag}] unresolved @library('{lib}') in {}",
-                project_file.display()
+                project_file.display(),
+                tag = project.tag,
             );
         }
         for err in &report.errors {
-            warn!("[{tag}][reload_project] {err}");
+            warn!("[{tag}][reload_project] {err}", tag = project.tag);
         }
         // **P19.23** — evict modules that are no longer in the
         // project's reachable closure (e.g., the user commented out an
@@ -686,10 +697,15 @@ impl Backend {
         if !evicted.is_empty() {
             info!(
                 "[{tag}][reload_project] evicted {} unreachable file(s):",
-                evicted.len()
+                evicted.len(),
+                tag = project.tag
             );
             for uri in &evicted {
-                info!("[{tag}][reload_project]   - {}", uri.as_str());
+                info!(
+                    "[{tag}][reload_project]   - {}",
+                    uri.as_str(),
+                    tag = project.tag
+                );
             }
         }
         // Log additions explicitly too — symmetric with eviction so the
@@ -697,10 +713,15 @@ impl Backend {
         if !report.loaded.is_empty() {
             info!(
                 "[{tag}][reload_project] loaded {} new file(s):",
-                report.loaded.len()
+                report.loaded.len(),
+                tag = project.tag
             );
             for (uri, _) in &report.loaded {
-                info!("[{tag}][reload_project]   + {}", uri.as_str());
+                info!(
+                    "[{tag}][reload_project]   + {}",
+                    uri.as_str(),
+                    tag = project.tag
+                );
             }
         }
         let rebuild_start = Instant::now();
@@ -711,6 +732,7 @@ impl Backend {
             report.reachable.len(),
             report.loaded.len(),
             evicted.len(),
+            tag = project.tag,
         );
         // Snapshot the report fields we'll need after we drop the
         // mutable borrow on `self.projects` so we can update
@@ -757,34 +779,25 @@ impl Backend {
         let Some(project) = self.project_for_mut(uri) else {
             return;
         };
-        let tag = project.tag.clone();
         let start = Instant::now();
         project.analysis.invalidate(&project.manager, uri);
         let took = start.elapsed();
         if took.as_millis() >= SLOW_REBUILD_MS {
             info!(
                 "[{tag}][slow-rebuild] {source} for {} took {took:?}",
-                uri.as_str()
+                uri.as_str(),
+                tag = project.tag,
             );
         }
     }
 
     pub fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Result<()> {
         let uri = &params.text_document.uri;
-        let tag = self
-            .project_for(uri)
-            .map(|p| p.tag.as_str().to_string())
-            .unwrap_or_else(|| {
-                if self.orphans.get(uri).is_some() {
-                    ORPHAN_LOG_TAG.into()
-                } else {
-                    SERVER_LOG_TAG.into()
-                }
-            });
         debug!(
             "[{tag}][did_save] {} (text={:?})",
             uri.as_str(),
-            params.text
+            params.text,
+            tag = self.tag_for(uri),
         );
         // Editors may format/lint on save and send the canonical text;
         // re-publish so any newly-introduced or newly-resolved errors
@@ -795,17 +808,11 @@ impl Backend {
 
     pub fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Result<()> {
         let uri = params.text_document.uri;
-        let tag = self
-            .project_for(&uri)
-            .map(|p| p.tag.as_str().to_string())
-            .unwrap_or_else(|| {
-                if self.orphans.get(&uri).is_some() {
-                    ORPHAN_LOG_TAG.into()
-                } else {
-                    SERVER_LOG_TAG.into()
-                }
-            });
-        debug!("[{tag}][did_close] {}", uri.as_str());
+        debug!(
+            "[{tag}][did_close] {}",
+            uri.as_str(),
+            tag = self.tag_for(&uri)
+        );
         // P32.5 — orphans don't outlive `did_close`. The dim diag
         // is purely an editor signal, so dropping the doc with the
         // buffer is correct.
@@ -963,8 +970,9 @@ impl Backend {
                     && let Some(project) = self.projects.get(&root)
                 {
                     debug!(
-                        "[{}][watch] {:?} on lib/installed -> reload",
-                        project.tag, ev.typ
+                        "[{tag}][watch] {:?} on lib/installed -> reload",
+                        ev.typ,
+                        tag = project.tag
                     );
                     reload_set.insert(root);
                 }
@@ -983,8 +991,8 @@ impl Backend {
             if opened {
                 let tag = self
                     .project_for(uri)
-                    .map(|p| p.tag.as_str().to_string())
-                    .unwrap_or_else(|| SERVER_LOG_TAG.into());
+                    .map(|p| p.tag.as_str())
+                    .unwrap_or_else(|| SERVER_LOG_TAG);
                 debug!(
                     "[{tag}][watch] {:?} on opened {} -> skip",
                     ev.typ,
@@ -1060,6 +1068,20 @@ impl Backend {
             self.reload_project_closure_for(&root);
         }
         Ok(())
+    }
+
+    /// Returns the tag of the associated project if found,
+    /// or the orphan if found, or server as fallback
+    fn tag_for(&self, uri: &Uri) -> &str {
+        self.project_for(uri)
+            .map(|p| p.tag.as_str())
+            .unwrap_or_else(|| {
+                if self.orphans.get(uri).is_some() {
+                    ORPHAN_LOG_TAG
+                } else {
+                    SERVER_LOG_TAG
+                }
+            })
     }
 }
 
@@ -1146,6 +1168,7 @@ mod tests {
                 workspace_roots: Vec::new(),
                 lint_libs: false,
                 registry: None,
+                encoding: SourceEncoding::UTF8,
             },
             rx,
         )

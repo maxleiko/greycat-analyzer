@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use greycat_analyzer_core::SourceEncoding;
 use log::{debug, info};
 use lsp_server::*;
 use lsp_types::notification::{
@@ -39,6 +40,7 @@ pub fn start_server() -> Result<()> {
             "name": "greycat-analyzer",
             "version": VERSION
         },
+        "positionEncoding": "utf-8", // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#positionEncodingKind
         "capabilities": ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Options(
                 TextDocumentSyncOptions {
@@ -127,6 +129,17 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
         // builds always have it; WASM uses a different bridge that
         // doesn't go through this entry point.
         registry: Some(crate::registry::shared()),
+        encoding: match init
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_deref())
+        {
+            Some(encodings) if encodings.contains(&PositionEncodingKind::UTF8) => {
+                SourceEncoding::UTF8
+            }
+            _ => SourceEncoding::UTF16,
+        },
     };
 
     server.initialized(&init)?;

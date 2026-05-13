@@ -14,6 +14,12 @@ use crate::{
     resolver::{Context, FsContext, global_std_dir, library_dir},
 };
 
+#[derive(Debug, Clone, Copy)]
+pub enum SourceEncoding {
+    UTF8,
+    UTF16,
+}
+
 /// Storage for parsed `.gcl` documents, keyed by LSP `Uri`. Holds a
 /// [`Context`] so callers can trigger recursive loads (`@library` /
 /// `@include`) without threading filesystem access themselves.
@@ -118,9 +124,10 @@ impl SourceManager {
         uri: &Uri,
         changes: Vec<TextDocumentContentChangeEvent>,
         version: i32,
+        encoding: SourceEncoding,
     ) -> Ref<'_, Document> {
         if let Some(doc) = self.documents.get(uri) {
-            doc.borrow_mut().apply_changes(changes, version);
+            doc.borrow_mut().apply_changes(changes, version, encoding);
             doc.borrow()
         } else {
             panic!("cannot update unknown document")
