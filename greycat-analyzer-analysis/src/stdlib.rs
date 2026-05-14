@@ -16,12 +16,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use greycat_analyzer_core::lsp_types::Uri;
+use greycat_analyzer_core::{
+    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeDeclId, TypeId, TypeKind,
+};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as HirTypeRef};
-use greycat_analyzer_types::{
-    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeDeclId, TypeId, TypeKind,
-};
 
 /// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
 /// declaration whose `extends` chain reaches a 5th level with
@@ -694,12 +694,7 @@ impl ProjectIndex {
     /// Replaces every `is_subtype_of(&str, &str)` call site as the
     /// migration progresses; the string form is kept during the
     /// `Named` -> `Type(handle)` cascade and deleted in P36.7.
-    pub fn is_subtype_of_decl(
-        &self,
-        arena: &greycat_analyzer_types::TypeArena,
-        sub: TypeDeclId,
-        sup: TypeDeclId,
-    ) -> bool {
+    pub fn is_subtype_of_decl(&self, arena: &TypeArena, sub: TypeDeclId, sup: TypeDeclId) -> bool {
         if sub == sup {
             return true;
         }
@@ -918,14 +913,14 @@ impl ProjectIndex {
                     // the same module — sees the canonical TypeId.
                     self.enum_types.entry(name_sym).or_insert_with(|| {
                         let name_owned: SmolStr = name_str.into();
-                        let variants: Vec<SmolStr> = ed
+                        let variants: Box<[Symbol]> = ed
                             .fields
                             .iter()
-                            .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str().into())
+                            .map(|f| hir.idents[hir.enum_fields[*f].name].symbol)
                             .collect();
                         arena.alloc(Type {
                             kind: TypeKind::Enum {
-                                name: name_owned,
+                                name: name_sym,
                                 variants,
                             },
                             nullable: false,
@@ -1040,13 +1035,16 @@ impl ProjectIndex {
     /// question.
     pub fn locate_decl(&self, name: &str) -> &[(Uri, Idx<Decl>)] {
         match self.symbols.lookup(name) {
-            Some(s) => self
-                .decl_locations
-                .get(&s)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]),
+            Some(s) => self.locate_decl_by_symbol(s),
             None => &[],
         }
+    }
+
+    pub fn locate_decl_by_symbol(&self, name: Symbol) -> &[(Uri, Idx<Decl>)] {
+        self.decl_locations
+            .get(&s)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// `true` iff `name` resolves against any name the project knows:
@@ -1177,15 +1175,15 @@ fn native_signature_for(
 /// or stdlib types declared earlier in the same module).
 fn lower_native_type_ref(
     hir: &Hir,
-    idx: greycat_analyzer_hir::arena::Idx<HirTypeRef>,
+    idx: Idx<HirTypeRef>,
     arena: &mut TypeArena,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     locate_decl: &FxHashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
     symbols: &SymbolTable,
 ) -> TypeId {
     let tr = &hir.type_refs[idx];
-    let name = hir.idents[tr.name].text.clone();
-    let mut base = match name.as_str() {
+    let name_sym = hir.idents[tr.name].symbol;
+    let mut base = match &symbols[name_sym] {
         "bool" => arena.primitive(Primitive::Bool),
         "int" => arena.primitive(Primitive::Int),
         "float" => arena.primitive(Primitive::Float),
@@ -1199,13 +1197,10 @@ fn lower_native_type_ref(
         _ => {
             // Resolve the decl handle once (the same lookup powers both
             // the generic and non-generic branches).
-            let handle = symbols
-                .lookup(&name)
-                .and_then(|s| locate_decl.get(&s))
-                .and_then(|locs| {
-                    locs.iter()
-                        .find_map(|(uri, decl)| decl_registry.lookup(uri, *decl))
-                });
+            let handle = locate_decl.get(&name_sym).and_then(|locs| {
+                locs.iter()
+                    .find_map(|(uri, decl)| decl_registry.lookup(uri, *decl))
+            });
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
                     .params
@@ -1215,15 +1210,15 @@ fn lower_native_type_ref(
                     })
                     .collect();
                 match handle {
-                    Some(h) => arena.generic(h, name, args),
-                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                    Some(h) => arena.generic(h, args),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else {
                 // Try to mint a handle-keyed `Type(handle)` so native
                 // signatures intern equal to whatever the body-walker
                 // / signature pass produces for the same source token.
                 match handle {
-                    Some(h) => arena.alloc_type(h, name),
+                    Some(h) => arena.alloc_type(h),
                     None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
                 }
             }
@@ -1244,7 +1239,8 @@ mod tests {
 
     fn lower(src: &str) -> Hir {
         let tree = parse(src);
-        lower_module(src, "stdmod", "std", tree.root_node())
+        let s = SymbolTable::default();
+        lower_module(src, &s, "stdmod", "std", tree.root_node())
     }
 
     fn uri(path: &str) -> Uri {
@@ -1412,7 +1408,7 @@ fn helper(): int { return 1; }
             let sym = idx
                 .symbol(n)
                 .unwrap_or_else(|| panic!("{n} not interned after ingest"));
-            assert_eq!(idx.symbols.resolve(sym), Some(n));
+            assert_eq!(idx.symbols.resolve(&sym), Some(n));
         }
 
         // The new `&str` accessors hit through the symbol table.
@@ -1435,9 +1431,9 @@ fn helper(): int { return 1; }
         // short-circuit without arena access; missing handles return
         // false.
         use crate::well_known::DeclRegistry;
+        use greycat_analyzer_core::TypeArena;
         use greycat_analyzer_hir::arena::Idx;
         use greycat_analyzer_hir::types::Decl;
-        use greycat_analyzer_types::TypeArena;
 
         let hir = lower(
             "type Animal { name: String; }\n\
@@ -1464,10 +1460,9 @@ fn helper(): int { return 1; }
         let mut cat = None;
         for decl_id in &module.decls {
             if let Decl::Type(td) = &hir.decls[*decl_id] {
-                let name = hir.idents[td.name].text.as_str();
                 let id = registry.get_or_insert(&u, *decl_id);
-                arena.alloc_type(id, name);
-                match name {
+                arena.alloc_type(id);
+                match &idx.symbols[hir.idents[td.name].symbol] {
                     "Animal" => animal = Some(id),
                     "Cat" => cat = Some(id),
                     _ => {}

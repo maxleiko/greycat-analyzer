@@ -7,6 +7,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use greycat_analyzer_core::SymbolTable;
+use greycat_analyzer_hir::lower_module;
+use greycat_analyzer_hir::types::Expr;
+use greycat_analyzer_syntax::parse;
+
 #[test]
 fn enumerate_unsupported_kinds() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -67,10 +72,11 @@ fn collect(dir: &std::path::Path, counts: &mut BTreeMap<String, usize>, visited:
             continue;
         };
         *visited += 1;
-        let tree = greycat_analyzer_syntax::parse(&text);
-        let hir = greycat_analyzer_hir::lower_module(&text, "m", "p", tree.root_node());
+        let tree = parse(&text);
+        let symbols = SymbolTable::default();
+        let hir = lower_module(&text, &symbols, "m", "p", tree.root_node());
         for (_, e) in hir.exprs.iter() {
-            if let greycat_analyzer_hir::types::Expr::Unsupported { kind, .. } = e {
+            if let Expr::Unsupported { kind, .. } = e {
                 *counts.entry((*kind).to_string()).or_default() += 1;
             }
         }

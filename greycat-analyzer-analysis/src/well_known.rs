@@ -13,10 +13,10 @@
 //!   `Decl::Type` whose `(module.lib, module.name, decl_name)` matches
 //!   `("std", "core", N)` stashes its handle into slot `N`.
 
+use greycat_analyzer_core::TypeDeclId;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
-use greycat_analyzer_types::TypeDeclId;
 use rustc_hash::FxHashMap;
 
 /// Append-only registry mapping `(Uri, Idx<Decl>)` pairs to dense
@@ -28,7 +28,7 @@ use rustc_hash::FxHashMap;
 /// instances, handles are not comparable.
 ///
 /// Decl *names* aren't stored here — the arena owns them via
-/// [`greycat_analyzer_types::TypeArena::decl_name`], registered at
+/// [`greycat_analyzer_core::TypeArena::decl_name`], registered at
 /// `alloc_type` / `generic` time. This keeps the registry to a
 /// single responsibility (handle identity) and lets downstream
 /// consumers render types through `arena.display(id)` with no
@@ -127,7 +127,7 @@ pub struct WellKnown {
     pub function_decl: Option<TypeDeclId>,
 
     // Node-tag generics — the auto-deref family. P35.5 rewrites
-    // [`greycat_analyzer_types::is_node_tag`] as a comparison against
+    // [`greycat_analyzer_core::is_node_tag`] as a comparison against
     // these handles.
     pub node_decl: Option<TypeDeclId>,
     pub node_time_decl: Option<TypeDeclId>,
@@ -155,7 +155,7 @@ impl WellKnown {
 
     /// `true` when `id` is one of the node-tag decl handles
     /// (`node`, `nodeTime`, `nodeIndex`, `nodeList`, `nodeGeo`).
-    /// Direct replacement for [`greycat_analyzer_types::is_node_tag`]
+    /// Direct replacement for [`greycat_analyzer_core::is_node_tag`]
     /// — handle-keyed rather than string-keyed, so a user-declared
     /// `type node<T>` is not mistaken for the std-core tag.
     pub fn is_node_tag(&self, id: TypeDeclId) -> bool {

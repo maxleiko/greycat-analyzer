@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_syntax::parse;
 
@@ -46,7 +47,8 @@ fn lowers_corpus_without_panicking() {
     for path in &files {
         let source = std::fs::read_to_string(path).expect("read corpus file");
         let tree = parse(&source);
-        let hir = lower_module(&source, "fixture", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(&source, &symbols, "fixture", "project", tree.root_node());
         let module = hir
             .module
             .as_ref()

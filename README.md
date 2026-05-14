@@ -208,9 +208,8 @@ pnpm dev     # opens the playground at http://localhost:5173
 | Crate | Purpose |
 |---|---|
 | [greycat-analyzer-syntax](greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](tree-sitter-greycat/) (git submodule at the repo root). Generated typed-node accessors. |
-| [greycat-analyzer-core](greycat-analyzer-core/) | `Document`, `SourceManager`, project graph, module resolver, parse diagnostics. |
+| [greycat-analyzer-core](greycat-analyzer-core/) | `Type` enum, interning arena, subtyping, generics, `Document`, `SourceManager`, project graph, module resolver, parse diagnostics. |
 | [greycat-analyzer-hir](greycat-analyzer-hir/) | Arena-backed HIR + CST→HIR lowering. |
-| [greycat-analyzer-types](greycat-analyzer-types/) | `Type` enum, interning arena, subtyping, generics. |
 | [greycat-analyzer-analysis](greycat-analyzer-analysis/) | Resolver, analyzer, lint rules, stdlib ingestion. |
 | [greycat-analyzer-fmt](greycat-analyzer-fmt/) | Tree-sitter-driven formatter. |
 | [greycat-analyzer-server](greycat-analyzer-server/) | LSP server + capability handlers. |

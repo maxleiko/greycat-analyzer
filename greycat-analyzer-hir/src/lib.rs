@@ -32,13 +32,15 @@ pub use lower::{LowerCtx, lower_module};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_syntax::parse;
 
     #[test]
     fn lowers_simple_function() {
         let src = "fn greet(name: String): String { return name; }\n";
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let s = SymbolTable::default();
+        let hir = lower_module(src, &s, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().expect("module produced");
         assert_eq!(module.decls.len(), 1);
 
@@ -46,10 +48,10 @@ mod tests {
         let Decl::Fn(fnd) = decl else {
             panic!("expected fn decl, got {decl:?}");
         };
-        assert_eq!(hir.idents[fnd.name].text, "greet");
+        assert_eq!(&s[hir.idents[fnd.name].symbol], "greet");
         assert_eq!(fnd.params.len(), 1);
         let param = &hir.fn_params[fnd.params[0]];
-        assert_eq!(hir.idents[param.name].text, "name");
+        assert_eq!(&s[hir.idents[param.name].symbol], "name");
         assert!(fnd.return_type.is_some());
         assert!(fnd.body.is_some());
     }
@@ -64,23 +66,28 @@ type Point {
 }
 "#;
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().unwrap();
         assert_eq!(module.decls.len(), 1);
         let Decl::Type(td) = &hir.decls[module.decls[0]] else {
             panic!("expected type decl");
         };
-        assert_eq!(hir.idents[td.name].text, "Point");
+        assert_eq!(&symbols[hir.idents[td.name].symbol], "Point");
         assert_eq!(td.attrs.len(), 2);
         assert_eq!(td.methods.len(), 1);
-        assert_eq!(hir.idents[hir.type_attrs[td.attrs[0]].name].text, "x");
+        assert_eq!(
+            &symbols[hir.idents[hir.type_attrs[td.attrs[0]].name].symbol],
+            "x"
+        );
     }
 
     #[test]
     fn lowers_enum_decl() {
         let src = "enum Color { Red, Green, Blue }\n";
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().unwrap();
         let Decl::Enum(ed) = &hir.decls[module.decls[0]] else {
             panic!("expected enum");
@@ -89,7 +96,7 @@ type Point {
         let names: Vec<&str> = ed
             .fields
             .iter()
-            .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str())
+            .map(|f| &symbols[hir.idents[hir.enum_fields[*f].name].symbol])
             .collect();
         assert_eq!(names, vec!["Red", "Green", "Blue"]);
     }
@@ -98,13 +105,14 @@ type Point {
     fn lowers_module_pragmas() {
         let src = "@library(\"std\", \"1.0\");\n@expose;\n";
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().unwrap();
         let pragma_names: Vec<&str> = module
             .decls
             .iter()
             .filter_map(|d| match &hir.decls[*d] {
-                Decl::Pragma(p) => Some(hir.idents[p.name].text.as_str()),
+                Decl::Pragma(p) => Some(&symbols[hir.idents[p.name].symbol]),
                 _ => None,
             })
             .collect();
@@ -115,7 +123,8 @@ type Point {
     fn lowers_expressions_inside_body() {
         let src = "fn calc(): int { return 1 + 2 * 3; }\n";
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().unwrap();
         let Decl::Fn(fnd) = &hir.decls[module.decls[0]] else {
             panic!()
@@ -153,7 +162,8 @@ fn build(n: String, a: int): Foo {
 }
 "#;
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().unwrap();
         let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
             panic!("expected fn decl")
@@ -173,7 +183,7 @@ fn build(n: String, a: int): Foo {
         let Expr::Ident { name: name_use, .. } = &hir.exprs[obj.fields[0].value] else {
             panic!("expected ident use for value")
         };
-        assert_eq!(hir.idents[*name_use].text, "n");
+        assert_eq!(&symbols[hir.idents[*name_use].symbol], "n");
     }
 
     #[test]
@@ -189,7 +199,8 @@ fn make(g: Group) {
 }
 "#;
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().unwrap();
         let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
             panic!("expected fn decl")
@@ -213,6 +224,6 @@ fn make(g: Group) {
         let Expr::Ident { name: used, .. } = &hir.exprs[obj.fields[0].value] else {
             panic!("expected ident use")
         };
-        assert_eq!(hir.idents[*used].text, "g");
+        assert_eq!(&symbols[hir.idents[*used].symbol], "g");
     }
 }

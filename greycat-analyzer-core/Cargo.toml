@@ -12,6 +12,7 @@ categories.workspace = true
 [dependencies]
 greycat-analyzer-syntax.workspace = true
 
+lasso.workspace = true
 line-index.workspace = true
 log.workspace = true
 lsp-types.workspace = true
@@ -20,6 +21,8 @@ rustc-hash.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tree-sitter.workspace = true
+smallvec.workspace = true
+smol_str.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -12,16 +12,18 @@
 
 use std::ops::Range;
 
-use rustc_hash::FxHashSet;
+use greycat_analyzer_analysis::directives::Directives;
+use greycat_analyzer_hir::arena::Idx;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use greycat_analyzer_analysis::analyzer::Severity;
+use greycat_analyzer_analysis::analyzer::{AnalysisResult, Severity};
 use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity, run_lints};
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
-use greycat_analyzer_analysis::resolver::{Definition, resolve};
-use greycat_analyzer_core::SourceManager;
+use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
+use greycat_analyzer_core::{SourceManager, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Expr, FnDecl, TypeDecl};
+use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, FnDecl, Ident, Stmt, TypeDecl};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset, walk_named};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::*;
@@ -280,11 +282,11 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
 
 fn ident_hover_markdown(
     hir: &Hir,
-    resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
-    ident_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
-    ident: &greycat_analyzer_hir::types::Ident,
+    resolutions: &Resolutions,
+    analysis: &AnalysisResult,
+    arena: &TypeArena,
+    ident_idx: Idx<Ident>,
+    ident: &Ident,
     project: Option<HoverProjectCtx<'_>>,
 ) -> Option<String> {
     // P6.3: property idents in `a.b` aren't in `Resolutions` — they
@@ -2045,8 +2047,7 @@ pub fn inlay_hints_with_project(
     // `<module>::` whenever the bare decl name is ambiguous across
     // modules — so the user reading `var f = b::Foo {};` sees
     // `: b::Foo`, not the misleading bare `: Foo`.
-    let render: &dyn Fn(greycat_analyzer_types::TypeId) -> String =
-        &|ty| project.display_type(ty).to_string();
+    let render: &dyn Fn(TypeId) -> String = &|ty| project.display_type(ty).to_string();
     inlay_hints_inner(module, render, text, range)
 }
 
@@ -2074,10 +2075,9 @@ pub fn inlay_hints(
         lints: Vec::new(),
         lib: lib.to_string(),
         timings: Default::default(),
-        directives: greycat_analyzer_analysis::directives::Directives::default(),
+        directives: Directives::default(),
     };
-    let render: &dyn Fn(greycat_analyzer_types::TypeId) -> String =
-        &|ty| arena.display(ty).to_string();
+    let render: &dyn Fn(TypeId) -> String = &|ty| arena.display(ty).to_string();
     inlay_hints_inner(&module, render, text, range)
 }
 
@@ -2086,7 +2086,7 @@ pub fn inlay_hints(
 /// shim falls back to the bare arena printer.
 fn inlay_hints_inner(
     module: &ModuleAnalysis,
-    render_ty: &dyn Fn(greycat_analyzer_types::TypeId) -> String,
+    render_ty: &dyn Fn(TypeId) -> String,
     text: &str,
     range: &lsp_types::Range,
 ) -> Vec<InlayHint> {
@@ -2143,11 +2143,7 @@ fn inlay_hints_inner(
 /// Peek at the last expression-shaped statement of a fn body
 /// to infer its return type. Returns `None` for blocks that don't end
 /// in a `Stmt::Return(...)` with an inferred-type expression.
-fn inferred_fn_return(
-    hir: &Hir,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
-    body: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
-) -> Option<greycat_analyzer_types::TypeId> {
+fn inferred_fn_return(hir: &Hir, analysis: &AnalysisResult, body: Idx<Stmt>) -> Option<TypeId> {
     use greycat_analyzer_hir::types::Stmt;
     let block = match &hir.stmts[body] {
         Stmt::Block(b) => b,
@@ -2320,9 +2316,9 @@ fn emit_call_arg_hints_expr(
 /// `Idx<Stmt>` for them.
 fn emit_var_hints_block(
     hir: &Hir,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
-    render_ty: &dyn Fn(greycat_analyzer_types::TypeId) -> String,
-    block: &greycat_analyzer_hir::types::BlockStmt,
+    analysis: &AnalysisResult,
+    render_ty: &dyn Fn(TypeId) -> String,
+    block: &BlockStmt,
     want: (usize, usize),
     text: &str,
     out: &mut Vec<InlayHint>,
@@ -2335,7 +2331,7 @@ fn emit_var_hints_block(
 fn emit_var_hints(
     hir: &Hir,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
-    render_ty: &dyn Fn(greycat_analyzer_types::TypeId) -> String,
+    render_ty: &dyn Fn(TypeId) -> String,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     want: (usize, usize),
     text: &str,
@@ -3918,7 +3914,7 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
 /// docs, since locals carry none); generics return both as `None`.
 fn scope_name_meta(
     module: &ModuleAnalysis,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     source: &NameSource,
 ) -> (Option<String>, Option<Documentation>) {
     match source {
@@ -4287,16 +4283,13 @@ fn member_completion(
     // head name of the resulting type.
     let _ = well_known;
     let inner_head: Option<String> = (|| {
-        let (recv_name, recv_args): (String, Vec<greycat_analyzer_types::TypeId>) =
-            match &arena.get(recv_ty).kind {
-                greycat_analyzer_types::TypeKind::Type(d) => {
-                    (arena.decl_name(*d)?.to_string(), Vec::new())
-                }
-                greycat_analyzer_types::TypeKind::Generic { decl, args } => {
-                    (arena.decl_name(*decl)?.to_string(), args.to_vec())
-                }
-                _ => return None,
-            };
+        let (recv_name, recv_args): (String, Vec<TypeId>) = match &arena.get(recv_ty).kind {
+            TypeKind::Type(d) => (arena.decl_name(*d)?.to_string(), Vec::new()),
+            TypeKind::Generic { decl, args } => {
+                (arena.decl_name(*decl)?.to_string(), args.to_vec())
+            }
+            _ => return None,
+        };
         let members = project.index.type_members_for(&recv_name)?;
         let deref_ret = members.deref_return_ty?;
         // Substitute the receiver's generic args into the cached
@@ -4304,8 +4297,7 @@ fn member_completion(
         if recv_args.is_empty() {
             return type_head_name(arena, deref_ret).map(|s| s.to_string());
         }
-        let mut subst: rustc_hash::FxHashMap<String, greycat_analyzer_types::TypeId> =
-            rustc_hash::FxHashMap::default();
+        let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
         for (i, gp_sym) in members.generics.iter().enumerate() {
             if let Some(arg) = recv_args.get(i)
                 && let Some(gp_name) = project.index.symbols.resolve(*gp_sym)
@@ -4448,9 +4440,9 @@ fn member_completion(
 fn receiver_type_at(
     text: &str,
     root: tree_sitter::Node<'_>,
-    module: &greycat_analyzer_analysis::project::ModuleAnalysis,
+    module: &ModuleAnalysis,
     recv_end: usize,
-) -> Option<greycat_analyzer_types::TypeId> {
+) -> Option<TypeId> {
     if let Some((id, _)) = module
         .hir
         .exprs
@@ -4519,7 +4511,7 @@ fn lookup_name_type_at(
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
     cursor_byte: usize,
     name: &str,
-) -> Option<greycat_analyzer_types::TypeId> {
+) -> Option<TypeId> {
     use greycat_analyzer_hir::types::Decl as HD;
     let module = hir.module.as_ref()?;
     // P35.10 — first pass: top-level `Decl::Var`. Module-level vars
@@ -4575,7 +4567,7 @@ fn lookup_name_type_in_fn(
     cursor_byte: usize,
     fnd: &greycat_analyzer_hir::types::FnDecl,
     name: &str,
-) -> Option<greycat_analyzer_types::TypeId> {
+) -> Option<TypeId> {
     for p_id in &fnd.params {
         let p = &hir.fn_params[*p_id];
         if hir.idents[p.name].text == name {
@@ -4594,7 +4586,7 @@ fn lookup_name_type_in_block(
     cursor_byte: usize,
     block: &greycat_analyzer_hir::types::BlockStmt,
     name: &str,
-) -> Option<greycat_analyzer_types::TypeId> {
+) -> Option<TypeId> {
     use greycat_analyzer_hir::types::Stmt as HS;
     if !(block.byte_range.start <= cursor_byte && cursor_byte <= block.byte_range.end) {
         return None;
@@ -4623,7 +4615,7 @@ fn lookup_name_type_in_stmt(
     cursor_byte: usize,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     name: &str,
-) -> Option<greycat_analyzer_types::TypeId> {
+) -> Option<TypeId> {
     use greycat_analyzer_hir::types::Stmt as HS;
     match &hir.stmts[stmt_id] {
         HS::Block(b) => lookup_name_type_in_block(hir, analysis, cursor_byte, b, name),
@@ -4685,11 +4677,8 @@ fn lookup_name_type_in_stmt(
 /// Read the head name of `id` from `arena` — the bare type name
 /// stripped of nullability / generic args. Returns `None` for shapes
 /// without a single name (lambdas, tuples, anonymous structures).
-fn type_head_name(
-    arena: &greycat_analyzer_types::TypeArena,
-    id: greycat_analyzer_types::TypeId,
-) -> Option<&str> {
-    use greycat_analyzer_types::TypeKind;
+fn type_head_name(arena: &TypeArena, id: TypeId) -> Option<&str> {
+    use greycat_analyzer_core::TypeKind;
     let t = arena.get(id);
     match &t.kind {
         // P35.7 — handle-keyed variants read the name from the arena's

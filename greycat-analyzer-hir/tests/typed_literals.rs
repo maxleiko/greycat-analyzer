@@ -1,13 +1,15 @@
 //! P13.3 — typed-suffix numeric literals lower to dedicated
 //! [`LiteralKind`] variants instead of bare `Number`.
 
+use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::{Decl, Expr, LiteralExpr, LiteralKind, Stmt};
 use greycat_analyzer_syntax::parse;
 
 fn first_var_init_kind(src: &str, idx: usize) -> LiteralKind {
     let tree = parse(src);
-    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let symbols = SymbolTable::default();
+    let hir = lower_module(src, &symbols, "module", "lib", tree.root_node());
     let module = hir.module.as_ref().expect("module lowered");
     let fn_decl = module
         .decls
@@ -61,20 +63,21 @@ fn map_two_generic_params_lower_both() {
     // Regression: `Map<K, V>` had only `K` captured (P14.9 fix).
     let src = "type T { paths: Map<String, Inner>?; }\ntype Inner {}\n";
     let tree = parse(src);
-    let hir = lower_module(src, "m", "p", tree.root_node());
+    let symbols = SymbolTable::default();
+    let hir = lower_module(src, &symbols, "m", "p", tree.root_node());
     let attr = hir
         .type_attrs
         .iter()
-        .find(|(_, a)| hir.idents[a.name].text == "paths")
+        .find(|(_, a)| &symbols[hir.idents[a.name].symbol] == "paths")
         .map(|(_, a)| a.clone())
         .expect("paths attr");
     let tr = &hir.type_refs[attr.ty.expect("typed")];
-    assert_eq!(hir.idents[tr.name].text, "Map");
+    assert_eq!(&symbols[hir.idents[tr.name].symbol], "Map");
     assert_eq!(tr.params.len(), 2, "expected both K and V params");
     let names: Vec<_> = tr
         .params
         .iter()
-        .map(|p| hir.idents[hir.type_refs[*p].name].text.clone())
+        .map(|p| &symbols[hir.idents[hir.type_refs[*p].name].symbol])
         .collect();
     assert_eq!(names, vec!["String", "Inner"]);
 }
@@ -101,7 +104,8 @@ fn negated_int_literal_reaches_i64_min() {
     // Look up the parse_issue on the literal to confirm the
     // boundary case carries NO overflow flag.
     let tree = parse(src);
-    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let symbols = SymbolTable::default();
+    let hir = lower_module(src, &symbols, "module", "lib", tree.root_node());
     let module = hir.module.as_ref().unwrap();
     let fnd = module
         .decls
@@ -146,7 +150,8 @@ fn positive_int_literal_one_past_i64_max_overflows() {
     // and must saturate with the overflow flag set.
     let src = "fn f() {\n    var i = 9223372036854775808;\n}\n";
     let tree = parse(src);
-    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let symbols = SymbolTable::default();
+    let hir = lower_module(src, &symbols, "module", "lib", tree.root_node());
     let module = hir.module.as_ref().unwrap();
     let fnd = module
         .decls
@@ -182,7 +187,8 @@ fn negated_int_literal_one_past_i64_min_overflows() {
     // range even with the negative-asymmetry rule.
     let src = "fn f() {\n    var i = -9223372036854775809;\n}\n";
     let tree = parse(src);
-    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let symbols = SymbolTable::default();
+    let hir = lower_module(src, &symbols, "module", "lib", tree.root_node());
     let module = hir.module.as_ref().unwrap();
     let fnd = module
         .decls

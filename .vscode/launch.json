@@ -11,7 +11,7 @@
       "cargo": {
         "args": ["build", "--bin", "greycat-analyzer"]
       },
-      "args": ["lint", "${workspaceFolder}/examples/project.gcl"]
+      "args": ["lint"]
     },
     {
       "type": "lldb",
@@ -20,7 +20,16 @@
       "cargo": {
         "args": ["build", "--bin", "greycat-analyzer"]
       },
-      "args": ["cst", "${workspaceFolder}/examples/project.gcl", "--trivia"]
+      "args": ["cst", "${workspaceFolder}/project.gcl"]
     },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug fmt",
+      "cargo": {
+        "args": ["build", "--bin", "greycat-analyzer"]
+      },
+      "args": ["fmt", "${workspaceFolder}/project.gcl"]
+    }
   ]
 }

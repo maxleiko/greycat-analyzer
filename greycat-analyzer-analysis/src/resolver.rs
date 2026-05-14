@@ -365,7 +365,7 @@ impl<'a> Cx<'a> {
 /// also resolve and the current module's own entries are excluded
 /// from the global public-lookup tier.
 pub fn resolve(hir: &Hir) -> Resolutions {
-    let mut arena = greycat_analyzer_types::TypeArena::new();
+    let mut arena = TypeArena::new();
     let index = ProjectIndex::new(&mut arena);
     resolve_inner(hir, &index, None)
 }
@@ -785,13 +785,15 @@ fn visit_type_ref(cx: &mut Cx, ty_id: Idx<TypeRef>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_hir::types::{Decl, Expr};
     use greycat_analyzer_syntax::parse;
 
     fn analyze(src: &str) -> (Hir, Resolutions) {
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let s = SymbolTable::default();
+        let hir = lower_module(src, &s, "mod", "project", tree.root_node());
         let res = resolve(&hir);
         (hir, res)
     }
@@ -965,10 +967,11 @@ fn f(p: Foo): Foo { return p; }
         // carrying A's URI + the Helper decl id (P11.2).
         let other_src = "type Helper {}\n";
         let other_tree = parse(other_src);
-        let other_hir = lower_module(other_src, "a", "p", other_tree.root_node());
+        let s = SymbolTable::default();
+        let other_hir = lower_module(other_src, &s, "a", "p", other_tree.root_node());
 
         let other_uri = Uri::from_str("file:///proj/a.gcl").unwrap();
-        let mut arena = greycat_analyzer_types::TypeArena::new();
+        let mut arena = TypeArena::new();
         let mut decl_registry = crate::well_known::DeclRegistry::default();
         let mut well_known = crate::well_known::WellKnown::default();
         let mut idx = ProjectIndex::new(&mut arena);
@@ -982,7 +985,8 @@ fn f(p: Foo): Foo { return p; }
 
         let user_src = "fn use_helper(h: Helper) {}\n";
         let user_tree = parse(user_src);
-        let user_hir = lower_module(user_src, "b", "p", user_tree.root_node());
+        let s = SymbolTable::default();
+        let user_hir = lower_module(user_src, &s, "b", "p", user_tree.root_node());
         let res = resolve_with_index(&user_hir, &idx);
 
         let helper_uses: Vec<_> = user_hir

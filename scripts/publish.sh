@@ -20,7 +20,6 @@ ORDER=(
   greycat-analyzer-syntax
   greycat-analyzer-core
   greycat-analyzer-hir
-  greycat-analyzer-types
   greycat-analyzer-fmt
   greycat-analyzer-analysis
   greycat-analyzer-server

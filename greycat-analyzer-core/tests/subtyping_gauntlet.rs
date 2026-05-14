@@ -19,7 +19,7 @@
 //! ```
 //! against the live stdlib. Tests below assert the runtime outcome.
 
-use greycat_analyzer_types::{
+use greycat_analyzer_core::{
     GenericOwner, Primitive, TypeArena, TypeDeclId, is_assignable_to, is_castable,
 };
 
@@ -390,7 +390,7 @@ fn rt_cast_nullable_decl_to_non_nullable_decl() {
 
 #[test]
 fn rt_cast_nullable_enum_shape_to_non_nullable_enum_shape() {
-    use greycat_analyzer_types::{Type, TypeKind};
+    use greycat_analyzer_core::{Type, TypeKind};
     let mut a = arena();
     let enum_kind = TypeKind::Enum {
         name: "PointType".into(),

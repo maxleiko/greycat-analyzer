@@ -179,6 +179,7 @@ struct FmtEntry {
 /// usable in code review without an extra viewer.
 fn print_unified_diff(path: &Path, old: &str, new: &str, color: bool) {
     use similar::{ChangeTag, TextDiff};
+
     const RED: &str = "\x1b[31m";
     const GREEN: &str = "\x1b[32m";
     const CYAN: &str = "\x1b[36m";

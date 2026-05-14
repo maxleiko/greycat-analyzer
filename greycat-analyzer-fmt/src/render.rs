@@ -24,6 +24,7 @@ enum Mode {
 /// contains trailing whitespace on any line; a trailing newline is
 /// appended iff `opts.eol_last`.
 pub fn render(doc: &Doc, opts: &FmtOptions) -> String {
+    println!("{doc:#?}");
     let mut out = String::new();
     let mut col: usize = 0;
     let mut stack: Vec<(usize, Mode, &Doc)> = vec![(0, Mode::Break, doc)];
@@ -288,6 +289,17 @@ mod tests {
         let d = Doc::text("hello");
         assert_eq!(render(&d, &opts()), "hello");
     }
+
+    #[test]
+    fn eol_comment_are_spaced() {
+        let d = Doc::concat(vec![
+            Doc::Hard,
+            Doc::Concat(vec![Doc::text("42"), Doc::text(";")]),
+            Doc::text("// foo"),
+        ]);
+        assert_eq!(render(&d, &opts()), "var x; // foo");
+    }
+
 
     #[test]
     fn group_fits_flat() {

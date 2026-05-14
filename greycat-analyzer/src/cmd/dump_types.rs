@@ -36,12 +36,12 @@ use greycat_analyzer_analysis::{
     stdlib::ProjectIndex,
 };
 use greycat_analyzer_core::{Document, SourceManager, lsp_types::Uri, resolver::FsContext};
+use greycat_analyzer_core::{Primitive, TypeArena, TypeId, display_fqn};
 use greycat_analyzer_hir::{
     Hir,
     arena::Idx,
     types::{Decl, Expr, LiteralKind, Pragma, StringPart, TypeRef, UnaryOp},
 };
-use greycat_analyzer_types::{Primitive, TypeArena, TypeId, display_fqn};
 
 use crate::utils::AnyError;
 
@@ -328,9 +328,9 @@ fn collect_type_records(
     rel: &Path,
     doc: &Ref<'_, Document>,
     module: &ModuleAnalysis,
-    project_arena: &greycat_analyzer_types::TypeArena,
+    project_arena: &TypeArena,
     index: &ProjectIndex,
-    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     out: &mut Vec<Record>,
 ) {
     let file = path_to_string(rel);

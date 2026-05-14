@@ -15,13 +15,14 @@
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use greycat_analyzer_hir::arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::Decl;
+use greycat_analyzer_core::{SourceManager, SymbolTable, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_hir::types::{Decl, TypeRef};
 use greycat_analyzer_hir::{Hir, lower_module};
+use smol_str::SmolStr;
 
 use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
 use crate::directives::Directives;
@@ -93,7 +94,7 @@ impl ModuleTimings {
 /// instead of lingering.
 ///
 // P19
-/// The [`greycat_analyzer_types::TypeArena`] now lives on the
+/// The [`TypeArena`] now lives on the
 /// project (not per [`AnalysisResult`]). Every module's analyzer mints
 /// into the same arena so cross-module `TypeId`s are directly
 /// comparable — no `mint_type_shape`/`read_type_shape` translation
@@ -107,20 +108,20 @@ pub struct ProjectAnalysis {
     /// module's analyzer pass. Append-only and interned, so duplicate
     /// `seed_builtins` calls per `analyze_with_index_into` are a
     /// no-op.
-    pub arena: greycat_analyzer_types::TypeArena,
+    pub arena: TypeArena,
     // P35.1
     /// Project-wide registry of resolved `(Uri, Idx<Decl>)` →
     /// [`TypeDeclId`]. Issued during signature lowering; consumed by
     /// the type system to identify decls without going through their
     /// SmolStr name.
-    pub decl_registry: crate::well_known::DeclRegistry,
+    pub decl_registry: DeclRegistry,
     // P35.1
     /// Stable handles for the std/core native types the analyzer
     /// special-cases (node-tag auto-deref, runtime sentinels,
     /// collections). Populated during signature lowering. Slots stay
     /// `None` until the corresponding decl flows through the pipeline
     /// (or forever, when std isn't loaded).
-    pub well_known: crate::well_known::WellKnown,
+    pub well_known: WellKnown,
     // P23.7
     /// When `true`, lint suppressions (`// gcl-lint-off …`)
     /// are still recorded but never silence emissions. Drives the CLI's
@@ -175,36 +176,25 @@ struct ModuleSigCache {
     name_set_hash: u64,
     // P19.9
     /// `(type_sym, attr_sym, ty)`.
-    attrs: Vec<(
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::TypeId,
-    )>,
+    attrs: Vec<(Symbol, Symbol, TypeId)>,
     // P19.9
     /// `(type_sym, method_sym, ty)`.
-    methods: Vec<(
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::TypeId,
-    )>,
+    methods: Vec<(Symbol, Symbol, TypeId)>,
     // P19.9
     /// `(fn_sym, signature)`.
-    fns: Vec<(greycat_analyzer_types::Symbol, FnSignature)>,
+    fns: Vec<(Symbol, FnSignature)>,
     // P19.10
     /// `(var_sym, ty)`. Top-level `var` declared types.
     /// Lowered alongside the other signatures in
     /// [`lower_module_signatures`] so the analyzer's bare-Ident path
     /// can type a cross-module `Definition::ProjectDecl` pointing at
     /// a var.
-    vars: Vec<(
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::TypeId,
-    )>,
+    vars: Vec<(Symbol, TypeId)>,
 }
 
 impl ProjectAnalysis {
     pub fn new() -> Self {
-        let mut arena = greycat_analyzer_types::TypeArena::new();
+        let mut arena = TypeArena::new();
         seed_builtins(&mut arena);
         let index = ProjectIndex::new(&mut arena);
         Self {
@@ -222,15 +212,20 @@ impl ProjectAnalysis {
 
     /// Borrow the project-wide type arena — required for any
     /// `TypeId` lookup (`arena.get(id)`, `display(arena, id)`, …).
-    pub fn arena(&self) -> &greycat_analyzer_types::TypeArena {
+    pub fn arena(&self) -> &TypeArena {
         &self.arena
     }
 
     /// Mutable borrow of the project-wide type arena. Capability
     /// handlers should not mint new types; this is reserved for the
     /// orchestrator and the staged-pipeline body walker.
-    pub fn arena_mut(&mut self) -> &mut greycat_analyzer_types::TypeArena {
+    pub fn arena_mut(&mut self) -> &mut TypeArena {
         &mut self.arena
+    }
+
+    /// Borrow the project-wide symbol table
+    pub fn symbols(&self) -> &SymbolTable {
+        &self.index.symbols
     }
 
     /// Project-wide decl-handle registry — the canonical
@@ -257,7 +252,7 @@ impl ProjectAnalysis {
     ///
     /// Used by inlay hints so the user reading `var f = b::Foo {};`
     /// sees `: b::Foo` rather than the ambiguous bare `: Foo`.
-    pub fn display_type(&self, ty: greycat_analyzer_types::TypeId) -> ProjectTypeDisplay<'_> {
+    pub fn display_type(&self, ty: TypeId) -> ProjectTypeDisplay<'_> {
         ProjectTypeDisplay {
             project: self,
             id: ty,
@@ -325,6 +320,9 @@ impl ProjectAnalysis {
         // forward pass, no per-module dependency.
         let lowered = self.stage_lower(manager);
 
+        std::fs::create_dir_all("stage").unwrap();
+        std::fs::write("stage/lower.ron", format!("{lowered:#?}")).unwrap();
+
         // P40.1 — fold the entrypoint's `@lint_off("…")` / `@lint_on("…")`
         // pragmas into the project-wide policy. CLI flags (`--off` /
         // `--on`) have already been merged into `enabled_rules` /
@@ -333,12 +331,18 @@ impl ProjectAnalysis {
         // them, conflicts within one source aren't resolved here (P40.3
         // adds `conflicting-lint-pragma`). Per-module pragmas in
         // non-entrypoint modules land on `ModuleAnalysis` further down.
-        if let Some(entry_uri) = manager.entrypoint_uri()
-            && let Some((_, _, _, _, _, pragmas)) =
-                lowered.iter().find(|(uri, _, _, _, _, _)| uri == entry_uri)
-        {
-            self.disabled_rules.extend(pragmas.off.iter().cloned());
-            self.enabled_rules.extend(pragmas.on.iter().cloned());
+        if let Some(entry_uri) = manager.entrypoint_uri() {
+            let entry_pragmas = lowered.iter().find_map(|(uri, _, _, _, _, pragmas)| {
+                if uri == entry_uri {
+                    Some(pragmas)
+                } else {
+                    None
+                }
+            });
+            if let Some(pragmas) = entry_pragmas {
+                self.disabled_rules.extend(pragmas.off.iter().cloned());
+                self.enabled_rules.extend(pragmas.on.iter().cloned());
+            }
         }
 
         // S7-S11 (signatures) — lower every type's attr `TypeRef`s and
@@ -365,6 +369,8 @@ impl ProjectAnalysis {
         // lint. Lives outside the 12 stages because it mutates the
         // project index, not the type table.
         self.stage_compute_qualified_refs(manager);
+
+        std::fs::write("analysis.ron", format!("{self:#?}")).unwrap();
 
         // P40.1 — apply project-wide rule policy (`disabled_rules`,
         // sourced from CLI `--off` + the entrypoint's `@lint_off(...)`)
@@ -404,7 +410,7 @@ impl ProjectAnalysis {
     /// idempotent (the arena interns them on the second insert).
     fn reset_state(&mut self) {
         self.modules.clear();
-        self.arena = greycat_analyzer_types::TypeArena::new();
+        self.arena = TypeArena::new();
         seed_builtins(&mut self.arena);
         self.index = ProjectIndex::new(&mut self.arena);
         // P19.6 — cached `TypeId`s reference the old arena, which
@@ -481,7 +487,13 @@ impl ProjectAnalysis {
             // filename, which the recognizer ignores anyway.
             let module_name =
                 crate::stdlib::module_name_from_uri(&uri).unwrap_or_else(|| "module".to_string());
-            let hir = lower_module(&text, module_name, lib.as_str(), tree.root_node());
+            let hir = lower_module(
+                &text,
+                &self.index.symbols,
+                module_name,
+                lib.as_str(),
+                tree.root_node(),
+            );
             let lower_took = lower_start.elapsed();
             let directives = crate::directives::parse_directives(&text, tree.root_node());
             // P40.1 + P40.5 — walk `@lint_off` / `@lint_on` annotations.
@@ -567,7 +579,7 @@ impl ProjectAnalysis {
 /// the bare renderer byte-for-byte.
 pub struct ProjectTypeDisplay<'a> {
     project: &'a ProjectAnalysis,
-    id: greycat_analyzer_types::TypeId,
+    id: TypeId,
 }
 
 impl std::fmt::Display for ProjectTypeDisplay<'_> {
@@ -579,10 +591,10 @@ impl std::fmt::Display for ProjectTypeDisplay<'_> {
 fn write_type_qualified(
     f: &mut std::fmt::Formatter<'_>,
     project: &ProjectAnalysis,
-    id: greycat_analyzer_types::TypeId,
+    id: TypeId,
 ) -> std::fmt::Result {
-    use greycat_analyzer_types::TypeKind;
     let arena = project.arena();
+    let symbols = project.symbols();
     let ty = arena.get(id);
     match &ty.kind {
         TypeKind::Null => f.write_str("null")?,
@@ -596,16 +608,16 @@ fn write_type_qualified(
         }
         TypeKind::Unresolved { name, .. } => f.write_str(name.as_str())?,
         TypeKind::GenericParam { name, .. } => f.write_str(name.as_str())?,
-        TypeKind::Lambda(l) => {
+        TypeKind::Lambda { params, ret } => {
             f.write_str("(")?;
-            for (i, p) in l.params.iter().enumerate() {
+            for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
                 write_type_qualified(f, project, *p)?;
             }
             f.write_str(") -> ")?;
-            write_type_qualified(f, project, l.ret)?;
+            write_type_qualified(f, project, *ret)?;
         }
         TypeKind::Enum { name, .. } => f.write_str(name.as_str())?,
         TypeKind::Union { alts } => {
@@ -633,7 +645,7 @@ fn write_type_qualified(
 fn write_args_qualified(
     f: &mut std::fmt::Formatter<'_>,
     project: &ProjectAnalysis,
-    args: &[greycat_analyzer_types::TypeId],
+    args: &[TypeId],
 ) -> std::fmt::Result {
     f.write_str("<")?;
     for (i, a) in args.iter().enumerate() {
@@ -648,7 +660,7 @@ fn write_args_qualified(
 fn write_decl_qualified(
     f: &mut std::fmt::Formatter<'_>,
     project: &ProjectAnalysis,
-    decl: greycat_analyzer_types::TypeDeclId,
+    decl: TypeDeclId,
 ) -> std::fmt::Result {
     let Some(name) = project.arena().decl_name(decl) else {
         return write!(f, "?type#{}", decl.raw());
@@ -665,9 +677,7 @@ fn write_decl_qualified(
 
 // P19.6
 /// Fingerprint of the project-wide name set used by
-/// [`lower_type_ref_project`]. `lower_type_ref_project` checks
-/// `index.has_name(...)` for every non-primitive, non-generic-param
-/// TypeRef name; the answer flips between `Named(name)` and `any()`.
+/// [`lower_type_ref_project`].
 /// We hash the names that *exist* (sorted, so the answer is order-
 /// independent) so cached contributions can be reused only when the
 /// flip outcome is identical to last time.
@@ -678,19 +688,13 @@ fn project_name_set_hash(index: &ProjectIndex) -> u64 {
     // back to text through the project's symbol table for stable
     // string hashing.
     for sym in &index.type_names {
-        if let Some(s) = index.symbols.resolve(*sym) {
-            names.insert(s);
-        }
+        names.insert(&index.symbols[sym]);
     }
     for sym in index.natives.signatures.keys() {
-        if let Some(s) = index.symbols.resolve(*sym) {
-            names.insert(s);
-        }
+        names.insert(&index.symbols[sym]);
     }
     for sym in &index.values {
-        if let Some(s) = index.symbols.resolve(*sym) {
-            names.insert(s);
-        }
+        names.insert(&index.symbols[sym]);
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for n in &names {
@@ -825,7 +829,7 @@ fn hash_type_ref(
 /// so the rebuild walks every module fresh.
 #[allow(clippy::mutable_key_type)]
 fn lower_signatures_into(
-    arena_mut: &mut greycat_analyzer_types::TypeArena,
+    arena_mut: &mut TypeArena,
     index: &mut ProjectIndex,
     decl_registry: &crate::well_known::DeclRegistry,
     lowered: &[(&Uri, &Hir)],
@@ -880,8 +884,7 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
     // from `type_flags`, then resolve each via the chain-walking
     // method-return lookup. Avoids holding `&type_members` + `&mut
     // type_members` borrows simultaneously.
-    let mut resolutions: FxHashMap<greycat_analyzer_types::Symbol, greycat_analyzer_types::TypeId> =
-        FxHashMap::default();
+    let mut resolutions: FxHashMap<Symbol, TypeId> = FxHashMap::default();
     for (type_sym, flags) in &index.type_flags {
         let Some(method_name) = flags.deref.as_deref() else {
             continue;
@@ -889,9 +892,6 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
         if method_name.is_empty() {
             continue;
         }
-        let Some(type_name) = index.symbols.resolve(*type_sym) else {
-            continue;
-        };
         if let Some(ret) = index.type_method_return_chain(type_name, method_name) {
             resolutions.insert(*type_sym, ret);
         }
@@ -916,7 +916,7 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
 /// shared arena. The interner makes the *map* lookup cheap; the
 /// owner still needs the text for display.
 fn lower_module_signatures(
-    arena_mut: &mut greycat_analyzer_types::TypeArena,
+    arena_mut: &mut TypeArena,
     index: &mut ProjectIndex,
     decl_registry: &crate::well_known::DeclRegistry,
     uri: &Uri,
@@ -924,7 +924,7 @@ fn lower_module_signatures(
     sig_hash: u64,
     name_set_hash: u64,
 ) -> ModuleSigCache {
-    use greycat_analyzer_types::{GenericOwner, Symbol};
+    use {GenericOwner, Symbol};
 
     let mut entry = ModuleSigCache {
         sig_hash,
@@ -1047,8 +1047,7 @@ fn lower_module_signatures(
                 // **P19.15** — also pre-lower parameter types so the
                 // analyzer's generic-call inference can run on
                 // cross-module callees (`abs`, `min`, `max`, …).
-                let mut params: Vec<greycat_analyzer_types::TypeId> =
-                    Vec::with_capacity(fnd.params.len());
+                let mut params: Vec<TypeId> = Vec::with_capacity(fnd.params.len());
                 for p_id in &fnd.params {
                     let p = &hir.fn_params[*p_id];
                     let pt = if let Some(tr) = p.ty {
@@ -1102,7 +1101,7 @@ fn lower_module_signatures(
 }
 
 // P19.14
-/// Index-aware extension of [`greycat_analyzer_types::is_assignable_to`]
+/// Index-aware extension of [`is_assignable_to`]
 /// that recognises user-declared inheritance. Adds two cases on top
 /// of the standard relation:
 /// - `Named(Sub)` is assignable to `Named(Super)` when `Sub` is `Super`'s
@@ -1117,12 +1116,12 @@ fn lower_module_signatures(
 fn is_assignable_to_with_index(
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
-    arena: &greycat_analyzer_types::TypeArena,
-    from: greycat_analyzer_types::TypeId,
-    to: greycat_analyzer_types::TypeId,
+    arena: &TypeArena,
+    from: TypeId,
+    to: TypeId,
 ) -> bool {
-    use greycat_analyzer_types::TypeKind;
-    if greycat_analyzer_types::is_assignable_to(arena, from, to) {
+    use TypeKind;
+    if is_assignable_to(arena, from, to) {
         return true;
     }
     let a = arena.get(from);
@@ -1168,18 +1167,18 @@ fn is_assignable_to_with_index(
     }
 }
 
-/// Index-aware extension of [`greycat_analyzer_types::is_castable`].
+/// Index-aware extension of [`is_castable`].
 /// Adds the node-tag-handle-to-int cast rule (handles are 64-bit
 /// ints at runtime, so `nodeTime<T> as int` succeeds) using
 /// `WellKnown::is_node_tag(decl)` for decl-keyed dispatch.
 pub(crate) fn is_castable_with_index(
     well_known: &crate::well_known::WellKnown,
-    arena: &greycat_analyzer_types::TypeArena,
-    from: greycat_analyzer_types::TypeId,
-    to: greycat_analyzer_types::TypeId,
+    arena: &TypeArena,
+    from: TypeId,
+    to: TypeId,
 ) -> bool {
-    use greycat_analyzer_types::{Primitive, TypeKind};
-    if greycat_analyzer_types::is_castable(arena, from, to) {
+    use {Primitive, TypeKind};
+    if is_castable(arena, from, to) {
         return true;
     }
     // `*node as int`, `*nodeTime<T> as int`, … — the runtime handle
@@ -1422,7 +1421,7 @@ impl ProjectAnalysis {
         well_known: &crate::well_known::WellKnown,
         decl_registry: &crate::well_known::DeclRegistry,
         cur_uri: &Uri,
-        arena: &mut greycat_analyzer_types::TypeArena,
+        arena: &mut TypeArena,
     ) -> Vec<crate::analyzer::SemanticDiagnostic> {
         use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
         use greycat_analyzer_hir::types::Expr;
@@ -1539,9 +1538,9 @@ impl ProjectAnalysis {
                         severity: Severity::Error,
                         message: format!(
                             "value of type `{}` is not assignable to parameter `{}: {}`",
-                            arena.display(arg_ty),
+                            arena.display(arg_ty, &index.symbols),
                             p_name,
-                            arena.display(declared_ty),
+                            arena.display(declared_ty, &index.symbols),
                         ),
                         byte_range: r,
                         category: DiagCategory::TypeRelation,
@@ -1897,7 +1896,13 @@ impl ProjectAnalysis {
             // P35.1 — module name from URI for the well-known recogniser.
             let module_name =
                 crate::stdlib::module_name_from_uri(uri).unwrap_or_else(|| "module".to_string());
-            let hir = lower_module(&doc.text, module_name, &doc.lib, doc.root_node());
+            let hir = lower_module(
+                &doc.text,
+                &self.index.symbols,
+                module_name,
+                &doc.lib,
+                doc.root_node(),
+            );
             lower_took = start.elapsed();
             changed_lib = Some(doc.lib.clone());
             changed_directives = Some(crate::directives::parse_directives(
@@ -1958,7 +1963,13 @@ impl ProjectAnalysis {
             // P35.1 — module name from URI for the well-known recogniser.
             let module_name = crate::stdlib::module_name_from_uri(other_uri)
                 .unwrap_or_else(|| "module".to_string());
-            let hir = lower_module(&doc.text, module_name, &doc.lib, doc.root_node());
+            let hir = lower_module(
+                &doc.text,
+                &self.index.symbols,
+                module_name,
+                &doc.lib,
+                doc.root_node(),
+            );
             new_index.ingest(
                 other_uri,
                 &hir,
@@ -2173,7 +2184,7 @@ fn resolve_call_target(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
     cur: &ModuleAnalysis,
-    callee: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
+    callee: Idx<greycat_analyzer_hir::types::Expr>,
 ) -> Option<(Option<Uri>, Idx<Decl>)> {
     use crate::analyzer::MemberDef;
     use crate::resolver::Definition;
@@ -2332,7 +2343,7 @@ fn resolve_qualified_chain(
 fn run_typed_lints_for_module(
     uri: &Uri,
     module: &mut ModuleAnalysis,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     index: &ProjectIndex,
     bypass: bool,
     enabled_rules: &FxHashSet<String>,
@@ -2447,14 +2458,13 @@ fn run_typed_lints_for_module(
 fn validate_module_type_relations(
     module: &ModuleAnalysis,
     index: &ProjectIndex,
-    well_known: &crate::well_known::WellKnown,
-    decl_registry: &crate::well_known::DeclRegistry,
-    arena: &mut greycat_analyzer_types::TypeArena,
-    diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
+    well_known: &WellKnown,
+    decl_registry: &DeclRegistry,
+    arena: &mut TypeArena,
+    diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{SemanticDiagnostic, Severity};
     use greycat_analyzer_hir::types::Decl;
-    use greycat_analyzer_types::Primitive;
 
     let hir = &module.hir;
     let analysis = &module.analysis;
@@ -2479,13 +2489,13 @@ fn validate_module_type_relations(
 
     #[allow(clippy::too_many_arguments)]
     fn validate_decl(
-        hir: &greycat_analyzer_hir::Hir,
-        analysis: &crate::analyzer::AnalysisResult,
+        hir: &Hir,
+        analysis: &AnalysisResult,
         index: &ProjectIndex,
-        well_known: &crate::well_known::WellKnown,
-        decl_registry: &crate::well_known::DeclRegistry,
-        arena: &mut greycat_analyzer_types::TypeArena,
-        bool_t: greycat_analyzer_types::TypeId,
+        well_known: &WellKnown,
+        decl_registry: &DeclRegistry,
+        arena: &mut TypeArena,
+        bool_t: TypeId,
         decl: &Decl,
         diags: &mut Vec<SemanticDiagnostic>,
     ) {
@@ -2591,15 +2601,15 @@ fn validate_module_type_relations(
 
     #[allow(clippy::too_many_arguments)]
     fn validate_block(
-        hir: &greycat_analyzer_hir::Hir,
-        analysis: &crate::analyzer::AnalysisResult,
+        hir: &Hir,
+        analysis: &AnalysisResult,
         index: &ProjectIndex,
-        well_known: &crate::well_known::WellKnown,
-        decl_registry: &crate::well_known::DeclRegistry,
-        arena: &mut greycat_analyzer_types::TypeArena,
-        bool_t: greycat_analyzer_types::TypeId,
-        block: &greycat_analyzer_hir::types::BlockStmt,
-        return_ty: Option<greycat_analyzer_types::TypeId>,
+        well_known: &WellKnown,
+        decl_registry: &DeclRegistry,
+        arena: &mut TypeArena,
+        bool_t: TypeId,
+        block: &BlockStmt,
+        return_ty: Option<TypeId>,
         diags: &mut Vec<SemanticDiagnostic>,
     ) {
         for s in &block.stmts {
@@ -2620,15 +2630,15 @@ fn validate_module_type_relations(
 
     #[allow(clippy::too_many_arguments)]
     fn validate_stmt(
-        hir: &greycat_analyzer_hir::Hir,
-        analysis: &crate::analyzer::AnalysisResult,
+        hir: &Hir,
+        analysis: &AnalysisResult,
         index: &ProjectIndex,
-        well_known: &crate::well_known::WellKnown,
-        decl_registry: &crate::well_known::DeclRegistry,
-        arena: &mut greycat_analyzer_types::TypeArena,
-        bool_t: greycat_analyzer_types::TypeId,
-        stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
-        return_ty: Option<greycat_analyzer_types::TypeId>,
+        well_known: &WellKnown,
+        decl_registry: &DeclRegistry,
+        arena: &mut TypeArena,
+        bool_t: TypeId,
+        stmt_id: Idx<Stmt>,
+        return_ty: Option<TypeId>,
         diags: &mut Vec<SemanticDiagnostic>,
     ) {
         use greycat_analyzer_hir::types::{
@@ -2893,12 +2903,12 @@ fn validate_module_type_relations(
 
     #[allow(clippy::too_many_arguments)]
     fn check_assign(
-        analysis: &crate::analyzer::AnalysisResult,
+        analysis: &AnalysisResult,
         index: &ProjectIndex,
-        well_known: &crate::well_known::WellKnown,
-        arena: &greycat_analyzer_types::TypeArena,
-        value_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
-        declared_ty: greycat_analyzer_types::TypeId,
+        well_known: &WellKnown,
+        arena: &TypeArena,
+        value_id: Idx<Expr>,
+        declared_ty: TypeId,
         value_label: &str,
         target_label: &str,
         range: std::ops::Range<usize>,
@@ -2910,46 +2920,43 @@ fn validate_module_type_relations(
         if is_assignable_to_with_index(index, well_known, arena, value_ty, declared_ty) {
             return;
         }
-        let got = arena.display(value_ty);
-        let want = arena.display(declared_ty);
+        let got = arena.display(value_ty, &index.symbols);
+        let want = arena.display(declared_ty, &index.symbols);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             message: format!(
                 "{value_label} of type `{got}` is not assignable to {target_label} `{want}`"
             ),
             byte_range: range,
-            category: crate::analyzer::DiagCategory::TypeRelation,
+            category: DiagCategory::TypeRelation,
         });
     }
 
     fn check_bool(
-        analysis: &crate::analyzer::AnalysisResult,
-        arena: &greycat_analyzer_types::TypeArena,
-        expr_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
-        bool_t: greycat_analyzer_types::TypeId,
+        analysis: &AnalysisResult,
+        arena: &TypeArena,
+        expr_id: Idx<Expr>,
+        bool_t: TypeId,
         label: &'static str,
-        hir: &greycat_analyzer_hir::Hir,
+        hir: &Hir,
         diags: &mut Vec<SemanticDiagnostic>,
     ) {
         let Some(ty) = analysis.expr_types.get(&expr_id).copied() else {
             return;
         };
-        if greycat_analyzer_types::is_assignable_to(arena, ty, bool_t) {
+        if is_assignable_to(arena, ty, bool_t) {
             return;
         }
-        let got = arena.display(ty);
+        let got = arena.display(ty, &index.symbols);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             message: format!("{label} must be `bool`, got `{got}`"),
             byte_range: expr_byte_range(hir, expr_id),
-            category: crate::analyzer::DiagCategory::TypeRelation,
+            category: DiagCategory::TypeRelation,
         });
     }
 
-    fn expr_byte_range(
-        hir: &greycat_analyzer_hir::Hir,
-        expr_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
-    ) -> std::ops::Range<usize> {
+    fn expr_byte_range(hir: &Hir, expr_id: Idx<Expr>) -> std::ops::Range<usize> {
         hir.exprs[expr_id].byte_range()
     }
 }
@@ -2965,16 +2972,12 @@ fn validate_module_type_relations(
 /// instead of `Named { name: "T" }`.
 fn lower_type_ref_project(
     hir: &Hir,
-    type_ref: Idx<greycat_analyzer_hir::types::TypeRef>,
-    arena: &mut greycat_analyzer_types::TypeArena,
+    type_ref: Idx<TypeRef>,
+    arena: &mut TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
-    generics_in_scope: &FxHashMap<
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::GenericOwner,
-    >,
-) -> greycat_analyzer_types::TypeId {
-    use greycat_analyzer_types::Primitive;
+    decl_registry: &DeclRegistry,
+    generics_in_scope: &FxHashMap<Symbol, GenericOwner>,
+) -> TypeId {
     let tr = hir.type_refs[type_ref].clone();
     // Qualified ref (`b::Foo`, …): bypass the bare-name ladder. The
     // resolver-side `bind_qualified_type_leaf` and the body walker's
@@ -2990,82 +2993,78 @@ fn lower_type_ref_project(
             generics_in_scope,
         );
     }
-    let name = hir.idents[tr.name].text.as_str();
-    let mut base =
-        match name {
-            "bool" => arena.primitive(Primitive::Bool),
-            "int" => arena.primitive(Primitive::Int),
-            "float" => arena.primitive(Primitive::Float),
-            "char" => arena.primitive(Primitive::Char),
-            "String" => arena.primitive(Primitive::String),
-            "time" => arena.primitive(Primitive::Time),
-            "duration" => arena.primitive(Primitive::Duration),
-            "geo" => arena.primitive(Primitive::Geo),
-            "any" => arena.any(),
-            "null" => arena.null(),
-            _ => {
-                if !tr.params.is_empty() {
-                    let args: Vec<greycat_analyzer_types::TypeId> = tr
-                        .params
-                        .iter()
-                        .map(|p| {
-                            lower_type_ref_project(
-                                hir,
-                                *p,
-                                arena,
-                                index,
-                                decl_registry,
-                                generics_in_scope,
-                            )
-                        })
-                        .collect();
-                    match resolve_decl_handle(index, decl_registry, name) {
-                        Some(handle) => arena.generic(handle, name.to_string(), args),
-                        None => arena
-                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
-                    }
-                } else if let Some(sym) = index.symbol(name)
-                    && let Some(owner) = generics_in_scope.get(&sym)
-                {
-                    arena.generic_param(name.to_string(), owner.clone())
-                } else if let Some(arity) = index
-                    .type_members_for(name)
-                    .map(|m| m.generics.len())
-                    .filter(|n| *n > 0)
-                {
-                    // Raw-form generic reference: `Tensor` (no params)
-                    // ≡ `Tensor<any?, any?>`. Expand at lowering time so
-                    // the body walker and validation pass agree on the
-                    // same shape; kills the need for any raw-form bridge
-                    // in `is_assignable_to`.
-                    let any_q = arena.any_nullable();
-                    let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
-                    match resolve_decl_handle(index, decl_registry, name) {
-                        Some(handle) => arena.generic(handle, name.to_string(), args),
-                        None => arena
-                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
-                    }
-                } else if let Some(enum_id) = index.enum_type_for(name) {
-                    // P19.10 — canonical enum TypeId from S7-S11.
-                    // Without this, a cross-module enum reference would
-                    // mint `Named(name)` (kind != Enum), which breaks
-                    // the analyzer's `Static` enum-variant arm
-                    // (`if let TypeKind::Enum { variants, .. } = ...`).
-                    enum_id
-                } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
-                    // Non-generic concrete type with a known home decl:
-                    // mint a handle-keyed `Type(handle)` so it interns
-                    // equal to whatever `register_module_types` produced
-                    // for the same decl in the per-module analyzer.
-                    arena.alloc_type(handle, name.to_string())
-                } else {
-                    // No reachable decl: `Unresolved` so hover / display
-                    // surface the typo'd name verbatim, behaves like
-                    // `any?` for assignability.
-                    arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
+    let name_sym = hir.idents[tr.name].symbol;
+    let name = &index.symbols[name_sym];
+    let mut base = match name {
+        "bool" => arena.primitive(Primitive::Bool),
+        "int" => arena.primitive(Primitive::Int),
+        "float" => arena.primitive(Primitive::Float),
+        "char" => arena.primitive(Primitive::Char),
+        "String" => arena.primitive(Primitive::String),
+        "time" => arena.primitive(Primitive::Time),
+        "duration" => arena.primitive(Primitive::Duration),
+        "geo" => arena.primitive(Primitive::Geo),
+        "any" => arena.any(),
+        "null" => arena.null(),
+        _ => {
+            if !tr.params.is_empty() {
+                let args: Vec<TypeId> = tr
+                    .params
+                    .iter()
+                    .map(|p| {
+                        lower_type_ref_project(
+                            hir,
+                            *p,
+                            arena,
+                            index,
+                            decl_registry,
+                            generics_in_scope,
+                        )
+                    })
+                    .collect();
+                match resolve_decl_handle(index, decl_registry, name) {
+                    Some(handle) => arena.generic(handle, args),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
+            } else if let Some(owner) = generics_in_scope.get(&name_sym) {
+                arena.generic_param(name_sym, owner.clone())
+            } else if let Some(arity) = index
+                .type_members_for(name)
+                .map(|m| m.generics.len())
+                .filter(|n| *n > 0)
+            {
+                // Raw-form generic reference: `Tensor` (no params)
+                // ≡ `Tensor<any?, any?>`. Expand at lowering time so
+                // the body walker and validation pass agree on the
+                // same shape; kills the need for any raw-form bridge
+                // in `is_assignable_to`.
+                let any_q = arena.any_nullable();
+                let args: Vec<TypeId> = vec![any_q; arity];
+                match resolve_decl_handle(index, decl_registry, name) {
+                    Some(handle) => arena.generic(handle, args),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
+                }
+            } else if let Some(enum_id) = index.enum_type_for(name) {
+                // P19.10 — canonical enum TypeId from S7-S11.
+                // Without this, a cross-module enum reference would
+                // mint `Named(name)` (kind != Enum), which breaks
+                // the analyzer's `Static` enum-variant arm
+                // (`if let TypeKind::Enum { variants, .. } = ...`).
+                enum_id
+            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+                // Non-generic concrete type with a known home decl:
+                // mint a handle-keyed `Type(handle)` so it interns
+                // equal to whatever `register_module_types` produced
+                // for the same decl in the per-module analyzer.
+                arena.alloc_type(handle)
+            } else {
+                // No reachable decl: `Unresolved` so hover / display
+                // surface the typo'd name verbatim, behaves like
+                // `any?` for assignability.
+                arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end))
             }
-        };
+        }
+    };
     if tr.optional {
         base = arena.nullable(base);
     }
@@ -3083,9 +3082,9 @@ fn lower_type_ref_project(
 // types.
 pub fn resolve_decl_handle(
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     name: &str,
-) -> Option<greycat_analyzer_types::TypeDeclId> {
+) -> Option<TypeDeclId> {
     for (uri, decl) in index.locate_decl(name) {
         if let Some(h) = decl_registry.lookup(uri, *decl) {
             return Some(h);
@@ -3100,24 +3099,21 @@ pub fn resolve_decl_handle(
 /// qualified ref binds to, or cross-arena identity breaks.
 fn lower_qualified_type_ref_project(
     hir: &Hir,
-    tr: &greycat_analyzer_hir::types::TypeRef,
-    arena: &mut greycat_analyzer_types::TypeArena,
+    tr: &TypeRef,
+    arena: &mut TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
-    generics_in_scope: &FxHashMap<
-        greycat_analyzer_types::Symbol,
-        greycat_analyzer_types::GenericOwner,
-    >,
-) -> greycat_analyzer_types::TypeId {
+    decl_registry: &DeclRegistry,
+    generics_in_scope: &FxHashMap<Symbol, GenericOwner>,
+) -> TypeId {
     let module_segment = *tr
         .qualifier
         .last()
         .expect("lower_qualified_type_ref_project called with empty qualifier");
-    let module_name = hir.idents[module_segment].text.as_str();
-    let leaf_name = hir.idents[tr.name].text.to_string();
+    let module_name = hir.idents[module_segment].symbol;
+    let leaf_name = hir.idents[tr.name].symbol;
     let byte_span = (tr.byte_range.start, tr.byte_range.end);
 
-    let Some(module_uri) = index.module_uri(module_name).cloned() else {
+    let Some(module_uri) = index.module_names.get(&module_name) else {
         let mut base = arena.unresolved(leaf_name, byte_span);
         if tr.optional {
             base = arena.nullable(base);
@@ -3126,13 +3122,13 @@ fn lower_qualified_type_ref_project(
     };
 
     let decl_in_module: Option<Idx<Decl>> = index
-        .locate_decl(&leaf_name)
+        .locate_decl_by_symbol(leaf_name)
         .iter()
-        .find(|(uri, _)| uri == &module_uri)
+        .find(|(uri, _)| uri == module_uri)
         .map(|(_, d)| *d);
 
     if !tr.params.is_empty() {
-        let args: Vec<greycat_analyzer_types::TypeId> = tr
+        let args: Vec<TypeId> = tr
             .params
             .iter()
             .map(|p| {
@@ -3140,8 +3136,8 @@ fn lower_qualified_type_ref_project(
             })
             .collect();
         let mut base = match decl_in_module.and_then(|d| decl_registry.lookup(&module_uri, d)) {
-            Some(handle) => arena.generic(handle, leaf_name.clone(), args),
-            None => arena.unresolved(leaf_name.clone(), byte_span),
+            Some(handle) => arena.generic(handle, args),
+            None => arena.unresolved(leaf_name, byte_span),
         };
         if tr.optional {
             base = arena.nullable(base);
@@ -3151,7 +3147,7 @@ fn lower_qualified_type_ref_project(
 
     let mut base = match decl_in_module {
         Some(d) => match decl_registry.lookup(&module_uri, d) {
-            Some(handle) => arena.alloc_type(handle, leaf_name.clone()),
+            Some(handle) => arena.alloc_type(handle),
             None => arena.unresolved(leaf_name, byte_span),
         },
         None => arena.unresolved(leaf_name, byte_span),
@@ -3167,15 +3163,15 @@ fn lower_qualified_type_ref_project(
 /// `analysis.types`, so any new mints land where `is_assignable_to`
 /// can see them.
 fn lower_type_ref_id(
-    hir: &greycat_analyzer_hir::Hir,
-    type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
-    registry: &greycat_analyzer_types::TypeRegistry,
+    hir: &Hir,
+    type_ref: Idx<TypeRef>,
+    registry: &TypeRegistry,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
-    type_decls: &rustc_hash::FxHashMap<smol_str::SmolStr, greycat_analyzer_hir::arena::Idx<Decl>>,
-    arena: &mut greycat_analyzer_types::TypeArena,
-) -> Option<greycat_analyzer_types::TypeId> {
-    use greycat_analyzer_types::Primitive;
+    decl_registry: &DeclRegistry,
+    type_decls: &FxHashMap<SmolStr, Idx<Decl>>,
+    arena: &mut TypeArena,
+) -> Option<TypeId> {
+    use Primitive;
     let tr = &hir.type_refs[type_ref];
     // Qualified ref (`b::Foo`, …) — route through the same
     // module-scoped lookup the resolver and the body walker use, so
@@ -3191,75 +3187,72 @@ fn lower_type_ref_id(
             &generics_in_scope,
         ));
     }
-    let name = hir.idents[tr.name].text.as_str();
-    let base =
-        match name {
-            "bool" => arena.primitive(Primitive::Bool),
-            "int" => arena.primitive(Primitive::Int),
-            "float" => arena.primitive(Primitive::Float),
-            "char" => arena.primitive(Primitive::Char),
-            "String" => arena.primitive(Primitive::String),
-            "time" => arena.primitive(Primitive::Time),
-            "duration" => arena.primitive(Primitive::Duration),
-            "geo" => arena.primitive(Primitive::Geo),
-            "any" => arena.any(),
-            "null" => arena.null(),
-            _ => {
-                if !tr.params.is_empty() {
-                    let mut args = Vec::with_capacity(tr.params.len());
-                    for p in &tr.params {
-                        args.push(lower_type_ref_id(
-                            hir,
-                            *p,
-                            registry,
-                            index,
-                            decl_registry,
-                            type_decls,
-                            arena,
-                        )?);
-                    }
-                    match resolve_decl_handle(index, decl_registry, name) {
-                        Some(handle) => arena.generic(handle, name.to_string(), args),
-                        None => arena
-                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
-                    }
-                } else if let Some(arity) = generic_arity_for(name, hir, type_decls, index) {
-                    // Raw-form generic reference: `Tensor` (no params)
-                    // ≡ `Tensor<any?, any?>`. Expand here so the
-                    // validation pass and the body walker's
-                    // `lower_type_ref` produce the same shape.
-                    let any_q = arena.any_nullable();
-                    let args: Vec<greycat_analyzer_types::TypeId> = vec![any_q; arity];
-                    match resolve_decl_handle(index, decl_registry, name) {
-                        Some(handle) => arena.generic(handle, name.to_string(), args),
-                        None => arena
-                            .unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end)),
-                    }
-                } else if let Some(id) = registry.lookup(name) {
-                    id
-                } else if let Some(enum_id) = index.enum_type_for(name) {
-                    // Canonical enum TypeId from S7-S11. The body walker's
-                    // `lower_type_ref` and `lower_type_ref_project` both
-                    // hit this branch ahead of `resolve_decl_handle`; the
-                    // validation pass has to agree or `Generic("Array",
-                    // [Enum{...}])` (body) vs `Generic("Array",
-                    // [Type(handle)])` (validation) fails invariant
-                    // arg-equality.
-                    enum_id
-                } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
-                    // Foreign non-generic decl: mint `Type(handle)` to
-                    // match what the body walker's `lower_type_ref` and
-                    // the signature pass's `lower_type_ref_project`
-                    // produce. Without this, the validation pass would
-                    // mint a different shape than the body walker for
-                    // the same source token — surfacing as a self-named
-                    // "T is not assignable to T" diagnostic.
-                    arena.alloc_type(handle, name.to_string())
-                } else {
-                    arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
+    let name_sym = hir.idents[tr.name].symbol;
+    let base = match &index.symbols[name_sym] {
+        "bool" => arena.primitive(Primitive::Bool),
+        "int" => arena.primitive(Primitive::Int),
+        "float" => arena.primitive(Primitive::Float),
+        "char" => arena.primitive(Primitive::Char),
+        "String" => arena.primitive(Primitive::String),
+        "time" => arena.primitive(Primitive::Time),
+        "duration" => arena.primitive(Primitive::Duration),
+        "geo" => arena.primitive(Primitive::Geo),
+        "any" => arena.any(),
+        "null" => arena.null(),
+        _ => {
+            if !tr.params.is_empty() {
+                let mut args = Vec::with_capacity(tr.params.len());
+                for p in &tr.params {
+                    args.push(lower_type_ref_id(
+                        hir,
+                        *p,
+                        registry,
+                        index,
+                        decl_registry,
+                        type_decls,
+                        arena,
+                    )?);
                 }
+                match resolve_decl_handle(index, decl_registry, name) {
+                    Some(handle) => arena.generic(handle, args),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
+                }
+            } else if let Some(arity) = generic_arity_for(name, hir, type_decls, index) {
+                // Raw-form generic reference: `Tensor` (no params)
+                // ≡ `Tensor<any?, any?>`. Expand here so the
+                // validation pass and the body walker's
+                // `lower_type_ref` produce the same shape.
+                let any_q = arena.any_nullable();
+                let args: Vec<TypeId> = vec![any_q; arity];
+                match resolve_decl_handle(index, decl_registry, name) {
+                    Some(handle) => arena.generic(handle, args),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
+                }
+            } else if let Some(id) = registry.lookup(name) {
+                id
+            } else if let Some(enum_id) = index.enum_type_for(name) {
+                // Canonical enum TypeId from S7-S11. The body walker's
+                // `lower_type_ref` and `lower_type_ref_project` both
+                // hit this branch ahead of `resolve_decl_handle`; the
+                // validation pass has to agree or `Generic("Array",
+                // [Enum{...}])` (body) vs `Generic("Array",
+                // [Type(handle)])` (validation) fails invariant
+                // arg-equality.
+                enum_id
+            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+                // Foreign non-generic decl: mint `Type(handle)` to
+                // match what the body walker's `lower_type_ref` and
+                // the signature pass's `lower_type_ref_project`
+                // produce. Without this, the validation pass would
+                // mint a different shape than the body walker for
+                // the same source token — surfacing as a self-named
+                // "T is not assignable to T" diagnostic.
+                arena.alloc_type(handle)
+            } else {
+                arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
             }
-        };
+        }
+    };
     Some(if tr.optional {
         arena.nullable(base)
     } else {
@@ -3275,7 +3268,7 @@ fn lower_type_ref_id(
 fn generic_arity_for(
     name: &str,
     hir: &greycat_analyzer_hir::Hir,
-    type_decls: &rustc_hash::FxHashMap<smol_str::SmolStr, greycat_analyzer_hir::arena::Idx<Decl>>,
+    type_decls: &rustc_hash::FxHashMap<smol_str::SmolStr, Idx<Decl>>,
     index: &ProjectIndex,
 ) -> Option<usize> {
     if let Some(decl_id) = type_decls.get(name)
@@ -3309,19 +3302,18 @@ fn generic_arity_for(
 /// `value: T`", and the call appears broken to the user even though
 /// the runtime accepts it cleanly. Substituting `T → int?` before
 /// minting closes the gap.
-type GenericsInScope =
-    FxHashMap<greycat_analyzer_types::Symbol, greycat_analyzer_types::GenericOwner>;
-type MethodSubst = FxHashMap<String, greycat_analyzer_types::TypeId>;
+type GenericsInScope = FxHashMap<Symbol, GenericOwner>;
+type MethodSubst = FxHashMap<String, TypeId>;
 
 fn method_subst_from_receiver(
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     cur_module: &ModuleAnalysis,
     fn_module: &ModuleAnalysis,
     index: &ProjectIndex,
     callee_expr: &greycat_analyzer_hir::types::Expr,
 ) -> (GenericsInScope, MethodSubst) {
     use greycat_analyzer_hir::types::Expr;
-    use greycat_analyzer_types::{GenericOwner, TypeKind};
+    use {GenericOwner, TypeKind};
     let empty = || (GenericsInScope::default(), MethodSubst::default());
     let receiver_expr_id = match callee_expr {
         Expr::Member(m) | Expr::Arrow(m) => m.receiver,
@@ -3336,7 +3328,7 @@ fn method_subst_from_receiver(
         return empty();
     };
     let recv = arena.get(receiver_ty);
-    let (recv_name, recv_args): (&str, &[greycat_analyzer_types::TypeId]) = match &recv.kind {
+    let (recv_name, recv_args): (&str, &[TypeId]) = match &recv.kind {
         TypeKind::Generic { decl, args } => match arena.decl_name(*decl) {
             Some(n) => (n, args.as_slice()),
             None => return empty(),
@@ -3624,7 +3616,10 @@ mod tests {
             .index
             .fn_signature_for("a")
             .expect("a sig present after invalidate");
-        let display = pa.arena.display(sig.return_ty).to_string();
+        let display = pa
+            .arena
+            .display(sig.return_ty, &pa.index.symbols)
+            .to_string();
         assert!(
             display.contains("String"),
             "expected refreshed return type to be String, got {display:?}"

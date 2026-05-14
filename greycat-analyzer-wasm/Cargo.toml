@@ -18,7 +18,6 @@ greycat-analyzer-core.workspace = true
 greycat-analyzer-fmt.workspace = true
 greycat-analyzer-hir.workspace = true
 greycat-analyzer-syntax.workspace = true
-greycat-analyzer-types.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

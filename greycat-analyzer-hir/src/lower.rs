@@ -5,22 +5,25 @@
 
 use std::ops::Range;
 
+use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_syntax::tree_sitter;
 
 use crate::Hir;
 use crate::arena::Idx;
 use crate::types::*;
 
-pub struct LowerCtx<'src> {
+pub struct LowerCtx<'src, 'symbols> {
     pub hir: Hir,
     source: &'src str,
+    symbols: &'symbols SymbolTable,
 }
 
-impl<'src> LowerCtx<'src> {
-    pub fn new(source: &'src str) -> Self {
+impl<'src, 'symbols> LowerCtx<'src, 'symbols> {
+    pub fn new(source: &'src str, symbols: &'symbols SymbolTable) -> Self {
         Self {
             hir: Hir::default(),
             source,
+            symbols,
         }
     }
 
@@ -30,8 +33,7 @@ impl<'src> LowerCtx<'src> {
 
     fn alloc_ident(&mut self, node: tree_sitter::Node<'_>) -> Idx<Ident> {
         self.hir.idents.alloc(Ident {
-            // P25.5
-            text: self.text(node).into(),
+            symbol: self.symbols.intern(self.text(node)),
             byte_range: node.byte_range(),
         })
     }
@@ -56,8 +58,7 @@ impl<'src> LowerCtx<'src> {
                 .find(|n| n.kind() == "string_fragment")
             {
                 return self.hir.idents.alloc(Ident {
-                    // P25.5
-                    text: self.text(frag).into(),
+                    symbol: self.symbols.intern(self.text(frag)),
                     byte_range: node.byte_range(),
                 });
             }
@@ -80,11 +81,12 @@ impl<'src> LowerCtx<'src> {
 
 pub fn lower_module(
     source: &str,
+    symbols: &SymbolTable,
     name: impl Into<String>,
     lib: impl Into<String>,
     root: tree_sitter::Node<'_>,
 ) -> Hir {
-    let mut cx = LowerCtx::new(source);
+    let mut cx = LowerCtx::new(source, symbols);
     let mut decl_ids: Vec<Idx<Decl>> = Vec::new();
 
     if root.kind() == "module" {
@@ -1835,7 +1837,10 @@ fn collect_static_chain_idents(
     true
 }
 
-fn operator_text<'src>(cx: &LowerCtx<'src>, node: tree_sitter::Node<'_>) -> &'src str {
+fn operator_text<'src, 'symbols>(
+    cx: &LowerCtx<'src, 'symbols>,
+    node: tree_sitter::Node<'_>,
+) -> &'src str {
     // The operator is the first anonymous (non-named) child.
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {

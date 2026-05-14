@@ -16,7 +16,6 @@ greycat-analyzer-fmt.workspace = true
 greycat-analyzer-hir.workspace = true
 greycat-analyzer-server.workspace = true
 greycat-analyzer-syntax.workspace = true
-greycat-analyzer-types.workspace = true
 
 clap.workspace = true
 env_logger.workspace = true

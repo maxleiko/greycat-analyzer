@@ -1,10 +1,11 @@
 //! HIR node types — declarations, statements, expressions, type refs.
 //! "Type ref" here means *syntactic* type annotation (e.g. `Array<int>`),
-//! distinct from the *semantic* `Type` enum that `greycat-analyzer-types`
+//! distinct from the *semantic* `Type` enum that `greycat-analyzer-core`
 //! computes during inference.
 
 use std::ops::Range;
 
+use greycat_analyzer_core::Symbol;
 use smol_str::SmolStr;
 
 use crate::arena::Idx;
@@ -23,8 +24,7 @@ pub struct Module {
 
 #[derive(Debug, Clone)]
 pub struct Ident {
-    // P25.5
-    pub text: SmolStr,
+    pub symbol: Symbol,
     pub byte_range: Span,
 }
 
@@ -700,9 +700,7 @@ pub struct LambdaExpr {
 /// faithfully: `(ident "::")* ident <generics>? "?"?`.
 ///
 /// `qualifier` carries the module path prefix (zero or more segments,
-/// leftmost-first). Empty slice = bare reference. `Box<[_]>` rather
-/// than `Vec` because the path is fixed after lowering — `Vec`'s
-/// capacity word would just be waste.
+/// leftmost-first). Empty slice = bare reference.
 #[derive(Debug, Clone)]
 pub struct TypeRef {
     /// Module-qualifier segments before the leaf name.

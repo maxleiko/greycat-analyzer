@@ -2,13 +2,15 @@
 //! (not the `Not` wildcard fallback). Regression test for
 //! `fix(hir): lower ++ / -- / + as Inc/Dec/Pos, not Not`.
 
+use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::{Decl, Expr, Stmt, UnaryExpr, UnaryOp};
 use greycat_analyzer_syntax::parse;
 
 fn first_stmt_unary_op(src: &str) -> UnaryOp {
     let tree = parse(src);
-    let hir = lower_module(src, "module", "lib", tree.root_node());
+    let symbols = SymbolTable::default();
+    let hir = lower_module(src, &symbols, "module", "lib", tree.root_node());
     let module = hir.module.as_ref().expect("module lowered");
     let fn_decl = module
         .decls

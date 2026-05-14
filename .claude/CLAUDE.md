@@ -11,9 +11,8 @@ Rust edition 2024. Workspace resolver `"3"`. Workspace metadata (`license = "MIT
 | Crate | Purpose |
 |---|---|
 | [greycat-analyzer-syntax](../greycat-analyzer-syntax/) | Tree-sitter wrapper. Owns parsing via [tree-sitter-greycat](../tree-sitter-greycat/) (git submodule at the repo root). |
-| [greycat-analyzer-core](../greycat-analyzer-core/) | `Document`, `SourceManager`, `span`, project graph, `@library` / `@include` resolver, parse diagnostics. Re-exports `lsp_types` and `greycat_analyzer_syntax`. |
+| [greycat-analyzer-core](../greycat-analyzer-core/) | `Document`, `SourceManager`, `span`, project graph, `@library` / `@include` resolver, parse diagnostics. Re-exports `lsp_types` and `greycat_analyzer_syntax`, `Type` / `TypeKind`, `TypeArena`, subtyping (`is_assignable_to`), `InferenceTable` foundation. |
 | [greycat-analyzer-hir](../greycat-analyzer-hir/) | Arena-backed typed HIR, CST→HIR lowering. |
-| [greycat-analyzer-types](../greycat-analyzer-types/) | `Type` / `TypeKind`, `TypeArena`, subtyping (`is_assignable_to`), `InferenceTable` foundation. |
 | [greycat-analyzer-analysis](../greycat-analyzer-analysis/) | Resolver, analyzer (inference + null-flow + `is`-narrowing + enum exhaustiveness + member resolution), lints, `ProjectAnalysis` driver, `ProjectIndex` cross-module index, `actions` vocabulary. |
 | [greycat-analyzer-fmt](../greycat-analyzer-fmt/) | Formatter (foundational; per-construct parity with TS `cst_format.ts` is P9.1). |
 | [greycat-analyzer-server](../greycat-analyzer-server/) | LSP server (`lsp-server` + `crossbeam-channel`). Capability handlers in [src/capabilities.rs](../greycat-analyzer-server/src/capabilities.rs). |

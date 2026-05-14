@@ -27,9 +27,13 @@ pub mod module_desc;
 pub mod registry;
 pub mod resolver;
 pub mod span;
+mod types;
+mod symbols;
 
 pub use doc::*;
 pub use manager::*;
+pub use types::*;
+pub use symbols::*;
 
 /// Re-export `lsp_types`
 pub use lsp_types;

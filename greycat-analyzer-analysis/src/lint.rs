@@ -16,13 +16,13 @@ use std::ops::Range;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
+use greycat_analyzer_core::TypeKind;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, PropertyName, Stmt,
     TypeDecl, UnaryExpr, UnaryOp,
 };
-use greycat_analyzer_types::TypeKind;
 
 use crate::analyzer::AnalysisResult;
 use crate::resolver::{Definition, Resolutions};
@@ -1020,7 +1020,7 @@ fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
 pub fn lint_arrow_on_non_deref(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
 ) {
@@ -1032,7 +1032,7 @@ pub fn lint_arrow_on_non_deref(
 pub fn lint_arrow_on_non_deref_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut crate::directives::Directives,
@@ -1052,7 +1052,7 @@ pub fn lint_arrow_on_non_deref_with_directives(
 fn lint_arrow_on_non_deref_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut crate::directives::Directives>,
@@ -1127,10 +1127,7 @@ fn emit_typed(
 /// `Primitive` to their canonical name. Returns `None` for shapes the
 /// lint conservatively skips (any / never / null / lambda / tuple /
 /// anonymous / union / enum / generic-param).
-fn receiver_head_name(
-    arena: &greycat_analyzer_types::TypeArena,
-    ty: greycat_analyzer_types::TypeId,
-) -> Option<String> {
+fn receiver_head_name(arena: &TypeArena, ty: TypeId) -> Option<String> {
     let t = arena.get(ty);
     match &t.kind {
         // P35.7 — `TypeKind::Type(handle)` / `Generic` recover
@@ -1278,7 +1275,7 @@ impl LintRule for ModVarShape {
 pub fn lint_inferred_return_type(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
 ) {
     lint_inferred_return_type_inner(hir, analysis, arena, out, None, false);
@@ -1288,7 +1285,7 @@ pub fn lint_inferred_return_type(
 pub fn lint_inferred_return_type_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut crate::directives::Directives,
     bypass_suppressions: bool,
@@ -1306,7 +1303,7 @@ pub fn lint_inferred_return_type_with_directives(
 fn lint_inferred_return_type_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut crate::directives::Directives>,
     bypass_suppressions: bool,
@@ -1348,7 +1345,7 @@ fn lint_inferred_return_type_inner(
 fn check_fn_inferred_return(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     fnd: &FnDecl,
     out: &mut Vec<LintDiagnostic>,
     directives: Option<&mut crate::directives::Directives>,
@@ -1395,7 +1392,7 @@ fn inferred_return_from_body(
     hir: &Hir,
     analysis: &AnalysisResult,
     body: Idx<Stmt>,
-) -> Option<greycat_analyzer_types::TypeId> {
+) -> Option<TypeId> {
     let Stmt::Block(block) = &hir.stmts[body] else {
         return None;
     };
@@ -1462,7 +1459,7 @@ pub fn chain_has_upstream_nullsafe(hir: &Hir, expr_id: Idx<Expr>) -> bool {
 pub fn lint_nullability(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
 ) {
     lint_nullability_inner(hir, analysis, arena, out, None, false);
@@ -1472,7 +1469,7 @@ pub fn lint_nullability(
 pub fn lint_nullability_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut crate::directives::Directives,
     bypass_suppressions: bool,
@@ -1490,7 +1487,7 @@ pub fn lint_nullability_with_directives(
 fn lint_nullability_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
-    arena: &greycat_analyzer_types::TypeArena,
+    arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut crate::directives::Directives>,
     bypass_suppressions: bool,

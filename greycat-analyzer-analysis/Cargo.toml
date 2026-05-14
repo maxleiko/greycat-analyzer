@@ -10,7 +10,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-greycat-analyzer-types.workspace = true
 greycat-analyzer-hir.workspace = true
 greycat-analyzer-core.workspace = true
 greycat-analyzer-syntax.workspace = true

@@ -25,6 +25,10 @@ use std::ops::Range;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
+use greycat_analyzer_core::{
+    GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
+    is_assignable_to,
+};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -32,10 +36,6 @@ use greycat_analyzer_hir::types::{
     ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr, ObjectExpr,
     OffsetExpr, Pragma, StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef,
     UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
-};
-use greycat_analyzer_types::{
-    GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_assignable_to,
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -428,7 +428,7 @@ pub fn analyze_with_index_into(
         let ident = &hir.idents[ident_idx];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
-            format!("unresolved name `{}`", ident.text),
+            format!("unresolved name `{}`", &index.symbols[ident.symbol]),
             ident.byte_range.clone(),
         ));
     }
@@ -447,15 +447,14 @@ pub fn analyze_with_index_into(
                 crate::stdlib::module_name_from_uri(uri).unwrap_or_else(|| "<unknown>".to_string())
             })
             .collect();
+        let name = &index.symbols[ident.symbol];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             format!(
-                "ambiguous-symbol: `{}` is exported by {} modules ({}); use a fully-qualified name like `{}::{}`",
-                ident.text,
+                "ambiguous-symbol: `{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
                 module_names.len(),
                 module_names.join(", "),
                 module_names.first().map(String::as_str).unwrap_or("<module>"),
-                ident.text,
             ),
             ident.byte_range.clone(),
         ));
@@ -481,7 +480,7 @@ pub fn analyze_with_index_into(
                 format!(
                     "{kind_label} `{}` has {} generic parameters; \
                      the GreyCat runtime supports at most {MAX_GENERICS}",
-                    hir.idents[name_ident].text,
+                    &index.symbols[hir.idents[name_ident].symbol],
                     generics.len(),
                 ),
                 hir.idents[first_over_limit].byte_range.clone(),
@@ -599,7 +598,7 @@ fn register_module_types(
         let decl = &hir.decls[*d];
         match decl {
             Decl::Type(td) => {
-                let name: SmolStr = hir.idents[td.name].text.as_str().into();
+                let name = hir.idents[td.name].symbol;
                 // Mint `TypeKind::Type(handle)` for the local decl.
                 // The project pipeline's `ingest` always pre-pop'd
                 // the registry; the standalone `analyze` /
@@ -608,10 +607,10 @@ fn register_module_types(
                 // caller bypassed both — `Unresolved` is the
                 // safest fallback (behaves like `any?`).
                 let id = match decl_registry.lookup(module_uri, *d) {
-                    Some(handle) => arena.alloc_type(handle, name.clone()),
-                    None => arena.unresolved(name.clone(), (0, 0)),
+                    Some(handle) => arena.alloc_type(handle),
+                    None => arena.unresolved(name, (0, 0)),
                 };
-                out.registry.register(name.clone(), id);
+                out.registry.register(name, id);
                 out.type_decls.insert(name, *d);
             }
             Decl::Enum(ed) => {

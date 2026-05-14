@@ -8,7 +8,6 @@ members = [
   "greycat-analyzer-hir",
   "greycat-analyzer-server",
   "greycat-analyzer-syntax",
-  "greycat-analyzer-types",
   "greycat-analyzer-wasm",
 ]
 
@@ -36,7 +35,6 @@ greycat-analyzer-fmt = { path = "greycat-analyzer-fmt", version = "0.1.0" }
 greycat-analyzer-hir = { path = "greycat-analyzer-hir", version = "0.1.0" }
 greycat-analyzer-server = { path = "greycat-analyzer-server", version = "0.1.0" }
 greycat-analyzer-syntax = { path = "greycat-analyzer-syntax", version = "0.1.0" }
-greycat-analyzer-types = { path = "greycat-analyzer-types", version = "0.1.0" }
 tree-sitter-greycat = { path = "tree-sitter-greycat" }
 
 # Third-party. Features chosen here are the union of what crates
@@ -51,6 +49,7 @@ dashmap = "6.1.0"
 env_logger = "0.11.8"
 insta = "1"
 line-index = "0.1.2"
+lasso = { version = "0.7.3", features = ["multi-threaded", "serialize"] }
 log = "0.4.27"
 lsp-server = "0.7.8"
 lsp-types = "0.97.0"
