@@ -20,7 +20,7 @@
 //! against the live stdlib. Tests below assert the runtime outcome.
 
 use greycat_analyzer_core::{
-    GenericOwner, Primitive, TypeArena, TypeDeclId, is_assignable_to, is_castable,
+    GenericOwner, Primitive, SymbolTable, TypeArena, TypeDeclId, is_assignable_to, is_castable,
 };
 
 fn arena() -> TypeArena {
@@ -159,7 +159,7 @@ fn rt_null_to_nullable_allowed() {
 fn rt_array_int_to_array_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
-    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
+    let arr_i = a.generic(ARRAY_DECL, vec![i]);
     assert!(is_assignable_to(&a, arr_i, arr_i));
 }
 
@@ -170,8 +170,8 @@ fn rt_array_int_to_array_float_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let f = a.primitive(Primitive::Float);
-    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
-    let arr_f = a.generic(ARRAY_DECL, "Array", vec![f]);
+    let arr_i = a.generic(ARRAY_DECL, vec![i]);
+    let arr_f = a.generic(ARRAY_DECL, vec![f]);
     assert!(!is_assignable_to(&a, arr_i, arr_f));
     assert!(!is_assignable_to(&a, arr_f, arr_i));
 }
@@ -186,8 +186,8 @@ fn rt_array_int_to_array_nullable_int_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
-    let arr_iq = a.generic(ARRAY_DECL, "Array", vec![i_q]);
+    let arr_i = a.generic(ARRAY_DECL, vec![i]);
+    let arr_iq = a.generic(ARRAY_DECL, vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
 }
 
@@ -232,7 +232,7 @@ fn rt_cast_int_to_node_tags_allowed() {
         (14, "nodeGeo"),
     ] {
         let tag_decl = TypeDeclId::from_raw(raw);
-        let tagged = a.alloc_type(tag_decl, tag);
+        let tagged = a.alloc_type(tag_decl);
         assert!(is_castable(&a, i, tagged), "int as {tag} should be allowed",);
     }
 }
@@ -271,9 +271,13 @@ fn rt_generic_param_substitution_through_inference_table() {
     // through `is_assignable_to` semantics: a bare GenericParam is
     // assignable only to itself.
     let mut a = arena();
-    let t1 = a.generic_param("T", GenericOwner::Function("f".into()));
-    let t2 = a.generic_param("T", GenericOwner::Function("f".into()));
-    let u = a.generic_param("U", GenericOwner::Function("f".into()));
+    let symbols = SymbolTable::new();
+    let t_sym = symbols.intern("T");
+    let u_sym = symbols.intern("U");
+    let owner = GenericOwner::Function(symbols.intern("f"));
+    let t1 = a.generic_param(t_sym, owner.clone());
+    let t2 = a.generic_param(t_sym, owner.clone());
+    let u = a.generic_param(u_sym, owner);
     assert_eq!(t1, t2, "interning should collapse identical GenericParams");
     assert!(is_assignable_to(&a, t1, t2));
     assert!(!is_assignable_to(&a, t1, u));
@@ -314,8 +318,8 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic(ARRAY_DECL, "Array", vec![i]);
-    let arr_iq = a.generic(ARRAY_DECL, "Array", vec![i_q]);
+    let arr_i = a.generic(ARRAY_DECL, vec![i]);
+    let arr_iq = a.generic(ARRAY_DECL, vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
     assert!(!is_assignable_to(&a, arr_iq, arr_i));
 }
@@ -383,7 +387,7 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
 fn rt_cast_nullable_decl_to_non_nullable_decl() {
     let mut a = arena();
     let foo_decl = TypeDeclId::from_raw(20);
-    let foo = a.alloc_type(foo_decl, "Foo");
+    let foo = a.alloc_type(foo_decl);
     let foo_q = a.nullable(foo);
     assert!(is_castable(&a, foo_q, foo));
 }
@@ -392,9 +396,15 @@ fn rt_cast_nullable_decl_to_non_nullable_decl() {
 fn rt_cast_nullable_enum_shape_to_non_nullable_enum_shape() {
     use greycat_analyzer_core::{Type, TypeKind};
     let mut a = arena();
+    let symbols = SymbolTable::new();
     let enum_kind = TypeKind::Enum {
-        name: "PointType".into(),
-        variants: vec!["a".into(), "b".into(), "c".into()],
+        name: symbols.intern("PointType"),
+        variants: vec![
+            symbols.intern("a"),
+            symbols.intern("b"),
+            symbols.intern("c"),
+        ]
+        .into_boxed_slice(),
     };
     let enum_id = a.alloc(Type {
         kind: enum_kind.clone(),
@@ -412,6 +422,6 @@ fn rt_cast_non_nullable_decl_to_self_still_works() {
     // must still pass.
     let mut a = arena();
     let foo_decl = TypeDeclId::from_raw(21);
-    let foo = a.alloc_type(foo_decl, "Foo");
+    let foo = a.alloc_type(foo_decl);
     assert!(is_castable(&a, foo, foo));
 }

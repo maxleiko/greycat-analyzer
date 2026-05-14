@@ -25,7 +25,6 @@
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use smol_str::SmolStr;
 
 use crate::{Symbol, SymbolTable};
 
@@ -191,12 +190,6 @@ pub enum Primitive {
     Time,
     Duration,
     Geo,
-    // TODO: the following should also be primitives
-    // Node,
-    // NodeTime,
-    // NodeIndex,
-    // NodeGeo,
-    // NodeList,
 }
 
 impl Primitive {
@@ -216,7 +209,7 @@ impl Primitive {
 
 /// Where a generic parameter was declared.
 // P25.4
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenericOwner {
     /// `fn<T>(...)`.
     Function(Symbol),
@@ -1352,9 +1345,11 @@ mod tests {
         let mut reg = TypeRegistry::new();
         let foo_decl = TypeDeclId::from_raw(0);
         let foo = cx.arena.alloc_type(foo_decl);
-        reg.register("Foo", foo);
-        assert_eq!(reg.lookup("Foo"), Some(foo));
-        assert!(reg.lookup("Bar").is_none());
+        let foo_sym = cx.symbols.intern("Foo");
+        let bar_sym = cx.symbols.intern("Bar");
+        reg.register(foo_sym, foo);
+        assert_eq!(reg.lookup(foo_sym), Some(foo));
+        assert!(reg.lookup(bar_sym).is_none());
     }
 
     #[test]

@@ -339,8 +339,8 @@ impl ProjectAnalysis {
         // forward pass, no per-module dependency.
         let lowered = self.stage_lower(manager);
 
-        std::fs::create_dir_all("stage").unwrap();
-        std::fs::write("stage/lower.ron", format!("{lowered:#?}")).unwrap();
+        // std::fs::create_dir_all("stage").unwrap();
+        // std::fs::write("stage/lower.ron", format!("{lowered:#?}")).unwrap();
 
         // P40.1 — fold the entrypoint's `@lint_off("…")` / `@lint_on("…")`
         // pragmas into the project-wide policy. CLI flags (`--off` /
@@ -389,7 +389,7 @@ impl ProjectAnalysis {
         // project index, not the type table.
         self.stage_compute_qualified_refs(manager);
 
-        std::fs::write("analysis.ron", format!("{self:#?}")).unwrap();
+        // std::fs::write("analysis.ron", format!("{self:#?}")).unwrap();
 
         // P40.1 — apply project-wide rule policy (`disabled_rules`,
         // sourced from CLI `--off` + the entrypoint's `@lint_off(...)`)
@@ -613,7 +613,6 @@ fn write_type_qualified(
     id: TypeId,
 ) -> std::fmt::Result {
     let arena = project.arena();
-    let symbols = project.symbols();
     let ty = arena.get(id);
     match &ty.kind {
         TypeKind::Null => f.write_str("null")?,

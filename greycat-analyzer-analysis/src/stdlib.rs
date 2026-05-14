@@ -1311,7 +1311,8 @@ type Company {
         let TypeKind::Enum { variants, .. } = &ty.kind else {
             panic!("expected enum, got {ty:?}");
         };
-        assert_eq!(variants, &["Red", "Green", "Blue"]);
+        let variant_names: Vec<&str> = variants.iter().map(|s| &idx.symbols[*s]).collect();
+        assert_eq!(variant_names, ["Red", "Green", "Blue"]);
     }
 
     #[test]
@@ -1411,7 +1412,7 @@ fn helper(): int { return 1; }
             let sym = idx
                 .symbol(n)
                 .unwrap_or_else(|| panic!("{n} not interned after ingest"));
-            assert_eq!(idx.symbols.resolve(&sym), Some(n));
+            assert_eq!(idx.symbols.resolve(&sym), n);
         }
 
         // The new `&str` accessors hit through the symbol table.
@@ -1463,9 +1464,10 @@ fn helper(): int { return 1; }
         let mut cat = None;
         for decl_id in &module.decls {
             if let Decl::Type(td) = &hir.decls[*decl_id] {
-                let id = registry.get_or_insert(&u, *decl_id);
+                let name_sym = hir.idents[td.name].symbol;
+                let id = registry.get_or_insert(&u, *decl_id, name_sym);
                 arena.alloc_type(id);
-                match &idx.symbols[hir.idents[td.name].symbol] {
+                match &idx.symbols[name_sym] {
                     "Animal" => animal = Some(id),
                     "Cat" => cat = Some(id),
                     _ => {}
@@ -1475,15 +1477,20 @@ fn helper(): int { return 1; }
         let animal = animal.unwrap();
         let cat = cat.unwrap();
 
-        assert!(idx.is_subtype_of_decl(&arena, cat, animal));
-        assert!(!idx.is_subtype_of_decl(&arena, animal, cat));
-        // Reflexivity short-circuits regardless of arena membership.
-        assert!(idx.is_subtype_of_decl(&arena, animal, animal));
+        assert!(idx.is_subtype_of_decl(&registry, cat, animal));
+        assert!(!idx.is_subtype_of_decl(&registry, animal, cat));
+        // Reflexivity short-circuits regardless of registry membership.
+        assert!(idx.is_subtype_of_decl(&registry, animal, animal));
 
         // A handle whose name was never registered in the arena returns
         // false (no panic).
-        let dangling = registry.get_or_insert(&uri("/other.gcl"), Idx::<Decl>::from_raw(99u32));
-        assert!(!idx.is_subtype_of_decl(&arena, dangling, animal));
+        let dangling_name = idx.symbols.intern("__dangling__");
+        let dangling = registry.get_or_insert(
+            &uri("/other.gcl"),
+            Idx::<Decl>::from_raw(99u32),
+            dangling_name,
+        );
+        assert!(!idx.is_subtype_of_decl(&registry, dangling, animal));
     }
 
     #[test]

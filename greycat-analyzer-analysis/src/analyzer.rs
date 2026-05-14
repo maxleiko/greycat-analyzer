@@ -4077,7 +4077,8 @@ impl<'a> Cx<'a> {
 mod tests {
     use super::*;
     use crate::resolver::resolve;
-    use greycat_analyzer_hir::lower_module;
+    use greycat_analyzer_core::SymbolTable;
+use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
 
     fn analyze_src(src: &str) -> (TypeArena, AnalysisResult) {

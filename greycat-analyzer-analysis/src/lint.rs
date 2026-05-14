@@ -14,7 +14,6 @@
 use std::ops::Range;
 
 use rustc_hash::FxHashMap;
-use smol_str::SmolStr;
 
 use greycat_analyzer_core::{SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
@@ -602,9 +601,14 @@ impl LintRule for UnusedLocal {
         };
         for decl_id in &module.decls {
             match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => {
-                    check_fn(cx.hir, cx.res, cx.symbols, fnd, &mut candidates, self.name())
-                }
+                Decl::Fn(fnd) => check_fn(
+                    cx.hir,
+                    cx.res,
+                    cx.symbols,
+                    fnd,
+                    &mut candidates,
+                    self.name(),
+                ),
                 Decl::Type(td) => {
                     check_type(cx.hir, cx.res, cx.symbols, td, &mut candidates, self.name())
                 }
@@ -730,9 +734,14 @@ impl LintRule for UnusedParam {
         };
         for decl_id in &module.decls {
             match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => {
-                    check_fn_params(cx.hir, cx.res, cx.symbols, fnd, &mut candidates, self.name())
-                }
+                Decl::Fn(fnd) => check_fn_params(
+                    cx.hir,
+                    cx.res,
+                    cx.symbols,
+                    fnd,
+                    &mut candidates,
+                    self.name(),
+                ),
                 Decl::Type(td) => {
                     for method_id in &td.methods {
                         if let Decl::Fn(fnd) = &cx.hir.decls[*method_id] {
@@ -1079,16 +1088,7 @@ pub fn lint_arrow_on_non_deref(
     decl_registry: &crate::well_known::DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
 ) {
-    lint_arrow_on_non_deref_inner(
-        hir,
-        analysis,
-        arena,
-        index,
-        decl_registry,
-        out,
-        None,
-        false,
-    );
+    lint_arrow_on_non_deref_inner(hir, analysis, arena, index, decl_registry, out, None, false);
 }
 
 /// Directive-aware variant of [`lint_arrow_on_non_deref`]. Drops
@@ -2117,9 +2117,10 @@ mod tests {
 
     fn lint(src: &str) -> Vec<LintDiagnostic> {
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir);
-        run_lints(&hir, &res)
+        run_lints(&hir, &res, &symbols)
     }
 
     #[test]

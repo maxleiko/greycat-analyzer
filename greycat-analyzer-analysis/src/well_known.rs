@@ -318,11 +318,14 @@ mod tests {
     /// registry instance.
     #[test]
     fn decl_registry_get_or_insert_is_idempotent() {
+        use greycat_analyzer_core::SymbolTable;
         let mut r = DeclRegistry::new();
         let uri = Uri::from_str("file:///x.gcl").unwrap();
         let decl = Idx::<Decl>::from_raw(0u32);
-        let a = r.get_or_insert(&uri, decl);
-        let b = r.get_or_insert(&uri, decl);
+        let symbols = SymbolTable::new();
+        let name = symbols.intern("Foo");
+        let a = r.get_or_insert(&uri, decl, name);
+        let b = r.get_or_insert(&uri, decl, name);
         assert_eq!(a, b);
         assert_eq!(r.len(), 1);
     }

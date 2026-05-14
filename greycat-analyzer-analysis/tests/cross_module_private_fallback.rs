@@ -32,7 +32,7 @@ fn callee_bindings(pa: &ProjectAnalysis, uri: &Uri, name: &str) -> Vec<Definitio
     for (_, expr) in m.hir.exprs.iter() {
         if let Expr::Call(c) = expr
             && let Expr::Ident { name: name_idx, .. } = m.hir.exprs[c.callee].clone()
-            && m.hir.idents[name_idx].text == name
+            && pa.symbol(&m.hir.idents[name_idx].symbol) == name
             && let Some(def) = m.resolutions.lookup(name_idx)
         {
             hits.push(def);

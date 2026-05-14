@@ -199,16 +199,19 @@ pub fn dead_else_range_for_exhaustive_chain(hir: &Hir, head_id: Idx<Stmt>) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_hir::types::{Decl, FnDecl};
     use greycat_analyzer_syntax::parse;
 
-    fn lower(src: &str) -> Hir {
+    fn lower(src: &str) -> (Hir, SymbolTable) {
         let tree = parse(src);
-        lower_module(src, "mod", "project", tree.root_node())
+        let symbols = SymbolTable::new();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
+        (hir, symbols)
     }
 
-    fn fn_body(hir: &Hir, symbols: &greycat_analyzer_core::SymbolTable, name: &str) -> BlockStmt {
+    fn fn_body(hir: &Hir, symbols: &SymbolTable, name: &str) -> BlockStmt {
         let module = hir.module.as_ref().expect("module");
         let needle = symbols.lookup(name).expect("name interned");
         for decl_id in &module.decls {
@@ -228,22 +231,22 @@ mod tests {
 
     #[test]
     fn return_diverges() {
-        let hir = lower("fn f(): int { return 1; }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f(): int { return 1; }");
+        let body = fn_body(&hir, &symbols, "f");
         assert!(block_diverges(&hir, &body));
     }
 
     #[test]
     fn throw_diverges() {
-        let hir = lower("fn f() { throw \"bad\"; }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f() { throw \"bad\"; }");
+        let body = fn_body(&hir, &symbols, "f");
         assert!(block_diverges(&hir, &body));
     }
 
     #[test]
     fn break_diverges() {
-        let hir = lower("fn f() { while (true) { break; } }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f() { while (true) { break; } }");
+        let body = fn_body(&hir, &symbols, "f");
         // The OUTER block doesn't diverge — `while` doesn't diverge
         // even though its body does. Conservative on loops.
         assert!(!block_diverges(&hir, &body));
@@ -251,40 +254,40 @@ mod tests {
 
     #[test]
     fn straight_line_does_not_diverge() {
-        let hir = lower("fn f() { var x = 1; var y = 2; }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f() { var x = 1; var y = 2; }");
+        let body = fn_body(&hir, &symbols, "f");
         assert!(!block_diverges(&hir, &body));
     }
 
     #[test]
     fn if_diverges_only_when_both_branches_diverge() {
-        let hir1 = lower("fn f(): int { if (true) { return 1; } else { return 2; } }");
-        let body1 = fn_body(&hir1, "f");
+        let (hir1, symbols1) = lower("fn f(): int { if (true) { return 1; } else { return 2; } }");
+        let body1 = fn_body(&hir1, &symbols1, "f");
         assert!(block_diverges(&hir1, &body1));
 
-        let hir2 = lower("fn f(): int { if (true) { return 1; } else { var _ = 0; } return 0; }");
+        let (hir2, symbols2) = lower("fn f(): int { if (true) { return 1; } else { var _ = 0; } return 0; }");
         // The if doesn't diverge (else falls through), but the trailing
         // `return 0;` does — so the OUTER block diverges.
-        let body2 = fn_body(&hir2, "f");
+        let body2 = fn_body(&hir2, &symbols2, "f");
         assert!(block_diverges(&hir2, &body2));
 
-        let hir3 = lower("fn f(): int { if (true) { return 1; } return 0; }");
+        let (hir3, symbols3) = lower("fn f(): int { if (true) { return 1; } return 0; }");
         // No else → if doesn't diverge → trailing return picks up the slack.
-        let body3 = fn_body(&hir3, "f");
+        let body3 = fn_body(&hir3, &symbols3, "f");
         assert!(block_diverges(&hir3, &body3));
     }
 
     #[test]
     fn try_diverges_when_both_blocks_diverge() {
-        let hir = lower("fn f(): int { try { return 1; } catch (e) { return 2; } }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f(): int { try { return 1; } catch (e) { return 2; } }");
+        let body = fn_body(&hir, &symbols, "f");
         assert!(block_diverges(&hir, &body));
     }
 
     #[test]
     fn try_does_not_diverge_when_catch_falls_through() {
-        let hir = lower("fn f(): int { try { return 1; } catch (e) { var _ = 0; } return 3; }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f(): int { try { return 1; } catch (e) { var _ = 0; } return 3; }");
+        let body = fn_body(&hir, &symbols, "f");
         // Outer block diverges via the trailing return; the try alone
         // wouldn't.
         assert!(block_diverges(&hir, &body));
@@ -292,15 +295,15 @@ mod tests {
 
     #[test]
     fn while_never_diverges_even_with_diverging_body() {
-        let hir = lower("fn f() { while (true) { return; } }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f() { while (true) { return; } }");
+        let body = fn_body(&hir, &symbols, "f");
         assert!(!block_diverges(&hir, &body));
     }
 
     #[test]
     fn first_dead_index_after_return() {
-        let hir = lower("fn f(): int { return 1; var _ = 0; var _ = 1; }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f(): int { return 1; var _ = 0; var _ = 1; }");
+        let body = fn_body(&hir, &symbols, "f");
         // `return` is index 0. First dead index is 1 (the first
         // `var _`).
         assert_eq!(first_dead_index(&hir, &body), Some(1));
@@ -308,15 +311,15 @@ mod tests {
 
     #[test]
     fn first_dead_index_none_when_all_reachable() {
-        let hir = lower("fn f(): int { var x = 1; return x; }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f(): int { var x = 1; return x; }");
+        let body = fn_body(&hir, &symbols, "f");
         assert_eq!(first_dead_index(&hir, &body), None);
     }
 
     #[test]
     fn first_dead_index_none_when_divergent_is_last() {
-        let hir = lower("fn f(): int { var x = 1; return x; }");
-        let body = fn_body(&hir, "f");
+        let (hir, symbols) = lower("fn f(): int { var x = 1; return x; }");
+        let body = fn_body(&hir, &symbols, "f");
         // The return is the last stmt — nothing after it, no dead index.
         assert_eq!(first_dead_index(&hir, &body), None);
     }
@@ -372,7 +375,7 @@ mod tests {
             "enum E { A, B }\nfn f(x: E): int { if (x == E::A) { return 1; } else if (x == E::B) { return 2; } return 0; }\n",
         );
         let m = pa.module(&uri).unwrap();
-        let body = fn_body(&m.hir, "f");
+        let body = fn_body(&m.hir, pa.symbols(), "f");
         // The exhaustive chain is at index 0; every arm returns; so
         // `stmt_diverges_with_analysis` should call it divergent.
         let head_id = body.stmts[0];
@@ -387,7 +390,7 @@ mod tests {
         let src = "enum E { A, B }\nfn f(x: E): int { if (x == E::A) { return 1; } else if (x == E::B) { return 2; } else { return 3; } }\n";
         let (uri, pa) = project_analyze(src);
         let m = pa.module(&uri).unwrap();
-        let body = fn_body(&m.hir, "f");
+        let body = fn_body(&m.hir, pa.symbols(), "f");
         let head_id = body.stmts[0];
         assert!(m.analysis.exhaustive_enum_chains.contains(&head_id));
         let dead_range =
