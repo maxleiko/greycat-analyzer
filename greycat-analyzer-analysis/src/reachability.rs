@@ -208,15 +208,16 @@ mod tests {
         lower_module(src, "mod", "project", tree.root_node())
     }
 
-    fn fn_body(hir: &Hir, name: &str) -> BlockStmt {
+    fn fn_body(hir: &Hir, symbols: &greycat_analyzer_core::SymbolTable, name: &str) -> BlockStmt {
         let module = hir.module.as_ref().expect("module");
+        let needle = symbols.lookup(name).expect("name interned");
         for decl_id in &module.decls {
             if let Decl::Fn(FnDecl {
                 name: name_idx,
                 body: Some(body_id),
                 ..
             }) = &hir.decls[*decl_id]
-                && hir.idents[*name_idx].text == name
+                && hir.idents[*name_idx].symbol == needle
                 && let Stmt::Block(block) = &hir.stmts[*body_id]
             {
                 return block.clone();

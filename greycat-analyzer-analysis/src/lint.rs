@@ -16,7 +16,7 @@ use std::ops::Range;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
-use greycat_analyzer_core::TypeKind;
+use greycat_analyzer_core::{SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -105,6 +105,12 @@ pub trait LintRule {
 pub struct LintCx<'a> {
     pub hir: &'a Hir,
     pub res: &'a Resolutions,
+    // FIXME(symbol-migration): added to plumb the symbol table through
+    // the lint passes — `Ident` no longer carries `text`, so resolving
+    // an ident back to its source string requires the project-wide
+    // `SymbolTable`. Set to `&SymbolTable::default()` by per-file
+    // callers that don't go through `ProjectAnalysis`.
+    pub symbols: &'a SymbolTable,
     pub directives: Option<&'a mut crate::directives::Directives>,
     pub bypass_suppressions: bool,
     out: &'a mut Vec<LintDiagnostic>,
@@ -114,6 +120,7 @@ impl<'a> LintCx<'a> {
     pub fn new(
         hir: &'a Hir,
         res: &'a Resolutions,
+        symbols: &'a SymbolTable,
         directives: Option<&'a mut crate::directives::Directives>,
         bypass_suppressions: bool,
         out: &'a mut Vec<LintDiagnostic>,
@@ -121,6 +128,7 @@ impl<'a> LintCx<'a> {
         Self {
             hir,
             res,
+            symbols,
             directives,
             bypass_suppressions,
             out,
@@ -314,9 +322,9 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
 
 /// Run every registered HIR-only rule in order and return the merged
 /// findings. Suppressions are honored when `directives` is `Some(_)`.
-pub fn run_lints(hir: &Hir, res: &Resolutions) -> Vec<LintDiagnostic> {
+pub fn run_lints(hir: &Hir, res: &Resolutions, symbols: &SymbolTable) -> Vec<LintDiagnostic> {
     let mut out = Vec::new();
-    let mut cx = LintCx::new(hir, res, None, false, &mut out);
+    let mut cx = LintCx::new(hir, res, symbols, None, false, &mut out);
     for rule in default_rules() {
         rule.check(&mut cx);
     }
@@ -329,11 +337,19 @@ pub fn run_lints(hir: &Hir, res: &Resolutions) -> Vec<LintDiagnostic> {
 pub fn run_lints_with_directives(
     hir: &Hir,
     res: &Resolutions,
+    symbols: &SymbolTable,
     directives: &mut crate::directives::Directives,
     bypass_suppressions: bool,
 ) -> Vec<LintDiagnostic> {
     let mut out = Vec::new();
-    let mut cx = LintCx::new(hir, res, Some(directives), bypass_suppressions, &mut out);
+    let mut cx = LintCx::new(
+        hir,
+        res,
+        symbols,
+        Some(directives),
+        bypass_suppressions,
+        &mut out,
+    );
     for rule in default_rules() {
         rule.check(&mut cx);
     }
@@ -586,8 +602,12 @@ impl LintRule for UnusedLocal {
         };
         for decl_id in &module.decls {
             match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => check_fn(cx.hir, cx.res, fnd, &mut candidates, self.name()),
-                Decl::Type(td) => check_type(cx.hir, cx.res, td, &mut candidates, self.name()),
+                Decl::Fn(fnd) => {
+                    check_fn(cx.hir, cx.res, cx.symbols, fnd, &mut candidates, self.name())
+                }
+                Decl::Type(td) => {
+                    check_type(cx.hir, cx.res, cx.symbols, td, &mut candidates, self.name())
+                }
                 _ => {}
             }
         }
@@ -600,6 +620,7 @@ impl LintRule for UnusedLocal {
 fn check_fn(
     hir: &Hir,
     res: &Resolutions,
+    symbols: &SymbolTable,
     fnd: &FnDecl,
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
@@ -607,19 +628,20 @@ fn check_fn(
     let Some(body) = fnd.body else {
         return;
     };
-    visit_for_locals(hir, res, body, out, rule);
+    visit_for_locals(hir, res, symbols, body, out, rule);
 }
 
 fn check_type(
     hir: &Hir,
     res: &Resolutions,
+    symbols: &SymbolTable,
     td: &TypeDecl,
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
     for method_id in &td.methods {
         if let Decl::Fn(fnd) = &hir.decls[*method_id] {
-            check_fn(hir, res, fnd, out, rule);
+            check_fn(hir, res, symbols, fnd, out, rule);
         }
     }
 }
@@ -627,28 +649,31 @@ fn check_type(
 fn visit_block_for_locals(
     hir: &Hir,
     res: &Resolutions,
+    symbols: &SymbolTable,
     block: &greycat_analyzer_hir::types::BlockStmt,
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
     for s in &block.stmts {
-        visit_for_locals(hir, res, *s, out, rule);
+        visit_for_locals(hir, res, symbols, *s, out, rule);
     }
 }
 
 fn visit_for_locals(
     hir: &Hir,
     res: &Resolutions,
+    symbols: &SymbolTable,
     stmt_id: Idx<Stmt>,
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(b) => visit_block_for_locals(hir, res, b, out, rule),
+        Stmt::Block(b) => visit_block_for_locals(hir, res, symbols, b, out, rule),
         Stmt::Var(v) => {
             let ident = &hir.idents[v.name];
-            if ident.text.starts_with('_') {
+            let name = &symbols[ident.symbol];
+            if name.starts_with('_') {
                 return;
             }
             let used = res.uses.values().any(|d| match d {
@@ -659,27 +684,27 @@ fn visit_for_locals(
                 out.push(LintDiagnostic {
                     rule,
                     severity: LintSeverity::Warning,
-                    message: format!("unused local `{}`", ident.text),
+                    message: format!("unused local `{name}`"),
                     byte_range: ident.byte_range.clone(),
                     tag: None,
                 });
             }
         }
         Stmt::If(i) => {
-            visit_block_for_locals(hir, res, &i.then_branch, out, rule);
+            visit_block_for_locals(hir, res, symbols, &i.then_branch, out, rule);
             if let Some(eb) = i.else_branch {
-                visit_for_locals(hir, res, eb, out, rule);
+                visit_for_locals(hir, res, symbols, eb, out, rule);
             }
         }
-        Stmt::While(w) => visit_block_for_locals(hir, res, &w.body, out, rule),
-        Stmt::DoWhile(w) => visit_block_for_locals(hir, res, &w.body, out, rule),
-        Stmt::For(f) => visit_block_for_locals(hir, res, &f.body, out, rule),
-        Stmt::ForIn(f) => visit_block_for_locals(hir, res, &f.body, out, rule),
+        Stmt::While(w) => visit_block_for_locals(hir, res, symbols, &w.body, out, rule),
+        Stmt::DoWhile(w) => visit_block_for_locals(hir, res, symbols, &w.body, out, rule),
+        Stmt::For(f) => visit_block_for_locals(hir, res, symbols, &f.body, out, rule),
+        Stmt::ForIn(f) => visit_block_for_locals(hir, res, symbols, &f.body, out, rule),
         Stmt::Try(t) => {
-            visit_block_for_locals(hir, res, &t.try_block, out, rule);
-            visit_block_for_locals(hir, res, &t.catch_block, out, rule);
+            visit_block_for_locals(hir, res, symbols, &t.try_block, out, rule);
+            visit_block_for_locals(hir, res, symbols, &t.catch_block, out, rule);
         }
-        Stmt::At(a) => visit_block_for_locals(hir, res, &a.block, out, rule),
+        Stmt::At(a) => visit_block_for_locals(hir, res, symbols, &a.block, out, rule),
         _ => {}
     }
 }
@@ -705,11 +730,20 @@ impl LintRule for UnusedParam {
         };
         for decl_id in &module.decls {
             match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name()),
+                Decl::Fn(fnd) => {
+                    check_fn_params(cx.hir, cx.res, cx.symbols, fnd, &mut candidates, self.name())
+                }
                 Decl::Type(td) => {
                     for method_id in &td.methods {
                         if let Decl::Fn(fnd) = &cx.hir.decls[*method_id] {
-                            check_fn_params(cx.hir, cx.res, fnd, &mut candidates, self.name());
+                            check_fn_params(
+                                cx.hir,
+                                cx.res,
+                                cx.symbols,
+                                fnd,
+                                &mut candidates,
+                                self.name(),
+                            );
                         }
                     }
                 }
@@ -744,7 +778,14 @@ impl LintRule for UnusedCatchParam {
             match &cx.hir.decls[*decl_id] {
                 Decl::Fn(fnd) => {
                     if let Some(body) = fnd.body {
-                        visit_for_catch_params(cx.hir, cx.res, body, &mut candidates, self.name());
+                        visit_for_catch_params(
+                            cx.hir,
+                            cx.res,
+                            cx.symbols,
+                            body,
+                            &mut candidates,
+                            self.name(),
+                        );
                     }
                 }
                 Decl::Type(td) => {
@@ -755,6 +796,7 @@ impl LintRule for UnusedCatchParam {
                             visit_for_catch_params(
                                 cx.hir,
                                 cx.res,
+                                cx.symbols,
                                 body,
                                 &mut candidates,
                                 self.name(),
@@ -774,6 +816,7 @@ impl LintRule for UnusedCatchParam {
 fn check_fn_params(
     hir: &Hir,
     res: &Resolutions,
+    symbols: &SymbolTable,
     fnd: &FnDecl,
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
@@ -787,7 +830,8 @@ fn check_fn_params(
     for param_id in &fnd.params {
         let param = &hir.fn_params[*param_id];
         let ident: &Ident = &hir.idents[param.name];
-        if ident.text.starts_with('_') {
+        let name = &symbols[ident.symbol];
+        if name.starts_with('_') {
             continue;
         }
         let used = res.uses.values().any(|d| match d {
@@ -798,7 +842,7 @@ fn check_fn_params(
             out.push(LintDiagnostic {
                 rule,
                 severity: LintSeverity::Warning,
-                message: format!("unused parameter `{}`", ident.text),
+                message: format!("unused parameter `{name}`"),
                 byte_range: ident.byte_range.clone(),
                 tag: None,
             });
@@ -814,6 +858,7 @@ fn check_fn_params(
 fn visit_for_catch_params(
     hir: &Hir,
     res: &Resolutions,
+    symbols: &SymbolTable,
     stmt_id: Idx<Stmt>,
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
@@ -822,32 +867,34 @@ fn visit_for_catch_params(
     fn visit_block(
         hir: &Hir,
         res: &Resolutions,
+        symbols: &SymbolTable,
         block: &BlockStmt,
         out: &mut Vec<LintDiagnostic>,
         rule: &'static str,
     ) {
         for s in &block.stmts {
-            visit_for_catch_params(hir, res, *s, out, rule);
+            visit_for_catch_params(hir, res, symbols, *s, out, rule);
         }
     }
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(b) => visit_block(hir, res, b, out, rule),
+        Stmt::Block(b) => visit_block(hir, res, symbols, b, out, rule),
         Stmt::If(i) => {
-            visit_block(hir, res, &i.then_branch, out, rule);
+            visit_block(hir, res, symbols, &i.then_branch, out, rule);
             if let Some(eb) = i.else_branch {
-                visit_for_catch_params(hir, res, eb, out, rule);
+                visit_for_catch_params(hir, res, symbols, eb, out, rule);
             }
         }
-        Stmt::While(w) => visit_block(hir, res, &w.body, out, rule),
-        Stmt::DoWhile(w) => visit_block(hir, res, &w.body, out, rule),
-        Stmt::For(f) => visit_block(hir, res, &f.body, out, rule),
-        Stmt::ForIn(f) => visit_block(hir, res, &f.body, out, rule),
+        Stmt::While(w) => visit_block(hir, res, symbols, &w.body, out, rule),
+        Stmt::DoWhile(w) => visit_block(hir, res, symbols, &w.body, out, rule),
+        Stmt::For(f) => visit_block(hir, res, symbols, &f.body, out, rule),
+        Stmt::ForIn(f) => visit_block(hir, res, symbols, &f.body, out, rule),
         Stmt::Try(t) => {
-            visit_block(hir, res, &t.try_block, out, rule);
+            visit_block(hir, res, symbols, &t.try_block, out, rule);
             if let Some(name) = t.error_param {
                 let ident = &hir.idents[name];
-                if !ident.text.starts_with('_') {
+                let ident_name = &symbols[ident.symbol];
+                if !ident_name.starts_with('_') {
                     let used = res.uses.values().any(|d| match d {
                         Definition::Local(n) => *n == name,
                         _ => false,
@@ -856,16 +903,16 @@ fn visit_for_catch_params(
                         out.push(LintDiagnostic {
                             rule,
                             severity: LintSeverity::Warning,
-                            message: format!("unused catch parameter `{}`", ident.text),
+                            message: format!("unused catch parameter `{ident_name}`"),
                             byte_range: ident.byte_range.clone(),
                             tag: None,
                         });
                     }
                 }
             }
-            visit_block(hir, res, &t.catch_block, out, rule);
+            visit_block(hir, res, symbols, &t.catch_block, out, rule);
         }
-        Stmt::At(a) => visit_block(hir, res, &a.block, out, rule),
+        Stmt::At(a) => visit_block(hir, res, symbols, &a.block, out, rule),
         _ => {}
     }
 }
@@ -889,14 +936,19 @@ impl LintRule for UnusedDecl {
 
     fn check(&self, cx: &mut LintCx<'_>) {
         let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        check_unused_decl(cx.hir, cx.res, &mut candidates);
+        check_unused_decl(cx.hir, cx.res, cx.symbols, &mut candidates);
         for d in candidates {
             cx.emit(d);
         }
     }
 }
 
-fn check_unused_decl(hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>) {
+fn check_unused_decl(
+    hir: &Hir,
+    res: &Resolutions,
+    symbols: &SymbolTable,
+    out: &mut Vec<LintDiagnostic>,
+) {
     let Some(module) = hir.module.as_ref() else {
         return;
     };
@@ -921,7 +973,8 @@ fn check_unused_decl(hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>
             continue;
         }
         let ident = &hir.idents[name_idx];
-        if ident.text.starts_with('_') {
+        let name = &symbols[ident.symbol];
+        if name.starts_with('_') {
             continue;
         }
         let count = res.references_to.get(decl_id).copied().unwrap_or(0);
@@ -929,7 +982,7 @@ fn check_unused_decl(hir: &Hir, res: &Resolutions, out: &mut Vec<LintDiagnostic>
             out.push(LintDiagnostic {
                 rule: "unused-decl",
                 severity: LintSeverity::Warning,
-                message: format!("unused private {kind} `{}`", ident.text),
+                message: format!("unused private {kind} `{name}`"),
                 byte_range: ident.byte_range.clone(),
                 tag: None,
             });
@@ -956,7 +1009,7 @@ impl LintRule for DuplicateDecl {
         let Some(module) = cx.hir.module.as_ref() else {
             return;
         };
-        let mut seen: FxHashMap<SmolStr, ()> = FxHashMap::default();
+        let mut seen: FxHashMap<greycat_analyzer_core::Symbol, ()> = FxHashMap::default();
         let mut candidates: Vec<LintDiagnostic> = Vec::new();
         for decl_id in &module.decls {
             let Some(name_id) = cx.hir.decls[*decl_id].name() else {
@@ -966,11 +1019,12 @@ impl LintRule for DuplicateDecl {
                 continue;
             }
             let ident = &cx.hir.idents[name_id];
-            if seen.insert(ident.text.clone(), ()).is_some() {
+            if seen.insert(ident.symbol, ()).is_some() {
+                let name = &cx.symbols[ident.symbol];
                 candidates.push(LintDiagnostic {
                     rule: "duplicate-decl",
                     severity: LintSeverity::Error,
-                    message: format!("identifier `{}` is already declared", ident.text),
+                    message: format!("identifier `{name}` is already declared"),
                     byte_range: ident.byte_range.clone(),
                     tag: None,
                 });
@@ -1022,9 +1076,19 @@ pub fn lint_arrow_on_non_deref(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
 ) {
-    lint_arrow_on_non_deref_inner(hir, analysis, arena, index, out, None, false);
+    lint_arrow_on_non_deref_inner(
+        hir,
+        analysis,
+        arena,
+        index,
+        decl_registry,
+        out,
+        None,
+        false,
+    );
 }
 
 /// Directive-aware variant of [`lint_arrow_on_non_deref`]. Drops
@@ -1034,6 +1098,7 @@ pub fn lint_arrow_on_non_deref_with_directives(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut crate::directives::Directives,
     bypass_suppressions: bool,
@@ -1043,6 +1108,7 @@ pub fn lint_arrow_on_non_deref_with_directives(
         analysis,
         arena,
         index,
+        decl_registry,
         out,
         Some(directives),
         bypass_suppressions,
@@ -1054,6 +1120,7 @@ fn lint_arrow_on_non_deref_inner(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut crate::directives::Directives>,
     bypass_suppressions: bool,
@@ -1070,7 +1137,7 @@ fn lint_arrow_on_non_deref_inner(
         let Some(recv_ty) = analysis.expr_types.get(receiver).copied() else {
             continue;
         };
-        let head = receiver_head_name(arena, recv_ty);
+        let head = receiver_head_name(arena, decl_registry, &index.symbols, recv_ty);
         let Some(name) = head else {
             // Conservative: receiver is `any` / lambda / tuple / etc. —
             // no head name to classify. Skip.
@@ -1083,7 +1150,7 @@ fn lint_arrow_on_non_deref_inner(
             continue;
         }
         let _ = expr_id;
-        let display = arena.display(recv_ty);
+        let display = arena.display(recv_ty, &index.symbols);
         emit_typed(
             out,
             directives.as_deref_mut(),
@@ -1127,13 +1194,19 @@ fn emit_typed(
 /// `Primitive` to their canonical name. Returns `None` for shapes the
 /// lint conservatively skips (any / never / null / lambda / tuple /
 /// anonymous / union / enum / generic-param).
-fn receiver_head_name(arena: &TypeArena, ty: TypeId) -> Option<String> {
+fn receiver_head_name(
+    arena: &TypeArena,
+    decl_registry: &crate::well_known::DeclRegistry,
+    symbols: &SymbolTable,
+    ty: TypeId,
+) -> Option<String> {
     let t = arena.get(ty);
+    let decl_name = |d| decl_registry.name(d).map(|sym| symbols[sym].to_string());
     match &t.kind {
         // P35.7 — `TypeKind::Type(handle)` / `Generic` recover
-        // their decl name from the arena's parallel name table.
-        TypeKind::Type(decl) => arena.decl_name(*decl).map(str::to_string),
-        TypeKind::Generic { decl, .. } => arena.decl_name(*decl).map(str::to_string),
+        // their decl name via the project's `DeclRegistry`.
+        TypeKind::Type(decl) => decl_name(*decl),
+        TypeKind::Generic { decl, .. } => decl_name(*decl),
         TypeKind::Primitive(p) => Some(p.name().to_string()),
         _ => None,
     }
@@ -1178,7 +1251,7 @@ impl LintRule for ModVarShape {
                 continue;
             };
             let ty = &cx.hir.type_refs[ty_ref];
-            let head = cx.hir.idents[ty.name].text.as_str();
+            let head = &cx.symbols[cx.hir.idents[ty.name].symbol];
             // Syntactic-level lint: rejects everything except the
             // five node-tag head names. Pure source-level pattern,
             // no decl handle involved (the lint fires before
@@ -1276,9 +1349,10 @@ pub fn lint_inferred_return_type(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
+    symbols: &SymbolTable,
     out: &mut Vec<LintDiagnostic>,
 ) {
-    lint_inferred_return_type_inner(hir, analysis, arena, out, None, false);
+    lint_inferred_return_type_inner(hir, analysis, arena, symbols, out, None, false);
 }
 
 /// Directive-aware variant of [`lint_inferred_return_type`].
@@ -1286,6 +1360,7 @@ pub fn lint_inferred_return_type_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
+    symbols: &SymbolTable,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut crate::directives::Directives,
     bypass_suppressions: bool,
@@ -1294,6 +1369,7 @@ pub fn lint_inferred_return_type_with_directives(
         hir,
         analysis,
         arena,
+        symbols,
         out,
         Some(directives),
         bypass_suppressions,
@@ -1304,6 +1380,7 @@ fn lint_inferred_return_type_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
+    symbols: &SymbolTable,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut crate::directives::Directives>,
     bypass_suppressions: bool,
@@ -1317,6 +1394,7 @@ fn lint_inferred_return_type_inner(
                 hir,
                 analysis,
                 arena,
+                symbols,
                 fnd,
                 out,
                 directives.as_deref_mut(),
@@ -1329,6 +1407,7 @@ fn lint_inferred_return_type_inner(
                             hir,
                             analysis,
                             arena,
+                            symbols,
                             fnd,
                             out,
                             directives.as_deref_mut(),
@@ -1346,6 +1425,7 @@ fn check_fn_inferred_return(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
+    symbols: &SymbolTable,
     fnd: &FnDecl,
     out: &mut Vec<LintDiagnostic>,
     directives: Option<&mut crate::directives::Directives>,
@@ -1367,7 +1447,7 @@ fn check_fn_inferred_return(
     if matches!(kind, TypeKind::Any | TypeKind::Never) {
         return;
     }
-    let display = arena.display(ret_ty);
+    let display = arena.display(ret_ty, symbols);
     let name = &hir.idents[fnd.name];
     emit_typed(
         out,
@@ -1458,16 +1538,18 @@ pub fn chain_has_upstream_nullsafe(hir: &Hir, expr_id: Idx<Expr>) -> bool {
 /// reference here on purpose.
 pub fn lint_nullability(
     hir: &Hir,
+    symbols: &SymbolTable,
     analysis: &AnalysisResult,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
 ) {
-    lint_nullability_inner(hir, analysis, arena, out, None, false);
+    lint_nullability_inner(hir, symbols, analysis, arena, out, None, false);
 }
 
 /// Directive-aware variant of [`lint_nullability`].
 pub fn lint_nullability_with_directives(
     hir: &Hir,
+    symbols: &SymbolTable,
     analysis: &AnalysisResult,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
@@ -1476,6 +1558,7 @@ pub fn lint_nullability_with_directives(
 ) {
     lint_nullability_inner(
         hir,
+        symbols,
         analysis,
         arena,
         out,
@@ -1486,6 +1569,7 @@ pub fn lint_nullability_with_directives(
 
 fn lint_nullability_inner(
     hir: &Hir,
+    symbols: &SymbolTable,
     analysis: &AnalysisResult,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
@@ -1517,7 +1601,7 @@ fn lint_nullability_inner(
                 }
                 let recv_range = receiver_byte_range(hir, *receiver);
                 if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
-                    let display = display_receiver(hir, *receiver);
+                    let display = display_receiver(hir, symbols, *receiver);
                     emit_typed(
                         out,
                         directives.as_deref_mut(),
@@ -1563,7 +1647,7 @@ fn lint_nullability_inner(
                 }
                 let recv_range = receiver_byte_range(hir, *receiver);
                 if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
-                    let display = display_receiver(hir, *receiver);
+                    let display = display_receiver(hir, symbols, *receiver);
                     emit_typed(
                         out,
                         directives.as_deref_mut(),
@@ -1667,40 +1751,40 @@ fn receiver_byte_range(hir: &Hir, expr_id: Idx<Expr>) -> Range<usize> {
 /// inside diagnostic messages: bareword for `Ident`, quoted for
 /// `String`. Mirrors what the user wrote so messages like
 /// `` `conf."ssl.location"` is possibly null `` quote the source.
-fn display_property(hir: &Hir, property: PropertyName) -> String {
-    let text = &hir.idents[property.ident()].text;
+fn display_property(hir: &Hir, symbols: &SymbolTable, property: PropertyName) -> String {
+    let text = &symbols[hir.idents[property.ident()].symbol];
     match property {
         PropertyName::Ident(_) => text.to_string(),
         PropertyName::String(_) => format!("\"{text}\""),
     }
 }
 
-fn display_receiver(hir: &Hir, expr_id: Idx<Expr>) -> String {
+fn display_receiver(hir: &Hir, symbols: &SymbolTable, expr_id: Idx<Expr>) -> String {
     match &hir.exprs[expr_id] {
-        Expr::Ident { name: name_idx, .. } => hir.idents[*name_idx].text.to_string(),
+        Expr::Ident { name: name_idx, .. } => symbols[hir.idents[*name_idx].symbol].to_string(),
         Expr::This { .. } => "this".into(),
         Expr::Literal(_) | Expr::Null { .. } => "expression".into(),
         Expr::Member(m) => {
-            let recv = display_receiver(hir, m.receiver);
-            let prop = display_property(hir, m.property);
+            let recv = display_receiver(hir, symbols, m.receiver);
+            let prop = display_property(hir, symbols, m.property);
             let q = if m.pre_optional { "?." } else { "." };
             let post = if m.post_optional { "?" } else { "" };
             format!("{recv}{q}{prop}{post}")
         }
         Expr::Arrow(m) => {
-            let recv = display_receiver(hir, m.receiver);
-            let prop = display_property(hir, m.property);
+            let recv = display_receiver(hir, symbols, m.receiver);
+            let prop = display_property(hir, symbols, m.property);
             let q = if m.pre_optional { "?->" } else { "->" };
             let post = if m.post_optional { "?" } else { "" };
             format!("{recv}{q}{prop}{post}")
         }
         Expr::Static(s) => {
             let ty = &hir.type_refs[s.ty];
-            let prop = display_property(hir, s.property);
-            let ty_name = &hir.idents[ty.name].text;
+            let prop = display_property(hir, symbols, s.property);
+            let ty_name = &symbols[hir.idents[ty.name].symbol];
             format!("{ty_name}::{prop}")
         }
-        Expr::Paren(inner, _) => display_receiver(hir, *inner),
+        Expr::Paren(inner, _) => display_receiver(hir, symbols, *inner),
         _ => "expression".into(),
     }
 }

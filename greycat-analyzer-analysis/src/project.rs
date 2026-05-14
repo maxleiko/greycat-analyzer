@@ -19,12 +19,18 @@ use greycat_analyzer_hir::arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{SourceManager, SymbolTable, TypeArena, TypeId, TypeKind};
-use greycat_analyzer_hir::types::{Decl, TypeRef};
+use greycat_analyzer_core::{
+    GenericOwner, Primitive, SourceManager, Symbol, SymbolTable, TypeArena, TypeDeclId, TypeId,
+    TypeKind, is_assignable_to, is_castable,
+};
+use greycat_analyzer_core::TypeRegistry;
+use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Stmt, TypeRef};
 use greycat_analyzer_hir::{Hir, lower_module};
 use smol_str::SmolStr;
 
-use crate::analyzer::{AnalysisResult, analyze_with_index_into, seed_builtins};
+use crate::analyzer::{
+    AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into, seed_builtins,
+};
 use crate::directives::Directives;
 use crate::lint::{
     LintDiagnostic, lint_arrow_on_non_deref_with_directives, lint_catch_empty_parens,
@@ -35,6 +41,7 @@ use crate::lint::{
 };
 use crate::resolver::{Resolutions, resolve_with_index_for};
 use crate::stdlib::{FnSignature, ProjectIndex};
+use crate::well_known::{DeclRegistry, WellKnown};
 
 /// Per-document outputs of the analyzer pipeline. Held by
 /// [`ProjectAnalysis`] so LSP / CLI consumers can pull diagnostics
@@ -257,6 +264,18 @@ impl ProjectAnalysis {
             project: self,
             id: ty,
         }
+    }
+
+    /// Resolve a `Symbol` back to its source text through the
+    /// project's [`SymbolTable`].
+    pub fn symbol(&self, sym: &Symbol) -> &str {
+        &self.index.symbols[*sym]
+    }
+
+    /// Resolve a `TypeDeclId` to its declared source name through
+    /// `decl_registry.name(id) → Symbol → SymbolTable`.
+    pub fn decl_name(&self, id: TypeDeclId) -> Option<&str> {
+        self.decl_registry.name(id).map(|sym| self.symbol(&sym))
     }
 
     /// One-pass build over every document currently in `manager`.
@@ -606,8 +625,14 @@ fn write_type_qualified(
             write_decl_qualified(f, project, *decl)?;
             write_args_qualified(f, project, args)?;
         }
-        TypeKind::Unresolved { name, .. } => f.write_str(name.as_str())?,
-        TypeKind::GenericParam { name, .. } => f.write_str(name.as_str())?,
+        TypeKind::Node { kind, args } => {
+            f.write_str(kind.name())?;
+            if !args.is_empty() {
+                write_args_qualified(f, project, args)?;
+            }
+        }
+        TypeKind::Unresolved { name, .. } => f.write_str(project.symbol(name))?,
+        TypeKind::GenericParam { name, .. } => f.write_str(project.symbol(name))?,
         TypeKind::Lambda { params, ret } => {
             f.write_str("(")?;
             for (i, p) in params.iter().enumerate() {
@@ -619,7 +644,7 @@ fn write_type_qualified(
             f.write_str(") -> ")?;
             write_type_qualified(f, project, *ret)?;
         }
-        TypeKind::Enum { name, .. } => f.write_str(name.as_str())?,
+        TypeKind::Enum { name, .. } => f.write_str(project.symbol(name))?,
         TypeKind::Union { alts } => {
             for (i, a) in alts.iter().enumerate() {
                 if i > 0 {
@@ -662,7 +687,7 @@ fn write_decl_qualified(
     project: &ProjectAnalysis,
     decl: TypeDeclId,
 ) -> std::fmt::Result {
-    let Some(name) = project.arena().decl_name(decl) else {
+    let Some(name) = project.decl_name(decl) else {
         return write!(f, "?type#{}", decl.raw());
     };
     if project.index.locate_decl(name).len() > 1
@@ -688,13 +713,13 @@ fn project_name_set_hash(index: &ProjectIndex) -> u64 {
     // back to text through the project's symbol table for stable
     // string hashing.
     for sym in &index.type_names {
-        names.insert(&index.symbols[sym]);
+        names.insert(&index.symbols[*sym]);
     }
     for sym in index.natives.signatures.keys() {
-        names.insert(&index.symbols[sym]);
+        names.insert(&index.symbols[*sym]);
     }
     for sym in &index.values {
-        names.insert(&index.symbols[sym]);
+        names.insert(&index.symbols[*sym]);
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for n in &names {
@@ -723,14 +748,14 @@ fn module_signature_hash(hir: &Hir) -> u64 {
         match &hir.decls[*d_id] {
             Decl::Type(td) => {
                 1u8.hash(&mut hasher);
-                hir.idents[td.name].text.as_str().hash(&mut hasher);
+                hir.idents[td.name].symbol.hash(&mut hasher);
                 for g in &td.generics {
-                    hir.idents[*g].text.as_str().hash(&mut hasher);
+                    hir.idents[*g].symbol.hash(&mut hasher);
                 }
                 0u8.hash(&mut hasher);
                 for attr_id in &td.attrs {
                     let attr = &hir.type_attrs[*attr_id];
-                    hir.idents[attr.name].text.as_str().hash(&mut hasher);
+                    hir.idents[attr.name].symbol.hash(&mut hasher);
                     if let Some(tr) = attr.ty {
                         hash_type_ref(&mut hasher, hir, tr);
                     } else {
@@ -742,9 +767,9 @@ fn module_signature_hash(hir: &Hir) -> u64 {
                     let Decl::Fn(fnd) = &hir.decls[*method_id] else {
                         continue;
                     };
-                    hir.idents[fnd.name].text.as_str().hash(&mut hasher);
+                    hir.idents[fnd.name].symbol.hash(&mut hasher);
                     for g in &fnd.generics {
-                        hir.idents[*g].text.as_str().hash(&mut hasher);
+                        hir.idents[*g].symbol.hash(&mut hasher);
                     }
                     0u8.hash(&mut hasher);
                     if let Some(ret) = fnd.return_type {
@@ -757,20 +782,19 @@ fn module_signature_hash(hir: &Hir) -> u64 {
             }
             Decl::Enum(ed) => {
                 2u8.hash(&mut hasher);
-                hir.idents[ed.name].text.as_str().hash(&mut hasher);
+                hir.idents[ed.name].symbol.hash(&mut hasher);
                 for f in &ed.fields {
                     hir.idents[hir.enum_fields[*f].name]
-                        .text
-                        .as_str()
+                        .symbol
                         .hash(&mut hasher);
                 }
                 0u8.hash(&mut hasher);
             }
             Decl::Fn(fnd) => {
                 3u8.hash(&mut hasher);
-                hir.idents[fnd.name].text.as_str().hash(&mut hasher);
+                hir.idents[fnd.name].symbol.hash(&mut hasher);
                 for g in &fnd.generics {
-                    hir.idents[*g].text.as_str().hash(&mut hasher);
+                    hir.idents[*g].symbol.hash(&mut hasher);
                 }
                 0u8.hash(&mut hasher);
                 if let Some(ret) = fnd.return_type {
@@ -785,7 +809,7 @@ fn module_signature_hash(hir: &Hir) -> u64 {
                 // must change when the var name or its TypeRef
                 // shape changes.
                 4u8.hash(&mut hasher);
-                hir.idents[vd.name].text.as_str().hash(&mut hasher);
+                hir.idents[vd.name].symbol.hash(&mut hasher);
                 if let Some(tr) = vd.ty {
                     hash_type_ref(&mut hasher, hir, tr);
                 } else {
@@ -804,7 +828,7 @@ fn hash_type_ref(
     tr: Idx<greycat_analyzer_hir::types::TypeRef>,
 ) {
     let r = &hir.type_refs[tr];
-    hir.idents[r.name].text.as_str().hash(hasher);
+    hir.idents[r.name].symbol.hash(hasher);
     r.optional.hash(hasher);
     for p in &r.params {
         hash_type_ref(hasher, hir, *p);
@@ -892,6 +916,7 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
         if method_name.is_empty() {
             continue;
         }
+        let type_name = &index.symbols[*type_sym];
         if let Some(ret) = index.type_method_return_chain(type_name, method_name) {
             resolutions.insert(*type_sym, ret);
         }
@@ -924,8 +949,6 @@ fn lower_module_signatures(
     sig_hash: u64,
     name_set_hash: u64,
 ) -> ModuleSigCache {
-    use {GenericOwner, Symbol};
-
     let mut entry = ModuleSigCache {
         sig_hash,
         name_set_hash,
@@ -937,17 +960,16 @@ fn lower_module_signatures(
     for d_id in &module.decls {
         match &hir.decls[*d_id] {
             Decl::Type(td) => {
-                let type_name_text = hir.idents[td.name].text.as_str();
-                let type_sym = index.symbols.intern(type_name_text);
-                let owner = GenericOwner::Type(type_name_text.into());
+                let type_sym = hir.idents[td.name].symbol;
+                let owner = GenericOwner::Type(type_sym);
                 let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 for g in &td.generics {
-                    let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
+                    let g_sym = hir.idents[*g].symbol;
                     generics_in_scope.insert(g_sym, owner.clone());
                 }
                 for attr_id in &td.attrs {
                     let attr = &hir.type_attrs[*attr_id];
-                    let attr_sym = index.symbols.intern(hir.idents[attr.name].text.as_str());
+                    let attr_sym = hir.idents[attr.name].symbol;
                     let Some(tr) = attr.ty else {
                         continue;
                     };
@@ -965,8 +987,7 @@ fn lower_module_signatures(
                     let Decl::Fn(fnd) = &hir.decls[*method_id] else {
                         continue;
                     };
-                    let method_text = hir.idents[fnd.name].text.as_str();
-                    let method_sym = index.symbols.intern(method_text);
+                    let method_sym = hir.idents[fnd.name].symbol;
                     let Some(ret) = fnd.return_type else {
                         continue;
                     };
@@ -976,11 +997,11 @@ fn lower_module_signatures(
                     // GenericOwner-owned Strings) per method —
                     // overrides of the outer scope are saved and
                     // restored.
-                    let method_owner = GenericOwner::Function(method_text.into());
+                    let method_owner = GenericOwner::Function(method_sym);
                     let mut saved: Vec<(Symbol, Option<GenericOwner>)> =
                         Vec::with_capacity(fnd.generics.len());
                     for g in &fnd.generics {
-                        let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
+                        let g_sym = hir.idents[*g].symbol;
                         let prev = generics_in_scope.insert(g_sym, method_owner.clone());
                         saved.push((g_sym, prev));
                     }
@@ -1023,16 +1044,15 @@ fn lower_module_signatures(
                 // validation stage.
             }
             Decl::Fn(fnd) => {
-                let fn_text = hir.idents[fnd.name].text.as_str();
-                let fn_sym = index.symbols.intern(fn_text);
+                let fn_sym = hir.idents[fnd.name].symbol;
                 let Some(ret) = fnd.return_type else {
                     continue;
                 };
-                let owner = GenericOwner::Function(fn_text.into());
+                let owner = GenericOwner::Function(fn_sym);
                 let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 let mut generics: Vec<Symbol> = Vec::with_capacity(fnd.generics.len());
                 for g in &fnd.generics {
-                    let g_sym = index.symbols.intern(hir.idents[*g].text.as_str());
+                    let g_sym = hir.idents[*g].symbol;
                     generics_in_scope.insert(g_sym, owner.clone());
                     generics.push(g_sym);
                 }
@@ -1083,8 +1103,7 @@ fn lower_module_signatures(
                 // `Named("type")`. Vars without a declared type
                 // contribute nothing — the analyzer's local body
                 // walker types them from the initializer.
-                let var_text = hir.idents[vd.name].text.as_str();
-                let var_sym = index.symbols.intern(var_text);
+                let var_sym = hir.idents[vd.name].symbol;
                 let Some(tr) = vd.ty else {
                     continue;
                 };
@@ -1116,11 +1135,11 @@ fn lower_module_signatures(
 fn is_assignable_to_with_index(
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
+    decl_registry: &DeclRegistry,
     arena: &TypeArena,
     from: TypeId,
     to: TypeId,
 ) -> bool {
-    use TypeKind;
     if is_assignable_to(arena, from, to) {
         return true;
     }
@@ -1136,7 +1155,9 @@ fn is_assignable_to_with_index(
         // gone; `Named` only survives for genuinely-unknown names
         // and they're already absorbed by the `Unresolved` arm in
         // `is_assignable_to`.
-        (TypeKind::Type(sub), TypeKind::Type(sup)) => index.is_subtype_of_decl(arena, *sub, *sup),
+        (TypeKind::Type(sub), TypeKind::Type(sup)) => {
+            index.is_subtype_of_decl(decl_registry, *sub, *sup)
+        }
         // Node-tag bivariance (handle-keyed): `nodeTime<X> ↔
         // nodeTime<X?>`, `nodeList<node<Dog>> → nodeList<node<Animal>>`,
         // etc. Verified against the runtime oracle: node handles are
@@ -1161,7 +1182,7 @@ fn is_assignable_to_with_index(
             // identical). Recurse so a chain like
             // node<DeepSub> -> node<MidSub> -> node<Super> still
             // works in one hop.
-            is_assignable_to_with_index(index, well_known, arena, aa[0], ab[0])
+            is_assignable_to_with_index(index, well_known, decl_registry, arena, aa[0], ab[0])
         }
         _ => false,
     }
@@ -1177,7 +1198,6 @@ pub(crate) fn is_castable_with_index(
     from: TypeId,
     to: TypeId,
 ) -> bool {
-    use {Primitive, TypeKind};
     if is_castable(arena, from, to) {
         return true;
     }
@@ -1293,6 +1313,7 @@ impl ProjectAnalysis {
             lints.extend(run_lints_with_directives(
                 &hir,
                 &resolutions,
+                &index.symbols,
                 &mut directives,
                 bypass,
             ));
@@ -1458,7 +1479,9 @@ impl ProjectAnalysis {
             let expected = fnd.params.len();
             let actual = call.args.len();
             if expected != actual {
-                let fn_name = fn_module.hir.idents[fnd.name].text.clone();
+                let fn_name = SmolStr::from(
+                    &index.symbols[fn_module.hir.idents[fnd.name].symbol],
+                );
                 let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
                 let plural = if expected == 1 { "" } else { "s" };
                 out.push(SemanticDiagnostic {
@@ -1499,6 +1522,7 @@ impl ProjectAnalysis {
                 cur_module,
                 fn_module,
                 index,
+                decl_registry,
                 &cur_module.hir.exprs[call.callee],
             );
             let pair_count = fnd.params.len().min(call.args.len());
@@ -1531,8 +1555,16 @@ impl ProjectAnalysis {
                     Some(t) => t,
                     None => continue,
                 };
-                if !is_assignable_to_with_index(index, well_known, arena, arg_ty, declared_ty) {
-                    let p_name = fn_module.hir.idents[p.name].text.clone();
+                if !is_assignable_to_with_index(
+                    index,
+                    well_known,
+                    decl_registry,
+                    arena,
+                    arg_ty,
+                    declared_ty,
+                ) {
+                    let p_name =
+                        SmolStr::from(&index.symbols[fn_module.hir.idents[p.name].symbol]);
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     out.push(SemanticDiagnostic {
                         severity: Severity::Error,
@@ -1600,6 +1632,7 @@ impl ProjectAnalysis {
         // alongside `&mut self.modules`.
         let arena = &self.arena;
         let index = &self.index;
+        let decl_registry = &self.decl_registry;
         let bypass = self.bypass_suppressions;
         let enabled_rules = &self.enabled_rules;
 
@@ -1632,7 +1665,16 @@ impl ProjectAnalysis {
             .filter(|(uri, _)| in_scope(uri))
             .collect();
         crate::parallel::par_for_each(modules, |(uri, module)| {
-            run_typed_lints_for_module(uri, module, arena, index, bypass, enabled_rules, &doc_data);
+            run_typed_lints_for_module(
+                uri,
+                module,
+                arena,
+                index,
+                decl_registry,
+                bypass,
+                enabled_rules,
+                &doc_data,
+            );
         });
     }
 
@@ -1810,7 +1852,7 @@ impl ProjectAnalysis {
                 let needle = &chain[1];
                 for decl_id in &target_root.decls {
                     if let Some(name_idx) = target_module.hir.decls[*decl_id].name()
-                        && target_module.hir.idents[name_idx].text == *needle
+                        && &self.index.symbols[target_module.hir.idents[name_idx].symbol] == needle
                     {
                         bumps.entry(target_uri.clone()).or_default().push(*decl_id);
                         break;
@@ -1839,6 +1881,7 @@ impl ProjectAnalysis {
             let mut cx = crate::lint::LintCx::new(
                 &module.hir,
                 &module.resolutions,
+                &self.index.symbols,
                 Some(&mut module.directives),
                 false,
                 &mut new_lints,
@@ -2047,6 +2090,7 @@ impl ProjectAnalysis {
         lints.extend(run_lints_with_directives(
             &hir,
             &resolutions,
+            &self.index.symbols,
             &mut directives,
             bypass,
         ));
@@ -2269,21 +2313,21 @@ fn resolve_qualified_chain(
     if chain.len() != 3 {
         return None;
     }
-    let module_name = cur.hir.idents[chain[0]].text.as_str();
-    let type_name = cur.hir.idents[chain[1]].text.as_str();
-    let member_name = cur.hir.idents[chain[2]].text.as_str();
-    let module_uri = index.module_uri(module_name)?.clone();
+    let module_name_sym = cur.hir.idents[chain[0]].symbol;
+    let type_name_sym = cur.hir.idents[chain[1]].symbol;
+    let member_name_sym = cur.hir.idents[chain[2]].symbol;
+    let module_uri = index.module_uri(&index.symbols[module_name_sym])?.clone();
     let foreign = modules.get(&module_uri)?;
     let foreign_root = foreign.hir.module.as_ref()?;
     // Look for the named decl — could be a `type` or `enum`.
     let mut found: Option<Idx<Decl>> = None;
     for decl_id in &foreign_root.decls {
-        let name_text = match &foreign.hir.decls[*decl_id] {
-            Decl::Type(td) => &foreign.hir.idents[td.name].text,
-            Decl::Enum(ed) => &foreign.hir.idents[ed.name].text,
+        let name_sym = match &foreign.hir.decls[*decl_id] {
+            Decl::Type(td) => foreign.hir.idents[td.name].symbol,
+            Decl::Enum(ed) => foreign.hir.idents[ed.name].symbol,
             _ => continue,
         };
-        if name_text == type_name {
+        if name_sym == type_name_sym {
             found = Some(*decl_id);
             break;
         }
@@ -2292,7 +2336,7 @@ fn resolve_qualified_chain(
     match &foreign.hir.decls[type_decl_id] {
         Decl::Enum(ed) => {
             for f in &ed.fields {
-                if foreign.hir.idents[foreign.hir.enum_fields[*f].name].text == member_name {
+                if foreign.hir.idents[foreign.hir.enum_fields[*f].name].symbol == member_name_sym {
                     return Some((module_uri, type_decl_id, QualifiedTarget::EnumVariant));
                 }
             }
@@ -2300,7 +2344,9 @@ fn resolve_qualified_chain(
         }
         Decl::Type(td) => {
             for attr_id in &td.attrs {
-                if foreign.hir.idents[foreign.hir.type_attrs[*attr_id].name].text == member_name {
+                if foreign.hir.idents[foreign.hir.type_attrs[*attr_id].name].symbol
+                    == member_name_sym
+                {
                     return Some((
                         module_uri,
                         type_decl_id,
@@ -2312,7 +2358,7 @@ fn resolve_qualified_chain(
                 let Decl::Fn(m) = &foreign.hir.decls[*method_id] else {
                     continue;
                 };
-                if foreign.hir.idents[m.name].text == member_name {
+                if foreign.hir.idents[m.name].symbol == member_name_sym {
                     return Some((
                         module_uri,
                         type_decl_id,
@@ -2345,6 +2391,7 @@ fn run_typed_lints_for_module(
     module: &mut ModuleAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
+    decl_registry: &DeclRegistry,
     bypass: bool,
     enabled_rules: &FxHashSet<String>,
     doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
@@ -2404,12 +2451,14 @@ fn run_typed_lints_for_module(
         &module.analysis,
         arena,
         index,
+        decl_registry,
         &mut module.lints,
         &mut module.directives,
         bypass,
     );
     lint_nullability_with_directives(
         &module.hir,
+        &index.symbols,
         &module.analysis,
         arena,
         &mut module.lints,
@@ -2420,6 +2469,7 @@ fn run_typed_lints_for_module(
         &module.hir,
         &module.analysis,
         arena,
+        &index.symbols,
         &mut module.lints,
         &mut module.directives,
         bypass,
@@ -2545,6 +2595,7 @@ fn validate_module_type_relations(
                             analysis,
                             index,
                             well_known,
+                            decl_registry,
                             arena,
                             init,
                             declared_ty,
@@ -2585,6 +2636,7 @@ fn validate_module_type_relations(
                         analysis,
                         index,
                         well_known,
+                        decl_registry,
                         arena,
                         init,
                         declared_ty,
@@ -2675,6 +2727,7 @@ fn validate_module_type_relations(
                         analysis,
                         index,
                         well_known,
+                        decl_registry,
                         arena,
                         *init_id,
                         declared_ty,
@@ -2696,6 +2749,7 @@ fn validate_module_type_relations(
                         analysis,
                         index,
                         well_known,
+                        decl_registry,
                         arena,
                         *value,
                         target_ty,
@@ -2715,6 +2769,7 @@ fn validate_module_type_relations(
                 check_bool(
                     analysis,
                     arena,
+                    index,
                     *condition,
                     bool_t,
                     "if condition",
@@ -2754,6 +2809,7 @@ fn validate_module_type_relations(
                 check_bool(
                     analysis,
                     arena,
+                    index,
                     *condition,
                     bool_t,
                     "while condition",
@@ -2779,6 +2835,7 @@ fn validate_module_type_relations(
                 check_bool(
                     analysis,
                     arena,
+                    index,
                     *condition,
                     bool_t,
                     "do-while condition",
@@ -2802,7 +2859,7 @@ fn validate_module_type_relations(
                 condition, body, ..
             }) => {
                 if let Some(c) = condition {
-                    check_bool(analysis, arena, *c, bool_t, "for condition", hir, diags);
+                    check_bool(analysis, arena, index, *c, bool_t, "for condition", hir, diags);
                 }
                 validate_block(
                     hir,
@@ -2882,6 +2939,7 @@ fn validate_module_type_relations(
                         analysis,
                         index,
                         well_known,
+                        decl_registry,
                         arena,
                         *v,
                         rt,
@@ -2906,6 +2964,7 @@ fn validate_module_type_relations(
         analysis: &AnalysisResult,
         index: &ProjectIndex,
         well_known: &WellKnown,
+        decl_registry: &DeclRegistry,
         arena: &TypeArena,
         value_id: Idx<Expr>,
         declared_ty: TypeId,
@@ -2917,7 +2976,7 @@ fn validate_module_type_relations(
         let Some(value_ty) = analysis.expr_types.get(&value_id).copied() else {
             return;
         };
-        if is_assignable_to_with_index(index, well_known, arena, value_ty, declared_ty) {
+        if is_assignable_to_with_index(index, well_known, decl_registry, arena, value_ty, declared_ty) {
             return;
         }
         let got = arena.display(value_ty, &index.symbols);
@@ -2935,6 +2994,7 @@ fn validate_module_type_relations(
     fn check_bool(
         analysis: &AnalysisResult,
         arena: &TypeArena,
+        index: &ProjectIndex,
         expr_id: Idx<Expr>,
         bool_t: TypeId,
         label: &'static str,
@@ -3168,10 +3228,9 @@ fn lower_type_ref_id(
     registry: &TypeRegistry,
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
-    type_decls: &FxHashMap<SmolStr, Idx<Decl>>,
+    type_decls: &FxHashMap<Symbol, Idx<Decl>>,
     arena: &mut TypeArena,
 ) -> Option<TypeId> {
-    use Primitive;
     let tr = &hir.type_refs[type_ref];
     // Qualified ref (`b::Foo`, …) — route through the same
     // module-scoped lookup the resolver and the body walker use, so
@@ -3200,6 +3259,7 @@ fn lower_type_ref_id(
         "any" => arena.any(),
         "null" => arena.null(),
         _ => {
+            let name = &index.symbols[name_sym];
             if !tr.params.is_empty() {
                 let mut args = Vec::with_capacity(tr.params.len());
                 for p in &tr.params {
@@ -3228,7 +3288,7 @@ fn lower_type_ref_id(
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
-            } else if let Some(id) = registry.lookup(name) {
+            } else if let Some(id) = registry.lookup(name_sym) {
                 id
             } else if let Some(enum_id) = index.enum_type_for(name) {
                 // Canonical enum TypeId from S7-S11. The body walker's
@@ -3249,7 +3309,7 @@ fn lower_type_ref_id(
                 // "T is not assignable to T" diagnostic.
                 arena.alloc_type(handle)
             } else {
-                arena.unresolved(name.to_string(), (tr.byte_range.start, tr.byte_range.end))
+                arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end))
             }
         }
     };
@@ -3268,10 +3328,11 @@ fn lower_type_ref_id(
 fn generic_arity_for(
     name: &str,
     hir: &greycat_analyzer_hir::Hir,
-    type_decls: &rustc_hash::FxHashMap<smol_str::SmolStr, Idx<Decl>>,
+    type_decls: &rustc_hash::FxHashMap<Symbol, Idx<Decl>>,
     index: &ProjectIndex,
 ) -> Option<usize> {
-    if let Some(decl_id) = type_decls.get(name)
+    if let Some(name_sym) = index.symbols.lookup(name)
+        && let Some(decl_id) = type_decls.get(&name_sym)
         && let Decl::Type(td) = &hir.decls[*decl_id]
         && !td.generics.is_empty()
     {
@@ -3303,17 +3364,17 @@ fn generic_arity_for(
 /// the runtime accepts it cleanly. Substituting `T → int?` before
 /// minting closes the gap.
 type GenericsInScope = FxHashMap<Symbol, GenericOwner>;
-type MethodSubst = FxHashMap<String, TypeId>;
+type MethodSubst = FxHashMap<Symbol, TypeId>;
 
 fn method_subst_from_receiver(
     arena: &TypeArena,
     cur_module: &ModuleAnalysis,
     fn_module: &ModuleAnalysis,
     index: &ProjectIndex,
+    decl_registry: &DeclRegistry,
     callee_expr: &greycat_analyzer_hir::types::Expr,
 ) -> (GenericsInScope, MethodSubst) {
     use greycat_analyzer_hir::types::Expr;
-    use {GenericOwner, TypeKind};
     let empty = || (GenericsInScope::default(), MethodSubst::default());
     let receiver_expr_id = match callee_expr {
         Expr::Member(m) | Expr::Arrow(m) => m.receiver,
@@ -3329,8 +3390,8 @@ fn method_subst_from_receiver(
     };
     let recv = arena.get(receiver_ty);
     let (recv_name, recv_args): (&str, &[TypeId]) = match &recv.kind {
-        TypeKind::Generic { decl, args } => match arena.decl_name(*decl) {
-            Some(n) => (n, args.as_slice()),
+        TypeKind::Generic { decl, args } => match decl_registry.name(*decl) {
+            Some(n) => (&index.symbols[n], args.as_slice()),
             None => return empty(),
         },
         _ => return empty(),
@@ -3341,7 +3402,7 @@ fn method_subst_from_receiver(
     let mut owner_td: Option<&greycat_analyzer_hir::types::TypeDecl> = None;
     for d_id in &module.decls {
         if let Decl::Type(td) = &fn_module.hir.decls[*d_id]
-            && fn_module.hir.idents[td.name].text.as_str() == recv_name
+            && &index.symbols[fn_module.hir.idents[td.name].symbol] == recv_name
         {
             owner_td = Some(td);
             break;
@@ -3350,21 +3411,17 @@ fn method_subst_from_receiver(
     let Some(td) = owner_td else {
         return empty();
     };
-    let owner = GenericOwner::Type(recv_name.into());
+    let owner = match index.symbol(recv_name) {
+        Some(s) => GenericOwner::Type(s),
+        None => return empty(),
+    };
     let mut generics_in_scope: GenericsInScope = FxHashMap::default();
     let mut subst: MethodSubst = FxHashMap::default();
     for (i, gen_idx) in td.generics.iter().enumerate() {
-        let gname = fn_module.hir.idents[*gen_idx].text.as_str();
-        // `lower_type_ref_project` reads `generics_in_scope` keyed by
-        // Symbol; only names *already* in the project's symbol table
-        // get the GenericParam treatment. Use `lookup` (read-only) —
-        // mutating the table here would cross the `&ProjectIndex`
-        // borrow.
-        if let Some(sym) = index.symbol(gname) {
-            generics_in_scope.insert(sym, owner.clone());
-        }
+        let gen_sym = fn_module.hir.idents[*gen_idx].symbol;
+        generics_in_scope.insert(gen_sym, owner.clone());
         if let Some(arg_id) = recv_args.get(i).copied() {
-            subst.insert(gname.to_string(), arg_id);
+            subst.insert(gen_sym, arg_id);
         }
     }
     (generics_in_scope, subst)

@@ -394,16 +394,12 @@ impl TypeArena {
     //     }
     // }
 
-    /// Recover the source name for `decl`, or `None` if no
-    /// `alloc_type` / `generic` has interned it yet.
-    pub fn decl_name(&self, decl: TypeDeclId) -> Option<&str> {
-        // self.decl_names
-        //     .get(decl.raw() as usize)
-        //     .filter(|s| !s.is_empty())
-        //     .map(SmolStr::as_str)
-        let _ = decl;
-        todo!("TypeArena::decl_name")
-    }
+    // Decl-name resolution lives one layer up — see
+    // `ProjectAnalysis::decl_name` in the analysis crate, which goes
+    // through `DeclRegistry::name(id) -> Symbol` then resolves the
+    // symbol against the project's [`SymbolTable`]. `TypeArena`
+    // intentionally does not store names; it only knows
+    // [`TypeDeclId`] handles.
 
     /// Return a [`Display`]-implementing wrapper that renders the type
     /// at `id`. Reads decl names from this arena's `decl_names` table —
@@ -544,12 +540,13 @@ impl TypeArena {
 // Type registry — holds module-level declared types
 // =============================================================================
 
-/// Looks up named types. / will populate this from HIR + stdlib.
+/// Looks up named types.
 #[derive(Debug, Default)]
 pub struct TypeRegistry {
-    /// Maps simple type name -> a TypeId in the arena.
+    /// Maps `Symbol` (an interned type name) → `TypeId` in the
+    /// shared arena.
     // P25.2
-    named: FxHashMap<SmolStr, TypeId>,
+    named: FxHashMap<Symbol, TypeId>,
 }
 
 impl TypeRegistry {
@@ -557,20 +554,19 @@ impl TypeRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, name: impl Into<SmolStr>, id: TypeId) {
-        self.named.insert(name.into(), id);
+    pub fn register(&mut self, name: Symbol, id: TypeId) {
+        self.named.insert(name, id);
     }
 
-    pub fn lookup(&self, name: &str) -> Option<TypeId> {
-        self.named.get(name).copied()
+    pub fn lookup(&self, name: Symbol) -> Option<TypeId> {
+        self.named.get(&name).copied()
     }
 
     // P19.6
-    /// Iterate every registered name. Used by the
-    /// signature-cache invalidation path to fingerprint the
-    /// project-wide name set.
-    pub fn iter_names(&self) -> impl Iterator<Item = &str> {
-        self.named.keys().map(|s| s.as_str())
+    /// Iterate every registered name [`Symbol`]. Use the project's
+    /// [`SymbolTable`] to recover the source text.
+    pub fn iter_names(&self) -> impl Iterator<Item = Symbol> + '_ {
+        self.named.keys().copied()
     }
 }
 
@@ -994,15 +990,14 @@ fn write_type(
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Node { kind: decl, .. } => f.write_str(decl.name())?,
-        TypeKind::Type(d) => match arena.decl_name(*d) {
-            Some(name) => f.write_str(name)?,
-            None => write!(f, "?type#{}", d.raw())?,
-        },
+        // Decl-name rendering belongs to the project layer
+        // (see `ProjectTypeDisplay` in
+        // `greycat-analyzer-analysis::project`). Core's bare display
+        // doesn't have access to a `DeclRegistry → Symbol` map, so it
+        // renders named types as the `?type#<raw>` placeholder.
+        TypeKind::Type(d) => write!(f, "?type#{}", d.raw())?,
         TypeKind::Generic { decl, args } => {
-            match arena.decl_name(*decl) {
-                Some(name) => f.write_str(name)?,
-                None => write!(f, "?type#{}", decl.raw())?,
-            }
+            write!(f, "?type#{}", decl.raw())?;
             write_args(f, arena, symbols, args)?;
         }
         TypeKind::Unresolved { name, .. } => f.write_str(&symbols[*name])?,
@@ -1106,31 +1101,19 @@ pub fn display_fqn(
                 .collect();
             format!("core::{}<{}>", kind.name(), parts.join(", "))
         }
-        // P35.2 — decl names come from the arena (registered at alloc
-        // time). `home_lib` resolves the home library for each decl
-        // by name.
-        TypeKind::Type(d) => match arena.decl_name(*d) {
-            Some(name) => format!(
-                "{}::{}",
-                home_lib(name).unwrap_or_else(|| "core".to_string()),
-                name
-            ),
-            None => format!("?type#{}", d.raw()),
-        },
+        // Decl-name rendering belongs to the project layer.
+        // `display_fqn` doesn't have access to a `TypeDeclId →
+        // Symbol` map (that lives on `DeclRegistry` in the analysis
+        // crate), so it renders named types as the `?type#<raw>`
+        // placeholder. Callers that need FQN rendering should use a
+        // project-aware Display.
+        TypeKind::Type(d) => format!("?type#{}", d.raw()),
         TypeKind::Generic { decl, args } => {
             let parts: Box<[String]> = args
                 .iter()
                 .map(|a| display_fqn(arena, symbols, *a, home_lib))
                 .collect();
-            match arena.decl_name(*decl) {
-                Some(name) => format!(
-                    "{}::{}<{}>",
-                    home_lib(name).unwrap_or_else(|| "core".to_string()),
-                    name,
-                    parts.join(", ")
-                ),
-                None => format!("?type#{}<{}>", decl.raw(), parts.join(", ")),
-            }
+            format!("?type#{}<{}>", decl.raw(), parts.join(", "))
         }
         // P35.3 — unresolved name, render verbatim with the same
         // `<lib>::` prefix the rest of the resolver would have used.

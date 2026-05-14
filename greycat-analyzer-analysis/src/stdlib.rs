@@ -23,6 +23,8 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as HirTypeRef};
 
+use crate::well_known::DeclRegistry;
+
 /// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
 /// declaration whose `extends` chain reaches a 5th level with
 /// `too depth inheritance: <name>` (verified against `greycat build`:
@@ -694,13 +696,21 @@ impl ProjectIndex {
     /// Replaces every `is_subtype_of(&str, &str)` call site as the
     /// migration progresses; the string form is kept during the
     /// `Named` -> `Type(handle)` cascade and deleted in P36.7.
-    pub fn is_subtype_of_decl(&self, arena: &TypeArena, sub: TypeDeclId, sup: TypeDeclId) -> bool {
+    pub fn is_subtype_of_decl(
+        &self,
+        decl_registry: &DeclRegistry,
+        sub: TypeDeclId,
+        sup: TypeDeclId,
+    ) -> bool {
         if sub == sup {
             return true;
         }
-        let (Some(sub_name), Some(sup_name)) = (arena.decl_name(sub), arena.decl_name(sup)) else {
+        let (Some(sub_sym), Some(sup_sym)) = (decl_registry.name(sub), decl_registry.name(sup))
+        else {
             return false;
         };
+        let sub_name = &self.symbols[sub_sym];
+        let sup_name = &self.symbols[sup_sym];
         self.is_subtype_of(sub_name, sup_name)
     }
     pub fn native_for(&self, name: &str) -> Option<&NativeSignature> {
@@ -781,8 +791,7 @@ impl ProjectIndex {
         for decl_id in &module.decls {
             let modifiers = match &hir.decls[*decl_id] {
                 Decl::Type(td) => {
-                    let name_str = hir.idents[td.name].text.as_str();
-                    let name_sym = self.symbols.intern(name_str);
+                    let name_sym = hir.idents[td.name].symbol;
                     // Recognised type name (drives `has_name` and the
                     // sig-cache fingerprint).
                     self.type_names.insert(name_sym);
@@ -791,8 +800,8 @@ impl ProjectIndex {
                     // standalone pre-pass in
                     // `stage_lower_signatures` so the project has a
                     // single decl-registration point.
-                    let handle = decl_registry.get_or_insert(uri, *decl_id);
-                    well_known.record(&module.lib, &module.name, name_str, handle);
+                    let handle = decl_registry.get_or_insert(uri, *decl_id, name_sym);
+                    well_known.record(&module.lib, &module.name, &self.symbols[name_sym], handle);
                     // P13.5: capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
                     let flags = derive_type_flags(&td.modifiers.annotations);
@@ -806,11 +815,8 @@ impl ProjectIndex {
                     // methods inline instead of deferring to a post
                     // pass.
                     if !self.type_members.contains_key(&name_sym) {
-                        let generics: Vec<Symbol> = td
-                            .generics
-                            .iter()
-                            .map(|g| self.symbols.intern(hir.idents[*g].text.as_str()))
-                            .collect();
+                        let generics: Vec<Symbol> =
+                            td.generics.iter().map(|g| hir.idents[*g].symbol).collect();
                         // **P19.14** — capture the direct supertype
                         // name (the `Super` in `type Sub extends
                         // Super`). Resolved as a Symbol now (without
@@ -819,7 +825,8 @@ impl ProjectIndex {
                         // module-dependent). Lookup walks the chain
                         // lazily on access.
                         let supertype = td.supertype.and_then(|tr| {
-                            let parent_text = hir.idents[hir.type_refs[tr].name].text.as_str();
+                            let parent_sym = hir.idents[hir.type_refs[tr].name].symbol;
+                            let parent_text = &self.symbols[parent_sym];
                             // Skip the trivial primitives that can
                             // never be a user type's supertype —
                             // they'd never resolve to a TypeMembers
@@ -840,7 +847,7 @@ impl ProjectIndex {
                             ) {
                                 None
                             } else {
-                                Some(self.symbols.intern(parent_text))
+                                Some(parent_sym)
                             }
                         });
                         let mut m = TypeMembers {
@@ -866,7 +873,7 @@ impl ProjectIndex {
                         };
                         for attr_id in &td.attrs {
                             let attr = &hir.type_attrs[*attr_id];
-                            let attr_sym = self.symbols.intern(hir.idents[attr.name].text.as_str());
+                            let attr_sym = hir.idents[attr.name].symbol;
                             m.attrs.insert(attr_sym, *attr_id);
                             // P19.13 — capture `static` flag at
                             // ingest time so `Expr::Static` value
@@ -879,8 +886,7 @@ impl ProjectIndex {
                         }
                         for method_id in &td.methods {
                             if let Decl::Fn(fnd) = &hir.decls[*method_id] {
-                                let method_sym =
-                                    self.symbols.intern(hir.idents[fnd.name].text.as_str());
+                                let method_sym = hir.idents[fnd.name].symbol;
                                 m.methods.insert(method_sym, *method_id);
                                 if fnd.modifiers.static_ {
                                     m.static_methods.insert(method_sym);
@@ -896,13 +902,12 @@ impl ProjectIndex {
                     Some(&td.modifiers)
                 }
                 Decl::Enum(ed) => {
-                    let name_str = hir.idents[ed.name].text.as_str();
-                    let name_sym = self.symbols.intern(name_str);
+                    let name_sym = hir.idents[ed.name].symbol;
                     self.type_names.insert(name_sym);
                     // Project-wide decl handle (enums get one too — the
                     // resolver / lowering paths route foreign enum refs
                     // through `Type(handle)` for some shapes).
-                    let _ = decl_registry.get_or_insert(uri, *decl_id);
+                    let _ = decl_registry.get_or_insert(uri, *decl_id, name_sym);
                     // Alloc the canonical `TypeKind::Enum` into the
                     // shared arena and publish to `enum_types`
                     // immediately. Doing it here (rather than as a
@@ -912,7 +917,6 @@ impl ProjectIndex {
                     // return-type lowering for methods declared in
                     // the same module — sees the canonical TypeId.
                     self.enum_types.entry(name_sym).or_insert_with(|| {
-                        let name_owned: SmolStr = name_str.into();
                         let variants: Box<[Symbol]> = ed
                             .fields
                             .iter()
@@ -930,8 +934,7 @@ impl ProjectIndex {
                     Some(&ed.modifiers)
                 }
                 Decl::Fn(fnd) => {
-                    let name_str = hir.idents[fnd.name].text.as_str();
-                    let name_sym = self.symbols.intern(name_str);
+                    let name_sym = hir.idents[fnd.name].symbol;
                     if fnd.modifiers.native {
                         let sig = native_signature_for(
                             hir,
@@ -955,7 +958,7 @@ impl ProjectIndex {
                     Some(&fnd.modifiers)
                 }
                 Decl::Var(vd) => {
-                    let name_sym = self.symbols.intern(hir.idents[vd.name].text.as_str());
+                    let name_sym = hir.idents[vd.name].symbol;
                     self.values.insert(name_sym);
                     self.record_decl_location(name_sym, uri, *decl_id);
                     Some(&vd.modifiers)
@@ -963,7 +966,7 @@ impl ProjectIndex {
                 Decl::Pragma(p) => {
                     // P13.6: capture `@permission("name")` mod-pragmas
                     // into the project-wide `module_permissions` map.
-                    if hir.idents[p.name].text == "permission"
+                    if &self.symbols[hir.idents[p.name].symbol] == "permission"
                         && let Some(arg_expr) = p.args.first()
                         && let greycat_analyzer_hir::types::Expr::String(s) = &hir.exprs[*arg_expr]
                     {
@@ -988,9 +991,9 @@ impl ProjectIndex {
                 if modifiers.private {
                     self.private_locations.insert((uri.clone(), *decl_id));
                 }
-                let local_name = hir.decls[*decl_id]
+                let local_name: SmolStr = hir.decls[*decl_id]
                     .name()
-                    .map(|n| hir.idents[n].text.clone())
+                    .map(|n| SmolStr::from(&self.symbols[hir.idents[n].symbol]))
                     .unwrap_or_default();
                 for ann in &modifiers.annotations {
                     if ann.name != "expose" {
@@ -1042,7 +1045,7 @@ impl ProjectIndex {
 
     pub fn locate_decl_by_symbol(&self, name: Symbol) -> &[(Uri, Idx<Decl>)] {
         self.decl_locations
-            .get(&s)
+            .get(&name)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -1219,7 +1222,7 @@ fn lower_native_type_ref(
                 // / signature pass produces for the same source token.
                 match handle {
                     Some(h) => arena.alloc_type(h),
-                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             }
         }

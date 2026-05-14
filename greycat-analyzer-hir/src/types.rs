@@ -583,7 +583,7 @@ pub enum PropertyName {
     /// `a.b`, `a->b`, `T::b` — bareword identifier property.
     Ident(Idx<Ident>),
     /// `a."b.c"`, `a->"b.c"`, `T::"b.c"` — string-literal property.
-    /// The pointed-to `Ident.text` carries the *decoded* property name
+    /// The pointed-to `Ident.symbol` resolves to the *decoded* property name
     /// (without surrounding quotes); `Ident.byte_range` covers the
     /// entire `"..."` literal in source.
     String(Idx<Ident>),

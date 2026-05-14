@@ -13,8 +13,8 @@
 //!   `Decl::Type` whose `(module.lib, module.name, decl_name)` matches
 //!   `("std", "core", N)` stashes its handle into slot `N`.
 
-use greycat_analyzer_core::TypeDeclId;
 use greycat_analyzer_core::lsp_types::Uri;
+use greycat_analyzer_core::{Symbol, TypeDeclId};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use rustc_hash::FxHashMap;
@@ -27,17 +27,23 @@ use rustc_hash::FxHashMap;
 /// were issued for the same `(uri, decl)` pair. Across registry
 /// instances, handles are not comparable.
 ///
-/// Decl *names* aren't stored here — the arena owns them via
-/// [`greycat_analyzer_core::TypeArena::decl_name`], registered at
-/// `alloc_type` / `generic` time. This keeps the registry to a
-/// single responsibility (handle identity) and lets downstream
-/// consumers render types through `arena.display(id)` with no
-/// registry borrow.
-/// One entry per resolved `(Uri, Idx<Decl>)` pair.
+/// Decl *names* are not stored here — they live on the `Decl`
+/// variant in the owning module's `Hir`. Display paths that need a
+/// `&str` for a `TypeDeclId` resolve through
+/// [`crate::ProjectAnalysis::decl_name`], which goes
+/// `TypeDeclId → (Uri, Idx<Decl>) → Decl::name() → Idx<Ident> →
+/// Symbol → &str`.
 #[derive(Debug, Clone)]
 struct DeclEntry {
     uri: Uri,
     decl: Idx<Decl>,
+    /// Cached `Symbol` for the decl's name — `Idx<Decl>` alone is
+    /// only dereferenceable with the owning module's `Hir`, which
+    /// the per-module `Cx` doesn't carry. Storing the `Symbol` (a
+    /// `u32` handle into the project's `SymbolTable`, *not* a
+    /// duplicated string) lets every consumer render the name in
+    /// constant time.
+    name: Symbol,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -52,8 +58,9 @@ impl DeclRegistry {
     }
 
     /// Intern `(uri, decl)`. Idempotent — re-calling with the same
-    /// pair returns the previously-issued handle.
-    pub fn get_or_insert(&mut self, uri: &Uri, decl: Idx<Decl>) -> TypeDeclId {
+    /// pair returns the previously-issued handle; `name` on
+    /// subsequent calls is ignored (first call wins).
+    pub fn get_or_insert(&mut self, uri: &Uri, decl: Idx<Decl>, name: Symbol) -> TypeDeclId {
         let key = (uri.clone(), decl);
         if let Some(&id) = self.intern.get(&key) {
             return id;
@@ -62,9 +69,16 @@ impl DeclRegistry {
         self.items.push(DeclEntry {
             uri: uri.clone(),
             decl,
+            name,
         });
         self.intern.insert(key, id);
         id
+    }
+
+    /// Resolve a handle to the [`Symbol`] for its declared name.
+    /// Combine with the project's [`SymbolTable`] to get the `&str`.
+    pub fn name(&self, id: TypeDeclId) -> Option<Symbol> {
+        self.items.get(id.raw() as usize).map(|e| e.name)
     }
 
     /// Read-only lookup: returns the handle for `(uri, decl)` or

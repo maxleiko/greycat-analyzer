@@ -31,6 +31,7 @@
 
 use rustc_hash::FxHashMap;
 
+use greycat_analyzer_core::TypeArena;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -195,7 +196,7 @@ impl<'a> Cx<'a> {
     }
 
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
-        &self.hir.idents[idx].text
+        &self.index.symbols[self.hir.idents[idx].symbol]
     }
 
     fn record_use(&mut self, idx: Idx<Ident>) {
@@ -790,12 +791,12 @@ mod tests {
     use greycat_analyzer_hir::types::{Decl, Expr};
     use greycat_analyzer_syntax::parse;
 
-    fn analyze(src: &str) -> (Hir, Resolutions) {
+    fn analyze(src: &str) -> (Hir, Resolutions, SymbolTable) {
         let tree = parse(src);
         let s = SymbolTable::default();
         let hir = lower_module(src, &s, "mod", "project", tree.root_node());
         let res = resolve(&hir);
-        (hir, res)
+        (hir, res, s)
     }
 
     #[test]
@@ -807,11 +808,12 @@ mod tests {
         // Uses a local `Wrap` rather than the runtime `Map` so the
         // per-file resolver (no stdlib ingest) recognises the head.
         let src = "type T { paths: Wrap<String, Inner>?; }\ntype Inner {}\ntype Wrap<K, V> {}\n";
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
+        let inner_sym = s.lookup("Inner").expect("Inner interned");
         let inner_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "Inner")
+            .filter(|(_, i)| i.symbol == inner_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         assert_eq!(inner_uses.len(), 1, "Inner used once: {:?}", res.unresolved);
@@ -826,13 +828,14 @@ mod tests {
     #[test]
     fn param_use_resolves_to_param() {
         let src = "fn id(x: int): int { return x; }\n";
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
+        let x_sym = s.lookup("x").expect("x interned");
 
         // Find the use of `x` inside the body.
         let x_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "x")
+            .filter(|(_, i)| i.symbol == x_sym)
             .map(|(idx, _)| idx)
             .collect();
         // Two `x` idents: one is the parameter name (definition),
@@ -849,12 +852,13 @@ mod tests {
 fn caller(): int { return helper(); }
 fn helper(): int { return 1; }
 "#;
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
+        let helper_sym = s.lookup("helper").expect("helper interned");
         // The Ident for the use of `helper` in caller's body.
         let helper_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "helper")
+            .filter(|(_, i)| i.symbol == helper_sym)
             .map(|(idx, _)| idx)
             .collect();
         let bound: Vec<_> = helper_uses
@@ -869,7 +873,7 @@ fn helper(): int { return 1; }
     #[test]
     fn unresolved_name_reported() {
         let src = "fn f(): int { return missing; }\n";
-        let (_hir, res) = analyze(src);
+        let (_hir, res, _s) = analyze(src);
         assert_eq!(res.unresolved.len(), 1);
     }
 
@@ -881,11 +885,12 @@ fn f(x: int): int {
     return x;
 }
 "#;
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
+        let x_sym = s.lookup("x").expect("x interned");
         let return_x_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "x")
+            .filter(|(_, i)| i.symbol == x_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         // Use site (return x) — we expect it to bind to the local, not the param.
@@ -903,11 +908,13 @@ fn f(x: int): int {
 type Foo {}
 fn f(p: Foo): Foo { return p; }
 "#;
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
+        let foo_sym = s.lookup("Foo").expect("Foo interned");
+        let p_sym = s.lookup("p").expect("p interned");
         let foo_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "Foo")
+            .filter(|(_, i)| i.symbol == foo_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         // Two uses of `Foo`: in param type and return type. Both should
@@ -927,7 +934,7 @@ fn f(p: Foo): Foo { return p; }
         let p_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "p")
+            .filter(|(_, i)| i.symbol == p_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         assert!(p_uses.iter().any(|d| matches!(d, Definition::Param(_))));
@@ -940,11 +947,12 @@ fn f(p: Foo): Foo { return p; }
     #[test]
     fn generic_param_resolves_to_generic_definition() {
         let src = "fn id<T>(x: T): T { return x; }\n";
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
+        let t_sym = s.lookup("T").expect("T interned");
         let t_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "T")
+            .filter(|(_, i)| i.symbol == t_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         // Two uses of `T` (param type, return type) — both bind to the
@@ -988,11 +996,12 @@ fn f(p: Foo): Foo { return p; }
         let s = SymbolTable::default();
         let user_hir = lower_module(user_src, &s, "b", "p", user_tree.root_node());
         let res = resolve_with_index(&user_hir, &idx);
+        let helper_sym = s.lookup("Helper").expect("Helper interned");
 
         let helper_uses: Vec<_> = user_hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "Helper")
+            .filter(|(_, i)| i.symbol == helper_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         assert_eq!(helper_uses.len(), 1);
@@ -1016,12 +1025,13 @@ fn f(p: Foo): Foo { return p; }
         // ingest) can still recognise the iterator's type — runtime
         // types like `Array` only land in scope through stdlib.
         let src = "type Xs {}\nfn f(xs: Xs) { for (i, x in xs) { var s = i + x; } }\n";
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
         for name in ["i", "x"] {
+            let needle_sym = s.lookup(name).expect("name interned");
             let uses: Vec<_> = hir
                 .idents
                 .iter()
-                .filter(|(_, id)| id.text == name)
+                .filter(|(_, id)| id.symbol == needle_sym)
                 .filter_map(|(idx, _)| res.uses.get(&idx))
                 .collect();
             assert!(
@@ -1046,11 +1056,12 @@ fn f(p: Foo): Foo { return p; }
     #[test]
     fn catch_param_binds_in_catch_block() {
         let src = "fn f() { try { } catch (ex) { throw ex; } }\n";
-        let (hir, res) = analyze(src);
+        let (hir, res, s) = analyze(src);
+        let ex_sym = s.lookup("ex").expect("ex interned");
         let ex_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "ex")
+            .filter(|(_, i)| i.symbol == ex_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
         assert_eq!(

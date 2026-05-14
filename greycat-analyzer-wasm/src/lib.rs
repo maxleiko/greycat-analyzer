@@ -36,6 +36,7 @@ use greycat_analyzer_analysis::{
     resolver::resolve,
 };
 use greycat_analyzer_core::SourceManager;
+use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_core::diagnostics::parse_diagnostics;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
@@ -239,22 +240,30 @@ struct HirCounts {
     idents: usize,
 }
 
-fn ident_text(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Ident>) -> String {
-    hir.idents[idx].text.to_string()
+fn ident_text(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    idx: Idx<greycat_analyzer_hir::types::Ident>,
+) -> String {
+    symbols[hir.idents[idx].symbol].to_string()
 }
 
-fn type_ref_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::TypeRef>) -> HirNode {
+fn type_ref_node(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    idx: Idx<greycat_analyzer_hir::types::TypeRef>,
+) -> HirNode {
     let tr = &hir.type_refs[idx];
     let mut children = Vec::new();
     for &p in &tr.params {
-        children.push(type_ref_node(hir, p));
+        children.push(type_ref_node(hir, symbols, p));
     }
     let mut label = String::new();
     for q in tr.qualifier.iter() {
-        label.push_str(&ident_text(hir, *q));
+        label.push_str(&ident_text(hir, symbols, *q));
         label.push_str("::");
     }
-    label.push_str(&ident_text(hir, tr.name));
+    label.push_str(&ident_text(hir, symbols, tr.name));
     if tr.optional {
         label.push('?');
     }
@@ -266,12 +275,20 @@ fn type_ref_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::TypeRef>) -> H
     }
 }
 
-fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode {
+fn expr_node(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    idx: Idx<greycat_analyzer_hir::types::Expr>,
+) -> HirNode {
     use greycat_analyzer_hir::types::Expr;
     let e = &hir.exprs[idx];
     let range: ByteRange = e.byte_range().into();
     let (kind, label, children) = match e {
-        Expr::Ident { name, .. } => ("expr:ident", Some(ident_text(hir, *name)), Vec::new()),
+        Expr::Ident { name, .. } => (
+            "expr:ident",
+            Some(ident_text(hir, symbols, *name)),
+            Vec::new(),
+        ),
         Expr::Literal(l) => ("expr:literal", Some(format!("{:?}", l.kind)), Vec::new()),
         Expr::Null { .. } => ("expr:null", None, Vec::new()),
         Expr::This { .. } => ("expr:this", None, Vec::new()),
@@ -283,7 +300,7 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
                         kind: "expr:string-interp".into(),
                         label: None,
                         range: byte_range.clone().into(),
-                        children: vec![expr_node(hir, *expr)],
+                        children: vec![expr_node(hir, symbols, *expr)],
                     });
                 }
             }
@@ -292,24 +309,24 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
         Expr::Tuple(items, _) => (
             "expr:tuple",
             None,
-            items.iter().map(|i| expr_node(hir, *i)).collect(),
+            items.iter().map(|i| expr_node(hir, symbols, *i)).collect(),
         ),
         Expr::Array(items, _) => (
             "expr:array",
             None,
-            items.iter().map(|i| expr_node(hir, *i)).collect(),
+            items.iter().map(|i| expr_node(hir, symbols, *i)).collect(),
         ),
         Expr::Object(o) => {
             let mut kids = Vec::new();
             if let Some(t) = o.ty {
-                kids.push(type_ref_node(hir, t));
+                kids.push(type_ref_node(hir, symbols, t));
             }
             for f in &o.fields {
                 kids.push(HirNode {
                     kind: "expr:object-field".into(),
-                    label: f.name.map(|n| ident_text(hir, n)),
+                    label: f.name.map(|n| ident_text(hir, symbols, n)),
                     range: f.byte_range.clone().into(),
-                    children: vec![expr_node(hir, f.value)],
+                    children: vec![expr_node(hir, symbols, f.value)],
                 });
             }
             ("expr:object", None, kids)
@@ -322,21 +339,21 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
             };
             (
                 kind,
-                Some(ident_text(hir, m.property.ident())),
-                vec![expr_node(hir, m.receiver)],
+                Some(ident_text(hir, symbols, m.property.ident())),
+                vec![expr_node(hir, symbols, m.receiver)],
             )
         }
         Expr::Static(s) => (
             "expr:static",
-            Some(ident_text(hir, s.property.ident())),
-            vec![type_ref_node(hir, s.ty)],
+            Some(ident_text(hir, symbols, s.property.ident())),
+            vec![type_ref_node(hir, symbols, s.ty)],
         ),
         Expr::QualifiedStatic { chain, .. } => (
             "expr:qualified-static",
             Some(
                 chain
                     .iter()
-                    .map(|n| ident_text(hir, *n))
+                    .map(|n| ident_text(hir, symbols, *n))
                     .collect::<Vec<_>>()
                     .join("::"),
             ),
@@ -345,61 +362,77 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
         Expr::Offset(o) => (
             "expr:offset",
             None,
-            vec![expr_node(hir, o.receiver), expr_node(hir, o.index)],
+            vec![
+                expr_node(hir, symbols, o.receiver),
+                expr_node(hir, symbols, o.index),
+            ],
         ),
         Expr::Call(c) => {
-            let mut kids = vec![expr_node(hir, c.callee)];
+            let mut kids = vec![expr_node(hir, symbols, c.callee)];
             for &a in &c.args {
-                kids.push(expr_node(hir, a));
+                kids.push(expr_node(hir, symbols, a));
             }
             ("expr:call", None, kids)
         }
         Expr::Binary(b) => (
             "expr:binary",
             Some(format!("{:?}", b.op)),
-            vec![expr_node(hir, b.left), expr_node(hir, b.right)],
+            vec![
+                expr_node(hir, symbols, b.left),
+                expr_node(hir, symbols, b.right),
+            ],
         ),
         Expr::Unary(u) => (
             "expr:unary",
             Some(format!("{:?}", u.op)),
-            vec![expr_node(hir, u.operand)],
+            vec![expr_node(hir, symbols, u.operand)],
         ),
-        Expr::Paren(inner, _) => ("expr:paren", None, vec![expr_node(hir, *inner)]),
+        Expr::Paren(inner, _) => (
+            "expr:paren",
+            None,
+            vec![expr_node(hir, symbols, *inner)],
+        ),
         Expr::Lambda(l) => {
             let mut kids = Vec::new();
             for &p in &l.params {
                 let pp = &hir.fn_params[p];
                 let mut pk = Vec::new();
                 if let Some(t) = pp.ty {
-                    pk.push(type_ref_node(hir, t));
+                    pk.push(type_ref_node(hir, symbols, t));
                 }
                 kids.push(HirNode {
                     kind: "fn-param".into(),
-                    label: Some(ident_text(hir, pp.name)),
+                    label: Some(ident_text(hir, symbols, pp.name)),
                     range: hir.idents[pp.name].byte_range.clone().into(),
                     children: pk,
                 });
             }
-            kids.push(expr_node(hir, l.body));
+            kids.push(expr_node(hir, symbols, l.body));
             ("expr:lambda", None, kids)
         }
         Expr::Is { value, ty, .. } => (
             "expr:is",
             None,
-            vec![expr_node(hir, *value), type_ref_node(hir, *ty)],
+            vec![
+                expr_node(hir, symbols, *value),
+                type_ref_node(hir, symbols, *ty),
+            ],
         ),
         Expr::Cast { value, ty, .. } => (
             "expr:cast",
             None,
-            vec![expr_node(hir, *value), type_ref_node(hir, *ty)],
+            vec![
+                expr_node(hir, symbols, *value),
+                type_ref_node(hir, symbols, *ty),
+            ],
         ),
         Expr::Range { from, to, .. } => {
             let mut kids = Vec::new();
             if let Some(f) = from {
-                kids.push(expr_node(hir, *f));
+                kids.push(expr_node(hir, symbols, *f));
             }
             if let Some(t) = to {
-                kids.push(expr_node(hir, *t));
+                kids.push(expr_node(hir, symbols, *t));
             }
             ("expr:range", None, kids)
         }
@@ -413,37 +446,49 @@ fn expr_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Expr>) -> HirNode 
     }
 }
 
-fn block_node(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -> HirNode {
+fn block_node(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    block: &greycat_analyzer_hir::types::BlockStmt,
+) -> HirNode {
     HirNode {
         kind: "stmt:block".into(),
         label: None,
         range: block.byte_range.clone().into(),
-        children: block.stmts.iter().map(|s| stmt_node(hir, *s)).collect(),
+        children: block
+            .stmts
+            .iter()
+            .map(|s| stmt_node(hir, symbols, *s))
+            .collect(),
     }
 }
 
-fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode {
+fn stmt_node(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    idx: Idx<greycat_analyzer_hir::types::Stmt>,
+) -> HirNode {
     use greycat_analyzer_hir::types::Stmt;
     let s = &hir.stmts[idx];
     match s {
-        Stmt::Block(b) => block_node(hir, b),
+        Stmt::Block(b) => block_node(hir, symbols, b),
         Stmt::Expr(e) => HirNode {
             kind: "stmt:expr".into(),
             label: None,
             range: hir.exprs[*e].byte_range().into(),
-            children: vec![expr_node(hir, *e)],
+            children: vec![expr_node(hir, symbols, *e)],
         },
         Stmt::Var(v) => {
             let mut kids = Vec::new();
             if let Some(t) = v.ty {
-                kids.push(type_ref_node(hir, t));
+                kids.push(type_ref_node(hir, symbols, t));
             }
             if let Some(i) = v.init {
-                kids.push(expr_node(hir, i));
+                kids.push(expr_node(hir, symbols, i));
             }
             HirNode {
                 kind: "stmt:var".into(),
-                label: Some(ident_text(hir, v.name)),
+                label: Some(ident_text(hir, symbols, v.name)),
                 range: v.byte_range.clone().into(),
                 children: kids,
             }
@@ -452,12 +497,18 @@ fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode 
             kind: "stmt:assign".into(),
             label: Some(format!("{:?}", a.op)),
             range: a.byte_range.clone().into(),
-            children: vec![expr_node(hir, a.target), expr_node(hir, a.value)],
+            children: vec![
+                expr_node(hir, symbols, a.target),
+                expr_node(hir, symbols, a.value),
+            ],
         },
         Stmt::If(i) => {
-            let mut kids = vec![expr_node(hir, i.condition), block_node(hir, &i.then_branch)];
+            let mut kids = vec![
+                expr_node(hir, symbols, i.condition),
+                block_node(hir, symbols, &i.then_branch),
+            ];
             if let Some(eb) = i.else_branch {
-                kids.push(stmt_node(hir, eb));
+                kids.push(stmt_node(hir, symbols, eb));
             }
             HirNode {
                 kind: "stmt:if".into(),
@@ -470,29 +521,35 @@ fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode 
             kind: "stmt:while".into(),
             label: None,
             range: w.byte_range.clone().into(),
-            children: vec![expr_node(hir, w.condition), block_node(hir, &w.body)],
+            children: vec![
+                expr_node(hir, symbols, w.condition),
+                block_node(hir, symbols, &w.body),
+            ],
         },
         Stmt::DoWhile(w) => HirNode {
             kind: "stmt:do-while".into(),
             label: None,
             range: w.byte_range.clone().into(),
-            children: vec![block_node(hir, &w.body), expr_node(hir, w.condition)],
+            children: vec![
+                block_node(hir, symbols, &w.body),
+                expr_node(hir, symbols, w.condition),
+            ],
         },
         Stmt::For(f) => {
             let mut kids = Vec::new();
             if let Some(v) = f.init_value {
-                kids.push(expr_node(hir, v));
+                kids.push(expr_node(hir, symbols, v));
             }
             if let Some(c) = f.condition {
-                kids.push(expr_node(hir, c));
+                kids.push(expr_node(hir, symbols, c));
             }
             if let Some(i) = f.increment {
-                kids.push(expr_node(hir, i));
+                kids.push(expr_node(hir, symbols, i));
             }
-            kids.push(block_node(hir, &f.body));
+            kids.push(block_node(hir, symbols, &f.body));
             HirNode {
                 kind: "stmt:for".into(),
-                label: f.init_name.map(|n| ident_text(hir, n)),
+                label: f.init_name.map(|n| ident_text(hir, symbols, n)),
                 range: f.byte_range.clone().into(),
                 children: kids,
             }
@@ -502,17 +559,17 @@ fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode 
             for p in &f.params {
                 let mut pk = Vec::new();
                 if let Some(t) = p.ty {
-                    pk.push(type_ref_node(hir, t));
+                    pk.push(type_ref_node(hir, symbols, t));
                 }
                 kids.push(HirNode {
                     kind: "for-in-param".into(),
-                    label: Some(ident_text(hir, p.name)),
+                    label: Some(ident_text(hir, symbols, p.name)),
                     range: hir.idents[p.name].byte_range.clone().into(),
                     children: pk,
                 });
             }
-            kids.push(expr_node(hir, f.range));
-            kids.push(block_node(hir, &f.body));
+            kids.push(expr_node(hir, symbols, f.range));
+            kids.push(block_node(hir, symbols, &f.body));
             HirNode {
                 kind: "stmt:for-in".into(),
                 label: None,
@@ -524,13 +581,15 @@ fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode 
             kind: "stmt:return".into(),
             label: None,
             range: v.map(|e| hir.exprs[e].byte_range()).unwrap_or(0..0).into(),
-            children: v.map(|e| vec![expr_node(hir, e)]).unwrap_or_default(),
+            children: v
+                .map(|e| vec![expr_node(hir, symbols, e)])
+                .unwrap_or_default(),
         },
         Stmt::Throw(e) => HirNode {
             kind: "stmt:throw".into(),
             label: None,
             range: hir.exprs[*e].byte_range().into(),
-            children: vec![expr_node(hir, *e)],
+            children: vec![expr_node(hir, symbols, *e)],
         },
         Stmt::Break => HirNode {
             kind: "stmt:break".into(),
@@ -551,12 +610,12 @@ fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode 
             children: Vec::new(),
         },
         Stmt::Try(t) => {
-            let mut kids = vec![block_node(hir, &t.try_block)];
+            let mut kids = vec![block_node(hir, symbols, &t.try_block)];
             kids.push(HirNode {
                 kind: "catch".into(),
-                label: t.error_param.map(|n| ident_text(hir, n)),
+                label: t.error_param.map(|n| ident_text(hir, symbols, n)),
                 range: t.catch_block.byte_range.clone().into(),
-                children: vec![block_node(hir, &t.catch_block)],
+                children: vec![block_node(hir, symbols, &t.catch_block)],
             });
             HirNode {
                 kind: "stmt:try".into(),
@@ -569,23 +628,30 @@ fn stmt_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Stmt>) -> HirNode 
             kind: "stmt:at".into(),
             label: None,
             range: a.byte_range.clone().into(),
-            children: vec![expr_node(hir, a.expr), block_node(hir, &a.block)],
+            children: vec![
+                expr_node(hir, symbols, a.expr),
+                block_node(hir, symbols, &a.block),
+            ],
         },
     }
 }
 
-fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode {
+fn decl_node(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    idx: Idx<greycat_analyzer_hir::types::Decl>,
+) -> HirNode {
     use greycat_analyzer_hir::types::Decl;
     let d = &hir.decls[idx];
     let range: ByteRange = d.byte_range().clone().into();
-    let name = d.name().map(|n| ident_text(hir, n));
+    let name = d.name().map(|n| ident_text(hir, symbols, n));
     match d {
         Decl::Fn(f) => {
             let mut kids = Vec::new();
             for &g in &f.generics {
                 kids.push(HirNode {
                     kind: "generic".into(),
-                    label: Some(ident_text(hir, g)),
+                    label: Some(ident_text(hir, symbols, g)),
                     range: hir.idents[g].byte_range.clone().into(),
                     children: Vec::new(),
                 });
@@ -594,11 +660,11 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
                 let pp = &hir.fn_params[p];
                 let mut pk = Vec::new();
                 if let Some(t) = pp.ty {
-                    pk.push(type_ref_node(hir, t));
+                    pk.push(type_ref_node(hir, symbols, t));
                 }
                 kids.push(HirNode {
                     kind: "fn-param".into(),
-                    label: Some(ident_text(hir, pp.name)),
+                    label: Some(ident_text(hir, symbols, pp.name)),
                     range: hir.idents[pp.name].byte_range.clone().into(),
                     children: pk,
                 });
@@ -608,11 +674,11 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
                     kind: "fn-return-type".into(),
                     label: None,
                     range: hir.type_refs[rt].byte_range.clone().into(),
-                    children: vec![type_ref_node(hir, rt)],
+                    children: vec![type_ref_node(hir, symbols, rt)],
                 });
             }
             if let Some(body) = f.body {
-                kids.push(stmt_node(hir, body));
+                kids.push(stmt_node(hir, symbols, body));
             }
             HirNode {
                 kind: "fn".into(),
@@ -626,7 +692,7 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
             for &g in &t.generics {
                 kids.push(HirNode {
                     kind: "generic".into(),
-                    label: Some(ident_text(hir, g)),
+                    label: Some(ident_text(hir, symbols, g)),
                     range: hir.idents[g].byte_range.clone().into(),
                     children: Vec::new(),
                 });
@@ -636,27 +702,27 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
                     kind: "extends".into(),
                     label: None,
                     range: hir.type_refs[parent].byte_range.clone().into(),
-                    children: vec![type_ref_node(hir, parent)],
+                    children: vec![type_ref_node(hir, symbols, parent)],
                 });
             }
             for &a in &t.attrs {
                 let attr = &hir.type_attrs[a];
                 let mut ak = Vec::new();
                 if let Some(ty) = attr.ty {
-                    ak.push(type_ref_node(hir, ty));
+                    ak.push(type_ref_node(hir, symbols, ty));
                 }
                 if let Some(init) = attr.init {
-                    ak.push(expr_node(hir, init));
+                    ak.push(expr_node(hir, symbols, init));
                 }
                 kids.push(HirNode {
                     kind: "type-attr".into(),
-                    label: Some(ident_text(hir, attr.name)),
+                    label: Some(ident_text(hir, symbols, attr.name)),
                     range: attr.byte_range.clone().into(),
                     children: ak,
                 });
             }
             for &m in &t.methods {
-                kids.push(decl_node(hir, m));
+                kids.push(decl_node(hir, symbols, m));
             }
             HirNode {
                 kind: "type".into(),
@@ -673,11 +739,11 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
                     let ef = &hir.enum_fields[f];
                     let mut fk = Vec::new();
                     if let Some(v) = ef.value {
-                        fk.push(expr_node(hir, v));
+                        fk.push(expr_node(hir, symbols, v));
                     }
                     HirNode {
                         kind: "enum-variant".into(),
-                        label: Some(ident_text(hir, ef.name)),
+                        label: Some(ident_text(hir, symbols, ef.name)),
                         range: hir.idents[ef.name].byte_range.clone().into(),
                         children: fk,
                     }
@@ -693,10 +759,10 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
         Decl::Var(v) => {
             let mut kids = Vec::new();
             if let Some(t) = v.ty {
-                kids.push(type_ref_node(hir, t));
+                kids.push(type_ref_node(hir, symbols, t));
             }
             if let Some(i) = v.init {
-                kids.push(expr_node(hir, i));
+                kids.push(expr_node(hir, symbols, i));
             }
             HirNode {
                 kind: "var".into(),
@@ -706,10 +772,14 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
             }
         }
         Decl::Pragma(p) => {
-            let kids = p.args.iter().map(|&a| expr_node(hir, a)).collect();
+            let kids = p
+                .args
+                .iter()
+                .map(|&a| expr_node(hir, symbols, a))
+                .collect();
             HirNode {
                 kind: "pragma".into(),
-                label: Some(ident_text(hir, p.name)),
+                label: Some(ident_text(hir, symbols, p.name)),
                 range,
                 children: kids,
             }
@@ -717,7 +787,7 @@ fn decl_node(hir: &Hir, idx: Idx<greycat_analyzer_hir::types::Decl>) -> HirNode 
     }
 }
 
-fn full_hir(hir: &Hir) -> HirRoot {
+fn full_hir(hir: &Hir, symbols: &SymbolTable) -> HirRoot {
     let module = hir
         .module
         .clone()
@@ -727,7 +797,11 @@ fn full_hir(hir: &Hir) -> HirRoot {
             decls: Box::default(),
             byte_range: 0..0,
         });
-    let decls = module.decls.iter().map(|&d| decl_node(hir, d)).collect();
+    let decls = module
+        .decls
+        .iter()
+        .map(|&d| decl_node(hir, symbols, d))
+        .collect();
     HirRoot {
         module_name: module.name,
         lib: module.lib,
@@ -745,8 +819,9 @@ fn full_hir(hir: &Hir) -> HirRoot {
 #[wasm_bindgen]
 pub fn lower_hir(source: &str) -> Result<JsValue, JsValue> {
     let tree = greycat_analyzer_syntax::parse(source);
-    let hir = lower_module(source, "module", "project", tree.root_node());
-    to_js(&full_hir(&hir))
+    let symbols = SymbolTable::new();
+    let hir = lower_module(source, &symbols, "module", "project", tree.root_node());
+    to_js(&full_hir(&hir, &symbols))
 }
 
 // =============================================================================
@@ -784,7 +859,7 @@ pub fn infer_types(source: &str) -> Result<JsValue, JsValue> {
         let range = module.hir.exprs[*idx].byte_range();
         out.push(ExprType {
             range: range.into(),
-            ty: pa.arena().display(*ty).to_string(),
+            ty: pa.display_type(*ty).to_string(),
         });
     }
     to_js(&out)
@@ -824,7 +899,8 @@ pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
         })
         .collect();
 
-    let hir = lower_module(source, "module", "project", tree.root_node());
+    let symbols = SymbolTable::new();
+    let hir = lower_module(source, &symbols, "module", "project", tree.root_node());
     let resolutions = resolve(&hir);
     let (_arena, analysis) = analyze(&hir, &resolutions);
     for d in &analysis.diagnostics {
@@ -843,7 +919,7 @@ pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
             end: pos_at(source, d.byte_range.end),
         });
     }
-    for l in run_lints(&hir, &resolutions) {
+    for l in run_lints(&hir, &resolutions, &symbols) {
         let sev = match l.severity {
             LintSeverity::Error => "error",
             LintSeverity::Warning => "warning",

@@ -34,8 +34,11 @@ use greycat_analyzer_analysis::{
     project::{ModuleAnalysis, ProjectAnalysis},
     resolver::{Definition, Resolutions},
     stdlib::ProjectIndex,
+    well_known::DeclRegistry,
 };
-use greycat_analyzer_core::{Document, SourceManager, lsp_types::Uri, resolver::FsContext};
+use greycat_analyzer_core::{
+    Document, SourceManager, SymbolTable, lsp_types::Uri, resolver::FsContext,
+};
 use greycat_analyzer_core::{Primitive, TypeArena, TypeId, display_fqn};
 use greycat_analyzer_hir::{
     Hir,
@@ -150,6 +153,7 @@ fn run_dump(target: &Path, filter: Option<&str>, mode: Mode) -> Result<ExitCode,
                     &doc,
                     module,
                     analysis.arena(),
+                    analysis.symbols(),
                     &analysis.index,
                     analysis.decl_registry(),
                     &mut records,
@@ -162,6 +166,7 @@ fn run_dump(target: &Path, filter: Option<&str>, mode: Mode) -> Result<ExitCode,
                     module,
                     &mgr,
                     &project_root,
+                    analysis.symbols(),
                     &analysis.index,
                     &mut records,
                 );
@@ -329,6 +334,7 @@ fn collect_type_records(
     doc: &Ref<'_, Document>,
     module: &ModuleAnalysis,
     project_arena: &TypeArena,
+    symbols: &SymbolTable,
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
     out: &mut Vec<Record>,
@@ -368,7 +374,7 @@ fn collect_type_records(
             text,
             &byte_range,
             kind,
-            display_fqn(&arena, ty, &home),
+            display_fqn(&arena, symbols, ty, &home),
             arena.get(ty).nullable,
         );
         // 1b. P17.5 — for template strings, also emit per-part
@@ -378,7 +384,7 @@ fn collect_type_records(
         if let Expr::String(s) = expr
             && s.has_interpolation()
         {
-            let str_ty_display = display_fqn(&arena, ty, &home);
+            let str_ty_display = display_fqn(&arena, symbols, ty, &home);
             let str_ty_nullable = arena.get(ty).nullable;
             for part in &s.parts {
                 match part {
@@ -412,14 +418,14 @@ fn collect_type_records(
     // 2. Per-type-ref records (`TypeIdent` in TS).
     for (idx, _) in hir.type_refs.iter() {
         let tref = &hir.type_refs[idx];
-        let ty = lower_type_ref_local(hir, idx, &mut arena, index, decl_registry);
+        let ty = lower_type_ref_local(hir, symbols, idx, &mut arena, index, decl_registry);
         push_type_record(
             out,
             &file,
             text,
             &tref.byte_range,
             "TypeIdent",
-            display_fqn(&arena, ty, &home),
+            display_fqn(&arena, symbols, ty, &home),
             arena.get(ty).nullable,
         );
     }
@@ -611,14 +617,15 @@ fn collect_expr_descendants(
 /// Local copy of `analysis::stdlib::lower_type_ref` (private upstream).
 fn lower_type_ref_local(
     hir: &Hir,
+    symbols: &SymbolTable,
     idx: Idx<TypeRef>,
     arena: &mut TypeArena,
     index: &ProjectIndex,
     decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
 ) -> TypeId {
     let tr = &hir.type_refs[idx];
-    let name = hir.idents[tr.name].text.to_string();
-    let mut base = match name.as_str() {
+    let name = &symbols[hir.idents[tr.name].symbol];
+    let mut base = match name {
         "bool" => arena.primitive(Primitive::Bool),
         "int" => arena.primitive(Primitive::Int),
         "float" => arena.primitive(Primitive::Float),
@@ -631,25 +638,23 @@ fn lower_type_ref_local(
         "null" => arena.null(),
         _ => {
             // Resolve the decl handle once — drives both branches below.
-            let handle = greycat_analyzer_analysis::project::resolve_decl_handle(
-                index,
-                decl_registry,
-                &name,
-            );
+            let handle =
+                greycat_analyzer_analysis::project::resolve_decl_handle(index, decl_registry, name);
+            let name_sym = symbols.intern(name);
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
                     .params
                     .iter()
-                    .map(|p| lower_type_ref_local(hir, *p, arena, index, decl_registry))
+                    .map(|p| lower_type_ref_local(hir, symbols, *p, arena, index, decl_registry))
                     .collect();
                 match handle {
-                    Some(h) => arena.generic(h, name, args),
-                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                    Some(h) => arena.generic(h, args),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else {
                 match handle {
-                    Some(h) => arena.alloc_type(h, name),
-                    None => arena.unresolved(name, (tr.byte_range.start, tr.byte_range.end)),
+                    Some(h) => arena.alloc_type(h),
+                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             }
         }
@@ -670,6 +675,7 @@ fn collect_resolution_records(
     module: &ModuleAnalysis,
     mgr: &SourceManager,
     project_root: &Path,
+    symbols: &SymbolTable,
     index: &ProjectIndex,
     out: &mut Vec<Record>,
 ) {
@@ -687,16 +693,17 @@ fn collect_resolution_records(
     let self_decls = collect_decl_idents(hir);
     for (ident_idx, ref_kind, decl_kind) in self_decls {
         let ident = &hir.idents[ident_idx];
+        let ident_name = &symbols[ident.symbol];
         let fqn = match decl_kind {
             "FnDecl" | "TypeDecl" | "EnumDecl" | "ModuleVar" => {
-                format!("{lib_stem}::{}", ident.text)
+                format!("{lib_stem}::{}", ident_name)
             }
-            _ => ident.text.to_string(),
+            _ => ident_name.to_string(),
         };
         let payload = DeclPayload {
             ref_kind,
             decl_kind,
-            name: ident.text.to_string(),
+            name: ident_name.to_string(),
             fqn,
             decl_file: file.clone(),
             decl_range: ident.byte_range.clone(),
@@ -709,7 +716,8 @@ fn collect_resolution_records(
     // 2. Use-site bindings from the resolver.
     for (ident_idx, def) in res.uses.iter() {
         let ident = &hir.idents[*ident_idx];
-        let Some(payload) = build_decl_payload(def, hir, &file, mgr, project_root, index) else {
+        let Some(payload) = build_decl_payload(def, hir, symbols, &file, mgr, project_root, index)
+        else {
             continue;
         };
         push_resolution_record(out, &file, text, &ident.byte_range, &payload);
@@ -857,6 +865,7 @@ struct DeclPayload {
 fn build_decl_payload(
     def: &Definition,
     hir: &Hir,
+    symbols: &SymbolTable,
     self_file: &str,
     mgr: &SourceManager,
     project_root: &Path,
@@ -865,7 +874,7 @@ fn build_decl_payload(
     match def {
         Definition::Decl(decl_idx) => {
             let decl = &hir.decls[*decl_idx];
-            let (rk, dk, name) = decl_summary(hir, decl);
+            let (rk, dk, name) = decl_summary(hir, symbols, decl);
             let name_id = decl.name()?;
             let id = &hir.idents[name_id];
             // We need the file's text to compute line/col — but we only
@@ -896,11 +905,12 @@ fn build_decl_payload(
         }
         Definition::Local(idx) => {
             let id = &hir.idents[*idx];
+            let name = symbols[id.symbol].to_string();
             Some(DeclPayload {
                 ref_kind: "var",
                 decl_kind: "VarDecl",
-                name: id.text.to_string(),
-                fqn: id.text.to_string(),
+                name: name.clone(),
+                fqn: name,
                 decl_file: self_file.to_string(),
                 decl_range: id.byte_range.clone(),
                 decl_line: 0,
@@ -909,11 +919,12 @@ fn build_decl_payload(
         }
         Definition::Param(idx) => {
             let id = &hir.idents[*idx];
+            let name = symbols[id.symbol].to_string();
             Some(DeclPayload {
                 ref_kind: "var",
                 decl_kind: "FnParam",
-                name: id.text.to_string(),
-                fqn: id.text.to_string(),
+                name: name.clone(),
+                fqn: name,
                 decl_file: self_file.to_string(),
                 decl_range: id.byte_range.clone(),
                 decl_line: 0,
@@ -922,11 +933,12 @@ fn build_decl_payload(
         }
         Definition::Generic(idx) => {
             let id = &hir.idents[*idx];
+            let name = symbols[id.symbol].to_string();
             Some(DeclPayload {
                 ref_kind: "type",
                 decl_kind: "TypeParam",
-                name: id.text.to_string(),
-                fqn: id.text.to_string(),
+                name: name.clone(),
+                fqn: name,
                 decl_file: self_file.to_string(),
                 decl_range: id.byte_range.clone(),
                 decl_line: 0,
@@ -945,6 +957,7 @@ fn build_decl_payload(
             // there to avoid double-lowering.
             let other_hir = greycat_analyzer_hir::lower::lower_module(
                 &other_doc.text,
+                symbols,
                 "module",
                 &other_doc.lib,
                 other_doc.root_node(),
@@ -953,7 +966,7 @@ fn build_decl_payload(
                 return None;
             }
             let actual_decl = &other_hir.decls[*decl];
-            let (rk, dk, name) = decl_summary(&other_hir, actual_decl);
+            let (rk, dk, name) = decl_summary(&other_hir, symbols, actual_decl);
             let name_id = actual_decl.name()?;
             let id = &other_hir.idents[name_id];
             let other_lib = module_stem_from_uri(uri).unwrap_or_else(|| "core".to_string());
@@ -974,13 +987,37 @@ fn build_decl_payload(
     }
 }
 
-fn decl_summary(hir: &Hir, decl: &Decl) -> (&'static str, &'static str, String) {
+fn decl_summary(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    decl: &Decl,
+) -> (&'static str, &'static str, String) {
     match decl {
-        Decl::Fn(d) => ("fn", "FnDecl", hir.idents[d.name].text.to_string()),
-        Decl::Type(d) => ("type", "TypeDecl", hir.idents[d.name].text.to_string()),
-        Decl::Enum(d) => ("type", "EnumDecl", hir.idents[d.name].text.to_string()),
-        Decl::Var(d) => ("var", "ModuleVar", hir.idents[d.name].text.to_string()),
-        Decl::Pragma(p) => ("type", "Pragma", hir.idents[p.name].text.to_string()),
+        Decl::Fn(d) => (
+            "fn",
+            "FnDecl",
+            symbols[hir.idents[d.name].symbol].to_string(),
+        ),
+        Decl::Type(d) => (
+            "type",
+            "TypeDecl",
+            symbols[hir.idents[d.name].symbol].to_string(),
+        ),
+        Decl::Enum(d) => (
+            "type",
+            "EnumDecl",
+            symbols[hir.idents[d.name].symbol].to_string(),
+        ),
+        Decl::Var(d) => (
+            "var",
+            "ModuleVar",
+            symbols[hir.idents[d.name].symbol].to_string(),
+        ),
+        Decl::Pragma(p) => (
+            "type",
+            "Pragma",
+            symbols[hir.idents[p.name].symbol].to_string(),
+        ),
     }
 }
 

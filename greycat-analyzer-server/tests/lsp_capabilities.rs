@@ -428,7 +428,7 @@ fn cross_module_static_call_infers_return_type() {
         .hir
         .idents
         .iter()
-        .find(|(_, i)| i.text == "x")
+        .find(|(_, i)| pa.symbols()[i.symbol] == *"x")
         .map(|(idx, _)| idx)
         .expect("`x` ident");
     let ty = user_module
@@ -437,7 +437,7 @@ fn cross_module_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let display = pa.arena().display(ty).to_string();
+    let display = pa.arena().display(ty, pa.symbols()).to_string();
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
@@ -1556,7 +1556,7 @@ fn qualified_static_call_infers_return_type() {
         .hir
         .idents
         .iter()
-        .find(|(_, i)| i.text == "x")
+        .find(|(_, i)| pa.symbols()[i.symbol] == *"x")
         .map(|(idx, _)| idx)
         .expect("`x` ident");
     let ty = user_module
@@ -1565,7 +1565,7 @@ fn qualified_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let display = pa.arena().display(ty).to_string();
+    let display = pa.arena().display(ty, pa.symbols()).to_string();
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
@@ -1601,7 +1601,7 @@ fn qualified_static_method_ref_infers_function() {
         .hir
         .idents
         .iter()
-        .find(|(_, i)| i.text == "y")
+        .find(|(_, i)| pa.symbols()[i.symbol] == *"y")
         .map(|(idx, _)| idx)
         .expect("`y` ident");
     let ty = user_module
@@ -1610,7 +1610,7 @@ fn qualified_static_method_ref_infers_function() {
         .get(&y_local)
         .copied()
         .expect("def_type for y");
-    let display = pa.arena().display(ty).to_string();
+    let display = pa.arena().display(ty, pa.symbols()).to_string();
     assert_eq!(
         display, "function",
         "y should infer as `function`, got `{display}`"
@@ -1642,7 +1642,7 @@ fn module_prefixed_type_ref_infers_type() {
         .hir
         .idents
         .iter()
-        .find(|(_, i)| i.text == "w")
+        .find(|(_, i)| pa.symbols()[i.symbol] == *"w")
         .map(|(idx, _)| idx)
         .expect("`w` ident");
     let ty = user_module
@@ -1651,7 +1651,7 @@ fn module_prefixed_type_ref_infers_type() {
         .get(&w_local)
         .copied()
         .expect("def_type for w");
-    let display = pa.arena().display(ty).to_string();
+    let display = pa.arena().display(ty, pa.symbols()).to_string();
     assert_eq!(display, "type", "w should infer as `type`, got `{display}`");
 }
 
@@ -1684,7 +1684,7 @@ fn cross_module_static_method_ref_infers_function() {
         .hir
         .idents
         .iter()
-        .find(|(_, i)| i.text == "y")
+        .find(|(_, i)| pa.symbols()[i.symbol] == *"y")
         .map(|(idx, _)| idx)
         .expect("`y` ident");
     let ty = user_module
@@ -1693,7 +1693,7 @@ fn cross_module_static_method_ref_infers_function() {
         .get(&y_local)
         .copied()
         .expect("def_type for y");
-    let display = pa.arena().display(ty).to_string();
+    let display = pa.arena().display(ty, pa.symbols()).to_string();
     assert_eq!(
         display, "function",
         "y should infer as `function`, got `{display}`"
@@ -1724,7 +1724,7 @@ fn cross_module_static_attr_ref_infers_field() {
         .hir
         .idents
         .iter()
-        .find(|(_, i)| i.text == "z")
+        .find(|(_, i)| pa.symbols()[i.symbol] == *"z")
         .map(|(idx, _)| idx)
         .expect("`z` ident");
     let ty = user_module
@@ -1733,7 +1733,7 @@ fn cross_module_static_attr_ref_infers_field() {
         .get(&z_local)
         .copied()
         .expect("def_type for z");
-    let display = pa.arena().display(ty).to_string();
+    let display = pa.arena().display(ty, pa.symbols()).to_string();
     assert_eq!(
         display, "field",
         "z should infer as `field`, got `{display}`"
@@ -1769,7 +1769,7 @@ fn cross_module_static_call_binds_foreign_method() {
         .hir
         .idents
         .iter()
-        .filter(|(_, i)| i.text == "create")
+        .filter(|(_, i)| pa.symbols()[i.symbol] == *"create")
         .map(|(idx, _)| idx)
         .collect();
     assert_eq!(create_uses.len(), 1, "one `create` ident in main.gcl");
@@ -1807,7 +1807,7 @@ fn cross_module_member_resolution_binds_foreign_attr() {
         .hir
         .idents
         .iter()
-        .filter(|(_, i)| i.text == "x")
+        .filter(|(_, i)| pa.symbols()[i.symbol] == *"x")
         .map(|(idx, _)| idx)
         .collect();
     assert_eq!(x_uses.len(), 1, "one `x` ident in user.gcl");
@@ -1862,10 +1862,12 @@ fn cross_module_goto_implementation_walks_every_module() {
 
 #[test]
 fn cross_module_decl_location_points_at_foreign_name() {
+    use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_hir::lower_module;
     let foreign_text = "type Helper {}\n";
     let foreign_tree = parse(foreign_text);
-    let foreign_hir = lower_module(foreign_text, "a", "p", foreign_tree.root_node());
+    let symbols = SymbolTable::new();
+    let foreign_hir = lower_module(foreign_text, &symbols, "a", "p", foreign_tree.root_node());
     let helper_decl = foreign_hir
         .module
         .as_ref()

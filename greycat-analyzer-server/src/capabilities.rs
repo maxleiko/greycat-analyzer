@@ -20,7 +20,7 @@ use greycat_analyzer_analysis::analyzer::{AnalysisResult, Severity};
 use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity, run_lints};
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
-use greycat_analyzer_core::{SourceManager, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_core::{SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, FnDecl, Ident, Stmt, TypeDecl};
@@ -136,6 +136,7 @@ pub fn hover_with_project(
         {
             if let Some(markdown) = ident_hover_markdown(
                 &module.hir,
+                project.symbols(),
                 &module.resolutions,
                 &module.analysis,
                 project.arena(),
@@ -156,7 +157,8 @@ pub fn hover_with_project(
                     if let Some(name_id) = decl.name()
                         && module.hir.idents[name_id].byte_range == node.byte_range()
                     {
-                        let markdown = render_decl_hover_markdown(&module.hir, decl, None);
+                        let markdown =
+                            render_decl_hover_markdown(&module.hir, project.symbols(), decl, None);
                         return Some(hover_from_markdown(
                             markdown,
                             module.hir.idents[name_id].byte_range.clone(),
@@ -186,8 +188,8 @@ pub fn hover_with_project(
             {
                 let label = format!(
                     "{}: {}",
-                    short_expr_label(&module.hir, expr),
-                    project.arena().display(*ty),
+                    short_expr_label(&module.hir, project.symbols(), expr),
+                    project.arena().display(*ty, project.symbols()),
                 );
                 return Some(hover_from_markdown(wrap_code(&label), r, text));
             }
@@ -211,7 +213,8 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
         return None;
     }
 
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir);
     let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
 
@@ -224,6 +227,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
     {
         if let Some(markdown) = ident_hover_markdown(
             &hir,
+            &symbols,
             &resolutions,
             &analysis,
             &arena,
@@ -244,7 +248,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
                 if let Some(name_id) = decl.name()
                     && hir.idents[name_id].byte_range == node.byte_range()
                 {
-                    let markdown = render_decl_hover_markdown(&hir, decl, None);
+                    let markdown = render_decl_hover_markdown(&hir, &symbols, decl, None);
                     return Some(hover_from_markdown(
                         markdown,
                         hir.idents[name_id].byte_range.clone(),
@@ -272,7 +276,11 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
             })
             && let Some(ty) = analysis.expr_types.get(&expr_id)
         {
-            let label = format!("{}: {}", short_expr_label(&hir, expr), arena.display(*ty),);
+            let label = format!(
+                "{}: {}",
+                short_expr_label(&hir, &symbols, expr),
+                arena.display(*ty, &symbols),
+            );
             return Some(hover_from_markdown(wrap_code(&label), r, text));
         }
     }
@@ -282,6 +290,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
 
 fn ident_hover_markdown(
     hir: &Hir,
+    symbols: &SymbolTable,
     resolutions: &Resolutions,
     analysis: &AnalysisResult,
     arena: &TypeArena,
@@ -289,11 +298,12 @@ fn ident_hover_markdown(
     ident: &Ident,
     project: Option<HoverProjectCtx<'_>>,
 ) -> Option<String> {
+    let ident_name = &symbols[ident.symbol];
     // P6.3: property idents in `a.b` aren't in `Resolutions` — they
     // bind to a `TypeAttr` / method via the analyzer's member pass.
     // Check that first so member hovers render with the right shape.
     if let Some(member) = analysis.member_lookup(ident_idx) {
-        return Some(member_hover_markdown(hir, member, ident));
+        return Some(member_hover_markdown(hir, symbols, member, ident));
     }
     // P11.5 — cross-module member binding (`a.b` where the receiver
     // type lives in another module, or `Type::method` where Type is
@@ -306,6 +316,7 @@ fn ident_hover_markdown(
         let provenance = module_label_for_uri(&foreign.uri);
         return Some(foreign_member_hover_markdown(
             &fmod.hir,
+            symbols,
             &foreign.member,
             ident,
             &provenance,
@@ -322,6 +333,7 @@ fn ident_hover_markdown(
         let provenance = module_label_for_uri(&fdecl.uri);
         return Some(render_decl_hover_markdown(
             &fmod.hir,
+            symbols,
             &fmod.hir.decls[fdecl.decl],
             Some(&provenance),
         ));
@@ -330,11 +342,14 @@ fn ident_hover_markdown(
         Definition::Param(name) | Definition::Local(name) => analysis
             .def_types
             .get(&name)
-            .map(|ty| wrap_code(&format!("{}: {}", ident.text, arena.display(*ty)))),
-        Definition::Decl(decl_id) => {
-            Some(render_decl_hover_markdown(hir, &hir.decls[decl_id], None))
-        }
-        Definition::Generic(_) => Some(wrap_code(&format!("(type parameter) {}", ident.text))),
+            .map(|ty| wrap_code(&format!("{}: {}", ident_name, arena.display(*ty, symbols)))),
+        Definition::Decl(decl_id) => Some(render_decl_hover_markdown(
+            hir,
+            symbols,
+            &hir.decls[decl_id],
+            None,
+        )),
+        Definition::Generic(_) => Some(wrap_code(&format!("(type parameter) {}", ident_name))),
         Definition::ProjectDecl {
             uri: foreign_uri,
             decl,
@@ -349,13 +364,14 @@ fn ident_hover_markdown(
                 let provenance = module_label_for_uri(&foreign_uri);
                 return Some(render_decl_hover_markdown(
                     &fmod.hir,
+                    symbols,
                     &fmod.hir.decls[decl],
                     Some(&provenance),
                 ));
             }
-            Some(wrap_code(&format!("(project) {}", ident.text)))
+            Some(wrap_code(&format!("(project) {}", ident_name)))
         }
-        Definition::Project => Some(wrap_code(&format!("(runtime built-in) {}", ident.text))),
+        Definition::Project => Some(wrap_code(&format!("(runtime built-in) {}", ident_name))),
     }
 }
 
@@ -364,6 +380,7 @@ fn ident_hover_markdown(
 /// declared / inferred return type when available.
 fn member_hover_markdown(
     hir: &Hir,
+    symbols: &SymbolTable,
     member: greycat_analyzer_analysis::analyzer::MemberDef,
     ident: &greycat_analyzer_hir::types::Ident,
 ) -> String {
@@ -373,16 +390,19 @@ fn member_hover_markdown(
             let attr = &hir.type_attrs[attr_id];
             let ty_str = attr
                 .ty
-                .map(|t| render_type_ref(hir, t))
+                .map(|t| render_type_ref(hir, symbols, t))
                 .unwrap_or_else(|| "any".into());
             let mut out = String::new();
             push_doc_section(&mut out, attr.doc.as_deref());
-            out.push_str(&wrap_code(&format!("{}: {}", ident.text, ty_str)));
+            out.push_str(&wrap_code(&format!(
+                "{}: {}",
+                &symbols[ident.symbol], ty_str
+            )));
             out
         }
         MemberDef::Method(decl_id) => {
             let decl = &hir.decls[decl_id];
-            render_decl_hover_markdown(hir, decl, None)
+            render_decl_hover_markdown(hir, symbols, decl, None)
         }
     }
 }
@@ -393,6 +413,7 @@ fn member_hover_markdown(
 /// `*defined in `<module>`*` footnote.
 fn foreign_member_hover_markdown(
     foreign_hir: &Hir,
+    symbols: &SymbolTable,
     member: &greycat_analyzer_analysis::analyzer::MemberDef,
     ident: &greycat_analyzer_hir::types::Ident,
     provenance: &str,
@@ -403,16 +424,19 @@ fn foreign_member_hover_markdown(
             let attr = &foreign_hir.type_attrs[*attr_id];
             let ty_str = attr
                 .ty
-                .map(|t| render_type_ref(foreign_hir, t))
+                .map(|t| render_type_ref(foreign_hir, symbols, t))
                 .unwrap_or_else(|| "any".into());
             let mut s = String::new();
             push_doc_section(&mut s, attr.doc.as_deref());
-            s.push_str(&wrap_code(&format!("{}: {}", ident.text, ty_str)));
+            s.push_str(&wrap_code(&format!(
+                "{}: {}",
+                &symbols[ident.symbol], ty_str
+            )));
             s
         }
         MemberDef::Method(decl_id) => {
             let decl = &foreign_hir.decls[*decl_id];
-            render_decl_hover_markdown(foreign_hir, decl, None)
+            render_decl_hover_markdown(foreign_hir, symbols, decl, None)
         }
     };
     out.push_str("\n\n*defined in `");
@@ -427,9 +451,14 @@ fn foreign_member_hover_markdown(
 /// signature, then (when `provenance` is `Some`) an italic
 /// "*defined in `<name>`*" footnote. `provenance` is supplied only for
 /// cross-module idents — intra-module uses pass `None`.
-fn render_decl_hover_markdown(hir: &Hir, decl: &Decl, provenance: Option<&str>) -> String {
+fn render_decl_hover_markdown(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    decl: &Decl,
+    provenance: Option<&str>,
+) -> String {
     let mut out = String::new();
-    let signature = render_decl_signature(hir, decl);
+    let signature = render_decl_signature(hir, symbols, decl);
     out.push_str(&wrap_code(&signature));
     out.push('\n');
     push_doc_section(&mut out, decl_doc(decl));
@@ -455,23 +484,23 @@ fn decl_doc(decl: &Decl) -> Option<&str> {
 /// `fn` decls render the full `fn name<G>(p: T): R`; types render
 /// `type Name<G> extends Parent`; enums render `enum Name`; vars
 /// render `var name: T`.
-fn render_decl_signature(hir: &Hir, decl: &Decl) -> String {
+fn render_decl_signature(hir: &Hir, symbols: &SymbolTable, decl: &Decl) -> String {
     match decl {
-        Decl::Fn(d) => render_fn_signature(hir, d),
-        Decl::Type(d) => render_type_signature(hir, d),
-        Decl::Enum(d) => format!("enum {}", hir.idents[d.name].text),
+        Decl::Fn(d) => render_fn_signature(hir, symbols, d),
+        Decl::Type(d) => render_type_signature(hir, symbols, d),
+        Decl::Enum(d) => format!("enum {}", &symbols[hir.idents[d.name].symbol]),
         Decl::Var(d) => {
             let ty =
-                d.ty.map(|t| render_type_ref(hir, t))
+                d.ty.map(|t| render_type_ref(hir, symbols, t))
                     .unwrap_or_else(|| "any".into());
-            format!("var {}: {}", hir.idents[d.name].text, ty)
+            format!("var {}: {}", &symbols[hir.idents[d.name].symbol], ty)
         }
-        Decl::Pragma(p) => format!("@{}", hir.idents[p.name].text),
+        Decl::Pragma(p) => format!("@{}", &symbols[hir.idents[p.name].symbol]),
     }
 }
 
-fn render_fn_signature(hir: &Hir, fnd: &FnDecl) -> String {
-    let name = &hir.idents[fnd.name].text;
+fn render_fn_signature(hir: &Hir, symbols: &SymbolTable, fnd: &FnDecl) -> String {
+    let name = &symbols[hir.idents[fnd.name].symbol];
     let mut out = String::new();
     if fnd.modifiers.private {
         out.push_str("private ");
@@ -493,7 +522,7 @@ fn render_fn_signature(hir: &Hir, fnd: &FnDecl) -> String {
             if i > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&hir.idents[*g].text);
+            out.push_str(&symbols[hir.idents[*g].symbol]);
         }
         out.push('>');
     }
@@ -503,22 +532,22 @@ fn render_fn_signature(hir: &Hir, fnd: &FnDecl) -> String {
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(&hir.idents[p.name].text);
+        out.push_str(&symbols[hir.idents[p.name].symbol]);
         out.push_str(": ");
         match p.ty {
-            Some(t) => out.push_str(&render_type_ref(hir, t)),
+            Some(t) => out.push_str(&render_type_ref(hir, symbols, t)),
             None => out.push_str("any"),
         }
     }
     out.push(')');
     if let Some(ret) = fnd.return_type {
         out.push_str(": ");
-        out.push_str(&render_type_ref(hir, ret));
+        out.push_str(&render_type_ref(hir, symbols, ret));
     }
     out
 }
 
-fn render_type_signature(hir: &Hir, td: &TypeDecl) -> String {
+fn render_type_signature(hir: &Hir, symbols: &SymbolTable, td: &TypeDecl) -> String {
     let mut out = String::new();
     if td.modifiers.private {
         out.push_str("private ");
@@ -530,42 +559,43 @@ fn render_type_signature(hir: &Hir, td: &TypeDecl) -> String {
         out.push_str("native ");
     }
     out.push_str("type ");
-    out.push_str(&hir.idents[td.name].text);
+    out.push_str(&symbols[hir.idents[td.name].symbol]);
     if !td.generics.is_empty() {
         out.push('<');
         for (i, g) in td.generics.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&hir.idents[*g].text);
+            out.push_str(&symbols[hir.idents[*g].symbol]);
         }
         out.push('>');
     }
     if let Some(parent) = td.supertype {
         out.push_str(" extends ");
-        out.push_str(&render_type_ref(hir, parent));
+        out.push_str(&render_type_ref(hir, symbols, parent));
     }
     out
 }
 
 fn render_type_ref(
     hir: &Hir,
+    symbols: &SymbolTable,
     type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
 ) -> String {
     let tr = &hir.type_refs[type_ref];
     let mut out = String::new();
     for q in tr.qualifier.iter() {
-        out.push_str(&hir.idents[*q].text);
+        out.push_str(&symbols[hir.idents[*q].symbol]);
         out.push_str("::");
     }
-    out.push_str(&hir.idents[tr.name].text);
+    out.push_str(&symbols[hir.idents[tr.name].symbol]);
     if !tr.params.is_empty() {
         out.push('<');
         for (i, p) in tr.params.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&render_type_ref(hir, *p));
+            out.push_str(&render_type_ref(hir, symbols, *p));
         }
         out.push('>');
     }
@@ -610,16 +640,18 @@ fn hover_from_markdown(markdown: String, range: Range<usize>, text: &str) -> Hov
     }
 }
 
-fn short_expr_label(hir: &Hir, expr: &Expr) -> String {
+fn short_expr_label(hir: &Hir, symbols: &SymbolTable, expr: &Expr) -> String {
     match expr {
-        Expr::Ident { name: idx, .. } => hir.idents[*idx].text.to_string(),
+        Expr::Ident { name: idx, .. } => symbols[hir.idents[*idx].symbol].to_string(),
         Expr::Literal(_) => "literal".into(),
         Expr::String(_) => "string".into(),
         Expr::Call(_) => "call".into(),
         Expr::Binary(_) => "expression".into(),
         Expr::Unary(_) => "expression".into(),
-        Expr::Member(m) | Expr::Arrow(m) => hir.idents[m.property.ident()].text.to_string(),
-        Expr::Static(s) => hir.idents[s.property.ident()].text.to_string(),
+        Expr::Member(m) | Expr::Arrow(m) => {
+            symbols[hir.idents[m.property.ident()].symbol].to_string()
+        }
+        Expr::Static(s) => symbols[hir.idents[s.property.ident()].symbol].to_string(),
         _ => "expression".into(),
     }
 }
@@ -641,29 +673,30 @@ pub fn signature_help(
         node = node.parent()?;
     }
     let callee = node.child_by_field_name("fn")?;
-    let callee_text = text.get(callee.byte_range())?.to_string();
+    let callee_text = text.get(callee.byte_range())?;
 
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     // Find a fn_decl with matching name.
     let module = hir.module.as_ref()?;
     let fnd = module.decls.iter().find_map(|d| match &hir.decls[*d] {
-        Decl::Fn(f) if hir.idents[f.name].text == callee_text => Some(f.clone()),
+        Decl::Fn(f) if &symbols[hir.idents[f.name].symbol] == callee_text => Some(f.clone()),
         _ => None,
     })?;
 
     let mut params = Vec::new();
-    let mut label = format!("fn {}(", hir.idents[fnd.name].text);
+    let mut label = format!("fn {}(", &symbols[hir.idents[fnd.name].symbol]);
     for (i, p_id) in fnd.params.iter().enumerate() {
         if i > 0 {
             label.push_str(", ");
         }
         let p = &hir.fn_params[*p_id];
-        let pname = hir.idents[p.name].text.to_string();
+        let pname = symbols[hir.idents[p.name].symbol].to_string();
         let label_start = label.len();
         let mut piece = pname.clone();
         if let Some(ty_id) = p.ty {
             piece.push_str(": ");
-            piece.push_str(&render_type_ref(&hir, ty_id));
+            piece.push_str(&render_type_ref(&hir, &symbols, ty_id));
         }
         label.push_str(&piece);
         params.push(ParameterInformation {
@@ -677,7 +710,7 @@ pub fn signature_help(
     label.push(')');
     if let Some(rt) = fnd.return_type {
         label.push_str(": ");
-        label.push_str(&render_type_ref(&hir, rt));
+        label.push_str(&render_type_ref(&hir, &symbols, rt));
     }
 
     Some(SignatureHelp {
@@ -714,15 +747,16 @@ pub fn goto_definition(
         return None;
     }
 
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir);
 
     // Find which Idx<Ident> this CST node corresponds to.
-    let ident_text = text.get(node.byte_range())?.to_string();
+    let ident_text = text.get(node.byte_range())?;
     let target = hir
         .idents
         .iter()
-        .find(|(_, i)| i.byte_range == node.byte_range() && i.text == ident_text)?
+        .find(|(_, i)| i.byte_range == node.byte_range() && &symbols[i.symbol] == ident_text)?
         .0;
 
     if let Some(def) = resolutions.lookup(target) {
@@ -986,7 +1020,8 @@ pub fn goto_implementation(
     }
     let cursor_text = text.get(node.byte_range())?.to_string();
 
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let mut locations = Vec::new();
     let Some(module) = hir.module.as_ref() else {
         return goto_definition(text, lib, root, uri, pos);
@@ -998,7 +1033,7 @@ pub fn goto_implementation(
                     if fnd.modifiers.abstract_ || fnd.modifiers.native {
                         continue;
                     }
-                    if hir.idents[fnd.name].text == cursor_text {
+                    if symbols[hir.idents[fnd.name].symbol] == *cursor_text {
                         locations.push(Location {
                             uri: uri.clone(),
                             range: byte_range_to_lsp(text, &hir.idents[fnd.name].byte_range),
@@ -1067,7 +1102,7 @@ pub fn goto_implementation_across_project(
             let Decl::Type(td) = &module.hir.decls[*decl_id] else {
                 continue;
             };
-            let candidate_type = module.hir.idents[td.name].text.as_str();
+            let candidate_type = &project.symbols()[module.hir.idents[td.name].symbol];
             if !project
                 .index
                 .is_subtype_of(candidate_type, declaring_type.as_str())
@@ -1081,7 +1116,7 @@ pub fn goto_implementation_across_project(
                 if fnd.modifiers.abstract_ || fnd.modifiers.native {
                     continue;
                 }
-                if module.hir.idents[fnd.name].text == cursor_text {
+                if project.symbols()[module.hir.idents[fnd.name].symbol] == *cursor_text {
                     locations.push(Location {
                         uri: uri.clone(),
                         range: byte_range_to_lsp(
@@ -1182,7 +1217,7 @@ fn declaring_type_for_method_cursor(
     let doc = cell.borrow();
     let module = project.module(cursor_uri)?;
     let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
-    let cursor_text = module.hir.idents[cursor_idx].text.clone();
+    let cursor_sym = module.hir.idents[cursor_idx].symbol;
     let cursor_range = module.hir.idents[cursor_idx].byte_range.clone();
     drop(doc);
 
@@ -1197,8 +1232,8 @@ fn declaring_type_for_method_cursor(
                     continue;
                 };
                 let name_range = &module.hir.idents[fnd.name].byte_range;
-                if *name_range == cursor_range && module.hir.idents[fnd.name].text == cursor_text {
-                    return Some(module.hir.idents[td.name].text.to_string());
+                if *name_range == cursor_range && module.hir.idents[fnd.name].symbol == cursor_sym {
+                    return Some(project.symbols()[module.hir.idents[td.name].symbol].to_string());
                 }
             }
         }
@@ -1214,7 +1249,7 @@ fn declaring_type_for_method_cursor(
                 continue;
             };
             if td.methods.contains(&decl_id) {
-                return Some(module.hir.idents[td.name].text.to_string());
+                return Some(project.symbols()[module.hir.idents[td.name].symbol].to_string());
             }
         }
     }
@@ -1231,7 +1266,7 @@ fn declaring_type_for_method_cursor(
             continue;
         };
         if td.methods.contains(&decl_id) {
-            return Some(foreign_module.hir.idents[td.name].text.to_string());
+            return Some(project.symbols()[foreign_module.hir.idents[td.name].symbol].to_string());
         }
     }
     None
@@ -1242,7 +1277,8 @@ fn declaring_type_for_method_cursor(
 // =============================================================================
 
 pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Vec<DocumentSymbol> {
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let module = match hir.module.as_ref() {
         Some(m) => m,
         None => return Vec::new(),
@@ -1255,6 +1291,7 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
             continue;
         };
         let ident = &hir.idents[name_id];
+        let ident_text = &symbols[ident.symbol];
         // The LSP `DocumentSymbol.name` field is required non-empty —
         // VSCode's client throws "name must not be falsy" if it sees
         // a `""`. Tree-sitter's error recovery synthesizes empty-range
@@ -1263,7 +1300,7 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
         // and lowering's `alloc_ident` faithfully interns that empty
         // text. Skip rather than push it; an out-of-LSP-spec symbol
         // poisons the whole batch on the client side.
-        if ident.text.is_empty() {
+        if ident_text.is_empty() {
             continue;
         }
         let kind = match decl {
@@ -1280,11 +1317,12 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
             for attr_id in &td.attrs {
                 let a = &hir.type_attrs[*attr_id];
                 let aname = &hir.idents[a.name];
-                if aname.text.is_empty() {
+                let aname_text = &symbols[aname.symbol];
+                if aname_text.is_empty() {
                     continue;
                 }
                 children.push(DocumentSymbol {
-                    name: aname.text.to_string(),
+                    name: aname_text.to_string(),
                     detail: None,
                     kind: SymbolKind::FIELD,
                     tags: None,
@@ -1298,12 +1336,13 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
             for method_id in &td.methods {
                 if let Decl::Fn(fnd) = &hir.decls[*method_id] {
                     let mname = &hir.idents[fnd.name];
-                    if mname.text.is_empty() {
+                    let mname_text = &symbols[mname.symbol];
+                    if mname_text.is_empty() {
                         continue;
                     }
                     #[allow(deprecated)]
                     children.push(DocumentSymbol {
-                        name: mname.text.to_string(),
+                        name: mname_text.to_string(),
                         detail: None,
                         kind: SymbolKind::METHOD,
                         tags: None,
@@ -1317,7 +1356,7 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
         }
         #[allow(deprecated)]
         out.push(DocumentSymbol {
-            name: ident.text.to_string(),
+            name: ident_text.to_string(),
             detail: None,
             kind,
             tags: None,
@@ -1358,7 +1397,8 @@ pub fn references(
     // back at the same binding. Falls back to text equality for
     // `Definition::Project` (cross-module — P8.2 lifts it through the
     // project pipeline).
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let res = resolve(&hir);
     let Some(cursor_idx) = idx_for_node(&hir, node) else {
         return Vec::new();
@@ -1486,7 +1526,8 @@ pub fn rename(
     // P8.1: same scope-aware filter as `references`. Falls back to
     // text equality when the cursor name doesn't resolve through
     // `Resolutions` (cross-module — P8.2 picks that up).
-    let hir = lower_module(text, "module", "project", root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", "project", root);
     let res = resolve(&hir);
     let mut edits = Vec::new();
     if let Some(cursor_idx) = idx_for_node(&hir, node)
@@ -2048,7 +2089,7 @@ pub fn inlay_hints_with_project(
     // modules — so the user reading `var f = b::Foo {};` sees
     // `: b::Foo`, not the misleading bare `: Foo`.
     let render: &dyn Fn(TypeId) -> String = &|ty| project.display_type(ty).to_string();
-    inlay_hints_inner(module, render, text, range)
+    inlay_hints_inner(module, project.symbols(), render, text, range)
 }
 
 /// Single-file shim — only used by unit tests / single-file CLI
@@ -2065,7 +2106,8 @@ pub fn inlay_hints(
     root: tree_sitter::Node<'_>,
     range: &lsp_types::Range,
 ) -> Vec<InlayHint> {
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir);
     let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
     let module = ModuleAnalysis {
@@ -2077,8 +2119,8 @@ pub fn inlay_hints(
         timings: Default::default(),
         directives: Directives::default(),
     };
-    let render: &dyn Fn(TypeId) -> String = &|ty| arena.display(ty).to_string();
-    inlay_hints_inner(&module, render, text, range)
+    let render: &dyn Fn(TypeId) -> String = &|ty| arena.display(ty, &symbols).to_string();
+    inlay_hints_inner(&module, &symbols, render, text, range)
 }
 
 /// Shared emitter — takes a type-rendering closure so the
@@ -2086,6 +2128,7 @@ pub fn inlay_hints(
 /// shim falls back to the bare arena printer.
 fn inlay_hints_inner(
     module: &ModuleAnalysis,
+    symbols: &SymbolTable,
     render_ty: &dyn Fn(TypeId) -> String,
     text: &str,
     range: &lsp_types::Range,
@@ -2132,7 +2175,7 @@ fn inlay_hints_inner(
             if let Some(body) = fnd.body {
                 emit_var_hints(hir, analysis, render_ty, body, want, text, &mut out);
                 // P13.7: argument-name hints inside the body.
-                emit_call_arg_hints(hir, resolutions, body, want, text, &mut out);
+                emit_call_arg_hints(hir, symbols, resolutions, body, want, text, &mut out);
             }
         }
     }
@@ -2162,6 +2205,7 @@ fn inferred_fn_return(hir: &Hir, analysis: &AnalysisResult, body: Idx<Stmt>) -> 
 /// the block inline now.
 fn emit_call_arg_hints_block(
     hir: &Hir,
+    symbols: &SymbolTable,
     resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
     block: &greycat_analyzer_hir::types::BlockStmt,
     want: (usize, usize),
@@ -2169,7 +2213,7 @@ fn emit_call_arg_hints_block(
     out: &mut Vec<InlayHint>,
 ) {
     for s in &block.stmts {
-        emit_call_arg_hints(hir, resolutions, *s, want, text, out);
+        emit_call_arg_hints(hir, symbols, resolutions, *s, want, text, out);
     }
 }
 
@@ -2178,6 +2222,7 @@ fn emit_call_arg_hints_block(
 /// `<param_name>:` hint anchored at the start of each positional arg.
 fn emit_call_arg_hints(
     hir: &Hir,
+    symbols: &SymbolTable,
     resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     want: (usize, usize),
@@ -2187,44 +2232,46 @@ fn emit_call_arg_hints(
     use greycat_analyzer_hir::types::Stmt;
     let stmt = &hir.stmts[stmt_id];
     match stmt {
-        Stmt::Block(b) => emit_call_arg_hints_block(hir, resolutions, b, want, text, out),
+        Stmt::Block(b) => emit_call_arg_hints_block(hir, symbols, resolutions, b, want, text, out),
         Stmt::Expr(e)
         | Stmt::Return(Some(e))
         | Stmt::Throw(e)
         | Stmt::Var(greycat_analyzer_hir::types::LocalVar { init: Some(e), .. }) => {
-            emit_call_arg_hints_expr(hir, resolutions, *e, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, *e, want, text, out);
         }
         Stmt::Assign(a) => {
-            emit_call_arg_hints_expr(hir, resolutions, a.target, want, text, out);
-            emit_call_arg_hints_expr(hir, resolutions, a.value, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, a.target, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, a.value, want, text, out);
         }
         Stmt::If(i) => {
-            emit_call_arg_hints_expr(hir, resolutions, i.condition, want, text, out);
-            emit_call_arg_hints_block(hir, resolutions, &i.then_branch, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, i.condition, want, text, out);
+            emit_call_arg_hints_block(hir, symbols, resolutions, &i.then_branch, want, text, out);
             if let Some(eb) = i.else_branch {
-                emit_call_arg_hints(hir, resolutions, eb, want, text, out);
+                emit_call_arg_hints(hir, symbols, resolutions, eb, want, text, out);
             }
         }
         Stmt::While(w) => {
-            emit_call_arg_hints_expr(hir, resolutions, w.condition, want, text, out);
-            emit_call_arg_hints_block(hir, resolutions, &w.body, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, w.condition, want, text, out);
+            emit_call_arg_hints_block(hir, symbols, resolutions, &w.body, want, text, out);
         }
         Stmt::DoWhile(w) => {
-            emit_call_arg_hints_block(hir, resolutions, &w.body, want, text, out);
-            emit_call_arg_hints_expr(hir, resolutions, w.condition, want, text, out);
+            emit_call_arg_hints_block(hir, symbols, resolutions, &w.body, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, w.condition, want, text, out);
         }
-        Stmt::For(f) => emit_call_arg_hints_block(hir, resolutions, &f.body, want, text, out),
+        Stmt::For(f) => {
+            emit_call_arg_hints_block(hir, symbols, resolutions, &f.body, want, text, out)
+        }
         Stmt::ForIn(f) => {
-            emit_call_arg_hints_expr(hir, resolutions, f.range, want, text, out);
-            emit_call_arg_hints_block(hir, resolutions, &f.body, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, f.range, want, text, out);
+            emit_call_arg_hints_block(hir, symbols, resolutions, &f.body, want, text, out);
         }
         Stmt::Try(t) => {
-            emit_call_arg_hints_block(hir, resolutions, &t.try_block, want, text, out);
-            emit_call_arg_hints_block(hir, resolutions, &t.catch_block, want, text, out);
+            emit_call_arg_hints_block(hir, symbols, resolutions, &t.try_block, want, text, out);
+            emit_call_arg_hints_block(hir, symbols, resolutions, &t.catch_block, want, text, out);
         }
         Stmt::At(a) => {
-            emit_call_arg_hints_expr(hir, resolutions, a.expr, want, text, out);
-            emit_call_arg_hints_block(hir, resolutions, &a.block, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, a.expr, want, text, out);
+            emit_call_arg_hints_block(hir, symbols, resolutions, &a.block, want, text, out);
         }
         _ => {}
     }
@@ -2232,6 +2279,7 @@ fn emit_call_arg_hints(
 
 fn emit_call_arg_hints_expr(
     hir: &Hir,
+    symbols: &SymbolTable,
     resolutions: &greycat_analyzer_analysis::resolver::Resolutions,
     expr_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Expr>,
     want: (usize, usize),
@@ -2243,9 +2291,9 @@ fn emit_call_arg_hints_expr(
         Expr::Call(CallExpr { callee, args, .. }) => {
             // Recurse into nested args first so hints fire on inner
             // calls too.
-            emit_call_arg_hints_expr(hir, resolutions, *callee, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, *callee, want, text, out);
             for a in args {
-                emit_call_arg_hints_expr(hir, resolutions, *a, want, text, out);
+                emit_call_arg_hints_expr(hir, symbols, resolutions, *a, want, text, out);
             }
             // Look up callee's params.
             if let Expr::Ident { name: name_idx, .. } = &hir.exprs[*callee]
@@ -2257,7 +2305,7 @@ fn emit_call_arg_hints_expr(
                         break;
                     };
                     let p = &hir.fn_params[*p_id];
-                    let param_name = hir.idents[p.name].text.to_string();
+                    let param_name = symbols[hir.idents[p.name].symbol].to_string();
                     if param_name.starts_with('_') {
                         continue;
                     }
@@ -2280,32 +2328,36 @@ fn emit_call_arg_hints_expr(
         }
         Expr::Tuple(items, _) | Expr::Array(items, _) => {
             for e in items {
-                emit_call_arg_hints_expr(hir, resolutions, *e, want, text, out);
+                emit_call_arg_hints_expr(hir, symbols, resolutions, *e, want, text, out);
             }
         }
         Expr::Member(m) | Expr::Arrow(m) => {
-            emit_call_arg_hints_expr(hir, resolutions, m.receiver, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, m.receiver, want, text, out);
         }
         Expr::Offset(o) => {
-            emit_call_arg_hints_expr(hir, resolutions, o.receiver, want, text, out);
-            emit_call_arg_hints_expr(hir, resolutions, o.index, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, o.receiver, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, o.index, want, text, out);
         }
         Expr::Binary(b) => {
-            emit_call_arg_hints_expr(hir, resolutions, b.left, want, text, out);
-            emit_call_arg_hints_expr(hir, resolutions, b.right, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, b.left, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, b.right, want, text, out);
         }
-        Expr::Unary(u) => emit_call_arg_hints_expr(hir, resolutions, u.operand, want, text, out),
+        Expr::Unary(u) => {
+            emit_call_arg_hints_expr(hir, symbols, resolutions, u.operand, want, text, out)
+        }
         Expr::Paren(inner, _) => {
-            emit_call_arg_hints_expr(hir, resolutions, *inner, want, text, out)
+            emit_call_arg_hints_expr(hir, symbols, resolutions, *inner, want, text, out)
         }
         Expr::Object(o) => {
             for f in &o.fields {
-                emit_call_arg_hints_expr(hir, resolutions, f.value, want, text, out);
+                emit_call_arg_hints_expr(hir, symbols, resolutions, f.value, want, text, out);
             }
         }
-        Expr::Lambda(l) => emit_call_arg_hints_expr(hir, resolutions, l.body, want, text, out),
+        Expr::Lambda(l) => {
+            emit_call_arg_hints_expr(hir, symbols, resolutions, l.body, want, text, out)
+        }
         Expr::Is { value, .. } | Expr::Cast { value, .. } => {
-            emit_call_arg_hints_expr(hir, resolutions, *value, want, text, out);
+            emit_call_arg_hints_expr(hir, symbols, resolutions, *value, want, text, out);
         }
         _ => {}
     }
@@ -2516,7 +2568,8 @@ const TOK_COMMENT: u32 = 8;
 const TOK_KEYWORD: u32 = 9;
 
 pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> SemanticTokens {
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir);
 
     let mut events: Vec<SemanticTokenEvent> = Vec::new();
@@ -3699,7 +3752,7 @@ fn ident_or_keyword_completion(
 
     // Scope-visible names — this module's HIR walked top-to-cursor.
     if let Some(module) = project.module(uri) {
-        let names = scope_names_at(&module.hir, cursor_byte);
+        let names = scope_names_at(&module.hir, project.symbols(), cursor_byte);
         for (name, kind, sort_pri, source) in names {
             if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                 continue;
@@ -3707,7 +3760,8 @@ fn ident_or_keyword_completion(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let (detail, documentation) = scope_name_meta(module, project.arena(), &source);
+            let (detail, documentation) =
+                scope_name_meta(module, project.arena(), project.symbols(), &source);
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(kind),
@@ -3733,7 +3787,7 @@ fn ident_or_keyword_completion(
                     md.decls
                         .iter()
                         .filter_map(|d| m.hir.decls[*d].name())
-                        .map(|n| m.hir.idents[n].text.to_string())
+                        .map(|n| project.symbols()[m.hir.idents[n].symbol].to_string())
                         .collect()
                 })
                 .unwrap_or_default()
@@ -3741,9 +3795,7 @@ fn ident_or_keyword_completion(
         .unwrap_or_default();
 
     for (name_sym, locs) in &project.index.decl_locations {
-        let Some(name) = project.index.symbols.resolve(*name_sym) else {
-            continue;
-        };
+        let name = project.index.symbols.resolve(name_sym);
         if in_module.contains(name) {
             continue;
         }
@@ -3770,9 +3822,7 @@ fn ident_or_keyword_completion(
         });
     }
     for name_sym in project.index.values.iter() {
-        let Some(name) = project.index.symbols.resolve(*name_sym) else {
-            continue;
-        };
+        let name = project.index.symbols.resolve(name_sym);
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
@@ -3788,9 +3838,7 @@ fn ident_or_keyword_completion(
         });
     }
     for name_sym in project.index.module_names.keys() {
-        let Some(name) = project.index.symbols.resolve(*name_sym) else {
-            continue;
-        };
+        let name = project.index.symbols.resolve(name_sym);
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
@@ -3915,13 +3963,14 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
 fn scope_name_meta(
     module: &ModuleAnalysis,
     arena: &TypeArena,
+    symbols: &SymbolTable,
     source: &NameSource,
 ) -> (Option<String>, Option<Documentation>) {
     match source {
         NameSource::ModuleDecl(decl_id) => {
             let decl = &module.hir.decls[*decl_id];
             (
-                Some(render_decl_signature(&module.hir, decl)),
+                Some(render_decl_signature(&module.hir, symbols, decl)),
                 doc_to_markup(decl_doc(decl)),
             )
         }
@@ -3930,7 +3979,7 @@ fn scope_name_meta(
                 .analysis
                 .def_types
                 .get(name_idx)
-                .map(|ty| arena.display(*ty).to_string());
+                .map(|ty| arena.display(*ty, symbols).to_string());
             (detail, None)
         }
         NameSource::Generic => (None, None),
@@ -3954,7 +4003,7 @@ fn foreign_decl_completion_meta(
         return (None, None, None);
     };
     let decl = &m.hir.decls[*decl_id];
-    let detail = render_decl_signature(&m.hir, decl);
+    let detail = render_decl_signature(&m.hir, project.symbols(), decl);
     let documentation = doc_to_markup(decl_doc(decl));
     let description = module_label_for_uri(uri);
     (Some(detail), documentation, Some(description))
@@ -4014,6 +4063,7 @@ enum NameSource {
 /// keystroke would be wasteful.
 fn scope_names_at(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     cursor_byte: usize,
 ) -> Vec<(String, CompletionItemKind, &'static str, NameSource)> {
     use greycat_analyzer_hir::types::Decl as HD;
@@ -4024,7 +4074,7 @@ fn scope_names_at(
     // Module-level decls are always visible (forward-ref allowed).
     for &decl_id in &module.decls {
         if let Some(name_id) = hir.decls[decl_id].name() {
-            let name = hir.idents[name_id].text.to_string();
+            let name = symbols[hir.idents[name_id].symbol].to_string();
             let kind = match &hir.decls[decl_id] {
                 HD::Fn(_) => CompletionItemKind::FUNCTION,
                 HD::Type(_) => CompletionItemKind::CLASS,
@@ -4042,10 +4092,10 @@ fn scope_names_at(
             continue;
         }
         match &hir.decls[decl_id] {
-            HD::Fn(d) => collect_fn_scope(hir, d, cursor_byte, &mut out),
+            HD::Fn(d) => collect_fn_scope(hir, symbols, d, cursor_byte, &mut out),
             HD::Type(d) => {
                 for g in &d.generics {
-                    let n = hir.idents[*g].text.to_string();
+                    let n = symbols[hir.idents[*g].symbol].to_string();
                     out.push((
                         n,
                         CompletionItemKind::TYPE_PARAMETER,
@@ -4059,7 +4109,7 @@ fn scope_names_at(
                         continue;
                     }
                     if let HD::Fn(fd) = &hir.decls[m_id] {
-                        collect_fn_scope(hir, fd, cursor_byte, &mut out);
+                        collect_fn_scope(hir, symbols, fd, cursor_byte, &mut out);
                     }
                 }
             }
@@ -4071,12 +4121,13 @@ fn scope_names_at(
 
 fn collect_fn_scope(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     fnd: &greycat_analyzer_hir::types::FnDecl,
     cursor_byte: usize,
     out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
 ) {
     for g in &fnd.generics {
-        let n = hir.idents[*g].text.to_string();
+        let n = symbols[hir.idents[*g].symbol].to_string();
         out.push((
             n,
             CompletionItemKind::TYPE_PARAMETER,
@@ -4086,7 +4137,7 @@ fn collect_fn_scope(
     }
     for p in &fnd.params {
         let p = &hir.fn_params[*p];
-        let n = hir.idents[p.name].text.to_string();
+        let n = symbols[hir.idents[p.name].symbol].to_string();
         out.push((
             n,
             CompletionItemKind::VARIABLE,
@@ -4095,7 +4146,7 @@ fn collect_fn_scope(
         ));
     }
     if let Some(body) = fnd.body {
-        collect_stmt_scope(hir, body, cursor_byte, out);
+        collect_stmt_scope(hir, symbols, body, cursor_byte, out);
     }
 }
 
@@ -4111,6 +4162,7 @@ fn cursor_in_block(block: &greycat_analyzer_hir::types::BlockStmt, cursor_byte: 
 /// even for `{ }` empty bodies — fixing the for-in scope-walker bug).
 fn collect_block_scope(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     block: &greycat_analyzer_hir::types::BlockStmt,
     cursor_byte: usize,
     out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
@@ -4123,7 +4175,7 @@ fn collect_block_scope(
         let r = stmt_byte_range(hir, *s);
         if r.end <= cursor_byte {
             if let HS::Var(lv) = &hir.stmts[*s] {
-                let n = hir.idents[lv.name].text.to_string();
+                let n = symbols[hir.idents[lv.name].symbol].to_string();
                 out.push((
                     n,
                     CompletionItemKind::VARIABLE,
@@ -4132,34 +4184,35 @@ fn collect_block_scope(
                 ));
             }
         } else if r.start <= cursor_byte && cursor_byte <= r.end {
-            collect_stmt_scope(hir, *s, cursor_byte, out);
+            collect_stmt_scope(hir, symbols, *s, cursor_byte, out);
         }
     }
 }
 
 fn collect_stmt_scope(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     cursor_byte: usize,
     out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
 ) {
     use greycat_analyzer_hir::types::Stmt as HS;
     match &hir.stmts[stmt_id] {
-        HS::Block(b) => collect_block_scope(hir, b, cursor_byte, out),
+        HS::Block(b) => collect_block_scope(hir, symbols, b, cursor_byte, out),
         HS::If(s) => {
-            collect_block_scope(hir, &s.then_branch, cursor_byte, out);
+            collect_block_scope(hir, symbols, &s.then_branch, cursor_byte, out);
             if let Some(eb) = s.else_branch {
                 let er = stmt_byte_range(hir, eb);
                 if er.start <= cursor_byte && cursor_byte <= er.end {
-                    collect_stmt_scope(hir, eb, cursor_byte, out);
+                    collect_stmt_scope(hir, symbols, eb, cursor_byte, out);
                 }
             }
         }
-        HS::While(s) => collect_block_scope(hir, &s.body, cursor_byte, out),
-        HS::DoWhile(s) => collect_block_scope(hir, &s.body, cursor_byte, out),
+        HS::While(s) => collect_block_scope(hir, symbols, &s.body, cursor_byte, out),
+        HS::DoWhile(s) => collect_block_scope(hir, symbols, &s.body, cursor_byte, out),
         HS::For(s) if cursor_in_block(&s.body, cursor_byte) => {
             if let Some(name_id) = s.init_name {
-                let n = hir.idents[name_id].text.to_string();
+                let n = symbols[hir.idents[name_id].symbol].to_string();
                 out.push((
                     n,
                     CompletionItemKind::VARIABLE,
@@ -4167,11 +4220,11 @@ fn collect_stmt_scope(
                     NameSource::Local(name_id),
                 ));
             }
-            collect_block_scope(hir, &s.body, cursor_byte, out);
+            collect_block_scope(hir, symbols, &s.body, cursor_byte, out);
         }
         HS::ForIn(s) if cursor_in_block(&s.body, cursor_byte) => {
             for p in &s.params {
-                let n = hir.idents[p.name].text.to_string();
+                let n = symbols[hir.idents[p.name].symbol].to_string();
                 out.push((
                     n,
                     CompletionItemKind::VARIABLE,
@@ -4179,13 +4232,13 @@ fn collect_stmt_scope(
                     NameSource::Local(p.name),
                 ));
             }
-            collect_block_scope(hir, &s.body, cursor_byte, out);
+            collect_block_scope(hir, symbols, &s.body, cursor_byte, out);
         }
         HS::Try(s) => {
-            collect_block_scope(hir, &s.try_block, cursor_byte, out);
+            collect_block_scope(hir, symbols, &s.try_block, cursor_byte, out);
             if cursor_in_block(&s.catch_block, cursor_byte) {
                 if let Some(err_id) = s.error_param {
-                    let n = hir.idents[err_id].text.to_string();
+                    let n = symbols[hir.idents[err_id].symbol].to_string();
                     out.push((
                         n,
                         CompletionItemKind::VARIABLE,
@@ -4193,10 +4246,10 @@ fn collect_stmt_scope(
                         NameSource::Local(err_id),
                     ));
                 }
-                collect_block_scope(hir, &s.catch_block, cursor_byte, out);
+                collect_block_scope(hir, symbols, &s.catch_block, cursor_byte, out);
             }
         }
-        HS::At(s) => collect_block_scope(hir, &s.block, cursor_byte, out),
+        HS::At(s) => collect_block_scope(hir, symbols, &s.block, cursor_byte, out),
         _ => {}
     }
 }
@@ -4270,8 +4323,8 @@ fn member_completion(
     let module = project.module(uri)?;
     let arena = project.arena();
     let well_known = project.well_known();
-    let recv_ty = receiver_type_at(text, root, module, recv_end)?;
-    let name = type_head_name(arena, recv_ty)?;
+    let recv_ty = receiver_type_at(text, root, module, project.symbols(), recv_end)?;
+    let name = type_head_name(project, arena, recv_ty)?;
 
     // `@deref`-driven completion: when the receiver's type declares
     // `@deref("methodName")`, the `*` / `->` deref desugars to a call
@@ -4284,9 +4337,9 @@ fn member_completion(
     let _ = well_known;
     let inner_head: Option<String> = (|| {
         let (recv_name, recv_args): (String, Vec<TypeId>) = match &arena.get(recv_ty).kind {
-            TypeKind::Type(d) => (arena.decl_name(*d)?.to_string(), Vec::new()),
+            TypeKind::Type(d) => (project.decl_name(*d)?.to_string(), Vec::new()),
             TypeKind::Generic { decl, args } => {
-                (arena.decl_name(*decl)?.to_string(), args.to_vec())
+                (project.decl_name(*decl)?.to_string(), args.to_vec())
             }
             _ => return None,
         };
@@ -4295,14 +4348,12 @@ fn member_completion(
         // Substitute the receiver's generic args into the cached
         // (still-abstract) deref-method return type.
         if recv_args.is_empty() {
-            return type_head_name(arena, deref_ret).map(|s| s.to_string());
+            return type_head_name(project, arena, deref_ret).map(|s| s.to_string());
         }
-        let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
+        let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
         for (i, gp_sym) in members.generics.iter().enumerate() {
-            if let Some(arg) = recv_args.get(i)
-                && let Some(gp_name) = project.index.symbols.resolve(*gp_sym)
-            {
-                subst.insert(gp_name.to_string(), *arg);
+            if let Some(arg) = recv_args.get(i) {
+                subst.insert(*gp_sym, *arg);
             }
         }
         // Read-only completion path — clone the arena once, do the
@@ -4310,7 +4361,7 @@ fn member_completion(
         // arena stays untouched.
         let mut working_arena = arena.clone();
         let resolved = working_arena.substitute(deref_ret, &subst);
-        type_head_name(&working_arena, resolved).map(|s| s.to_string())
+        type_head_name(project, &working_arena, resolved).map(|s| s.to_string())
     })();
 
     let mut items: Vec<CompletionItem> = Vec::new();
@@ -4320,17 +4371,24 @@ fn member_completion(
     // `arrow_deref_receiver` mirrors this dispatch.
     let list_tag_members = !(is_arrow && inner_head.is_some());
     if list_tag_members {
-        if let Some(decl_id) = module.analysis.type_decls.get(name).copied()
+        if let Some(name_sym) = project.symbols().lookup(name)
+            && let Some(decl_id) = module.analysis.type_decls.get(&name_sym).copied()
             && let Decl::Type(td) = &module.hir.decls[decl_id]
         {
-            collect_type_members(&module.hir, td, &prefix_lower, &mut items);
+            collect_type_members(
+                &module.hir,
+                project.symbols(),
+                td,
+                &prefix_lower,
+                &mut items,
+            );
         }
         if items.is_empty()
             && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(name).first()
             && let Some(fmod) = project.module(foreign_uri)
             && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
         {
-            collect_type_members(&fmod.hir, td, &prefix_lower, &mut items);
+            collect_type_members(&fmod.hir, project.symbols(), td, &prefix_lower, &mut items);
         }
     }
 
@@ -4338,17 +4396,30 @@ fn member_completion(
     // `additional_text_edits`; `->` lands the items verbatim.
     if let Some(inner) = inner_head.as_deref() {
         let mut inner_items: Vec<CompletionItem> = Vec::new();
-        if let Some(decl_id) = module.analysis.type_decls.get(inner).copied()
+        if let Some(inner_sym) = project.symbols().lookup(inner)
+            && let Some(decl_id) = module.analysis.type_decls.get(&inner_sym).copied()
             && let Decl::Type(td) = &module.hir.decls[decl_id]
         {
-            collect_type_members(&module.hir, td, &prefix_lower, &mut inner_items);
+            collect_type_members(
+                &module.hir,
+                project.symbols(),
+                td,
+                &prefix_lower,
+                &mut inner_items,
+            );
         }
         if inner_items.is_empty()
             && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(inner).first()
             && let Some(fmod) = project.module(foreign_uri)
             && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
         {
-            collect_type_members(&fmod.hir, td, &prefix_lower, &mut inner_items);
+            collect_type_members(
+                &fmod.hir,
+                project.symbols(),
+                td,
+                &prefix_lower,
+                &mut inner_items,
+            );
         }
         if !is_arrow && !inner_items.is_empty() {
             // `.` → `->` rewrite. The edit replaces the `.` byte with
@@ -4441,6 +4512,7 @@ fn receiver_type_at(
     text: &str,
     root: tree_sitter::Node<'_>,
     module: &ModuleAnalysis,
+    symbols: &SymbolTable,
     recv_end: usize,
 ) -> Option<TypeId> {
     if let Some((id, _)) = module
@@ -4500,7 +4572,7 @@ fn receiver_type_at(
     // Stage 3: ident dropped by lowering (lives inside an ERROR);
     // resolve by name lookup.
     let recv_text = text.get(r)?.to_string();
-    lookup_name_type_at(&module.hir, &module.analysis, recv_end, &recv_text)
+    lookup_name_type_at(&module.hir, symbols, &module.analysis, recv_end, &recv_text)
 }
 
 /// Walk the HIR for a Param / Local binding whose name matches `name`
@@ -4508,6 +4580,7 @@ fn receiver_type_at(
 /// `TypeId` from `def_types`.
 fn lookup_name_type_at(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
     cursor_byte: usize,
     name: &str,
@@ -4524,7 +4597,7 @@ fn lookup_name_type_at(
     // below never sees it.
     for &decl_id in &module.decls {
         if let HD::Var(vd) = &hir.decls[decl_id]
-            && hir.idents[vd.name].text == name
+            && symbols[hir.idents[vd.name].symbol] == *name
             && let Some(t) = analysis.def_types.get(&vd.name).copied()
         {
             return Some(t);
@@ -4537,7 +4610,9 @@ fn lookup_name_type_at(
         }
         match &hir.decls[decl_id] {
             HD::Fn(fnd) => {
-                if let Some(t) = lookup_name_type_in_fn(hir, analysis, cursor_byte, fnd, name) {
+                if let Some(t) =
+                    lookup_name_type_in_fn(hir, symbols, analysis, cursor_byte, fnd, name)
+                {
                     return Some(t);
                 }
             }
@@ -4549,7 +4624,7 @@ fn lookup_name_type_at(
                     }
                     if let HD::Fn(fnd) = &hir.decls[m_id]
                         && let Some(t) =
-                            lookup_name_type_in_fn(hir, analysis, cursor_byte, fnd, name)
+                            lookup_name_type_in_fn(hir, symbols, analysis, cursor_byte, fnd, name)
                     {
                         return Some(t);
                     }
@@ -4563,6 +4638,7 @@ fn lookup_name_type_at(
 
 fn lookup_name_type_in_fn(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
     cursor_byte: usize,
     fnd: &greycat_analyzer_hir::types::FnDecl,
@@ -4570,18 +4646,19 @@ fn lookup_name_type_in_fn(
 ) -> Option<TypeId> {
     for p_id in &fnd.params {
         let p = &hir.fn_params[*p_id];
-        if hir.idents[p.name].text == name {
+        if symbols[hir.idents[p.name].symbol] == *name {
             return analysis.def_types.get(&p.name).copied();
         }
     }
     if let Some(body) = fnd.body {
-        return lookup_name_type_in_stmt(hir, analysis, cursor_byte, body, name);
+        return lookup_name_type_in_stmt(hir, symbols, analysis, cursor_byte, body, name);
     }
     None
 }
 
 fn lookup_name_type_in_block(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
     cursor_byte: usize,
     block: &greycat_analyzer_hir::types::BlockStmt,
@@ -4595,13 +4672,13 @@ fn lookup_name_type_in_block(
         let r = stmt_byte_range(hir, *s);
         if r.end <= cursor_byte {
             if let HS::Var(lv) = &hir.stmts[*s]
-                && hir.idents[lv.name].text == name
+                && symbols[hir.idents[lv.name].symbol] == *name
             {
                 return analysis.def_types.get(&lv.name).copied();
             }
         } else if r.start <= cursor_byte
             && cursor_byte <= r.end
-            && let Some(t) = lookup_name_type_in_stmt(hir, analysis, cursor_byte, *s, name)
+            && let Some(t) = lookup_name_type_in_stmt(hir, symbols, analysis, cursor_byte, *s, name)
         {
             return Some(t);
         }
@@ -4611,6 +4688,7 @@ fn lookup_name_type_in_block(
 
 fn lookup_name_type_in_stmt(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
     cursor_byte: usize,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
@@ -4618,42 +4696,46 @@ fn lookup_name_type_in_stmt(
 ) -> Option<TypeId> {
     use greycat_analyzer_hir::types::Stmt as HS;
     match &hir.stmts[stmt_id] {
-        HS::Block(b) => lookup_name_type_in_block(hir, analysis, cursor_byte, b, name),
+        HS::Block(b) => lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, b, name),
         HS::If(s) => {
             if let Some(t) =
-                lookup_name_type_in_block(hir, analysis, cursor_byte, &s.then_branch, name)
+                lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, &s.then_branch, name)
             {
                 return Some(t);
             }
             if let Some(eb) = s.else_branch {
                 let er = stmt_byte_range(hir, eb);
                 if er.start <= cursor_byte && cursor_byte <= er.end {
-                    return lookup_name_type_in_stmt(hir, analysis, cursor_byte, eb, name);
+                    return lookup_name_type_in_stmt(hir, symbols, analysis, cursor_byte, eb, name);
                 }
             }
             None
         }
-        HS::While(s) => lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name),
-        HS::DoWhile(s) => lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name),
+        HS::While(s) => {
+            lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, &s.body, name)
+        }
+        HS::DoWhile(s) => {
+            lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, &s.body, name)
+        }
         HS::For(s) => {
             if let Some(name_id) = s.init_name
-                && hir.idents[name_id].text == name
+                && symbols[hir.idents[name_id].symbol] == *name
             {
                 return analysis.def_types.get(&name_id).copied();
             }
-            lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name)
+            lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, &s.body, name)
         }
         HS::ForIn(s) => {
             for p in &s.params {
-                if hir.idents[p.name].text == name {
+                if symbols[hir.idents[p.name].symbol] == *name {
                     return analysis.def_types.get(&p.name).copied();
                 }
             }
-            lookup_name_type_in_block(hir, analysis, cursor_byte, &s.body, name)
+            lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, &s.body, name)
         }
         HS::Try(s) => {
             if let Some(t) =
-                lookup_name_type_in_block(hir, analysis, cursor_byte, &s.try_block, name)
+                lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, &s.try_block, name)
             {
                 return Some(t);
             }
@@ -4661,15 +4743,22 @@ fn lookup_name_type_in_stmt(
                 && cursor_byte <= s.catch_block.byte_range.end
             {
                 if let Some(err_id) = s.error_param
-                    && hir.idents[err_id].text == name
+                    && symbols[hir.idents[err_id].symbol] == *name
                 {
                     return analysis.def_types.get(&err_id).copied();
                 }
-                return lookup_name_type_in_block(hir, analysis, cursor_byte, &s.catch_block, name);
+                return lookup_name_type_in_block(
+                    hir,
+                    symbols,
+                    analysis,
+                    cursor_byte,
+                    &s.catch_block,
+                    name,
+                );
             }
             None
         }
-        HS::At(s) => lookup_name_type_in_block(hir, analysis, cursor_byte, &s.block, name),
+        HS::At(s) => lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, &s.block, name),
         _ => None,
     }
 }
@@ -4677,14 +4766,14 @@ fn lookup_name_type_in_stmt(
 /// Read the head name of `id` from `arena` — the bare type name
 /// stripped of nullability / generic args. Returns `None` for shapes
 /// without a single name (lambdas, tuples, anonymous structures).
-fn type_head_name(arena: &TypeArena, id: TypeId) -> Option<&str> {
+fn type_head_name<'a>(pa: &'a ProjectAnalysis, arena: &'a TypeArena, id: TypeId) -> Option<&'a str> {
     use greycat_analyzer_core::TypeKind;
     let t = arena.get(id);
     match &t.kind {
-        // P35.7 — handle-keyed variants read the name from the arena's
-        // parallel decl-names table.
-        TypeKind::Type(d) => arena.decl_name(*d),
-        TypeKind::Generic { decl, .. } => arena.decl_name(*decl),
+        // P35.7 — handle-keyed variants read the name from the project's
+        // decl-registry.
+        TypeKind::Type(d) => pa.decl_name(*d),
+        TypeKind::Generic { decl, .. } => pa.decl_name(*decl),
         TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }
@@ -4696,18 +4785,19 @@ fn type_head_name(arena: &TypeArena, id: TypeId) -> Option<&str> {
 /// instance access lists everything.
 fn collect_type_members(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     td: &greycat_analyzer_hir::types::TypeDecl,
     prefix_lower: &str,
     items: &mut Vec<CompletionItem>,
 ) {
     for attr_id in &td.attrs {
         let a = &hir.type_attrs[*attr_id];
-        let name = hir.idents[a.name].text.to_string();
+        let name = symbols[hir.idents[a.name].symbol].to_string();
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
         let ty =
-            a.ty.map(|t| render_type_ref(hir, t))
+            a.ty.map(|t| render_type_ref(hir, symbols, t))
                 .unwrap_or_else(|| "any".into());
         items.push(CompletionItem {
             label: name.clone(),
@@ -4727,7 +4817,7 @@ fn collect_type_members(
         if m.modifiers.static_ {
             continue;
         }
-        let name = hir.idents[m.name].text.to_string();
+        let name = symbols[hir.idents[m.name].symbol].to_string();
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
@@ -4735,7 +4825,7 @@ fn collect_type_members(
             label: name.clone(),
             kind: Some(CompletionItemKind::METHOD),
             insert_text: Some(name),
-            detail: Some(render_fn_signature(hir, m)),
+            detail: Some(render_fn_signature(hir, symbols, m)),
             documentation: doc_to_markup(m.doc.as_deref()),
             ..Default::default()
         });
@@ -4803,11 +4893,11 @@ fn static_completion(
                     if !m.modifiers.static_ {
                         continue;
                     }
-                    let name = fmod.hir.idents[m.name].text.to_string();
+                    let name = project.symbols()[fmod.hir.idents[m.name].symbol].to_string();
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
-                    let detail = Some(render_fn_signature(&fmod.hir, m));
+                    let detail = Some(render_fn_signature(&fmod.hir, project.symbols(), m));
                     let documentation = doc_to_markup(m.doc.as_deref());
                     items.push(static_completion_item(
                         name,
@@ -4825,7 +4915,8 @@ fn static_completion(
                 // `"America/New_York"`, …) so we keep the per-item
                 // path allocation-light.
                 for f in &ed.fields {
-                    let name = fmod.hir.idents[fmod.hir.enum_fields[*f].name].text.as_str();
+                    let name =
+                        &project.symbols()[fmod.hir.idents[fmod.hir.enum_fields[*f].name].symbol];
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
@@ -4849,7 +4940,7 @@ fn static_completion(
             let Some(name_id) = mod_analysis.hir.decls[decl_id].name() else {
                 continue;
             };
-            let name = mod_analysis.hir.idents[name_id].text.to_string();
+            let name = project.symbols()[mod_analysis.hir.idents[name_id].symbol].to_string();
             if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                 continue;
             }
@@ -4861,7 +4952,11 @@ fn static_completion(
                 Decl::Var(_) => CompletionItemKind::VARIABLE,
                 Decl::Pragma(_) => continue,
             };
-            let detail = Some(render_decl_signature(&mod_analysis.hir, decl));
+            let detail = Some(render_decl_signature(
+                &mod_analysis.hir,
+                project.symbols(),
+                decl,
+            ));
             let documentation = doc_to_markup(decl_doc(decl));
             items.push(static_completion_item(
                 name,
@@ -5061,14 +5156,14 @@ fn type_position_completion(
                 _ => continue,
             };
             if let Some(name_id) = module.hir.decls[*decl_id].name() {
-                let name = module.hir.idents[name_id].text.to_string();
+                let name = project.symbols()[module.hir.idents[name_id].symbol].to_string();
                 push(&mut items, &mut seen, &name, kind);
             }
         }
     }
     // In-scope generic type-params from the enclosing fn / type.
     if let Some(module) = project.module(uri) {
-        for (name, kind, _, _) in scope_names_at(&module.hir, cursor_byte) {
+        for (name, kind, _, _) in scope_names_at(&module.hir, project.symbols(), cursor_byte) {
             if matches!(kind, CompletionItemKind::TYPE_PARAMETER) {
                 push(&mut items, &mut seen, &name, kind);
             }
@@ -5076,9 +5171,7 @@ fn type_position_completion(
     }
     // Project-level type / enum decls.
     for (name_sym, locs) in &project.index.decl_locations {
-        let Some(name) = project.index.symbols.resolve(*name_sym) else {
-            continue;
-        };
+        let name = project.index.symbols.resolve(name_sym);
         if let Some((u, d)) = locs.first()
             && let Some(m) = project.module(u)
         {
@@ -5099,9 +5192,7 @@ fn type_position_completion(
     // Module names — type slots can read `module::Foo`, so module
     // names are valid here as the leading segment.
     for name_sym in project.index.module_names.keys() {
-        let Some(name) = project.index.symbols.resolve(*name_sym) else {
-            continue;
-        };
+        let name = project.index.symbols.resolve(name_sym);
         push(&mut items, &mut seen, name, CompletionItemKind::MODULE);
     }
 
@@ -5146,17 +5237,24 @@ fn object_field_completion(
     // Find the type's HIR (in-module first, then cross-module).
     let module = project.module(uri)?;
     let mut items: Vec<CompletionItem> = Vec::new();
-    if let Some(decl_id) = module.analysis.type_decls.get(type_name.as_str()).copied()
+    if let Some(type_sym) = project.symbols().lookup(type_name.as_str())
+        && let Some(decl_id) = module.analysis.type_decls.get(&type_sym).copied()
         && let Decl::Type(td) = &module.hir.decls[decl_id]
     {
-        emit_attrs(&module.hir, td, &prefix_lower, &mut items);
+        emit_attrs(
+            &module.hir,
+            project.symbols(),
+            td,
+            &prefix_lower,
+            &mut items,
+        );
     }
     if items.is_empty()
         && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&type_name).first()
         && let Some(fmod) = project.module(foreign_uri)
         && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
     {
-        emit_attrs(&fmod.hir, td, &prefix_lower, &mut items);
+        emit_attrs(&fmod.hir, project.symbols(), td, &prefix_lower, &mut items);
     }
     if items.is_empty() {
         return None;
@@ -5167,13 +5265,14 @@ fn object_field_completion(
 
 fn emit_attrs(
     hir: &greycat_analyzer_hir::Hir,
+    symbols: &SymbolTable,
     td: &greycat_analyzer_hir::types::TypeDecl,
     prefix_lower: &str,
     items: &mut Vec<CompletionItem>,
 ) {
     for attr_id in &td.attrs {
         let a = &hir.type_attrs[*attr_id];
-        let name = hir.idents[a.name].text.to_string();
+        let name = symbols[hir.idents[a.name].symbol].to_string();
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
@@ -5209,7 +5308,8 @@ pub(crate) fn current_diagnostics(
     lib: &str,
     root: tree_sitter::Node<'_>,
 ) -> Vec<Diagnostic> {
-    let hir = lower_module(text, "module", lib, root);
+    let symbols = SymbolTable::new();
+    let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir);
     let (_arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
     let mut out: Vec<Diagnostic> = analysis
@@ -5228,7 +5328,7 @@ pub(crate) fn current_diagnostics(
             ..Default::default()
         })
         .collect();
-    for lint in run_lints(&hir, &resolutions) {
+    for lint in run_lints(&hir, &resolutions, &symbols) {
         out.push(Diagnostic {
             range: byte_range_to_lsp_range(text, &lint.byte_range),
             severity: Some(match lint.severity {

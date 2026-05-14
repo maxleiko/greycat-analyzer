@@ -26,8 +26,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use greycat_analyzer_core::{
-    GenericOwner, InferenceTable, Primitive, Type, TypeArena, TypeId, TypeKind, TypeRegistry,
-    is_assignable_to,
+    GenericOwner, InferenceTable, Primitive, Symbol, Type, TypeArena, TypeId, TypeKind,
+    TypeRegistry, is_assignable_to,
 };
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -170,7 +170,7 @@ pub struct AnalysisResult {
     /// member resolution navigate from a receiver's `TypeId` back to
     /// the declaring node so attr / method idents can be bound.
     // P25.3
-    pub type_decls: FxHashMap<SmolStr, Idx<Decl>>,
+    pub type_decls: FxHashMap<Symbol, Idx<Decl>>,
     /// Member-access bindings produced by each property ident in
     /// `a.b` / `a->b` that resolves to a [`TypeAttr`] or to a
     /// `TypeDecl::methods` entry, keyed by the property `Idx<Ident>`.
@@ -309,12 +309,12 @@ pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
     let mut decl_registry = crate::well_known::DeclRegistry::default();
     if let Some(module) = hir.module.as_ref() {
         for d_id in &module.decls {
-            match &hir.decls[*d_id] {
-                Decl::Type(_) | Decl::Enum(_) => {
-                    let _ = decl_registry.get_or_insert(&module_uri, *d_id);
-                }
-                _ => {}
-            }
+            let name = match &hir.decls[*d_id] {
+                Decl::Type(td) => hir.idents[td.name].symbol,
+                Decl::Enum(ed) => hir.idents[ed.name].symbol,
+                _ => continue,
+            };
+            let _ = decl_registry.get_or_insert(&module_uri, *d_id, name);
         }
     }
     let out = analyze_with_index_into(
@@ -348,12 +348,12 @@ pub fn analyze_with_index(
     let mut decl_registry = crate::well_known::DeclRegistry::default();
     if let Some(module) = hir.module.as_ref() {
         for d_id in &module.decls {
-            match &hir.decls[*d_id] {
-                Decl::Type(_) | Decl::Enum(_) => {
-                    let _ = decl_registry.get_or_insert(&module_uri, *d_id);
-                }
-                _ => {}
-            }
+            let name = match &hir.decls[*d_id] {
+                Decl::Type(td) => hir.idents[td.name].symbol,
+                Decl::Enum(ed) => hir.idents[ed.name].symbol,
+                _ => continue,
+            };
+            let _ = decl_registry.get_or_insert(&module_uri, *d_id, name);
         }
     }
     let out = analyze_with_index_into(
@@ -614,20 +614,17 @@ fn register_module_types(
                 out.type_decls.insert(name, *d);
             }
             Decl::Enum(ed) => {
-                let name: SmolStr = hir.idents[ed.name].text.as_str().into();
-                let variants: Vec<SmolStr> = ed
+                let name = hir.idents[ed.name].symbol;
+                let variants: Box<[greycat_analyzer_core::Symbol]> = ed
                     .fields
                     .iter()
-                    .map(|f| hir.idents[hir.enum_fields[*f].name].text.as_str().into())
+                    .map(|f| hir.idents[hir.enum_fields[*f].name].symbol)
                     .collect();
                 let id = arena.alloc(Type {
-                    kind: TypeKind::Enum {
-                        name: name.clone(),
-                        variants,
-                    },
+                    kind: TypeKind::Enum { name, variants },
                     nullable: false,
                 });
-                out.registry.register(name.clone(), id);
+                out.registry.register(name, id);
                 out.type_decls.insert(name, *d);
             }
             _ => {}
@@ -977,7 +974,7 @@ impl<'a> Cx<'a> {
                         let name = self.ident_text(*ident).to_string();
                         let pretty: Vec<String> = tys
                             .iter()
-                            .map(|t| self.arena.display(*t).to_string())
+                            .map(|t| self.arena.display(*t, &self.index.symbols).to_string())
                             .collect();
                         let msg = format!(
                             "condition is always false: `{}` cannot simultaneously be {}",
@@ -1014,7 +1011,7 @@ impl<'a> Cx<'a> {
                                 let msg = format!(
                                     "condition is always true: `{}` is already of type `{}`",
                                     name,
-                                    self.arena.display(known),
+                                    self.arena.display(known, &self.index.symbols),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
@@ -1036,8 +1033,8 @@ impl<'a> Cx<'a> {
                                 let msg = format!(
                                     "condition is always false: `{}` of type `{}` can never be `{}`",
                                     name,
-                                    self.arena.display(known),
-                                    self.arena.display(asserted),
+                                    self.arena.display(known, &self.index.symbols),
+                                    self.arena.display(asserted, &self.index.symbols),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
@@ -1090,25 +1087,34 @@ impl<'a> Cx<'a> {
     /// `&mut self` arena allocation.
     fn function_ty(&mut self) -> TypeId {
         match self.well_known.function_decl {
-            Some(d) => self.arena.alloc_type(d, "function"),
+            Some(d) => self.arena.alloc_type(d),
             // P35.8 — when std isn't loaded, the runtime sentinel
             // names (`function` / `type` / `field`) have no decl
             // handle. Mint `Unresolved` so display still renders the
             // name verbatim and assignability behaves like `any?`
             // (no cascading diagnostics).
-            None => self.arena.unresolved("function", (0, 0)),
+            None => {
+                let name = self.index.symbols.intern("function");
+                self.arena.unresolved(name, (0, 0))
+            }
         }
     }
     fn type_ty(&mut self) -> TypeId {
         match self.well_known.type_decl {
-            Some(d) => self.arena.alloc_type(d, "type"),
-            None => self.arena.unresolved("type", (0, 0)),
+            Some(d) => self.arena.alloc_type(d),
+            None => {
+                let name = self.index.symbols.intern("type");
+                self.arena.unresolved(name, (0, 0))
+            }
         }
     }
     fn field_ty(&mut self) -> TypeId {
         match self.well_known.field_decl {
-            Some(d) => self.arena.alloc_type(d, "field"),
-            None => self.arena.unresolved("field", (0, 0)),
+            Some(d) => self.arena.alloc_type(d),
+            None => {
+                let name = self.index.symbols.intern("field");
+                self.arena.unresolved(name, (0, 0))
+            }
         }
     }
     fn record(&mut self, expr: Idx<Expr>, ty: TypeId) {
@@ -1126,7 +1132,16 @@ impl<'a> Cx<'a> {
         ));
     }
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
-        &self.hir.idents[idx].text
+        &self.index.symbols[self.hir.idents[idx].symbol]
+    }
+
+    /// Resolve a `TypeDeclId` to its source name through
+    /// `decl_registry → SymbolTable`. Replaces the old
+    /// `arena.decl_name(id)` API.
+    fn decl_name(&self, id: greycat_analyzer_core::TypeDeclId) -> Option<&str> {
+        self.decl_registry
+            .name(id)
+            .map(|sym| &self.index.symbols[sym] as &str)
     }
 
     fn push_narrow(&mut self) {
@@ -1337,9 +1352,9 @@ impl<'a> Cx<'a> {
         let (type_name, instantiation): (SmolStr, Vec<TypeId>) = {
             let ty = self.arena.get(recv_ty);
             match &ty.kind {
-                TypeKind::Type(d) => (self.arena.decl_name(*d)?.into(), Vec::new()),
+                TypeKind::Type(d) => (self.decl_name(*d)?.into(), Vec::new()),
                 TypeKind::Generic { decl, args } => {
-                    (self.arena.decl_name(*decl)?.into(), args.to_vec())
+                    (self.decl_name(*decl)?.into(), args.to_vec())
                 }
                 _ => return None,
             }
@@ -1355,12 +1370,10 @@ impl<'a> Cx<'a> {
         if instantiation.is_empty() {
             return Some(method_ret);
         }
-        let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
+        let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
         for (i, gp_sym) in members.generics.iter().enumerate() {
-            if let Some(arg) = instantiation.get(i)
-                && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
-            {
-                subst.insert(gp_name.to_string(), *arg);
+            if let Some(arg) = instantiation.get(i) {
+                subst.insert(*gp_sym, *arg);
             }
         }
         Some(self.arena.substitute(method_ret, &subst))
@@ -1390,8 +1403,8 @@ impl<'a> Cx<'a> {
         let type_name: Option<SmolStr> = match &ty.kind {
             // P35.7 — handle-keyed variants read the name from the
             // arena's parallel decl-names table.
-            TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
-            TypeKind::Generic { decl, .. } => self.arena.decl_name(*decl).map(SmolStr::from),
+            TypeKind::Type(d) => self.decl_name(*d).map(SmolStr::from),
+            TypeKind::Generic { decl, .. } => self.decl_name(*decl).map(SmolStr::from),
             // P16.2 — primitives (`String`, `int`, ...) carry methods
             // declared as `native type String { ... }` in stdlib.
             // Map the primitive back to its name and fall through to
@@ -1403,6 +1416,7 @@ impl<'a> Cx<'a> {
         let Some(name) = type_name else {
             return;
         };
+        let prop_sym = self.hir.idents[property].symbol;
         let prop_text = self.ident_text(property);
 
         // Resolution order: attrs first (local then inherited), methods
@@ -1411,10 +1425,10 @@ impl<'a> Cx<'a> {
         // inherited `from: time` attr even when a `static fn from(...)`
         // is declared on the receiver type.
         let local_type_decl = self
-            .out
-            .type_decls
-            .get(name.as_str())
-            .copied()
+            .index
+            .symbols
+            .lookup(name.as_str())
+            .and_then(|sym| self.out.type_decls.get(&sym).copied())
             .and_then(|id| match &self.hir.decls[id] {
                 Decl::Type(td) => Some(td.clone()),
                 _ => None,
@@ -1423,7 +1437,7 @@ impl<'a> Cx<'a> {
         if let Some(type_decl) = local_type_decl.as_ref() {
             for attr_id in &type_decl.attrs {
                 let attr = &self.hir.type_attrs[*attr_id];
-                if self.hir.idents[attr.name].text == prop_text {
+                if self.hir.idents[attr.name].symbol == prop_sym {
                     self.out
                         .member_uses
                         .insert(property, MemberDef::Attr(*attr_id));
@@ -1449,7 +1463,7 @@ impl<'a> Cx<'a> {
                 if instance_access && m.modifiers.static_ {
                     continue;
                 }
-                if self.hir.idents[m.name].text == prop_text {
+                if self.hir.idents[m.name].symbol == prop_sym {
                     self.out
                         .member_uses
                         .insert(property, MemberDef::Method(*method_id));
@@ -1616,12 +1630,12 @@ impl<'a> Cx<'a> {
             // decl name via the arena's decl-names table so the
             // downstream chain-walking lookup (still SmolStr-keyed)
             // finds the type.
-            TypeKind::Type(decl) => match self.arena.decl_name(decl) {
+            TypeKind::Type(decl) => match self.decl_name(decl) {
                 Some(n) => (n.into(), Vec::new()),
                 None => return None,
             },
             // P25.7
-            TypeKind::Generic { decl, args } => match self.arena.decl_name(decl) {
+            TypeKind::Generic { decl, args } => match self.decl_name(decl) {
                 Some(n) => (n.into(), args.into_vec()),
                 None => return None,
             },
@@ -1634,12 +1648,10 @@ impl<'a> Cx<'a> {
             .index
             .type_method_return_chain(&type_name, property_text)?;
         let members = self.index.type_members_for(&type_name)?;
-        let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
+        let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
         for (i, gp_sym) in members.generics.iter().enumerate() {
-            if let Some(arg) = instantiation.get(i)
-                && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
-            {
-                subst.insert(gp_name.to_string(), *arg);
+            if let Some(arg) = instantiation.get(i) {
+                subst.insert(*gp_sym, *arg);
             }
         }
         Some(self.arena.substitute(ret_ty, &subst))
@@ -1679,7 +1691,7 @@ impl<'a> Cx<'a> {
                 .index
                 .type_members_for(self.ident_text(chain[1]))
                 .and_then(|members| {
-                    let prop = self.hir.idents[chain[2]].text.as_str();
+                    let prop = &self.index.symbols[self.hir.idents[chain[2]].symbol];
                     if let Some(attr_id) = members.attr_id(&self.index.symbols, prop) {
                         Some((members.home_uri.clone(), MemberDef::Attr(attr_id)))
                     } else {
@@ -1710,7 +1722,7 @@ impl<'a> Cx<'a> {
     /// (the analyzer never crosses module boundaries during the
     /// body walk).
     fn static_value_type(&mut self, recv_ty: TypeId, property: Idx<Ident>) -> Option<TypeId> {
-        let prop_text = self.hir.idents[property].text.as_str();
+        let prop_text = &self.index.symbols[self.hir.idents[property].symbol];
         if let Some(MemberDef::Attr(attr_id)) = self.out.member_uses.get(&property).copied() {
             let attr = &self.hir.type_attrs[attr_id];
             if attr.modifiers.static_ {
@@ -1728,9 +1740,9 @@ impl<'a> Cx<'a> {
             // receiver's type. The receiver is the `Type::` part
             // of the static expr; we have its lowered TypeId.
             let owner_name: Option<SmolStr> = match &self.arena.get(recv_ty).kind {
-                TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
-                TypeKind::Generic { decl, .. } => self.arena.decl_name(*decl).map(SmolStr::from),
-                TypeKind::Enum { name, .. } => Some(name.clone()),
+                TypeKind::Type(d) => self.decl_name(*d).map(SmolStr::from),
+                TypeKind::Generic { decl, .. } => self.decl_name(*decl).map(SmolStr::from),
+                TypeKind::Enum { name, .. } => Some(SmolStr::from(&self.index.symbols[*name])),
                 // **P19.14** — primitives carry static methods /
                 // attrs in stdlib (`time::max`, `int::max`, etc.);
                 // map them to the stdlib type name so the
@@ -1801,7 +1813,8 @@ impl<'a> Cx<'a> {
                 // arm so call-arg validation against `_: Foo` passes.
                 if let Some(ty_id) = self.index.enum_type_for(&type_name)
                     && let TypeKind::Enum { variants, .. } = &self.arena.get(ty_id).kind
-                    && variants.iter().any(|v| v == &member_name)
+                    && let Some(member_sym) = self.index.symbols.lookup(&member_name)
+                    && variants.iter().any(|v| *v == member_sym)
                 {
                     return Some(ty_id);
                 }
@@ -1857,12 +1870,12 @@ impl<'a> Cx<'a> {
         let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match &self.arena.get(recv_ty).kind
         {
             // P35.7 — handle-keyed variants.
-            TypeKind::Type(d) => match self.arena.decl_name(*d) {
+            TypeKind::Type(d) => match self.decl_name(*d) {
                 Some(n) => (n.into(), Vec::new()),
                 None => return None,
             },
             // P25.7
-            TypeKind::Generic { decl, args } => match self.arena.decl_name(*decl) {
+            TypeKind::Generic { decl, args } => match self.decl_name(*decl) {
                 Some(n) => (n.into(), args.to_vec()),
                 None => return None,
             },
@@ -1874,19 +1887,17 @@ impl<'a> Cx<'a> {
         // **P19.14** — chain-walking lookup so attrs declared on a
         // parent type (`type Sub extends Super { ... }`) resolve
         // when accessed through a `Sub` receiver.
-        let property_text = self.hir.idents[property].text.as_str();
+        let property_text = &self.index.symbols[self.hir.idents[property].symbol];
         let (attr_ty, subst) = {
             let attr_ty = self.index.type_attr_ty_chain(&type_name, property_text)?;
             // Generic substitution is driven by the *receiver type*'s
             // own generic params, not the parent's — `node<Foo<int>>`
             // accessing a `Foo`-declared attr substitutes `T → int`.
             let members = self.index.type_members_for(&type_name)?;
-            let mut subst: FxHashMap<String, TypeId> = FxHashMap::default();
+            let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
             for (i, gp_sym) in members.generics.iter().enumerate() {
-                if let Some(arg) = instantiation.get(i)
-                    && let Some(gp_name) = self.index.symbols.resolve(*gp_sym)
-                {
-                    subst.insert(gp_name.to_string(), *arg);
+                if let Some(arg) = instantiation.get(i) {
+                    subst.insert(*gp_sym, *arg);
                 }
             }
             (attr_ty, subst)
@@ -1907,7 +1918,8 @@ impl<'a> Cx<'a> {
     fn generic_arity_for(&self, name: &str) -> Option<usize> {
         use greycat_analyzer_hir::types::Decl;
         // Local: find the decl by name and inspect its generics.
-        if let Some(decl_id) = self.out.type_decls.get(name)
+        if let Some(name_sym) = self.index.symbols.lookup(name)
+            && let Some(decl_id) = self.out.type_decls.get(&name_sym)
             && let Decl::Type(td) = &self.hir.decls[*decl_id]
             && !td.generics.is_empty()
         {
@@ -1930,8 +1942,9 @@ impl<'a> Cx<'a> {
         if !tr.qualifier.is_empty() {
             return self.lower_qualified_type_ref(&tr);
         }
-        let name = self.ident_text(tr.name).to_string();
-        let mut base = match name.as_str() {
+        let name_sym = self.hir.idents[tr.name].symbol;
+        let name: &str = &self.index.symbols[name_sym];
+        let mut base = match name {
             "bool" => self.primitive(Primitive::Bool),
             "int" => self.primitive(Primitive::Int),
             "float" => self.primitive(Primitive::Float),
@@ -1943,22 +1956,23 @@ impl<'a> Cx<'a> {
             "any" => self.any(),
             "null" => self.null(),
             _ => {
+                let name = name.to_string();
                 if !tr.params.is_empty() {
                     let args: Vec<TypeId> =
                         tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
                     match crate::project::resolve_decl_handle(self.index, self.decl_registry, &name)
                     {
-                        Some(handle) => self.arena.generic(handle, name.clone(), args),
+                        Some(handle) => self.arena.generic(handle, args),
                         None => self
                             .arena
-                            .unresolved(name.clone(), (tr.byte_range.start, tr.byte_range.end)),
+                            .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                     }
                 } else if let Some(owner) = self.lookup_generic(&name) {
                     // P12.1: name matches a fn / type generic param in
                     // scope — produce a `GenericParam` rather than a
                     // bare `Named`, so call-site inference can record
                     // witnesses for it.
-                    self.arena.generic_param(name.clone(), owner)
+                    self.arena.generic_param(name_sym, owner)
                 } else if let Some(arity) = self.generic_arity_for(&name) {
                     // Raw-form generic reference: `Tensor` (no params)
                     // is equivalent to `Tensor<any?, any?>` per the
@@ -1972,12 +1986,12 @@ impl<'a> Cx<'a> {
                     let args: Vec<TypeId> = vec![any_q; arity];
                     match crate::project::resolve_decl_handle(self.index, self.decl_registry, &name)
                     {
-                        Some(handle) => self.arena.generic(handle, name.clone(), args),
+                        Some(handle) => self.arena.generic(handle, args),
                         None => self
                             .arena
-                            .unresolved(name.clone(), (tr.byte_range.start, tr.byte_range.end)),
+                            .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                     }
-                } else if let Some(id) = self.out.registry.lookup(&name) {
+                } else if let Some(id) = self.out.registry.lookup(name_sym) {
                     id
                 } else if let Some(enum_id) = self.index.enum_type_for(&name) {
                     // P19.10 — canonical enum TypeId from the
@@ -2012,7 +2026,7 @@ impl<'a> Cx<'a> {
                     // the runtime nonetheless recognises (which
                     // `has_name` covers via the seeded primitives /
                     // runtime-implemented types).
-                    self.arena.alloc_type(handle, name.clone())
+                    self.arena.alloc_type(handle)
                 } else {
                     // No decl handle reachable. Either the name is
                     // genuinely unknown (typo, missing import) or it
@@ -2023,7 +2037,7 @@ impl<'a> Cx<'a> {
                     // assignability so downstream type-relation
                     // checks don't cascade.
                     self.arena
-                        .unresolved(name.clone(), (tr.byte_range.start, tr.byte_range.end))
+                        .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end))
                 }
             }
         };
@@ -2044,6 +2058,7 @@ impl<'a> Cx<'a> {
             .last()
             .expect("lower_qualified_type_ref called with empty qualifier");
         let module_name = self.ident_text(module_segment).to_string();
+        let leaf_sym = self.hir.idents[tr.name].symbol;
         let leaf_name = self.ident_text(tr.name).to_string();
         let byte_span = (tr.byte_range.start, tr.byte_range.end);
 
@@ -2051,7 +2066,7 @@ impl<'a> Cx<'a> {
             // Qualifier doesn't name a known module — the resolver
             // already flagged it as unresolved. Surface the leaf as
             // an Unresolved type so downstream typing doesn't cascade.
-            let mut base = self.arena.unresolved(leaf_name, byte_span);
+            let mut base = self.arena.unresolved(leaf_sym, byte_span);
             if tr.optional {
                 base = self.arena.nullable(base);
             }
@@ -2075,8 +2090,8 @@ impl<'a> Cx<'a> {
             let mut base = match in_module(self.index)
                 .and_then(|decl| self.decl_registry.lookup(&module_uri, decl))
             {
-                Some(handle) => self.arena.generic(handle, leaf_name.clone(), args),
-                None => self.arena.unresolved(leaf_name.clone(), byte_span),
+                Some(handle) => self.arena.generic(handle, args),
+                None => self.arena.unresolved(leaf_sym, byte_span),
             };
             if tr.optional {
                 base = self.arena.nullable(base);
@@ -2089,10 +2104,10 @@ impl<'a> Cx<'a> {
         // call boundary.
         let mut base = match in_module(self.index) {
             Some(decl) => match self.decl_registry.lookup(&module_uri, decl) {
-                Some(handle) => self.arena.alloc_type(handle, leaf_name.clone()),
-                None => self.arena.unresolved(leaf_name, byte_span),
+                Some(handle) => self.arena.alloc_type(handle),
+                None => self.arena.unresolved(leaf_sym, byte_span),
             },
-            None => self.arena.unresolved(leaf_name, byte_span),
+            None => self.arena.unresolved(leaf_sym, byte_span),
         };
         if tr.optional {
             base = self.arena.nullable(base);
@@ -2139,8 +2154,7 @@ impl<'a> Cx<'a> {
                         _ => return None,
                     };
                 // Lower the declared signature with the fn's generics in scope.
-                let owner =
-                    GenericOwner::Function(self.hir.idents[fn_name_idx].text.as_str().into());
+                let owner = GenericOwner::Function(self.hir.idents[fn_name_idx].symbol);
                 self.push_generic_scope(&fn_generics, owner);
                 let declared_params: Vec<TypeId> = fn_params
                     .iter()
@@ -2218,9 +2232,9 @@ impl<'a> Cx<'a> {
                 if prior != witness {
                     let msg = format!(
                         "cannot infer `{}`: `{}` conflicts with `{}`",
-                        name,
-                        self.arena.display(prior),
-                        self.arena.display(witness),
+                        &self.index.symbols[*name],
+                        self.arena.display(prior, &self.index.symbols),
+                        self.arena.display(witness, &self.index.symbols),
                     );
                     self.diag(Severity::Error, msg, call_range.clone());
                 }
@@ -2262,7 +2276,7 @@ impl<'a> Cx<'a> {
         // P12.1: register the fn's generic params into scope so
         // `lower_type_ref` mints `GenericParam` for each `T` mention
         // instead of falling back to `any`.
-        let owner = GenericOwner::Function(self.hir.idents[d.name].text.as_str().into());
+        let owner = GenericOwner::Function(self.hir.idents[d.name].symbol);
         self.push_generic_scope(&d.generics, owner);
         // Bind parameter types into def_types so identifier inference
         // produces real types instead of `any`.
@@ -2286,7 +2300,8 @@ impl<'a> Cx<'a> {
     fn visit_type_decl(&mut self, d: &TypeDecl) {
         // P12.1: type-level generics are visible in attrs + method
         // signatures.
-        let type_name: SmolStr = self.hir.idents[d.name].text.as_str().into();
+        let type_name_sym = self.hir.idents[d.name].symbol;
+        let type_name: SmolStr = SmolStr::from(&self.index.symbols[type_name_sym]);
         // Inheritance-depth check: the runtime caps `extends` chains
         // at MAX_INHERITANCE_DEPTH types (including the leaf). A
         // declaration past that limit fails to build with
@@ -2309,7 +2324,7 @@ impl<'a> Cx<'a> {
                 span,
             );
         }
-        let owner = GenericOwner::Type(type_name.clone());
+        let owner = GenericOwner::Type(type_name_sym);
         self.push_generic_scope(&d.generics, owner.clone());
         // **P19.11** — build the `this` TypeId. For non-generic
         // types it's `Named { name }`; for generic types it's
@@ -2323,17 +2338,17 @@ impl<'a> Cx<'a> {
             // it, otherwise an `Unresolved` sink). Avoids re-minting
             // and keeps `this` and outside references pointing at
             // the same `TypeId`.
-            self.out.registry.lookup(&type_name).unwrap_or_else(|| {
+            self.out.registry.lookup(type_name_sym).unwrap_or_else(|| {
                 let span = self.hir.idents[d.name].byte_range.clone();
-                self.arena.unresolved(type_name, (span.start, span.end))
+                self.arena.unresolved(type_name_sym, (span.start, span.end))
             })
         } else {
             let args: Vec<TypeId> = d
                 .generics
                 .iter()
                 .map(|g| {
-                    let g_name = self.hir.idents[*g].text.clone();
-                    self.arena.generic_param(g_name, owner.clone())
+                    let g_sym = self.hir.idents[*g].symbol;
+                    self.arena.generic_param(g_sym, owner.clone())
                 })
                 .collect();
             // P35.7 — mint the generic `this` against the decl handle
@@ -2344,10 +2359,10 @@ impl<'a> Cx<'a> {
             // fall back to `Unresolved` so downstream type-relations
             // stay quiet rather than cascade.
             match crate::project::resolve_decl_handle(self.index, self.decl_registry, &type_name) {
-                Some(handle) => self.arena.generic(handle, type_name, args),
+                Some(handle) => self.arena.generic(handle, args),
                 None => {
                     let span = self.hir.idents[d.name].byte_range.clone();
-                    self.arena.unresolved(type_name, (span.start, span.end))
+                    self.arena.unresolved(type_name_sym, (span.start, span.end))
                 }
             }
         };
@@ -2368,7 +2383,11 @@ impl<'a> Cx<'a> {
     fn push_generic_scope(&mut self, generics: &[Idx<Ident>], owner: GenericOwner) {
         let mut frame = FxHashMap::default();
         for g in generics {
-            let name = self.hir.idents[*g].text.clone();
+            // FIXME(symbol-migration): `generics_in_scope` still keys
+            // on `SmolStr` for now — the lookup at the use site
+            // (`lookup_generic(name: &str)`) hasn't moved to `Symbol`
+            // yet. Rebuild the string from the interned symbol.
+            let name: SmolStr = SmolStr::from(&self.index.symbols[self.hir.idents[*g].symbol]);
             frame.insert(name, owner.clone());
         }
         self.generics_in_scope.push(frame);
@@ -2877,7 +2896,6 @@ impl<'a> Cx<'a> {
                 let underlying_kind = self.arena.get(underlying_ty).kind.clone();
                 let generic_name_and_args: Option<(SmolStr, Vec<TypeId>)> = match &underlying_kind {
                     TypeKind::Generic { decl, args } => self
-                        .arena
                         .decl_name(*decl)
                         .map(|n| (SmolStr::from(n), args.to_vec())),
                     _ => None,
@@ -2887,7 +2905,7 @@ impl<'a> Cx<'a> {
                 // `Generic`. Recover the name so the no-args
                 // fallback arms still fire for the collection set.
                 let non_generic_name: Option<SmolStr> = match &underlying_kind {
-                    TypeKind::Type(d) => self.arena.decl_name(*d).map(SmolStr::from),
+                    TypeKind::Type(d) => self.decl_name(*d).map(SmolStr::from),
                     _ => None,
                 };
                 let inferred: Vec<TypeId> = match (generic_name_and_args, non_generic_name) {
@@ -3145,7 +3163,10 @@ impl<'a> Cx<'a> {
         if chain.arms.len() < 2 {
             return;
         }
-        let Some(enum_id) = self.out.registry.lookup(&chain.enum_name) else {
+        let Some(enum_sym) = self.index.symbols.lookup(&chain.enum_name) else {
+            return;
+        };
+        let Some(enum_id) = self.out.registry.lookup(enum_sym) else {
             return;
         };
         let enum_ty = self.arena.get(enum_id);
@@ -3156,7 +3177,7 @@ impl<'a> Cx<'a> {
         let covered: FxHashSet<&str> = chain.arms.iter().map(|a| a.variant.as_str()).collect();
         let missing: Vec<&str> = variants
             .iter()
-            .map(SmolStr::as_str)
+            .map(|sym| &self.index.symbols[*sym])
             .filter(|v| !covered.contains(v))
             .collect();
         if missing.is_empty() {
@@ -3271,10 +3292,9 @@ impl<'a> Cx<'a> {
         let Expr::Static(StaticExpr { ty, property, .. }) = &self.hir.exprs[static_side] else {
             return None;
         };
-        let enum_name = self.hir.idents[self.hir.type_refs[*ty].name]
-            .text
-            .to_string();
-        let variant = self.hir.idents[property.ident()].text.to_string();
+        let enum_name =
+            self.index.symbols[self.hir.idents[self.hir.type_refs[*ty].name].symbol].to_string();
+        let variant = self.index.symbols[self.hir.idents[property.ident()].symbol].to_string();
         Some((binding, enum_name, variant))
     }
 
@@ -3425,7 +3445,10 @@ impl<'a> Cx<'a> {
                 let span = self.hir.exprs[expr_id].byte_range();
                 match self.well_known.tuple_decl {
                     Some(decl) => self.arena.tuple(decl, x, y),
-                    None => self.arena.unresolved("Tuple", (span.start, span.end)),
+                    None => {
+                        let name = self.index.symbols.intern("Tuple");
+                        self.arena.unresolved(name, (span.start, span.end))
+                    }
                 }
             }
             Expr::Array(items, _) => {
@@ -3435,8 +3458,11 @@ impl<'a> Cx<'a> {
                 let any = self.any_nullable();
                 let span = self.hir.exprs[expr_id].byte_range();
                 match self.well_known.array_decl {
-                    Some(decl) => self.arena.generic(decl, "Array", vec![any]),
-                    None => self.arena.unresolved("Array", (span.start, span.end)),
+                    Some(decl) => self.arena.generic(decl, vec![any]),
+                    None => {
+                        let name = self.index.symbols.intern("Array");
+                        self.arena.unresolved(name, (span.start, span.end))
+                    }
                 }
             }
             Expr::Object(ObjectExpr { ty, fields, .. }) => {
@@ -3564,8 +3590,8 @@ impl<'a> Cx<'a> {
                 // and `a` is one of its variants — the value's type is
                 // the enum itself, not `any`.
                 if let TypeKind::Enum { variants, .. } = &self.arena.get(recv_ty).kind {
-                    let prop = self.hir.idents[property].text.as_str();
-                    if variants.iter().any(|v| v == prop) {
+                    let prop_sym = self.hir.idents[property].symbol;
+                    if variants.iter().any(|v| *v == prop_sym) {
                         return recv_ty;
                     }
                 }
@@ -3645,7 +3671,6 @@ impl<'a> Cx<'a> {
                     let info: Option<(SmolStr, Vec<TypeId>)> =
                         match &self.arena.get(underlying).kind {
                             TypeKind::Generic { decl, args } => self
-                                .arena
                                 .decl_name(*decl)
                                 .map(|n| (SmolStr::from(n), args.to_vec())),
                             _ => None,
@@ -3885,13 +3910,16 @@ impl<'a> Cx<'a> {
                     let from_kind = &self.arena.get(from_ty).kind;
                     let to_kind = &self.arena.get(to_ty).kind;
                     // P36.3 — handle-keyed shapes resolve their name
-                    // via the arena's decl-names table.
-                    let arena = &*self.arena;
+                    // via the project's decl registry + symbol table.
+                    let decl_registry = self.decl_registry;
+                    let symbols = &self.index.symbols;
                     let extract_name = |k: &TypeKind| -> Option<SmolStr> {
                         match k {
-                            TypeKind::Type(d) => arena.decl_name(*d).map(SmolStr::from),
+                            TypeKind::Type(d) => {
+                                decl_registry.name(*d).map(|s| SmolStr::from(&symbols[s]))
+                            }
                             TypeKind::Generic { decl, .. } => {
-                                arena.decl_name(*decl).map(SmolStr::from)
+                                decl_registry.name(*decl).map(|s| SmolStr::from(&symbols[s]))
                             }
                             _ => None,
                         }
@@ -3915,8 +3943,8 @@ impl<'a> Cx<'a> {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",
-                        self.arena.display(from_ty),
-                        self.arena.display(to_ty),
+                        self.arena.display(from_ty, &self.index.symbols),
+                        self.arena.display(to_ty, &self.index.symbols),
                     );
                     self.diag(Severity::Error, msg, r);
                 }
@@ -4054,7 +4082,8 @@ mod tests {
 
     fn analyze_src(src: &str) -> (TypeArena, AnalysisResult) {
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::new();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir);
         analyze(&hir, &res)
     }
@@ -4224,7 +4253,8 @@ type Point {
 fn first(p: Point): int { return p.x; }
 "#;
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::new();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir);
         let (_arena, analysis) = analyze(&hir, &res);
 
@@ -4233,7 +4263,7 @@ fn first(p: Point): int { return p.x; }
         let x_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "x")
+            .filter(|(_, i)| &symbols[i.symbol] == "x")
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(x_uses.len(), 2, "expected attr decl + member use");
@@ -4259,14 +4289,15 @@ type Box {
 fn read(b: Box): int { return b->inner; }
 "#;
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::new();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir);
         let (_arena, analysis) = analyze(&hir, &res);
 
         let inner_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| i.text == "inner")
+            .filter(|(_, i)| &symbols[i.symbol] == "inner")
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(inner_uses.len(), 2);
@@ -4680,14 +4711,15 @@ type Point { x: int; }
 fn f(p: Point): int { return p.bogus; }
 "#;
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::new();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir);
         let (_arena, analysis) = analyze(&hir, &res);
 
         let bogus = hir
             .idents
             .iter()
-            .find(|(_, i)| i.text == "bogus")
+            .find(|(_, i)| &symbols[i.symbol] == "bogus")
             .map(|(idx, _)| idx)
             .expect("bogus ident exists");
         assert!(analysis.member_lookup(bogus).is_none());
@@ -4700,17 +4732,18 @@ fn f(p: Point): int { return p.bogus; }
     /// Resolve the inferred type for the `init` of `var <name> = …`.
     fn local_init_ty(src: &str, name: &str) -> Option<String> {
         let tree = parse(src);
-        let hir = lower_module(src, "mod", "project", tree.root_node());
+        let symbols = SymbolTable::new();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir);
         let (arena, analysis) = analyze(&hir, &res);
         for (stmt_id, stmt) in hir.stmts.iter() {
             if let Stmt::Var(v) = stmt
-                && hir.idents[v.name].text == name
+                && &symbols[hir.idents[v.name].symbol] == name
                 && let Some(init) = v.init
             {
                 let _ = stmt_id;
                 let ty = analysis.expr_types.get(&init).copied()?;
-                return Some(arena.display(ty).to_string());
+                return Some(arena.display(ty, &symbols).to_string());
             }
         }
         None
@@ -4735,7 +4768,7 @@ fn f(p: Point): int { return p.bogus; }
         let module = pa.module(&src_uri)?;
         for (_id, stmt) in module.hir.stmts.iter() {
             if let Stmt::Var(v) = stmt
-                && module.hir.idents[v.name].text == name
+                && pa.symbol(&module.hir.idents[v.name].symbol) == name
                 && let Some(init) = v.init
             {
                 let ty = module.analysis.expr_types.get(&init).copied()?;
