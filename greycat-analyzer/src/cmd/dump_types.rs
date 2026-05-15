@@ -30,6 +30,7 @@ use std::{
     sync::Arc,
 };
 
+use greycat_analyzer_analysis::display_fqn;
 use greycat_analyzer_analysis::{
     project::{ModuleAnalysis, ProjectAnalysis},
     resolver::{Definition, Resolutions},
@@ -39,7 +40,7 @@ use greycat_analyzer_analysis::{
 use greycat_analyzer_core::{
     Document, SourceManager, SymbolTable, lsp_types::Uri, resolver::FsContext,
 };
-use greycat_analyzer_core::{Primitive, TypeArena, TypeId, display_fqn};
+use greycat_analyzer_core::{Primitive, TypeArena, TypeId};
 use greycat_analyzer_hir::{
     Hir,
     arena::Idx,
@@ -376,7 +377,7 @@ fn collect_type_records(
             text,
             &byte_range,
             kind,
-            display_fqn(&arena, symbols, ty, &home),
+            display_fqn(&arena, decl_registry, symbols, ty, &home),
             arena.get(ty).nullable,
         );
         // 1b. P17.5 — for template strings, also emit per-part
@@ -386,7 +387,7 @@ fn collect_type_records(
         if let Expr::String(s) = expr
             && s.has_interpolation()
         {
-            let str_ty_display = display_fqn(&arena, symbols, ty, &home);
+            let str_ty_display = display_fqn(&arena, decl_registry, symbols, ty, &home);
             let str_ty_nullable = arena.get(ty).nullable;
             for part in &s.parts {
                 match part {
@@ -427,7 +428,7 @@ fn collect_type_records(
             text,
             &tref.byte_range,
             "TypeIdent",
-            display_fqn(&arena, symbols, ty, &home),
+            display_fqn(&arena, decl_registry, symbols, ty, &home),
             arena.get(ty).nullable,
         );
     }

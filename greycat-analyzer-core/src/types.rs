@@ -26,7 +26,7 @@
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use crate::{Symbol, SymbolTable};
+use crate::Symbol;
 
 /// A handle into a [`TypeArena`]. Cheap to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -200,19 +200,16 @@ pub enum GenericOwner {
 /// the same [`TypeId`]; comparing for equality is then just an integer
 /// comparison.
 ///
-/// The arena also owns a parallel `decl_names` table indexed by
-/// `TypeDeclId.raw()`. Every `alloc_type` / `generic` records the
-/// decl's source name there, so `arena.display(id)` can
-/// recover a printable name without a callback or a borrow on the
-/// project's `DeclRegistry`. The duplication is a deliberate
-/// denormalisation: `DeclRegistry` stays the canonical `(uri, decl) →
-/// handle` interner; `decl_names` is a read-path view scoped to one
-/// arena.
+/// The arena intentionally does **not** store decl names. Rendering a
+/// `TypeKind::Type` / `TypeKind::Generic` to a printable string needs
+/// a `DeclRegistry` to recover the source name from a `TypeDeclId` —
+/// see `greycat_analyzer_analysis::project::display_type` and
+/// `greycat_analyzer_analysis::display_fqn`. Core has no concept of a
+/// decl registry by design.
 #[derive(Debug, Default, Clone)]
 pub struct TypeArena {
     pub items: Vec<Type>,
     pub intern: FxHashMap<Type, TypeId>,
-    // decl_names: Vec<SmolStr>,
 }
 
 impl TypeArena {
@@ -302,16 +299,8 @@ impl TypeArena {
     }
 
     // P35.2
-    /// Allocate a resolved non-generic [`TypeKind::Type`]. Registers
-    /// `name` with the arena so [`Self::display`] can render the type
-    /// without a callback or a `DeclRegistry` borrow. Name registration
-    /// is idempotent on `decl`.
-    pub fn alloc_type(
-        &mut self,
-        decl: TypeDeclId,
-        // name: impl Into<SmolStr>,
-    ) -> TypeId {
-        // self.register_decl_name(decl, name.into());
+    /// Allocate a resolved non-generic [`TypeKind::Type`].
+    pub fn alloc_type(&mut self, decl: TypeDeclId) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Type(decl),
             nullable: false,
@@ -322,16 +311,9 @@ impl TypeArena {
     /// Allocate a [`TypeKind::Generic`] (decl-keyed generic
     /// instantiation). Caller guarantees `args` is non-empty —
     /// zero-arg uses of a generic decl are an upstream lowering
-    /// error, not a value-shaped concept. `name` is registered with
-    /// the arena (same idempotency as [`Self::alloc_type`]).
-    pub fn generic(
-        &mut self,
-        decl: TypeDeclId,
-        // name: impl Into<SmolStr>,
-        args: Vec<TypeId>,
-    ) -> TypeId {
+    /// error, not a value-shaped concept.
+    pub fn generic(&mut self, decl: TypeDeclId, args: Vec<TypeId>) -> TypeId {
         debug_assert!(!args.is_empty(), "Generic must have non-empty args");
-        // self.register_decl_name(decl, name.into());
         self.alloc(Type {
             kind: TypeKind::Generic {
                 decl,
@@ -339,45 +321,6 @@ impl TypeArena {
             },
             nullable: false,
         })
-    }
-
-    // Idempotently record `name` as the printable source name for
-    // `decl`. First call wins; subsequent calls with a matching name
-    // no-op, conflicting names trip a debug-assert (the decl identity
-    // is supposed to be 1:1 with its name).
-    // fn register_decl_name(&mut self, decl: TypeDeclId, name: SmolStr) {
-    //     let i = decl.raw() as usize;
-    //     if i >= self.decl_names.len() {
-    //         self.decl_names.resize(i + 1, SmolStr::default());
-    //     }
-    //     if self.decl_names[i].is_empty() {
-    //         self.decl_names[i] = name;
-    //     } else {
-    //         debug_assert_eq!(
-    //             self.decl_names[i],
-    //             name,
-    //             "TypeDeclId {} re-registered with a different name",
-    //             decl.raw()
-    //         );
-    //     }
-    // }
-
-    // Decl-name resolution lives one layer up — see
-    // `ProjectAnalysis::decl_name` in the analysis crate, which goes
-    // through `DeclRegistry::name(id) -> Symbol` then resolves the
-    // symbol against the project's [`SymbolTable`]. `TypeArena`
-    // intentionally does not store names; it only knows
-    // [`TypeDeclId`] handles.
-
-    /// Return a [`Display`]-implementing wrapper that renders the type
-    /// at `id`. Reads decl names from this arena's `decl_names` table —
-    /// no callback, no registry borrow.
-    pub fn display<'s>(&self, id: TypeId, symbols: &'s SymbolTable) -> TypeDisplay<'_, 's> {
-        TypeDisplay {
-            arena: self,
-            symbols,
-            id,
-        }
     }
 
     // P35.3
@@ -924,216 +867,17 @@ fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
     from == to
 }
 
-// =============================================================================
-// Display
-// =============================================================================
-
-/// `Display`-implementing wrapper returned by [`TypeArena::display`].
-///
-/// Renders a [`TypeId`] using the arena's `decl_names` table to recover
-/// printable names for [`TypeKind::Type`] / [`TypeKind::Generic`].
-/// When a decl handle hasn't been registered yet (an internal invariant
-/// violation, since every alloc registers a name), falls back to the
-/// `?type#<raw>` placeholder so the output stays distinguishable.
-///
-/// Writes straight into the formatter — no intermediate `String`.
-pub struct TypeDisplay<'a, 's> {
-    arena: &'a TypeArena,
-    symbols: &'s SymbolTable,
-    id: TypeId,
-}
-
-impl std::fmt::Display for TypeDisplay<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_type(f, self.arena, self.symbols, self.id)
-    }
-}
-
-fn write_type(
-    f: &mut std::fmt::Formatter<'_>,
-    arena: &TypeArena,
-    symbols: &SymbolTable,
-    id: TypeId,
-) -> std::fmt::Result {
-    let ty = arena.get(id);
-    match &ty.kind {
-        TypeKind::Null => f.write_str("null")?,
-        TypeKind::Any => f.write_str("any")?,
-        TypeKind::Never => f.write_str("never")?,
-        TypeKind::Primitive(p) => f.write_str(p.name())?,
-        // Decl-name rendering belongs to the project layer
-        // (see `ProjectTypeDisplay` in
-        // `greycat-analyzer-analysis::project`). Core's bare display
-        // doesn't have access to a `DeclRegistry → Symbol` map, so it
-        // renders named types as the `?type#<raw>` placeholder.
-        TypeKind::Type(d) => write!(f, "?type#{}", d.raw())?,
-        TypeKind::Generic { decl, args } => {
-            write!(f, "?type#{}", decl.raw())?;
-            write_args(f, arena, symbols, args)?;
-        }
-        TypeKind::Unresolved { name, .. } => f.write_str(&symbols[*name])?,
-        TypeKind::GenericParam { name, .. } => f.write_str(&symbols[*name])?,
-        TypeKind::Lambda { params, ret } => {
-            f.write_str("(")?;
-            for (i, p) in params.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type(f, arena, symbols, *p)?;
-            }
-            f.write_str(") -> ")?;
-            write_type(f, arena, symbols, *ret)?;
-        }
-        TypeKind::Enum { name, .. } => f.write_str(&symbols[*name])?,
-        TypeKind::Union { alts } => {
-            // Unions render as `A | B | …`. When the union is also
-            // nullable and no `Null` alt is already present, append
-            // an explicit `| null` — the `?` suffix would visually
-            // bind to the last alt only and read wrong. Mirrors the
-            // TS reference: simple types get `T?`, narrowing-introduced
-            // unions get `T | U | null`.
-            for (i, a) in alts.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(" | ")?;
-                }
-                write_type(f, arena, symbols, *a)?;
-            }
-            if ty.nullable
-                && !alts
-                    .iter()
-                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
-            {
-                f.write_str(" | null")?;
-            }
-        }
-    }
-    // `?` suffix for nullable types — except `Null` (redundant) and
-    // `Union` (handled inline above with an explicit `| null` alt
-    // so the suffix doesn't visually bind to the last alt only).
-    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
-        f.write_str("?")?;
-    }
-    Ok(())
-}
-
-fn write_args(
-    f: &mut std::fmt::Formatter<'_>,
-    arena: &TypeArena,
-    symbols: &SymbolTable,
-    args: &[TypeId],
-) -> std::fmt::Result {
-    f.write_str("<")?;
-    for (i, a) in args.iter().enumerate() {
-        if i > 0 {
-            f.write_str(", ")?;
-        }
-        write_type(f, arena, symbols, *a)?;
-    }
-    f.write_str(">")
-}
-
-// P18.1
-/// Fully-qualified-name display, matching the GreyCat canonical
-/// printer (e.g. `core::int`, `core::Array<core::int?>`,
-/// `project::Foo`).
-///
-/// `home_lib` resolves a Type/Generic/Enum's home module (e.g. `Foo →
-/// "project"`, `node → "core"`). Returning `None` falls back to the
-/// `core` library — matches the TS reference's behavior for builtins
-/// not in the project decl table.
-///
-/// Differences from [`display`]:
-/// - Primitives, builtin runtime types, and unresolved names get a
-///   `core::` prefix.
-/// - User types resolve to `<lib>::<Name>` via `home_lib`.
-///
-/// Nullability is rendered with the `?` suffix (same as `display`)
-/// for every kind except `Null`. Strict `any` renders as `core::any`,
-/// nullable `any?` renders as `core::any?`.
-pub fn display_fqn(
-    arena: &TypeArena,
-    symbols: &SymbolTable,
-    id: TypeId,
-    home_lib: &dyn Fn(&str) -> Option<String>,
-) -> String {
-    let ty = arena.get(id);
-    let mut s = match &ty.kind {
-        // TS reference's `dump-types` emits the bare null literal as
-        // `null`, not `core::null` — match that.
-        TypeKind::Null => "null".to_string(),
-        TypeKind::Any => "core::any".to_string(),
-        TypeKind::Never => "core::never".to_string(),
-        TypeKind::Primitive(p) => format!("core::{}", p.name()),
-        // Decl-name rendering belongs to the project layer.
-        // `display_fqn` doesn't have access to a `TypeDeclId →
-        // Symbol` map (that lives on `DeclRegistry` in the analysis
-        // crate), so it renders named types as the `?type#<raw>`
-        // placeholder. Callers that need FQN rendering should use a
-        // project-aware Display.
-        TypeKind::Type(d) => format!("?type#{}", d.raw()),
-        TypeKind::Generic { decl, args } => {
-            let parts: Box<[String]> = args
-                .iter()
-                .map(|a| display_fqn(arena, symbols, *a, home_lib))
-                .collect();
-            format!("?type#{}<{}>", decl.raw(), parts.join(", "))
-        }
-        // P35.3 — unresolved name, render verbatim with the same
-        // `<lib>::` prefix the rest of the resolver would have used.
-        TypeKind::Unresolved { name, .. } => {
-            let name = &symbols[*name];
-            format!(
-                "{}::{name}",
-                home_lib(name).unwrap_or_else(|| "core".to_string()),
-            )
-        }
-        TypeKind::GenericParam { name, .. } => symbols[*name].to_string(),
-        TypeKind::Lambda { params, ret } => {
-            let parts: Box<[String]> = params
-                .iter()
-                .map(|p| display_fqn(arena, symbols, *p, home_lib))
-                .collect();
-            format!(
-                "({}) -> {}",
-                parts.join(", "),
-                display_fqn(arena, symbols, *ret, home_lib)
-            )
-        }
-        TypeKind::Enum { name, .. } => {
-            let name = &symbols[*name];
-            format!(
-                "{}::{name}",
-                home_lib(name).unwrap_or_else(|| "core".to_string()),
-            )
-        }
-        TypeKind::Union { alts } => {
-            // Same union rule as [`display`]: render with `|`-joined
-            // alts and expand nullability into an explicit `null` alt
-            // rather than appending a `?` suffix (which would read as
-            // "only the last alt is nullable").
-            let mut parts: Vec<String> = alts
-                .iter()
-                .map(|a| display_fqn(arena, symbols, *a, home_lib))
-                .collect();
-            if ty.nullable
-                && !alts
-                    .iter()
-                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
-            {
-                parts.push("null".to_string());
-            }
-            parts.join(" | ")
-        }
-    };
-    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
-        s.push('?');
-    }
-    s
-}
+// Type display (decl-name aware) lives in the analysis crate —
+// see `greycat_analyzer_analysis::project::display_type` for the
+// `TypeWithDecls` wrapper, `greycat_analyzer_analysis::display_fqn`
+// for fully-qualified rendering. Core does not own a `DeclRegistry`
+// and therefore cannot render `TypeKind::Type` / `TypeKind::Generic`
+// by source name.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SymbolTable;
 
     #[derive(Default)]
     struct TextCx {
@@ -1334,25 +1078,6 @@ mod tests {
         assert_eq!(s.resolve(&b), "beta");
         assert_eq!(s.lookup("alpha"), Some(a1));
         assert!(s.lookup("gamma").is_none());
-    }
-
-    #[test]
-    fn display_renders_nullable_suffix() {
-        let mut cx = TextCx::default();
-        let int = cx.arena.primitive(Primitive::Int);
-        let int_q = cx.arena.nullable(int);
-        let str_t = cx.arena.primitive(Primitive::String);
-        let array_decl = TypeDeclId::from_raw(0);
-        let arr = cx.arena.generic(array_decl, vec![str_t]);
-        assert_eq!(cx.arena.display(int_q, &cx.symbols).to_string(), "int?");
-        // Core's bare `display` no longer knows decl names — the arena
-        // doesn't store them. `Array<String>`-style rendering lives in
-        // the analysis crate's `display_type` helper, which threads a
-        // `DeclRegistry` through.
-        assert_eq!(
-            cx.arena.display(arr, &cx.symbols).to_string(),
-            "?type#0<String>"
-        );
     }
 
     #[test]

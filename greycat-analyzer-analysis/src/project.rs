@@ -236,10 +236,10 @@ impl ProjectAnalysis {
     }
 
     /// Project-wide decl-handle registry — the canonical
-    /// `(Uri, Idx<Decl>) → TypeDeclId` interner. Decl *names* for
-    /// rendering are owned by `TypeArena` (registered at alloc time
-    /// alongside the handle), so capability handlers go through
-    /// `arena.display(id)` rather than this registry.
+    /// `(Uri, Idx<Decl>) → TypeDeclId` interner. Decl *names* live
+    /// here too: capability handlers thread the registry into
+    /// [`display_type`] / [`display_fqn`] so decl-keyed types render
+    /// as their source name.
     pub fn decl_registry(&self) -> &crate::well_known::DeclRegistry {
         &self.decl_registry
     }
@@ -255,7 +255,7 @@ impl ProjectAnalysis {
     /// Project-aware type display. Renders the type with a
     /// `<module>::` qualifier prefix whenever the bare decl name is
     /// ambiguous within the project (≥2 modules export it). When the
-    /// name is unique, behaves identically to `arena.display(id)`.
+    /// name is unique, output matches [`display_type`] byte-for-byte.
     ///
     /// Used by inlay hints so the user reading `var f = b::Foo {};`
     /// sees `: b::Foo` rather than the ambiguous bare `: Foo`.
@@ -591,11 +591,10 @@ impl ProjectAnalysis {
 }
 
 /// `Display`-implementing wrapper returned by
-/// [`ProjectAnalysis::display_type`]. Walks the type structure the
-/// same way `TypeArena::display` does, but prefixes `<module>::`
-/// whenever the bare decl name is ambiguous within the project (≥2
-/// modules export it). When the name is unique the output matches
-/// the bare renderer byte-for-byte.
+/// [`ProjectAnalysis::display_type`]. Prefixes `<module>::` whenever
+/// the bare decl name is ambiguous within the project (≥2 modules
+/// export it). When the name is unique, output matches the
+/// registry-aware [`display_type`] byte-for-byte.
 pub struct ProjectTypeDisplay<'a> {
     project: &'a ProjectAnalysis,
     id: TypeId,
@@ -675,12 +674,10 @@ fn write_args_qualified(
     f.write_str(">")
 }
 
-/// Registry-aware [`Display`] wrapper for a [`TypeId`]. Renders the
-/// type the same way [`TypeArena::display`] does, but consults
+/// Registry-aware [`Display`] wrapper for a [`TypeId`]. Consults
 /// `decl_registry` to recover decl names for `Type(d)` / `Generic{decl,
 /// args}` so error messages and lint diagnostics surface the real
-/// `Foo` / `Map<int, String>` instead of the bare-arena placeholder
-/// `?type#<raw>`. No module-qualification logic — use
+/// `Foo` / `Map<int, String>`. No module-qualification logic — use
 /// [`ProjectAnalysis::display_type`] when ambiguity disambiguation is
 /// needed.
 pub fn display_type<'a>(
@@ -722,7 +719,7 @@ fn write_type_with_decls(
     let decl_name = |d: TypeDeclId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
         match decl_registry.name(d) {
             Some(sym) => f.write_str(&symbols[sym]),
-            None => write!(f, "?type#{}", d.raw()),
+            None => write!(f, "<unregistered decl {}>", d.raw()),
         }
     };
     match &ty.kind {
@@ -784,7 +781,7 @@ fn write_decl_qualified(
     decl: TypeDeclId,
 ) -> std::fmt::Result {
     let Some(name) = project.decl_name(decl) else {
-        return write!(f, "?type#{}", decl.raw());
+        return write!(f, "<unregistered decl {}>", decl.raw());
     };
     if project.index.locate_decl(name).len() > 1
         && let Some((uri, _)) = project.decl_registry.resolve(decl)
@@ -3882,10 +3879,7 @@ mod tests {
             .index
             .fn_signature_for("a")
             .expect("a sig present after invalidate");
-        let display = pa
-            .arena
-            .display(sig.return_ty, &pa.index.symbols)
-            .to_string();
+        let display = pa.display_type(sig.return_ty).to_string();
         assert!(
             display.contains("String"),
             "expected refreshed return type to be String, got {display:?}"

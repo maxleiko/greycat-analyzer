@@ -894,7 +894,7 @@ pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
     let symbols = SymbolTable::new();
     let hir = lower_module(source, &symbols, "module", "project", tree.root_node());
     let resolutions = resolve(&hir, &symbols);
-    let (_arena, analysis) = analyze(&hir, &resolutions, &symbols);
+    let (_arena, _decl_registry, analysis) = analyze(&hir, &resolutions, &symbols);
     for d in &analysis.diagnostics {
         let sev = match d.severity {
             Severity::Error => "error",

@@ -41,6 +41,7 @@
 pub mod actions;
 pub mod analyzer;
 pub mod directives;
+pub mod display;
 pub mod lint;
 // P27.1
 pub mod parallel;
@@ -52,3 +53,5 @@ pub mod resolver;
 pub mod stdlib;
 // P35.1
 pub mod well_known;
+
+pub use display::display_fqn;

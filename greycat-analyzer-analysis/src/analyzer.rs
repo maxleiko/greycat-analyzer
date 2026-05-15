@@ -288,10 +288,15 @@ impl AnalysisResult {
 /// capabilities and unit tests.
 ///
 // P19
-/// Allocates a fresh [`TypeArena`] internally and discards it
-/// — callers that need to inspect `TypeId`s after the call must use
-/// [`analyze_with_index_into`] instead so the arena outlives the call.
-pub fn analyze(hir: &Hir, res: &Resolutions, symbols: &SymbolTable) -> (TypeArena, AnalysisResult) {
+/// Allocates a fresh [`TypeArena`] and [`DeclRegistry`] internally
+/// and returns them alongside the analysis — callers that need to
+/// render decl-keyed types (anything routing through
+/// `display_type` / `display_fqn`) consume the returned registry.
+pub fn analyze(
+    hir: &Hir,
+    res: &Resolutions,
+    symbols: &SymbolTable,
+) -> (TypeArena, crate::well_known::DeclRegistry, AnalysisResult) {
     use std::str::FromStr;
     let mut arena = TypeArena::new();
     let index = ProjectIndex::with_symbols(symbols.clone(), &mut arena);
@@ -326,17 +331,18 @@ pub fn analyze(hir: &Hir, res: &Resolutions, symbols: &SymbolTable) -> (TypeAren
         &module_uri,
         &mut arena,
     );
-    (arena, out)
+    (arena, decl_registry, out)
 }
 
-/// Convenience wrapper that allocates a private arena. Same caveat as
-/// [`analyze`]: the arena is returned to the caller alongside the
-/// result so any [`TypeId`] in the result can still be looked up.
+/// Convenience wrapper that allocates a private arena and decl
+/// registry. Same caveat as [`analyze`]: both are returned to the
+/// caller alongside the result so any [`TypeId`] / [`TypeDeclId`] in
+/// the result can still be looked up.
 pub fn analyze_with_index(
     hir: &Hir,
     res: &Resolutions,
     index: &ProjectIndex,
-) -> (TypeArena, AnalysisResult) {
+) -> (TypeArena, crate::well_known::DeclRegistry, AnalysisResult) {
     use std::str::FromStr;
     // P35.4 — per-file callers default-construct an empty
     // `WellKnown`; see [`analyze`] for the rationale.
@@ -365,7 +371,7 @@ pub fn analyze_with_index(
         &module_uri,
         &mut arena,
     );
-    (arena, out)
+    (arena, decl_registry, out)
 }
 
 /// Run the analyzer with a shared project index *and* a caller-owned
@@ -1145,8 +1151,7 @@ impl<'a> Cx<'a> {
     }
 
     /// Resolve a `TypeDeclId` to its source name through
-    /// `decl_registry → SymbolTable`. Replaces the old
-    /// `arena.decl_name(id)` API.
+    /// `decl_registry → SymbolTable`.
     fn decl_name(&self, id: greycat_analyzer_core::TypeDeclId) -> Option<&str> {
         self.decl_registry
             .name(id)
@@ -1154,9 +1159,8 @@ impl<'a> Cx<'a> {
     }
 
     /// Registry-aware type-display wrapper. Renders `Foo` / `Map<int,
-    /// String>` instead of the bare arena's `?type#<raw>`
-    /// placeholder. Use this whenever a diagnostic / lint message
-    /// surfaces a type to the user.
+    /// String>` for decl-keyed types. Use this whenever a diagnostic
+    /// or lint message surfaces a type to the user.
     fn display(&self, id: TypeId) -> crate::project::TypeWithDecls<'_> {
         crate::project::display_type(self.arena, self.decl_registry, &self.index.symbols, id)
     }
@@ -4084,7 +4088,8 @@ mod tests {
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir, &symbols);
-        analyze(&hir, &res, &symbols)
+        let (arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
+        (arena, analysis)
     }
 
     /// Drop-in helper for tests that don't need to inspect the arena.
@@ -4255,7 +4260,7 @@ fn first(p: Point): int { return p.x; }
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir, &symbols);
-        let (_arena, analysis) = analyze(&hir, &res, &symbols);
+        let (_arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
 
         // Find the property ident `x` inside `p.x` — the second `x`
         // ident in the source (the first is the attr decl name).
@@ -4291,7 +4296,7 @@ fn read(b: Box): int { return b->inner; }
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir, &symbols);
-        let (_arena, analysis) = analyze(&hir, &res, &symbols);
+        let (_arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
 
         let inner_uses: Vec<_> = hir
             .idents
@@ -4713,7 +4718,7 @@ fn f(p: Point): int { return p.bogus; }
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let res = resolve(&hir, &symbols);
-        let (_arena, analysis) = analyze(&hir, &res, &symbols);
+        let (_arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
 
         let bogus = hir
             .idents
@@ -4730,7 +4735,7 @@ fn f(p: Point): int { return p.bogus; }
 
     /// Resolve the inferred type for the `init` of `var <name> = …`.
     /// Routes through the project pipeline so user-decl names render
-    /// (the bare arena display renders `?type#<raw>` for `Type(decl)`).
+    /// through the registry-aware `display_type`.
     fn local_init_ty(src: &str, name: &str) -> Option<String> {
         use greycat_analyzer_core::SourceManager;
         use std::str::FromStr;

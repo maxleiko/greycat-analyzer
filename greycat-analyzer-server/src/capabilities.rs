@@ -140,6 +140,7 @@ pub fn hover_with_project(
                 &module.resolutions,
                 &module.analysis,
                 project.arena(),
+                project.decl_registry(),
                 ident_idx,
                 ident,
                 Some(HoverProjectCtx { project, manager }),
@@ -189,7 +190,7 @@ pub fn hover_with_project(
                 let label = format!(
                     "{}: {}",
                     short_expr_label(&module.hir, project.symbols(), expr),
-                    project.arena().display(*ty, project.symbols()),
+                    project.display_type(*ty),
                 );
                 return Some(hover_from_markdown(wrap_code(&label), r, text));
             }
@@ -216,7 +217,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir, &symbols);
-    let (arena, analysis) =
+    let (arena, decl_registry, analysis) =
         greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
 
     // --- Layer 1: ident-based hover (params / locals / decls / builtins).
@@ -232,6 +233,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
             &resolutions,
             &analysis,
             &arena,
+            &decl_registry,
             ident_idx,
             ident,
             None,
@@ -280,7 +282,12 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
             let label = format!(
                 "{}: {}",
                 short_expr_label(&hir, &symbols, expr),
-                arena.display(*ty, &symbols),
+                greycat_analyzer_analysis::project::display_type(
+                    &arena,
+                    &decl_registry,
+                    &symbols,
+                    *ty,
+                ),
             );
             return Some(hover_from_markdown(wrap_code(&label), r, text));
         }
@@ -296,6 +303,7 @@ fn ident_hover_markdown(
     resolutions: &Resolutions,
     analysis: &AnalysisResult,
     arena: &TypeArena,
+    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
     ident_idx: Idx<Ident>,
     ident: &Ident,
     project: Option<HoverProjectCtx<'_>>,
@@ -341,10 +349,20 @@ fn ident_hover_markdown(
         ));
     }
     match resolutions.lookup(ident_idx)? {
-        Definition::Param(name) | Definition::Local(name) => analysis
-            .def_types
-            .get(&name)
-            .map(|ty| wrap_code(&format!("{}: {}", ident_name, arena.display(*ty, symbols)))),
+        Definition::Param(name) | Definition::Local(name) => {
+            analysis.def_types.get(&name).map(|ty| {
+                wrap_code(&format!(
+                    "{}: {}",
+                    ident_name,
+                    greycat_analyzer_analysis::project::display_type(
+                        arena,
+                        decl_registry,
+                        symbols,
+                        *ty,
+                    ),
+                ))
+            })
+        }
         Definition::Decl(decl_id) => Some(render_decl_hover_markdown(
             hir,
             symbols,
@@ -785,7 +803,7 @@ pub fn goto_definition(
     // P6.3: the property side of `a.b` / `a->b` isn't in `Resolutions`
     // — bindings live in `AnalysisResult::member_uses`. Run the
     // analyzer to consult it before giving up.
-    let (_arena, analysis) =
+    let (_arena, _decl_registry, analysis) =
         greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
     let member = analysis.member_lookup(target)?;
     let target_range = match member {
@@ -2387,7 +2405,7 @@ pub fn inlay_hints(
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir, &symbols);
-    let (arena, analysis) =
+    let (arena, decl_registry, analysis) =
         greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
     let module = ModuleAnalysis {
         hir,
@@ -2398,7 +2416,10 @@ pub fn inlay_hints(
         timings: Default::default(),
         directives: Directives::default(),
     };
-    let render: &dyn Fn(TypeId) -> String = &|ty| arena.display(ty, &symbols).to_string();
+    let render: &dyn Fn(TypeId) -> String = &|ty| {
+        greycat_analyzer_analysis::project::display_type(&arena, &decl_registry, &symbols, ty)
+            .to_string()
+    };
     inlay_hints_inner(&module, &symbols, render, text, range)
 }
 
@@ -4039,8 +4060,13 @@ fn ident_or_keyword_completion(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let (detail, documentation) =
-                scope_name_meta(module, project.arena(), project.symbols(), &source);
+            let (detail, documentation) = scope_name_meta(
+                module,
+                project.arena(),
+                project.decl_registry(),
+                project.symbols(),
+                &source,
+            );
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(kind),
@@ -4242,6 +4268,7 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
 fn scope_name_meta(
     module: &ModuleAnalysis,
     arena: &TypeArena,
+    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
     symbols: &SymbolTable,
     source: &NameSource,
 ) -> (Option<String>, Option<Documentation>) {
@@ -4254,11 +4281,10 @@ fn scope_name_meta(
             )
         }
         NameSource::Local(name_idx) | NameSource::Param(name_idx) => {
-            let detail = module
-                .analysis
-                .def_types
-                .get(name_idx)
-                .map(|ty| arena.display(*ty, symbols).to_string());
+            let detail = module.analysis.def_types.get(name_idx).map(|ty| {
+                greycat_analyzer_analysis::project::display_type(arena, decl_registry, symbols, *ty)
+                    .to_string()
+            });
             (detail, None)
         }
         NameSource::Generic => (None, None),
@@ -5622,7 +5648,7 @@ pub(crate) fn current_diagnostics(
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
     let resolutions = resolve(&hir, &symbols);
-    let (_arena, analysis) =
+    let (_arena, _decl_registry, analysis) =
         greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
     let mut out: Vec<Diagnostic> = analysis
         .diagnostics

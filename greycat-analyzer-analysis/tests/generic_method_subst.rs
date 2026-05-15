@@ -115,7 +115,7 @@ fn param_node_int_q_set_accepts_int_arg() {
 /// the declared return type and the body's return value as
 /// different shapes (`Named{Tensor}` on one side, `Type(handle)` on
 /// the other after a partial 35.7 migration), surfacing a false
-/// "return value of type `?type#N` is not assignable to declared
+/// "return value of type `Tensor` is not assignable to declared
 /// return type `Tensor`" diagnostic.
 ///
 /// The fix normalizes raw-form generic references at lowering time:
