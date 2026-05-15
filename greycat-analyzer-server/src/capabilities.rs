@@ -3560,6 +3560,53 @@ fn pragma_items() -> Vec<CompletionItem> {
             ),
             ..Default::default()
         },
+        // Fmt-specific pragmas
+        CompletionItem {
+            label: "@fmt_line_width".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("fmt_line_width($1);$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("Maximum line width before a `Group` breaks. Default: `120`".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@fmt_indent".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("fmt_indent($1);$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("Spaces per indent step. Default: `4`".into()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@fmt_eol_last".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("fmt_eol_last($1);$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("Append a trailing newline at end of file. Default: `false`".into()),
+            ..Default::default()
+        },
+        // Lint-specific pragmas
+        CompletionItem {
+            label: "@lint_off".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("lint_off(\"$1\");$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some(
+                "Silence specific lint rule(s) globally. Variadic string arguments.".into(),
+            ),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@lint_on".into(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            insert_text: Some("lint_on(\"$1\");$0".into()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some(
+                "Enable advisory lint rule(s) that ship off by default. Variadic string arguments."
+                    .into(),
+            ),
+            ..Default::default()
+        },
     ]
 }
 

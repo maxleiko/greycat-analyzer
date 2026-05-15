@@ -21,14 +21,14 @@ pub mod trivia;
 
 use greycat_analyzer_syntax::tree_sitter::Node;
 
-/// Layout options. Defaults match the TS reference (`cst_format.ts`).
+/// Layout options.
 #[derive(Debug, Clone, Copy)]
 pub struct FmtOptions {
-    /// Maximum line width before a `Group` breaks. TS default: 120.
+    /// Maximum line width before a `Group` breaks. Default: `120`.
     pub line_width: usize,
-    /// Spaces per indent step. TS default: 4.
+    /// Spaces per indent step. Default: `4`.
     pub indent: usize,
-    /// Append a trailing newline at end of file. TS default: false.
+    /// Append a trailing newline at end of file. Default: `false`.
     pub eol_last: bool,
 }
 
