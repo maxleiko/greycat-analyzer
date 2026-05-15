@@ -1329,61 +1329,102 @@ pub(crate) fn is_assignable_to_with_index(
     if a.nullable && !b.nullable {
         return false;
     }
-    match (&a.kind, &b.kind) {
-        // Union handling must recurse into `_with_index` (not core)
-        // so each per-alt check picks up the supertype chain. Core's
-        // own Union arms recurse into core, which only knows decl-
-        // handle identity — that's how `Rect | Circle → Shape`
-        // (every alt extends Shape) used to fail. The "all" / "any"
-        // semantics match core (Union source: every alt must assign;
-        // Union target: any alt accepts the source); we only swap
-        // out the inner relation. Source-Union check fires before
-        // target-Union so a `Union → Union` shape walks alts on the
-        // source first and re-enters this arm for each alt against
-        // the target union, picking up the target's `any` rule
-        // naturally on each recursion.
-        (TypeKind::Union { alts }, _) => alts.iter().all(|alt| {
+    // Exhaustive nested match. Same rationale as core's
+    // `is_assignable_to`: a `_ => false` would absorb future
+    // `TypeKind` variants and re-introduce the `Union → supertype`
+    // class of bug at this layer. Each source-arm exhaustively
+    // handles every target-kind; cases the wrapper doesn't extend
+    // beyond core (already tried above) return `false` explicitly.
+    //
+    // Union arms recurse into `_with_index` (not core) so each
+    // per-alt check picks up the supertype chain. Source-Union
+    // fires first; target-Union recurses against each alt.
+    match &a.kind {
+        // Caught by the `is_assignable_to(...)` early-return above:
+        // these source kinds short-circuit in core (Null via target
+        // nullability; Never/Any/Unresolved as top/bottom rules).
+        TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => false,
+
+        TypeKind::Union { alts } => alts.iter().all(|alt| {
             is_assignable_to_with_index(index, well_known, decl_registry, arena, *alt, to)
         }),
-        (_, TypeKind::Union { alts }) => alts.iter().any(|alt| {
-            is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
-        }),
-        // Handle-keyed subtype chain — the only representation
-        // production paths produce for `.gcl`-declared types after
-        // the `Named` removal. The legacy `(Named, Named)` arm is
-        // gone; `Named` only survives for genuinely-unknown names
-        // and they're already absorbed by the `Unresolved` arm in
-        // `is_assignable_to`.
-        (TypeKind::Type(sub), TypeKind::Type(sup)) => {
-            index.is_subtype_of_decl(decl_registry, *sub, *sup)
-        }
-        // Node-tag bivariance (handle-keyed): `nodeTime<X> ↔
-        // nodeTime<X?>`, `nodeList<node<Dog>> → nodeList<node<Animal>>`,
-        // etc. Verified against the runtime oracle: node handles are
-        // 64-bit ints so T-nullability / T-subtyping flow both ways
-        // through any node-tag generic. Outer-decl equality + arg
-        // arity still required. Dispatch by decl identity via
-        // `WellKnown::is_node_tag(decl)` — a user-declared
-        // `type node<T>` would have its own (different) handle and
-        // wouldn't pick up the rule.
-        (TypeKind::Generic { decl: da, args: aa }, TypeKind::Generic { decl: db, args: ab })
-            if da == db && aa.len() == ab.len() && well_known.is_node_tag(*da) =>
-        {
-            true
-        }
-        (TypeKind::Generic { decl: da, args: aa }, TypeKind::Generic { decl: db, args: ab })
-            if da == db
-                && aa.len() == 1
-                && ab.len() == 1
-                && well_known.node_decl.is_some_and(|nd| nd == *da) =>
-        {
-            // node<Sub> -> node<Super> when Sub extends Super (or
-            // identical). Recurse so a chain like
-            // node<DeepSub> -> node<MidSub> -> node<Super> still
-            // works in one hop.
-            is_assignable_to_with_index(index, well_known, decl_registry, arena, aa[0], ab[0])
-        }
-        _ => false,
+
+        // Handle-keyed subtype chain — the inheritance layer this
+        // wrapper exists to add. `Type(sub) → Type(sup)` when `sub`
+        // is a transitive descendant of `sup` in `index.type_members`.
+        TypeKind::Type(sub) => match &b.kind {
+            TypeKind::Type(sup) => index.is_subtype_of_decl(decl_registry, *sub, *sup),
+            TypeKind::Union { alts } => alts.iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. } => false,
+        },
+
+        // Node-tag bivariance + node<T> covariance. Other generics
+        // stay invariant (handled by core's same-handle args check).
+        TypeKind::Generic { decl: da, args: aa } => match &b.kind {
+            TypeKind::Generic { decl: db, args: ab }
+                if da == db && aa.len() == ab.len() && well_known.is_node_tag(*da) =>
+            {
+                true
+            }
+            TypeKind::Generic { decl: db, args: ab }
+                if da == db
+                    && aa.len() == 1
+                    && ab.len() == 1
+                    && well_known.node_decl.is_some_and(|nd| nd == *da) =>
+            {
+                // node<Sub> -> node<Super> when Sub extends Super.
+                // Recurse so a chain like node<DeepSub> ->
+                // node<MidSub> -> node<Super> works in one hop.
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, aa[0], ab[0])
+            }
+            TypeKind::Union { alts } => alts.iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Type(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. } => false,
+        },
+
+        // Primitive / Lambda / Enum / GenericParam: the wrapper adds
+        // no inheritance-aware rules beyond what core already covers.
+        // Only the target-Union retry is meaningful (a single alt
+        // might match via the wrapper's extensions even when core
+        // rejected the whole union).
+        TypeKind::Primitive(_)
+        | TypeKind::Lambda { .. }
+        | TypeKind::Enum { .. }
+        | TypeKind::GenericParam { .. } => match &b.kind {
+            TypeKind::Union { alts } => alts.iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Type(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. } => false,
+        },
     }
 }
 
@@ -1406,58 +1447,109 @@ pub(crate) fn is_castable_with_index(
     }
     let from_t = arena.get(from);
     let to_t = arena.get(to);
-    // Union handling. Same layering principle as
-    // `is_assignable_to_with_index`: recurse into self (not core)
-    // so each alt picks up the bidirectional inheritance arm below.
-    // Source-Union: every alt must cast. Target-Union: any alt
-    // accepts. Source-first so `Union → Union` walks source alts and
-    // re-enters this arm for each against the target union.
-    if let TypeKind::Union { alts } = &from_t.kind {
-        return alts
+    // Helper: bidirectional handle-keyed inheritance for the cast
+    // operator. `Sub as Sup` (upcast, widening) and `Sup as Sub`
+    // (downcast, runtime-checked) are both valid. Generic shapes
+    // compare by head-decl identity (matches the call-site
+    // `inheritance_ok` semantics).
+    let bidi_inherits = |fd: TypeDeclId, td: TypeDeclId| -> bool {
+        index.is_subtype_of_decl(decl_registry, fd, td)
+            || index.is_subtype_of_decl(decl_registry, td, fd)
+    };
+    // Exhaustive nested match. Same rationale as the assignability
+    // wrapper: no `_ => false` so future `TypeKind` variants can't
+    // silently slip past inheritance / node-tag rules. Union arms
+    // recurse into self so each alt picks up everything below.
+    match &from_t.kind {
+        // Caught by the `is_castable(...)` early-return above.
+        TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => false,
+
+        TypeKind::Union { alts } => alts
             .iter()
-            .all(|alt| is_castable_with_index(index, well_known, decl_registry, arena, *alt, to));
+            .all(|alt| is_castable_with_index(index, well_known, decl_registry, arena, *alt, to)),
+
+        // Source Type: bidirectional inheritance with Type / Generic
+        // targets; target-Union retry. No node-tag-int rule applies
+        // (Type is non-generic, can't be a node tag).
+        TypeKind::Type(fd) => match &to_t.kind {
+            TypeKind::Type(td) => bidi_inherits(*fd, *td),
+            TypeKind::Generic { decl: td, .. } => bidi_inherits(*fd, *td),
+            TypeKind::Union { alts } => alts.iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. } => false,
+        },
+
+        // Source Generic: bidirectional inheritance with Type /
+        // Generic targets. `<node-tag> as int` succeeds because the
+        // runtime handle is a 64-bit int. Target-Union retry.
+        TypeKind::Generic { decl: fd, .. } => match &to_t.kind {
+            TypeKind::Type(td) => bidi_inherits(*fd, *td),
+            TypeKind::Generic { decl: td, .. } => bidi_inherits(*fd, *td),
+            TypeKind::Primitive(Primitive::Int) if well_known.is_node_tag(*fd) => true,
+            TypeKind::Union { alts } => alts.iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. } => false,
+        },
+
+        // Source Primitive(Int): inverse `int as <node-tag>` rule.
+        // Other primitives have no wrapper-side rules — core handled
+        // them already (and returned false here, otherwise the
+        // early-return would have fired).
+        TypeKind::Primitive(Primitive::Int) => match &to_t.kind {
+            TypeKind::Generic { decl: td, .. } if well_known.is_node_tag(*td) => true,
+            TypeKind::Union { alts } => alts.iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Type(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. } => false,
+        },
+
+        // Other source kinds: wrapper adds no rules beyond core; only
+        // the target-Union retry might matter (an alt could pick up
+        // a wrapper rule even when the whole union didn't).
+        TypeKind::Primitive(_)
+        | TypeKind::Lambda { .. }
+        | TypeKind::Enum { .. }
+        | TypeKind::GenericParam { .. } => match &to_t.kind {
+            TypeKind::Union { alts } => alts.iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Type(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. } => false,
+        },
     }
-    if let TypeKind::Union { alts } = &to_t.kind {
-        return alts.iter().any(|alt| {
-            is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
-        });
-    }
-    // Bidirectional inheritance for the cast operator — `Sub as Sup`
-    // (upcast, widening) and `Sup as Sub` (downcast, runtime-checked)
-    // are both valid. Generics compare by head-decl identity, matching
-    // the call-site `inheritance_ok` short-circuit's name-based check.
-    let from_decl = match &from_t.kind {
-        TypeKind::Type(d) => Some(*d),
-        TypeKind::Generic { decl, .. } => Some(*decl),
-        _ => None,
-    };
-    let to_decl = match &to_t.kind {
-        TypeKind::Type(d) => Some(*d),
-        TypeKind::Generic { decl, .. } => Some(*decl),
-        _ => None,
-    };
-    if let (Some(fd), Some(td)) = (from_decl, to_decl)
-        && (index.is_subtype_of_decl(decl_registry, fd, td)
-            || index.is_subtype_of_decl(decl_registry, td, fd))
-    {
-        return true;
-    }
-    // `*node as int`, `*nodeTime<T> as int`, … — the runtime handle
-    // is a 64-bit int.
-    if matches!(to_t.kind, TypeKind::Primitive(Primitive::Int))
-        && matches!(&from_t.kind, TypeKind::Generic { decl, .. } if well_known.is_node_tag(*decl))
-    {
-        return true;
-    }
-    // Inverse direction: `int as nodeTime<T>` succeeds for the same
-    // reason — runtime handle is an int the runtime reinterprets as a
-    // node id.
-    if matches!(from_t.kind, TypeKind::Primitive(Primitive::Int))
-        && matches!(&to_t.kind, TypeKind::Generic { decl, .. } if well_known.is_node_tag(*decl))
-    {
-        return true;
-    }
-    false
 }
 
 // P19.6
