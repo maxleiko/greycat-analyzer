@@ -494,11 +494,12 @@ pub fn analyze_with_index_into(
         }
     }
 
-    // Surface literal parse anomalies recorded at HIR lowering time:
-    // numeric overflow, float precision loss, malformed char escape /
-    // ISO-8601 shape. The literal still types by its declared kind so
-    // downstream inference is unaffected — this pass only emits the
-    // user-facing warning / error.
+    // Surface hard parse failures recorded at HIR lowering time:
+    // malformed char escape, malformed ISO-8601 shape. Numeric
+    // overflow / float precision loss now route through the
+    // `literal-overflow` lint rule (lint.rs) so users can suppress
+    // them site-by-site — the analyzer's diagnostic vec is a one-way
+    // surface that doesn't honour `// gcl-lint-off`.
     for (_, expr) in hir.exprs.iter() {
         let Expr::Literal(LiteralExpr {
             kind,
@@ -508,9 +509,11 @@ pub fn analyze_with_index_into(
         else {
             continue;
         };
-        let (severity, message) = literal_parse_issue_diagnostic(*kind, *issue);
+        let Some(message) = literal_parse_issue_error(*kind, *issue) else {
+            continue;
+        };
         out.diagnostics.push(SemanticDiagnostic::structural(
-            severity,
+            Severity::Error,
             message,
             byte_range.clone(),
         ));
@@ -519,49 +522,22 @@ pub fn analyze_with_index_into(
     out
 }
 
-/// Map a `(LiteralKind, ParseIssue)` pair to a user-facing diagnostic.
-/// Overflow / precision-loss surface as warnings — the literal still
-/// has a usable best-effort value, so the rest of the program type-
-/// checks. Malformed shape (char escape, ISO date) is an error.
-fn literal_parse_issue_diagnostic(
+/// Map a `(LiteralKind, ParseIssue)` pair to a hard parse error.
+/// Returns `None` for overflow / precision-loss cases, which the
+/// `literal-overflow` lint rule owns.
+fn literal_parse_issue_error(
     kind: LiteralKind,
     issue: greycat_analyzer_hir::types::ParseIssue,
-) -> (Severity, String) {
+) -> Option<String> {
     use greycat_analyzer_hir::types::ParseIssue;
     match (kind, issue) {
-        (LiteralKind::Int(_), ParseIssue::Overflow) => (
-            Severity::Warning,
-            "integer literal exceeds `int` range: overflow".to_string(),
-        ),
-        (LiteralKind::Float(_), ParseIssue::PrecisionLoss) => (
-            Severity::Warning,
-            "float literal has more significant digits than `float` can represent: \
-             precision lost"
-                .to_string(),
-        ),
-        (LiteralKind::Float(_), ParseIssue::Overflow) => (
-            Severity::Warning,
-            "float literal exceeds `float` range: value rounded to infinity".to_string(),
-        ),
-        (LiteralKind::Duration(_), ParseIssue::Overflow) => (
-            Severity::Warning,
-            "duration literal exceeds the representable `duration` range (µs): value saturated"
-                .to_string(),
-        ),
-        (LiteralKind::Time(_), ParseIssue::Overflow) => (
-            Severity::Warning,
-            "time literal exceeds the representable `time` range (µs): value saturated".to_string(),
-        ),
-        (LiteralKind::Char(_), ParseIssue::Malformed) => (
-            Severity::Error,
-            "malformed char literal: unrecognised escape sequence".to_string(),
-        ),
-        (LiteralKind::Iso8601(_), ParseIssue::Malformed) => {
-            (Severity::Error, "malformed ISO-8601 literal".to_string())
+        (LiteralKind::Char(_), ParseIssue::Malformed) => {
+            Some("malformed char literal: unrecognised escape sequence".to_string())
         }
-        // Other combinations are unreachable at lowering, but stay
-        // conservative rather than panic if a future variant slips in.
-        _ => (Severity::Warning, "literal parse anomaly".to_string()),
+        (LiteralKind::Iso8601(_), ParseIssue::Malformed) => {
+            Some("malformed ISO-8601 literal".to_string())
+        }
+        _ => None,
     }
 }
 

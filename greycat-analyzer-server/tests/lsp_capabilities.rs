@@ -2193,11 +2193,12 @@ fn completion_cross_module_decl_carries_signature_and_module_label() {
     );
 }
 
-/// LSP must not surface lints from non-`project` libraries. Library
-/// code isn't the user's — the `unused-decl` (and friends) signals
-/// from stdlib / vendored deps would be pure editor noise. Type-
-/// relation diagnostics still flow regardless so cross-module shape
-/// mismatches can't hide behind a lib boundary.
+/// LSP must not surface diagnostics from non-`project` libraries —
+/// neither lints (`unused-decl` etc.) nor semantic ones (type-relation
+/// errors). Library code isn't the user's, and stdlib quirks /
+/// analyzer false-positives there are pure editor noise. The
+/// `--lint-libs` flag (LSP `greycat-analyzer.lintLibs` setting) lifts
+/// the suppression for both axes at once.
 #[test]
 fn diagnostics_skip_non_project_lib_lints() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -2245,6 +2246,44 @@ fn diagnostics_skip_non_project_lib_lints() {
             .iter()
             .any(|d| d.message.contains("unused private fn")),
         "lib-owned lints SHOULD surface when lint_libs=true; got: {lib_diags_opted_in:?}"
+    );
+}
+
+/// Semantic diagnostics (type errors, malformed-literal errors)
+/// emanating from non-`project` libraries also stay silent unless
+/// the user opts into `lint_libs`. The user isn't going to fix a
+/// stdlib bug from their IDE, so we don't pollute it with one.
+#[test]
+fn semantic_diagnostics_skip_non_project_lib_by_default() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    // A malformed char escape is a hard semantic error
+    // (`malformed char literal`) at HIR lowering time — the simplest
+    // semantic-side regression surface that doesn't depend on cross-
+    // module typing.
+    let lib_src = "fn helper() { var c = '\\q'; }\n";
+    let lib_uri = Uri::from_str("file:///proj/lib/std/core.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(lib_uri.clone(), lib_src, "std", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let lib_module = pa.module(&lib_uri).unwrap();
+
+    let suppressed = capabilities::diagnostics_from_module(lib_src, lib_module, false);
+    assert!(
+        !suppressed
+            .iter()
+            .any(|d| d.message.contains("malformed char")),
+        "lib-owned semantic diagnostics must NOT surface with \
+         lint_libs=false; got: {suppressed:?}"
+    );
+
+    let opted_in = capabilities::diagnostics_from_module(lib_src, lib_module, true);
+    assert!(
+        opted_in
+            .iter()
+            .any(|d| d.message.contains("malformed char")),
+        "lib-owned semantic diagnostics SHOULD surface when \
+         lint_libs=true; got: {opted_in:?}"
     );
 }
 

@@ -316,7 +316,9 @@ impl Lint {
                     text,
                 ));
             }
-            if let Some(module) = analysis.module(uri) {
+            if let Some(module) = analysis.module(uri)
+                && (lint_libs || module.lib == "project")
+            {
                 for d in &module.analysis.diagnostics {
                     diagnostics.push(Diagnostic {
                         range: byte_range_to_lsp(text, &d.byte_range),
@@ -331,24 +333,22 @@ impl Lint {
                         ..Default::default()
                     });
                 }
-                if lint_libs || module.lib == "project" {
-                    for l in &module.lints {
-                        if disabled_ref.contains(l.rule) {
-                            continue;
-                        }
-                        diagnostics.push(Diagnostic {
-                            range: byte_range_to_lsp(text, &l.byte_range),
-                            severity: Some(match l.severity {
-                                LintSeverity::Error => DiagnosticSeverity::ERROR,
-                                LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                                LintSeverity::Hint => DiagnosticSeverity::HINT,
-                            }),
-                            code: Some(NumberOrString::String(l.rule.into())),
-                            source: Some("lint".into()),
-                            message: l.message.clone(),
-                            ..Default::default()
-                        });
+                for l in &module.lints {
+                    if disabled_ref.contains(l.rule) {
+                        continue;
                     }
+                    diagnostics.push(Diagnostic {
+                        range: byte_range_to_lsp(text, &l.byte_range),
+                        severity: Some(match l.severity {
+                            LintSeverity::Error => DiagnosticSeverity::ERROR,
+                            LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                            LintSeverity::Hint => DiagnosticSeverity::HINT,
+                        }),
+                        code: Some(NumberOrString::String(l.rule.into())),
+                        source: Some("lint".into()),
+                        message: l.message.clone(),
+                        ..Default::default()
+                    });
                 }
             }
             Entry {
@@ -496,7 +496,9 @@ impl Lint {
                             &pragma_ctx,
                         ));
                     }
-                    if let Some(module) = new_analysis.module(uri) {
+                    if let Some(module) = new_analysis.module(uri)
+                        && (self.lint_libs || module.lib == "project")
+                    {
                         for d in &module.analysis.diagnostics {
                             diagnostics.push(Diagnostic {
                                 range: byte_range_to_lsp(&doc.text, &d.byte_range),
@@ -511,24 +513,22 @@ impl Lint {
                                 ..Default::default()
                             });
                         }
-                        if self.lint_libs || module.lib == "project" {
-                            for l in &module.lints {
-                                if disabled.contains(l.rule) {
-                                    continue;
-                                }
-                                diagnostics.push(Diagnostic {
-                                    range: byte_range_to_lsp(&doc.text, &l.byte_range),
-                                    severity: Some(match l.severity {
-                                        LintSeverity::Error => DiagnosticSeverity::ERROR,
-                                        LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                                        LintSeverity::Hint => DiagnosticSeverity::HINT,
-                                    }),
-                                    code: Some(NumberOrString::String(l.rule.into())),
-                                    source: Some("lint".into()),
-                                    message: l.message.clone(),
-                                    ..Default::default()
-                                });
+                        for l in &module.lints {
+                            if disabled.contains(l.rule) {
+                                continue;
                             }
+                            diagnostics.push(Diagnostic {
+                                range: byte_range_to_lsp(&doc.text, &l.byte_range),
+                                severity: Some(match l.severity {
+                                    LintSeverity::Error => DiagnosticSeverity::ERROR,
+                                    LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                                    LintSeverity::Hint => DiagnosticSeverity::HINT,
+                                }),
+                                code: Some(NumberOrString::String(l.rule.into())),
+                                source: Some("lint".into()),
+                                message: l.message.clone(),
+                                ..Default::default()
+                            });
                         }
                     }
                     entries.push(Entry {

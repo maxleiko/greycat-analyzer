@@ -5704,19 +5704,22 @@ fn lint_tags(tag: Option<DiagTag>) -> Option<Vec<DiagnosticTag>> {
 /// `lint` command's per-module conversion so the LSP and the
 /// CLI surface the same diagnostic shape.
 ///
-/// `lint_libs` opts into emitting lint diagnostics for non-project
-/// modules (anything under `lib/<name>/`). Default for the LSP is
-/// `false` — most users don't want warnings about vendored libraries
-/// they don't own. The VS Code extension exposes this via the
-/// `greycat-analyzer.lintLibs` setting; the CLI uses `--lint-libs`.
-/// Type-relation / semantic diagnostics are unaffected — those always
-/// surface regardless of the module's home library, so cross-module
-/// shape mismatches can't hide behind a library boundary.
+/// `lint_libs` opts into emitting diagnostics — both lint and
+/// semantic — for non-project modules (anything under `lib/<name>/`).
+/// Default for the LSP is `false`: users don't own stdlib / vendored
+/// code and don't want noise about it in their editor, including
+/// type-relation diagnostics (which can fire from cross-module
+/// inference quirks against trusted library code). The VS Code
+/// extension exposes this via the `greycat-analyzer.lintLibs`
+/// setting; the CLI uses `--lint-libs`.
 pub fn diagnostics_from_module(
     text: &str,
     module: &ModuleAnalysis,
     lint_libs: bool,
 ) -> Vec<Diagnostic> {
+    if !lint_libs && module.lib != "project" {
+        return Vec::new();
+    }
     let mut out: Vec<Diagnostic> = module
         .analysis
         .diagnostics
@@ -5734,22 +5737,20 @@ pub fn diagnostics_from_module(
             ..Default::default()
         })
         .collect();
-    if lint_libs || module.lib == "project" {
-        for lint in &module.lints {
-            out.push(Diagnostic {
-                range: byte_range_to_lsp_range(text, &lint.byte_range),
-                severity: Some(match lint.severity {
-                    LintSeverity::Error => DiagnosticSeverity::ERROR,
-                    LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                    LintSeverity::Hint => DiagnosticSeverity::HINT,
-                }),
-                code: Some(NumberOrString::String(lint.rule.into())),
-                source: Some("lint".into()),
-                message: lint.message.clone(),
-                tags: lint_tags(lint.tag),
-                ..Default::default()
-            });
-        }
+    for lint in &module.lints {
+        out.push(Diagnostic {
+            range: byte_range_to_lsp_range(text, &lint.byte_range),
+            severity: Some(match lint.severity {
+                LintSeverity::Error => DiagnosticSeverity::ERROR,
+                LintSeverity::Warning => DiagnosticSeverity::WARNING,
+                LintSeverity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(lint.rule.into())),
+            source: Some("lint".into()),
+            message: lint.message.clone(),
+            tags: lint_tags(lint.tag),
+            ..Default::default()
+        });
     }
     out
 }
