@@ -337,15 +337,20 @@ fn normal(a: int): int { return a; }
 
     #[test]
     fn block_stmt_eol_comment_stays_on_same_line() {
-        let src = "fn f() {\n    var x = 1;//eol\n    var y = 2; //padded\n}\n";
+        let src =
+            "fn f() {\n    var x = 1;//eol\n    var y = 2; //padded\n    var z = 3;   //wide\n}\n";
         let out = roundtrip(src);
         assert!(
-            out.contains("var x = 1;//eol"),
-            "expected block EOL glued with no leading space:\n{out}"
+            out.contains("var x = 1; //eol"),
+            "expected block EOL glued with exactly one space:\n{out}"
         );
         assert!(
-            out.contains("var y = 2;//padded"),
-            "expected block EOL whitespace-before-`//` stripped:\n{out}"
+            out.contains("var y = 2; //padded"),
+            "expected block EOL collapsed to one space:\n{out}"
+        );
+        assert!(
+            out.contains("var z = 3; //wide"),
+            "expected block EOL wide whitespace collapsed to one space:\n{out}"
         );
     }
 

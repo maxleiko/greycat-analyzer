@@ -1,0 +1,5 @@
+fn f() {
+    var x = 1;// tight
+    var y = 2;   //wide
+    var z = 3; // padded
+}

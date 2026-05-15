@@ -1,0 +1,40 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn f() {\n    var x = 1;// tight\n    var y = 2;   //wide\n    var z = 3; // padded\n}"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 'x')
+        (initializer
+          expr: (number
+            (number_int '1')
+          )
+        )
+      )
+      (line_comment '// tight')
+      (var_decl
+        name: (ident 'y')
+        (initializer
+          expr: (number
+            (number_int '2')
+          )
+        )
+      )
+      (line_comment '//wide')
+      (var_decl
+        name: (ident 'z')
+        (initializer
+          expr: (number
+            (number_int '3')
+          )
+        )
+      )
+      (line_comment '// padded')
+    )
+  )
+)

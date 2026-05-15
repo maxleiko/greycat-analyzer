@@ -563,7 +563,6 @@ fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         .unwrap_or(node.start_byte() + 1);
     let mut inner = Vec::new();
     let mut prev_end: usize = lbrace_end;
-    let mut after_brace = true;
     for s in &stmts {
         // Recover block comments + extra blank lines from the source
         // gap. The grammar drops `_block_comment` (hidden), so the
@@ -582,23 +581,19 @@ fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
                     }
                     inner.push(Doc::text(text.to_string()));
                     nl_total = 0;
-                    after_brace = false;
                 }
             }
         }
         // EOL `// ...` line comment on the same source line as whatever
-        // came before. Two flavors, both matching the TS reference's
-        // `cst_format.ts`:
-        //   - immediately after `{` (no stmt seen yet): emit `{ //...`
-        //     with one space.
-        //   - after a stmt: emit `<stmt>//...` with no whitespace.
+        // came before. Always glue with exactly one space — both after
+        // `{` (`{ //...`) and after a stmt (`<stmt>; //...`). The
+        // previous "no whitespace after stmt" rule was tracked as a
+        // bug in TODO.md (`var x; // comment` formatted to
+        // `var x;// comment`).
         if s.kind() == "line_comment" && nl_total == 0 {
-            if after_brace {
-                inner.push(Doc::text(" "));
-            }
+            inner.push(Doc::text(" "));
             inner.push(Doc::text(cx.text(*s).to_string()));
             prev_end = s.end_byte();
-            after_brace = false;
             continue;
         }
         inner.push(Doc::hardline());
@@ -607,7 +602,6 @@ fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
         inner.push(lower_node(cx, *s));
         prev_end = s.end_byte();
-        after_brace = false;
     }
     Doc::concat(vec![
         Doc::text("{"),
