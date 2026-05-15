@@ -1704,9 +1704,13 @@ impl<'a> Cx<'a> {
         // `self.index`, so we'd otherwise collide with the `&mut
         // self.out` insert below. Cloning the Uri is the necessary
         // owned copy here, not the laziness kind.
+        // Intentionally namespace-agnostic: `chain[1]` in a
+        // `module::Decl(::member)` shape may be either a type or a
+        // value (free fn invoked as `module::fn(args)`). Downstream
+        // `type_members_for` disambiguates by member kind.
         let (host_uri, host_decl_id) =
             match self.index.locate_decl(self.ident_text(chain[1])).first() {
-                Some((uri, decl_id)) => (uri.clone(), *decl_id),
+                Some((uri, decl_id, _)) => (uri.clone(), *decl_id),
                 None => return,
             };
         self.out.foreign_decl_uses.insert(

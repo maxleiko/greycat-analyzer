@@ -41,7 +41,38 @@ use greycat_analyzer_hir::types::{
     StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, VarDeclTop, WhileStmt,
 };
 
-use crate::stdlib::ProjectIndex;
+use crate::stdlib::{Namespace, ProjectIndex};
+
+/// Where in source a name was used — drives the per-namespace lookup
+/// order in [`Cx::record_use`]. The GreyCat runtime keeps three
+/// top-level name slots ([`Namespace::Type`], [`Namespace::Fn`],
+/// [`Namespace::Var`]); `Type` positions look in type-ns only, value
+/// positions try fn-ns then var-ns. Within each namespace the
+/// existing runtime-conformant ladder (nested → module-public →
+/// global-public → module-private) runs unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    /// Bare ident at a type-annotation position (`var x: Foo`,
+    /// `T extends Foo`, `Object<Foo>`).
+    Type,
+    /// Bare ident at a value-expression position (`Foo()`, bare
+    /// `Foo` in expr / qualifier-segment / static-receiver).
+    Value,
+}
+
+impl Position {
+    fn namespaces(self) -> &'static [Namespace] {
+        match self {
+            Position::Type => &[Namespace::Type],
+            // Fn before Var: matches the analyzer's existing
+            // `contains_fn_signature`-first preference when typing a
+            // bare ident, and the runtime's apparent behavior
+            // (verified via `greycat build` on cross-module `fn`/`var`
+            // mixes).
+            Position::Value => &[Namespace::Fn, Namespace::Var],
+        }
+    }
+}
 
 /// Where a use of an `Ident` resolves to.
 ///
@@ -125,18 +156,30 @@ impl Scope {
 
 struct Cx<'a> {
     hir: &'a Hir,
-    // P38.3 — module-scope bindings split by visibility. `module_public`
+    // P38.3 — module-scope bindings split by visibility. `module_public_*`
     // participates in normal bare-name lookup (first-tier, alongside
-    // nested scopes); `module_private` is a LAST-RESORT fallback,
+    // nested scopes); `module_private_*` is a LAST-RESORT fallback,
     // consulted only after the global-public lookup misses. See the
     // commentary in `record_use` for the runtime-conformance rationale.
-    /// Module-level decls without a `private` modifier.
-    module_public: FxHashMap<String, Definition>,
-    /// Module-level decls with a `private` modifier.
-    module_private: FxHashMap<String, Definition>,
+    //
+    // Within each visibility tier, decls split by [`Namespace`] (type,
+    // fn, var) — validated against `greycat build` 8.0.301-dev: every
+    // cross-namespace pair coexists, every in-namespace pair errors.
+    /// Module-level `type` / `enum` decls without `private`.
+    module_public_type: FxHashMap<String, Definition>,
+    /// Module-level `fn` decls without `private`.
+    module_public_fn: FxHashMap<String, Definition>,
+    /// Module-level `var` decls without `private`.
+    module_public_var: FxHashMap<String, Definition>,
+    /// Module-level `type` / `enum` decls with `private`.
+    module_private_type: FxHashMap<String, Definition>,
+    /// Module-level `fn` decls with `private`.
+    module_private_fn: FxHashMap<String, Definition>,
+    /// Module-level `var` decls with `private`.
+    module_private_var: FxHashMap<String, Definition>,
     /// Nested lexical scopes (fn / type / block / loop / try / catch).
     /// The module-level scope is *not* held here — see
-    /// `module_public` / `module_private` above.
+    /// `module_public_*` / `module_private_*` above.
     scopes: Vec<Scope>,
     // P6.1 — project pipeline passes the rebuilt index.
     /// Project-level fallback for names that miss every local scope.
@@ -158,12 +201,48 @@ impl<'a> Cx<'a> {
     fn new(hir: &'a Hir, index: &'a ProjectIndex, current_uri: Option<&'a Uri>) -> Self {
         Self {
             hir,
-            module_public: FxHashMap::default(),
-            module_private: FxHashMap::default(),
+            module_public_type: FxHashMap::default(),
+            module_public_fn: FxHashMap::default(),
+            module_public_var: FxHashMap::default(),
+            module_private_type: FxHashMap::default(),
+            module_private_fn: FxHashMap::default(),
+            module_private_var: FxHashMap::default(),
             scopes: Vec::new(),
             index,
             current_uri,
             res: Resolutions::default(),
+        }
+    }
+
+    fn module_public(&self, ns: Namespace) -> &FxHashMap<String, Definition> {
+        match ns {
+            Namespace::Type => &self.module_public_type,
+            Namespace::Fn => &self.module_public_fn,
+            Namespace::Var => &self.module_public_var,
+        }
+    }
+
+    fn module_public_mut(&mut self, ns: Namespace) -> &mut FxHashMap<String, Definition> {
+        match ns {
+            Namespace::Type => &mut self.module_public_type,
+            Namespace::Fn => &mut self.module_public_fn,
+            Namespace::Var => &mut self.module_public_var,
+        }
+    }
+
+    fn module_private(&self, ns: Namespace) -> &FxHashMap<String, Definition> {
+        match ns {
+            Namespace::Type => &self.module_private_type,
+            Namespace::Fn => &self.module_private_fn,
+            Namespace::Var => &self.module_private_var,
+        }
+    }
+
+    fn module_private_mut(&mut self, ns: Namespace) -> &mut FxHashMap<String, Definition> {
+        match ns {
+            Namespace::Type => &mut self.module_private_type,
+            Namespace::Fn => &mut self.module_private_fn,
+            Namespace::Var => &mut self.module_private_var,
         }
     }
 
@@ -180,124 +259,116 @@ impl<'a> Cx<'a> {
             .expect("at least one nested scope is live (push_scope must precede insert)")
     }
 
-    // P38.3 — first-tier lookup: nested scopes (params / locals /
-    // generics / for-in bindings / catch params) innermost-first,
-    // falling through to module-level *public* decls. Module-level
-    // private decls are NOT consulted here — they live in
-    // `module_private` and are reached only via the last-resort
-    // fallback in `record_use`.
-    fn lookup_nested_or_public(&self, name: &str) -> Option<Definition> {
+    /// Walk nested lexical scopes (params / locals / generics /
+    /// for-in / catch) innermost-first. Scopes are not partitioned by
+    /// namespace — the grammar disallows re-using a single scope's
+    /// name across kinds. Module-level tables are *not* consulted
+    /// here; `record_use` handles them per-namespace.
+    fn lookup_scope(&self, name: &str) -> Option<Definition> {
         for scope in self.scopes.iter().rev() {
             if let Some(d) = scope.names.get(name) {
                 return Some(d.clone());
             }
         }
-        self.module_public.get(name).cloned()
+        None
     }
 
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
         &self.index.symbols[self.hir.idents[idx].symbol]
     }
 
-    fn record_use(&mut self, idx: Idx<Ident>) {
+    fn record_use(&mut self, idx: Idx<Ident>, pos: Position) {
         let name = self.ident_text(idx).to_string();
         // P38.3 — Bare-name resolution order matches the GreyCat
-        // runtime oracle (8.0.291-dev), validated against
-        // `greycat build` on a multi-module project. The order is:
+        // runtime oracle (validated against `greycat build`
+        // 8.0.301-dev). The order, applied per namespace in the
+        // priority list for `pos`:
         //
-        //   1. Non-module scopes + module-level PUBLIC decls.
-        //   2. Global PUBLIC across the project closure
-        //      (`ProjectIndex::locate_decl`). Multiple hits collapse to
-        //      *unresolved* — 38.4 emits the helpful diagnostic naming
-        //      each candidate; the runtime reports plain "unresolved
-        //      function: <name>" and we surface the modules with FQN
-        //      quick-fixes, but the severity stays Error.
-        //   3. Module-level PRIVATE decls — LAST-RESORT FALLBACK.
-        //   4. `Project` placeholder (runtime-implemented types,
-        //      primitives by name, native fns), known module names
-        //      (left segment of a `module::Decl` chain), or unresolved.
+        //   1. Non-module scopes (universal, walked once at the top).
+        //   2. Module-level PUBLIC decls in this namespace.
+        //   3. Global PUBLIC across the project closure
+        //      (`ProjectIndex::locate_decl_in_ns`). Multiple hits in
+        //      the same namespace collapse to *ambiguous-symbol*
+        //      (Severity::Error with FQN quick-fixes).
+        //   4. Module-level PRIVATE decls in this namespace
+        //      — LAST-RESORT, only reached when both 2 and 3 missed
+        //      in every namespace in the priority list.
+        //   5. `Project` placeholder (runtime-implemented types,
+        //      primitives by name, native fns), known module names,
+        //      or unresolved.
         //
-        // We intentionally match the runtime even though step 3 is
-        // design-questionable: a local PUBLIC same-named decl WILL
-        // shadow a remote public (step 1 wins), but a local PRIVATE
-        // same-named decl will NOT shadow it (step 2 fires before
-        // step 3). The asymmetry would surprise most language
-        // designers — most expect "module-local first, regardless of
-        // visibility." We doubted this choice loudly before
-        // implementing it; the runtime is the oracle and we conform.
-        // If the runtime ever flips the order to "local-private
-        // shadows remote-public," this is the single place to swap
-        // steps 2 and 3.
-        if let Some(def) = self.lookup_nested_or_public(&name) {
-            // P6.7: bump the reverse-reference count for top-level decls.
+        // The 2-→3-→4 ordering matches the runtime even though it
+        // makes a local PRIVATE decl NOT shadow a remote PUBLIC. See
+        // `cross_module_private_fallback.rs` for the test mirror of
+        // probes p3/p8/p9.
+        //
+        // Across namespaces: at a value position the priority is fn
+        // before var (matches the analyzer's
+        // `contains_fn_signature`-first preference at
+        // `Definition::ProjectDecl` value typing). A miss in one
+        // namespace falls through to the next; an ambiguity in any
+        // namespace short-circuits the whole walk.
+
+        // 1. Nested scopes are namespace-agnostic.
+        if let Some(def) = self.lookup_scope(&name) {
             if let Definition::Decl(decl_id) = &def {
                 *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
             }
             self.res.uses.insert(idx, def);
             return;
         }
-        // P11.2 + P38.3 + P38.4 — global PUBLIC lookup across
-        // distinct modules. Filters in order:
-        //   - exclude entries from the current module (so a same-
-        //     module decl reaches the local-private fallback below
-        //     rather than self-referring via `ProjectDecl`);
-        //   - exclude entries flagged `private` by the index (private
-        //     decls don't participate in bare cross-module lookup —
-        //     the FQN form is the runtime-allowed escape hatch).
-        //
-        // Outcomes:
-        //   - exactly 1 hit          → `ProjectDecl { uri, decl }`.
-        //   - ≥2 hits across modules → record in `ambiguous` for
-        //                              `ambiguous-symbol` Severity::Error
-        //                              emission; bare ident does NOT
-        //                              fall through to local-private
-        //                              (the runtime treats the clash
-        //                              as unresolved at this layer).
-        //   - 0 hits                 → continue to the last-resort
-        //                              local-private step below.
-        let cross_module_hits: Vec<(Uri, Idx<Decl>)> = self
-            .index
-            .locate_decl(&name)
-            .iter()
-            .filter(|(uri, decl)| {
-                let from_other_module = self.current_uri.map(|cur| uri != cur).unwrap_or(true);
-                from_other_module && !self.index.is_decl_private(uri, *decl)
-            })
-            .map(|(uri, decl)| (uri.clone(), *decl))
-            .collect();
-        match cross_module_hits.len() {
-            0 => {}
-            1 => {
-                let (uri, decl) = cross_module_hits.into_iter().next().unwrap();
-                self.res
-                    .uses
-                    .insert(idx, Definition::ProjectDecl { uri, decl });
+
+        // 2 + 3, per namespace in the position's priority order.
+        for &ns in pos.namespaces() {
+            // Step 2: module-public in this namespace.
+            if let Some(def) = self.module_public(ns).get(&name).cloned() {
+                if let Definition::Decl(decl_id) = &def {
+                    *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
+                }
+                self.res.uses.insert(idx, def);
                 return;
             }
-            _ => {
-                // ≥2 distinct-module public hits. Record the
-                // candidates so the project pipeline can emit
-                // `ambiguous-symbol` with FQN quick-fixes; mark the
-                // ident as unresolved so downstream typing doesn't
-                // arbitrarily pick one of the candidates and mask
-                // the error.
-                self.res.ambiguous.insert(idx, cross_module_hits);
-                self.res.unresolved.push(idx);
+            // Step 3: cross-module PUBLIC in this namespace, with
+            // current-module and `private` filters.
+            let cross_module_hits: Vec<(Uri, Idx<Decl>)> = self
+                .index
+                .locate_decl_in_ns(&name, ns)
+                .filter(|(uri, decl)| {
+                    let from_other_module = self.current_uri.map(|cur| uri != &cur).unwrap_or(true);
+                    from_other_module && !self.index.is_decl_private(uri, *decl)
+                })
+                .map(|(uri, decl)| (uri.clone(), decl))
+                .collect();
+            match cross_module_hits.len() {
+                0 => continue,
+                1 => {
+                    let (uri, decl) = cross_module_hits.into_iter().next().unwrap();
+                    self.res
+                        .uses
+                        .insert(idx, Definition::ProjectDecl { uri, decl });
+                    return;
+                }
+                _ => {
+                    self.res.ambiguous.insert(idx, cross_module_hits);
+                    self.res.unresolved.push(idx);
+                    return;
+                }
+            }
+        }
+
+        // 4. Last-resort: module-private, also walked per-namespace
+        // in priority order.
+        for &ns in pos.namespaces() {
+            if let Some(def) = self.module_private(ns).get(&name).cloned() {
+                if let Definition::Decl(decl_id) = &def {
+                    *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
+                }
+                self.res.uses.insert(idx, def);
                 return;
             }
         }
-        // P38.3 — module-private last-resort fallback. Reached only
-        // when both step 1 (nested + module-public) and step 2 (global
-        // public) missed. A local `private` decl shadows nothing
-        // outside its module; inside its module it's reachable only
-        // when no public match exists anywhere.
-        if let Some(def) = self.module_private.get(&name).cloned() {
-            if let Definition::Decl(decl_id) = &def {
-                *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
-            }
-            self.res.uses.insert(idx, def);
-            return;
-        }
+
+        // 5. Project-level fallback.
         if self.index.has_name(&name) {
             self.res.uses.insert(idx, Definition::Project);
             return;
@@ -338,12 +409,13 @@ impl<'a> Cx<'a> {
             self.res.unresolved.push(leaf);
             return;
         };
+        // Leaf of a qualified TypeRef is unambiguously a type — filter
+        // out same-named values declared in the module.
         let hit = self
             .index
-            .locate_decl(&leaf_name)
-            .iter()
-            .find(|(uri, _)| uri == &module_uri)
-            .map(|(uri, decl)| (uri.clone(), *decl));
+            .locate_decl_in_ns(&leaf_name, Namespace::Type)
+            .find(|(uri, _)| *uri == &module_uri)
+            .map(|(uri, decl)| (uri.clone(), decl));
         match hit {
             Some((uri, decl)) => {
                 self.res
@@ -416,16 +488,22 @@ fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
     let Some(name_id) = decl.name() else {
         return;
     };
+    let Some(ns) = Namespace::of_decl(decl) else {
+        return;
+    };
     let name = cx.ident_text(name_id).to_string();
-    // P38.3 — route on visibility. Public decls join the first-tier
-    // lookup namespace alongside nested scopes; private decls go to
-    // the last-resort fallback table. See the order doctrine in
-    // `record_use`.
-    if decl_is_private(decl) {
-        cx.module_private.insert(name, Definition::Decl(decl_id));
+    // P38.3 — route on visibility, then on namespace. Public decls
+    // join the first-tier lookup namespace alongside nested scopes;
+    // private decls go to the last-resort fallback table. See the
+    // order doctrine in `record_use`. Three namespaces (type, fn,
+    // var) — validated against the runtime — let same-name decls
+    // across different kinds coexist.
+    let table = if decl_is_private(decl) {
+        cx.module_private_mut(ns)
     } else {
-        cx.module_public.insert(name, Definition::Decl(decl_id));
-    }
+        cx.module_public_mut(ns)
+    };
+    table.insert(name, Definition::Decl(decl_id));
 }
 
 // P38.3
@@ -667,7 +745,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
 fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
     let expr = cx.hir.exprs[expr_id].clone();
     match expr {
-        Expr::Ident { name, .. } => cx.record_use(name),
+        Expr::Ident { name, .. } => cx.record_use(name, Position::Value),
         Expr::Literal(_) => {}
         Expr::String(StringExpr { parts, .. }) => {
             // P17.5 — recurse into `${expr}` interpolations so inner
@@ -705,7 +783,13 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             // segments are members and bind via type-driven resolution
             // in the analyzer / pass 3.5, not here.
             if let Some(first) = chain.first() {
-                cx.record_use(*first);
+                // Leftmost segment of `Foo::bar` is either a type
+                // (static method / static attr / enum variant access)
+                // or a module name (`std::Foo::bar`). Module names
+                // aren't in `decl_locations`; the namespaced lookup
+                // misses cleanly and the existing `has_module`
+                // fallback at the tail of `record_use` catches them.
+                cx.record_use(*first, Position::Type);
             }
         }
         Expr::Offset(OffsetExpr {
@@ -765,16 +849,19 @@ fn visit_type_ref(cx: &mut Cx, ty_id: Idx<TypeRef>) {
     if ty.qualifier.is_empty() {
         // Bare reference: full bare-name resolution, including the
         // `ambiguous-symbol` collapse when ≥2 modules export the leaf.
-        cx.record_use(ty.name);
+        // Type-position — only type/enum decls participate.
+        cx.record_use(ty.name, Position::Type);
     } else {
         // Qualified reference (`b::Foo`, `a::b::Foo`, …): the user has
         // already disambiguated. Bind each qualifier segment as a
         // normal use (so module names get a binding for hover / goto)
         // and resolve the leaf in the named module specifically — the
         // bare-name path's ambiguous-symbol collapse must NOT fire on
-        // a leaf the user explicitly qualified.
+        // a leaf the user explicitly qualified. Qualifier segments
+        // are module names; `has_module` catches them at the tail of
+        // `record_use`.
         for q in ty.qualifier.iter() {
-            cx.record_use(*q);
+            cx.record_use(*q, Position::Type);
         }
         cx.bind_qualified_type_leaf(&ty);
     }

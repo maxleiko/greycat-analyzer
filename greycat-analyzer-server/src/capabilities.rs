@@ -3997,9 +3997,13 @@ fn scope_name_meta(
 /// `None` when the decl's home module isn't cached.
 fn foreign_decl_completion_meta(
     project: &ProjectAnalysis,
-    locs: &[(Uri, greycat_analyzer_hir::arena::Idx<Decl>)],
+    locs: &[(
+        Uri,
+        greycat_analyzer_hir::arena::Idx<Decl>,
+        greycat_analyzer_analysis::stdlib::Namespace,
+    )],
 ) -> (Option<String>, Option<Documentation>, Option<String>) {
-    let Some((uri, decl_id)) = locs.first() else {
+    let Some((uri, decl_id, _)) = locs.first() else {
         return (None, None, None);
     };
     let Some(m) = project.module(uri) else {
@@ -4018,9 +4022,13 @@ fn foreign_decl_completion_meta(
 /// the resolver uses.
 fn decl_locs_kind(
     project: &ProjectAnalysis,
-    locs: &[(Uri, greycat_analyzer_hir::arena::Idx<Decl>)],
+    locs: &[(
+        Uri,
+        greycat_analyzer_hir::arena::Idx<Decl>,
+        greycat_analyzer_analysis::stdlib::Namespace,
+    )],
 ) -> CompletionItemKind {
-    if let Some((uri, decl_id)) = locs.first()
+    if let Some((uri, decl_id, _)) = locs.first()
         && let Some(m) = project.module(uri)
     {
         match &m.hir.decls[*decl_id] {
@@ -4387,9 +4395,12 @@ fn member_completion(
             );
         }
         if items.is_empty()
-            && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(name).first()
+            && let Some((foreign_uri, foreign_decl_id)) = project
+                .index
+                .locate_decl_in_ns(name, greycat_analyzer_analysis::stdlib::Namespace::Type)
+                .next()
             && let Some(fmod) = project.module(foreign_uri)
-            && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+            && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
         {
             collect_type_members(&fmod.hir, project.symbols(), td, &prefix_lower, &mut items);
         }
@@ -4412,9 +4423,12 @@ fn member_completion(
             );
         }
         if inner_items.is_empty()
-            && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(inner).first()
+            && let Some((foreign_uri, foreign_decl_id)) = project
+                .index
+                .locate_decl_in_ns(inner, greycat_analyzer_analysis::stdlib::Namespace::Type)
+                .next()
             && let Some(fmod) = project.module(foreign_uri)
-            && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+            && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
         {
             collect_type_members(
                 &fmod.hir,
@@ -4887,11 +4901,19 @@ fn static_completion(
 
     // Receiver branch: type-decl → static methods, enum-decl →
     // variants. The `recv` text matches a top-level decl name in some
-    // module (resolved through the project decl table).
-    if let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&ctx.recv).first()
+    // module (resolved through the project decl table). Filter to the
+    // type namespace — a value-namespace `fn ctx.recv()` is irrelevant
+    // here, the receiver is a static dispatch target.
+    if let Some((foreign_uri, foreign_decl_id)) = project
+        .index
+        .locate_decl_in_ns(
+            &ctx.recv,
+            greycat_analyzer_analysis::stdlib::Namespace::Type,
+        )
+        .next()
         && let Some(fmod) = project.module(foreign_uri)
     {
-        match &fmod.hir.decls[*foreign_decl_id] {
+        match &fmod.hir.decls[foreign_decl_id] {
             Decl::Type(td) => {
                 for method_id in &td.methods {
                     let Decl::Fn(m) = &fmod.hir.decls[*method_id] else {
@@ -5179,7 +5201,7 @@ fn type_position_completion(
     // Project-level type / enum decls.
     for (name_sym, locs) in &project.index.decl_locations {
         let name = project.index.symbols.resolve(name_sym);
-        if let Some((u, d)) = locs.first()
+        if let Some((u, d, _)) = locs.first()
             && let Some(m) = project.module(u)
         {
             let kind = match &m.hir.decls[*d] {
@@ -5257,9 +5279,15 @@ fn object_field_completion(
         );
     }
     if items.is_empty()
-        && let Some((foreign_uri, foreign_decl_id)) = project.index.locate_decl(&type_name).first()
+        && let Some((foreign_uri, foreign_decl_id)) = project
+            .index
+            .locate_decl_in_ns(
+                &type_name,
+                greycat_analyzer_analysis::stdlib::Namespace::Type,
+            )
+            .next()
         && let Some(fmod) = project.module(foreign_uri)
-        && let Decl::Type(td) = &fmod.hir.decls[*foreign_decl_id]
+        && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
     {
         emit_attrs(&fmod.hir, project.symbols(), td, &prefix_lower, &mut items);
     }

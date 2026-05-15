@@ -3360,7 +3360,9 @@ pub fn resolve_decl_handle(
     name: &str,
 ) -> Option<TypeDeclId> {
     let name_sym = index.symbols.lookup(name)?;
-    for (uri, _) in index.locate_decl(name) {
+    // Type-namespace only: this mints a [`TypeDeclId`], so a
+    // same-named `Fn` / `Var` decl must never be returned.
+    for (uri, _) in index.locate_decl_in_ns(name, crate::stdlib::Namespace::Type) {
         if let Some(h) = decl_registry.lookup(uri, name_sym) {
             return Some(h);
         }

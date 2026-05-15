@@ -26,7 +26,7 @@ use greycat_analyzer_hir::types::{
 use crate::analyzer::AnalysisResult;
 use crate::directives::Directives;
 use crate::resolver::{Definition, Resolutions};
-use crate::stdlib::ProjectIndex;
+use crate::stdlib::{Namespace, ProjectIndex};
 use crate::well_known::DeclRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1017,17 +1017,23 @@ impl LintRule for DuplicateDecl {
         let Some(module) = cx.hir.module.as_ref() else {
             return;
         };
-        let mut seen: FxHashMap<greycat_analyzer_core::Symbol, ()> = FxHashMap::default();
+        // Bucket by `(symbol, namespace)` — GreyCat lets a type/enum
+        // and a fn/var share an identifier (see `lib/std/core.gcl`'s
+        // `type geo` plus `fn geo(...)`). Collisions only fire when
+        // two decls land in the same namespace.
+        let mut seen: FxHashMap<(greycat_analyzer_core::Symbol, Namespace), ()> =
+            FxHashMap::default();
         let mut candidates: Vec<LintDiagnostic> = Vec::new();
         for decl_id in &module.decls {
-            let Some(name_id) = cx.hir.decls[*decl_id].name() else {
+            let decl = &cx.hir.decls[*decl_id];
+            let Some(name_id) = decl.name() else {
                 continue;
             };
-            if matches!(&cx.hir.decls[*decl_id], Decl::Pragma(_)) {
+            let Some(ns) = Namespace::of_decl(decl) else {
                 continue;
-            }
+            };
             let ident = &cx.hir.idents[name_id];
-            if seen.insert(ident.symbol, ()).is_some() {
+            if seen.insert((ident.symbol, ns), ()).is_some() {
                 let name = &cx.symbols[ident.symbol];
                 candidates.push(LintDiagnostic {
                     rule: "duplicate-decl",

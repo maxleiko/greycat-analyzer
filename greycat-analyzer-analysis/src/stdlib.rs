@@ -25,6 +25,47 @@ use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as
 
 use crate::well_known::DeclRegistry;
 
+/// Symbol namespace for top-level decls. The GreyCat runtime
+/// (validated against `greycat build` 8.0.301-dev) keeps three name
+/// slots — type/enum, fn, and module-var (root node) — that may all
+/// share an identifier. `type geo` (type-ns) and `fn geo(...)`
+/// (fn-ns) coexist in `lib/std/core.gcl`; the runtime probe confirms
+/// every cross-namespace pair builds clean, while every in-namespace
+/// pair errors at parse time.
+///
+/// Per-name indexes that gate `duplicate-decl` / `ambiguous-symbol`
+/// filter by this tag; `Decl::Pragma` has no namespace (returns
+/// `None` from [`Namespace::of_decl`]) and is skipped at every
+/// callsite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Namespace {
+    /// `type` / `enum` declarations.
+    Type,
+    /// `fn` declarations (free functions; methods live on a
+    /// `TypeMembers` entry, not at module top level).
+    Fn,
+    /// Module-level `var` declarations (graph-root nodes).
+    Var,
+}
+
+impl Namespace {
+    pub fn of_decl(decl: &Decl) -> Option<Self> {
+        match decl {
+            Decl::Type(_) | Decl::Enum(_) => Some(Self::Type),
+            Decl::Fn(_) => Some(Self::Fn),
+            Decl::Var(_) => Some(Self::Var),
+            Decl::Pragma(_) => None,
+        }
+    }
+}
+
+/// Name → every (uri, decl, namespace) triple known under that name
+/// across the project. Stored shape of [`ProjectIndex::decl_locations`];
+/// extracted as a type alias because clippy's `type_complexity` rule
+/// fires on the bare `FxHashMap<Symbol, Vec<(Uri, Idx<Decl>, Namespace)>>`
+/// surface when threaded through helper signatures.
+pub type DeclLocationMap = FxHashMap<Symbol, Vec<(Uri, Idx<Decl>, Namespace)>>;
+
 /// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
 /// declaration whose `extends` chain reaches a 5th level with
 /// `too depth inheritance: <name>` (verified against `greycat build`:
@@ -143,12 +184,16 @@ pub struct ProjectIndex {
     /// stay reachable only via FQN). Empty by default; populated by
     /// [`Self::ingest`].
     pub private_locations: FxHashSet<(Uri, Idx<Decl>)>,
-    /// Cross-module decl table: name → every `(Uri, Idx<Decl>)`
-    /// pair that introduces a top-level decl with this name across the
+    /// Cross-module decl table: name → every `(Uri, Idx<Decl>, Namespace)`
+    /// triple that introduces a top-level decl with this name across the
     /// project. Collisions are kept; disambiguation happens at the use
-    /// site via the importing module's lib/include closure.
-    /// Pragma decls have no name and are excluded.
-    pub decl_locations: FxHashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
+    /// site via the importing module's lib/include closure. The
+    /// [`Namespace`] tag lets namespace-aware callers (resolver
+    /// `record_use`, `duplicate-decl`, `resolve_decl_handle`) filter
+    /// type-position vs value-position hits without re-fetching the
+    /// `Decl` from foreign HIR. Pragma decls have no name and are
+    /// excluded.
+    pub decl_locations: DeclLocationMap,
     // P13.4
     /// Runtime-exposed names. Keyed by the rename string of
     /// `@expose("renamed")` (or the decl's own name when `@expose` has
@@ -931,7 +976,7 @@ impl ProjectIndex {
                         }
                         self.type_members.insert(name_sym, m);
                     }
-                    self.record_decl_location(name_sym, uri, *decl_id);
+                    self.record_decl_location(name_sym, uri, *decl_id, Namespace::Type);
                     Some(&td.modifiers)
                 }
                 Decl::Enum(ed) => {
@@ -963,7 +1008,7 @@ impl ProjectIndex {
                             nullable: false,
                         })
                     });
-                    self.record_decl_location(name_sym, uri, *decl_id);
+                    self.record_decl_location(name_sym, uri, *decl_id, Namespace::Type);
                     Some(&ed.modifiers)
                 }
                 Decl::Fn(fnd) => {
@@ -987,13 +1032,13 @@ impl ProjectIndex {
                         // to `type_ty()` via `has_name`.
                         self.non_native_fn_names.insert(name_sym);
                     }
-                    self.record_decl_location(name_sym, uri, *decl_id);
+                    self.record_decl_location(name_sym, uri, *decl_id, Namespace::Fn);
                     Some(&fnd.modifiers)
                 }
                 Decl::Var(vd) => {
                     let name_sym = hir.idents[vd.name].symbol;
                     self.values.insert(name_sym);
-                    self.record_decl_location(name_sym, uri, *decl_id);
+                    self.record_decl_location(name_sym, uri, *decl_id, Namespace::Var);
                     Some(&vd.modifiers)
                 }
                 Decl::Pragma(p) => {
@@ -1055,32 +1100,67 @@ impl ProjectIndex {
 
     // P19.9
     /// `Symbol`-keyed location index. Caller must have
-    /// already interned `name_sym` through `self.symbols`.
-    fn record_decl_location(&mut self, name_sym: Symbol, uri: &Uri, decl_id: Idx<Decl>) {
+    /// already interned `name_sym` through `self.symbols`. `ns` is the
+    /// namespace of the decl being registered — letting downstream
+    /// lookups segregate type-position from value-position hits.
+    fn record_decl_location(
+        &mut self,
+        name_sym: Symbol,
+        uri: &Uri,
+        decl_id: Idx<Decl>,
+        ns: Namespace,
+    ) {
         let entry = self.decl_locations.entry(name_sym).or_default();
-        if !entry.iter().any(|(u, d)| u == uri && *d == decl_id) {
-            entry.push((uri.clone(), decl_id));
+        if !entry.iter().any(|(u, d, _)| u == uri && *d == decl_id) {
+            entry.push((uri.clone(), decl_id, ns));
         }
     }
 
-    /// Cross-module decl lookup: every `(Uri, Idx<Decl>)` pair
+    /// Cross-module decl lookup: every `(Uri, Idx<Decl>, Namespace)` triple
     /// known under this name. Empty slice when the name is unknown.
     /// Built-in runtime type names (`Array`, `Map`, …) and language
     /// primitives have no `.gcl` decl and so never appear here — use
     /// [`Self::has_name`] to ask the broader "is this name known?"
     /// question.
-    pub fn locate_decl(&self, name: &str) -> &[(Uri, Idx<Decl>)] {
+    pub fn locate_decl(&self, name: &str) -> &[(Uri, Idx<Decl>, Namespace)] {
         match self.symbols.lookup(name) {
             Some(s) => self.locate_decl_by_symbol(s),
             None => &[],
         }
     }
 
-    pub fn locate_decl_by_symbol(&self, name: Symbol) -> &[(Uri, Idx<Decl>)] {
+    pub fn locate_decl_by_symbol(&self, name: Symbol) -> &[(Uri, Idx<Decl>, Namespace)] {
         self.decl_locations
             .get(&name)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Same as [`Self::locate_decl`] but filtered to a single namespace.
+    /// Used by the resolver (`record_use` / `bind_qualified_type_leaf`)
+    /// and `resolve_decl_handle` to avoid cross-namespace false
+    /// matches (e.g. `type geo` vs `fn geo()`).
+    pub fn locate_decl_in_ns(
+        &self,
+        name: &str,
+        ns: Namespace,
+    ) -> impl Iterator<Item = (&Uri, Idx<Decl>)> {
+        self.locate_decl(name)
+            .iter()
+            .filter(move |(_, _, n)| *n == ns)
+            .map(|(u, d, _)| (u, *d))
+    }
+
+    /// `Symbol`-keyed variant of [`Self::locate_decl_in_ns`].
+    pub fn locate_decl_by_symbol_in_ns(
+        &self,
+        sym: Symbol,
+        ns: Namespace,
+    ) -> impl Iterator<Item = (&Uri, Idx<Decl>)> {
+        self.locate_decl_by_symbol(sym)
+            .iter()
+            .filter(move |(_, _, n)| *n == ns)
+            .map(|(u, d, _)| (u, *d))
     }
 
     /// `true` iff `name` resolves against any name the project knows:
@@ -1182,7 +1262,7 @@ fn native_signature_for(
     fnd: &FnDecl,
     arena: &mut TypeArena,
     decl_registry: &crate::well_known::DeclRegistry,
-    locate_decl: &FxHashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
+    locate_decl: &DeclLocationMap,
     symbols: &SymbolTable,
 ) -> NativeSignature {
     let params = fnd
@@ -1214,7 +1294,7 @@ fn lower_native_type_ref(
     idx: Idx<HirTypeRef>,
     arena: &mut TypeArena,
     decl_registry: &DeclRegistry,
-    locate_decl: &FxHashMap<Symbol, Vec<(Uri, Idx<Decl>)>>,
+    locate_decl: &DeclLocationMap,
     symbols: &SymbolTable,
 ) -> TypeId {
     let tr = &hir.type_refs[idx];
@@ -1235,7 +1315,7 @@ fn lower_native_type_ref(
             // the generic and non-generic branches).
             let handle = locate_decl.get(&name_sym).and_then(|locs| {
                 locs.iter()
-                    .find_map(|(uri, _)| decl_registry.lookup(uri, name_sym))
+                    .find_map(|(uri, _, _)| decl_registry.lookup(uri, name_sym))
             });
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
@@ -1406,9 +1486,10 @@ private native fn now(): time;
 
         let hits = idx.locate_decl("Permission");
         assert_eq!(hits.len(), 1, "exactly one Permission decl across project");
-        let (found_uri, decl_id) = &hits[0];
+        let (found_uri, decl_id, ns) = &hits[0];
         assert_eq!(found_uri, &permission_uri);
         assert!(matches!(&hir.decls[*decl_id], Decl::Type(_)));
+        assert_eq!(*ns, Namespace::Type);
     }
 
     // P19.9

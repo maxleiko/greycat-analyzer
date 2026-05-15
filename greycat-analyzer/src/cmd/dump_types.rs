@@ -261,7 +261,8 @@ fn module_stem_from_uri(uri: &Uri) -> Option<String> {
 /// callers fall back to `core` (matches TS).
 fn home_lib_for(index: &ProjectIndex, name: &str) -> Option<String> {
     let locs = index.locate_decl(name);
-    locs.first().and_then(|(uri, _)| module_stem_from_uri(uri))
+    locs.first()
+        .and_then(|(uri, _, _)| module_stem_from_uri(uri))
 }
 
 // ---------------------------------------------------------------------------
