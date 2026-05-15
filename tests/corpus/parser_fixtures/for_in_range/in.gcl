@@ -1,0 +1,5 @@
+fn f(pvEntity: PvEntity, from: time, to: time) {
+    for (t, stats in pvEntity->operatingStats->dynamicStats[from..to]) {
+        x;
+    }
+}

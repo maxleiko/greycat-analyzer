@@ -1,0 +1,55 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f(pvEntity: PvEntity, from: time, to: time) {\n    for (t, stats in pvEntity->operatingStats->dynamicStats[from..to]) {\n        x;\n    }\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'pvEntity')
+        type: (type_ident
+          name: (ident 'PvEntity')
+        )
+      )
+      param: (fn_param
+        name: (ident 'from')
+        type: (type_ident
+          name: (ident 'time')
+        )
+      )
+      param: (fn_param
+        name: (ident 'to')
+        type: (type_ident
+          name: (ident 'time')
+        )
+      )
+    )
+    body: (block
+      (for_in_stmt
+        (for_in_param
+          name: (ident 't')
+        )
+        (for_in_param
+          name: (ident 'stats')
+        )
+        iterator: (arrow_expr
+          (arrow_expr
+            (ident 'pvEntity')
+            property: (ident 'operatingStats')
+          )
+          property: (ident 'dynamicStats')
+        )
+        range: (interval_expr
+          from: (ident 'from')
+          to: (ident 'to')
+        )
+        block: (block
+          (expr_stmt
+            (ident 'x')
+          )
+        )
+      )
+    )
+  )
+)

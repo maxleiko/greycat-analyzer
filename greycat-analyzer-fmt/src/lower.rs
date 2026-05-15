@@ -1051,8 +1051,10 @@ fn lower_for_in_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if iter_optional {
         header.push(Doc::text("?"));
     }
+    // The `range` interval_expr renders with its own `[`/`]` (or `]`/`[`)
+    // brackets included — glue it to the iterator with no separating space,
+    // mirroring how `arr[from..to]` reads as a subscript form.
     if let Some(r) = range {
-        header.push(Doc::space());
         header.push(r);
     }
     if let Some(s) = sampling {
