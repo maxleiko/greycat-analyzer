@@ -58,6 +58,7 @@ This is the long-arc plan for porting the [GreyCat](https://greycat.io) language
 - [Phase 38 — Runtime-conformant cross-module symbol resolution](#phase-38--runtime-conformant-cross-module-symbol-resolution-3-5-days)
 - [Phase 39 — Directive vocabulary normalization (off/on suffix)](#phase-39--directive-vocabulary-normalization-offon-suffix-1-2-days)
 - [Phase 40 — Project-pragma lint / fmt control (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`)](#phase-40--project-pragma-lint--fmt-control-lint_off--lint_on--fmt_off--fmt_on-2-3-days)
+- [Phase 41 — Sealed-hierarchy exhaustive `is`-narrowing](#phase-41--sealed-hierarchy-exhaustive-is-narrowing-3-5-days)
 
 ### Other sections
 
@@ -1532,6 +1533,119 @@ Read bottom-up: start from the default, layer module pragmas, then project pragm
 - Pragmas in nested annotations (`@some_other(@lint_off("x"))`). The grammar accepts nested annotations but no use case justifies the complexity here.
 - Migrating `--off` / `--on` to _only_ be expressible as pragmas. The CLI flags are useful for ad-hoc CI invocations that shouldn't require a source edit. Both surfaces stay, with the precedence stack documented above.
 - Auto-fixing a `conflicting-lint-pragma` finding. The user has to decide which side wins.
+
+---
+
+### Phase 41 — Sealed-hierarchy exhaustive `is`-narrowing (~3-5 days)
+
+**Goal:** narrow the *else* branch of `if (s is T)` when the receiver's static type is an `abstract` decl whose concrete derivative set is closed by the project graph. Today the analyzer narrows the then-branch (`s: T`) but leaves the else as the original `Sup`, forcing the user to `as`-cast or write redundant `is` guards even when only one derivative remains.
+
+**Trigger:** P-symbol-handle bug (2026-05-15). The canonical reproducer (`abstract type Shape {} type Rect extends Shape {} type Circle extends Shape {}` plus `if (s is Rect) { ... } else { expect_circle(s); }`) ships a legitimate "Shape not assignable to Circle" against the else-branch call even though `Circle` is the only remaining concrete possibility. Came up while validating the `(Uri, Symbol)` registry re-key; the registry fix is independent, but the narrow gap is the next thing a user types into and hits.
+
+**Mechanism:** negative narrowing via subtype subtraction. For `if (s is T)` where `s` has *current narrowed type* `Sup` (the latest entry on the narrow stack — declared type only when no outer narrow applies):
+
+1. Define `closure(X)` for **every** type, abstract or concrete:
+   ```
+   closure(X) = (X itself, iff X is concrete)
+              ∪ ⋃ closure(child) for each direct child of X
+   ```
+   So abstract intermediates contribute their concrete descendants but not themselves (they can't be runtime values); concrete intermediates contribute themselves *and* recurse into their concrete subclasses (e.g. `closure(Cat)` includes `Cat` and any `SiameseCat extends Cat`).
+2. Determine if `Sup` is **closed**: closure-completeness is given by the project graph (`@library` / `@include` pin the world; no `sealed` keyword needed). The narrow only fires when `Sup` is abstract — concrete `Sup` is itself a runtime possibility, no subtraction is sound.
+3. Compute `R = closure(Sup) \ closure(T)`.
+4. **Collapse to ancestor (mandatory).** Look up `R` in the reverse index `abstract_by_closure_set`. If `R == closure(A)` for some abstract `A`, the narrow value is `Type(A_handle)` — a single nominal type, not a union. The collapse is part of `narrow_complement`'s return value, not a display-time post-pass: every downstream consumer (member access, assignability, hover, inlay hints, diagnostics) sees the nominal form. Rationale: the union form is an analyzer-internal construction; users think in terms of the abstract type they wrote. When the equivalence is exact, surface the user's vocabulary.
+5. Otherwise: narrow `s` to `Union(R)` in the else-branch. Single-element `R` collapses to the lone concrete via the existing `lower_typed_union` rule.
+6. Empty `R`: the else is unreachable; emit `is-check-exhausts-hierarchy`.
+
+**Tie-break on ancestor lookup.** Two abstracts with identical closures (`abstract Felidae` and `abstract CatLike` both spanning `{Cat, Lynx, Tiger}`) — pick deterministically by Symbol-alpha (the lexicographic order of the abstract's name in the project's `SymbolTable`). Rare in practice; `abstract_by_closure_set` records the alpha-first entry on first insert and ignores subsequent collisions.
+
+**Scope of the collapse.** Applies only to TypeIds *manufactured by `narrow_complement`*. User-written union types in source (`var x: Eagle | Penguin | Sparrow`) are left as-written — that's an authoring choice the analyzer respects.
+
+The **then-branch narrow stays at `T`**, even when `T` is abstract with a single concrete derivative. `a: Animal; if (a is Feline)` keeps `a: Feline` in the then-branch — *not* a collapse to `Cat`. Reason: a future sibling `type Tiger extends Feline` would silently break any code that assumed Cat. The runtime's `is` returns true for any concrete derivative of `Feline`, so the precise narrow is "some Feline." Further specialization requires a further `is`.
+
+**Composition with nested narrows.** `narrow_complement(known, asserted)` reads `known` from `Cx::lookup_def_type` (the narrow stack), not from `def_types` (the declared type). That's what makes nested `is` chains work — each inner else subtracts from the *currently narrowed* type, not the original declaration. Example: in `if (a is Mammal) { if (a is Feline) { ... } else { ... } }`, the inner else subtracts `closure(Feline)` from `closure(Mammal)` (the outer narrow), not from `closure(Animal)`.
+
+**New `ProjectIndex` state** (derived, rebuilt on `invalidate`):
+
+- `subtype_closure: FxHashMap<Symbol, Box<[Symbol]>>` — for every type (abstract *and* concrete), the closure set per the recursive definition above. Built by inverting `type_members[name].supertype` into a `Symbol → Vec<Symbol>` direct-child map, then DFS-walking each root. **Closure entries are stored canonically sorted by `Symbol`'s raw `u32`** so `abstract_by_closure_set` lookups hit regardless of source order. Linear in number of type decls.
+- `abstract_by_closure_set: FxHashMap<Box<[Symbol]>, Symbol>` — reverse index for the mandatory collapse: maps each abstract's canonical-sorted closure to the abstract's Symbol. Built in the same pass that populates `subtype_closure`. Symbol-alpha tie-break on collision (first insert wins; subsequent inserts compare by Symbol's resolved name and keep the alphabetically-earlier one).
+- `is_abstract: FxHashSet<Symbol>` — currently implicit on `Decl::Type::modifiers.abstract_`; centralize so the closure walker and the narrow helper don't have to chase HIR each time.
+
+All three populate at the end of `ingest` / `apply_module_contributions`. `name_set_hash` already flips on any add / rename / delete, so the existing sig-cache invalidation cascade covers them — no new invalidation knob needed.
+
+**Order-independence invariant.** Set equality is the load-bearing primitive: `{A, B, C} ≡ {C, A, B} ≡ closure(S)` must all resolve to the same `S`. Held by three rules that compose:
+1. Closure-build sorts before storing — every `subtype_closure[X]` is canonical.
+2. `narrow_complement`'s subtraction is a linear merge over two already-sorted lists, producing a sorted result.
+3. The reverse-index lookup feeds the sorted result directly into `abstract_by_closure_set.get(...)`.
+
+No code path can construct an `abstract_by_closure_set` key from an unsorted source. Pin this with a test that declares the *same* hierarchy twice — once with subtypes in source order `A, B, C`, once `C, A, B` — and asserts both projects collapse the same narrow to the same abstract.
+
+**Hookpoint in `Cx`:** the narrow-application path in [`analyzer.rs`](../greycat-analyzer-analysis/src/analyzer.rs) runs `collect_then_narrows` against the if-condition, then walks `CondNarrows.then_typed` / `else_typed`. Today the symmetric `else_typed` is populated only under `!` negation. Two paths gain the complement-narrow:
+
+1. **Plain `if (s is T)`**: the then-path now also pushes an "else complement" entry — same `(ident, asserted)` pair routed through `narrow_complement(known_ty, asserted)` instead of `asserted` itself.
+2. **`narrow_complement(known, asserted) -> Option<TypeId>`**: new helper. Returns `Some(Union(remaining))` when `known`'s decl is closed and the subtraction is non-empty, `Some(never)` when exhausted (caller emits the new diagnostic), `None` otherwise (caller falls back to today's no-op behavior).
+
+The push/pop on the `narrows` stack at else-branch entry already exists — only the *value* pushed changes.
+
+**Edge cases that need tests:**
+
+- **Single leaf left** (canonical reproducer): `Shape → {Rect, Circle}`, `s is Rect` else → `s: Circle`. Flip the existing reproducer's failing assertion to assert `expect_circle(s)` typechecks.
+- **Multiple leaves left**: `Shape → {Rect, Circle, Triangle}`, `s is Rect` else → `s: Circle | Triangle`. `expect_circle(s)` *should* still flag — confirm the union is what surfaces in the diagnostic.
+- **Non-abstract root**: `Shape` concrete (not abstract). Else cannot subtract — the root itself is a runtime possibility. No narrow; no diagnostic regression.
+- **Multi-level hierarchy** (two levels): `Shape → {Rect, Quadrilateral}`, `Quadrilateral → {Square, Rhombus}` (both abstract). `s: Shape; s is Rect` else → `Square | Rhombus`. Closure walker keeps descending until concrete.
+- **Deeply nested abstract chain**: `Animal → Mammal → Feline → Cat` (every level abstract except concrete leaves). Sibling branches at each level (`Animal → Bird`, `Mammal → Dog/Horse/Dolphin`, `Feline → Cat/Lynx/Tiger`, `Bird → Eagle/Penguin/Sparrow`). Composes via the narrow stack *and* exercises the mandatory ancestor-collapse:
+  ```gcl
+  fn test(a: Animal) {
+      if (a is Mammal) {            // a: Mammal
+          if (a is Feline) {        // a: Feline (still abstract — no collapse to a single concrete)
+              // closure(Feline) = {Cat, Lynx, Tiger}
+          } else {                  // closure(Mammal) − closure(Feline) = {Dog, Horse, Dolphin}
+              // No abstract has exactly {Dog, Horse, Dolphin} → narrow stays as the union
+          }
+      } else {                      // closure(Animal) − closure(Mammal) = {Eagle, Penguin, Sparrow}
+                                    //   == closure(Bird) → collapse: a: Bird (not the union)
+      }
+  }
+  ```
+  The inner else subtracts from `Mammal` (the outer narrow), not from `Animal` — `narrow_complement` reads `known` off the narrow stack. The outer else collapses to `Bird` because the remaining set exactly matches `Bird`'s closure; diagnostics and hover render `a: Bird`, not `Eagle | Penguin | Sparrow`.
+- **Collapse stops applying when the hierarchy expands**: adding `type Fish extends Animal` (concrete, not under any existing abstract) changes `closure(Animal) − closure(Mammal)` to `{Eagle, Penguin, Sparrow, Fish}`. No abstract has this closure → narrow renders as the explicit union. This is correct behavior, not a regression — the user changed the world, and the narrow now reflects it.
+- **Collapse tie-break**: declare two abstracts with identical closures and assert that the alphabetically-first one wins deterministically across re-lowers.
+- **Cross-module derivatives**: `Shape` in file A, `Rect extends Shape` in file B. Closure must span the project — `decl_locations` already does; the closure builder consults it by Symbol.
+- **`is` against a non-derivative**: `s: Shape; s is int`. Today flagged "always false" by the decidability pass; the narrow path bails when `asserted` isn't in `closure(Sup)`. Verify no double-emission.
+- **Asserted type is abstract**: `a: Animal; a is Feline`. Then-branch narrows to `Feline` (not collapsed to `Cat`); else-branch subtracts `closure(Feline)` from `closure(Animal)`. Confirms the "don't collapse abstract-asserted to its lone concrete leaf" rule.
+- **`!is` (then-branch complement)**: `if (!(s is Rect)) { /* here */ }`. Route the existing `else_typed`-via-`!` path through `narrow_complement` so both shapes get the same treatment.
+- **Disjunctive `||`**: `if (s is Rect || s is Square)` else → `closure(known) - closure(Rect) - closure(Square)`. The then-branch already builds `then_typed_union`; the else mirror folds all alts through the same subtraction.
+
+**Touchpoints:**
+
+| Layer                       | Files                                                                                       | Surface                                                                                                                                                                                                                                                                            |
+| --------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Subtype-closure index       | [`greycat-analyzer-analysis/src/stdlib.rs`](../greycat-analyzer-analysis/src/stdlib.rs)     | New `subtype_closure` + `is_abstract` fields on `ProjectIndex`; populator runs at the end of `ingest` (or as a `populate_*` post-pass parallel to `populate_deref_caches`).                                                                                                       |
+| Narrow helper               | [`greycat-analyzer-analysis/src/analyzer.rs`](../greycat-analyzer-analysis/src/analyzer.rs) | New `Cx::narrow_complement(known, asserted)`. Pure over `arena` + `index` + `decl_registry`.                                                                                                                                                                                       |
+| Else-branch narrow wiring   | [`greycat-analyzer-analysis/src/analyzer.rs`](../greycat-analyzer-analysis/src/analyzer.rs) | In `CondNarrows` collection / application: route plain `is` through the new helper for the else-branch frame. Mirror for `!is` (already has an else-branch entry; just replace the asserted type with the complement). Mirror for `is \|\| is` via union-of-asserts subtraction.   |
+| Exhaustion diagnostic       | [`greycat-analyzer-analysis/src/analyzer.rs`](../greycat-analyzer-analysis/src/analyzer.rs) | New `is-check-exhausts-hierarchy` Warning at the if-condition span when `narrow_complement` returns `never`. Distinct from the existing "condition is always (true\|false)" — emitted only when the asserted type covers every closed concrete derivative.                          |
+| Reproducer test flip        | [`greycat-analyzer-server/tests/lsp_capabilities.rs`](../greycat-analyzer-server/tests/lsp_capabilities.rs) | The `sealed_hierarchy_is_narrow_does_not_false_positive` test already exists; extend it to also assert that `expect_circle(s)` in the else-branch does not flag "Shape not assignable to Circle" (the `then_branch_err` filter currently only guards the then-branch).      |
+| Docs                        | [`README.md`](../README.md)                                                                  | Update the analyzer feature blurb / examples if subtype-narrowing is called out there. CLAUDE.md's analysis-stages section already names "is-narrowing" as a layered concern; no new checklist row needed.                                                                          |
+
+**Chunks:**
+
+- [ ] **41.1 Subtype-closure + ancestor-reverse indices** (S) — `subtype_closure` (every type, canonical-sorted), `abstract_by_closure_set` (reverse index, Symbol-alpha tie-break), `is_abstract` on `ProjectIndex`, all built at end of `ingest`. Unit tests: (a) closure contents are concrete-only and span cross-module decls (Shape → Rect/Circle; Animal/Mammal/Feline/Cat chain); (b) reverse lookup returns the right abstract for `closure(Bird)` exactly; (c) **order-independence**: declare the same hierarchy with subtypes in different source orders (`Eagle, Penguin, Sparrow` vs `Sparrow, Eagle, Penguin`) and assert both produce the same `abstract_by_closure_set` entry resolving to `Bird`; (d) tie-break test with two same-closure abstracts asserts alphabetically-earlier wins deterministically.
+- [ ] **41.2 `narrow_complement` helper with mandatory collapse** (S) — pure function over `arena` + `index` + `decl_registry`. Returns `Type(A_handle)` whenever the subtraction set exactly matches `closure(A)` for some abstract `A`; otherwise the union (or singleton). Unit tests: single-leaf-remaining returns the leaf; multi-leaf with no ancestor match returns the Union; multi-leaf with ancestor match returns `Type(ancestor)`; exhausted returns never; non-closed returns None; non-derivative asserted returns None; hierarchy-expansion test (add a sibling, assert collapse stops applying).
+- [ ] **41.3 Plain `if (s is T)` else-branch wiring** (S) — populate an `else_typed_complement` entry alongside `then_typed`; route through the helper at else-branch entry. The existing reproducer test in `lsp_capabilities.rs` flips green here.
+- [ ] **41.4 `!is` and `is \|\| is` mirroring** (S) — same routing for the existing `else_typed` / `then_typed_union` paths. Tests: `if (!(s is Rect))` narrows in the then-branch; `if (s is Rect \|\| s is Square)` narrows in the else; user's deeply-nested `Animal/Mammal/Feline/Bird` example renders `a: Bird` in the outer else.
+- [ ] **41.5 Exhaustion diagnostic** (XS) — new `is-check-exhausts-hierarchy` Warning at the if-condition span. Register in `LINT_RULES` if framed as a lint, or emit as a `DiagCategory::Structural` directly from `analyzer.rs` (closer to existing `condition is always …` siblings, no rule registration needed).
+- [ ] **41.6 Generic-root note + docs** (XS) — explicit out-of-scope line documenting that closed generic roots (`Container<T> → {ArrayContainer<T>, MapContainer<T>}`) fall back to no-narrow until generic substitution is wired through the closure walker. Capture in code comments at the bail-out site so a future revisit knows where to start.
+
+**M41:** The canonical reproducer (`abstract type Shape {}` + Rect/Circle + `if (s is Rect) { expect_rect(s); } else { expect_circle(s); }`) typechecks with zero diagnostics on both branches. A 3-leaf hierarchy where the else-branch user code targets only one leaf still flags appropriately. `cargo test --workspace` + `cargo clippy --workspace --all-targets` clean.
+
+**Out of scope:**
+
+- Generic-root closure walking (`Container<T> → ArrayContainer<T> | MapContainer<T>`). Documented bail-out; revisit when the generic substitution story for the closure index is worth building.
+- `@sealed` keyword or any explicit hierarchy marker. The project graph is the closure boundary; explicit marking would be redundant given `@library` / `@include` already pin the world.
+- Pattern-matching syntax (`match s { Rect r => …, Circle c => … }`). GreyCat doesn't have it; the narrowing here is exclusively `is`-driven via `if` / `else`.
+- Multi-receiver narrowing (`if (s is Rect && t is Square)` narrowing `s` *and* `t` separately in the else). The current narrow stack already supports per-binding entries; the else-complement just needs to apply per-ident. Falls out of 41.3 naturally — no separate chunk.
+- Fold the exhaustion case into the existing `condition is always …` decidability pass. The decidable pass answers "is this condition impossible?"; sealed exhaustion answers "is the else-branch impossible?". Distinct questions — keep them in their own emission sites.
+- **Then-branch collapse to a single concrete leaf** when the asserted type is abstract with one derivative. `a: Animal; if (a is Feline)` keeps `a: Feline`, not `a: Cat`. Future siblings (`type Tiger extends Feline`) would silently break code that relied on the collapse. The user writes a further `is Cat` when they need Cat-specific access.
+- **Auto-collapsing user-written unions.** `var x: Eagle | Penguin | Sparrow` stays as-written even when set-equal to `closure(Bird)`. The mandatory collapse only applies to TypeIds manufactured by `narrow_complement` — user authoring intent is preserved verbatim everywhere else.
 
 ---
 
