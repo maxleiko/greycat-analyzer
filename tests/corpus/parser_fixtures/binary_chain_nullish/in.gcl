@@ -1,0 +1,3 @@
+fn f() {
+    var x = aaaaaaaaaaaaaa ?? bbbbbbbbbbbb ?? cccccccccccccccc ?? dddddddddddddddd ?? eeeeeeeeeeeeeeee ?? ffffffffffffffff;
+}

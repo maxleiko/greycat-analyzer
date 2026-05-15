@@ -1,0 +1,5 @@
+fn f() {
+    for (i, k, v in indexed_long_iterator_name.member_access.something_else_long_name_aaa sampling 100 limit 50 skip 10) {
+        x;
+    }
+}

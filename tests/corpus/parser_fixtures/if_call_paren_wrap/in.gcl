@@ -1,0 +1,5 @@
+fn f() {
+    if (some_really_really_really_really_really_really_long_function_call_with_many_letters_aaaaaaaa(arg1, arg2, arg3)) {
+        x;
+    }
+}

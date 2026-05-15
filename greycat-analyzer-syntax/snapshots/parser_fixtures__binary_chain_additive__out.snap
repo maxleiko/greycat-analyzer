@@ -1,0 +1,55 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f(aaaaaaaaaaaaaa: int, bbbbbbbbbbbbbb: int, cccccccccccccc: int, dddddddddddddd: int) {\n    var sum = aaaaaaaaaaaaaaaaaaa\n        + bbbbbbbbbbbbbbbbbbb\n        - ccccccccccccccccccc\n        + ddddddddddddddddddd\n        - eeeeeeeeeeeeeeeeeee;\n}"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'aaaaaaaaaaaaaa')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'bbbbbbbbbbbbbb')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'cccccccccccccc')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'dddddddddddddd')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+    )
+    body: (block
+      (var_decl
+        name: (ident 'sum')
+        (initializer
+          expr: (binary_expr
+            left: (binary_expr
+              left: (binary_expr
+                left: (binary_expr
+                  left: (ident 'aaaaaaaaaaaaaaaaaaa')
+                  right: (ident 'bbbbbbbbbbbbbbbbbbb')
+                )
+                right: (ident 'ccccccccccccccccccc')
+              )
+              right: (ident 'ddddddddddddddddddd')
+            )
+            right: (ident 'eeeeeeeeeeeeeeeeeee')
+          )
+        )
+      )
+    )
+  )
+)

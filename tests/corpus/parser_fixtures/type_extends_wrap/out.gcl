@@ -1,0 +1,2 @@
+type LongExtends
+    extends LongBase<SomeVeryLongTypeParameterAaa, SomeVeryLongTypeParameterBbb, SomeVeryLongTypeParameterCcc> {}

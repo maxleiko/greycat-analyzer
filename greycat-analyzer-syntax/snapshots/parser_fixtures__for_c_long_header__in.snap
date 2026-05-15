@@ -1,0 +1,40 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f() {\n    for (var i: int = 0; i < some_very_long_condition_name_aaa && some_other_condition_name_bbb; i = i + step_size_value) {\n        x;\n    }\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (for_stmt
+        it_name: (ident 'i')
+        it_type: (type_ident
+          name: (ident 'int')
+        )
+        it_value: (number
+          (number_int '0')
+        )
+        it_condition: (binary_expr
+          left: (binary_expr
+            left: (ident 'i')
+            right: (ident 'some_very_long_condition_name_aaa')
+          )
+          right: (ident 'some_other_condition_name_bbb')
+        )
+        it_increment: (binary_expr
+          left: (ident 'i')
+          right: (binary_expr
+            left: (ident 'i')
+            right: (ident 'step_size_value')
+          )
+        )
+        block: (block
+          (expr_stmt
+            (ident 'x')
+          )
+        )
+      )
+    )
+  )
+)

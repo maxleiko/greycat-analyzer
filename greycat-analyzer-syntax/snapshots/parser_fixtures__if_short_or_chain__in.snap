@@ -1,0 +1,43 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn example(a: bool, b: bool, c: bool) {\n    if (a || b || c) {\n        // ok\n    }\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'example')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'a')
+        type: (type_ident
+          name: (ident 'bool')
+        )
+      )
+      param: (fn_param
+        name: (ident 'b')
+        type: (type_ident
+          name: (ident 'bool')
+        )
+      )
+      param: (fn_param
+        name: (ident 'c')
+        type: (type_ident
+          name: (ident 'bool')
+        )
+      )
+    )
+    body: (block
+      (if_stmt
+        condition: (binary_expr
+          left: (binary_expr
+            left: (ident 'a')
+            right: (ident 'b')
+          )
+          right: (ident 'c')
+        )
+        then_branch: (block
+          (line_comment '// ok')
+        )
+      )
+    )
+  )
+)

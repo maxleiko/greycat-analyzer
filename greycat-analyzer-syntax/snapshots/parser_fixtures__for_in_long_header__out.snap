@@ -1,0 +1,44 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f() {\n    for (\n        i,\n        k,\n        v in indexed_long_iterator_name.member_access.something_else_long_name_aaa sampling 100 limit 50 skip 10\n    ) {\n        x;\n    }\n}"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (for_in_stmt
+        (for_in_param
+          name: (ident 'i')
+        )
+        (for_in_param
+          name: (ident 'k')
+        )
+        (for_in_param
+          name: (ident 'v')
+        )
+        iterator: (member_expr
+          (member_expr
+            (ident 'indexed_long_iterator_name')
+            property: (ident 'member_access')
+          )
+          property: (ident 'something_else_long_name_aaa')
+        )
+        sampling: (number
+          (number_int '100')
+        )
+        limit: (number
+          (number_int '50')
+        )
+        skip: (number
+          (number_int '10')
+        )
+        block: (block
+          (expr_stmt
+            (ident 'x')
+          )
+        )
+      )
+    )
+  )
+)

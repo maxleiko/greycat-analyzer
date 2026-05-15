@@ -1,0 +1,83 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "enum Example {\n    first_field,\n    second_field,\n    third_field,\n    fourth_field,\n}\n\nfn example(e: Example) {\n    if (e == Example::first_field || e == Example::second_field || e == Example::third_field || e == Example::fourth_field) {\n        // do something\n    }\n}\n"
+---
+(module
+  (enum_decl
+    name: (ident 'Example')
+    body: (enum_body
+      (enum_field
+        (ident 'first_field')
+      )
+      (enum_field
+        (ident 'second_field')
+      )
+      (enum_field
+        (ident 'third_field')
+      )
+      (enum_field
+        (ident 'fourth_field')
+      )
+    )
+  )
+  (fn_decl
+    name: (ident 'example')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'e')
+        type: (type_ident
+          name: (ident 'Example')
+        )
+      )
+    )
+    body: (block
+      (if_stmt
+        condition: (binary_expr
+          left: (binary_expr
+            left: (binary_expr
+              left: (binary_expr
+                left: (ident 'e')
+                right: (static_expr
+                  (type_ident
+                    name: (ident 'Example')
+                  )
+                  property: (ident 'first_field')
+                )
+              )
+              right: (binary_expr
+                left: (ident 'e')
+                right: (static_expr
+                  (type_ident
+                    name: (ident 'Example')
+                  )
+                  property: (ident 'second_field')
+                )
+              )
+            )
+            right: (binary_expr
+              left: (ident 'e')
+              right: (static_expr
+                (type_ident
+                  name: (ident 'Example')
+                )
+                property: (ident 'third_field')
+              )
+            )
+          )
+          right: (binary_expr
+            left: (ident 'e')
+            right: (static_expr
+              (type_ident
+                name: (ident 'Example')
+              )
+              property: (ident 'fourth_field')
+            )
+          )
+        )
+        then_branch: (block
+          (line_comment '// do something')
+        )
+      )
+    )
+  )
+)

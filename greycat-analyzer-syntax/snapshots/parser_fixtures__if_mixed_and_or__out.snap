@@ -1,0 +1,128 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn example(aaa: int, bbb: int, ccc: int, ddd: int, eee: int, fff: int, ggg: int, hhh: int) {\n    if (aaa == 1111 && bbb == 2222\n        || ccc == 3333 && ddd == 4444\n        || eee == 5555 && fff == 6666\n        || ggg == 7777 && hhh == 8888) {\n        // mixed\n    }\n}"
+---
+(module
+  (fn_decl
+    name: (ident 'example')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'aaa')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'bbb')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'ccc')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'ddd')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'eee')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'fff')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'ggg')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'hhh')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+    )
+    body: (block
+      (if_stmt
+        condition: (binary_expr
+          left: (binary_expr
+            left: (binary_expr
+              left: (binary_expr
+                left: (binary_expr
+                  left: (ident 'aaa')
+                  right: (number
+                    (number_int '1111')
+                  )
+                )
+                right: (binary_expr
+                  left: (ident 'bbb')
+                  right: (number
+                    (number_int '2222')
+                  )
+                )
+              )
+              right: (binary_expr
+                left: (binary_expr
+                  left: (ident 'ccc')
+                  right: (number
+                    (number_int '3333')
+                  )
+                )
+                right: (binary_expr
+                  left: (ident 'ddd')
+                  right: (number
+                    (number_int '4444')
+                  )
+                )
+              )
+            )
+            right: (binary_expr
+              left: (binary_expr
+                left: (ident 'eee')
+                right: (number
+                  (number_int '5555')
+                )
+              )
+              right: (binary_expr
+                left: (ident 'fff')
+                right: (number
+                  (number_int '6666')
+                )
+              )
+            )
+          )
+          right: (binary_expr
+            left: (binary_expr
+              left: (ident 'ggg')
+              right: (number
+                (number_int '7777')
+              )
+            )
+            right: (binary_expr
+              left: (ident 'hhh')
+              right: (number
+                (number_int '8888')
+              )
+            )
+          )
+        )
+        then_branch: (block
+          (line_comment '// mixed')
+        )
+      )
+    )
+  )
+)

@@ -1,0 +1,51 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f(obj: SomeType) {\n    var result = obj\n        .method_with_long_name_aaaaa(arg)\n        .another_method_bbbbb()\n        .yet_another_method_ccccc()\n        .final_call_ddddd();\n}"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'obj')
+        type: (type_ident
+          name: (ident 'SomeType')
+        )
+      )
+    )
+    body: (block
+      (var_decl
+        name: (ident 'result')
+        (initializer
+          expr: (call_expr
+            fn: (member_expr
+              (call_expr
+                fn: (member_expr
+                  (call_expr
+                    fn: (member_expr
+                      (call_expr
+                        fn: (member_expr
+                          (ident 'obj')
+                          property: (ident 'method_with_long_name_aaaaa')
+                        )
+                        (args
+                          (ident 'arg')
+                        )
+                      )
+                      property: (ident 'another_method_bbbbb')
+                    )
+                    (args '()')
+                  )
+                  property: (ident 'yet_another_method_ccccc')
+                )
+                (args '()')
+              )
+              property: (ident 'final_call_ddddd')
+            )
+            (args '()')
+          )
+        )
+      )
+    )
+  )
+)

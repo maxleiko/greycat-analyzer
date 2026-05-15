@@ -1,0 +1,33 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f() {\n    var x = aaaaaaaaaaaaaa ?? bbbbbbbbbbbb ?? cccccccccccccccc ?? dddddddddddddddd ?? eeeeeeeeeeeeeeee ?? ffffffffffffffff;\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 'x')
+        (initializer
+          expr: (binary_expr
+            left: (binary_expr
+              left: (binary_expr
+                left: (binary_expr
+                  left: (binary_expr
+                    left: (ident 'aaaaaaaaaaaaaa')
+                    right: (ident 'bbbbbbbbbbbb')
+                  )
+                  right: (ident 'cccccccccccccccc')
+                )
+                right: (ident 'dddddddddddddddd')
+              )
+              right: (ident 'eeeeeeeeeeeeeeee')
+            )
+            right: (ident 'ffffffffffffffff')
+          )
+        )
+      )
+    )
+  )
+)

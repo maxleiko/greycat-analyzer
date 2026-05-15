@@ -1,0 +1,21 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f() {\n    var t = (some_very_long_expression_that_is_definitely_long_enough_aaaaaa, some_other_very_long_expression_thing_aaaaaaa);\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 't')
+        (initializer
+          expr: (tuple_expr
+            left: (ident 'some_very_long_expression_that_is_definitely_long_enough_aaaaaa')
+            right: (ident 'some_other_very_long_expression_thing_aaaaaaa')
+          )
+        )
+      )
+    )
+  )
+)

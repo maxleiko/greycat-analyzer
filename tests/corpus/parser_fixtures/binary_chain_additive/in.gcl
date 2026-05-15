@@ -1,0 +1,3 @@
+fn f(aaaaaaaaaaaaaa: int, bbbbbbbbbbbbbb: int, cccccccccccccc: int, dddddddddddddd: int) {
+    var sum = aaaaaaaaaaaaaaaaaaa + bbbbbbbbbbbbbbbbbbb - ccccccccccccccccccc + ddddddddddddddddddd - eeeeeeeeeeeeeeeeeee;
+}

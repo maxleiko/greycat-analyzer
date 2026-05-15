@@ -1,0 +1,27 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f() {\n    if (some_really_really_really_really_really_really_long_function_call_with_many_letters_aaaaaaaa(arg1, arg2, arg3)) {\n        x;\n    }\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (if_stmt
+        condition: (call_expr
+          fn: (ident 'some_really_really_really_really_really_really_long_function_call_with_many_letters_aaaaaaaa')
+          (args
+            (ident 'arg1')
+            (ident 'arg2')
+            (ident 'arg3')
+          )
+        )
+        then_branch: (block
+          (expr_stmt
+            (ident 'x')
+          )
+        )
+      )
+    )
+  )
+)

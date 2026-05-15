@@ -1,0 +1,20 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f() {\n    var p = (\n        some_very_long_expression_that_definitely_overflows_one_hundred_twenty_columns_aaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    );\n}"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 'p')
+        (initializer
+          expr: (paren_expr
+            expr: (ident 'some_very_long_expression_that_definitely_overflows_one_hundred_twenty_columns_aaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+          )
+        )
+      )
+    )
+  )
+)

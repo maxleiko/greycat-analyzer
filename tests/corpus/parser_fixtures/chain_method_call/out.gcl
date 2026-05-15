@@ -1,0 +1,7 @@
+fn f(obj: SomeType) {
+    var result = obj
+        .method_with_long_name_aaaaa(arg)
+        .another_method_bbbbb()
+        .yet_another_method_ccccc()
+        .final_call_ddddd();
+}

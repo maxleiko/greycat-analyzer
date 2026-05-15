@@ -1,0 +1,6 @@
+fn f() {
+    var t = (
+        some_very_long_expression_that_is_definitely_long_enough_aaaaaa,
+        some_other_very_long_expression_thing_aaaaaaa
+    );
+}

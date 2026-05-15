@@ -1,0 +1,5 @@
+fn f() {
+    var p = (
+        some_very_long_expression_that_definitely_overflows_one_hundred_twenty_columns_aaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    );
+}

@@ -1,0 +1,22 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "type LongExtends extends LongBase<SomeVeryLongTypeParameterAaa, SomeVeryLongTypeParameterBbb, SomeVeryLongTypeParameterCcc> {}\n"
+---
+(module
+  (type_decl
+    name: (ident 'LongExtends')
+    supertype: (type_ident
+      name: (ident 'LongBase')
+      params: (type_ident
+        name: (ident 'SomeVeryLongTypeParameterAaa')
+      )
+      params: (type_ident
+        name: (ident 'SomeVeryLongTypeParameterBbb')
+      )
+      params: (type_ident
+        name: (ident 'SomeVeryLongTypeParameterCcc')
+      )
+    )
+    body: (type_body '{}')
+  )
+)

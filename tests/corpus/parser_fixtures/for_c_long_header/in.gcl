@@ -1,0 +1,5 @@
+fn f() {
+    for (var i: int = 0; i < some_very_long_condition_name_aaa && some_other_condition_name_bbb; i = i + step_size_value) {
+        x;
+    }
+}

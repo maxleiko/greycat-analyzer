@@ -310,8 +310,11 @@ fn lower_type_decl<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         parts.push(lower_node(cx, p));
     }
     if let Some(s) = node.child_by_field_name("supertype") {
-        parts.push(Doc::text(" extends "));
-        parts.push(lower_node(cx, s));
+        parts.push(Doc::group(Doc::indent(Doc::concat(vec![
+            Doc::line(),
+            Doc::text("extends "),
+            lower_node(cx, s),
+        ]))));
     }
     if let Some(body) = node.child_by_field_name("body") {
         parts.push(Doc::space());
@@ -816,7 +819,7 @@ fn lower_return_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if let Some(e) = expr {
         Doc::concat(vec![
             Doc::text("return "),
-            lower_node(cx, e),
+            wrap_keyword_expr(cx, e),
             Doc::text(";"),
         ])
     } else {
@@ -830,11 +833,40 @@ fn lower_keyword_expr_stmt<'a>(cx: &Cx<'a>, node: Node<'a>, kw: &'static str) ->
     if let Some(e) = expr {
         Doc::concat(vec![
             Doc::text(format!("{kw} ")),
-            lower_node(cx, e),
+            wrap_keyword_expr(cx, e),
             Doc::text(";"),
         ])
     } else {
         Doc::text(format!("{kw};"))
+    }
+}
+
+/// Lower an expression that follows a statement keyword (`return`,
+/// `throw`, …) with a fallback line-break before the expression when
+/// the keyword + expression would overflow. Expressions whose own
+/// lowering already breaks (chains) are emitted as-is, since adding an
+/// outer Group on top would just produce nested wrapping.
+fn wrap_keyword_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    if is_self_wrapping_expr(cx, node) {
+        lower_node(cx, node)
+    } else {
+        Doc::group(Doc::indent(Doc::concat(vec![
+            Doc::softline(),
+            lower_node(cx, node),
+        ])))
+    }
+}
+
+/// True when the expression's lowering already produces a `Doc::Group`
+/// that can break across lines on its own. Used by paren-wrapping
+/// callers (if/while/return/…) to avoid stacking a redundant outer
+/// Group on top of an inner break.
+fn is_self_wrapping_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> bool {
+    match node.kind() {
+        "binary_expr" => binary_op_text(cx, node)
+            .and_then(|op| chain_group(&op))
+            .is_some(),
+        _ => false,
     }
 }
 
@@ -851,7 +883,7 @@ fn lower_expr_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 fn lower_if_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut parts = vec![Doc::text("if (")];
     if let Some(cond) = node.child_by_field_name("condition") {
-        parts.push(lower_node(cx, cond));
+        parts.push(wrap_paren_condition(cx, cond));
     }
     parts.push(Doc::text(") "));
     if let Some(t) = node.child_by_field_name("then_branch") {
@@ -885,7 +917,7 @@ fn lower_if_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 fn lower_while_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut parts = vec![Doc::text("while (")];
     if let Some(cond) = node.child_by_field_name("condition") {
-        parts.push(lower_node(cx, cond));
+        parts.push(wrap_paren_condition(cx, cond));
     }
     parts.push(Doc::text(") "));
     if let Some(b) = node.child_by_field_name("block") {
@@ -901,28 +933,78 @@ fn lower_do_while_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     }
     parts.push(Doc::text(" while ("));
     if let Some(cond) = node.child_by_field_name("condition") {
-        parts.push(lower_node(cx, cond));
+        parts.push(wrap_paren_condition(cx, cond));
     }
     parts.push(Doc::text(");"));
     Doc::concat(parts)
 }
 
-fn lower_for_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // `for (var i: T = init; cond; incr) <block>`
-    // Render verbatim header text — too many small fields and
-    // grammar-internal hidden rules to be worth a structured emit at
-    // P21.3 maturity. Body uses the structural lowerer.
-    let header_end = node.child_by_field_name("block").map(|b| b.start_byte());
-    let header = if let Some(end) = header_end {
-        // Take everything from start of for_stmt to start of block,
-        // then trim trailing whitespace.
-        let raw = &cx.source[node.start_byte()..end];
-        let trimmed = raw.trim_end();
-        trimmed.to_string()
+/// Wrap a condition expression (the body of `if (…)`, `while (…)`,
+/// `at (…)`, `do { } while (…)`) so the parens flow onto their own
+/// lines when the condition would overflow. Chain-style conditions
+/// already break internally and are emitted as-is — the leading
+/// operator stays on the `if (` line rather than the more-verbose
+/// "parens on bare lines" shape.
+fn wrap_paren_condition<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    if is_self_wrapping_expr(cx, node) {
+        lower_node(cx, node)
     } else {
-        cx.text(node).to_string()
-    };
-    let mut parts = vec![Doc::text(header), Doc::space()];
+        Doc::group(Doc::concat(vec![
+            Doc::indent(Doc::concat(vec![Doc::softline(), lower_node(cx, node)])),
+            Doc::softline(),
+        ]))
+    }
+}
+
+fn lower_for_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // `for (var <name>[: <type>] = <init>; <cond>; <incr>) <block>`
+    let it_name = node
+        .child_by_field_name("it_name")
+        .map(|n| cx.text(n).to_string())
+        .unwrap_or_default();
+    // The `it_type` field grammar is `optional(seq(":", $.type_ident))`,
+    // and tree-sitter applies the field name to *every* element of the
+    // seq — so `child_by_field_name("it_type")` returns the `:` token,
+    // not the type_ident. Pick the named type_ident directly instead.
+    let it_type = named_child_by_field(node, "it_type").map(|n| lower_node(cx, n));
+    let it_value = node
+        .child_by_field_name("it_value")
+        .map(|n| lower_node(cx, n));
+    let it_condition = node
+        .child_by_field_name("it_condition")
+        .map(|n| lower_node(cx, n));
+    let it_increment = node
+        .child_by_field_name("it_increment")
+        .map(|n| lower_node(cx, n));
+
+    let mut init = vec![Doc::text("var "), Doc::text(it_name)];
+    if let Some(t) = it_type {
+        init.push(Doc::text(": "));
+        init.push(t);
+    }
+    init.push(Doc::text(" = "));
+    if let Some(v) = it_value {
+        init.push(v);
+    }
+
+    let header = Doc::concat(vec![
+        Doc::concat(init),
+        Doc::text(";"),
+        Doc::line(),
+        it_condition.unwrap_or(Doc::nil()),
+        Doc::text(";"),
+        Doc::line(),
+        it_increment.unwrap_or(Doc::nil()),
+    ]);
+
+    let mut parts = vec![
+        Doc::text("for ("),
+        Doc::group(Doc::concat(vec![
+            Doc::indent(Doc::concat(vec![Doc::softline(), header])),
+            Doc::softline(),
+        ])),
+        Doc::text(") "),
+    ];
     if let Some(b) = node.child_by_field_name("block") {
         parts.push(lower_node(cx, b));
     }
@@ -930,16 +1012,108 @@ fn lower_for_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_for_in_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // Same approach as for_stmt: header is verbatim, body is structural.
-    let header_end = node.child_by_field_name("block").map(|b| b.start_byte());
-    let header = if let Some(end) = header_end {
-        cx.source[node.start_byte()..end].trim_end().to_string()
-    } else {
-        cx.text(node).to_string()
-    };
-    let mut parts = vec![Doc::text(header), Doc::space()];
+    // `for (<param>[, <param>...] in <iter>[?][<range>][sampling X][limit Y][skip Z]) <block>`
+    let mut params: Vec<Node<'_>> = Vec::new();
+    let mut iter_optional = false;
+    let mut walker = node.walk();
+    for c in node.named_children(&mut walker) {
+        match c.kind() {
+            "for_in_param" => params.push(c),
+            "optional" => iter_optional = true,
+            _ => {}
+        }
+    }
+
+    let iterator = node
+        .child_by_field_name("iterator")
+        .map(|n| lower_node(cx, n));
+    let range = node.child_by_field_name("range").map(|n| lower_node(cx, n));
+    // `sampling` / `limit` / `skip` fields wrap a seq with the keyword
+    // and the expr — same trap as `it_type` on for_stmt: the field
+    // tags both children, and `child_by_field_name` returns the keyword
+    // token. Pick the named expr child directly.
+    let sampling = named_child_by_field(node, "sampling").map(|n| lower_node(cx, n));
+    let limit = named_child_by_field(node, "limit").map(|n| lower_node(cx, n));
+    let skip = named_child_by_field(node, "skip").map(|n| lower_node(cx, n));
+
+    let mut header: Vec<Doc> = Vec::new();
+    for (i, p) in params.iter().enumerate() {
+        if i > 0 {
+            header.push(Doc::text(","));
+            header.push(Doc::line());
+        }
+        header.push(lower_for_in_param(cx, *p));
+    }
+    header.push(Doc::text(" in "));
+    if let Some(it) = iterator {
+        header.push(it);
+    }
+    if iter_optional {
+        header.push(Doc::text("?"));
+    }
+    if let Some(r) = range {
+        header.push(Doc::space());
+        header.push(r);
+    }
+    if let Some(s) = sampling {
+        header.push(Doc::text(" sampling "));
+        header.push(s);
+    }
+    if let Some(l) = limit {
+        header.push(Doc::text(" limit "));
+        header.push(l);
+    }
+    if let Some(sk) = skip {
+        header.push(Doc::text(" skip "));
+        header.push(sk);
+    }
+
+    let mut parts = vec![
+        Doc::text("for ("),
+        Doc::group(Doc::concat(vec![
+            Doc::indent(Doc::concat(vec![Doc::softline(), Doc::concat(header)])),
+            Doc::softline(),
+        ])),
+        Doc::text(") "),
+    ];
     if let Some(b) = node.child_by_field_name("block") {
         parts.push(lower_node(cx, b));
+    }
+    Doc::concat(parts)
+}
+
+/// `child_by_field_name` matches the *first* child with the given
+/// field name, but when the grammar applies a field to a wrapping
+/// `seq(token, $.named_node)` (as in for_stmt's `it_type` or for_in_stmt's
+/// `sampling` / `limit` / `skip`), tree-sitter tags both children with
+/// the field name and returns the keyword/punctuation first. Walking
+/// the cursor and filtering to named children with the matching field
+/// gives the actual content node.
+fn named_child_by_field<'a>(node: Node<'a>, name: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        if cursor.node().is_named() && cursor.field_name() == Some(name) {
+            return Some(cursor.node());
+        }
+        if !cursor.goto_next_sibling() {
+            return None;
+        }
+    }
+}
+
+fn lower_for_in_param<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| cx.text(n).to_string())
+        .unwrap_or_default();
+    let ty = node.child_by_field_name("type").map(|n| lower_node(cx, n));
+    let mut parts = vec![Doc::text(name)];
+    if let Some(t) = ty {
+        parts.push(Doc::text(": "));
+        parts.push(t);
     }
     Doc::concat(parts)
 }
@@ -969,7 +1143,7 @@ fn lower_try_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 fn lower_at_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut parts = vec![Doc::text("at (")];
     if let Some(e) = node.child_by_field_name("expr") {
-        parts.push(lower_node(cx, e));
+        parts.push(wrap_paren_condition(cx, e));
     }
     parts.push(Doc::text(") "));
     if let Some(b) = node.child_by_field_name("block") {
@@ -983,18 +1157,35 @@ fn lower_at_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 fn lower_binary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     // left <op> right. Op is one of: ?? ^ / * % + - > >= < <= == != as is && || = ?=
     // All take spaces around. `as`/`is` take a `type_ident` on the right.
-    let left = node.child_by_field_name("left").map(|n| lower_node(cx, n));
-    let right = node.child_by_field_name("right").map(|n| lower_node(cx, n));
-    // Operator: scan children for the first anonymous one between left and right.
-    let mut op_text: Option<String> = None;
-    let mut walker = node.walk();
-    for c in node.children(&mut walker) {
-        if !c.is_named() && !c.byte_range().is_empty() {
-            op_text = Some(cx.text(c).to_string());
-            break;
+    let op = binary_op_text(cx, node).unwrap_or_else(|| String::from("?"));
+
+    // Flatten left-associative chains of same-precedence operators into one
+    // Group, so the renderer can break before each operator onto its own
+    // continuation line (leading-operator style). Mixed precedence stays
+    // safe because the walk only descends while the left child's operator
+    // is in the *same* group — e.g. `a && b || c` (parsed as `(a && b) || c`)
+    // walks the outer `||` chain and treats the inner `&&` subtree as one
+    // atomic operand.
+    if let Some(group) = chain_group(&op) {
+        let mut head: Option<Doc> = None;
+        let mut segments: Vec<(String, Doc)> = Vec::new();
+        collect_op_chain(cx, node, group, &mut head, &mut segments);
+        if let Some(head_doc) = head
+            && segments.len() >= 2
+        {
+            let mut tail: Vec<Doc> = Vec::new();
+            for (seg_op, operand) in segments {
+                tail.push(Doc::line());
+                tail.push(Doc::text(seg_op));
+                tail.push(Doc::space());
+                tail.push(operand);
+            }
+            return Doc::group(Doc::concat(vec![head_doc, Doc::indent(Doc::concat(tail))]));
         }
     }
-    let op = op_text.unwrap_or_else(|| String::from("?"));
+
+    let left = node.child_by_field_name("left").map(|n| lower_node(cx, n));
+    let right = node.child_by_field_name("right").map(|n| lower_node(cx, n));
     let mut parts = Vec::new();
     if let Some(l) = left {
         parts.push(l);
@@ -1006,6 +1197,72 @@ fn lower_binary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         parts.push(r);
     }
     Doc::concat(parts)
+}
+
+/// Extract the operator text from a `binary_expr` — the first non-empty
+/// anonymous child between `left` and `right`.
+fn binary_op_text<'a>(cx: &Cx<'a>, node: Node<'a>) -> Option<String> {
+    let mut walker = node.walk();
+    for c in node.children(&mut walker) {
+        if !c.is_named() && !c.byte_range().is_empty() {
+            return Some(cx.text(c).to_string());
+        }
+    }
+    None
+}
+
+/// Precedence group for chain-wrappable binary operators. Same-group
+/// operators flatten into one Group; cross-group boundaries become
+/// atomic operands. Comparison / `as` / `is` / `=` / `?=` aren't
+/// chainable (or have non-expr right operands) and stay out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainGroup {
+    LogicalOr,
+    LogicalAnd,
+    Nullish,
+    Additive,
+    Multiplicative,
+    Xor,
+}
+
+fn chain_group(op: &str) -> Option<ChainGroup> {
+    match op {
+        "||" => Some(ChainGroup::LogicalOr),
+        "&&" => Some(ChainGroup::LogicalAnd),
+        "??" => Some(ChainGroup::Nullish),
+        "+" | "-" => Some(ChainGroup::Additive),
+        "*" | "/" | "%" => Some(ChainGroup::Multiplicative),
+        "^" => Some(ChainGroup::Xor),
+        _ => None,
+    }
+}
+
+/// Walk the left spine of a same-group operator chain and push
+/// `(op, operand)` pairs in source order into `out`. The chain's head
+/// operand (the deepest left leaf that isn't a same-group binary_expr)
+/// goes into `out_head`. Stops descending whenever the left child isn't
+/// a `binary_expr` with an operator in the same group — that subtree is
+/// then treated as one atomic operand.
+fn collect_op_chain<'a>(
+    cx: &Cx<'a>,
+    node: Node<'a>,
+    group: ChainGroup,
+    out_head: &mut Option<Doc>,
+    out_segments: &mut Vec<(String, Doc)>,
+) {
+    if let Some(left) = node.child_by_field_name("left") {
+        if left.kind() == "binary_expr"
+            && binary_op_text(cx, left).and_then(|op| chain_group(&op)) == Some(group)
+        {
+            collect_op_chain(cx, left, group, out_head, out_segments);
+        } else {
+            *out_head = Some(lower_node(cx, left));
+        }
+    }
+    let op = binary_op_text(cx, node).unwrap_or_else(|| String::from("?"));
+    if let Some(right) = node.child_by_field_name("right") {
+        out_segments.push((op, lower_node(cx, right)));
+    }
 }
 
 fn lower_unary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
@@ -1044,22 +1301,32 @@ fn lower_paren_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         .child_by_field_name("expr")
         .map(|n| lower_node(cx, n))
         .unwrap_or(Doc::nil());
-    Doc::concat(vec![Doc::text("("), inner, Doc::text(")")])
+    Doc::group(Doc::concat(vec![
+        Doc::text("("),
+        Doc::indent(Doc::concat(vec![Doc::softline(), inner])),
+        Doc::softline(),
+        Doc::text(")"),
+    ]))
 }
 
 fn lower_tuple_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let l = node.child_by_field_name("left").map(|n| lower_node(cx, n));
     let r = node.child_by_field_name("right").map(|n| lower_node(cx, n));
-    let mut parts = vec![Doc::text("(")];
+    let mut inner = vec![Doc::softline()];
     if let Some(l) = l {
-        parts.push(l);
+        inner.push(l);
     }
-    parts.push(Doc::text(", "));
+    inner.push(Doc::text(","));
+    inner.push(Doc::line());
     if let Some(r) = r {
-        parts.push(r);
+        inner.push(r);
     }
-    parts.push(Doc::text(")"));
-    Doc::concat(parts)
+    Doc::group(Doc::concat(vec![
+        Doc::text("("),
+        Doc::indent(Doc::concat(inner)),
+        Doc::softline(),
+        Doc::text(")"),
+    ]))
 }
 
 fn lower_object_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
@@ -1162,58 +1429,202 @@ fn lower_array_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_call_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // <fn> <args>
-    let mut parts = Vec::new();
-    if let Some(f) = node.child_by_field_name("fn") {
-        parts.push(lower_node(cx, f));
-    }
-    let mut walker = node.walk();
-    for c in node.named_children(&mut walker) {
-        if c.kind() == "args" {
-            parts.push(lower_args_call(cx, c));
-            break;
-        }
-    }
-    Doc::concat(parts)
+    lower_chain_root(cx, node)
 }
 
 fn lower_member_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    lower_dot_arrow_expr(cx, node, ".")
+    lower_chain_root(cx, node)
 }
 
 fn lower_arrow_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    lower_dot_arrow_expr(cx, node, "->")
+    lower_chain_root(cx, node)
 }
 
-fn lower_dot_arrow_expr<'a>(cx: &Cx<'a>, node: Node<'a>, sep: &'static str) -> Doc {
-    // `<recv> <pre_optional?> . <property> <post_optional?>`
-    // Children in source order: receiver (named), optional `?` (named),
-    // `.` (anon), property (named ident), optional `?` (named).
-    let mut walker = node.walk();
+/// Postfix chain link. Each link contributes content after the head
+/// (or previous link) in source order. `leading` is glued to whatever
+/// precedes it (no break-point); `after_break`, when present, is the
+/// portion that can flow onto a continuation line when the chain Group
+/// breaks. Break-points sit between `leading` and `after_break`.
+struct ChainLink {
+    leading: Doc,
+    after_break: Option<Doc>,
+}
+
+/// Lower an outermost postfix-chain node (`member_expr`, `arrow_expr`,
+/// `call_expr`, `offset_expr`) into one Group so the renderer can break
+/// the chain at `.` / `->` points when it overflows. Trivial chains
+/// (single call / single member access) collapse to flat text via the
+/// Group's fits check.
+fn lower_chain_root<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut head: Option<Doc> = None;
+    let mut links: Vec<ChainLink> = Vec::new();
+    collect_postfix_chain(cx, node, &mut head, &mut links);
+    let head_doc = head.unwrap_or(Doc::nil());
+
+    if links.is_empty() {
+        return head_doc;
+    }
+
     let mut parts: Vec<Doc> = Vec::new();
-    let mut emitted_sep = false;
-    for c in node.children(&mut walker) {
-        if !c.is_named() && !c.byte_range().is_empty() {
-            // The `.` or `->` operator.
-            parts.push(Doc::text(sep.to_string()));
-            emitted_sep = true;
-            continue;
+    for link in links {
+        if !is_doc_nil(&link.leading) {
+            parts.push(link.leading);
         }
-        if !c.is_named() {
-            continue;
-        }
-        // Named children: receiver, optional `?`, property ident.
-        if c.kind() == "optional" {
-            // Render the literal `?` token as-is.
-            parts.push(Doc::text("?"));
-        } else if !emitted_sep {
-            parts.push(lower_node(cx, c));
-        } else {
-            // Property ident.
-            parts.push(Doc::text(cx.text(c)));
+        if let Some(trail) = link.after_break {
+            parts.push(Doc::softline());
+            parts.push(trail);
         }
     }
-    Doc::concat(parts)
+    Doc::group(Doc::concat(vec![head_doc, Doc::indent(Doc::concat(parts))]))
+}
+
+fn is_doc_nil(d: &Doc) -> bool {
+    matches!(d, Doc::Nil)
+}
+
+/// Walk down the postfix chain (through `receiver` / `fn`), collecting
+/// per-link contributions in source order. Stops descending when the
+/// child is no longer a postfix kind — that subtree becomes the head
+/// (lowered through `lower_node` to preserve its own structure).
+fn collect_postfix_chain<'a>(
+    cx: &Cx<'a>,
+    node: Node<'a>,
+    out_head: &mut Option<Doc>,
+    out_links: &mut Vec<ChainLink>,
+) {
+    match node.kind() {
+        "member_expr" => collect_member_link(cx, node, ".", out_head, out_links),
+        "arrow_expr" => collect_member_link(cx, node, "->", out_head, out_links),
+        "call_expr" => {
+            if let Some(fn_node) = node.child_by_field_name("fn") {
+                collect_postfix_chain(cx, fn_node, out_head, out_links);
+            }
+            let mut walker = node.walk();
+            for c in node.named_children(&mut walker) {
+                if c.kind() == "args" {
+                    out_links.push(ChainLink {
+                        leading: lower_args_call(cx, c),
+                        after_break: None,
+                    });
+                    break;
+                }
+            }
+        }
+        "offset_expr" => collect_offset_link(cx, node, out_head, out_links),
+        _ => *out_head = Some(lower_node(cx, node)),
+    }
+}
+
+/// Build a member-or-arrow link: `[pre_?]<sep><prop>[post_?]`. The
+/// break-point sits before `<sep>`, so the pre-optional `?` glues to
+/// the previous link / head and travels on the leading side.
+fn collect_member_link<'a>(
+    cx: &Cx<'a>,
+    node: Node<'a>,
+    sep: &'static str,
+    out_head: &mut Option<Doc>,
+    out_links: &mut Vec<ChainLink>,
+) {
+    let mut walker = node.walk();
+    let mut emitted_sep = false;
+    let mut recv: Option<Node<'_>> = None;
+    let mut prop_doc: Option<Doc> = None;
+    let mut pre_opt = false;
+    let mut post_opt = false;
+
+    for c in node.children(&mut walker) {
+        if !c.is_named() {
+            if !c.byte_range().is_empty() {
+                emitted_sep = true;
+            }
+            continue;
+        }
+        if c.kind() == "optional" {
+            if emitted_sep {
+                post_opt = true;
+            } else {
+                pre_opt = true;
+            }
+        } else if !emitted_sep {
+            recv = Some(c);
+        } else {
+            prop_doc = Some(Doc::text(cx.text(c).to_string()));
+        }
+    }
+
+    if let Some(r) = recv {
+        collect_postfix_chain(cx, r, out_head, out_links);
+    }
+
+    let leading = if pre_opt { Doc::text("?") } else { Doc::nil() };
+    let mut trail_parts = vec![Doc::text(sep.to_string())];
+    if let Some(p) = prop_doc {
+        trail_parts.push(p);
+    }
+    if post_opt {
+        trail_parts.push(Doc::text("?"));
+    }
+    out_links.push(ChainLink {
+        leading,
+        after_break: Some(Doc::concat(trail_parts)),
+    });
+}
+
+fn collect_offset_link<'a>(
+    cx: &Cx<'a>,
+    node: Node<'a>,
+    out_head: &mut Option<Doc>,
+    out_links: &mut Vec<ChainLink>,
+) {
+    let mut walker = node.walk();
+    let mut state: u8 = 0; // 0 = before `[`, 1 = between `[` and `]`, 2 = after `]`
+    let mut recv: Option<Node<'_>> = None;
+    let mut idx: Option<Node<'_>> = None;
+    let mut pre_opt = false;
+    let mut post_opt = false;
+
+    for c in node.children(&mut walker) {
+        if c.is_named() {
+            if c.kind() == "optional" {
+                if state == 0 {
+                    pre_opt = true;
+                } else if state == 2 {
+                    post_opt = true;
+                }
+            } else if state == 0 {
+                recv = Some(c);
+            } else if state == 1 {
+                idx = Some(c);
+            }
+        } else if !c.byte_range().is_empty() {
+            match cx.text(c) {
+                "[" => state = 1,
+                "]" => state = 2,
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(r) = recv {
+        collect_postfix_chain(cx, r, out_head, out_links);
+    }
+
+    let mut leading_parts: Vec<Doc> = Vec::new();
+    if pre_opt {
+        leading_parts.push(Doc::text("?"));
+    }
+    leading_parts.push(Doc::text("["));
+    if let Some(i) = idx {
+        leading_parts.push(lower_node(cx, i));
+    }
+    leading_parts.push(Doc::text("]"));
+    if post_opt {
+        leading_parts.push(Doc::text("?"));
+    }
+    out_links.push(ChainLink {
+        leading: Doc::concat(leading_parts),
+        after_break: None,
+    });
 }
 
 fn lower_static_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
@@ -1238,34 +1649,7 @@ fn lower_static_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_offset_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // `<recv>?[<index>]?`
-    let mut walker = node.walk();
-    let mut parts: Vec<Doc> = Vec::new();
-    let mut state = 0u8; // 0=before [, 1=after [, 2=after ]
-    for c in node.children(&mut walker) {
-        if c.is_named() {
-            if c.kind() == "optional" {
-                parts.push(Doc::text("?"));
-            } else {
-                parts.push(lower_node(cx, c));
-            }
-        } else if !c.byte_range().is_empty() {
-            let t = cx.text(c);
-            match t {
-                "[" => {
-                    parts.push(Doc::text("["));
-                    state = 1;
-                }
-                "]" => {
-                    parts.push(Doc::text("]"));
-                    state = 2;
-                }
-                _ => parts.push(Doc::text(t.to_string())),
-            }
-        }
-    }
-    let _ = state;
-    Doc::concat(parts)
+    lower_chain_root(cx, node)
 }
 
 fn lower_lambda_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
