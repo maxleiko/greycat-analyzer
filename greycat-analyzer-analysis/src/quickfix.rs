@@ -38,6 +38,7 @@ pub fn edit_for_diagnostic(
         "unused-local" => unused_local_fix(text, start),
         "unused-decl" => unused_decl_fix(text, start),
         "unused-param" => unused_param_fix(text, start, end),
+        "unused-generic-param" => unused_generic_param_fix(text, start, end),
         "possibly-null" => possibly_null_fix(text, end),
         "redundant-nullable-access" => redundant_nullable_access_fix(text, start, end),
         "redundant-non-null-assertion" | "redundant-coalesce" => redundant_slice_fix(start, end),
@@ -250,6 +251,116 @@ fn unused_param_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
         byte_range: start..end,
         new_text: format!("_{name}"),
     }]
+}
+
+/// Strip an unused generic parameter from its enclosing `<...>`. The
+/// param's binding-site byte range is `ident_start..ident_end`; the
+/// fix decides which surrounding delimiter to swallow:
+///
+/// - If the preceding non-whitespace byte is `,`: cut from that comma
+///   through the end of the ident. `<X, T>` / `<X, T, Y>` →
+///   `<X>` / `<X, Y>`.
+/// - Else if the following non-whitespace byte is `,`: cut from the
+///   ident's start through that comma and any whitespace after it.
+///   `<T, X>` → `<X>`.
+/// - Else the param is the *only* generic (prev `<`, next `>`): cut
+///   the whole `<T>` block. `type Foo<T> {}` → `type Foo {}`.
+///
+/// Refuses the fix when the name still appears elsewhere in the
+/// enclosing decl — same belt-and-suspenders safety net
+/// [`unused_param_fix`] uses against stale-source false positives.
+fn unused_generic_param_fix(text: &str, ident_start: usize, ident_end: usize) -> Vec<TextEdit> {
+    if ident_end <= ident_start || ident_end > text.len() {
+        return Vec::new();
+    }
+    let name = &text[ident_start..ident_end];
+    if name.starts_with('_') {
+        return Vec::new();
+    }
+    if !is_generic_name_unused_in_enclosing_decl(text, ident_start, ident_end, name) {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    // Walk back through whitespace to the preceding `,` or `<`.
+    let mut left = ident_start;
+    while left > 0 && matches!(bytes[left - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        left -= 1;
+    }
+    if left == 0 {
+        return Vec::new();
+    }
+    let prev = bytes[left - 1];
+    let prev_pos = left - 1;
+    if prev != b',' && prev != b'<' {
+        return Vec::new();
+    }
+    // Walk forward through whitespace to the following `,` or `>`.
+    let mut right = ident_end;
+    while right < bytes.len() && matches!(bytes[right], b' ' | b'\t' | b'\n' | b'\r') {
+        right += 1;
+    }
+    if right >= bytes.len() {
+        return Vec::new();
+    }
+    let next = bytes[right];
+    let next_pos = right;
+    if next != b',' && next != b'>' {
+        return Vec::new();
+    }
+    let (cut_start, cut_end) = match (prev, next) {
+        // `<X, T>` / `<X, T, Y>` → swallow `, T`.
+        (b',', _) => (prev_pos, ident_end),
+        // `<T, X>` → swallow `T,` plus any whitespace after the comma
+        // so the survivor isn't left with a leading space.
+        (b'<', b',') => {
+            let mut after = next_pos + 1;
+            while after < bytes.len() && matches!(bytes[after], b' ' | b'\t') {
+                after += 1;
+            }
+            (ident_start, after)
+        }
+        // `<T>` only → swallow the whole `<...>` block.
+        (b'<', b'>') => (prev_pos, next_pos + 1),
+        _ => return Vec::new(),
+    };
+    vec![TextEdit {
+        byte_range: cut_start..cut_end,
+        new_text: String::new(),
+    }]
+}
+
+/// Whole-word search for `name` across the enclosing `fn_decl` /
+/// `type_decl` / `type_method`, excluding the binding-site range
+/// itself. The lint rule already established this invariant before
+/// emitting; re-checking here defends the fix against drifted source.
+fn is_generic_name_unused_in_enclosing_decl(
+    text: &str,
+    binding_start: usize,
+    binding_end: usize,
+    name: &str,
+) -> bool {
+    let tree = greycat_analyzer_syntax::parse(text);
+    let root = tree.root_node();
+    let Some(mut node) = root.descendant_for_byte_range(binding_start, binding_start) else {
+        return true;
+    };
+    loop {
+        match node.kind() {
+            "fn_decl" | "type_method" | "type_decl" => break,
+            _ => {}
+        }
+        let Some(p) = node.parent() else {
+            return true;
+        };
+        node = p;
+    }
+    let range = node.byte_range();
+    let rel_b_start = binding_start.saturating_sub(range.start);
+    let rel_b_end = binding_end.saturating_sub(range.start);
+    let decl_text = &text[range.start..range.end];
+    let before = decl_text.get(..rel_b_start).unwrap_or("");
+    let after = decl_text.get(rel_b_end..).unwrap_or("");
+    !contains_whole_word(before, name) && !contains_whole_word(after, name)
 }
 
 fn possibly_null_fix(text: &str, recv_end: usize) -> Vec<TextEdit> {
@@ -915,6 +1026,107 @@ mod tests {
         let edits = fix("unused-param", src, p_start..(p_start + 6));
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, "_unused");
+    }
+
+    fn apply(src: &str, edits: &[TextEdit]) -> String {
+        let mut out = src.to_string();
+        for e in edits.iter().rev() {
+            out.replace_range(e.byte_range.clone(), &e.new_text);
+        }
+        out
+    }
+
+    #[test]
+    fn unused_generic_param_strips_only_generic_block() {
+        let src = "type Foo<T> { a: int; }\n";
+        let t = src.find('T').unwrap();
+        let edits = fix("unused-generic-param", src, t..(t + 1));
+        assert_eq!(edits.len(), 1);
+        let after = apply(src, &edits);
+        assert_eq!(after, "type Foo { a: int; }\n");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "produced parse error: {after}"
+        );
+    }
+
+    #[test]
+    fn unused_generic_param_strips_leading_param() {
+        let src = "type Map<K, V> { a: V; }\n";
+        let k = src.find('K').unwrap();
+        let edits = fix("unused-generic-param", src, k..(k + 1));
+        assert_eq!(edits.len(), 1);
+        let after = apply(src, &edits);
+        assert_eq!(after, "type Map<V> { a: V; }\n");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "produced parse error: {after}"
+        );
+    }
+
+    #[test]
+    fn unused_generic_param_strips_trailing_param() {
+        let src = "type Map<K, V> { a: K; }\n";
+        let v = src.find(", V").unwrap() + 2;
+        let edits = fix("unused-generic-param", src, v..(v + 1));
+        assert_eq!(edits.len(), 1);
+        let after = apply(src, &edits);
+        assert_eq!(after, "type Map<K> { a: K; }\n");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "produced parse error: {after}"
+        );
+    }
+
+    #[test]
+    fn unused_generic_param_strips_middle_param_in_three_arity() {
+        let src = "fn foo<A, B, C>(a: A, c: C): A { return a; }\n";
+        let b = src.find(", B").unwrap() + 2;
+        let edits = fix("unused-generic-param", src, b..(b + 1));
+        assert_eq!(edits.len(), 1);
+        let after = apply(src, &edits);
+        assert_eq!(after, "fn foo<A, C>(a: A, c: C): A { return a; }\n");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "produced parse error: {after}"
+        );
+    }
+
+    #[test]
+    fn unused_generic_param_strips_fn_generic() {
+        let src = "fn foo<T>(x: int): int { return x; }\n";
+        let t = src.find('T').unwrap();
+        let edits = fix("unused-generic-param", src, t..(t + 1));
+        assert_eq!(edits.len(), 1);
+        let after = apply(src, &edits);
+        assert_eq!(after, "fn foo(x: int): int { return x; }\n");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "produced parse error: {after}"
+        );
+    }
+
+    #[test]
+    fn unused_generic_param_skipped_when_body_uses_it() {
+        // Drifted source: the lint may have emitted for `T` but a
+        // subsequent edit introduced a use. The fix must refuse.
+        let src = "fn foo<T>(x: T): T { return x; }\n";
+        let t = src.find('T').unwrap();
+        let edits = fix("unused-generic-param", src, t..(t + 1));
+        assert!(edits.is_empty(), "expected refusal, got {edits:?}");
+    }
+
+    #[test]
+    fn unused_generic_param_skipped_when_underscore_prefixed() {
+        let src = "type Foo<_T> { a: int; }\n";
+        let t = src.find("_T").unwrap();
+        let edits = fix("unused-generic-param", src, t..(t + 2));
+        assert!(edits.is_empty(), "expected refusal, got {edits:?}");
     }
 
     #[test]
