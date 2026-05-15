@@ -1,3 +1,9 @@
 - fmt: is still moving EOL comments to the line below in certain cases
-- lsp: rename is not implemented (or not working?)
+- fmt: EOL Comment should not remove the space before `//` (it should ensure only 1 appears) in things like:
+  ```gcl
+  fn main() {
+      var x; // formatting will remove the leading whitespace before the EOL comment
+  }
+  ```
+- lsp: rename does not propagate across enum-variant uses (`E::A` in `QualifiedStatic` chains)
 - lsp: find implementations is not implemented (or not working?)

@@ -288,6 +288,83 @@ fn cross_module_references_aggregates_across_docs() {
 }
 
 #[test]
+fn rename_method_renames_binding_and_call_sites() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let u = Uri::from_str("file:///m.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        u.clone(),
+        "type T { fn m(): int { return 1; } } fn caller(t: T) { t.m(); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    // Cursor on the method binding `m` inside `fn m(): int`.
+    let edit = capabilities::rename_across_project(&pa, &mgr, &u, pos(0, 12), "n").unwrap();
+    #[allow(clippy::mutable_key_type)]
+    let changes = edit.changes.unwrap();
+    let edits = changes.get(&u).expect("home-module edits");
+    assert_eq!(
+        edits.len(),
+        2,
+        "expected binding + call-site rename: {edits:?}"
+    );
+    for e in edits {
+        assert_eq!(e.new_text, "n");
+    }
+}
+
+#[test]
+fn rename_type_attr_renames_binding_and_member_access() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let u = Uri::from_str("file:///m.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        u.clone(),
+        "type T { a: int; } fn caller(t: T) { var x = t.a; }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    // Cursor on the attr binding `a` inside `a: int;`.
+    let edit = capabilities::rename_across_project(&pa, &mgr, &u, pos(0, 9), "b").unwrap();
+    #[allow(clippy::mutable_key_type)]
+    let changes = edit.changes.unwrap();
+    let edits = changes.get(&u).expect("home-module edits");
+    assert_eq!(
+        edits.len(),
+        2,
+        "expected binding + member-access rename: {edits:?}"
+    );
+}
+
+#[test]
+fn rename_cross_module_method_aggregates_per_uri() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let home = Uri::from_str("file:///home.gcl").unwrap();
+    let user = Uri::from_str("file:///user.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        home.clone(),
+        "type T { fn m(): int { return 1; } }\n",
+        "p",
+        false,
+    );
+    mgr.add_simple(user.clone(), "fn caller(t: T) { t.m(); }\n", "p", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    // Cursor on home.gcl's `m` binding (col 12 inside `fn m(): int`).
+    let edit = capabilities::rename_across_project(&pa, &mgr, &home, pos(0, 12), "n").unwrap();
+    #[allow(clippy::mutable_key_type)]
+    let changes = edit.changes.unwrap();
+    assert_eq!(changes.len(), 2, "expected edits in both URIs: {changes:?}");
+    assert_eq!(changes.get(&home).unwrap().len(), 1);
+    assert_eq!(changes.get(&user).unwrap().len(), 1);
+}
+
+#[test]
 fn cross_module_rename_aggregates_text_edits_per_uri() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
