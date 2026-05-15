@@ -6,5 +6,4 @@
   }
   ```
 - lsp: rename is not implemented (or not working?)
-- lsp: find implementations is not implemented (or not working?)
 - lint: new unused-generic-param rule for generic types that don't use there declared generic params (most likely a mistake/oversight)
