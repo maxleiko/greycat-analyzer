@@ -1597,6 +1597,24 @@ pub enum RenameTarget {
         uri: Uri,
         decl: greycat_analyzer_hir::arena::Idx<Decl>,
     },
+    /// A type attribute (`type Foo { name: String; }`). Use sites
+    /// bind via the analyzer's `member_uses` / `foreign_member_uses`
+    /// maps, not via the resolver — so a separate target shape is
+    /// needed.
+    TypeAttr {
+        uri: Uri,
+        attr: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeAttr>,
+    },
+    /// A type method (`type Foo { fn m() ... }`). The method itself
+    /// is a `Decl::Fn` (with its own `Idx<Decl>`), but use sites
+    /// resolve through `member_uses` / `foreign_member_uses` rather
+    /// than `Resolutions::uses`. Distinct from
+    /// [`Self::ProjectDecl`] so the visitor can fan out over the
+    /// member-use maps instead of decl-use maps.
+    TypeMethod {
+        uri: Uri,
+        method: greycat_analyzer_hir::arena::Idx<Decl>,
+    },
 }
 
 /// Inspect the cursor's binding through cached project analysis and
@@ -1609,6 +1627,7 @@ pub fn resolve_rename_target(
     cursor_uri: &Uri,
     cursor_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
 ) -> Option<RenameTarget> {
+    use greycat_analyzer_analysis::analyzer::MemberDef;
     let module = project.module(cursor_uri)?;
     if let Some(def) = module.resolutions.lookup(cursor_idx) {
         return match def {
@@ -1628,9 +1647,41 @@ pub fn resolve_rename_target(
             Definition::Project => None,
         };
     }
-    // Cursor isn't a use site — it's on a binding. Top-level decl
-    // names appear in `module.decls`; everything else (param names,
-    // local var names, generic-param decls) treats as LocalIdent.
+    // Member-position cursor: the resolver doesn't bind `.x` /
+    // `t.method()` (member resolution lives in the analyzer). Consult
+    // the analyzer's member-use maps to find which attr / method this
+    // use site refers to, then return the corresponding rename target
+    // anchored at the *home* module of the type that owns the member.
+    if let Some(member) = module.analysis.member_lookup(cursor_idx) {
+        return Some(match member {
+            MemberDef::Attr(attr) => RenameTarget::TypeAttr {
+                uri: cursor_uri.clone(),
+                attr,
+            },
+            MemberDef::Method(method) => RenameTarget::TypeMethod {
+                uri: cursor_uri.clone(),
+                method,
+            },
+        });
+    }
+    if let Some(foreign) = module.analysis.foreign_member_lookup(cursor_idx) {
+        return Some(match foreign.member {
+            MemberDef::Attr(attr) => RenameTarget::TypeAttr {
+                uri: foreign.uri.clone(),
+                attr,
+            },
+            MemberDef::Method(method) => RenameTarget::TypeMethod {
+                uri: foreign.uri.clone(),
+                method,
+            },
+        });
+    }
+    // Cursor isn't a use site — it's on a binding. Three flavors of
+    // binding live at module top level:
+    //   1. Top-level decls (`fn` / `type` / `enum` / `var`) — their
+    //      name idents appear in `module.decls`.
+    //   2. Type members (attrs + methods) — nested under a `Decl::Type`.
+    //   3. Param / local / generic — the LocalIdent fallback.
     let module_root = module.hir.module.as_ref()?;
     for &decl_id in &module_root.decls {
         if module.hir.decls[decl_id].name() == Some(cursor_idx) {
@@ -1638,6 +1689,24 @@ pub fn resolve_rename_target(
                 uri: cursor_uri.clone(),
                 decl: decl_id,
             });
+        }
+        if let Decl::Type(td) = &module.hir.decls[decl_id] {
+            for &attr_id in &td.attrs {
+                if module.hir.type_attrs[attr_id].name == cursor_idx {
+                    return Some(RenameTarget::TypeAttr {
+                        uri: cursor_uri.clone(),
+                        attr: attr_id,
+                    });
+                }
+            }
+            for &method_id in &td.methods {
+                if module.hir.decls[method_id].name() == Some(cursor_idx) {
+                    return Some(RenameTarget::TypeMethod {
+                        uri: cursor_uri.clone(),
+                        method: method_id,
+                    });
+                }
+            }
         }
     }
     Some(RenameTarget::LocalIdent {
@@ -1787,6 +1856,105 @@ fn visit_target_sites(
                     if let Definition::ProjectDecl { uri, decl } = def
                         && uri == target_uri
                         && decl == target_decl
+                    {
+                        emit(
+                            other_uri,
+                            &other_doc.text,
+                            other_module.hir.idents[*use_idx].byte_range.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        RenameTarget::TypeAttr {
+            uri: target_uri,
+            attr: target_attr,
+        } => {
+            use greycat_analyzer_analysis::analyzer::MemberDef;
+            // Home module: binding site + same-module member_uses.
+            if let Some(home_cell) = manager.get(target_uri)
+                && let Some(home_module) = project.module(target_uri)
+            {
+                let home_doc = home_cell.borrow();
+                let name_idx = home_module.hir.type_attrs[*target_attr].name;
+                emit(
+                    target_uri,
+                    &home_doc.text,
+                    home_module.hir.idents[name_idx].byte_range.clone(),
+                );
+                for (use_idx, member) in &home_module.analysis.member_uses {
+                    if matches!(member, MemberDef::Attr(a) if a == target_attr) {
+                        emit(
+                            target_uri,
+                            &home_doc.text,
+                            home_module.hir.idents[*use_idx].byte_range.clone(),
+                        );
+                    }
+                }
+            }
+            // Importers: foreign_member_uses entries pointing at this
+            // attr in the home module.
+            for (other_uri, other_module) in project.iter() {
+                if other_uri == target_uri {
+                    continue;
+                }
+                let Some(other_cell) = manager.get(other_uri) else {
+                    continue;
+                };
+                let other_doc = other_cell.borrow();
+                for (use_idx, foreign) in &other_module.analysis.foreign_member_uses {
+                    if foreign.uri == *target_uri
+                        && matches!(foreign.member, MemberDef::Attr(a) if a == *target_attr)
+                    {
+                        emit(
+                            other_uri,
+                            &other_doc.text,
+                            other_module.hir.idents[*use_idx].byte_range.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        RenameTarget::TypeMethod {
+            uri: target_uri,
+            method: target_method,
+        } => {
+            use greycat_analyzer_analysis::analyzer::MemberDef;
+            // Home module: method's own name + every same-module
+            // member_uses pointing at it.
+            if let Some(home_cell) = manager.get(target_uri)
+                && let Some(home_module) = project.module(target_uri)
+            {
+                let home_doc = home_cell.borrow();
+                if let Some(name_idx) = home_module.hir.decls[*target_method].name() {
+                    emit(
+                        target_uri,
+                        &home_doc.text,
+                        home_module.hir.idents[name_idx].byte_range.clone(),
+                    );
+                }
+                for (use_idx, member) in &home_module.analysis.member_uses {
+                    if matches!(member, MemberDef::Method(m) if m == target_method) {
+                        emit(
+                            target_uri,
+                            &home_doc.text,
+                            home_module.hir.idents[*use_idx].byte_range.clone(),
+                        );
+                    }
+                }
+            }
+            // Importers: foreign_member_uses pointing at this method.
+            for (other_uri, other_module) in project.iter() {
+                if other_uri == target_uri {
+                    continue;
+                }
+                let Some(other_cell) = manager.get(other_uri) else {
+                    continue;
+                };
+                let other_doc = other_cell.borrow();
+                for (use_idx, foreign) in &other_module.analysis.foreign_member_uses {
+                    if foreign.uri == *target_uri
+                        && matches!(foreign.member, MemberDef::Method(m) if m == *target_method)
                     {
                         emit(
                             other_uri,
