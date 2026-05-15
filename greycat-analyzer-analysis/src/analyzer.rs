@@ -3685,31 +3685,24 @@ impl<'a> Cx<'a> {
                 let base = if index_is_range {
                     underlying
                 } else {
-                    // Pull the generic's name + args via the arena's
-                    // decl-names table so this dispatch is purely
-                    // string-keyed downstream — no decl-handle plumbing
-                    // needed for the small fixed set of node-tag /
-                    // collection names below.
-                    let info: Option<(SmolStr, Vec<TypeId>)> =
-                        match &self.arena.get(underlying).kind {
-                            TypeKind::Generic { decl, args } => self
-                                .decl_name(*decl)
-                                .map(|n| (SmolStr::from(n), args.to_vec())),
-                            _ => None,
-                        };
-                    match info {
-                        Some((name, args))
-                            if (name == "Array" || name == "Set" || name == "nodeList")
-                                && !args.is_empty() =>
+                    // Offset access (`arr[i]`) is allowed only on
+                    // `Array<T>` per the GreyCat runtime — `greycat
+                    // run` rejects `Map[k]`, `nodeList[k]`,
+                    // `nodeIndex[k]`, etc. with "Offset access is
+                    // only allowed on instances of type 'Array'".
+                    // Compare the generic's decl-handle against
+                    // `WellKnown::array_decl` rather than
+                    // string-matching its printable name: handle
+                    // equality is the canonical identity check for
+                    // std-core decls (see `WellKnown::is_node_tag`)
+                    // and isn't fooled by a user-declared
+                    // `type Array<T>` in their own module.
+                    match &self.arena.get(underlying).kind {
+                        TypeKind::Generic { decl, args }
+                            if Some(*decl) == self.well_known.array_decl && !args.is_empty() =>
                         {
                             args[0]
                         }
-                        Some((name, args))
-                            if (name == "Map" || name == "nodeIndex") && args.len() >= 2 =>
-                        {
-                            args[1]
-                        }
-                        Some((name, args)) if name == "nodeTime" && !args.is_empty() => args[0],
                         _ => self.any_nullable(),
                     }
                 };
