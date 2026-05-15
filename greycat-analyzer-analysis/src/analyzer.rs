@@ -3912,7 +3912,9 @@ impl<'a> Cx<'a> {
                 };
                 if !inheritance_ok
                     && !crate::project::is_castable_with_index(
+                        self.index,
                         self.well_known,
+                        self.decl_registry,
                         self.arena,
                         from_ty,
                         to_ty,

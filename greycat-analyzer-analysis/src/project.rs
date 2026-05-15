@@ -1330,6 +1330,24 @@ pub(crate) fn is_assignable_to_with_index(
         return false;
     }
     match (&a.kind, &b.kind) {
+        // Union handling must recurse into `_with_index` (not core)
+        // so each per-alt check picks up the supertype chain. Core's
+        // own Union arms recurse into core, which only knows decl-
+        // handle identity — that's how `Rect | Circle → Shape`
+        // (every alt extends Shape) used to fail. The "all" / "any"
+        // semantics match core (Union source: every alt must assign;
+        // Union target: any alt accepts the source); we only swap
+        // out the inner relation. Source-Union check fires before
+        // target-Union so a `Union → Union` shape walks alts on the
+        // source first and re-enters this arm for each alt against
+        // the target union, picking up the target's `any` rule
+        // naturally on each recursion.
+        (TypeKind::Union { alts }, _) => alts.iter().all(|alt| {
+            is_assignable_to_with_index(index, well_known, decl_registry, arena, *alt, to)
+        }),
+        (_, TypeKind::Union { alts }) => alts.iter().any(|alt| {
+            is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
+        }),
         // Handle-keyed subtype chain — the only representation
         // production paths produce for `.gcl`-declared types after
         // the `Named` removal. The legacy `(Named, Named)` arm is
@@ -1376,7 +1394,9 @@ pub(crate) fn is_assignable_to_with_index(
 /// (decl)` so a user-declared `type node<T>` (which has its own
 /// handle) doesn't accidentally pick up these rules.
 pub(crate) fn is_castable_with_index(
+    index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
+    decl_registry: &DeclRegistry,
     arena: &TypeArena,
     from: TypeId,
     to: TypeId,
@@ -1386,6 +1406,42 @@ pub(crate) fn is_castable_with_index(
     }
     let from_t = arena.get(from);
     let to_t = arena.get(to);
+    // Union handling. Same layering principle as
+    // `is_assignable_to_with_index`: recurse into self (not core)
+    // so each alt picks up the bidirectional inheritance arm below.
+    // Source-Union: every alt must cast. Target-Union: any alt
+    // accepts. Source-first so `Union → Union` walks source alts and
+    // re-enters this arm for each against the target union.
+    if let TypeKind::Union { alts } = &from_t.kind {
+        return alts
+            .iter()
+            .all(|alt| is_castable_with_index(index, well_known, decl_registry, arena, *alt, to));
+    }
+    if let TypeKind::Union { alts } = &to_t.kind {
+        return alts.iter().any(|alt| {
+            is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+        });
+    }
+    // Bidirectional inheritance for the cast operator — `Sub as Sup`
+    // (upcast, widening) and `Sup as Sub` (downcast, runtime-checked)
+    // are both valid. Generics compare by head-decl identity, matching
+    // the call-site `inheritance_ok` short-circuit's name-based check.
+    let from_decl = match &from_t.kind {
+        TypeKind::Type(d) => Some(*d),
+        TypeKind::Generic { decl, .. } => Some(*decl),
+        _ => None,
+    };
+    let to_decl = match &to_t.kind {
+        TypeKind::Type(d) => Some(*d),
+        TypeKind::Generic { decl, .. } => Some(*decl),
+        _ => None,
+    };
+    if let (Some(fd), Some(td)) = (from_decl, to_decl)
+        && (index.is_subtype_of_decl(decl_registry, fd, td)
+            || index.is_subtype_of_decl(decl_registry, td, fd))
+    {
+        return true;
+    }
     // `*node as int`, `*nodeTime<T> as int`, … — the runtime handle
     // is a 64-bit int.
     if matches!(to_t.kind, TypeKind::Primitive(Primitive::Int))

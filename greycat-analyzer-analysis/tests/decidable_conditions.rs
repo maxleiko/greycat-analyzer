@@ -375,3 +375,78 @@ fn main() {
         "expected one always-true, got: {diags:?}"
     );
 }
+
+#[test]
+fn union_of_subtypes_assigns_to_common_supertype() {
+    // `s is Rect || s is Circle` narrows `s` to `Rect | Circle`.
+    // Both variants extend `Shape`, so the union must be assignable
+    // to a `Shape` parameter. The bug: the index-aware assignability
+    // wrapper had no Union arm, so the per-alt recursion dropped
+    // back to the core (inheritance-blind) relation and rejected
+    // every alt, surfacing a false-positive "not assignable" diag.
+    let src = "\
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+fn expect_shape(_: Shape) {}
+fn main(s: Shape) {
+    if (s is Rect || s is Circle) {
+        expect_shape(s);
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    let diags = assignability_diagnostics(&pa, &uri);
+    assert!(
+        diags.is_empty(),
+        "Union<Rect, Circle> must be assignable to Shape (common supertype), got: {diags:?}"
+    );
+}
+
+#[test]
+fn subtype_assigns_to_union_with_supertype_alt() {
+    // `Cat -> Animal | int` must succeed via the supertype alt.
+    // The bug: target-Union arm in core does `any(alt -> from)`
+    // using the inheritance-blind core relation, so `Cat -> Animal`
+    // failed; the index-aware wrapper had no Union arm to retry.
+    let src = "\
+type Animal {}
+type Cat extends Animal {}
+fn taker(_: Animal | int) {}
+fn main() {
+    var c = Cat{};
+    taker(c);
+}
+";
+    let (uri, pa) = analyze(src);
+    let diags = assignability_diagnostics(&pa, &uri);
+    assert!(
+        diags.is_empty(),
+        "Cat must be assignable to (Animal | int) via supertype alt, got: {diags:?}"
+    );
+}
+
+#[test]
+fn union_of_subtypes_casts_to_common_supertype() {
+    // Symmetric bug in `is_castable_with_index` — same layering, same
+    // missed Union arms. `(Rect | Circle) as Shape` must succeed.
+    let src = "\
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+fn main(s: Shape) {
+    if (s is Rect || s is Circle) {
+        var _x = s as Shape;
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    let cast_diags: Vec<String> = diag_messages(&pa, &uri)
+        .into_iter()
+        .filter(|m| m.contains("cannot cast") || m.contains("not castable"))
+        .collect();
+    assert!(
+        cast_diags.is_empty(),
+        "Union<Rect, Circle> must be castable to Shape (common supertype), got: {cast_diags:?}"
+    );
+}
