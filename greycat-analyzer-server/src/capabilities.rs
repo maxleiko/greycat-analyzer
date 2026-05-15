@@ -158,8 +158,13 @@ pub fn hover_with_project(
                     if let Some(name_id) = decl.name()
                         && module.hir.idents[name_id].byte_range == node.byte_range()
                     {
-                        let markdown =
-                            render_decl_hover_markdown(&module.hir, project.symbols(), decl, None);
+                        let markdown = render_decl_hover_markdown(
+                            &module.hir,
+                            project.symbols(),
+                            decl,
+                            None,
+                            None,
+                        );
                         return Some(hover_from_markdown(
                             markdown,
                             module.hir.idents[name_id].byte_range.clone(),
@@ -251,7 +256,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
                 if let Some(name_id) = decl.name()
                     && hir.idents[name_id].byte_range == node.byte_range()
                 {
-                    let markdown = render_decl_hover_markdown(&hir, &symbols, decl, None);
+                    let markdown = render_decl_hover_markdown(&hir, &symbols, decl, None, None);
                     return Some(hover_from_markdown(
                         markdown,
                         hir.idents[name_id].byte_range.clone(),
@@ -312,8 +317,29 @@ fn ident_hover_markdown(
     // P6.3: property idents in `a.b` aren't in `Resolutions` — they
     // bind to a `TypeAttr` / method via the analyzer's member pass.
     // Check that first so member hovers render with the right shape.
+    //
+    // When a project context is available, build a substitution map
+    // from the receiver's instantiation so the rendered signature
+    // shows the concrete generic args (`fn add(value: String): null`)
+    // instead of the declared param names (`fn add(value: T): null`).
     if let Some(member) = analysis.member_lookup(ident_idx) {
-        return Some(member_hover_markdown(hir, symbols, member, ident));
+        let subst_owner = project.and_then(|ctx| {
+            let recv_ty = receiver_ty_for_property(hir, analysis, ident_idx)?;
+            ctx.project.method_subst_from_receiver_ty(recv_ty)
+        });
+        let render_ctx = project
+            .zip(subst_owner.as_ref())
+            .map(|(ctx, subst)| RenderCtx {
+                project: ctx.project,
+                subst,
+            });
+        return Some(member_hover_markdown(
+            hir,
+            symbols,
+            member,
+            ident,
+            render_ctx.as_ref(),
+        ));
     }
     // P11.5 — cross-module member binding (`a.b` where the receiver
     // type lives in another module, or `Type::method` where Type is
@@ -324,12 +350,19 @@ fn ident_hover_markdown(
         && let Some(fmod) = ctx.project.module(&foreign.uri)
     {
         let provenance = module_label_for_uri(&foreign.uri);
+        let subst_owner = receiver_ty_for_property(hir, analysis, ident_idx)
+            .and_then(|recv_ty| ctx.project.method_subst_from_receiver_ty(recv_ty));
+        let render_ctx = subst_owner.as_ref().map(|subst| RenderCtx {
+            project: ctx.project,
+            subst,
+        });
         return Some(foreign_member_hover_markdown(
             &fmod.hir,
             symbols,
             &foreign.member,
             ident,
             &provenance,
+            render_ctx.as_ref(),
         ));
     }
     // P15.x — chain-segment foreign-decl binding (e.g. `Identity` in
@@ -346,6 +379,7 @@ fn ident_hover_markdown(
             symbols,
             &fmod.hir.decls[fdecl.decl],
             Some(&provenance),
+            None,
         ));
     }
     match resolutions.lookup(ident_idx)? {
@@ -368,6 +402,7 @@ fn ident_hover_markdown(
             symbols,
             &hir.decls[decl_id],
             None,
+            None,
         )),
         Definition::Generic(_) => Some(wrap_code(&format!("(type parameter) {}", ident_name))),
         Definition::ProjectDecl {
@@ -387,6 +422,7 @@ fn ident_hover_markdown(
                     symbols,
                     &fmod.hir.decls[decl],
                     Some(&provenance),
+                    None,
                 ));
             }
             Some(wrap_code(&format!("(project) {}", ident_name)))
@@ -403,6 +439,7 @@ fn member_hover_markdown(
     symbols: &SymbolTable,
     member: greycat_analyzer_analysis::analyzer::MemberDef,
     ident: &greycat_analyzer_hir::types::Ident,
+    ctx: Option<&RenderCtx<'_>>,
 ) -> String {
     use greycat_analyzer_analysis::analyzer::MemberDef;
     match member {
@@ -410,7 +447,7 @@ fn member_hover_markdown(
             let attr = &hir.type_attrs[attr_id];
             let ty_str = attr
                 .ty
-                .map(|t| render_type_ref(hir, symbols, t))
+                .map(|t| render_type_ref_with_subst(hir, symbols, t, ctx))
                 .unwrap_or_else(|| "any".into());
             let mut out = String::new();
             push_doc_section(&mut out, attr.doc.as_deref());
@@ -422,7 +459,7 @@ fn member_hover_markdown(
         }
         MemberDef::Method(decl_id) => {
             let decl = &hir.decls[decl_id];
-            render_decl_hover_markdown(hir, symbols, decl, None)
+            render_decl_hover_markdown(hir, symbols, decl, None, ctx)
         }
     }
 }
@@ -437,6 +474,7 @@ fn foreign_member_hover_markdown(
     member: &greycat_analyzer_analysis::analyzer::MemberDef,
     ident: &greycat_analyzer_hir::types::Ident,
     provenance: &str,
+    ctx: Option<&RenderCtx<'_>>,
 ) -> String {
     use greycat_analyzer_analysis::analyzer::MemberDef;
     let mut out = match member {
@@ -444,7 +482,7 @@ fn foreign_member_hover_markdown(
             let attr = &foreign_hir.type_attrs[*attr_id];
             let ty_str = attr
                 .ty
-                .map(|t| render_type_ref(foreign_hir, symbols, t))
+                .map(|t| render_type_ref_with_subst(foreign_hir, symbols, t, ctx))
                 .unwrap_or_else(|| "any".into());
             let mut s = String::new();
             push_doc_section(&mut s, attr.doc.as_deref());
@@ -456,7 +494,7 @@ fn foreign_member_hover_markdown(
         }
         MemberDef::Method(decl_id) => {
             let decl = &foreign_hir.decls[*decl_id];
-            render_decl_hover_markdown(foreign_hir, symbols, decl, None)
+            render_decl_hover_markdown(foreign_hir, symbols, decl, None, ctx)
         }
     };
     out.push_str("\n\n*defined in `");
@@ -476,9 +514,10 @@ fn render_decl_hover_markdown(
     symbols: &SymbolTable,
     decl: &Decl,
     provenance: Option<&str>,
+    ctx: Option<&RenderCtx<'_>>,
 ) -> String {
     let mut out = String::new();
-    let signature = render_decl_signature(hir, symbols, decl);
+    let signature = render_decl_signature(hir, symbols, decl, ctx);
     out.push_str(&wrap_code(&signature));
     out.push('\n');
     push_doc_section(&mut out, decl_doc(decl));
@@ -504,14 +543,27 @@ fn decl_doc(decl: &Decl) -> Option<&str> {
 /// `fn` decls render the full `fn name<G>(p: T): R`; types render
 /// `type Name<G> extends Parent`; enums render `enum Name`; vars
 /// render `var name: T`.
-fn render_decl_signature(hir: &Hir, symbols: &SymbolTable, decl: &Decl) -> String {
+///
+/// `ctx` carries an optional receiver-instantiation substitution: when
+/// present, generic params on the owning type are rendered as the
+/// receiver's concrete args (e.g. `arr: Array<String>` hovering on
+/// `arr.add` renders `fn add(value: String): null` instead of the
+/// declared `fn add(value: T): null`). The free-function / type-decl
+/// paths pass `None` and the renderer behaves byte-identically to the
+/// unsubst form.
+fn render_decl_signature(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    decl: &Decl,
+    ctx: Option<&RenderCtx<'_>>,
+) -> String {
     match decl {
-        Decl::Fn(d) => render_fn_signature(hir, symbols, d),
+        Decl::Fn(d) => render_fn_signature(hir, symbols, d, ctx),
         Decl::Type(d) => render_type_signature(hir, symbols, d),
         Decl::Enum(d) => format!("enum {}", &symbols[hir.idents[d.name].symbol]),
         Decl::Var(d) => {
             let ty =
-                d.ty.map(|t| render_type_ref(hir, symbols, t))
+                d.ty.map(|t| render_type_ref_with_subst(hir, symbols, t, ctx))
                     .unwrap_or_else(|| "any".into());
             format!("var {}: {}", &symbols[hir.idents[d.name].symbol], ty)
         }
@@ -519,7 +571,12 @@ fn render_decl_signature(hir: &Hir, symbols: &SymbolTable, decl: &Decl) -> Strin
     }
 }
 
-fn render_fn_signature(hir: &Hir, symbols: &SymbolTable, fnd: &FnDecl) -> String {
+fn render_fn_signature(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    fnd: &FnDecl,
+    ctx: Option<&RenderCtx<'_>>,
+) -> String {
     let name = &symbols[hir.idents[fnd.name].symbol];
     let mut out = String::new();
     if fnd.modifiers.private {
@@ -555,14 +612,14 @@ fn render_fn_signature(hir: &Hir, symbols: &SymbolTable, fnd: &FnDecl) -> String
         out.push_str(&symbols[hir.idents[p.name].symbol]);
         out.push_str(": ");
         match p.ty {
-            Some(t) => out.push_str(&render_type_ref(hir, symbols, t)),
+            Some(t) => out.push_str(&render_type_ref_with_subst(hir, symbols, t, ctx)),
             None => out.push_str("any"),
         }
     }
     out.push(')');
     if let Some(ret) = fnd.return_type {
         out.push_str(": ");
-        out.push_str(&render_type_ref(hir, symbols, ret));
+        out.push_str(&render_type_ref_with_subst(hir, symbols, ret, ctx));
     }
     out
 }
@@ -602,7 +659,56 @@ fn render_type_ref(
     symbols: &SymbolTable,
     type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
 ) -> String {
+    render_type_ref_with_subst(hir, symbols, type_ref, None)
+}
+
+/// Receiver-instantiation context used by the substitution-aware
+/// renderers. Built by `make_render_ctx` from a receiver `TypeId` —
+/// hover / completion thread it through `render_decl_signature` so
+/// generic params on a method's owning type (`Array<T>::add`'s `T`)
+/// render as the concrete instantiation (`String`) instead of the
+/// declared param name.
+struct RenderCtx<'a> {
+    project: &'a ProjectAnalysis,
+    subst: &'a FxHashMap<Symbol, TypeId>,
+}
+
+/// Substitution-aware variant of [`render_type_ref`]. When `ctx` is
+/// `Some` and the `TypeRef` is a bare generic-param ident (no
+/// qualifier, no type args) whose symbol is keyed in `ctx.subst`,
+/// render via the project's `display_type` on the substituted TypeId
+/// instead of emitting the literal param name.
+///
+/// Nullability handling: when `tr.optional` is true and the
+/// substituted TypeId isn't already nullable, append `?` (or
+/// ` | null` for a union — `display_type` formats unions without an
+/// outer `?` suffix). When the substituted TypeId is already
+/// nullable, the rendered form already carries the marker — leave it
+/// alone.
+fn render_type_ref_with_subst(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    type_ref: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::TypeRef>,
+    ctx: Option<&RenderCtx<'_>>,
+) -> String {
     let tr = &hir.type_refs[type_ref];
+    if let Some(ctx) = ctx
+        && tr.qualifier.is_empty()
+        && tr.params.is_empty()
+        && let Some(&subst_ty) = ctx.subst.get(&hir.idents[tr.name].symbol)
+    {
+        let rendered = ctx.project.display_type(subst_ty).to_string();
+        if tr.optional {
+            let arena_ty = ctx.project.arena().get(subst_ty);
+            if !arena_ty.nullable {
+                return match &arena_ty.kind {
+                    TypeKind::Union { .. } => format!("{rendered} | null"),
+                    _ => format!("{rendered}?"),
+                };
+            }
+        }
+        return rendered;
+    }
     let mut out = String::new();
     for q in tr.qualifier.iter() {
         out.push_str(&symbols[hir.idents[*q].symbol]);
@@ -615,7 +721,7 @@ fn render_type_ref(
             if i > 0 {
                 out.push_str(", ");
             }
-            out.push_str(&render_type_ref(hir, symbols, *p));
+            out.push_str(&render_type_ref_with_subst(hir, symbols, *p, ctx));
         }
         out.push('>');
     }
@@ -623,6 +729,25 @@ fn render_type_ref(
         out.push('?');
     }
     out
+}
+
+/// Find the receiver's `TypeId` for a property ident bound through
+/// member resolution. Walks `hir.exprs` for an `Expr::Member` /
+/// `Expr::Arrow` whose `property` is this ident, then reads the
+/// receiver expr's settled type from `analysis.expr_types`. Returns
+/// `None` when the property isn't carried by a member/arrow expr
+/// (e.g. `Type::method` static dispatch — handled elsewhere) or when
+/// the receiver's type didn't settle.
+fn receiver_ty_for_property(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    property: Idx<Ident>,
+) -> Option<TypeId> {
+    let receiver_id = hir.exprs.iter().find_map(|(_, e)| match e {
+        Expr::Member(m) | Expr::Arrow(m) if m.property.ident() == property => Some(m.receiver),
+        _ => None,
+    })?;
+    analysis.expr_types.get(&receiver_id).copied()
 }
 
 /// Best-effort module label for a foreign URI. Strips trailing `.gcl`
@@ -4323,7 +4448,7 @@ fn scope_name_meta(
         NameSource::ModuleDecl(decl_id) => {
             let decl = &module.hir.decls[*decl_id];
             (
-                Some(render_decl_signature(&module.hir, symbols, decl)),
+                Some(render_decl_signature(&module.hir, symbols, decl, None)),
                 doc_to_markup(decl_doc(decl)),
             )
         }
@@ -4359,7 +4484,7 @@ fn foreign_decl_completion_meta(
         return (None, None, None);
     };
     let decl = &m.hir.decls[*decl_id];
-    let detail = render_decl_signature(&m.hir, project.symbols(), decl);
+    let detail = render_decl_signature(&m.hir, project.symbols(), decl, None);
     let documentation = doc_to_markup(decl_doc(decl));
     let description = module_label_for_uri(uri);
     (Some(detail), documentation, Some(description))
@@ -4726,6 +4851,15 @@ fn member_completion(
 
     let mut items: Vec<CompletionItem> = Vec::new();
 
+    // Substitution context for receiver-instantiation rendering. When
+    // the receiver is `Array<String>`, build `{T → String}` so each
+    // method completion item's `detail` shows `value: String` instead
+    // of `value: T`.
+    let recv_subst = project.method_subst_from_receiver_ty(recv_ty);
+    let recv_ctx = recv_subst
+        .as_ref()
+        .map(|subst| RenderCtx { project, subst });
+
     // For `->` on a node-tag receiver, skip the tag's own members
     // entirely — those are reachable via `.` only. The analyzer's
     // `arrow_deref_receiver` mirrors this dispatch.
@@ -4741,6 +4875,7 @@ fn member_completion(
                 td,
                 &prefix_lower,
                 &mut items,
+                recv_ctx.as_ref(),
             );
         }
         if items.is_empty()
@@ -4751,12 +4886,25 @@ fn member_completion(
             && let Some(fmod) = project.module(foreign_uri)
             && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
         {
-            collect_type_members(&fmod.hir, project.symbols(), td, &prefix_lower, &mut items);
+            collect_type_members(
+                &fmod.hir,
+                project.symbols(),
+                td,
+                &prefix_lower,
+                &mut items,
+                recv_ctx.as_ref(),
+            );
         }
     }
 
     // Inner type's members. `.` rewrites to `->` via
     // `additional_text_edits`; `->` lands the items verbatim.
+    //
+    // Deref-target subst is intentionally `None` here: the deref
+    // resolution above mints types into a cloned arena, so any
+    // generic args carried by `resolved` aren't addressable through
+    // the shared project arena. Inner-method rendering stays in the
+    // declared form for the deref branch.
     if let Some(inner) = inner_head.as_deref() {
         let mut inner_items: Vec<CompletionItem> = Vec::new();
         if let Some(inner_sym) = project.symbols().lookup(inner)
@@ -4769,6 +4917,7 @@ fn member_completion(
                 td,
                 &prefix_lower,
                 &mut inner_items,
+                None,
             );
         }
         if inner_items.is_empty()
@@ -4785,6 +4934,7 @@ fn member_completion(
                 td,
                 &prefix_lower,
                 &mut inner_items,
+                None,
             );
         }
         if !is_arrow && !inner_items.is_empty() {
@@ -5159,6 +5309,7 @@ fn collect_type_members(
     td: &greycat_analyzer_hir::types::TypeDecl,
     prefix_lower: &str,
     items: &mut Vec<CompletionItem>,
+    ctx: Option<&RenderCtx<'_>>,
 ) {
     for attr_id in &td.attrs {
         let a = &hir.type_attrs[*attr_id];
@@ -5167,7 +5318,7 @@ fn collect_type_members(
             continue;
         }
         let ty =
-            a.ty.map(|t| render_type_ref(hir, symbols, t))
+            a.ty.map(|t| render_type_ref_with_subst(hir, symbols, t, ctx))
                 .unwrap_or_else(|| "any".into());
         items.push(CompletionItem {
             label: name.clone(),
@@ -5195,7 +5346,7 @@ fn collect_type_members(
             label: name.clone(),
             kind: Some(CompletionItemKind::METHOD),
             insert_text: Some(name),
-            detail: Some(render_fn_signature(hir, symbols, m)),
+            detail: Some(render_fn_signature(hir, symbols, m, ctx)),
             documentation: doc_to_markup(m.doc.as_deref()),
             ..Default::default()
         });
@@ -5275,7 +5426,7 @@ fn static_completion(
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
-                    let detail = Some(render_fn_signature(&fmod.hir, project.symbols(), m));
+                    let detail = Some(render_fn_signature(&fmod.hir, project.symbols(), m, None));
                     let documentation = doc_to_markup(m.doc.as_deref());
                     items.push(static_completion_item(
                         name,
@@ -5334,6 +5485,7 @@ fn static_completion(
                 &mod_analysis.hir,
                 project.symbols(),
                 decl,
+                None,
             ));
             let documentation = doc_to_markup(decl_doc(decl));
             items.push(static_completion_item(

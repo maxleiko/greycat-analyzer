@@ -3268,3 +3268,268 @@ fn completion_after_dot_on_modvar_node_receiver_no_error() {
         "expected at least one member completion (no-ERROR variant), got empty list"
     );
 }
+
+/// Synthetic stdlib that exposes `Array<T>` with the methods we
+/// need to exercise receiver-instantiation rendering (`add`, `get`,
+/// `set` — declared with `T` so the substitution can rewrite them).
+fn synthetic_std_core_with_generic_array() -> &'static str {
+    "native type any {}\n\
+     native type null {}\n\
+     native type bool {}\n\
+     native type int {}\n\
+     native type float {}\n\
+     native type String {}\n\
+     native type Array<T> {\n\
+         fn add(value: T);\n\
+         fn get(i: int): T;\n\
+         fn set(i: int, value: T): T;\n\
+         fn last(): T?;\n\
+     }\n\
+     native type Map<K, V> {\n\
+         fn set(key: K, value: V): V;\n\
+         fn get(key: K): V?;\n\
+     }\n"
+}
+
+/// Hover on `arr.add` where `arr: Array<String>` should render the
+/// signature with `T` substituted by `String` — the displayed
+/// signature should match the type-checker's view of the call.
+#[test]
+fn hover_on_generic_method_substitutes_receiver_instantiation() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        stdlib_uri,
+        synthetic_std_core_with_generic_array(),
+        "std",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() {\n    var arr = Array<String>{};\n    arr.add(42);\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor on `add` in `arr.add(42)` (line 2 col 9).
+    let hover = capabilities::hover_with_project(
+        &doc.text,
+        "project",
+        doc.root_node(),
+        pos(2, 9),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover should resolve on `add`");
+    let body = match hover.contents {
+        HoverContents::Markup(m) => m.value,
+        HoverContents::Scalar(MarkedString::String(s)) => s,
+        HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+        HoverContents::Array(_) => panic!("unexpected array hover shape"),
+    };
+    assert!(
+        body.contains("value: String"),
+        "hover should render `value: String` (instantiated), got:\n{body}"
+    );
+    assert!(
+        !body.contains("value: T"),
+        "hover should not leak declared `T` param after subst; got:\n{body}"
+    );
+}
+
+/// Map<K, V> instantiated as `Map<String, int>`: hover on `set`
+/// should substitute both `K` and `V` independently.
+#[test]
+fn hover_on_generic_method_substitutes_multiple_generics() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        stdlib_uri,
+        synthetic_std_core_with_generic_array(),
+        "std",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() {\n    var m = Map<String, int>{};\n    m.set(\"a\", 1);\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor on `set` in `m.set(...)` (line 2 col 7).
+    let hover = capabilities::hover_with_project(
+        &doc.text,
+        "project",
+        doc.root_node(),
+        pos(2, 7),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover should resolve on `set`");
+    let body = match hover.contents {
+        HoverContents::Markup(m) => m.value,
+        HoverContents::Scalar(MarkedString::String(s)) => s,
+        HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+        HoverContents::Array(_) => panic!("unexpected array hover shape"),
+    };
+    assert!(
+        body.contains("key: String") && body.contains("value: int"),
+        "hover should substitute K→String and V→int; got:\n{body}"
+    );
+}
+
+/// Nullable generic-param return (`fn last(): T?`) on `Array<String>`:
+/// hover should render `String?`, not `T?`.
+#[test]
+fn hover_on_nullable_generic_return_substitutes() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        stdlib_uri,
+        synthetic_std_core_with_generic_array(),
+        "std",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() {\n    var arr = Array<String>{};\n    arr.last();\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor on `last` (line 2 col 9).
+    let hover = capabilities::hover_with_project(
+        &doc.text,
+        "project",
+        doc.root_node(),
+        pos(2, 9),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover should resolve on `last`");
+    let body = match hover.contents {
+        HoverContents::Markup(m) => m.value,
+        HoverContents::Scalar(MarkedString::String(s)) => s,
+        HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+        HoverContents::Array(_) => panic!("unexpected array hover shape"),
+    };
+    assert!(
+        body.contains("String?"),
+        "hover should render nullable subst as `String?`; got:\n{body}"
+    );
+}
+
+/// Member completion on a generic receiver should render each
+/// method's `detail` with the receiver's instantiation substituted.
+#[test]
+fn completion_after_dot_substitutes_generic_method_signatures() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        stdlib_uri,
+        synthetic_std_core_with_generic_array(),
+        "std",
+        false,
+    );
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn main() {\n    var arr = Array<String>{};\n    arr.\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after the `.` on line 2 (col 8).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 8),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list after `arr.`");
+    let add = list
+        .items
+        .iter()
+        .find(|i| i.label == "add")
+        .unwrap_or_else(|| panic!("`add` missing from list: {:?}", list.items));
+    let detail = add.detail.as_deref().unwrap_or("");
+    assert!(
+        detail.contains("value: String"),
+        "completion detail should substitute T→String; got: {detail}"
+    );
+    let get = list
+        .items
+        .iter()
+        .find(|i| i.label == "get")
+        .unwrap_or_else(|| panic!("`get` missing from list: {:?}", list.items));
+    let get_detail = get.detail.as_deref().unwrap_or("");
+    assert!(
+        get_detail.contains(": String") && !get_detail.contains(": T"),
+        "completion detail for `get` should substitute return type T→String; got: {get_detail}"
+    );
+}
+
+/// Sanity: free-function hover (no receiver, no subst) is byte-
+/// identical to the pre-subst rendering. Guards against accidental
+/// `None`-ctx regression in the renderers.
+#[test]
+fn hover_on_free_function_no_subst_applied() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn helper(x: int): int { return x; }\nfn main() { helper(1); }\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor on `helper` at call site (line 1 col 14).
+    let hover = capabilities::hover_with_project(
+        &doc.text,
+        "project",
+        doc.root_node(),
+        pos(1, 14),
+        &user_uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover should resolve on `helper`");
+    let body = match hover.contents {
+        HoverContents::Markup(m) => m.value,
+        HoverContents::Scalar(MarkedString::String(s)) => s,
+        HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+        HoverContents::Array(_) => panic!("unexpected array hover shape"),
+    };
+    assert!(
+        body.contains("fn helper(x: int): int"),
+        "free-fn hover should render the declared signature unchanged; got:\n{body}"
+    );
+}

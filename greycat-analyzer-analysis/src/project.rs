@@ -278,6 +278,48 @@ impl ProjectAnalysis {
         self.decl_registry.name(id).map(|sym| self.symbol(&sym))
     }
 
+    /// Build a `{ generic_param_symbol → concrete_TypeId }` map for the
+    /// instantiation carried by `recv_ty`. Returns `None` when the
+    /// receiver isn't a generic instantiation (`TypeKind::Generic`) —
+    /// i.e. there are no generic params to substitute.
+    ///
+    /// Looks up the receiver's owning HIR `TypeDecl` through
+    /// [`ProjectIndex::locate_decl_in_ns`] to read the generic param
+    /// symbols, then zips them with the receiver's concrete args. Used
+    /// by capability handlers to render method signatures with the
+    /// receiver's instantiation substituted (so hover / completion on
+    /// `arr.add(...)` where `arr: Array<String>` shows
+    /// `fn add(value: String): null`, not `fn add(value: T): null`).
+    pub fn method_subst_from_receiver_ty(
+        &self,
+        recv_ty: TypeId,
+    ) -> Option<FxHashMap<Symbol, TypeId>> {
+        let (decl_id, args) = match &self.arena.get(recv_ty).kind {
+            TypeKind::Generic { decl, args } if !args.is_empty() => (*decl, args.clone()),
+            _ => return None,
+        };
+        let name = self.decl_name(decl_id)?;
+        let (foreign_uri, foreign_decl_id) = self
+            .index
+            .locate_decl_in_ns(name, crate::stdlib::Namespace::Type)
+            .next()?;
+        let fmod = self.module(foreign_uri)?;
+        let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id] else {
+            return None;
+        };
+        let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
+        for (i, gen_idx) in td.generics.iter().enumerate() {
+            let gen_sym = fmod.hir.idents[*gen_idx].symbol;
+            if let Some(arg_id) = args.get(i).copied() {
+                subst.insert(gen_sym, arg_id);
+            }
+        }
+        if subst.is_empty() {
+            return None;
+        }
+        Some(subst)
+    }
+
     /// One-pass build over every document currently in `manager`.
     pub fn analyze(manager: &SourceManager) -> Self {
         let mut out = Self::new();
