@@ -77,22 +77,27 @@ pub fn lower_module<'a>(cx: &Cx<'a>, root: Node<'a>) -> Doc {
             // Source-driven blank-line preservation: count newlines in
             // the gap and emit (count) hardlines so the user's vertical
             // spacing survives, capped at 4 (one terminator + 3 blanks).
-            let mut nls = cx.newlines_between(p, child).min(4);
-            // But: doc-comments live inside their host decl (in the
-            // `doc` field), so the gap between a `line_comment` extra
-            // and the next decl shouldn't grow if the user happened to
-            // separate them — actually the legacy treats a blank
-            // before a doc-attached decl specially. We replicate that
-            // in the per-decl visitor for the doc-vs-rest gap; module
-            // level just preserves the raw count.
+            let nls = cx.newlines_between(p, child).min(4);
+            // Doc-comments live inside their host decl (in the `doc`
+            // field), so module level just preserves the raw newline
+            // count for decl-to-decl gaps.
             if nls == 0 {
-                // No newline between two top-level constructs in source
-                // (e.g. one-line file with two decls — unusual). Force
-                // at least one to keep the output legal.
-                nls = 1;
-            }
-            for _ in 0..nls {
-                parts.push(Doc::hardline());
+                // Zero newlines — the child is on the same source line
+                // as `p`. The common case is an EOL `line_comment`
+                // trailing a top-level decl (`fn foo() {} // note`);
+                // emit a single space so the comment stays on the same
+                // line in the output. Other on-same-line top-level
+                // constructs (two decls on one line — unusual) get
+                // forced onto separate lines for legibility.
+                if child.kind() == "line_comment" {
+                    parts.push(Doc::text(" "));
+                } else {
+                    parts.push(Doc::hardline());
+                }
+            } else {
+                for _ in 0..nls {
+                    parts.push(Doc::hardline());
+                }
             }
         }
         parts.push(lower_node(cx, child));

@@ -1,0 +1,38 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn helper(): int { return 1; } // after fn decl\nvar top: node<int?>; // after top-level var\ntype Foo {} // after type decl\n"
+---
+(module
+  (fn_decl
+    name: (ident 'helper')
+    params: (fn_params '()')
+    return_type: (type_ident
+      name: (ident 'int')
+    )
+    body: (block
+      (return_stmt
+        (number
+          (number_int '1')
+        )
+      )
+    )
+  )
+  (line_comment '// after fn decl')
+  (modvar
+    name: (ident 'top')
+    type: (type_ident
+      name: (ident 'node')
+      params: (type_ident
+        name: (ident 'int')
+        (optional '?')
+      )
+    )
+  )
+  (line_comment '// after top-level var')
+  (type_decl
+    name: (ident 'Foo')
+    body: (type_body '{}')
+  )
+  (line_comment '// after type decl')
+)

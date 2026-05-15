@@ -1,0 +1,3 @@
+fn helper(): int { return 1; } // after fn decl
+var top: node<int?>; // after top-level var
+type Foo {} // after type decl
