@@ -387,11 +387,7 @@ fn expr_node(
             Some(format!("{:?}", u.op)),
             vec![expr_node(hir, symbols, u.operand)],
         ),
-        Expr::Paren(inner, _) => (
-            "expr:paren",
-            None,
-            vec![expr_node(hir, symbols, *inner)],
-        ),
+        Expr::Paren(inner, _) => ("expr:paren", None, vec![expr_node(hir, symbols, *inner)]),
         Expr::Lambda(l) => {
             let mut kids = Vec::new();
             for &p in &l.params {
@@ -772,11 +768,7 @@ fn decl_node(
             }
         }
         Decl::Pragma(p) => {
-            let kids = p
-                .args
-                .iter()
-                .map(|&a| expr_node(hir, symbols, a))
-                .collect();
+            let kids = p.args.iter().map(|&a| expr_node(hir, symbols, a)).collect();
             HirNode {
                 kind: "pragma".into(),
                 label: Some(ident_text(hir, symbols, p.name)),
@@ -901,8 +893,8 @@ pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
 
     let symbols = SymbolTable::new();
     let hir = lower_module(source, &symbols, "module", "project", tree.root_node());
-    let resolutions = resolve(&hir);
-    let (_arena, analysis) = analyze(&hir, &resolutions);
+    let resolutions = resolve(&hir, &symbols);
+    let (_arena, analysis) = analyze(&hir, &resolutions, &symbols);
     for d in &analysis.diagnostics {
         let sev = match d.severity {
             Severity::Error => "error",

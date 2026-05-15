@@ -265,7 +265,8 @@ mod tests {
         let body1 = fn_body(&hir1, &symbols1, "f");
         assert!(block_diverges(&hir1, &body1));
 
-        let (hir2, symbols2) = lower("fn f(): int { if (true) { return 1; } else { var _ = 0; } return 0; }");
+        let (hir2, symbols2) =
+            lower("fn f(): int { if (true) { return 1; } else { var _ = 0; } return 0; }");
         // The if doesn't diverge (else falls through), but the trailing
         // `return 0;` does — so the OUTER block diverges.
         let body2 = fn_body(&hir2, &symbols2, "f");
@@ -286,7 +287,8 @@ mod tests {
 
     #[test]
     fn try_does_not_diverge_when_catch_falls_through() {
-        let (hir, symbols) = lower("fn f(): int { try { return 1; } catch (e) { var _ = 0; } return 3; }");
+        let (hir, symbols) =
+            lower("fn f(): int { try { return 1; } catch (e) { var _ = 0; } return 3; }");
         let body = fn_body(&hir, &symbols, "f");
         // Outer block diverges via the trailing return; the try alone
         // wouldn't.

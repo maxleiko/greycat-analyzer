@@ -800,7 +800,7 @@ impl ProjectIndex {
                     // standalone pre-pass in
                     // `stage_lower_signatures` so the project has a
                     // single decl-registration point.
-                    let handle = decl_registry.get_or_insert(uri, *decl_id, name_sym);
+                    let handle = decl_registry.get_or_insert(uri, name_sym, *decl_id);
                     well_known.record(&module.lib, &module.name, &self.symbols[name_sym], handle);
                     // P13.5: capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
@@ -907,7 +907,7 @@ impl ProjectIndex {
                     // Project-wide decl handle (enums get one too — the
                     // resolver / lowering paths route foreign enum refs
                     // through `Type(handle)` for some shapes).
-                    let _ = decl_registry.get_or_insert(uri, *decl_id, name_sym);
+                    let _ = decl_registry.get_or_insert(uri, name_sym, *decl_id);
                     // Alloc the canonical `TypeKind::Enum` into the
                     // shared arena and publish to `enum_types`
                     // immediately. Doing it here (rather than as a
@@ -1202,7 +1202,7 @@ fn lower_native_type_ref(
             // the generic and non-generic branches).
             let handle = locate_decl.get(&name_sym).and_then(|locs| {
                 locs.iter()
-                    .find_map(|(uri, decl)| decl_registry.lookup(uri, *decl))
+                    .find_map(|(uri, _)| decl_registry.lookup(uri, name_sym))
             });
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
@@ -1240,10 +1240,9 @@ mod tests {
     use greycat_analyzer_syntax::parse;
     use std::str::FromStr;
 
-    fn lower(src: &str) -> Hir {
+    fn lower(symbols: &SymbolTable, src: &str) -> Hir {
         let tree = parse(src);
-        let s = SymbolTable::default();
-        lower_module(src, &s, "stdmod", "std", tree.root_node())
+        lower_module(src, symbols, "stdmod", "std", tree.root_node())
     }
 
     fn uri(path: &str) -> Uri {
@@ -1270,7 +1269,9 @@ mod tests {
 
     #[test]
     fn ingest_registers_type_decls() {
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         let hir = lower(
+            &idx.symbols,
             r#"
 type Person {
     name: String;
@@ -1282,7 +1283,6 @@ type Company {
 }
 "#,
         );
-        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         idx.ingest(
             &uri("/proj/people.gcl"),
             &hir,
@@ -1297,8 +1297,8 @@ type Company {
 
     #[test]
     fn ingest_registers_enum_decls() {
-        let hir = lower("enum Color { Red, Green, Blue }\n");
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        let hir = lower(&idx.symbols, "enum Color { Red, Green, Blue }\n");
         idx.ingest(
             &uri("/proj/color.gcl"),
             &hir,
@@ -1317,13 +1317,14 @@ type Company {
 
     #[test]
     fn ingest_captures_native_signatures() {
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         let hir = lower(
+            &idx.symbols,
             r#"
 private native fn read_file(path: String): String;
 private native fn now(): time;
 "#,
         );
-        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         idx.ingest(
             &uri("/proj/io.gcl"),
             &hir,
@@ -1339,9 +1340,9 @@ private native fn now(): time;
 
     #[test]
     fn ingest_is_idempotent_on_repeated_calls() {
-        let hir = lower("type T {}\n");
-        let u = uri("/proj/t.gcl");
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        let hir = lower(&idx.symbols, "type T {}\n");
+        let u = uri("/proj/t.gcl");
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
         let len_after_first = arena.len();
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
@@ -1359,9 +1360,9 @@ private native fn now(): time;
         // matching `Idx<Decl>`. Synthetic stand-in for `Permission` in
         // `lib/std/runtime.gcl` so the test doesn't depend on `greycat
         // install` having been run.
-        let hir = lower("private type Permission {}\n");
-        let permission_uri = uri("/proj/lib/std/runtime.gcl");
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        let hir = lower(&idx.symbols, "private type Permission {}\n");
+        let permission_uri = uri("/proj/lib/std/runtime.gcl");
         idx.ingest(
             &permission_uri,
             &hir,
@@ -1386,7 +1387,9 @@ private native fn now(): time;
     /// returned [`Symbol`] keys every map that holds a "Foo" entry.
     #[test]
     fn ingest_interns_names_into_symbol_table() {
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         let hir = lower(
+            &idx.symbols,
             r#"
 type Bag {
     weight: int;
@@ -1398,7 +1401,6 @@ enum Color { Red, Green }
 fn helper(): int { return 1; }
 "#,
         );
-        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         idx.ingest(
             &uri("/proj/m.gcl"),
             &hir,
@@ -1439,12 +1441,13 @@ fn helper(): int { return 1; }
         use greycat_analyzer_hir::arena::Idx;
         use greycat_analyzer_hir::types::Decl;
 
+        let (mut idx_arena, mut idx_decl_registry, mut idx_well_known, mut idx) = fresh_index();
         let hir = lower(
+            &idx.symbols,
             "type Animal { name: String; }\n\
              type Cat extends Animal { whiskers: int; }\n",
         );
         let u = uri("/proj/m.gcl");
-        let (mut idx_arena, mut idx_decl_registry, mut idx_well_known, mut idx) = fresh_index();
         idx.ingest(
             &u,
             &hir,
@@ -1465,7 +1468,7 @@ fn helper(): int { return 1; }
         for decl_id in &module.decls {
             if let Decl::Type(td) = &hir.decls[*decl_id] {
                 let name_sym = hir.idents[td.name].symbol;
-                let id = registry.get_or_insert(&u, *decl_id, name_sym);
+                let id = registry.get_or_insert(&u, name_sym, *decl_id);
                 arena.alloc_type(id);
                 match &idx.symbols[name_sym] {
                     "Animal" => animal = Some(id),
@@ -1487,8 +1490,8 @@ fn helper(): int { return 1; }
         let dangling_name = idx.symbols.intern("__dangling__");
         let dangling = registry.get_or_insert(
             &uri("/other.gcl"),
-            Idx::<Decl>::from_raw(99u32),
             dangling_name,
+            Idx::<Decl>::from_raw(99u32),
         );
         assert!(!idx.is_subtype_of_decl(&registry, dangling, animal));
     }
@@ -1498,9 +1501,9 @@ fn helper(): int { return 1; }
         // Same name in two modules should produce two entries — P11.2
         // disambiguates at the use site via the importer's lib/include
         // closure, but the table itself keeps every hit.
-        let hir_a = lower("type Helper {}\n");
-        let hir_b = lower("type Helper {}\n");
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        let hir_a = lower(&idx.symbols, "type Helper {}\n");
+        let hir_b = lower(&idx.symbols, "type Helper {}\n");
         idx.ingest(
             &uri("/proj/a.gcl"),
             &hir_a,
@@ -1526,7 +1529,9 @@ fn helper(): int { return 1; }
         // P13.4: `@expose("renamed")` keys into ProjectIndex::exposed by
         // the renamed string; bare `@expose` keys by the decl's local
         // name.
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         let hir = lower(
+            &idx.symbols,
             r#"
 @expose("public_alpha")
 fn alpha() {}
@@ -1539,7 +1544,6 @@ fn ignored() {}
 "#,
         );
         let u = uri("/proj/api.gcl");
-        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
         let alpha_sym = idx.symbol("public_alpha").expect("public_alpha interned");
@@ -1564,7 +1568,9 @@ fn ignored() {}
     fn ingest_captures_type_flags_from_annotations() {
         // P13.5: @iterable / @deref / @primitive annotations on a type
         // decl populate ProjectIndex.type_flags.
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         let hir = lower(
+            &idx.symbols,
             r#"
 @iterable
 @deref("resolve")
@@ -1577,7 +1583,6 @@ type Plain {}
 "#,
         );
         let u = uri("/proj/m.gcl");
-        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
         let bag = idx.type_flags_for("Bag").expect("Bag flags");
@@ -1597,9 +1602,12 @@ type Plain {}
     fn ingest_captures_permission_pragmas_per_module() {
         // P13.6: `@permission("name")` pragma populates
         // ProjectIndex::module_permissions[uri].
-        let hir = lower("@permission(\"admin\");\n@permission(\"user\");\nfn handler() {}\n");
-        let u = uri("/proj/api.gcl");
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        let hir = lower(
+            &idx.symbols,
+            "@permission(\"admin\");\n@permission(\"user\");\nfn handler() {}\n",
+        );
+        let u = uri("/proj/api.gcl");
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
         let perms = idx.module_permissions.get(&u).expect("permissions tracked");
@@ -1612,14 +1620,15 @@ type Plain {}
 
     #[test]
     fn locate_decl_records_fns_and_top_vars() {
+        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         let hir = lower(
+            &idx.symbols,
             r#"
 fn helper(): int { return 1; }
 var TOP: int = 1;
 "#,
         );
         let u = uri("/proj/m.gcl");
-        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
         assert_eq!(idx.locate_decl("helper").len(), 1);
         assert_eq!(idx.locate_decl("TOP").len(), 1);

@@ -452,7 +452,7 @@ fn enum_variant_access_types_as_enum_in_every_form() {
             .get(&idx)
             .copied()
             .unwrap_or_else(|| panic!("static expr at idx {idx:?} has no expr_types entry"));
-        let display = pa.arena().display(ty, pa.symbols()).to_string();
+        let display = pa.display_type(ty).to_string();
         assert_eq!(
             display, "Foo",
             "static expression should type as `Foo` (enum), got `{display}`"

@@ -31,8 +31,8 @@
 
 use rustc_hash::FxHashMap;
 
-use greycat_analyzer_core::TypeArena;
 use greycat_analyzer_core::lsp_types::Uri;
+use greycat_analyzer_core::{SymbolTable, TypeArena};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -365,9 +365,9 @@ impl<'a> Cx<'a> {
 /// pipeline uses [`resolve_with_index_for`] so cross-module names
 /// also resolve and the current module's own entries are excluded
 /// from the global public-lookup tier.
-pub fn resolve(hir: &Hir) -> Resolutions {
+pub fn resolve(hir: &Hir, symbols: &SymbolTable) -> Resolutions {
     let mut arena = TypeArena::new();
-    let index = ProjectIndex::new(&mut arena);
+    let index = ProjectIndex::with_symbols(symbols.clone(), &mut arena);
     resolve_inner(hir, &index, None)
 }
 
@@ -795,7 +795,7 @@ mod tests {
         let tree = parse(src);
         let s = SymbolTable::default();
         let hir = lower_module(src, &s, "mod", "project", tree.root_node());
-        let res = resolve(&hir);
+        let res = resolve(&hir, &s);
         (hir, res, s)
     }
 
@@ -973,16 +973,16 @@ fn f(p: Foo): Foo { return p; }
         // refers to `Helper` — without a ProjectIndex it'd be
         // unresolved; with one ingested from A it binds to ProjectDecl
         // carrying A's URI + the Helper decl id (P11.2).
-        let other_src = "type Helper {}\n";
-        let other_tree = parse(other_src);
-        let s = SymbolTable::default();
-        let other_hir = lower_module(other_src, &s, "a", "p", other_tree.root_node());
-
-        let other_uri = Uri::from_str("file:///proj/a.gcl").unwrap();
         let mut arena = TypeArena::new();
         let mut decl_registry = crate::well_known::DeclRegistry::default();
         let mut well_known = crate::well_known::WellKnown::default();
         let mut idx = ProjectIndex::new(&mut arena);
+
+        let other_src = "type Helper {}\n";
+        let other_tree = parse(other_src);
+        let other_hir = lower_module(other_src, &idx.symbols, "a", "p", other_tree.root_node());
+
+        let other_uri = Uri::from_str("file:///proj/a.gcl").unwrap();
         idx.ingest(
             &other_uri,
             &other_hir,
@@ -993,10 +993,9 @@ fn f(p: Foo): Foo { return p; }
 
         let user_src = "fn use_helper(h: Helper) {}\n";
         let user_tree = parse(user_src);
-        let s = SymbolTable::default();
-        let user_hir = lower_module(user_src, &s, "b", "p", user_tree.root_node());
+        let user_hir = lower_module(user_src, &idx.symbols, "b", "p", user_tree.root_node());
         let res = resolve_with_index(&user_hir, &idx);
-        let helper_sym = s.lookup("Helper").expect("Helper interned");
+        let helper_sym = idx.symbols.lookup("Helper").expect("Helper interned");
 
         let helper_uses: Vec<_> = user_hir
             .idents

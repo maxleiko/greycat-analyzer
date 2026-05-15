@@ -26,8 +26,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use greycat_analyzer_core::{
-    GenericOwner, InferenceTable, Primitive, Symbol, Type, TypeArena, TypeId, TypeKind,
-    TypeRegistry, is_assignable_to,
+    GenericOwner, InferenceTable, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId,
+    TypeKind, TypeRegistry, is_assignable_to,
 };
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -291,10 +291,10 @@ impl AnalysisResult {
 /// Allocates a fresh [`TypeArena`] internally and discards it
 /// — callers that need to inspect `TypeId`s after the call must use
 /// [`analyze_with_index_into`] instead so the arena outlives the call.
-pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
+pub fn analyze(hir: &Hir, res: &Resolutions, symbols: &SymbolTable) -> (TypeArena, AnalysisResult) {
     use std::str::FromStr;
     let mut arena = TypeArena::new();
-    let index = ProjectIndex::new(&mut arena);
+    let index = ProjectIndex::with_symbols(symbols.clone(), &mut arena);
     // P35.4 — per-file callers don't have a populated `WellKnown`;
     // pass a default (all-`None`) instance. The migrated sentinel
     // sites fall back to `arena.any()` for any slot still `None`.
@@ -314,7 +314,7 @@ pub fn analyze(hir: &Hir, res: &Resolutions) -> (TypeArena, AnalysisResult) {
                 Decl::Enum(ed) => hir.idents[ed.name].symbol,
                 _ => continue,
             };
-            let _ = decl_registry.get_or_insert(&module_uri, *d_id, name);
+            let _ = decl_registry.get_or_insert(&module_uri, name, *d_id);
         }
     }
     let out = analyze_with_index_into(
@@ -353,7 +353,7 @@ pub fn analyze_with_index(
                 Decl::Enum(ed) => hir.idents[ed.name].symbol,
                 _ => continue,
             };
-            let _ = decl_registry.get_or_insert(&module_uri, *d_id, name);
+            let _ = decl_registry.get_or_insert(&module_uri, name, *d_id);
         }
     }
     let out = analyze_with_index_into(
@@ -606,7 +606,7 @@ fn register_module_types(
                 // pre-walk. A missing handle here would mean the
                 // caller bypassed both — `Unresolved` is the
                 // safest fallback (behaves like `any?`).
-                let id = match decl_registry.lookup(module_uri, *d) {
+                let id = match decl_registry.lookup(module_uri, name) {
                     Some(handle) => arena.alloc_type(handle),
                     None => arena.unresolved(name, (0, 0)),
                 };
@@ -972,10 +972,8 @@ impl<'a> Cx<'a> {
                     self.write_narrow(*ident, never);
                     if !emitted {
                         let name = self.ident_text(*ident).to_string();
-                        let pretty: Vec<String> = tys
-                            .iter()
-                            .map(|t| self.arena.display(*t, &self.index.symbols).to_string())
-                            .collect();
+                        let pretty: Vec<String> =
+                            tys.iter().map(|t| self.display(*t).to_string()).collect();
                         let msg = format!(
                             "condition is always false: `{}` cannot simultaneously be {}",
                             name,
@@ -1004,14 +1002,19 @@ impl<'a> Cx<'a> {
                         // check is a meaningful runtime discriminator)
                         // and when known is `never` (downstream
                         // diagnostics already flag the unreachable
-                        // scope).
-                        if !known_is_top && is_assignable_to(self.arena, known, asserted) {
+                        // scope). Uses the index-aware
+                        // [`Cx::is_assignable`] so a `Sub: Super`
+                        // `extends` chain is honored — without this
+                        // hop the bare relation only knows decl-
+                        // handle identity and would miss "Sub is
+                        // already a Super" trivially.
+                        if !known_is_top && self.is_assignable(known, asserted) {
                             if !emitted {
                                 let name = self.ident_text(*ident).to_string();
                                 let msg = format!(
                                     "condition is always true: `{}` is already of type `{}`",
                                     name,
-                                    self.arena.display(known, &self.index.symbols),
+                                    self.display(known),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
@@ -1025,7 +1028,13 @@ impl<'a> Cx<'a> {
                         // assignable to the other) — the check can
                         // never pass. Skip when known is `any` (top)
                         // or `never` for the same reasons.
-                        if !known_is_top && !is_assignable_to(self.arena, asserted, known) {
+                        // Critical: the *forward* direction
+                        // (`is_assignable(asserted, known)`) uses
+                        // the project-aware extends walk. Without it
+                        // `s: Shape; s is Rect` where `Rect extends
+                        // Shape` would be flagged "always false" —
+                        // core's bare relation can't see the chain.
+                        if !known_is_top && !self.is_assignable(asserted, known) {
                             let never = mk_never(self.arena, &mut never_id);
                             self.write_narrow(*ident, never);
                             if !emitted {
@@ -1033,8 +1042,8 @@ impl<'a> Cx<'a> {
                                 let msg = format!(
                                     "condition is always false: `{}` of type `{}` can never be `{}`",
                                     name,
-                                    self.arena.display(known, &self.index.symbols),
-                                    self.arena.display(asserted, &self.index.symbols),
+                                    self.display(known),
+                                    self.display(asserted),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.diag(Severity::Warning, msg, range);
@@ -1142,6 +1151,31 @@ impl<'a> Cx<'a> {
         self.decl_registry
             .name(id)
             .map(|sym| &self.index.symbols[sym] as &str)
+    }
+
+    /// Registry-aware type-display wrapper. Renders `Foo` / `Map<int,
+    /// String>` instead of the bare arena's `?type#<raw>`
+    /// placeholder. Use this whenever a diagnostic / lint message
+    /// surfaces a type to the user.
+    fn display(&self, id: TypeId) -> crate::project::TypeWithDecls<'_> {
+        crate::project::display_type(self.arena, self.decl_registry, &self.index.symbols, id)
+    }
+
+    /// Project-aware assignability check. Like
+    /// [`is_assignable_to`] but walks the cross-module supertype
+    /// chain via `index.is_subtype_of_decl(...)` so
+    /// `Sub` assigns to `Sup` whenever `type Sub extends Sup` (and
+    /// transitively). Use this for any decidability check on user
+    /// types — the bare core relation only knows decl-handle identity.
+    fn is_assignable(&self, from: TypeId, to: TypeId) -> bool {
+        crate::project::is_assignable_to_with_index(
+            self.index,
+            self.well_known,
+            self.decl_registry,
+            self.arena,
+            from,
+            to,
+        )
     }
 
     fn push_narrow(&mut self) {
@@ -1353,9 +1387,7 @@ impl<'a> Cx<'a> {
             let ty = self.arena.get(recv_ty);
             match &ty.kind {
                 TypeKind::Type(d) => (self.decl_name(*d)?.into(), Vec::new()),
-                TypeKind::Generic { decl, args } => {
-                    (self.decl_name(*decl)?.into(), args.to_vec())
-                }
+                TypeKind::Generic { decl, args } => (self.decl_name(*decl)?.into(), args.to_vec()),
                 _ => return None,
             }
         };
@@ -2059,7 +2091,6 @@ impl<'a> Cx<'a> {
             .expect("lower_qualified_type_ref called with empty qualifier");
         let module_name = self.ident_text(module_segment).to_string();
         let leaf_sym = self.hir.idents[tr.name].symbol;
-        let leaf_name = self.ident_text(tr.name).to_string();
         let byte_span = (tr.byte_range.start, tr.byte_range.end);
 
         let Some(module_uri) = self.index.module_uri(&module_name).cloned() else {
@@ -2073,23 +2104,13 @@ impl<'a> Cx<'a> {
             return base;
         };
 
-        let in_module = |index: &crate::stdlib::ProjectIndex| -> Option<Idx<Decl>> {
-            index
-                .locate_decl(&leaf_name)
-                .iter()
-                .find(|(uri, _)| uri == &module_uri)
-                .map(|(_, d)| *d)
-        };
-
         // Generic instantiation: `b::Map<int>` etc. Recurse on params
         // first, then mint via the registry handle when we have one;
         // fall back to `Unresolved` when the foreign module hasn't
         // been ingested yet.
         if !tr.params.is_empty() {
             let args: Vec<TypeId> = tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
-            let mut base = match in_module(self.index)
-                .and_then(|decl| self.decl_registry.lookup(&module_uri, decl))
-            {
+            let mut base = match self.decl_registry.lookup(&module_uri, leaf_sym) {
                 Some(handle) => self.arena.generic(handle, args),
                 None => self.arena.unresolved(leaf_sym, byte_span),
             };
@@ -2102,11 +2123,8 @@ impl<'a> Cx<'a> {
         // Non-generic. Prefer the handle-keyed shape so cross-module
         // identity collapses to the same TypeDeclId both sides of the
         // call boundary.
-        let mut base = match in_module(self.index) {
-            Some(decl) => match self.decl_registry.lookup(&module_uri, decl) {
-                Some(handle) => self.arena.alloc_type(handle),
-                None => self.arena.unresolved(leaf_sym, byte_span),
-            },
+        let mut base = match self.decl_registry.lookup(&module_uri, leaf_sym) {
+            Some(handle) => self.arena.alloc_type(handle),
             None => self.arena.unresolved(leaf_sym, byte_span),
         };
         if tr.optional {
@@ -2233,8 +2251,8 @@ impl<'a> Cx<'a> {
                     let msg = format!(
                         "cannot infer `{}`: `{}` conflicts with `{}`",
                         &self.index.symbols[*name],
-                        self.arena.display(prior, &self.index.symbols),
-                        self.arena.display(witness, &self.index.symbols),
+                        self.display(prior),
+                        self.display(witness),
                     );
                     self.diag(Severity::Error, msg, call_range.clone());
                 }
@@ -3918,9 +3936,9 @@ impl<'a> Cx<'a> {
                             TypeKind::Type(d) => {
                                 decl_registry.name(*d).map(|s| SmolStr::from(&symbols[s]))
                             }
-                            TypeKind::Generic { decl, .. } => {
-                                decl_registry.name(*decl).map(|s| SmolStr::from(&symbols[s]))
-                            }
+                            TypeKind::Generic { decl, .. } => decl_registry
+                                .name(*decl)
+                                .map(|s| SmolStr::from(&symbols[s])),
                             _ => None,
                         }
                     };
@@ -3943,8 +3961,8 @@ impl<'a> Cx<'a> {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",
-                        self.arena.display(from_ty, &self.index.symbols),
-                        self.arena.display(to_ty, &self.index.symbols),
+                        self.display(from_ty),
+                        self.display(to_ty),
                     );
                     self.diag(Severity::Error, msg, r);
                 }
@@ -4078,15 +4096,15 @@ mod tests {
     use super::*;
     use crate::resolver::resolve;
     use greycat_analyzer_core::SymbolTable;
-use greycat_analyzer_hir::lower_module;
+    use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
 
     fn analyze_src(src: &str) -> (TypeArena, AnalysisResult) {
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir);
-        analyze(&hir, &res)
+        let res = resolve(&hir, &symbols);
+        analyze(&hir, &res, &symbols)
     }
 
     /// Drop-in helper for tests that don't need to inspect the arena.
@@ -4256,8 +4274,8 @@ fn first(p: Point): int { return p.x; }
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir);
-        let (_arena, analysis) = analyze(&hir, &res);
+        let res = resolve(&hir, &symbols);
+        let (_arena, analysis) = analyze(&hir, &res, &symbols);
 
         // Find the property ident `x` inside `p.x` — the second `x`
         // ident in the source (the first is the attr decl name).
@@ -4292,8 +4310,8 @@ fn read(b: Box): int { return b->inner; }
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir);
-        let (_arena, analysis) = analyze(&hir, &res);
+        let res = resolve(&hir, &symbols);
+        let (_arena, analysis) = analyze(&hir, &res, &symbols);
 
         let inner_uses: Vec<_> = hir
             .idents
@@ -4714,8 +4732,8 @@ fn f(p: Point): int { return p.bogus; }
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir);
-        let (_arena, analysis) = analyze(&hir, &res);
+        let res = resolve(&hir, &symbols);
+        let (_arena, analysis) = analyze(&hir, &res, &symbols);
 
         let bogus = hir
             .idents
@@ -4731,20 +4749,23 @@ fn f(p: Point): int { return p.bogus; }
     // -------------------------------------------------------------------
 
     /// Resolve the inferred type for the `init` of `var <name> = …`.
+    /// Routes through the project pipeline so user-decl names render
+    /// (the bare arena display renders `?type#<raw>` for `Type(decl)`).
     fn local_init_ty(src: &str, name: &str) -> Option<String> {
-        let tree = parse(src);
-        let symbols = SymbolTable::new();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir);
-        let (arena, analysis) = analyze(&hir, &res);
-        for (stmt_id, stmt) in hir.stmts.iter() {
+        use greycat_analyzer_core::SourceManager;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let src_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(src_uri.clone(), src, "project", false);
+        let pa = crate::project::ProjectAnalysis::analyze(&mgr);
+        let module = pa.module(&src_uri)?;
+        for (_id, stmt) in module.hir.stmts.iter() {
             if let Stmt::Var(v) = stmt
-                && &symbols[hir.idents[v.name].symbol] == name
+                && pa.symbol(&module.hir.idents[v.name].symbol) == name
                 && let Some(init) = v.init
             {
-                let _ = stmt_id;
-                let ty = analysis.expr_types.get(&init).copied()?;
-                return Some(arena.display(ty, &symbols).to_string());
+                let ty = module.analysis.expr_types.get(&init).copied()?;
+                return Some(pa.display_type(ty).to_string());
             }
         }
         None

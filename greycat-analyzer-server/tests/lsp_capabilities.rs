@@ -437,7 +437,7 @@ fn cross_module_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let display = pa.arena().display(ty, pa.symbols()).to_string();
+    let display = pa.display_type(ty).to_string();
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
@@ -1565,7 +1565,7 @@ fn qualified_static_call_infers_return_type() {
         .get(&x_local)
         .copied()
         .expect("def_type for x");
-    let display = pa.arena().display(ty, pa.symbols()).to_string();
+    let display = pa.display_type(ty).to_string();
     assert_eq!(
         display, "Identity",
         "x should infer as `Identity`, got `{display}`"
@@ -1610,7 +1610,7 @@ fn qualified_static_method_ref_infers_function() {
         .get(&y_local)
         .copied()
         .expect("def_type for y");
-    let display = pa.arena().display(ty, pa.symbols()).to_string();
+    let display = pa.display_type(ty).to_string();
     assert_eq!(
         display, "function",
         "y should infer as `function`, got `{display}`"
@@ -1651,7 +1651,7 @@ fn module_prefixed_type_ref_infers_type() {
         .get(&w_local)
         .copied()
         .expect("def_type for w");
-    let display = pa.arena().display(ty, pa.symbols()).to_string();
+    let display = pa.display_type(ty).to_string();
     assert_eq!(display, "type", "w should infer as `type`, got `{display}`");
 }
 
@@ -1693,7 +1693,7 @@ fn cross_module_static_method_ref_infers_function() {
         .get(&y_local)
         .copied()
         .expect("def_type for y");
-    let display = pa.arena().display(ty, pa.symbols()).to_string();
+    let display = pa.display_type(ty).to_string();
     assert_eq!(
         display, "function",
         "y should infer as `function`, got `{display}`"
@@ -1733,7 +1733,7 @@ fn cross_module_static_attr_ref_infers_field() {
         .get(&z_local)
         .copied()
         .expect("def_type for z");
-    let display = pa.arena().display(ty, pa.symbols()).to_string();
+    let display = pa.display_type(ty).to_string();
     assert_eq!(
         display, "field",
         "z should infer as `field`, got `{display}`"
@@ -2168,6 +2168,227 @@ fn diagnostics_skip_non_project_lib_lints() {
             .iter()
             .any(|d| d.message.contains("unused private fn")),
         "lib-owned lints SHOULD surface when lint_libs=true; got: {lib_diags_opted_in:?}"
+    );
+}
+
+/// Regression for the sealed-hierarchy `is`-narrow false positives
+/// observed against the `rework-symbols` working copy:
+/// `s is Rect` where `s: Shape` (and `Rect extends Shape`) was being
+/// flagged as "condition is always false" + unreachable code, with a
+/// follow-on "Shape not assignable to Rect" error inside the then-
+/// branch even though narrowing should have bound `s: Rect` there.
+///
+/// The hierarchy is open (Shape is abstract, Rect/Circle extend it);
+/// the analyzer must recognise the supertype→subtype `is` check as a
+/// legitimate narrow, not a contradiction. The fixture mirrors the
+/// repo-root `project.gcl` byte-for-byte.
+#[test]
+fn sealed_hierarchy_is_narrow_does_not_false_positive() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let src = "abstract type Shape {}\n\
+               type Rect extends Shape {}\n\
+               type Circle extends Shape {}\n\
+               \n\
+               fn test(s: Shape) {\n\
+                   if (s is Rect) {\n\
+                       expect_rect(s);\n\
+                   } else {\n\
+                       expect_circle(s);\n\
+                   }\n\
+               }\n\
+               \n\
+               fn expect_rect(_: Rect) {}\n\
+               fn expect_circle(_: Circle) {}\n";
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(user_uri.clone(), src, "project", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let module = pa.module(&user_uri).unwrap();
+    let diags = capabilities::diagnostics_from_module(src, module, false);
+
+    // 1. The `is`-check must not be reported as decidable. Shape can
+    //    legitimately be a Rect at runtime — that's the whole point of
+    //    the subtype dispatch.
+    let decidable: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message.contains("condition is always false")
+                || d.message.contains("condition is always true")
+        })
+        .collect();
+    assert!(
+        decidable.is_empty(),
+        "no decidable-condition diagnostic should fire for `Shape is Rect`; got: {decidable:#?}",
+    );
+
+    // 2. No unreachable-code report on the then-branch — it follows
+    //    from (1) being wrong, but pin it down independently so a
+    //    regression in either pass surfaces a focused failure.
+    let unreachable: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("unreachable"))
+        .collect();
+    assert!(
+        unreachable.is_empty(),
+        "no unreachable-code diagnostic expected; got: {unreachable:#?}",
+    );
+
+    // 3. Inside `if (s is Rect) { expect_rect(s); }`, `s` must narrow
+    //    to `Rect` so the call type-checks. The pre-fix behavior was
+    //    "Shape not assignable to Rect" — surface that explicitly.
+    let then_branch_err: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message.contains("not assignable")
+                && d.message.contains("Rect")
+                && d.message.contains("Shape")
+        })
+        .collect();
+    assert!(
+        then_branch_err.is_empty(),
+        "`s` should narrow to `Rect` inside the then-branch; got: {then_branch_err:#?}",
+    );
+}
+
+/// Regression for symbol/handle mis-alignment under live LSP edits.
+/// Captures the screenshot bug: the initial analysis renders the user's
+/// `Shape`/`Rect`/`Circle` correctly, but after a `did_change` →
+/// `invalidate` cycle the same diagnostics start naming unrelated
+/// foreign symbols (e.g. `path`, `append`) where the user's types
+/// should appear.
+///
+/// The hypothesis: caches that survive `invalidate` (the `TypeArena`,
+/// `DeclRegistry`, `SymbolTable`) hold `(Uri, Idx<Decl>) →
+/// TypeDeclId` and `Symbol → name` mappings that go stale when the
+/// freshly-lowered HIR allocates decls into different arena positions
+/// than the previous lower did. Reproducer drives the same `did_change`
+/// flow the LSP exercises (`manager.update` + `pa.invalidate`).
+#[test]
+fn invalidate_after_did_change_does_not_misalign_symbols() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::{SourceEncoding, SourceManager};
+
+    let stdlib_uri = Uri::from_str("file:///proj/std/core.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+
+    // Initial source — canonical reproducer shape. Type decls land at
+    // `Idx<Decl>` 0/1/2 in the HIR (no methods → no interleaved decls).
+    let initial_src = "abstract type Shape {}\n\
+                       type Rect extends Shape {}\n\
+                       type Circle extends Shape {}\n\
+                       fn test(s: Shape) {\n\
+                           if (s is Rect) {\n\
+                               expect_rect(s);\n\
+                           } else {\n\
+                               expect_circle(s);\n\
+                           }\n\
+                       }\n\
+                       fn expect_rect(_: Rect) {}\n\
+                       fn expect_circle(_: Circle) {}\n";
+
+    // Edit: add a method inside Shape. `lower_type_decl` pushes nested
+    // methods onto the *same* `hir.decls` arena BEFORE allocating the
+    // owning Type, so the method takes `Idx(0)` and every later type
+    // shifts up by one. After this edit, `Shape` lands where `Rect`
+    // used to be in the persistent `DeclRegistry`'s `(Uri, Idx<Decl>)`
+    // intern table — first-write-wins on `name` means the cached
+    // handle still reports "Rect".
+    let edited_src = "abstract type Shape { fn nudge() {} }\n\
+                      type Rect extends Shape {}\n\
+                      type Circle extends Shape {}\n\
+                      fn test(s: Shape) {\n\
+                          if (s is Rect) {\n\
+                              expect_rect(s);\n\
+                          } else {\n\
+                              expect_circle(s);\n\
+                          }\n\
+                      }\n\
+                      fn expect_rect(_: Rect) {}\n\
+                      fn expect_circle(_: Circle) {}\n";
+
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(stdlib_uri, synthetic_std_core_with_node(), "std", false);
+    mgr.add_simple(user_uri.clone(), initial_src, "project", false);
+    let mut pa = ProjectAnalysis::analyze(&mgr);
+
+    // Sanity: initial state is clean (no decidability false positives,
+    // no `not assignable` on the narrow path — same guarantees as the
+    // sealed-hierarchy test above).
+    {
+        let module = pa.module(&user_uri).unwrap();
+        let diags = capabilities::diagnostics_from_module(initial_src, module, false);
+        let bad: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.message.contains("condition is always")
+                    || (d.message.contains("not assignable")
+                        && d.message.contains("Shape")
+                        && d.message.contains("Rect"))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "pre-edit baseline must be clean; got: {bad:#?}",
+        );
+    }
+
+    // Drive the LSP `did_change` flow: text update + invalidate.
+    mgr.update(
+        &user_uri,
+        vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: edited_src.into(),
+        }],
+        1,
+        SourceEncoding::UTF8,
+    );
+    pa.invalidate(&mgr, &user_uri);
+
+    let module = pa.module(&user_uri).unwrap();
+
+    // Direct signal — render the type of every binding in `def_types`
+    // and compare against what the source declared. If `s: Shape` comes
+    // out as anything other than `Shape`, the registry / arena cache
+    // is leaking stale handle names across the invalidate boundary.
+    for (ident_idx, ty) in &module.analysis.def_types {
+        let binding_name = pa.symbols().resolve(&module.hir.idents[*ident_idx].symbol);
+        let rendered = pa.display_type(*ty).to_string();
+        let expected = match binding_name {
+            "s" => "Shape",
+            // Both `expect_rect`'s and `expect_circle`'s parameters are
+            // named `_`; check that whichever rendering we see is one
+            // of the two declared types, not a stale third name.
+            "_" => {
+                assert!(
+                    rendered == "Rect" || rendered == "Circle",
+                    "post-invalidate: `_` param should render as `Rect` or `Circle`, got `{rendered}`",
+                );
+                continue;
+            }
+            _ => continue,
+        };
+        assert_eq!(
+            rendered, expected,
+            "post-invalidate: `{binding_name}` should render as `{expected}`, got `{rendered}`",
+        );
+    }
+
+    // Diagnostic-side signal — the same regression surfaces as the
+    // decidable + unreachable + not-assignable triplet from the
+    // screenshot, with foreign names where the user's types should be.
+    let diags = capabilities::diagnostics_from_module(edited_src, module, false);
+    let decidable: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message.contains("condition is always false")
+                || d.message.contains("condition is always true")
+        })
+        .collect();
+    assert!(
+        decidable.is_empty(),
+        "post-invalidate: no decidable-condition diagnostic should fire for `Shape is Rect`; got: {decidable:#?}",
     );
 }
 

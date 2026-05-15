@@ -79,27 +79,6 @@ pub struct Type {
     pub nullable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NodeKind {
-    Node,
-    Time,
-    Index,
-    Geo,
-    List,
-}
-
-impl NodeKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            NodeKind::Node => "node",
-            NodeKind::Time => "nodeTime",
-            NodeKind::Index => "nodeIndex",
-            NodeKind::Geo => "nodeGeo",
-            NodeKind::List => "nodeList",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     /// `null`-only type. Convertible to any nullable.
@@ -133,10 +112,6 @@ pub enum TypeKind {
     Generic {
         decl: TypeDeclId,
         /// Cannot be zero-length (ensured by the lowering phase)
-        args: SmallVec<[TypeId; 2]>,
-    },
-    Node {
-        kind: NodeKind,
         args: SmallVec<[TypeId; 2]>,
     },
     // P35.3
@@ -874,10 +849,14 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // is allowed: the runtime decides at instantiation time.
         // Same for the symmetric `Foo as T` direction.
         TypeKind::GenericParam { .. } => true,
-        TypeKind::Primitive(Primitive::Int) => matches!(
-            to_t.kind,
-            TypeKind::Primitive(Primitive::Float) | TypeKind::Node { .. }
-        ),
+        // `int as <node-tag>` (and the inverse) requires
+        // handle-keyed dispatch via `WellKnown::is_node_tag`; lives in
+        // the analysis crate's `is_castable_with_index`. Core only
+        // knows `int as float` here — every other extending rule
+        // moved one layer up.
+        TypeKind::Primitive(Primitive::Int) => {
+            matches!(to_t.kind, TypeKind::Primitive(Primitive::Float))
+        }
         TypeKind::Primitive(Primitive::Float) => {
             matches!(to_t.kind, TypeKind::Primitive(Primitive::Int))
         }
@@ -982,7 +961,6 @@ fn write_type(
         TypeKind::Any => f.write_str("any")?,
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
-        TypeKind::Node { kind: decl, .. } => f.write_str(decl.name())?,
         // Decl-name rendering belongs to the project layer
         // (see `ProjectTypeDisplay` in
         // `greycat-analyzer-analysis::project`). Core's bare display
@@ -1086,14 +1064,6 @@ pub fn display_fqn(
         TypeKind::Any => "core::any".to_string(),
         TypeKind::Never => "core::never".to_string(),
         TypeKind::Primitive(p) => format!("core::{}", p.name()),
-        // TODO: add args
-        TypeKind::Node { kind, args } => {
-            let parts: Vec<String> = args
-                .iter()
-                .map(|a| display_fqn(arena, symbols, *a, home_lib))
-                .collect();
-            format!("core::{}<{}>", kind.name(), parts.join(", "))
-        }
         // Decl-name rendering belongs to the project layer.
         // `display_fqn` doesn't have access to a `TypeDeclId →
         // Symbol` map (that lives on `DeclRegistry` in the analysis
@@ -1375,7 +1345,14 @@ mod tests {
         let array_decl = TypeDeclId::from_raw(0);
         let arr = cx.arena.generic(array_decl, vec![str_t]);
         assert_eq!(cx.arena.display(int_q, &cx.symbols).to_string(), "int?");
-        assert_eq!(cx.arena.display(arr, &cx.symbols).to_string(), "Array<String>");
+        // Core's bare `display` no longer knows decl names — the arena
+        // doesn't store them. `Array<String>`-style rendering lives in
+        // the analysis crate's `display_type` helper, which threads a
+        // `DeclRegistry` through.
+        assert_eq!(
+            cx.arena.display(arr, &cx.symbols).to_string(),
+            "?type#0<String>"
+        );
     }
 
     #[test]

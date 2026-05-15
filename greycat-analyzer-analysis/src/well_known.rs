@@ -4,7 +4,7 @@
 //!
 //! Decl-handle identity replaces SmolStr-name identity:
 //!
-//! - [`DeclRegistry`] interns `(Uri, Idx<Decl>)` pairs into dense
+//! - [`DeclRegistry`] interns `(Uri, Symbol)` pairs into dense
 //!   `Copy` [`TypeDeclId`] handles. Used by the project orchestrator
 //!   while lowering signatures.
 //! - [`WellKnown`] holds one `Option<TypeDeclId>` slot per native type
@@ -19,37 +19,44 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use rustc_hash::FxHashMap;
 
-/// Append-only registry mapping `(Uri, Idx<Decl>)` pairs to dense
+/// Append-only registry mapping `(Uri, Symbol)` pairs to dense
 /// [`TypeDeclId`]s. Idempotent — the same pair always resolves to the
 /// same handle within a single registry instance.
 ///
 /// Two `TypeDeclId`s from the same registry compare equal iff they
-/// were issued for the same `(uri, decl)` pair. Across registry
+/// were issued for the same `(uri, name)` pair. Across registry
 /// instances, handles are not comparable.
 ///
-/// Decl *names* are not stored here — they live on the `Decl`
-/// variant in the owning module's `Hir`. Display paths that need a
-/// `&str` for a `TypeDeclId` resolve through
-/// [`crate::ProjectAnalysis::decl_name`], which goes
-/// `TypeDeclId → (Uri, Idx<Decl>) → Decl::name() → Idx<Ident> →
-/// Symbol → &str`.
+/// The key is `(Uri, Symbol)` rather than `(Uri, Idx<Decl>)` because
+/// `Idx<Decl>` is HIR-allocation-order — a property of the *current*
+/// lower, not of the decl. Re-lowering the same source after a body
+/// edit (which may shift an unrelated decl into a different Idx slot)
+/// would otherwise return a stale handle whose `name` field is from
+/// a now-deleted neighbour, surfacing as wrong type names in
+/// diagnostics. Keying on the name makes the handle stable across
+/// edits that don't rename, and renames correctly orphan the old
+/// handle (different name → different identity).
+///
+/// The `Idx<Decl>` field on each entry is a *mutable cache* of the
+/// current HIR's allocation slot, refreshed on every cache hit so
+/// [`resolve`] keeps returning a navigable index against the current
+/// HIR.
 #[derive(Debug, Clone)]
 struct DeclEntry {
     uri: Uri,
+    /// Current `Idx<Decl>` for this decl in its owning module's HIR.
+    /// Refreshed on every `get_or_insert` cache hit. Only meaningful
+    /// against the most recently-ingested HIR for `uri`.
     decl: Idx<Decl>,
-    /// Cached `Symbol` for the decl's name — `Idx<Decl>` alone is
-    /// only dereferenceable with the owning module's `Hir`, which
-    /// the per-module `Cx` doesn't carry. Storing the `Symbol` (a
-    /// `u32` handle into the project's `SymbolTable`, *not* a
-    /// duplicated string) lets every consumer render the name in
-    /// constant time.
+    /// Decl's source name — immutable identity (part of the intern
+    /// key). Joined with the project's `SymbolTable` to get a `&str`.
     name: Symbol,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct DeclRegistry {
     items: Vec<DeclEntry>,
-    intern: FxHashMap<(Uri, Idx<Decl>), TypeDeclId>,
+    intern: FxHashMap<(Uri, Symbol), TypeDeclId>,
 }
 
 impl DeclRegistry {
@@ -57,12 +64,16 @@ impl DeclRegistry {
         Self::default()
     }
 
-    /// Intern `(uri, decl)`. Idempotent — re-calling with the same
-    /// pair returns the previously-issued handle; `name` on
-    /// subsequent calls is ignored (first call wins).
-    pub fn get_or_insert(&mut self, uri: &Uri, decl: Idx<Decl>, name: Symbol) -> TypeDeclId {
-        let key = (uri.clone(), decl);
+    /// Intern `(uri, name)`. Idempotent on `(uri, name)` — re-calling
+    /// with the same pair returns the previously-issued handle and
+    /// refreshes the cached `decl` field to the new `Idx<Decl>` so
+    /// [`resolve`] stays valid against the current HIR.
+    pub fn get_or_insert(&mut self, uri: &Uri, name: Symbol, decl: Idx<Decl>) -> TypeDeclId {
+        let key = (uri.clone(), name);
         if let Some(&id) = self.intern.get(&key) {
+            // Refresh the cached decl idx — the HIR may have just
+            // been re-lowered with the decl at a different position.
+            self.items[id.raw() as usize].decl = decl;
             return id;
         }
         let id = TypeDeclId::from_raw(self.items.len() as u32);
@@ -81,13 +92,16 @@ impl DeclRegistry {
         self.items.get(id.raw() as usize).map(|e| e.name)
     }
 
-    /// Read-only lookup: returns the handle for `(uri, decl)` or
+    /// Read-only lookup: returns the handle for `(uri, name)` or
     /// `None` if no one has interned it yet.
-    pub fn lookup(&self, uri: &Uri, decl: Idx<Decl>) -> Option<TypeDeclId> {
-        self.intern.get(&(uri.clone(), decl)).copied()
+    pub fn lookup(&self, uri: &Uri, name: Symbol) -> Option<TypeDeclId> {
+        self.intern.get(&(uri.clone(), name)).copied()
     }
 
-    /// Resolve a handle back to its `(uri, decl)` source.
+    /// Resolve a handle back to its `(uri, decl)` source. `decl` is
+    /// the *current* HIR's Idx for this decl — refreshed on every
+    /// `get_or_insert` cache hit. Only valid against the most
+    /// recently-ingested HIR for `uri`.
     pub fn resolve(&self, id: TypeDeclId) -> Option<(&Uri, Idx<Decl>)> {
         self.items.get(id.raw() as usize).map(|e| (&e.uri, e.decl))
     }
@@ -324,8 +338,8 @@ mod tests {
         let decl = Idx::<Decl>::from_raw(0u32);
         let symbols = SymbolTable::new();
         let name = symbols.intern("Foo");
-        let a = r.get_or_insert(&uri, decl, name);
-        let b = r.get_or_insert(&uri, decl, name);
+        let a = r.get_or_insert(&uri, name, decl);
+        let b = r.get_or_insert(&uri, name, decl);
         assert_eq!(a, b);
         assert_eq!(r.len(), 1);
     }

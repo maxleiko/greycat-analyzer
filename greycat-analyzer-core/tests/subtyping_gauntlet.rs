@@ -220,28 +220,11 @@ fn rt_tuple_element_mismatch_rejected() {
 // Cast rules (P12.3) — asymmetric promotions
 // =============================================================================
 
-#[test]
-fn rt_cast_int_to_node_tags_allowed() {
-    let mut a = arena();
-    let i = a.primitive(Primitive::Int);
-    for (raw, tag) in [
-        (10u32, "node"),
-        (11, "nodeTime"),
-        (12, "nodeList"),
-        (13, "nodeIndex"),
-        (14, "nodeGeo"),
-    ] {
-        let tag_decl = TypeDeclId::from_raw(raw);
-        let tagged = a.alloc_type(tag_decl);
-        assert!(is_castable(&a, i, tagged), "int as {tag} should be allowed",);
-    }
-}
-
-// `rt_cast_node_tags_to_int_allowed` removed: the
-// `node<T> as int` cast rule moved to
+// `rt_cast_int_to_node_tags_allowed` and the inverse
+// `rt_cast_node_tags_to_int_allowed` both moved to
 // `crate::project::is_castable_with_index` (analysis crate) where
-// `WellKnown::is_node_tag(decl)` provides handle-keyed dispatch.
-// The pure `is_castable` in this crate no longer knows about node
+// `WellKnown::is_node_tag(decl)` provides handle-keyed dispatch. The
+// pure `is_castable` in this crate no longer knows about node
 // tags — coverage lives in the analysis crate's cross-module
 // fixtures now.
 

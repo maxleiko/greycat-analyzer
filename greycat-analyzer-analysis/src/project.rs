@@ -18,12 +18,12 @@ use std::time::{Duration, Instant};
 use greycat_analyzer_hir::arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
     GenericOwner, Primitive, SourceManager, Symbol, SymbolTable, TypeArena, TypeDeclId, TypeId,
     TypeKind, is_assignable_to, is_castable,
 };
-use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Stmt, TypeRef};
 use greycat_analyzer_hir::{Hir, lower_module};
 use smol_str::SmolStr;
@@ -624,12 +624,6 @@ fn write_type_qualified(
             write_decl_qualified(f, project, *decl)?;
             write_args_qualified(f, project, args)?;
         }
-        TypeKind::Node { kind, args } => {
-            f.write_str(kind.name())?;
-            if !args.is_empty() {
-                write_args_qualified(f, project, args)?;
-            }
-        }
         TypeKind::Unresolved { name, .. } => f.write_str(project.symbol(name))?,
         TypeKind::GenericParam { name, .. } => f.write_str(project.symbol(name))?,
         TypeKind::Lambda { params, ret } => {
@@ -679,6 +673,109 @@ fn write_args_qualified(
         write_type_qualified(f, project, *a)?;
     }
     f.write_str(">")
+}
+
+/// Registry-aware [`Display`] wrapper for a [`TypeId`]. Renders the
+/// type the same way [`TypeArena::display`] does, but consults
+/// `decl_registry` to recover decl names for `Type(d)` / `Generic{decl,
+/// args}` so error messages and lint diagnostics surface the real
+/// `Foo` / `Map<int, String>` instead of the bare-arena placeholder
+/// `?type#<raw>`. No module-qualification logic — use
+/// [`ProjectAnalysis::display_type`] when ambiguity disambiguation is
+/// needed.
+pub fn display_type<'a>(
+    arena: &'a TypeArena,
+    decl_registry: &'a crate::well_known::DeclRegistry,
+    symbols: &'a SymbolTable,
+    id: TypeId,
+) -> TypeWithDecls<'a> {
+    TypeWithDecls {
+        arena,
+        decl_registry,
+        symbols,
+        id,
+    }
+}
+
+pub struct TypeWithDecls<'a> {
+    arena: &'a TypeArena,
+    decl_registry: &'a crate::well_known::DeclRegistry,
+    symbols: &'a SymbolTable,
+    id: TypeId,
+}
+
+impl std::fmt::Display for TypeWithDecls<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_type_with_decls(f, self.arena, self.decl_registry, self.symbols, self.id)
+    }
+}
+
+fn write_type_with_decls(
+    f: &mut std::fmt::Formatter<'_>,
+    arena: &TypeArena,
+    decl_registry: &crate::well_known::DeclRegistry,
+    symbols: &SymbolTable,
+    id: TypeId,
+) -> std::fmt::Result {
+    use greycat_analyzer_core::TypeKind;
+    let ty = arena.get(id);
+    let decl_name = |d: TypeDeclId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
+        match decl_registry.name(d) {
+            Some(sym) => f.write_str(&symbols[sym]),
+            None => write!(f, "?type#{}", d.raw()),
+        }
+    };
+    match &ty.kind {
+        TypeKind::Null => f.write_str("null")?,
+        TypeKind::Any => f.write_str("any")?,
+        TypeKind::Never => f.write_str("never")?,
+        TypeKind::Primitive(p) => f.write_str(p.name())?,
+        TypeKind::Type(d) => decl_name(*d, f)?,
+        TypeKind::Generic { decl, args } => {
+            decl_name(*decl, f)?;
+            f.write_str("<")?;
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type_with_decls(f, arena, decl_registry, symbols, *a)?;
+            }
+            f.write_str(">")?;
+        }
+        TypeKind::Unresolved { name, .. } => f.write_str(&symbols[*name])?,
+        TypeKind::GenericParam { name, .. } => f.write_str(&symbols[*name])?,
+        TypeKind::Lambda { params, ret } => {
+            f.write_str("(")?;
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type_with_decls(f, arena, decl_registry, symbols, *p)?;
+            }
+            f.write_str(") -> ")?;
+            write_type_with_decls(f, arena, decl_registry, symbols, *ret)?;
+        }
+        TypeKind::Enum { name, .. } => f.write_str(&symbols[*name])?,
+        TypeKind::Union { alts } => {
+            for (i, a) in alts.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" | ")?;
+                }
+                write_type_with_decls(f, arena, decl_registry, symbols, *a)?;
+            }
+            if ty.nullable
+                && !alts
+                    .iter()
+                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
+            {
+                f.write_str(" | null")?;
+            }
+        }
+    }
+    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
+        f.write_str("?")?;
+    }
+    Ok(())
 }
 
 fn write_decl_qualified(
@@ -1131,7 +1228,7 @@ fn lower_module_signatures(
 ///
 /// Falls back to the standard relation when neither case applies, so
 /// every primitive / nullable / lambda / tuple rule still fires.
-fn is_assignable_to_with_index(
+pub(crate) fn is_assignable_to_with_index(
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
     decl_registry: &DeclRegistry,
@@ -1188,9 +1285,11 @@ fn is_assignable_to_with_index(
 }
 
 /// Index-aware extension of [`is_castable`].
-/// Adds the node-tag-handle-to-int cast rule (handles are 64-bit
-/// ints at runtime, so `nodeTime<T> as int` succeeds) using
-/// `WellKnown::is_node_tag(decl)` for decl-keyed dispatch.
+/// Adds the symmetric node-tag-handle / int cast rules — handles are
+/// 64-bit ints at runtime, so `nodeTime<T> as int` and `int as
+/// nodeTime<T>` both succeed. Dispatch via `WellKnown::is_node_tag
+/// (decl)` so a user-declared `type node<T>` (which has its own
+/// handle) doesn't accidentally pick up these rules.
 pub(crate) fn is_castable_with_index(
     well_known: &crate::well_known::WellKnown,
     arena: &TypeArena,
@@ -1200,15 +1299,24 @@ pub(crate) fn is_castable_with_index(
     if is_castable(arena, from, to) {
         return true;
     }
-    // `*node as int`, `*nodeTime<T> as int`, … — the runtime handle
-    // is a 64-bit int.
     let from_t = arena.get(from);
     let to_t = arena.get(to);
-    let to_is_int = matches!(to_t.kind, TypeKind::Primitive(Primitive::Int));
-    if !to_is_int {
-        return false;
+    // `*node as int`, `*nodeTime<T> as int`, … — the runtime handle
+    // is a 64-bit int.
+    if matches!(to_t.kind, TypeKind::Primitive(Primitive::Int))
+        && matches!(&from_t.kind, TypeKind::Generic { decl, .. } if well_known.is_node_tag(*decl))
+    {
+        return true;
     }
-    matches!(&from_t.kind, TypeKind::Generic { decl, .. } if well_known.is_node_tag(*decl))
+    // Inverse direction: `int as nodeTime<T>` succeeds for the same
+    // reason — runtime handle is an int the runtime reinterprets as a
+    // node id.
+    if matches!(from_t.kind, TypeKind::Primitive(Primitive::Int))
+        && matches!(&to_t.kind, TypeKind::Generic { decl, .. } if well_known.is_node_tag(*decl))
+    {
+        return true;
+    }
+    false
 }
 
 // P19.6
@@ -1478,9 +1586,7 @@ impl ProjectAnalysis {
             let expected = fnd.params.len();
             let actual = call.args.len();
             if expected != actual {
-                let fn_name = SmolStr::from(
-                    &index.symbols[fn_module.hir.idents[fnd.name].symbol],
-                );
+                let fn_name = SmolStr::from(&index.symbols[fn_module.hir.idents[fnd.name].symbol]);
                 let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
                 let plural = if expected == 1 { "" } else { "s" };
                 out.push(SemanticDiagnostic {
@@ -1562,16 +1668,15 @@ impl ProjectAnalysis {
                     arg_ty,
                     declared_ty,
                 ) {
-                    let p_name =
-                        SmolStr::from(&index.symbols[fn_module.hir.idents[p.name].symbol]);
+                    let p_name = SmolStr::from(&index.symbols[fn_module.hir.idents[p.name].symbol]);
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     out.push(SemanticDiagnostic {
                         severity: Severity::Error,
                         message: format!(
                             "value of type `{}` is not assignable to parameter `{}: {}`",
-                            arena.display(arg_ty, &index.symbols),
+                            display_type(arena, decl_registry, &index.symbols, arg_ty),
                             p_name,
-                            arena.display(declared_ty, &index.symbols),
+                            display_type(arena, decl_registry, &index.symbols, declared_ty),
                         ),
                         byte_range: r,
                         category: DiagCategory::TypeRelation,
@@ -2469,6 +2574,7 @@ fn run_typed_lints_for_module(
         &module.analysis,
         arena,
         &index.symbols,
+        decl_registry,
         &mut module.lints,
         &mut module.directives,
         bypass,
@@ -2769,6 +2875,7 @@ fn validate_module_type_relations(
                     analysis,
                     arena,
                     index,
+                    decl_registry,
                     *condition,
                     bool_t,
                     "if condition",
@@ -2809,6 +2916,7 @@ fn validate_module_type_relations(
                     analysis,
                     arena,
                     index,
+                    decl_registry,
                     *condition,
                     bool_t,
                     "while condition",
@@ -2835,6 +2943,7 @@ fn validate_module_type_relations(
                     analysis,
                     arena,
                     index,
+                    decl_registry,
                     *condition,
                     bool_t,
                     "do-while condition",
@@ -2858,7 +2967,17 @@ fn validate_module_type_relations(
                 condition, body, ..
             }) => {
                 if let Some(c) = condition {
-                    check_bool(analysis, arena, index, *c, bool_t, "for condition", hir, diags);
+                    check_bool(
+                        analysis,
+                        arena,
+                        index,
+                        decl_registry,
+                        *c,
+                        bool_t,
+                        "for condition",
+                        hir,
+                        diags,
+                    );
                 }
                 validate_block(
                     hir,
@@ -2975,11 +3094,18 @@ fn validate_module_type_relations(
         let Some(value_ty) = analysis.expr_types.get(&value_id).copied() else {
             return;
         };
-        if is_assignable_to_with_index(index, well_known, decl_registry, arena, value_ty, declared_ty) {
+        if is_assignable_to_with_index(
+            index,
+            well_known,
+            decl_registry,
+            arena,
+            value_ty,
+            declared_ty,
+        ) {
             return;
         }
-        let got = arena.display(value_ty, &index.symbols);
-        let want = arena.display(declared_ty, &index.symbols);
+        let got = display_type(arena, decl_registry, &index.symbols, value_ty);
+        let want = display_type(arena, decl_registry, &index.symbols, declared_ty);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             message: format!(
@@ -2994,6 +3120,7 @@ fn validate_module_type_relations(
         analysis: &AnalysisResult,
         arena: &TypeArena,
         index: &ProjectIndex,
+        decl_registry: &crate::well_known::DeclRegistry,
         expr_id: Idx<Expr>,
         bool_t: TypeId,
         label: &'static str,
@@ -3006,7 +3133,7 @@ fn validate_module_type_relations(
         if is_assignable_to(arena, ty, bool_t) {
             return;
         }
-        let got = arena.display(ty, &index.symbols);
+        let got = display_type(arena, decl_registry, &index.symbols, ty);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             message: format!("{label} must be `bool`, got `{got}`"),
@@ -3144,8 +3271,9 @@ pub fn resolve_decl_handle(
     decl_registry: &DeclRegistry,
     name: &str,
 ) -> Option<TypeDeclId> {
-    for (uri, decl) in index.locate_decl(name) {
-        if let Some(h) = decl_registry.lookup(uri, *decl) {
+    let name_sym = index.symbols.lookup(name)?;
+    for (uri, _) in index.locate_decl(name) {
+        if let Some(h) = decl_registry.lookup(uri, name_sym) {
             return Some(h);
         }
     }
@@ -3180,12 +3308,6 @@ fn lower_qualified_type_ref_project(
         return base;
     };
 
-    let decl_in_module: Option<Idx<Decl>> = index
-        .locate_decl_by_symbol(leaf_name)
-        .iter()
-        .find(|(uri, _)| uri == module_uri)
-        .map(|(_, d)| *d);
-
     if !tr.params.is_empty() {
         let args: Vec<TypeId> = tr
             .params
@@ -3194,7 +3316,7 @@ fn lower_qualified_type_ref_project(
                 lower_type_ref_project(hir, *p, arena, index, decl_registry, generics_in_scope)
             })
             .collect();
-        let mut base = match decl_in_module.and_then(|d| decl_registry.lookup(&module_uri, d)) {
+        let mut base = match decl_registry.lookup(module_uri, leaf_name) {
             Some(handle) => arena.generic(handle, args),
             None => arena.unresolved(leaf_name, byte_span),
         };
@@ -3204,11 +3326,8 @@ fn lower_qualified_type_ref_project(
         return base;
     }
 
-    let mut base = match decl_in_module {
-        Some(d) => match decl_registry.lookup(&module_uri, d) {
-            Some(handle) => arena.alloc_type(handle),
-            None => arena.unresolved(leaf_name, byte_span),
-        },
+    let mut base = match decl_registry.lookup(module_uri, leaf_name) {
+        Some(handle) => arena.alloc_type(handle),
         None => arena.unresolved(leaf_name, byte_span),
     };
     if tr.optional {

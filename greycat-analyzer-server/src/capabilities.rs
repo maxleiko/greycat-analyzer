@@ -215,8 +215,9 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
 
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir);
-    let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let resolutions = resolve(&hir, &symbols);
+    let (arena, analysis) =
+        greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
 
     // --- Layer 1: ident-based hover (params / locals / decls / builtins).
     if node.kind() == "ident"
@@ -749,7 +750,7 @@ pub fn goto_definition(
 
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir);
+    let resolutions = resolve(&hir, &symbols);
 
     // Find which Idx<Ident> this CST node corresponds to.
     let ident_text = text.get(node.byte_range())?;
@@ -783,7 +784,8 @@ pub fn goto_definition(
     // P6.3: the property side of `a.b` / `a->b` isn't in `Resolutions`
     // — bindings live in `AnalysisResult::member_uses`. Run the
     // analyzer to consult it before giving up.
-    let (_arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let (_arena, analysis) =
+        greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
     let member = analysis.member_lookup(target)?;
     let target_range = match member {
         greycat_analyzer_analysis::analyzer::MemberDef::Attr(attr_id) => {
@@ -1399,7 +1401,7 @@ pub fn references(
     // project pipeline).
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
-    let res = resolve(&hir);
+    let res = resolve(&hir, &symbols);
     let Some(cursor_idx) = idx_for_node(&hir, node) else {
         return Vec::new();
     };
@@ -1528,7 +1530,7 @@ pub fn rename(
     // `Resolutions` (cross-module — P8.2 picks that up).
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", "project", root);
-    let res = resolve(&hir);
+    let res = resolve(&hir, &symbols);
     let mut edits = Vec::new();
     if let Some(cursor_idx) = idx_for_node(&hir, node)
         && let Some(target) = target_binding(&hir, &res, cursor_idx)
@@ -2108,8 +2110,9 @@ pub fn inlay_hints(
 ) -> Vec<InlayHint> {
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir);
-    let (arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let resolutions = resolve(&hir, &symbols);
+    let (arena, analysis) =
+        greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
     let module = ModuleAnalysis {
         hir,
         resolutions,
@@ -2570,7 +2573,7 @@ const TOK_KEYWORD: u32 = 9;
 pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> SemanticTokens {
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir);
+    let resolutions = resolve(&hir, &symbols);
 
     let mut events: Vec<SemanticTokenEvent> = Vec::new();
 
@@ -4766,7 +4769,11 @@ fn lookup_name_type_in_stmt(
 /// Read the head name of `id` from `arena` — the bare type name
 /// stripped of nullability / generic args. Returns `None` for shapes
 /// without a single name (lambdas, tuples, anonymous structures).
-fn type_head_name<'a>(pa: &'a ProjectAnalysis, arena: &'a TypeArena, id: TypeId) -> Option<&'a str> {
+fn type_head_name<'a>(
+    pa: &'a ProjectAnalysis,
+    arena: &'a TypeArena,
+    id: TypeId,
+) -> Option<&'a str> {
     use greycat_analyzer_core::TypeKind;
     let t = arena.get(id);
     match &t.kind {
@@ -5310,8 +5317,9 @@ pub(crate) fn current_diagnostics(
 ) -> Vec<Diagnostic> {
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir);
-    let (_arena, analysis) = greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions);
+    let resolutions = resolve(&hir, &symbols);
+    let (_arena, analysis) =
+        greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
     let mut out: Vec<Diagnostic> = analysis
         .diagnostics
         .iter()

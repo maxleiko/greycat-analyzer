@@ -1,4 +1,5 @@
 use std::hash::BuildHasherDefault;
+use std::sync::Arc;
 
 use lasso::{Key, Spur, ThreadedRodeo};
 use rustc_hash::FxHasher;
@@ -26,16 +27,18 @@ impl Symbol {
 /// name across the project lifetime. Hot lookup paths (analyzer body
 /// walker, project orchestrator) use `lookup` for read-only checks
 /// and `intern` only when extending the index.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SymbolTable {
-    rodeo: ThreadedRodeo<Spur, BuildHasherDefault<FxHasher>>,
+    rodeo: Arc<ThreadedRodeo<Spur, BuildHasherDefault<FxHasher>>>,
 }
 
 impl Default for SymbolTable {
     #[inline(always)]
     fn default() -> Self {
         Self {
-            rodeo: ThreadedRodeo::with_hasher(BuildHasherDefault::<FxHasher>::default()),
+            rodeo: Arc::new(ThreadedRodeo::with_hasher(
+                BuildHasherDefault::<FxHasher>::default(),
+            )),
         }
     }
 }

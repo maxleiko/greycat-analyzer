@@ -24,8 +24,10 @@ use greycat_analyzer_hir::types::{
 };
 
 use crate::analyzer::AnalysisResult;
+use crate::directives::Directives;
 use crate::resolver::{Definition, Resolutions};
 use crate::stdlib::ProjectIndex;
+use crate::well_known::DeclRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintSeverity {
@@ -110,7 +112,7 @@ pub struct LintCx<'a> {
     // `SymbolTable`. Set to `&SymbolTable::default()` by per-file
     // callers that don't go through `ProjectAnalysis`.
     pub symbols: &'a SymbolTable,
-    pub directives: Option<&'a mut crate::directives::Directives>,
+    pub directives: Option<&'a mut Directives>,
     pub bypass_suppressions: bool,
     out: &'a mut Vec<LintDiagnostic>,
 }
@@ -120,7 +122,7 @@ impl<'a> LintCx<'a> {
         hir: &'a Hir,
         res: &'a Resolutions,
         symbols: &'a SymbolTable,
-        directives: Option<&'a mut crate::directives::Directives>,
+        directives: Option<&'a mut Directives>,
         bypass_suppressions: bool,
         out: &'a mut Vec<LintDiagnostic>,
     ) -> Self {
@@ -337,7 +339,7 @@ pub fn run_lints_with_directives(
     hir: &Hir,
     res: &Resolutions,
     symbols: &SymbolTable,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
 ) -> Vec<LintDiagnostic> {
     let mut out = Vec::new();
@@ -364,10 +366,7 @@ pub fn run_lints_with_directives(
 /// `unused-suppression` itself is suppressible only via
 /// `// gcl-lint-file-off unused-suppression` (narrower scopes would be
 /// circular). Folds findings directly into `out`.
-pub fn lint_unused_suppressions(
-    directives: &mut crate::directives::Directives,
-    out: &mut Vec<LintDiagnostic>,
-) {
+pub fn lint_unused_suppressions(directives: &mut Directives, out: &mut Vec<LintDiagnostic>) {
     // Two-phase: collect first so we can let `Directives::suppresses_lint`
     // mutate state without re-borrowing the suppression list.
     let mut emissions: Vec<LintDiagnostic> = Vec::new();
@@ -425,7 +424,7 @@ pub fn lint_unused_suppressions(
 pub fn lint_catch_empty_parens(
     text: &str,
     root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
     out: &mut Vec<LintDiagnostic>,
 ) {
@@ -488,7 +487,7 @@ pub fn lint_catch_empty_parens(
 pub fn lint_redundant_semicolon(
     text: &str,
     root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
     out: &mut Vec<LintDiagnostic>,
 ) {
@@ -537,7 +536,7 @@ pub fn lint_redundant_semicolon(
 /// out per-site via `// gcl-lint-off no-breakpoint`.
 pub fn lint_no_breakpoint(
     root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
     out: &mut Vec<LintDiagnostic>,
 ) {
@@ -1085,7 +1084,7 @@ pub fn lint_arrow_on_non_deref(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
 ) {
     lint_arrow_on_non_deref_inner(hir, analysis, arena, index, decl_registry, out, None, false);
@@ -1098,9 +1097,9 @@ pub fn lint_arrow_on_non_deref_with_directives(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
 ) {
     lint_arrow_on_non_deref_inner(
@@ -1120,9 +1119,9 @@ fn lint_arrow_on_non_deref_inner(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
-    mut directives: Option<&mut crate::directives::Directives>,
+    mut directives: Option<&mut Directives>,
     bypass_suppressions: bool,
 ) {
     for (expr_id, expr) in hir.exprs.iter() {
@@ -1150,7 +1149,6 @@ fn lint_arrow_on_non_deref_inner(
             continue;
         }
         let _ = expr_id;
-        let display = arena.display(recv_ty, &index.symbols);
         emit_typed(
             out,
             directives.as_deref_mut(),
@@ -1158,7 +1156,7 @@ fn lint_arrow_on_non_deref_inner(
             LintDiagnostic {
                 rule: "arrow-on-non-deref",
                 severity: LintSeverity::Error,
-                message: format!("`->` requires a node-tag or `@deref` receiver, got `{display}`"),
+                message: format!("`->` requires a node-tag or `@deref` receiver, got `{name}`"),
                 byte_range: byte_range.clone(),
                 tag: None,
             },
@@ -1173,7 +1171,7 @@ fn lint_arrow_on_non_deref_inner(
 /// auto-tag behavior as [`LintCx::emit`].
 fn emit_typed(
     out: &mut Vec<LintDiagnostic>,
-    directives: Option<&mut crate::directives::Directives>,
+    directives: Option<&mut Directives>,
     bypass_suppressions: bool,
     mut diag: LintDiagnostic,
 ) {
@@ -1196,7 +1194,7 @@ fn emit_typed(
 /// anonymous / union / enum / generic-param).
 fn receiver_head_name(
     arena: &TypeArena,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     symbols: &SymbolTable,
     ty: TypeId,
 ) -> Option<String> {
@@ -1350,9 +1348,19 @@ pub fn lint_inferred_return_type(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     symbols: &SymbolTable,
+    decl_registry: &DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
 ) {
-    lint_inferred_return_type_inner(hir, analysis, arena, symbols, out, None, false);
+    lint_inferred_return_type_inner(
+        hir,
+        analysis,
+        arena,
+        symbols,
+        decl_registry,
+        out,
+        None,
+        false,
+    );
 }
 
 /// Directive-aware variant of [`lint_inferred_return_type`].
@@ -1361,8 +1369,9 @@ pub fn lint_inferred_return_type_with_directives(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     symbols: &SymbolTable,
+    decl_registry: &DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
 ) {
     lint_inferred_return_type_inner(
@@ -1370,6 +1379,7 @@ pub fn lint_inferred_return_type_with_directives(
         analysis,
         arena,
         symbols,
+        decl_registry,
         out,
         Some(directives),
         bypass_suppressions,
@@ -1381,8 +1391,9 @@ fn lint_inferred_return_type_inner(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     symbols: &SymbolTable,
+    decl_registry: &DeclRegistry,
     out: &mut Vec<LintDiagnostic>,
-    mut directives: Option<&mut crate::directives::Directives>,
+    mut directives: Option<&mut Directives>,
     bypass_suppressions: bool,
 ) {
     let Some(module) = hir.module.as_ref() else {
@@ -1395,6 +1406,7 @@ fn lint_inferred_return_type_inner(
                 analysis,
                 arena,
                 symbols,
+                decl_registry,
                 fnd,
                 out,
                 directives.as_deref_mut(),
@@ -1408,6 +1420,7 @@ fn lint_inferred_return_type_inner(
                             analysis,
                             arena,
                             symbols,
+                            decl_registry,
                             fnd,
                             out,
                             directives.as_deref_mut(),
@@ -1426,9 +1439,10 @@ fn check_fn_inferred_return(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     symbols: &SymbolTable,
+    decl_registry: &DeclRegistry,
     fnd: &FnDecl,
     out: &mut Vec<LintDiagnostic>,
-    directives: Option<&mut crate::directives::Directives>,
+    directives: Option<&mut Directives>,
     bypass_suppressions: bool,
 ) {
     if fnd.return_type.is_some() {
@@ -1447,7 +1461,7 @@ fn check_fn_inferred_return(
     if matches!(kind, TypeKind::Any | TypeKind::Never) {
         return;
     }
-    let display = arena.display(ret_ty, symbols);
+    let display = crate::project::display_type(arena, decl_registry, symbols, ret_ty);
     let name = &hir.idents[fnd.name];
     emit_typed(
         out,
@@ -1553,7 +1567,7 @@ pub fn lint_nullability_with_directives(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
 ) {
     lint_nullability_inner(
@@ -1573,7 +1587,7 @@ fn lint_nullability_inner(
     analysis: &AnalysisResult,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
-    mut directives: Option<&mut crate::directives::Directives>,
+    mut directives: Option<&mut Directives>,
     bypass_suppressions: bool,
 ) {
     for (expr_id, expr) in hir.exprs.iter() {
@@ -1818,7 +1832,7 @@ pub fn lint_unreachable_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
     out: &mut Vec<LintDiagnostic>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
 ) {
     lint_unreachable_inner(hir, analysis, out, Some(directives), bypass_suppressions);
@@ -1828,7 +1842,7 @@ fn lint_unreachable_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
     out: &mut Vec<LintDiagnostic>,
-    mut directives: Option<&mut crate::directives::Directives>,
+    mut directives: Option<&mut Directives>,
     bypass_suppressions: bool,
 ) {
     let Some(module) = hir.module.as_ref() else {
@@ -1891,7 +1905,7 @@ fn lint_unreachable_inner(
 pub fn lint_non_exhaustive_with_directives(
     analysis: &AnalysisResult,
     out: &mut Vec<LintDiagnostic>,
-    directives: &mut crate::directives::Directives,
+    directives: &mut Directives,
     bypass_suppressions: bool,
 ) {
     for finding in &analysis.non_exhaustive_findings {
@@ -2119,7 +2133,7 @@ mod tests {
         let tree = parse(src);
         let symbols = SymbolTable::default();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir);
+        let res = resolve(&hir, &symbols);
         run_lints(&hir, &res, &symbols)
     }
 
