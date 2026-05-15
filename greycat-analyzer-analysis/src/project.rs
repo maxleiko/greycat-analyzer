@@ -996,6 +996,94 @@ fn lower_signatures_into(
     // the receiver's instantiation via `arena.substitute` at the
     // call site.
     populate_deref_caches(index);
+    // P41.1
+    populate_subtype_indices(index);
+}
+
+// P41.1
+/// Build `subtype_closure` (every type → canonical-sorted concrete
+/// leaves) and `abstract_by_closure_set` (reverse index mapping each
+/// abstract's closure to its name, for the mandatory ancestor-
+/// collapse in `narrow_complement`).
+///
+/// Algorithm:
+/// 1. Invert `type_members[*].supertype` into a direct-child map.
+/// 2. Memoized DFS: `closure(X) = ({X} if X concrete) ∪ ⋃ closure(child)`.
+/// 3. Reverse index: for each abstract `A`, insert `closure(A) → A`.
+///    Iterate abstracts in Symbol-alpha order (by their resolved
+///    name text) so collisions resolve deterministically across
+///    re-lowers — first-inserted wins, and that's always the
+///    alphabetically-earlier name.
+///
+/// Closure entries are stored canonically sorted by `Symbol`'s `Ord`
+/// impl so the reverse-index `get(...)` is order-independent at the
+/// call site.
+fn populate_subtype_indices(index: &mut ProjectIndex) {
+    use rustc_hash::FxHashSet;
+
+    // Snapshot every type name we'll need to compute closures for.
+    // `decl_locations` also covers cross-module decls, but we only
+    // need entries that have a `TypeMembers` record — those are the
+    // ones with a `supertype` edge to walk.
+    let all_types: Vec<Symbol> = index.type_members.keys().copied().collect();
+
+    // Step 1: invert supertype to direct-child.
+    let mut children: FxHashMap<Symbol, Vec<Symbol>> = FxHashMap::default();
+    for (name, members) in &index.type_members {
+        if let Some(parent) = members.supertype {
+            children.entry(parent).or_default().push(*name);
+        }
+    }
+
+    // Step 2: memoized closure build. Recursive helper; `memo` is
+    // shared across roots so sibling subtrees don't redo work.
+    fn build(
+        name: Symbol,
+        children: &FxHashMap<Symbol, Vec<Symbol>>,
+        is_abstract: &FxHashSet<Symbol>,
+        memo: &mut FxHashMap<Symbol, Box<[Symbol]>>,
+    ) {
+        if memo.contains_key(&name) {
+            return;
+        }
+        // Sentinel insert defends against accidental cycles in
+        // `supertype` (shouldn't occur, but corrupt fixtures or
+        // half-loaded projects could otherwise loop here).
+        memo.insert(name, Box::default());
+        let mut set: FxHashSet<Symbol> = FxHashSet::default();
+        if !is_abstract.contains(&name) {
+            set.insert(name);
+        }
+        if let Some(ch) = children.get(&name) {
+            for c in ch.clone() {
+                build(c, children, is_abstract, memo);
+                if let Some(c_closure) = memo.get(&c) {
+                    set.extend(c_closure.iter().copied());
+                }
+            }
+        }
+        let mut sorted: Vec<Symbol> = set.into_iter().collect();
+        sorted.sort();
+        memo.insert(name, sorted.into_boxed_slice());
+    }
+
+    let mut closure: FxHashMap<Symbol, Box<[Symbol]>> = FxHashMap::default();
+    for name in &all_types {
+        build(*name, &children, &index.is_abstract, &mut closure);
+    }
+
+    // Step 3: reverse index, abstracts only, Symbol-alpha order.
+    let mut abstract_names: Vec<Symbol> = index.is_abstract.iter().copied().collect();
+    abstract_names.sort_by(|a, b| index.symbols[*a].cmp(&index.symbols[*b]));
+    let mut reverse: FxHashMap<Box<[Symbol]>, Symbol> = FxHashMap::default();
+    for name in abstract_names {
+        if let Some(c) = closure.get(&name) {
+            reverse.entry(c.clone()).or_insert(name);
+        }
+    }
+
+    index.subtype_closure = closure;
+    index.abstract_by_closure_set = reverse;
 }
 
 fn populate_deref_caches(index: &mut ProjectIndex) {
@@ -3855,5 +3943,259 @@ mod tests {
             "expected eager bool-check diagnostic on `if (1)`, got: {:?}",
             m2.analysis.diagnostics
         );
+    }
+
+    // P41.1 — closure / reverse-index builders.
+
+    /// Resolve a name through the project's `SymbolTable`, panic if absent.
+    fn sym(pa: &ProjectAnalysis, name: &str) -> Symbol {
+        pa.index
+            .symbols
+            .lookup(name)
+            .unwrap_or_else(|| panic!("symbol `{name}` not interned"))
+    }
+
+    /// Collect a closure's concrete leaves as `&str` names so assertions
+    /// don't depend on Symbol identity (which changes per `SymbolTable`).
+    fn closure_names<'a>(pa: &'a ProjectAnalysis, root: &str) -> Vec<&'a str> {
+        let root_sym = sym(pa, root);
+        pa.index
+            .subtype_closure
+            .get(&root_sym)
+            .expect("closure entry present")
+            .iter()
+            .map(|s| &pa.index.symbols[*s])
+            .collect()
+    }
+
+    #[test]
+    fn subtype_closure_concrete_only_and_descending() {
+        // closure(X) includes X iff concrete; recurses into children
+        // regardless of X's abstractness. The Shape root is abstract so
+        // it doesn't include itself; Rect/Circle are concrete leaves
+        // that ARE in closure(Shape). Concrete Rect with abstract
+        // Quadrilateral parent: closure(Quadrilateral) = {Square, Rect}
+        // (Rect concrete → self), but only when Rect extends
+        // Quadrilateral. Keep the shape simple and assertable.
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/main.gcl"),
+            "abstract type Shape {}\n\
+             type Rect extends Shape {}\n\
+             type Circle extends Shape {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+
+        let mut leaves = closure_names(&pa, "Shape");
+        leaves.sort();
+        assert_eq!(leaves, vec!["Circle", "Rect"]);
+
+        // Concrete-leaf closures contain just self.
+        assert_eq!(closure_names(&pa, "Rect"), vec!["Rect"]);
+        assert_eq!(closure_names(&pa, "Circle"), vec!["Circle"]);
+    }
+
+    #[test]
+    fn subtype_closure_deeply_nested_abstract_chain() {
+        // Animal → Mammal → Feline → Cat plus sibling branches at
+        // every level. Exercises the recursive descent: closure(Animal)
+        // spans the full leaf set; closure(Mammal) drops the Bird side;
+        // closure(Feline) is just the Felines.
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/main.gcl"),
+            "abstract type Animal {}\n\
+             abstract type Mammal extends Animal {}\n\
+             type Dog extends Mammal {}\n\
+             type Horse extends Mammal {}\n\
+             abstract type Feline extends Mammal {}\n\
+             type Cat extends Feline {}\n\
+             type Lynx extends Feline {}\n\
+             type Tiger extends Feline {}\n\
+             abstract type Bird extends Animal {}\n\
+             type Eagle extends Bird {}\n\
+             type Penguin extends Bird {}\n\
+             type Sparrow extends Bird {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+
+        let mut animal = closure_names(&pa, "Animal");
+        animal.sort();
+        assert_eq!(
+            animal,
+            vec![
+                "Cat", "Dog", "Eagle", "Horse", "Lynx", "Penguin", "Sparrow", "Tiger"
+            ],
+        );
+        let mut mammal = closure_names(&pa, "Mammal");
+        mammal.sort();
+        assert_eq!(mammal, vec!["Cat", "Dog", "Horse", "Lynx", "Tiger"]);
+        let mut feline = closure_names(&pa, "Feline");
+        feline.sort();
+        assert_eq!(feline, vec!["Cat", "Lynx", "Tiger"]);
+        let mut bird = closure_names(&pa, "Bird");
+        bird.sort();
+        assert_eq!(bird, vec!["Eagle", "Penguin", "Sparrow"]);
+    }
+
+    #[test]
+    fn abstract_by_closure_set_reverse_lookup() {
+        // After building closures, the reverse index should resolve
+        // each abstract's closure back to that abstract's Symbol. The
+        // mandatory ancestor-collapse in `narrow_complement` will use
+        // this to render `Bird` instead of `Eagle | Penguin | Sparrow`.
+        //
+        // Note: closure(Animal) MUST differ from closure(Bird) here,
+        // otherwise the alpha-tie-break would assign closure(Bird)'s
+        // slot to `Animal` (which sorts earlier). A non-Bird Animal
+        // sibling (`Fish`) breaks the equivalence so the reverse-
+        // index entry uniquely identifies `Bird`.
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/main.gcl"),
+            "abstract type Animal {}\n\
+             abstract type Bird extends Animal {}\n\
+             type Eagle extends Bird {}\n\
+             type Penguin extends Bird {}\n\
+             type Sparrow extends Bird {}\n\
+             type Fish extends Animal {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        let bird_sym = sym(&pa, "Bird");
+        let bird_closure = pa
+            .index
+            .subtype_closure
+            .get(&bird_sym)
+            .expect("Bird closure present");
+        let resolved = pa
+            .index
+            .abstract_by_closure_set
+            .get(bird_closure.as_ref())
+            .copied()
+            .expect("reverse lookup hits");
+        assert_eq!(resolved, bird_sym);
+    }
+
+    #[test]
+    fn subtype_closure_order_independent_across_source_orderings() {
+        // Set-equality is the load-bearing primitive: declaring
+        // subtypes in different source orders MUST produce a closure
+        // set with the same *contents*, and the reverse-index lookup
+        // MUST hit in both. Within a project the canonical form is
+        // byte-stable (we sort by `Symbol::Ord`); across projects the
+        // resolved-name *order* may differ because each SymbolTable
+        // interns in its own order — comparing as sorted name SETS
+        // (alphabetical) is what proves the invariant.
+        let src_a = "abstract type Bird {}\n\
+                     type Eagle extends Bird {}\n\
+                     type Penguin extends Bird {}\n\
+                     type Sparrow extends Bird {}\n";
+        let src_b = "abstract type Bird {}\n\
+                     type Sparrow extends Bird {}\n\
+                     type Eagle extends Bird {}\n\
+                     type Penguin extends Bird {}\n";
+
+        let mut mgr_a = SourceManager::new();
+        mgr_a.add_simple(uri("/proj/main.gcl"), src_a, "project", false);
+        let pa_a = ProjectAnalysis::analyze(&mgr_a);
+
+        let mut mgr_b = SourceManager::new();
+        mgr_b.add_simple(uri("/proj/main.gcl"), src_b, "project", false);
+        let pa_b = ProjectAnalysis::analyze(&mgr_b);
+
+        let collect_sorted = |pa: &ProjectAnalysis, name: &str| -> Vec<String> {
+            let s = sym(pa, name);
+            let mut names: Vec<String> = pa
+                .index
+                .subtype_closure
+                .get(&s)
+                .unwrap()
+                .iter()
+                .map(|sym| pa.index.symbols[*sym].to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            collect_sorted(&pa_a, "Bird"),
+            collect_sorted(&pa_b, "Bird"),
+            "closure must have the same contents regardless of source order"
+        );
+
+        // The reverse index hits in both projects via each project's
+        // own (canonical) closure key — the within-project byte
+        // stability is what matters at narrow-time.
+        assert!(
+            pa_a.index
+                .abstract_by_closure_set
+                .contains_key(pa_a.index.subtype_closure.get(&sym(&pa_a, "Bird")).unwrap()),
+            "reverse index must resolve Bird's closure (src_a)",
+        );
+        assert!(
+            pa_b.index
+                .abstract_by_closure_set
+                .contains_key(pa_b.index.subtype_closure.get(&sym(&pa_b, "Bird")).unwrap()),
+            "reverse index must resolve Bird's closure (src_b)",
+        );
+    }
+
+    #[test]
+    fn abstract_by_closure_set_tie_break_is_symbol_alpha() {
+        // Two abstracts with identical closures — the reverse index
+        // keeps the alphabetically-earlier name (deterministic across
+        // re-lowers; no dependency on HIR Idx ordering).
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/main.gcl"),
+            "abstract type Felidae {}\n\
+             abstract type CatLike extends Felidae {}\n\
+             type Cat extends CatLike {}\n\
+             type Lynx extends CatLike {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        // closure(Felidae) == closure(CatLike) == {Cat, Lynx} —
+        // `CatLike` sorts alphabetically before `Felidae`, so it wins
+        // the reverse-index slot.
+        let catlike_sym = sym(&pa, "CatLike");
+        let cl = pa.index.subtype_closure.get(&catlike_sym).unwrap();
+        let winner = pa
+            .index
+            .abstract_by_closure_set
+            .get(cl.as_ref())
+            .copied()
+            .expect("reverse lookup hits");
+        let winner_name = &pa.index.symbols[winner];
+        assert_eq!(
+            winner_name, "CatLike",
+            "tie-break must pick alphabetically-earlier abstract"
+        );
+    }
+
+    #[test]
+    fn is_abstract_set_captures_abstract_modifier() {
+        // Centralized `is_abstract` set lets the narrowing pass ask
+        // "is this type closed?" without chasing the owning module's
+        // HIR. Captured at ingest time directly from the modifier.
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            uri("/proj/main.gcl"),
+            "abstract type Animal {}\n\
+             type Cat {}\n\
+             abstract type Bird extends Animal {}\n",
+            "project",
+            false,
+        );
+        let pa = ProjectAnalysis::analyze(&mgr);
+        assert!(pa.index.is_abstract.contains(&sym(&pa, "Animal")));
+        assert!(pa.index.is_abstract.contains(&sym(&pa, "Bird")));
+        assert!(!pa.index.is_abstract.contains(&sym(&pa, "Cat")));
     }
 }

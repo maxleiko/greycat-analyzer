@@ -226,6 +226,35 @@ pub struct ProjectIndex {
     /// in `values` too) but the body-walker would type them as
     /// `any`, masking float/int dispatch downstream.
     pub runtime_globals: FxHashMap<Symbol, TypeId>,
+    // P41.1
+    /// Names of types declared with the `abstract` modifier. Centralized
+    /// so the sealed-hierarchy narrowing pass can ask "is this type
+    /// abstract?" without chasing the owning module's HIR. Populated
+    /// during [`Self::ingest`].
+    pub is_abstract: FxHashSet<Symbol>,
+    // P41.1
+    /// For every type (abstract *and* concrete), the canonically-sorted
+    /// set of concrete leaves reachable through `extends`:
+    ///
+    /// ```text
+    /// closure(X) = (X itself, iff X is concrete)
+    ///            ∪ ⋃ closure(child) for each direct child of X
+    /// ```
+    ///
+    /// Stored sorted by `Symbol`'s `Ord` impl so the reverse-index
+    /// lookup in [`Self::abstract_by_closure_set`] is order-independent.
+    /// Built by [`populate_subtype_indices`] at the tail of
+    /// [`crate::project::lower_signatures_into`], after every module's
+    /// `supertype` edges are in place.
+    pub subtype_closure: FxHashMap<Symbol, Box<[Symbol]>>,
+    // P41.1
+    /// Reverse index for the mandatory ancestor-collapse: maps each
+    /// abstract's canonical-sorted closure to that abstract's `Symbol`.
+    /// `narrow_complement` consults this when its subtraction set
+    /// exactly matches some `closure(A)` — collapsing the narrow value
+    /// to `Type(A)` instead of emitting a `Union`. Symbol-alpha
+    /// tie-break on collision (deterministic across re-ingest).
+    pub abstract_by_closure_set: FxHashMap<Box<[Symbol]>, Symbol>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -795,6 +824,10 @@ impl ProjectIndex {
                     // Recognised type name (drives `has_name` and the
                     // sig-cache fingerprint).
                     self.type_names.insert(name_sym);
+                    // P41.1
+                    if td.modifiers.abstract_ {
+                        self.is_abstract.insert(name_sym);
+                    }
                     // Project-wide handle for this decl + well-known
                     // slot recording. Folded in from the former
                     // standalone pre-pass in
