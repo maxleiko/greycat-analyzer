@@ -330,6 +330,7 @@ fn parse_lc(s: &str) -> Option<(u32, u32)> {
 // Type-records collection
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn collect_type_records(
     rel: &Path,
     doc: &Ref<'_, Document>,
@@ -670,6 +671,7 @@ fn lower_type_ref_local(
 // Resolution-records collection
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn collect_resolution_records(
     rel: &Path,
     doc: &Ref<'_, Document>,

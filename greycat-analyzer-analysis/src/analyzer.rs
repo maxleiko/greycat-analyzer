@@ -1850,7 +1850,7 @@ impl<'a> Cx<'a> {
                 if let Some(ty_id) = self.index.enum_type_for(&type_name)
                     && let TypeKind::Enum { variants, .. } = &self.arena.get(ty_id).kind
                     && let Some(member_sym) = self.index.symbols.lookup(&member_name)
-                    && variants.iter().any(|v| *v == member_sym)
+                    && variants.contains(&member_sym)
                 {
                     return Some(ty_id);
                 }
@@ -2262,7 +2262,7 @@ impl<'a> Cx<'a> {
                 }
                 return;
             }
-            tbl.bind(name.clone(), witness);
+            tbl.bind(*name, witness);
             return;
         }
         let ak = self.arena.get(arg_ty).clone();
@@ -2347,7 +2347,7 @@ impl<'a> Cx<'a> {
             );
         }
         let owner = GenericOwner::Type(type_name_sym);
-        self.push_generic_scope(&d.generics, owner.clone());
+        self.push_generic_scope(&d.generics, owner);
         // **P19.11** — build the `this` TypeId. For non-generic
         // types it's `Named { name }`; for generic types it's
         // `Generic { name, args: [GenericParam(g0), GenericParam(g1), ...] }`.
@@ -2370,7 +2370,7 @@ impl<'a> Cx<'a> {
                 .iter()
                 .map(|g| {
                     let g_sym = self.hir.idents[*g].symbol;
-                    self.arena.generic_param(g_sym, owner.clone())
+                    self.arena.generic_param(g_sym, owner)
                 })
                 .collect();
             // P35.7 — mint the generic `this` against the decl handle
@@ -2410,7 +2410,7 @@ impl<'a> Cx<'a> {
             // (`lookup_generic(name: &str)`) hasn't moved to `Symbol`
             // yet. Rebuild the string from the interned symbol.
             let name: SmolStr = SmolStr::from(&self.index.symbols[self.hir.idents[*g].symbol]);
-            frame.insert(name, owner.clone());
+            frame.insert(name, owner);
         }
         self.generics_in_scope.push(frame);
     }
@@ -2422,7 +2422,7 @@ impl<'a> Cx<'a> {
     fn lookup_generic(&self, name: &str) -> Option<GenericOwner> {
         for frame in self.generics_in_scope.iter().rev() {
             if let Some(owner) = frame.get(name) {
-                return Some(owner.clone());
+                return Some(*owner);
             }
         }
         None
@@ -3613,7 +3613,7 @@ impl<'a> Cx<'a> {
                 // the enum itself, not `any`.
                 if let TypeKind::Enum { variants, .. } = &self.arena.get(recv_ty).kind {
                     let prop_sym = self.hir.idents[property].symbol;
-                    if variants.iter().any(|v| *v == prop_sym) {
+                    if variants.contains(&prop_sym) {
                         return recv_ty;
                     }
                 }

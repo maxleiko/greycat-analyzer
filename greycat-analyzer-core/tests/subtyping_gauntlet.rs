@@ -258,8 +258,8 @@ fn rt_generic_param_substitution_through_inference_table() {
     let t_sym = symbols.intern("T");
     let u_sym = symbols.intern("U");
     let owner = GenericOwner::Function(symbols.intern("f"));
-    let t1 = a.generic_param(t_sym, owner.clone());
-    let t2 = a.generic_param(t_sym, owner.clone());
+    let t1 = a.generic_param(t_sym, owner);
+    let t2 = a.generic_param(t_sym, owner);
     let u = a.generic_param(u_sym, owner);
     assert_eq!(t1, t2, "interning should collapse identical GenericParams");
     assert!(is_assignable_to(&a, t1, t2));

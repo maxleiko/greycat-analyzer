@@ -1149,7 +1149,7 @@ fn lower_module_signatures(
                 let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 for g in &td.generics {
                     let g_sym = hir.idents[*g].symbol;
-                    generics_in_scope.insert(g_sym, owner.clone());
+                    generics_in_scope.insert(g_sym, owner);
                 }
                 for attr_id in &td.attrs {
                     let attr = &hir.type_attrs[*attr_id];
@@ -1186,7 +1186,7 @@ fn lower_module_signatures(
                         Vec::with_capacity(fnd.generics.len());
                     for g in &fnd.generics {
                         let g_sym = hir.idents[*g].symbol;
-                        let prev = generics_in_scope.insert(g_sym, method_owner.clone());
+                        let prev = generics_in_scope.insert(g_sym, method_owner);
                         saved.push((g_sym, prev));
                     }
                     let ty = lower_type_ref_project(
@@ -1237,7 +1237,7 @@ fn lower_module_signatures(
                 let mut generics: Vec<Symbol> = Vec::with_capacity(fnd.generics.len());
                 for g in &fnd.generics {
                     let g_sym = hir.idents[*g].symbol;
-                    generics_in_scope.insert(g_sym, owner.clone());
+                    generics_in_scope.insert(g_sym, owner);
                     generics.push(g_sym);
                 }
                 let ret_ty = lower_type_ref_project(
@@ -3204,6 +3204,7 @@ fn validate_module_type_relations(
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_bool(
         analysis: &AnalysisResult,
         arena: &TypeArena,
@@ -3301,7 +3302,7 @@ fn lower_type_ref_project(
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(owner) = generics_in_scope.get(&name_sym) {
-                arena.generic_param(name_sym, owner.clone())
+                arena.generic_param(name_sym, *owner)
             } else if let Some(arity) = index
                 .type_members_for(name)
                 .map(|m| m.generics.len())
@@ -3627,7 +3628,7 @@ fn method_subst_from_receiver(
     let mut subst: MethodSubst = FxHashMap::default();
     for (i, gen_idx) in td.generics.iter().enumerate() {
         let gen_sym = fn_module.hir.idents[*gen_idx].symbol;
-        generics_in_scope.insert(gen_sym, owner.clone());
+        generics_in_scope.insert(gen_sym, owner);
         if let Some(arg_id) = recv_args.get(i).copied() {
             subst.insert(gen_sym, arg_id);
         }

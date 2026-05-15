@@ -1232,6 +1232,7 @@ pub fn lint_arrow_on_non_deref(
 
 /// Directive-aware variant of [`lint_arrow_on_non_deref`]. Drops
 /// suppressed emissions before they land in `out`.
+#[allow(clippy::too_many_arguments)]
 pub fn lint_arrow_on_non_deref_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
@@ -1254,6 +1255,7 @@ pub fn lint_arrow_on_non_deref_with_directives(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lint_arrow_on_non_deref_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
@@ -1504,6 +1506,7 @@ pub fn lint_inferred_return_type(
 }
 
 /// Directive-aware variant of [`lint_inferred_return_type`].
+#[allow(clippy::too_many_arguments)]
 pub fn lint_inferred_return_type_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
@@ -1526,6 +1529,7 @@ pub fn lint_inferred_return_type_with_directives(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lint_inferred_return_type_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
@@ -1574,6 +1578,7 @@ fn lint_inferred_return_type_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_fn_inferred_return(
     hir: &Hir,
     analysis: &AnalysisResult,

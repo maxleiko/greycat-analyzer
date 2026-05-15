@@ -289,6 +289,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ident_hover_markdown(
     hir: &Hir,
     symbols: &SymbolTable,

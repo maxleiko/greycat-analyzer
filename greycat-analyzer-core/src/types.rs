@@ -341,10 +341,10 @@ impl TypeArena {
         })
     }
 
-    /// Idempotently record `name` as the printable source name for
-    /// `decl`. First call wins; subsequent calls with a matching name
-    /// no-op, conflicting names trip a debug-assert (the decl identity
-    /// is supposed to be 1:1 with its name).
+    // Idempotently record `name` as the printable source name for
+    // `decl`. First call wins; subsequent calls with a matching name
+    // no-op, conflicting names trip a debug-assert (the decl identity
+    // is supposed to be 1:1 with its name).
     // fn register_decl_name(&mut self, decl: TypeDeclId, name: SmolStr) {
     //     let i = decl.raw() as usize;
     //     if i >= self.decl_names.len() {

@@ -188,6 +188,14 @@ Removal-side: same walk in reverse, then `git grep` for the rule name (e.g. `bre
 - **Keep ROADMAP phase markers OUT of doc comments.** `///` and `//!` are public API documentation — they end up in `cargo doc` and ship to consumers who don't care about our internal phase numbering. Phase markers (`P19.6`, `**P22.1** —`, `(P15.7 + P16.4)`, etc.) belong in a regular `// PNN.N` line *adjacent* to the doc comment, never inside the `///` / `//!` text. Same applies to README.md and any other consumer-facing prose. Pattern: `// P19.6` on its own line, then the `/// ...` block immediately below it.
 - **LICENSE:** dual MIT / Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE` at workspace root).
 
+## Hard rule — never push with clippy warnings
+
+`cargo clippy --workspace --all-targets` must report **zero warnings**, not just zero errors, before any commit lands on `main` (or any branch that will be pushed). This applies to chunk commits, `chore:` / `fix:` commits, submodule pointer bumps, every push.
+
+**Why:** clippy warnings are how the workspace's invariants (no needless clones on `Copy` types, no `iter().any()` when `contains` exists, no oversized signatures, no orphan doc comments) stay enforced. Each one ignored decays the bar toward "well, it was already noisy" — and once the noise floor rises, real warnings hide in it. The per-chunk checklist step 3 has always said this; promoting it to a hard rule means it sits next to the grammar / syntax-assumption / monkey-patch rules and gets the same gravity.
+
+**How to apply:** the per-chunk loop is `fmt → build → clippy → test`. If clippy reports warnings (your code's *or* pre-existing), fix them in the same commit. Never push and "fix in follow-up." If a warning genuinely warrants an exception (e.g. the existing `#[allow(clippy::too_many_arguments)]` precedent on deep analysis helpers in `project.rs`), gate it behind a narrowly-scoped `#[allow(...)]` on the specific item, never at crate or workspace level. Auto-mode does not waive this.
+
 ## Commit cadence (ROADMAP execution)
 
 While executing [ROADMAP.md](../ROADMAP.md), **one commit per chunk** (the `[ ]` items inside each phase). This keeps the history bisectable and lets the user review the port one workpackage at a time.
