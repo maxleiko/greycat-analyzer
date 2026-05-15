@@ -132,9 +132,9 @@ impl Fmt {
             FmtMode::Write => {
                 for e in &drift {
                     std::fs::write(&e.path, &e.formatted)?;
-                }
-                if !drift.is_empty() {
-                    println!("formatted {} file(s)", drift.len());
+                    // TODO: add formatting duration
+                    // println!("{}: {:.02?}", e.path.display(), e.duration());
+                    println!("{}", e.path.display());
                 }
                 Ok(if any_skipped {
                     ExitCode::FAILURE
@@ -144,7 +144,7 @@ impl Fmt {
             }
             FmtMode::Check => {
                 for e in &drift {
-                    println!("would reformat: {}", e.path.display());
+                    println!("{}: would reformat", e.path.display());
                 }
                 println!("{} file(s) would be reformatted", drift.len());
                 Ok(if drift.is_empty() && !any_skipped {
