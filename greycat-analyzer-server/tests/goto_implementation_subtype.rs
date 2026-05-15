@@ -173,6 +173,79 @@ fn main() {}
 }
 
 #[test]
+fn goto_impl_on_abstract_type_name_returns_concrete_subtypes() {
+    // Cursor on the abstract type's binding-site name (`Shape` in
+    // `abstract type Shape`). Returns every concrete subtype in the
+    // project — the type-cursor counterpart of the abstract-method
+    // case above.
+    let mut mgr = SourceManager::new();
+    let src = "\
+abstract type Shape {}
+type Square extends Shape {}
+type Circle extends Shape {}
+type Bystander {}
+";
+    let uri = add(&mut mgr, "/proj/src/mod.gcl", src);
+    let pa = ProjectAnalysis::analyze(&mgr);
+
+    let cursor_pos = position_of(src, "Shape {}");
+    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
+        .expect("goto-impl returned a response");
+    let locs = locations(resp);
+    assert_eq!(
+        locs.len(),
+        2,
+        "expected Square + Circle (Bystander excluded), got {locs:?}"
+    );
+}
+
+#[test]
+fn goto_impl_on_type_use_site_returns_concrete_subtypes() {
+    // Cursor on a *use* of the abstract type (`var x: Shape;`).
+    // Same answer as cursor-on-binding: concrete subtypes.
+    let mut mgr = SourceManager::new();
+    let src = "\
+abstract type Shape {}
+type Square extends Shape {}
+type Circle extends Shape {}
+fn use_it(s: Shape) {}
+";
+    let uri = add(&mut mgr, "/proj/src/mod.gcl", src);
+    let pa = ProjectAnalysis::analyze(&mgr);
+
+    let cursor_pos = position_of(src, "Shape) {}");
+    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
+        .expect("goto-impl returned a response");
+    let locs = locations(resp);
+    assert_eq!(
+        locs.len(),
+        2,
+        "expected Square + Circle from use-site cursor, got {locs:?}"
+    );
+}
+
+#[test]
+fn goto_impl_on_type_name_across_modules() {
+    let mut mgr = SourceManager::new();
+    let base_src = "abstract type Shape {}\n";
+    let sq_src = "type Square extends Shape {}\n";
+    let ci_src = "type Circle extends Shape {}\n";
+    let base_uri = add(&mut mgr, "/proj/src/base.gcl", base_src);
+    let sq_uri = add(&mut mgr, "/proj/src/square.gcl", sq_src);
+    let ci_uri = add(&mut mgr, "/proj/src/circle.gcl", ci_src);
+    let pa = ProjectAnalysis::analyze(&mgr);
+
+    let cursor_pos = position_of(base_src, "Shape {}");
+    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &base_uri, cursor_pos)
+        .expect("goto-impl returned a response");
+    let locs = locations(resp);
+    assert_eq!(locs.len(), 2, "expected 2 subtype locations: {locs:?}");
+    let mut uris: Vec<_> = locs.iter().map(|l| l.uri.clone()).collect();
+    uris.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
+    assert_eq!(uris, vec![ci_uri, sq_uri]);
+}
+
+#[test]
 fn goto_impl_no_inheritance_returns_only_self() {
     // Sanity: a standalone type with a method and no children should
     // return just its own definition (cursor on its decl line).

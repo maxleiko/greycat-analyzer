@@ -1082,6 +1082,16 @@ pub fn goto_implementation_across_project(
     let cursor_text = doc.text.get(node.byte_range())?.to_string();
     drop(doc);
 
+    // Cursor on a type name (binding site or use site) → return every
+    // concrete subtype across the project. Tried before the method
+    // path because the type-name shape can't be a method ident, and
+    // the method path won't match types.
+    if let Some(target_type) = type_target_for_cursor(project, manager, cursor_uri, cursor_pos)
+        && let Some(resp) = type_implementations(project, manager, &target_type)
+    {
+        return Some(resp);
+    }
+
     let Some(declaring_type) =
         declaring_type_for_method_cursor(project, manager, cursor_uri, cursor_pos)
     else {
@@ -1192,6 +1202,103 @@ pub fn goto_declaration_across_project(
         uri: foreign_uri.clone(),
         range: byte_range_to_lsp(&foreign_doc.text, &range),
     }))
+}
+
+/// Recognise a cursor sitting on a type-name ident — at a binding
+/// site (`type Foo {}`'s `Foo`), at a type-ref use (`var x: Foo`,
+/// `T extends Foo`, `Array<Foo>`), or at a static-receiver chain head
+/// (`Foo::bar`). Returns the canonical type name, which
+/// [`type_implementations`] then drives a project-wide subtype scan
+/// against.
+fn type_target_for_cursor(
+    project: &ProjectAnalysis,
+    manager: &SourceManager,
+    cursor_uri: &Uri,
+    cursor_pos: Position,
+) -> Option<String> {
+    let cell = manager.get(cursor_uri)?;
+    let doc = cell.borrow();
+    let module = project.module(cursor_uri)?;
+    let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
+    drop(doc);
+
+    // Binding-site: cursor on a `type Foo {}` / `enum Foo` ident.
+    if let Some(module_root) = module.hir.module.as_ref() {
+        for decl_id in &module_root.decls {
+            let name_idx = match &module.hir.decls[*decl_id] {
+                Decl::Type(td) => Some(td.name),
+                Decl::Enum(ed) => Some(ed.name),
+                _ => None,
+            };
+            if name_idx == Some(cursor_idx) {
+                return Some(project.symbols()[module.hir.idents[cursor_idx].symbol].to_string());
+            }
+        }
+    }
+
+    // Use-site: resolver bound this ident to a type decl (local
+    // `Definition::Decl` or cross-module `Definition::ProjectDecl`).
+    let def = module.resolutions.lookup(cursor_idx)?;
+    let (home_uri, decl_idx) = match def {
+        Definition::Decl(d) => (cursor_uri.clone(), d),
+        Definition::ProjectDecl { uri, decl } => (uri, decl),
+        _ => return None,
+    };
+    let home_module = project.module(&home_uri)?;
+    match &home_module.hir.decls[decl_idx] {
+        Decl::Type(td) => {
+            Some(project.symbols()[home_module.hir.idents[td.name].symbol].to_string())
+        }
+        Decl::Enum(ed) => {
+            Some(project.symbols()[home_module.hir.idents[ed.name].symbol].to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Return every concrete (non-`abstract`, non-`native`) subtype of
+/// `target_type` across the project as goto-implementation locations.
+/// Returns `None` when no subtypes exist (so the caller can fall
+/// through to the method path). The target type itself is included
+/// when it is concrete — matches the existing
+/// `goto_impl_on_no_inheritance_returns_only_self` convention.
+fn type_implementations(
+    project: &ProjectAnalysis,
+    manager: &SourceManager,
+    target_type: &str,
+) -> Option<GotoDefinitionResponse> {
+    let mut locations = Vec::new();
+    for (uri, module) in project.iter() {
+        let Some(module_root) = module.hir.module.as_ref() else {
+            continue;
+        };
+        let Some(cell) = manager.get(uri) else {
+            continue;
+        };
+        let doc = cell.borrow();
+        for decl_id in &module_root.decls {
+            let Decl::Type(td) = &module.hir.decls[*decl_id] else {
+                continue;
+            };
+            // `native` types live in the runtime — they have no
+            // userland implementation worth jumping to.
+            if td.modifiers.abstract_ || td.modifiers.native {
+                continue;
+            }
+            let candidate = &project.symbols()[module.hir.idents[td.name].symbol];
+            if !project.index.is_subtype_of(candidate, target_type) {
+                continue;
+            }
+            locations.push(Location {
+                uri: uri.clone(),
+                range: byte_range_to_lsp(&doc.text, &module.hir.idents[td.name].byte_range),
+            });
+        }
+    }
+    if locations.is_empty() {
+        return None;
+    }
+    Some(GotoDefinitionResponse::Array(locations))
 }
 
 /// Determine the *declaring type* of the method-name ident under the
