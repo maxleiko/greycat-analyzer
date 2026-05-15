@@ -2892,22 +2892,33 @@ impl<'a> Cx<'a> {
                 ..
             }) => {
                 let range_ty = self.visit_expr(range);
-                // P18.x — bind each iterator param's def_type from the
-                // iterable's element type. Grammar guarantees
-                // `params.len() >= 2` (tuple form). Common shapes:
-                //   - `Array<T>`  -> (index: int, value: T)
-                //   - `Map<K, V>` -> (key: K,    value: V)
-                //   - `Set<T>`    -> (index: int, value: T)
-                //   - other       -> all params keep their declared
-                //                    type (if any) or `any`.
-                let any_id = self.any_nullable();
+                // P18.x — bind each iterator param's def_type from
+                // the iterable's element type. Iterability in
+                // GreyCat is gated by the `@iterable` type-pragma;
+                // in stdlib that covers six native types — Array,
+                // Map, nodeList, nodeIndex, nodeTime, nodeGeo. All
+                // six have stable `WellKnown` decl handles, so the
+                // dispatch is `Some(decl) == self.well_known.<slot>`
+                // identity (same pattern as `WellKnown::is_node_tag`
+                // and the `Expr::Offset` rewrite). Tuple shapes:
+                //   - Array<T>     / nodeList<T>      -> (int,  T)
+                //   - Map<K, V>    / nodeIndex<K, V>  -> (K,    V)
+                //   - nodeTime<T>                     -> (time, T)
+                //   - nodeGeo<T>                      -> (geo,  T)
+                // Strict-null rule for unknown / missing parts:
+                // keys fall back to `any` (non-null — runtime never
+                // yields a null key during iteration); values fall
+                // back to `any?` (could legitimately be nullable).
+                let any_nn = self.any();
+                let any_nl = self.any_nullable();
                 let int_id = self.primitive(Primitive::Int);
                 let time_id = self.primitive(Primitive::Time);
                 let geo_id = self.primitive(Primitive::Geo);
-                // Receiver is nullable iterables propagate through here too —
-                // `for (i, v in arr?)` is valid GreyCat. Strip the optional
-                // before pattern-matching the kind so the binding logic is
-                // the same shape with or without the `?` marker.
+                // Receiver is nullable iterables propagate through
+                // here too — `for (i, v in arr?)` is valid GreyCat.
+                // Strip the optional before pattern-matching the
+                // kind so the binding logic is the same with or
+                // without the `?` marker.
                 let underlying_ty = if self.arena.get(range_ty).nullable {
                     let mut t = self.arena.get(range_ty).clone();
                     t.nullable = false;
@@ -2915,82 +2926,54 @@ impl<'a> Cx<'a> {
                 } else {
                     range_ty
                 };
-                let underlying_kind = self.arena.get(underlying_ty).kind.clone();
-                let generic_name_and_args: Option<(SmolStr, Vec<TypeId>)> = match &underlying_kind {
-                    TypeKind::Generic { decl, args } => self
-                        .decl_name(*decl)
-                        .map(|n| (SmolStr::from(n), args.to_vec())),
-                    _ => None,
+                // Both `Generic { decl, args }` (e.g. `Array<int>`)
+                // and bare `Type(decl)` (e.g. raw `Array` without
+                // args — **P19.15**) carry the same decl handle.
+                // Fold them so the dispatch is one pass with the
+                // args slice empty in the bare case.
+                let decl_and_args: Option<(greycat_analyzer_core::TypeDeclId, Vec<TypeId>)> =
+                    match &self.arena.get(underlying_ty).kind {
+                        TypeKind::Generic { decl, args } => Some((*decl, args.to_vec())),
+                        TypeKind::Type(decl) => Some((*decl, Vec::new())),
+                        _ => None,
+                    };
+                let (key_ty, val_ty) = if let Some((decl, args)) = decl_and_args {
+                    let wk = &self.well_known;
+                    if Some(decl) == wk.array_decl || Some(decl) == wk.node_list_decl {
+                        (int_id, args.first().copied().unwrap_or(any_nl))
+                    } else if Some(decl) == wk.map_decl || Some(decl) == wk.node_index_decl {
+                        (
+                            args.first().copied().unwrap_or(any_nn),
+                            args.get(1).copied().unwrap_or(any_nl),
+                        )
+                    } else if Some(decl) == wk.node_time_decl {
+                        (time_id, args.first().copied().unwrap_or(any_nl))
+                    } else if Some(decl) == wk.node_geo_decl {
+                        (geo_id, args.first().copied().unwrap_or(any_nl))
+                    } else {
+                        // Not a known iterable. A follow-up chunk
+                        // can consult `TypeFlags.iterable` for
+                        // user-tagged `@iterable` decls once a
+                        // per-decl tuple shape is defined.
+                        (any_nn, any_nl)
+                    }
+                } else {
+                    (any_nn, any_nl)
                 };
-                // **P19.15** — bare (raw) collection forms with no
-                // generic args lower to `Type(decl)` rather than
-                // `Generic`. Recover the name so the no-args
-                // fallback arms still fire for the collection set.
-                let non_generic_name: Option<SmolStr> = match &underlying_kind {
-                    TypeKind::Type(d) => self.decl_name(*d).map(SmolStr::from),
-                    _ => None,
-                };
-                let inferred: Vec<TypeId> = match (generic_name_and_args, non_generic_name) {
-                    (Some((name, args)), _)
-                        if name == "Array" || name == "Set" || name == "nodeList" =>
-                    {
-                        let elem = args.first().copied().unwrap_or(any_id);
-                        if params.len() == 2 {
-                            vec![int_id, elem]
-                        } else {
-                            vec![any_id; params.len()]
-                        }
+                let inferred: Vec<TypeId> = if params.len() == 2 {
+                    vec![key_ty, val_ty]
+                } else {
+                    // Defensive — grammar guarantees `>= 2`, but
+                    // keep slot 0 as the key (non-null) and the
+                    // rest as values (nullable). Old code returned
+                    // `any?` for all slots here, which was wrong
+                    // for slot 0 under strict-null semantics.
+                    let mut v = Vec::with_capacity(params.len());
+                    v.push(key_ty);
+                    for _ in 1..params.len() {
+                        v.push(any_nl);
                     }
-                    (Some((name, args)), _) if name == "Map" || name == "nodeIndex" => {
-                        if args.len() >= 2 && params.len() == 2 {
-                            vec![args[0], args[1]]
-                        } else {
-                            vec![any_id; params.len()]
-                        }
-                    }
-                    (Some((name, args)), _) if name == "nodeTime" => {
-                        let elem = args.first().copied().unwrap_or(any_id);
-                        if params.len() == 2 {
-                            vec![time_id, elem]
-                        } else {
-                            vec![any_id; params.len()]
-                        }
-                    }
-                    (Some((name, args)), _) if name == "nodeGeo" => {
-                        let elem = args.first().copied().unwrap_or(any_id);
-                        if params.len() == 2 {
-                            vec![geo_id, elem]
-                        } else {
-                            vec![any_id; params.len()]
-                        }
-                    }
-                    // **P19.15** — bare-named (raw) collection
-                    // forms `nodeTime` / `nodeIndex` / `nodeList` /
-                    // `Array` / `Map` / `Set` / `nodeGeo` (no
-                    // generic args declared) bind keys but the
-                    // value type stays `any` because the element
-                    // type is unknown.
-                    (_, Some(name))
-                        if matches!(
-                            name.as_str(),
-                            "Array" | "Set" | "nodeList" | "nodeTime" | "nodeGeo"
-                        ) =>
-                    {
-                        let key_ty = match name.as_str() {
-                            "nodeTime" => time_id,
-                            "nodeGeo" => geo_id,
-                            _ => int_id,
-                        };
-                        if params.len() == 2 {
-                            vec![key_ty, any_id]
-                        } else {
-                            vec![any_id; params.len()]
-                        }
-                    }
-                    (_, Some(name)) if matches!(name.as_str(), "Map" | "nodeIndex") => {
-                        vec![any_id; params.len()]
-                    }
-                    _ => vec![any_id; params.len()],
+                    v
                 };
                 for (p, inf_ty) in params.iter().zip(inferred.iter()) {
                     let bound_ty = match p.ty {
