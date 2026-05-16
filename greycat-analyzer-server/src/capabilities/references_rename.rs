@@ -15,7 +15,7 @@ use greycat_analyzer_syntax::cst::{node_at_offset, walk_named};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Location, Position, PrepareRenameResponse, TextEdit, Uri, WorkspaceEdit};
 
-use super::cursor_ident_idx;
+use super::goto::cursor_ident_idx;
 use crate::conv::{byte_range_to_lsp, position_to_byte};
 
 pub fn references(
