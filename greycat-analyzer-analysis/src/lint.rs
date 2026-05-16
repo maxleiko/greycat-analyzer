@@ -1043,7 +1043,7 @@ impl LintRule for UnusedGenericParam {
         for decl_id in &module.decls {
             match &cx.hir.decls[*decl_id] {
                 Decl::Fn(fnd) => {
-                    check_generics(
+                    check_fn_generics(
                         cx.hir,
                         cx.res,
                         cx.symbols,
@@ -1066,7 +1066,7 @@ impl LintRule for UnusedGenericParam {
                     // get checked here too.
                     for method_id in &td.methods {
                         if let Decl::Fn(method) = &cx.hir.decls[*method_id] {
-                            check_generics(
+                            check_fn_generics(
                                 cx.hir,
                                 cx.res,
                                 cx.symbols,
@@ -1086,7 +1086,7 @@ impl LintRule for UnusedGenericParam {
     }
 }
 
-fn check_generics(
+fn check_fn_generics(
     hir: &Hir,
     res: &Resolutions,
     symbols: &SymbolTable,
@@ -1094,7 +1094,7 @@ fn check_generics(
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
-    if fnd.modifiers.native || fnd.modifiers.abstract_ {
+    if fnd.modifiers.native {
         return;
     }
     emit_unused_generics(hir, res, symbols, &fnd.generics, out, rule);
@@ -1108,7 +1108,7 @@ fn check_type_generics(
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
-    if td.modifiers.native || td.modifiers.abstract_ {
+    if td.modifiers.native {
         return;
     }
     emit_unused_generics(hir, res, symbols, &td.generics, out, rule);

@@ -7,13 +7,14 @@
 
 use std::ops::Range;
 
-use greycat_analyzer_analysis::analyzer::AnalysisResult;
+use greycat_analyzer_analysis::analyzer::{AnalysisResult, MemberDef};
 use greycat_analyzer_analysis::ide::render::{
     RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_type_decl_with_body,
     render_type_ref_with_subst,
 };
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
+use greycat_analyzer_analysis::well_known::DeclRegistry;
 use greycat_analyzer_core::{SourceManager, SymbolTable, TypeArena, TypeId};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -233,7 +234,7 @@ fn ident_hover_markdown(
     resolutions: &Resolutions,
     analysis: &AnalysisResult,
     arena: &TypeArena,
-    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     ident_idx: Idx<Ident>,
     ident: &Ident,
     project: Option<HoverProjectCtx<'_>>,
@@ -362,11 +363,10 @@ fn ident_hover_markdown(
 fn member_hover_markdown(
     hir: &Hir,
     symbols: &SymbolTable,
-    member: greycat_analyzer_analysis::analyzer::MemberDef,
-    ident: &greycat_analyzer_hir::types::Ident,
+    member: MemberDef,
+    ident: &Ident,
     ctx: Option<&RenderCtx<'_>>,
 ) -> String {
-    use greycat_analyzer_analysis::analyzer::MemberDef;
     match member {
         MemberDef::Attr(attr_id) => {
             let attr = &hir.type_attrs[attr_id];
@@ -396,12 +396,11 @@ fn member_hover_markdown(
 fn foreign_member_hover_markdown(
     foreign_hir: &Hir,
     symbols: &SymbolTable,
-    member: &greycat_analyzer_analysis::analyzer::MemberDef,
-    ident: &greycat_analyzer_hir::types::Ident,
+    member: &MemberDef,
+    ident: &Ident,
     provenance: &str,
     ctx: Option<&RenderCtx<'_>>,
 ) -> String {
-    use greycat_analyzer_analysis::analyzer::MemberDef;
     let mut out = match member {
         MemberDef::Attr(attr_id) => {
             let attr = &foreign_hir.type_attrs[*attr_id];

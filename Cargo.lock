@@ -496,6 +496,7 @@ version = "0.1.0"
 dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-syntax",
+ "rustc-hash",
  "smallvec",
  "smol_str",
 ]
