@@ -13,3 +13,4 @@
 pub mod actions;
 pub mod quickfix;
 pub mod rename;
+pub mod render;

@@ -13,11 +13,11 @@ use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::hover::{
+use crate::conv::{byte_range_to_lsp, byte_to_position, position_to_byte, stmt_byte_range};
+use greycat_analyzer_analysis::ide::render::{
     RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_fn_signature,
     render_type_ref_with_subst,
 };
-use crate::conv::{byte_range_to_lsp, byte_to_position, position_to_byte, stmt_byte_range};
 
 // P15.2.3
 /// Completion with project context. Same dispatcher chain as

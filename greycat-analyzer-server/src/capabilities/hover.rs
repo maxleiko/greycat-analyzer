@@ -1,22 +1,26 @@
 //! Hover handlers — single-file + project-aware variants, plus the
-//! tower of helpers that render decls / members / type-refs into
-//! markdown. `render_type_ref` is `pub(super)` so signature_help can
-//! reuse the same renderer.
+//! markdown builders that wrap a rendered signature with doc / member /
+//! provenance prose. The signature renderers themselves live in
+//! [`greycat_analyzer_analysis::ide::render`] so completion and
+//! signature_help can reach them without going through the hover
+//! module.
 
 use std::ops::Range;
 
 use greycat_analyzer_analysis::analyzer::AnalysisResult;
+use greycat_analyzer_analysis::ide::render::{
+    RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_type_ref_with_subst,
+};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
-use greycat_analyzer_core::{SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_core::{SourceManager, SymbolTable, TypeArena, TypeId};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Expr, FnDecl, Ident, TypeDecl};
+use greycat_analyzer_hir::types::{Decl, Expr, Ident};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Uri};
-use rustc_hash::FxHashMap;
 
 use crate::conv::{byte_range_to_lsp, position_to_byte};
 
@@ -449,208 +453,6 @@ fn render_decl_hover_markdown(
     out
 }
 
-pub(super) fn decl_doc(decl: &Decl) -> Option<&str> {
-    match decl {
-        Decl::Fn(d) => d.doc.as_deref(),
-        Decl::Type(d) => d.doc.as_deref(),
-        Decl::Enum(d) => d.doc.as_deref(),
-        Decl::Var(_) => None,
-        Decl::Pragma(_) => None,
-    }
-}
-
-/// Render a decl as a single-line code-block-friendly signature.
-/// `fn` decls render the full `fn name<G>(p: T): R`; types render
-/// `type Name<G> extends Parent`; enums render `enum Name`; vars
-/// render `var name: T`.
-///
-/// `ctx` carries an optional receiver-instantiation substitution: when
-/// present, generic params on the owning type are rendered as the
-/// receiver's concrete args (e.g. `arr: Array<String>` hovering on
-/// `arr.add` renders `fn add(value: String): null` instead of the
-/// declared `fn add(value: T): null`). The free-function / type-decl
-/// paths pass `None` and the renderer behaves byte-identically to the
-/// unsubst form.
-pub(super) fn render_decl_signature(
-    hir: &Hir,
-    symbols: &SymbolTable,
-    decl: &Decl,
-    ctx: Option<&RenderCtx<'_>>,
-) -> String {
-    match decl {
-        Decl::Fn(d) => render_fn_signature(hir, symbols, d, ctx),
-        Decl::Type(d) => render_type_signature(hir, symbols, d),
-        Decl::Enum(d) => format!("enum {}", &symbols[hir.idents[d.name].symbol]),
-        Decl::Var(d) => {
-            let ty =
-                d.ty.map(|t| render_type_ref_with_subst(hir, symbols, t, ctx))
-                    .unwrap_or_else(|| "any".into());
-            format!("var {}: {}", &symbols[hir.idents[d.name].symbol], ty)
-        }
-        Decl::Pragma(p) => format!("@{}", &symbols[hir.idents[p.name].symbol]),
-    }
-}
-
-pub(super) fn render_fn_signature(
-    hir: &Hir,
-    symbols: &SymbolTable,
-    fnd: &FnDecl,
-    ctx: Option<&RenderCtx<'_>>,
-) -> String {
-    let name = &symbols[hir.idents[fnd.name].symbol];
-    let mut out = String::new();
-    if fnd.modifiers.private {
-        out.push_str("private ");
-    }
-    if fnd.modifiers.static_ {
-        out.push_str("static ");
-    }
-    if fnd.modifiers.abstract_ {
-        out.push_str("abstract ");
-    }
-    if fnd.modifiers.native {
-        out.push_str("native ");
-    }
-    out.push_str("fn ");
-    out.push_str(name);
-    if !fnd.generics.is_empty() {
-        out.push('<');
-        for (i, g) in fnd.generics.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&symbols[hir.idents[*g].symbol]);
-        }
-        out.push('>');
-    }
-    out.push('(');
-    for (i, param_id) in fnd.params.iter().enumerate() {
-        let p = &hir.fn_params[*param_id];
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&symbols[hir.idents[p.name].symbol]);
-        out.push_str(": ");
-        match p.ty {
-            Some(t) => out.push_str(&render_type_ref_with_subst(hir, symbols, t, ctx)),
-            None => out.push_str("any"),
-        }
-    }
-    out.push(')');
-    if let Some(ret) = fnd.return_type {
-        out.push_str(": ");
-        out.push_str(&render_type_ref_with_subst(hir, symbols, ret, ctx));
-    }
-    out
-}
-
-fn render_type_signature(hir: &Hir, symbols: &SymbolTable, td: &TypeDecl) -> String {
-    let mut out = String::new();
-    if td.modifiers.private {
-        out.push_str("private ");
-    }
-    if td.modifiers.abstract_ {
-        out.push_str("abstract ");
-    }
-    if td.modifiers.native {
-        out.push_str("native ");
-    }
-    out.push_str("type ");
-    out.push_str(&symbols[hir.idents[td.name].symbol]);
-    if !td.generics.is_empty() {
-        out.push('<');
-        for (i, g) in td.generics.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&symbols[hir.idents[*g].symbol]);
-        }
-        out.push('>');
-    }
-    if let Some(parent) = td.supertype {
-        out.push_str(" extends ");
-        out.push_str(&render_type_ref(hir, symbols, parent));
-    }
-    out
-}
-
-pub(super) fn render_type_ref(
-    hir: &Hir,
-    symbols: &SymbolTable,
-    type_ref: Idx<greycat_analyzer_hir::types::TypeRef>,
-) -> String {
-    render_type_ref_with_subst(hir, symbols, type_ref, None)
-}
-
-/// Receiver-instantiation context used by the substitution-aware
-/// renderers. Built by `make_render_ctx` from a receiver `TypeId` —
-/// hover / completion thread it through `render_decl_signature` so
-/// generic params on a method's owning type (`Array<T>::add`'s `T`)
-/// render as the concrete instantiation (`String`) instead of the
-/// declared param name.
-pub(super) struct RenderCtx<'a> {
-    pub project: &'a ProjectAnalysis,
-    pub subst: &'a FxHashMap<Symbol, TypeId>,
-}
-
-/// Substitution-aware variant of [`render_type_ref`]. When `ctx` is
-/// `Some` and the `TypeRef` is a bare generic-param ident (no
-/// qualifier, no type args) whose symbol is keyed in `ctx.subst`,
-/// render via the project's `display_type` on the substituted TypeId
-/// instead of emitting the literal param name.
-///
-/// Nullability handling: when `tr.optional` is true and the
-/// substituted TypeId isn't already nullable, append `?` (or
-/// ` | null` for a union — `display_type` formats unions without an
-/// outer `?` suffix). When the substituted TypeId is already
-/// nullable, the rendered form already carries the marker — leave it
-/// alone.
-pub(super) fn render_type_ref_with_subst(
-    hir: &Hir,
-    symbols: &SymbolTable,
-    type_ref: Idx<greycat_analyzer_hir::types::TypeRef>,
-    ctx: Option<&RenderCtx<'_>>,
-) -> String {
-    let tr = &hir.type_refs[type_ref];
-    if let Some(ctx) = ctx
-        && tr.qualifier.is_empty()
-        && tr.params.is_empty()
-        && let Some(&subst_ty) = ctx.subst.get(&hir.idents[tr.name].symbol)
-    {
-        let rendered = ctx.project.display_type(subst_ty).to_string();
-        if tr.optional {
-            let arena_ty = ctx.project.arena().get(subst_ty);
-            if !arena_ty.nullable {
-                return match &arena_ty.kind {
-                    TypeKind::Union { .. } => format!("{rendered} | null"),
-                    _ => format!("{rendered}?"),
-                };
-            }
-        }
-        return rendered;
-    }
-    let mut out = String::new();
-    for q in tr.qualifier.iter() {
-        out.push_str(&symbols[hir.idents[*q].symbol]);
-        out.push_str("::");
-    }
-    out.push_str(&symbols[hir.idents[tr.name].symbol]);
-    if !tr.params.is_empty() {
-        out.push('<');
-        for (i, p) in tr.params.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&render_type_ref_with_subst(hir, symbols, *p, ctx));
-        }
-        out.push('>');
-    }
-    if tr.optional {
-        out.push('?');
-    }
-    out
-}
-
 /// Find the receiver's `TypeId` for a property ident bound through
 /// member resolution. Walks `hir.exprs` for an `Expr::Member` /
 /// `Expr::Arrow` whose `property` is this ident, then reads the
@@ -668,17 +470,6 @@ fn receiver_ty_for_property(
         _ => None,
     })?;
     analysis.expr_types.get(&receiver_id).copied()
-}
-
-/// Best-effort module label for a foreign URI. Strips trailing `.gcl`
-/// off the file name so `file:///proj/lib/std/core.gcl` renders as
-/// `core` in the provenance footnote. Falls back to the URI string
-/// when path parsing fails.
-pub(super) fn module_label_for_uri(uri: &Uri) -> String {
-    let s = uri.as_str();
-    let path_part = s.strip_prefix("file://").unwrap_or(s);
-    let last = path_part.rsplit(['/', '\\']).next().unwrap_or(path_part);
-    last.strip_suffix(".gcl").unwrap_or(last).to_string()
 }
 
 fn push_doc_section(out: &mut String, doc: Option<&str>) {

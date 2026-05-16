@@ -12,8 +12,8 @@ use lsp_types::{
     SignatureHelp, SignatureInformation,
 };
 
-use super::hover::render_type_ref;
 use crate::conv::position_to_byte;
+use greycat_analyzer_analysis::ide::render::render_type_ref;
 
 pub fn signature_help(
     text: &str,
