@@ -7,6 +7,7 @@
 
 use greycat_analyzer_core::lsp_types::{self, *};
 use greycat_analyzer_core::{Symbol, SymbolTable, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
@@ -2601,8 +2602,8 @@ fn type_position_completion(
 /// Object-literal field completion: cursor sits inside an
 /// `object_initializers` / `object_fields` body (`Type { | }` or
 /// `Type { x: 1, | }`). Resolves the surrounding `object_expr`'s
-/// `type_ident` head, then emits the type's `attrs` as `FIELD`
-/// completions, skipping ones already named in the literal.
+/// `type_ident` head, walks the local supertype chain, and emits
+/// each non-static `FIELD` not already named in the literal.
 fn object_field_completion(
     text: &str,
     node: tree_sitter::Node<'_>,
@@ -2625,20 +2626,61 @@ fn object_field_completion(
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
 
-    // Find the type's HIR (in-module first, then cross-module).
+    // Collect already-supplied field names from sibling `object_field`
+    // entries in this literal so we don't suggest the same name twice.
+    // Skip the field whose own ident the cursor sits inside (the user
+    // is editing that one — let normal prefix-matching surface it).
+    let supplied = supplied_field_names(text, body, cursor_byte);
+
+    // Find the type's HIR (in-module first, then cross-module). Then
+    // walk the local supertype chain, accumulating attrs from each
+    // ancestor we can resolve.
     let module = project.module(uri)?;
     let mut items: Vec<CompletionItem> = Vec::new();
-    if let Some(type_sym) = project.symbols().lookup(type_name.as_str())
-        && let Some(decl_id) = module.analysis.type_decls.get(&type_sym).copied()
-        && let Decl::Type(td) = &module.hir.decls[decl_id]
-    {
+    let mut emitted: FxHashSet<String> = FxHashSet::default();
+
+    let visit_type_decl = |hir: &greycat_analyzer_hir::Hir,
+                           td: &greycat_analyzer_hir::types::TypeDecl,
+                           items: &mut Vec<CompletionItem>,
+                           emitted: &mut FxHashSet<String>| {
         emit_attrs(
-            &module.hir,
+            hir,
             project.symbols(),
             td,
             &prefix_lower,
-            &mut items,
+            &supplied,
+            emitted,
+            items,
         );
+    };
+
+    if let Some(type_sym) = project.symbols().lookup(type_name.as_str())
+        && let Some(decl_id) = module.analysis.type_decls.get(&type_sym).copied()
+    {
+        // Walk Sub → Super (local chain) just like the analyzer's
+        // required-attr check.
+        let mut hops = 0usize;
+        let mut seen: FxHashSet<Symbol> = FxHashSet::default();
+        let mut cursor_decl: Option<Idx<Decl>> = Some(decl_id);
+        let mut cursor_name = type_sym;
+        while let Some(d_id) = cursor_decl {
+            if !seen.insert(cursor_name) || hops > 32 {
+                break;
+            }
+            hops += 1;
+            let Decl::Type(td) = &module.hir.decls[d_id] else {
+                break;
+            };
+            visit_type_decl(&module.hir, td, &mut items, &mut emitted);
+            let Some(sup_ref) = td.supertype else { break };
+            let sup_tr = &module.hir.type_refs[sup_ref];
+            if !sup_tr.qualifier.is_empty() {
+                break;
+            }
+            let sup_name_sym = module.hir.idents[sup_tr.name].symbol;
+            cursor_name = sup_name_sym;
+            cursor_decl = module.analysis.type_decls.get(&sup_name_sym).copied();
+        }
     }
     if items.is_empty()
         && let Some((foreign_uri, foreign_decl_id)) = project
@@ -2648,7 +2690,7 @@ fn object_field_completion(
         && let Some(fmod) = project.module(foreign_uri)
         && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
     {
-        emit_attrs(&fmod.hir, project.symbols(), td, &prefix_lower, &mut items);
+        visit_type_decl(&fmod.hir, td, &mut items, &mut emitted);
     }
     if items.is_empty() {
         return None;
@@ -2657,16 +2699,62 @@ fn object_field_completion(
     Some(items)
 }
 
+/// Read the `name:` idents of every `object_field` sibling inside
+/// the given `object_initializers` / `object_fields` body, dropping
+/// the field whose own name range contains the cursor (user is
+/// editing that field's name — we still want it in completion).
+fn supplied_field_names(
+    text: &str,
+    body: tree_sitter::Node<'_>,
+    cursor_byte: usize,
+) -> FxHashSet<String> {
+    let mut out: FxHashSet<String> = FxHashSet::default();
+    let mut walker = body.walk();
+    for child in body.named_children(&mut walker) {
+        if child.kind() != "object_field" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let range = name_node.byte_range();
+        // Cursor inside this field's name → skip; it's the one being
+        // edited and we still want prefix-matched completion for it.
+        if cursor_byte >= range.start && cursor_byte <= range.end {
+            continue;
+        }
+        if let Some(name) = text.get(range) {
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
 fn emit_attrs(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
     td: &greycat_analyzer_hir::types::TypeDecl,
     prefix_lower: &str,
+    supplied: &FxHashSet<String>,
+    emitted: &mut FxHashSet<String>,
     items: &mut Vec<CompletionItem>,
 ) {
     for attr_id in &td.attrs {
         let a = &hir.type_attrs[*attr_id];
+        // Static attrs aren't part of the per-instance schema; they
+        // belong to `Type::|` static access, not object-literal init.
+        if a.modifiers.static_ {
+            continue;
+        }
         let name = symbols[hir.idents[a.name].symbol].to_string();
+        if supplied.contains(&name) {
+            continue;
+        }
+        if !emitted.insert(name.clone()) {
+            // Already emitted by a deeper level in the chain — a child
+            // type's attr shadows the parent's same-named one.
+            continue;
+        }
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }

@@ -1355,12 +1355,65 @@ fn completion_inside_object_literal_lists_attrs() {
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
-    assert!(labels.contains(&"x"), "got: {labels:?}");
+    // `x` is already in the literal — don't suggest it again.
+    assert!(
+        !labels.contains(&"x"),
+        "supplied field `x` should be filtered out: {labels:?}"
+    );
+    // `y` is the only attr left to fill in.
     assert!(labels.contains(&"y"), "got: {labels:?}");
     // Methods aren't fields.
     assert!(
         !labels.contains(&"norm"),
         "method leaked into object literal: {labels:?}"
+    );
+}
+
+/// Empty body `Foo { | }` should list every non-static attr from the
+/// type, the user's most common case.
+#[test]
+fn completion_inside_empty_object_literal_lists_all_attrs() {
+    let src =
+        "type Point { x: int; y: int; static k: int = 0; }\nfn main() { var _ = Point { }; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor between `{` and `}` of the `Point { }` literal (not the
+    // type decl's body) — anchor on `= Point {` so `find` lands on
+    // the right occurrence.
+    let cursor = support::position_after(src, "= Point {", "");
+    let list = project
+        .completion(cursor)
+        .expect("expected completion inside empty object literal");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"x"), "expected `x`: {labels:?}");
+    assert!(labels.contains(&"y"), "expected `y`: {labels:?}");
+    // Static attr — belongs to `Type::|` static access, not object init.
+    assert!(
+        !labels.contains(&"k"),
+        "static `k` should not appear: {labels:?}"
+    );
+}
+
+/// Object-literal completion walks the supertype chain so inherited
+/// attrs surface when the user is filling in a subclass literal.
+#[test]
+fn completion_inside_object_literal_walks_supertype_chain() {
+    let src = "type Animal { name: String; }\n\
+               type Dog extends Animal { breed: String; }\n\
+               fn main() { var _ = Dog { }; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor inside `Dog { | }`.
+    let cursor = support::position_after(src, "Dog { ", "");
+    let list = project
+        .completion(cursor)
+        .expect("expected completion inside Dog literal");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"breed"),
+        "own attr `breed` should appear: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"name"),
+        "inherited attr `name` should appear: {labels:?}"
     );
 }
 
