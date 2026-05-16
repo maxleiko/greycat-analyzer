@@ -665,6 +665,21 @@ struct CondNarrows {
     /// way `if (x is T) { } else { return; }` would.
     then_typed_id: Vec<(Idx<Ident>, TypeId)>,
     else_typed_id: Vec<(Idx<Ident>, TypeId)>,
+    /// Bindings narrowed to `TypeKind::Null` on the then-branch.
+    /// Populated by `x == null` / `null == x`. Materialized via
+    /// `arena.null()` in `apply_then_narrows` / the `Stmt::If`
+    /// then-entry path.
+    then_null: Vec<Idx<Ident>>,
+    /// Mirror for the else-branch. Populated by `x != null` /
+    /// `null != x`. Materialized via `arena.null()` in
+    /// `apply_else_narrows` / the `Stmt::If` else-entry path.
+    else_null: Vec<Idx<Ident>>,
+    /// Member-path version of `then_null`. Populated by
+    /// `a.b == null` / `null == a.b`.
+    then_member_null: Vec<String>,
+    /// Member-path version of `else_null`. Populated by
+    /// `a.b != null` / `null != a.b`.
+    else_member_null: Vec<String>,
     // P41.2
     /// `true` iff the condition is a single atomic `Expr::Is` (possibly
     /// wrapped in `Expr::Paren` or negated by `Expr::Unary(Not, …)`).
@@ -1707,6 +1722,14 @@ impl<'a> Cx<'a> {
         for (path, ty_ref) in &narrows.then_member_typed {
             let ty = self.lower_type_ref(*ty_ref);
             self.write_member_typed(path.clone(), ty);
+        }
+        for ident in &narrows.then_null {
+            let null_ty = self.null();
+            self.write_narrow(*ident, null_ty);
+        }
+        for path in &narrows.then_member_null {
+            let null_ty = self.null();
+            self.write_member_typed(path.clone(), null_ty);
         }
     }
 
@@ -3066,6 +3089,10 @@ impl<'a> Cx<'a> {
                     else_typed_union,
                     mut then_typed_id,
                     mut else_typed_id,
+                    then_null,
+                    else_null,
+                    then_member_null,
+                    else_member_null,
                     is_atomic_is,
                 } = self.derive_cond_narrows(condition);
 
@@ -3271,6 +3298,14 @@ impl<'a> Cx<'a> {
                     let ty = self.lower_type_ref(*ty_ref);
                     self.write_member_typed(path.clone(), ty);
                 }
+                for ident in &then_null {
+                    let null_ty = self.null();
+                    self.write_narrow(*ident, null_ty);
+                }
+                for path in &then_member_null {
+                    let null_ty = self.null();
+                    self.write_member_typed(path.clone(), null_ty);
+                }
                 // **P19.16** — inline the then-branch's stmts (instead
                 // of `visit_block`) so the narrow frame we just pushed
                 // captures any assignments inside the branch. The
@@ -3313,6 +3348,14 @@ impl<'a> Cx<'a> {
                         for (path, ty_ref) in &else_member_typed {
                             let ty = self.lower_type_ref(*ty_ref);
                             self.write_member_typed(path.clone(), ty);
+                        }
+                        for ident in &else_null {
+                            let null_ty = self.null();
+                            self.write_narrow(*ident, null_ty);
+                        }
+                        for path in &else_member_null {
+                            let null_ty = self.null();
+                            self.write_member_typed(path.clone(), null_ty);
                         }
                         // P19.16 — same inline pattern for the else
                         // branch. `eb` may be a Block or a nested If
@@ -3371,6 +3414,14 @@ impl<'a> Cx<'a> {
                         let ty = self.lower_type_ref(*ty_ref);
                         self.write_member_typed(path.clone(), ty);
                     }
+                    for ident in &else_null {
+                        let null_ty = self.null();
+                        self.write_narrow(*ident, null_ty);
+                    }
+                    for path in &else_member_null {
+                        let null_ty = self.null();
+                        self.write_member_typed(path.clone(), null_ty);
+                    }
                 }
                 if else_terminates {
                     for ident in &then_non_null {
@@ -3400,6 +3451,14 @@ impl<'a> Cx<'a> {
                     for (path, ty_ref) in &then_member_typed {
                         let ty = self.lower_type_ref(*ty_ref);
                         self.write_member_typed(path.clone(), ty);
+                    }
+                    for ident in &then_null {
+                        let null_ty = self.null();
+                        self.write_narrow(*ident, null_ty);
+                    }
+                    for path in &then_member_null {
+                        let null_ty = self.null();
+                        self.write_member_typed(path.clone(), null_ty);
                     }
                 }
 
@@ -3820,8 +3879,14 @@ impl<'a> Cx<'a> {
                             self.res.lookup(name_idx)
                     {
                         match *op {
-                            BinOp::Neq => out.then_non_null.push(def),
-                            BinOp::Eq => out.else_non_null.push(def),
+                            BinOp::Neq => {
+                                out.then_non_null.push(def);
+                                out.else_null.push(def);
+                            }
+                            BinOp::Eq => {
+                                out.else_non_null.push(def);
+                                out.then_null.push(def);
+                            }
                             _ => {}
                         }
                         return out;
@@ -3833,8 +3898,14 @@ impl<'a> Cx<'a> {
                     // those have no stable identity.
                     if let Some(path) = self.member_compared_to_null(*left, *right) {
                         match *op {
-                            BinOp::Neq => out.then_member_non_null.push(path),
-                            BinOp::Eq => out.else_member_non_null.push(path),
+                            BinOp::Neq => {
+                                out.then_member_non_null.push(path.clone());
+                                out.else_member_null.push(path);
+                            }
+                            BinOp::Eq => {
+                                out.else_member_non_null.push(path.clone());
+                                out.then_member_null.push(path);
+                            }
                             _ => {}
                         }
                     }
@@ -4646,16 +4717,29 @@ impl<'a> Cx<'a> {
                             else_typed_union: _,
                             then_typed_id: _,
                             else_typed_id: _,
+                            then_null,
+                            else_null,
+                            then_member_null,
+                            else_member_null,
                             is_atomic_is: _,
                         } = self.derive_cond_narrows(left);
-                        let (non_null, typed, typed_union, member_non_null, member_typed) = match op
-                        {
+                        let (
+                            non_null,
+                            typed,
+                            typed_union,
+                            member_non_null,
+                            member_typed,
+                            null,
+                            member_null,
+                        ) = match op {
                             BinOp::And => (
                                 then_non_null,
                                 then_typed,
                                 then_typed_union,
                                 then_member_non_null,
                                 then_member_typed,
+                                then_null,
+                                then_member_null,
                             ),
                             BinOp::Or => (
                                 else_non_null,
@@ -4663,6 +4747,8 @@ impl<'a> Cx<'a> {
                                 Vec::new(),
                                 else_member_non_null,
                                 Vec::new(),
+                                else_null,
+                                else_member_null,
                             ),
                             _ => unreachable!(),
                         };
@@ -4687,6 +4773,14 @@ impl<'a> Cx<'a> {
                         for (path, ty_ref) in member_typed {
                             let ty = self.lower_type_ref(ty_ref);
                             self.write_member_typed(path, ty);
+                        }
+                        for ident in &null {
+                            let null_ty = self.null();
+                            self.write_narrow(*ident, null_ty);
+                        }
+                        for path in member_null {
+                            let null_ty = self.null();
+                            self.write_member_typed(path, null_ty);
                         }
                         let rt = self.visit_expr(right);
                         self.pop_narrow();
