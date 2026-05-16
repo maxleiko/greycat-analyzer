@@ -144,3 +144,43 @@ fn caller(): String {
         ),
     }
 }
+
+#[test]
+fn two_modules_each_with_same_named_private_each_resolve_locally() {
+    // Kopr regression: maps.gcl has `private fn processIndex(...)` and
+    // single_line_diagrams.gcl has `private fn processIndex(...)` with
+    // a different signature. Each module's bare-name call must bind to
+    // its own local private, not to the other module's.
+    //
+    // Step 3 of `record_use` filters cross-module private candidates,
+    // so neither module sees the other's private — the step-4 module-
+    // private fallback should answer with the local decl.
+    let mut mgr = SourceManager::new();
+    let a_uri = add(
+        &mut mgr,
+        "/proj/src/a.gcl",
+        "private fn process(): int { return 1; }\n\
+         fn run_a(): int { return process(); }\n",
+    );
+    let b_uri = add(
+        &mut mgr,
+        "/proj/src/b.gcl",
+        "private fn process(): String { return \"b\"; }\n\
+         fn run_b(): String { return process(); }\n",
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let a_bindings = callee_bindings(&pa, &a_uri, "process");
+    let b_bindings = callee_bindings(&pa, &b_uri, "process");
+    assert_eq!(a_bindings.len(), 1, "a: {:#?}", a_bindings);
+    assert_eq!(b_bindings.len(), 1, "b: {:#?}", b_bindings);
+    assert!(
+        matches!(a_bindings[0], Definition::Decl(_)),
+        "a's call should resolve to its own local private (Decl), got {:?}",
+        a_bindings[0]
+    );
+    assert!(
+        matches!(b_bindings[0], Definition::Decl(_)),
+        "b's call should resolve to its own local private (Decl), got {:?}",
+        b_bindings[0]
+    );
+}

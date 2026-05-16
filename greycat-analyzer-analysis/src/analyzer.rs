@@ -1881,8 +1881,24 @@ impl<'a> Cx<'a> {
                 self.res.lookup(*name_idx)
                 && let Some(cur) = self.lookup_def_type(def)
             {
-                let stripped = self.strip_nullable(cur);
-                self.write_narrow(def, stripped);
+                // When the current narrow is the bottom `null` shape
+                // (a prior `x == null` guard pinned it), stripping
+                // `nullable` leaves a `Null` type with no values —
+                // the post-`?=` reads then see `null` and downstream
+                // typing falsely concludes the value is null. The
+                // operator's semantics are "x = x ?? rhs"; when x is
+                // null, the post-state is exactly `rhs`. So when the
+                // current narrow is a `null` shape (with or without
+                // the `nullable` flag), replace it with the RHS
+                // wholesale instead of stripping nullability.
+                let cur_kind = &self.arena.get(cur).kind;
+                let cur_is_null_shape = matches!(cur_kind, TypeKind::Null);
+                let new_ty = if cur_is_null_shape {
+                    value_ty
+                } else {
+                    self.strip_nullable(cur)
+                };
+                self.write_narrow(def, new_ty);
             }
             return;
         }
@@ -2123,27 +2139,32 @@ impl<'a> Cx<'a> {
     /// signatures index. Generic fns aren't handled here — they
     /// route through [`Self::try_generic_call_inference`] which the
     /// caller tries first.
+    ///
+    /// The resolver's `Definition::Decl` binding takes precedence over
+    /// the name-keyed `index.fn_signature_for` lookup: two modules
+    /// can each declare `private fn process(...)` with different
+    /// signatures, and `fn_signatures` is keyed by name with
+    /// first-decl-wins — so falling back to it for a local binding
+    /// would silently pick the wrong module's return type. Native fns
+    /// have no `Definition::Decl` (they're `Definition::Project`), so
+    /// the `fn_signatures` lookup is still reached for them.
     fn bare_fn_return(&mut self, name_idx: Idx<Ident>) -> Option<TypeId> {
         let def = self.res.lookup(name_idx)?;
+        if let Definition::Decl(decl_id) = &def {
+            let Decl::Fn(fnd) = &self.hir.decls[*decl_id] else {
+                return None;
+            };
+            if !fnd.generics.is_empty() {
+                return None;
+            }
+            let ret = fnd.return_type?;
+            return Some(self.lower_type_ref(ret));
+        }
         let fn_name = self.ident_text(name_idx);
-        // Project signatures index covers local + cross-module + native
-        // fns (P23 includes natives in `stage_lower_signatures`).
         if let Some(sig) = self.index.fn_signature_for(fn_name) {
             return Some(sig.return_ty);
         }
-        match def {
-            Definition::Decl(decl_id) => {
-                let Decl::Fn(fnd) = &self.hir.decls[decl_id] else {
-                    return None;
-                };
-                if !fnd.generics.is_empty() {
-                    return None;
-                }
-                let ret = fnd.return_type?;
-                Some(self.lower_type_ref(ret))
-            }
-            _ => None,
-        }
+        None
     }
 
     // P23
@@ -3513,6 +3534,20 @@ impl<'a> Cx<'a> {
                         let null_ty = self.null();
                         self.write_member_typed(path.clone(), null_ty);
                     }
+                    // Reassignments inside the else block must win
+                    // over the condition-entry narrows above — the
+                    // captured `else_branch_narrows` is the actual
+                    // end-of-else state. Applied last so an else-
+                    // branch `x = node<...>{...}` overrides the
+                    // condition's `else_null` lift for `x`.
+                    if !else_terminates {
+                        for (ident, ty) in &else_branch_narrows {
+                            self.write_narrow(*ident, *ty);
+                        }
+                        for path in &else_branch_member_narrows {
+                            self.write_member_non_null(path.clone());
+                        }
+                    }
                 }
                 if else_terminates {
                     for ident in &then_non_null {
@@ -3550,6 +3585,17 @@ impl<'a> Cx<'a> {
                     for path in &then_member_null {
                         let null_ty = self.null();
                         self.write_member_typed(path.clone(), null_ty);
+                    }
+                    // Mirror of the then_terminates path: the captured
+                    // then-branch state has reassignments that should
+                    // override the condition-entry narrows.
+                    if !then_terminates {
+                        for (ident, ty) in &then_branch_narrows {
+                            self.write_narrow(*ident, *ty);
+                        }
+                        for path in &then_branch_member_narrows {
+                            self.write_member_non_null(path.clone());
+                        }
                     }
                 }
 

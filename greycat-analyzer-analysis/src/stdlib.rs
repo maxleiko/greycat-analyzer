@@ -402,6 +402,20 @@ pub struct TypeMembers {
     /// `node<Super>`) when `Sub` is a descendant of `Super`.
     /// `None` for types without an explicit `extends` clause.
     pub supertype: Option<Symbol>,
+    /// Pre-lowered direct supertype as a project-arena `TypeId`. Holds
+    /// the *instantiated* parent shape: for `Sub extends Base<int>`
+    /// this is `Generic { decl: Base, args: [int] }`; for the generic
+    /// `MultiQuantizer<T> extends Quantizer<Array<T>>` it is
+    /// `Generic { decl: Quantizer, args: [Array<GenericParam(T,
+    /// owner=MultiQuantizer)>] }`. Populated by the signature-
+    /// lowering stage (after every module's types are ingested, so
+    /// foreign supertypes resolve). Lets assignability walk the chain
+    /// with full generic-arg substitution — the symbol-only
+    /// `supertype` field above can only answer "is it a subtype?",
+    /// not "what concrete shape did the parent get instantiated to?".
+    /// `None` for types without an explicit `extends` clause, or when
+    /// the parent name didn't resolve through the project index.
+    pub supertype_ty: Option<TypeId>,
     /// Pre-resolved deref-target TypeId for types carrying a
     /// `@deref("methodName")` annotation. Captured during signature
     /// lowering: the `@deref` annotation names a method, and this
@@ -947,6 +961,7 @@ impl ProjectIndex {
                             // after signature lowering — see
                             // `populate_deref_caches` in
                             // [`crate::project`].
+                            supertype_ty: None,
                             deref_return_ty: None,
                         };
                         for attr_id in &td.attrs {

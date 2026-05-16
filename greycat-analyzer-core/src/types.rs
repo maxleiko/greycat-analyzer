@@ -863,8 +863,16 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // is allowed: the runtime decides at instantiation time.
         TypeKind::GenericParam { .. } => true,
 
-        // Union: cast iff every alt casts.
-        TypeKind::Union { alts } => alts.iter().all(|alt| is_castable(arena, *alt, to)),
+        // Union source: cast iff ANY alt is castable to target.
+        // `as` is a runtime-checked downcast — `(A | B) as A` is
+        // accepted because the value MIGHT be `A`; if it turns out to
+        // be `B` at runtime, the cast panics, which is the documented
+        // behavior of `as`. Requiring `.all()` instead would reject
+        // the canonical narrow-back-after-?? pattern (kopr's
+        // `var x = lhs.get() ?? rhs.get(); ... x as node<L>`).
+        // Assignability uses `.all()` for the same shape because
+        // assignment is total — no runtime check stands behind it.
+        TypeKind::Union { alts } => alts.iter().any(|alt| is_castable(arena, *alt, to)),
 
         // Enum source: castable to `int` (runtime representation) or
         // anything assignable from the same enum.

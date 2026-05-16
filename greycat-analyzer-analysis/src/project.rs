@@ -197,6 +197,14 @@ struct ModuleSigCache {
     /// can type a cross-module `Definition::ProjectDecl` pointing at
     /// a var.
     vars: Vec<(Symbol, TypeId)>,
+    /// `(type_sym, supertype_ty)`. Pre-lowered direct supertype shape
+    /// (e.g. `Generic { decl: Base, args: [int] }` for
+    /// `Sub extends Base<int>`). Populated alongside the other
+    /// signatures so `apply_module_contributions` can write back the
+    /// instantiated parent TypeId into `TypeMembers::supertype_ty`
+    /// — used by `is_assignable_to_with_index` to walk the chain with
+    /// real generic args, not just decl identity.
+    supertypes: Vec<(Symbol, TypeId)>,
 }
 
 impl ProjectAnalysis {
@@ -1190,6 +1198,40 @@ fn lower_module_signatures(
                     let g_sym = hir.idents[*g].symbol;
                     generics_in_scope.insert(g_sym, owner);
                 }
+                if let Some(super_tr) = td.supertype {
+                    // Lower the supertype's TypeRef with the type's
+                    // own generic params in scope so a `Sub extends
+                    // Base<T>` for a generic `Sub<T>` lands as
+                    // `Generic { decl: Base, args: [GenericParam(T,
+                    // owner=Sub)] }`. Filter out the trivial primitive
+                    // cases (matches the symbol-only ingest filter).
+                    let parent_sym = hir.idents[hir.type_refs[super_tr].name].symbol;
+                    let parent_text: &str = &index.symbols[parent_sym];
+                    let is_primitive_parent = matches!(
+                        parent_text,
+                        "bool"
+                            | "int"
+                            | "float"
+                            | "char"
+                            | "String"
+                            | "time"
+                            | "duration"
+                            | "geo"
+                            | "any"
+                            | "null"
+                    );
+                    if !is_primitive_parent {
+                        let ty = lower_type_ref_project(
+                            hir,
+                            super_tr,
+                            arena_mut,
+                            &*index,
+                            decl_registry,
+                            &generics_in_scope,
+                        );
+                        entry.supertypes.push((type_sym, ty));
+                    }
+                }
                 for attr_id in &td.attrs {
                     let attr = &hir.type_attrs[*attr_id];
                     let attr_sym = hir.idents[attr.name].symbol;
@@ -1396,6 +1438,20 @@ pub(crate) fn is_assignable_to_with_index(
         // is a transitive descendant of `sup` in `index.type_members`.
         TypeKind::Type(sub) => match &b.kind {
             TypeKind::Type(sup) => index.is_subtype_of_decl(decl_registry, *sub, *sup),
+            // `Type(sub) → Generic(sup<args>)` — `sub` is a non-
+            // generic concrete type whose `extends` chain reaches the
+            // generic shape on the right (e.g. `PointChangeView
+            // extends GridChangeView<Point>` being passed where
+            // `GridChangeView<any?>` is expected). Walk the chain,
+            // looking for a hop whose pre-lowered `supertype_ty` is
+            // a `Generic { decl: sup_decl, .. }` instantiation, then
+            // hand the result to core's invariance / all-Any wildcard
+            // check. No substitution needed at this layer — `sub`
+            // is non-generic, so its parent's args are already
+            // fully concrete.
+            TypeKind::Generic { .. } => {
+                find_generic_supertype(index, decl_registry, arena, *sub, to)
+            }
             TypeKind::Union { alts } => alts.iter().any(|alt| {
                 is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
             }),
@@ -1404,7 +1460,6 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
             | TypeKind::Primitive(_)
-            | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
             | TypeKind::GenericParam { .. } => false,
@@ -1470,6 +1525,57 @@ pub(crate) fn is_assignable_to_with_index(
     }
 }
 
+/// Walk a non-generic concrete type's pre-lowered `supertype_ty` chain
+/// looking for a hop whose shape is assignable to `target`. Returns
+/// `true` iff such a hop exists. Stops at the first match — chains are
+/// short in practice and we don't need every reachable supertype.
+///
+/// `sub_decl` must be the source-side `TypeDeclId` for a non-generic
+/// `Type(decl)`; the source's own args are empty, so each hop's
+/// `supertype_ty` is already in fully concrete form (any
+/// `GenericParam` in it came from the parent's own decl-level
+/// generics, which a non-generic child cannot bind — that is the
+/// next-hop substitution case, deferred until the same call needs
+/// it for generic sources).
+fn find_generic_supertype(
+    index: &ProjectIndex,
+    decl_registry: &DeclRegistry,
+    arena: &TypeArena,
+    sub_decl: TypeDeclId,
+    target: TypeId,
+) -> bool {
+    let mut current = sub_decl;
+    // Same hop budget as `is_subtype_of` — a deep diamond would have
+    // surfaced as a stack-overflow long before exceeding this.
+    for _ in 0..32 {
+        let Some(name_sym) = decl_registry.name(current) else {
+            return false;
+        };
+        let Some(members) = index.type_members.get(&name_sym) else {
+            return false;
+        };
+        let Some(sup_ty) = members.supertype_ty else {
+            return false;
+        };
+        // Core's `is_assignable_to` handles the all-Any wildcard target,
+        // generic-arg invariance, and same-decl identity. If this hop
+        // is the right one, we are done.
+        if is_assignable_to(arena, sup_ty, target) {
+            return true;
+        }
+        // Otherwise advance one hop along the chain. The next decl
+        // is either `Type(d)` or `Generic { decl: d, .. }` — anything
+        // else (a primitive parent that slipped past the ingest
+        // filter, say) ends the walk.
+        current = match &arena.get(sup_ty).kind {
+            TypeKind::Type(d) => *d,
+            TypeKind::Generic { decl, .. } => *decl,
+            _ => return false,
+        };
+    }
+    false
+}
+
 /// Index-aware extension of [`is_castable`].
 /// Adds the symmetric node-tag-handle / int cast rules — handles are
 /// 64-bit ints at runtime, so `nodeTime<T> as int` and `int as
@@ -1506,9 +1612,15 @@ pub(crate) fn is_castable_with_index(
         // Caught by the `is_castable(...)` early-return above.
         TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => false,
 
+        // Union source: mirror core's `.any()` semantics — `as` is a
+        // runtime-checked downcast, so the wrapper's inheritance-
+        // aware extension also accepts the union when AT LEAST ONE
+        // alt could possibly cast. Switching from `.all()` to `.any()`
+        // here keeps the two layers in lockstep; otherwise the
+        // inheritance-aware retry would silently undo core's fix.
         TypeKind::Union { alts } => alts
             .iter()
-            .all(|alt| is_castable_with_index(index, well_known, decl_registry, arena, *alt, to)),
+            .any(|alt| is_castable_with_index(index, well_known, decl_registry, arena, *alt, to)),
 
         // Source Type: bidirectional inheritance with Type / Generic
         // targets; target-Union retry. No node-tag-int rule applies
@@ -1619,6 +1731,13 @@ fn apply_module_contributions(index: &mut ProjectIndex, c: &ModuleSigCache) {
     }
     for (sym, ty) in &c.vars {
         index.var_types.entry(*sym).or_insert(*ty);
+    }
+    for (type_sym, ty) in &c.supertypes {
+        if let Some(tm) = index.type_members.get_mut(type_sym)
+            && tm.supertype_ty.is_none()
+        {
+            tm.supertype_ty = Some(*ty);
+        }
     }
 }
 
