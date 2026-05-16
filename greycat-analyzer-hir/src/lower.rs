@@ -97,7 +97,6 @@ impl<'src, 'symbols> LowerCtx<'src, 'symbols> {
 /// Depth-bounded at one level — an `ERROR` nested inside an `ERROR`
 /// stays opaque. The recovered shapes tree-sitter produces are
 /// themselves shallow; chasing deeper costs more than it pays for.
-#[allow(dead_code)] // wired up at every list-of-kinds site in P43.3 / P43.4
 fn flatten_errors_named_children<'a>(
     node: tree_sitter::Node<'a>,
 ) -> Vec<(tree_sitter::Node<'a>, bool)> {
@@ -529,11 +528,27 @@ fn lower_block_inline(
         return None;
     }
     let mut stmts = Vec::new();
-    let mut cursor = node.walk();
-    for c in node.named_children(&mut cursor) {
-        if let Some(s) = lower_stmt(cx, c) {
-            stmts.push(s);
+    // P43.3 — walk through `flatten_errors_named_children` so any
+    // statement-shaped child the parser salvaged from inside an
+    // `ERROR` wrapper is still lowered. For expression-shaped salvage
+    // (the user's `if (c.sim.)` repro produces `(ERROR (member_expr …))`
+    // as a block child), wrap the expr in `Stmt::Expr` so downstream
+    // IDE consumers (completion, hover, goto-def) find the typed expr
+    // via the cached HIR fast path. Salvaged stmt ids are recorded so
+    // lints whose intent assumes complete code can skip them.
+    for (c, salvaged) in flatten_errors_named_children(node) {
+        let s_id = if let Some(s) = lower_stmt(cx, c) {
+            s
+        } else if salvaged {
+            let Some(e) = lower_expr(cx, c) else { continue };
+            cx.hir.stmts.alloc(Stmt::Expr(e))
+        } else {
+            continue;
+        };
+        if salvaged {
+            cx.hir.salvaged_stmts.insert(s_id);
         }
+        stmts.push(s_id);
     }
     Some(crate::types::BlockStmt {
         stmts: stmts.into_boxed_slice(),
