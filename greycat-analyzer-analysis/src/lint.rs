@@ -529,7 +529,7 @@ pub fn lint_redundant_semicolon(
         };
         out.push(LintDiagnostic {
             rule: "redundant-semicolon",
-            severity: LintSeverity::Error,
+            severity: LintSeverity::Warning,
             message,
             byte_range,
             tag: None,
@@ -3507,7 +3507,7 @@ fn f() {
             .iter()
             .find(|d| d.rule == "redundant-semicolon")
             .expect("expected one `redundant-semicolon` lint");
-        assert_eq!(hit.severity, LintSeverity::Error);
+        assert_eq!(hit.severity, LintSeverity::Warning);
         assert_eq!(
             &src[hit.byte_range.clone()],
             ";",
