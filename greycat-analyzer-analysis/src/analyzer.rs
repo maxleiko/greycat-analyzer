@@ -1673,6 +1673,43 @@ impl<'a> Cx<'a> {
         self.arena.alloc(t)
     }
 
+    /// Lift `narrows`'s then-side lists into the current narrow frame.
+    /// Used by `Stmt::While` / `Stmt::For` to make loop bodies see the
+    /// truthy implication of the loop condition at iteration entry.
+    ///
+    /// The narrow holds at *body entry of every iteration*; if the body
+    /// reassigns the binding to a possibly-null value, subsequent reads
+    /// in the same iteration correctly see the reassignment via the
+    /// innermost-frame-wins lookup invariant. Mirrors `Stmt::If`'s
+    /// then-side application but does not include the `is`-contradiction
+    /// diagnostics or `multi_typed` capture (those are If-specific).
+    fn apply_then_narrows(&mut self, narrows: &CondNarrows) {
+        for ident in &narrows.then_non_null {
+            if let Some(cur) = self.lookup_def_type(*ident) {
+                let stripped = self.strip_nullable(cur);
+                self.write_narrow(*ident, stripped);
+            }
+        }
+        for (ident, ty_ref) in &narrows.then_typed {
+            let ty = self.lower_type_ref(*ty_ref);
+            self.write_narrow(*ident, ty);
+        }
+        for (ident, ty_refs) in &narrows.then_typed_union {
+            let ty = self.lower_typed_union(ty_refs);
+            self.write_narrow(*ident, ty);
+        }
+        for (ident, ty) in &narrows.then_typed_id {
+            self.write_narrow(*ident, *ty);
+        }
+        for path in &narrows.then_member_non_null {
+            self.write_member_non_null(path.clone());
+        }
+        for (path, ty_ref) in &narrows.then_member_typed {
+            let ty = self.lower_type_ref(*ty_ref);
+            self.write_member_typed(path.clone(), ty);
+        }
+    }
+
     // P19.16
     /// When an assignment's LHS is an `Ident` resolving
     /// to a Param/Local, narrow that binding to the RHS's type for
@@ -3489,7 +3526,19 @@ impl<'a> Cx<'a> {
             }) => {
                 self.expect_bool(condition, "while condition");
                 self.diagnose_decidable_loop_condition(stmt_id, condition, "while");
-                self.visit_block(&body, return_ty);
+                // B2 — apply the condition's truthy narrows to the body.
+                // `while (x != null) { use(x) }` should see `x` as
+                // non-null inside the body, mirroring `if (x != null)`.
+                // Inline the body stmts (instead of `visit_block`) so
+                // the loop's narrow frame is the innermost at body
+                // entry — matches `Stmt::If`'s pattern.
+                let narrows = self.derive_cond_narrows(condition);
+                self.push_narrow();
+                self.apply_then_narrows(&narrows);
+                for s in &body.stmts {
+                    self.visit_stmt(*s, return_ty);
+                }
+                self.pop_narrow();
             }
             Stmt::DoWhile(DoWhileStmt {
                 condition, body, ..
@@ -3535,14 +3584,28 @@ impl<'a> Cx<'a> {
                         .unwrap_or_else(|| self.any_nullable());
                     self.out.def_types.insert(name, bound_ty);
                 }
-                if let Some(c) = condition {
+                // B1 — apply the condition's truthy narrows to body and
+                // increment. `for (var p = init; p != null; p = next(p))`
+                // should see `p` as non-null inside both the body and
+                // the increment expression. Increment runs after body
+                // inside the same frame, matching runtime order
+                // (cond → body → incr → cond).
+                let narrows = if let Some(c) = condition {
                     self.expect_bool(c, "for condition");
                     self.diagnose_decidable_loop_condition(stmt_id, c, "for");
+                    self.derive_cond_narrows(c)
+                } else {
+                    CondNarrows::default()
+                };
+                self.push_narrow();
+                self.apply_then_narrows(&narrows);
+                for s in &body.stmts {
+                    self.visit_stmt(*s, return_ty);
                 }
                 if let Some(i) = increment {
                     let _ = self.visit_expr(i);
                 }
-                self.visit_block(&body, return_ty);
+                self.pop_narrow();
             }
             Stmt::ForIn(ForInStmt {
                 params,
