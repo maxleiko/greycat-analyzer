@@ -2063,6 +2063,93 @@ impl<'a> Cx<'a> {
         base
     }
 
+    /// Object-expr completeness check: `Foo {}` / `Foo { a: 1 }`
+    /// against `type Foo { a: int; b: int = 0; c: String? }` should
+    /// require `a` (non-nullable, no default) and skip `b` (defaulted)
+    /// and `c` (nullable — runtime auto-initializes to `null`).
+    ///
+    /// Scope: bare local-module type refs with named fields only. We
+    /// skip the check when:
+    /// - the type ref is qualified (`b::Foo`) — cross-module attr
+    ///   metadata exists in the index but the `has-init` bit is
+    ///   HIR-only and not currently mirrored there;
+    /// - the receiver isn't a local `Decl::Type` (primitive / generic-
+    ///   param / runtime-generic without a `.gcl` decl);
+    /// - any field is positional (`Foo { 1, 2 }`) — those fill
+    ///   declaration order and need a different check;
+    /// - the type has a supertype (`extends`) — inherited required
+    ///   attrs would otherwise leak as false positives.
+    ///
+    /// These exclusions stop false positives at the cost of letting
+    /// some real violations through; the analyzer-as-truth conformance
+    /// roadmap can lift them once the index carries the missing bits.
+    fn check_object_required_attrs(
+        &mut self,
+        type_ref: Idx<TypeRef>,
+        fields: &[greycat_analyzer_hir::types::ObjectField],
+        expr_id: Idx<Expr>,
+    ) {
+        let tr = &self.hir.type_refs[type_ref];
+        if !tr.qualifier.is_empty() {
+            return;
+        }
+        let name_sym = self.hir.idents[tr.name].symbol;
+        let Some(decl_id) = self.out.type_decls.get(&name_sym).copied() else {
+            return;
+        };
+        let Decl::Type(td) = &self.hir.decls[decl_id] else {
+            return;
+        };
+        if td.supertype.is_some() {
+            return;
+        }
+        // Bail on positional / mixed: positional fields fill in attr
+        // declaration order with completely different completeness
+        // semantics.
+        if fields.iter().any(|f| f.name.is_none()) {
+            return;
+        }
+        let supplied: rustc_hash::FxHashSet<Symbol> = fields
+            .iter()
+            .filter_map(|f| f.name.map(|n| self.hir.idents[n].symbol))
+            .collect();
+        let mut missing: Vec<(SmolStr, std::ops::Range<usize>)> = Vec::new();
+        for attr_id in td.attrs.iter() {
+            let attr = &self.hir.type_attrs[*attr_id];
+            if attr.modifiers.static_ {
+                continue;
+            }
+            if attr.init.is_some() {
+                continue;
+            }
+            let Some(ty_ref) = attr.ty else { continue };
+            if self.hir.type_refs[ty_ref].optional {
+                continue;
+            }
+            let attr_sym = self.hir.idents[attr.name].symbol;
+            if supplied.contains(&attr_sym) {
+                continue;
+            }
+            let attr_name: &str = &self.index.symbols[attr_sym];
+            missing.push((SmolStr::new(attr_name), attr.byte_range.clone()));
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let span = self.hir.exprs[expr_id].byte_range();
+        let names: Vec<String> = missing.iter().map(|(n, _)| format!("`{n}`")).collect();
+        let joined = names.join(", ");
+        let plural = if missing.len() > 1 { "s" } else { "" };
+        let type_name: &str = &self.index.symbols[name_sym];
+        self.diag(
+            Severity::Error,
+            format!(
+                "missing required field{plural} for `{type_name}`: {joined} (non-nullable and no default)"
+            ),
+            span,
+        );
+    }
+
     /// Lower a module-qualified `TypeRef` (`b::Foo`, `b::Map<int>`, …)
     /// to a `TypeId`. The rightmost qualifier names the module; the
     /// leaf decl is resolved within that module specifically. Mirrors
@@ -3455,7 +3542,9 @@ impl<'a> Cx<'a> {
                     let _ = self.visit_expr(f.value);
                 }
                 if let Some(t) = ty {
-                    self.lower_type_ref(t)
+                    let lowered = self.lower_type_ref(t);
+                    self.check_object_required_attrs(t, &fields, expr_id);
+                    lowered
                 } else {
                     self.any_nullable()
                 }
@@ -4883,6 +4972,71 @@ fn caller(f: Foo?, b: Bar) {
         // Order is left-then-right; `display` joins union alts with
         // ` | `.
         assert_eq!(display, "Foo | Bar");
+    }
+
+    /// Object expression with all required attrs missing emits an
+    /// error naming each. Mirrors the runtime which rejects
+    /// `Foo {}` when `Foo` declares non-nullable, non-default
+    /// fields.
+    #[test]
+    fn object_expr_missing_required_attrs_errors() {
+        let src = "type Foo { a: int; b: String?; }\nfn main() { var _ = Foo {}; }\n";
+        let diags = analyze_project_src(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("missing required field"))
+            .unwrap_or_else(|| panic!("expected missing-required-field diag: {diags:?}"));
+        assert!(
+            hit.message.contains("`a`"),
+            "diagnostic should name `a`: {}",
+            hit.message
+        );
+        assert!(
+            !hit.message.contains("`b`"),
+            "nullable `b` should not appear: {}",
+            hit.message
+        );
+    }
+
+    /// `Foo {}` against a type whose every attr is nullable or has a
+    /// default produces no missing-field diagnostic.
+    #[test]
+    fn object_expr_all_optional_no_error() {
+        let src = "type Foo { a: int = 0; b: String?; }\nfn main() { var _ = Foo {}; }\n";
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("missing required field")),
+            "no missing-field diag expected: {diags:?}"
+        );
+    }
+
+    /// Supplying the missing attr by name silences the diagnostic.
+    #[test]
+    fn object_expr_supplied_required_attr_no_error() {
+        let src = "type Foo { a: int; }\nfn main() { var _ = Foo { a: 1 }; }\n";
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("missing required field")),
+            "no missing-field diag expected: {diags:?}"
+        );
+    }
+
+    /// Static attrs aren't part of the per-instance schema and must
+    /// not be counted as required.
+    #[test]
+    fn object_expr_static_attr_not_required() {
+        let src = "type Foo { static k: int = 0; a: int = 0; }\nfn main() { var _ = Foo {}; }\n";
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("missing required field")),
+            "static attr `k` should not be required: {diags:?}"
+        );
     }
 
     #[test]
