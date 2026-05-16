@@ -43,7 +43,7 @@
         },
         {
           "name": "constant.language.gcl",
-          "match": "\\b(true|false|null)\\b"
+          "match": "\\b(true|false|null|NaN|Infinity)\\b"
         },
         {
           "name": "variable.other.constant.gcl meta.annotation.gcl",

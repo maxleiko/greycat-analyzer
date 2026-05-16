@@ -3,6 +3,7 @@
 //! delta-encodes the result per the LSP spec.
 
 use greycat_analyzer_analysis::resolver::{Definition, resolve};
+use greycat_analyzer_analysis::stdlib::BUILTIN_RUNTIME_GLOBALS;
 use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::Decl;
@@ -73,7 +74,21 @@ pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Se
             "number_int" | "number_decimal" | "number_scientific" => push(&mut events, TOK_NUMBER),
             "number_suffix" => push(&mut events, TOK_KEYWORD),
             "line_comment" | "doc_comment" => push(&mut events, TOK_COMMENT),
+            // Language constants: paint as KEYWORD so themes render them
+            // the same way they render `true` / `false` / language literals.
+            "null" | "true" | "false" => push(&mut events, TOK_KEYWORD),
             "ident" => {
+                // Runtime value-position globals (`Infinity`, `NaN`) have no
+                // `.gcl` decl — they resolve through `Definition::Project`,
+                // which would otherwise paint them as TYPE. Override here
+                // so they render as language constants.
+                if text
+                    .get(n.byte_range())
+                    .is_some_and(|s| BUILTIN_RUNTIME_GLOBALS.iter().any(|(name, _)| *name == s))
+                {
+                    push(&mut events, TOK_KEYWORD);
+                    return true;
+                }
                 if let Some((idx, _)) = hir
                     .idents
                     .iter()
