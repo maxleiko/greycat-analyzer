@@ -49,6 +49,7 @@ pub mod pragmas;
 pub mod project;
 pub mod quickfix;
 pub mod reachability;
+pub mod rename;
 pub mod resolver;
 pub mod stdlib;
 // P35.1
