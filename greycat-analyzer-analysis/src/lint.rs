@@ -920,10 +920,7 @@ fn check_fn_params(
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
-    if fnd.modifiers.native || fnd.modifiers.abstract_ {
-        return;
-    }
-    if fnd.body.is_none() {
+    if fnd.modifiers.native || fnd.body.is_none() {
         return;
     }
     for param_id in &fnd.params {
@@ -1181,7 +1178,7 @@ fn check_unused_decl(
     };
     for decl_id in &module.decls {
         let decl = &hir.decls[*decl_id];
-        // Pragmas + native / abstract fns don't represent user
+        // Pragmas + native fns don't represent user
         // code that could be "unused" in a meaningful way.
         let (name_idx, modifiers, kind) = match decl {
             Decl::Fn(fnd) => (fnd.name, &fnd.modifiers, "fn"),
@@ -1190,13 +1187,13 @@ fn check_unused_decl(
             Decl::Var(vd) => (vd.name, &vd.modifiers, "var"),
             Decl::Pragma(_) => continue,
         };
-        if modifiers.native || modifiers.abstract_ {
+        if modifiers.native {
             continue;
         }
         if !modifiers.private {
             continue;
         }
-        if exposes_runtime(modifiers) {
+        if is_exposed(modifiers) {
             continue;
         }
         let ident = &hir.idents[name_idx];
@@ -1269,13 +1266,11 @@ impl LintRule for DuplicateDecl {
     }
 }
 
-fn exposes_runtime(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
-    modifiers.annotations.iter().any(|a| {
-        matches!(
-            a.name.as_str(),
-            "expose" | "permission" | "role" | "library"
-        )
-    })
+fn is_exposed(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
+    modifiers
+        .annotations
+        .iter()
+        .any(|a| matches!(a.name.as_str(), "expose"))
 }
 
 // =============================================================================

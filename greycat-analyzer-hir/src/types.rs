@@ -91,7 +91,7 @@ pub struct FnDecl {
     pub generics: Box<[Idx<Ident>]>,
     pub params: Box<[Idx<FnParam>]>,
     pub return_type: Option<Idx<TypeRef>>,
-    /// `None` for native / abstract functions.
+    /// `None` for native functions.
     pub body: Option<Idx<Stmt>>, // a Block stmt
     pub doc: Option<String>,
     pub byte_range: Span,

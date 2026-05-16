@@ -156,26 +156,26 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
                 }
             }
             Message::Response(resp) => debug!("got response: {resp:?}"),
-            Message::Notification(not) => match not.method.as_str() {
+            Message::Notification(notif) => match notif.method.as_str() {
                 DidOpenTextDocument::METHOD => {
-                    server.did_open(not.extract(DidOpenTextDocument::METHOD)?)?
+                    server.did_open(notif.extract(DidOpenTextDocument::METHOD)?)?
                 }
                 DidChangeTextDocument::METHOD => {
-                    server.did_change(not.extract(DidChangeTextDocument::METHOD)?)?
+                    server.did_change(notif.extract(DidChangeTextDocument::METHOD)?)?
                 }
                 DidSaveTextDocument::METHOD => {
-                    server.did_save(not.extract(DidSaveTextDocument::METHOD)?)?
+                    server.did_save(notif.extract(DidSaveTextDocument::METHOD)?)?
                 }
                 DidCloseTextDocument::METHOD => {
-                    server.did_close(not.extract(DidCloseTextDocument::METHOD)?)?
+                    server.did_close(notif.extract(DidCloseTextDocument::METHOD)?)?
                 }
                 DidChangeWatchedFiles::METHOD => {
-                    server.did_change_watched_files(not.extract(DidChangeWatchedFiles::METHOD)?)?
+                    server.did_change_watched_files(notif.extract(DidChangeWatchedFiles::METHOD)?)?
                 }
                 DidChangeWorkspaceFolders::METHOD => server.did_change_workspace_folders(
-                    not.extract(DidChangeWorkspaceFolders::METHOD)?,
+                    notif.extract(DidChangeWorkspaceFolders::METHOD)?,
                 )?,
-                _ => debug!("got notification: {not:#?}"),
+                _ => debug!("got notification: {notif:#?}"),
             },
         }
     }
