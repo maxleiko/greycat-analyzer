@@ -134,8 +134,12 @@ pub fn lower_module(
     let mut decl_ids: Vec<Idx<Decl>> = Vec::new();
 
     if root.kind() == "module" {
-        let mut cursor = root.walk();
-        for child in root.named_children(&mut cursor) {
+        // P43.4 — top-level decl walk goes through the salvage helper
+        // so a partial / mid-edit decl wrapped in an `ERROR` still
+        // produces an `Idx<Decl>` when the inner shape is recognizable
+        // (e.g. a `type_decl` whose body is incomplete and bubbles
+        // into an enclosing ERROR).
+        for (child, _salvaged) in flatten_errors_named_children(root) {
             if let Some(d) = lower_decl(&mut cx, child) {
                 decl_ids.push(d);
             }
@@ -316,8 +320,10 @@ fn lower_fn_params(cx: &mut LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Bo
         return Box::default();
     };
     let mut out: Vec<Idx<FnParam>> = Vec::new();
-    let mut cursor = node.walk();
-    for c in node.named_children(&mut cursor) {
+    // P43.4 — salvage params hidden by ERROR recovery (e.g. typing
+    // `fn foo(x: int, y: , z: bool)` puts the middle param in an ERROR;
+    // the surrounding well-formed params still surface via the helper).
+    for (c, _salvaged) in flatten_errors_named_children(node) {
         if c.kind() == "fn_param" {
             let Some(name_node) = c.child_by_field_name("name") else {
                 continue;
@@ -350,8 +356,10 @@ fn lower_type_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Typ
     let mut attrs = Vec::new();
     let mut methods = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
-        let mut cursor = body.walk();
-        for child in body.named_children(&mut cursor) {
+        // P43.4 — type-body walk uses the salvage helper. When an
+        // attr or method ends up half-typed (`x: int; foo.` in the
+        // body), the surrounding well-formed members still surface.
+        for (child, _salvaged) in flatten_errors_named_children(body) {
             match child.kind() {
                 "type_attr" => {
                     if let Some(a) = lower_type_attr(cx, child) {
@@ -412,8 +420,9 @@ fn lower_enum_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Enu
     modifiers.annotations = lower_annotations(cx, node);
     let mut fields = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
-        let mut cursor = body.walk();
-        for c in body.named_children(&mut cursor) {
+        // P43.4 — enum-body walk via the salvage helper so a mid-edit
+        // variant doesn't drop sibling variants.
+        for (c, _salvaged) in flatten_errors_named_children(body) {
             if c.kind() != "enum_field" {
                 continue;
             }
@@ -1141,8 +1150,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             for child in node.named_children(&mut walk) {
                 match child.kind() {
                     "object_initializers" => {
-                        let mut c = child.walk();
-                        for value_node in child.named_children(&mut c) {
+                        // P43.4 — positional `Foo { a, b, c }` salvage.
+                        for (value_node, _salvaged) in flatten_errors_named_children(child) {
                             if let Some(value) = lower_expr(cx, value_node) {
                                 fields.push(ObjectField {
                                     name: None,
@@ -1153,8 +1162,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                         }
                     }
                     "object_fields" => {
-                        let mut c = child.walk();
-                        for of in child.named_children(&mut c) {
+                        // P43.4 — named `Foo { a: x, b: y }` salvage.
+                        for (of, _salvaged) in flatten_errors_named_children(child) {
                             if of.kind() != "object_field" {
                                 continue;
                             }
@@ -1805,9 +1814,14 @@ fn duration_to_us(value: i64, suffix: &str) -> Option<i64> {
 }
 
 fn lower_expr_list(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Vec<Idx<Expr>> {
+    // P43.4 — covers `tuple_expr`, `array_expr`, `call_expr` args, and
+    // `object_initializers`. The user typing `foo(bar., baz)` produces
+    // an ERROR around the `bar.` arg; the salvage helper lets
+    // recognizable inner shapes (`bar` as an ident, or `member_expr`
+    // with property) still land in the call's arg vector so member
+    // completion / signature_help work mid-edit.
     let mut out = Vec::new();
-    let mut cursor = node.walk();
-    for c in node.named_children(&mut cursor) {
+    for (c, _salvaged) in flatten_errors_named_children(node) {
         if let Some(e) = lower_expr(cx, c) {
             out.push(e);
         }
