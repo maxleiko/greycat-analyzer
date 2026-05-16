@@ -33,13 +33,17 @@ use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::*;
 
 mod document_highlights;
+mod document_symbols;
 mod folding_ranges;
 mod formatting;
 mod selection_ranges;
+mod workspace_symbols;
 pub use document_highlights::document_highlights;
+pub use document_symbols::document_symbols;
 pub use folding_ranges::folding_ranges;
 pub use formatting::{formatting, range_formatting};
 pub use selection_ranges::selection_ranges;
+pub use workspace_symbols::workspace_symbols;
 
 // =============================================================================
 // P3.1 + P15.1 — hover
@@ -1484,107 +1488,6 @@ fn declaring_type_for_method_cursor(
 }
 
 // =============================================================================
-// P3.3 — document symbols
-// =============================================================================
-
-pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Vec<DocumentSymbol> {
-    let symbols = SymbolTable::new();
-    let hir = lower_module(text, &symbols, "module", lib, root);
-    let module = match hir.module.as_ref() {
-        Some(m) => m,
-        None => return Vec::new(),
-    };
-
-    let mut out = Vec::new();
-    for decl_id in &module.decls {
-        let decl = &hir.decls[*decl_id];
-        let Some(name_id) = decl.name() else {
-            continue;
-        };
-        let ident = &hir.idents[name_id];
-        let ident_text = &symbols[ident.symbol];
-        // The LSP `DocumentSymbol.name` field is required non-empty —
-        // VSCode's client throws "name must not be falsy" if it sees
-        // a `""`. Tree-sitter's error recovery synthesizes empty-range
-        // name nodes when the user is mid-typing (`type Foo { static<CURSOR> }`
-        // recovers as a partial method decl with an empty name ident),
-        // and lowering's `alloc_ident` faithfully interns that empty
-        // text. Skip rather than push it; an out-of-LSP-spec symbol
-        // poisons the whole batch on the client side.
-        if ident_text.is_empty() {
-            continue;
-        }
-        let kind = match decl {
-            Decl::Fn(_) => SymbolKind::FUNCTION,
-            Decl::Type(_) => SymbolKind::CLASS,
-            Decl::Enum(_) => SymbolKind::ENUM,
-            Decl::Var(_) => SymbolKind::VARIABLE,
-            Decl::Pragma(_) => SymbolKind::KEY,
-        };
-        let full_range = byte_range_to_lsp(text, decl.byte_range());
-        let selection_range = byte_range_to_lsp(text, &ident.byte_range);
-        let mut children: Vec<DocumentSymbol> = Vec::new();
-        if let Decl::Type(td) = decl {
-            for attr_id in &td.attrs {
-                let a = &hir.type_attrs[*attr_id];
-                let aname = &hir.idents[a.name];
-                let aname_text = &symbols[aname.symbol];
-                if aname_text.is_empty() {
-                    continue;
-                }
-                children.push(DocumentSymbol {
-                    name: aname_text.to_string(),
-                    detail: None,
-                    kind: SymbolKind::FIELD,
-                    tags: None,
-                    #[allow(deprecated)]
-                    deprecated: None,
-                    range: byte_range_to_lsp(text, &a.byte_range),
-                    selection_range: byte_range_to_lsp(text, &aname.byte_range),
-                    children: None,
-                });
-            }
-            for method_id in &td.methods {
-                if let Decl::Fn(fnd) = &hir.decls[*method_id] {
-                    let mname = &hir.idents[fnd.name];
-                    let mname_text = &symbols[mname.symbol];
-                    if mname_text.is_empty() {
-                        continue;
-                    }
-                    #[allow(deprecated)]
-                    children.push(DocumentSymbol {
-                        name: mname_text.to_string(),
-                        detail: None,
-                        kind: SymbolKind::METHOD,
-                        tags: None,
-                        deprecated: None,
-                        range: byte_range_to_lsp(text, &fnd.byte_range),
-                        selection_range: byte_range_to_lsp(text, &mname.byte_range),
-                        children: None,
-                    });
-                }
-            }
-        }
-        #[allow(deprecated)]
-        out.push(DocumentSymbol {
-            name: ident_text.to_string(),
-            detail: None,
-            kind,
-            tags: None,
-            deprecated: None,
-            range: full_range,
-            selection_range,
-            children: if children.is_empty() {
-                None
-            } else {
-                Some(children)
-            },
-        });
-    }
-    out
-}
-
-// =============================================================================
 // P3.4 — find references + rename
 // =============================================================================
 
@@ -2742,46 +2645,6 @@ fn emit_var_hints(
 /// keyed by URI. The `query` filter is a simple case-insensitive
 /// substring match against the symbol name (TS reference does the
 /// same).
-pub fn workspace_symbols(
-    docs: impl IntoIterator<Item = (Uri, String, String)>,
-    query: &str,
-) -> Vec<WorkspaceSymbol> {
-    let needle = query.to_lowercase();
-    let mut out = Vec::new();
-    for (uri, lib, text) in docs {
-        let tree = greycat_analyzer_syntax::parse(&text);
-        let symbols = document_symbols(&text, &lib, tree.root_node());
-        flatten_workspace(&uri, &symbols, &needle, &mut out);
-    }
-    out
-}
-
-fn flatten_workspace(
-    uri: &Uri,
-    symbols: &[DocumentSymbol],
-    needle: &str,
-    out: &mut Vec<WorkspaceSymbol>,
-) {
-    for sym in symbols {
-        if needle.is_empty() || sym.name.to_lowercase().contains(needle) {
-            out.push(WorkspaceSymbol {
-                name: sym.name.clone(),
-                kind: sym.kind,
-                tags: sym.tags.clone(),
-                container_name: None,
-                location: OneOf::Left(Location {
-                    uri: uri.clone(),
-                    range: sym.selection_range,
-                }),
-                data: None,
-            });
-        }
-        if let Some(children) = &sym.children {
-            flatten_workspace(uri, children, needle, out);
-        }
-    }
-}
-
 /// Token type table — must match `SEMANTIC_TOKEN_TYPES` registered with
 /// the client.
 pub const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
