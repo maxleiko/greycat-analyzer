@@ -665,6 +665,15 @@ struct CondNarrows {
     /// way `if (x is T) { } else { return; }` would.
     then_typed_id: Vec<(Idx<Ident>, TypeId)>,
     else_typed_id: Vec<(Idx<Ident>, TypeId)>,
+    // P41.2
+    /// `true` iff the condition is a single atomic `Expr::Is` (possibly
+    /// wrapped in `Expr::Paren` or negated by `Expr::Unary(Not, …)`).
+    /// The complement narrow is only sound on atomic conditions —
+    /// inside `A && B`, the else-branch holds when "at least one
+    /// failed", and we can't tell which; inside `A || B`, the
+    /// complement is sound *per-shape* but disjunctive narrowing is
+    /// owned by P42.4. Gate the `narrow_complement` call on this flag.
+    is_atomic_is: bool,
 }
 
 /// One arm in an enum-equality chain.
@@ -1051,6 +1060,91 @@ impl<'a> Cx<'a> {
                     self.write_narrow(*ident, asserted);
                 }
             }
+        }
+    }
+
+    // P41.2
+    /// Compute the complement of an `is`-guard: given the currently-
+    /// known type `known` and the asserted-type `asserted`, return the
+    /// `TypeId` that `known` should narrow to in the *else* branch
+    /// (and in any continuation past a then-side early exit).
+    ///
+    /// Dispatches by `known`'s `TypeKind`. Currently implements only
+    /// the `Union { alts }` arm:
+    /// - Walk the alts, drop every alt assignable to `asserted` (the
+    ///   runtime's `is` returns true for any subtype of `asserted`).
+    /// - When one alt survives, return it bare (matches
+    ///   [`Self::lower_typed_union`]'s collapse rule).
+    /// - When ≥ 2 survive, return a fresh `Union { alts: survivors }`.
+    /// - Nullability is preserved from `known`.
+    ///
+    /// Returns `None` when no rule applies (`known` isn't a union —
+    /// P42 will add a `TypeKind::Type` arm for closed abstract
+    /// hierarchies) or when the subtraction leaves zero alts
+    /// (vacuously-true if-condition; defer the diagnostic to P42's
+    /// `exhaustive-is-check`).
+    fn narrow_complement(&mut self, known: TypeId, asserted: TypeId) -> Option<TypeId> {
+        let known_ty = self.arena.get(known).clone();
+        let TypeKind::Union { alts } = &known_ty.kind else {
+            return None;
+        };
+        let mut survivors: Vec<TypeId> = Vec::with_capacity(alts.len());
+        for alt in alts.iter() {
+            // An alt survives the `is T` test only when it is NOT
+            // assignable to `T` — i.e. the runtime would NOT report
+            // `is T` as true for a value of type `alt`. Strip
+            // nullability before testing so `T?` and `T` line up.
+            let alt_t = self.arena.get(*alt).clone();
+            let alt_non_null = if alt_t.nullable {
+                self.arena.alloc(Type {
+                    kind: alt_t.kind,
+                    nullable: false,
+                })
+            } else {
+                *alt
+            };
+            let asserted_t = self.arena.get(asserted).clone();
+            let asserted_non_null = if asserted_t.nullable {
+                self.arena.alloc(Type {
+                    kind: asserted_t.kind,
+                    nullable: false,
+                })
+            } else {
+                asserted
+            };
+            if crate::project::is_assignable_to_with_index(
+                self.index,
+                self.well_known,
+                self.decl_registry,
+                self.arena,
+                alt_non_null,
+                asserted_non_null,
+            ) {
+                continue;
+            }
+            survivors.push(*alt);
+        }
+        if survivors.is_empty() {
+            // Exhausted — P42's `exhaustive-is-check` owns the
+            // diagnostic. Returning `None` keeps the apply sites
+            // untouched (no narrow lifted into the unreachable
+            // continuation).
+            return None;
+        }
+        let collapsed = if survivors.len() == 1 {
+            survivors[0]
+        } else {
+            self.arena.alloc(Type {
+                kind: TypeKind::Union { alts: survivors },
+                nullable: false,
+            })
+        };
+        // Preserve the original `known`'s nullability — `is T`
+        // doesn't tell us anything about `null`.
+        if known_ty.nullable {
+            Some(self.arena.nullable(collapsed))
+        } else {
+            Some(collapsed)
         }
     }
 
@@ -2639,9 +2733,40 @@ impl<'a> Cx<'a> {
                     else_member_typed,
                     then_typed_union,
                     else_typed_union,
-                    then_typed_id,
-                    else_typed_id,
+                    mut then_typed_id,
+                    mut else_typed_id,
+                    is_atomic_is,
                 } = self.derive_cond_narrows(condition);
+
+                // P41.2 — compute the else-side complement narrow for
+                // atomic `is`-conditions. `derive_cond_narrows` runs
+                // in `&self` context (`lower_type_ref` is `&mut self`),
+                // so the complement is computed here in `Stmt::If`
+                // where we have mutable access. Gated on
+                // `is_atomic_is` because compound boolean conditions
+                // (`A && B`, `A || B`) can't soundly derive
+                // per-binding complements from `then_typed` / `else_typed`
+                // alone — disjunctive support is owned by P42.4.
+                if is_atomic_is {
+                    for (ident, ty_ref) in &then_typed {
+                        let Some(known) = self.lookup_def_type(*ident) else {
+                            continue;
+                        };
+                        let asserted = self.lower_type_ref(*ty_ref);
+                        if let Some(complement) = self.narrow_complement(known, asserted) {
+                            else_typed_id.push((*ident, complement));
+                        }
+                    }
+                    for (ident, ty_ref) in &else_typed {
+                        let Some(known) = self.lookup_def_type(*ident) else {
+                            continue;
+                        };
+                        let asserted = self.lower_type_ref(*ty_ref);
+                        if let Some(complement) = self.narrow_complement(known, asserted) {
+                            then_typed_id.push((*ident, complement));
+                        }
+                    }
+                }
 
                 // Decide triviality BEFORE pushing any narrows — the
                 // null-strip and `is`-narrow application below would
@@ -3262,6 +3387,9 @@ impl<'a> Cx<'a> {
                 {
                     out.then_member_typed.push((path, *ty));
                 }
+                // P41.2 — mark the condition as atomic so `Stmt::If`
+                // knows it's safe to compute the else-side complement.
+                out.is_atomic_is = true;
             }
             // Strip parens before re-deriving.
             Expr::Paren(inner, _) => return self.derive_cond_narrows(*inner),
@@ -3290,6 +3418,9 @@ impl<'a> Cx<'a> {
                 // existing pairs.
                 out.then_typed_id = inner.else_typed_id;
                 out.else_typed_id = inner.then_typed_id;
+                // P41.2 — `!`-of-atomic stays atomic. `!(x is T)`
+                // should still produce a complement narrow.
+                out.is_atomic_is = inner.is_atomic_is;
             }
             _ => {}
         }
@@ -3901,6 +4032,7 @@ impl<'a> Cx<'a> {
                             else_typed_union: _,
                             then_typed_id: _,
                             else_typed_id: _,
+                            is_atomic_is: _,
                         } = self.derive_cond_narrows(left);
                         let (non_null, typed, typed_union, member_non_null, member_typed) = match op
                         {
