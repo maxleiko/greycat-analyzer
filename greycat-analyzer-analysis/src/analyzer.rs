@@ -2068,21 +2068,21 @@ impl<'a> Cx<'a> {
     /// require `a` (non-nullable, no default) and skip `b` (defaulted)
     /// and `c` (nullable — runtime auto-initializes to `null`).
     ///
-    /// Scope: bare local-module type refs with named fields only. We
-    /// skip the check when:
-    /// - the type ref is qualified (`b::Foo`) — cross-module attr
-    ///   metadata exists in the index but the `has-init` bit is
-    ///   HIR-only and not currently mirrored there;
+    /// Walks the local supertype chain so a `type Sub extends Super`
+    /// inherits `Super`'s required attrs. The walk stops at the first
+    /// cross-module link (qualified supertype, or a name without a
+    /// local `Decl::Type` entry) — we still emit errors for the
+    /// portion of the chain we could resolve, but stop short of
+    /// claiming "all required attrs initialized" in that case. False
+    /// negatives over false positives.
+    ///
+    /// Skipped when:
+    /// - the type ref is qualified (`b::Foo {}`) — same cross-module
+    ///   gap, top-level edition;
     /// - the receiver isn't a local `Decl::Type` (primitive / generic-
     ///   param / runtime-generic without a `.gcl` decl);
-    /// - any field is positional (`Foo { 1, 2 }`) — those fill
-    ///   declaration order and need a different check;
-    /// - the type has a supertype (`extends`) — inherited required
-    ///   attrs would otherwise leak as false positives.
-    ///
-    /// These exclusions stop false positives at the cost of letting
-    /// some real violations through; the analyzer-as-truth conformance
-    /// roadmap can lift them once the index carries the missing bits.
+    /// - any field is positional (`Foo { 1, 2 }`) — those fill in
+    ///   declaration order and need a different check.
     fn check_object_required_attrs(
         &mut self,
         type_ref: Idx<TypeRef>,
@@ -2093,14 +2093,11 @@ impl<'a> Cx<'a> {
         if !tr.qualifier.is_empty() {
             return;
         }
-        let name_sym = self.hir.idents[tr.name].symbol;
-        let Some(decl_id) = self.out.type_decls.get(&name_sym).copied() else {
+        let head_sym = self.hir.idents[tr.name].symbol;
+        let Some(head_decl_id) = self.out.type_decls.get(&head_sym).copied() else {
             return;
         };
-        let Decl::Type(td) = &self.hir.decls[decl_id] else {
-            return;
-        };
-        if td.supertype.is_some() {
+        if !matches!(&self.hir.decls[head_decl_id], Decl::Type(_)) {
             return;
         }
         // Bail on positional / mixed: positional fields fill in attr
@@ -2113,34 +2110,68 @@ impl<'a> Cx<'a> {
             .iter()
             .filter_map(|f| f.name.map(|n| self.hir.idents[n].symbol))
             .collect();
-        let mut missing: Vec<(SmolStr, std::ops::Range<usize>)> = Vec::new();
-        for attr_id in td.attrs.iter() {
-            let attr = &self.hir.type_attrs[*attr_id];
-            if attr.modifiers.static_ {
-                continue;
+
+        // Walk Sub → Super → SuperSuper. Cap the depth as a cheap guard
+        // against cycles — the analyzer is supposed to reject those
+        // elsewhere, but the walk here mustn't loop forever even if a
+        // cycle slips through.
+        let mut missing: Vec<SmolStr> = Vec::new();
+        let mut seen_names: rustc_hash::FxHashSet<Symbol> = rustc_hash::FxHashSet::default();
+        let mut cursor_decl: Option<Idx<Decl>> = Some(head_decl_id);
+        let mut cursor_name = head_sym;
+        let mut hops = 0usize;
+        while let Some(decl_id) = cursor_decl {
+            if !seen_names.insert(cursor_name) {
+                break;
             }
-            if attr.init.is_some() {
-                continue;
+            if hops > 32 {
+                break;
             }
-            let Some(ty_ref) = attr.ty else { continue };
-            if self.hir.type_refs[ty_ref].optional {
-                continue;
+            hops += 1;
+            let Decl::Type(td) = &self.hir.decls[decl_id] else {
+                break;
+            };
+            for attr_id in td.attrs.iter() {
+                let attr = &self.hir.type_attrs[*attr_id];
+                if attr.modifiers.static_ {
+                    continue;
+                }
+                if attr.init.is_some() {
+                    continue;
+                }
+                let Some(ty_ref) = attr.ty else { continue };
+                if self.hir.type_refs[ty_ref].optional {
+                    continue;
+                }
+                let attr_sym = self.hir.idents[attr.name].symbol;
+                if supplied.contains(&attr_sym) {
+                    continue;
+                }
+                let attr_name: &str = &self.index.symbols[attr_sym];
+                let smol = SmolStr::new(attr_name);
+                if !missing.iter().any(|m| m == &smol) {
+                    missing.push(smol);
+                }
             }
-            let attr_sym = self.hir.idents[attr.name].symbol;
-            if supplied.contains(&attr_sym) {
-                continue;
+            let Some(sup_ref) = td.supertype else { break };
+            let sup_tr = &self.hir.type_refs[sup_ref];
+            if !sup_tr.qualifier.is_empty() {
+                // Cross-module ancestor — stop, keep what we've got.
+                break;
             }
-            let attr_name: &str = &self.index.symbols[attr_sym];
-            missing.push((SmolStr::new(attr_name), attr.byte_range.clone()));
+            let sup_name_sym = self.hir.idents[sup_tr.name].symbol;
+            cursor_name = sup_name_sym;
+            cursor_decl = self.out.type_decls.get(&sup_name_sym).copied();
         }
+
         if missing.is_empty() {
             return;
         }
         let span = self.hir.exprs[expr_id].byte_range();
-        let names: Vec<String> = missing.iter().map(|(n, _)| format!("`{n}`")).collect();
+        let names: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
         let joined = names.join(", ");
         let plural = if missing.len() > 1 { "s" } else { "" };
-        let type_name: &str = &self.index.symbols[name_sym];
+        let type_name: &str = &self.index.symbols[head_sym];
         self.diag(
             Severity::Error,
             format!(
@@ -5036,6 +5067,93 @@ fn caller(f: Foo?, b: Bar) {
                 .iter()
                 .any(|d| d.message.contains("missing required field")),
             "static attr `k` should not be required: {diags:?}"
+        );
+    }
+
+    /// `Sub extends Super` inherits `Super`'s required attrs. `Sub {}`
+    /// must complain about both the inherited and the own-declared
+    /// required fields.
+    #[test]
+    fn object_expr_missing_inherited_required_attrs_errors() {
+        let src = "type Animal { name: String; }\n\
+                   type Dog extends Animal { breed: String; }\n\
+                   fn main() { var _ = Dog {}; }\n";
+        let diags = analyze_project_src(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("missing required field"))
+            .unwrap_or_else(|| panic!("expected missing-required-field diag: {diags:?}"));
+        assert!(
+            hit.message.contains("`breed`"),
+            "should name own-declared `breed`: {}",
+            hit.message
+        );
+        assert!(
+            hit.message.contains("`name`"),
+            "should name inherited `name`: {}",
+            hit.message
+        );
+    }
+
+    /// Supplying the inherited required attr (but not the own) only
+    /// names the own one in the diagnostic.
+    #[test]
+    fn object_expr_inherited_required_attr_supplied() {
+        let src = "type Animal { name: String; }\n\
+                   type Dog extends Animal { breed: String; }\n\
+                   fn main() { var _ = Dog { name: \"rex\" }; }\n";
+        let diags = analyze_project_src(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("missing required field"))
+            .unwrap_or_else(|| panic!("expected diag: {diags:?}"));
+        assert!(
+            hit.message.contains("`breed`"),
+            "should name `breed`: {}",
+            hit.message
+        );
+        assert!(
+            !hit.message.contains("`name`"),
+            "should not name supplied `name`: {}",
+            hit.message
+        );
+    }
+
+    /// Three-level chain: Sub extends Mid extends Top — every level's
+    /// required attrs must surface.
+    #[test]
+    fn object_expr_three_level_chain_required_attrs() {
+        let src = "type Top { a: int; }\n\
+                   type Mid extends Top { b: int; }\n\
+                   type Sub extends Mid { c: int; }\n\
+                   fn main() { var _ = Sub {}; }\n";
+        let diags = analyze_project_src(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("missing required field"))
+            .unwrap_or_else(|| panic!("expected diag: {diags:?}"));
+        for name in ["`a`", "`b`", "`c`"] {
+            assert!(
+                hit.message.contains(name),
+                "should name {name}: {}",
+                hit.message
+            );
+        }
+    }
+
+    /// Inherited attrs with defaults stay optional — the parent's
+    /// `init` shouldn't get scrubbed by the chain walk.
+    #[test]
+    fn object_expr_inherited_default_attr_not_required() {
+        let src = "type Animal { species: String = \"unknown\"; }\n\
+                   type Dog extends Animal { breed: String; }\n\
+                   fn main() { var _ = Dog { breed: \"lab\" }; }\n";
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("missing required field")),
+            "no missing-field diag expected when defaulted inherited attr is omitted: {diags:?}"
         );
     }
 
