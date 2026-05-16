@@ -2164,6 +2164,13 @@ fn collect_type_members(
 ) {
     for attr_id in &td.attrs {
         let a = &hir.type_attrs[*attr_id];
+        // `static` attrs (e.g. `int::min`, `int::max`) belong to the
+        // static-access path (`Type::|`), not instance access (`x.|`).
+        // Listing them on an instance leaks `min` / `max` into `42.|`
+        // completion where they aren't reachable.
+        if a.modifiers.static_ {
+            continue;
+        }
         let name = symbols[hir.idents[a.name].symbol].to_string();
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;

@@ -1016,6 +1016,50 @@ fn completion_after_dot_lists_attrs_and_methods() {
     assert!(!labels.contains(&"return"), "got: {labels:?}");
 }
 
+/// Instance member completion (`x.|`) must not surface static attrs:
+/// `int::min` / `int::max` belong to the static-access path
+/// (`Type::|`). Regression for the user-reported "completion shows
+/// `min` / `max` on `var x = 42; x.`" bug.
+#[test]
+fn completion_after_dot_skips_static_attrs() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Counter { static max: int = 99; n: int; fn inc(): int { return 0; } }\nfn use_(c: Counter) { c. }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after the `.` on line 1 col 24 (`...{ c.|}`).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 24),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"n"),
+        "instance attr `n` should appear: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"inc"),
+        "instance method `inc` should appear: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"max"),
+        "static attr `max` must NOT appear in instance completion: {labels:?}"
+    );
+}
+
 /// P19.17 — when the receiver is nullable, completions on `.` / `->`
 /// attach an `additional_text_edits` that inserts `?` immediately
 /// before the separator and surface the rewrite via `label_details`,
