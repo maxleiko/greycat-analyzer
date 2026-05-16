@@ -1063,31 +1063,54 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P41.2
+    // P41.2 / P42.2
     /// Compute the complement of an `is`-guard: given the currently-
     /// known type `known` and the asserted-type `asserted`, return the
     /// `TypeId` that `known` should narrow to in the *else* branch
     /// (and in any continuation past a then-side early exit).
     ///
-    /// Dispatches by `known`'s `TypeKind`. Currently implements only
-    /// the `Union { alts }` arm:
-    /// - Walk the alts, drop every alt assignable to `asserted` (the
-    ///   runtime's `is` returns true for any subtype of `asserted`).
-    /// - When one alt survives, return it bare (matches
-    ///   [`Self::lower_typed_union`]'s collapse rule).
-    /// - When ≥ 2 survive, return a fresh `Union { alts: survivors }`.
-    /// - Nullability is preserved from `known`.
+    /// Dispatches by `known`'s `TypeKind`:
+    /// - `Union { alts }` (P41) — subtract alts assignable to
+    ///   `asserted`, collapse single-survivor down to the lone alt,
+    ///   otherwise return a fresh `Union { alts: survivors }`.
+    /// - `Type(decl)` with `decl` abstract (P42) — sealed-hierarchy
+    ///   subtraction over `index.subtype_closure`, with the mandatory
+    ///   ancestor-collapse via `abstract_by_closure_set`.
     ///
-    /// Returns `None` when no rule applies (`known` isn't a union —
-    /// P42 will add a `TypeKind::Type` arm for closed abstract
-    /// hierarchies) or when the subtraction leaves zero alts
-    /// (vacuously-true if-condition; defer the diagnostic to P42's
+    /// Nullability is preserved from `known` in every arm — `is T`
+    /// rules out specific runtime tags, not the `null` value.
+    ///
+    /// Returns `None` when no rule applies (`known` isn't one of the
+    /// supported kinds; `Generic { … }` roots fall out per P42.6) or
+    /// when the subtraction leaves zero alts (vacuously-true
+    /// if-condition; defer the diagnostic to P42.5's
     /// `exhaustive-is-check`).
     fn narrow_complement(&mut self, known: TypeId, asserted: TypeId) -> Option<TypeId> {
         let known_ty = self.arena.get(known).clone();
-        let TypeKind::Union { alts } = &known_ty.kind else {
-            return None;
+        let nullable = known_ty.nullable;
+        let inner = match &known_ty.kind {
+            TypeKind::Union { alts } => {
+                let alts = alts.clone();
+                self.narrow_complement_union(&alts, asserted)?
+            }
+            TypeKind::Type(decl) => self.narrow_complement_abstract(*decl, asserted)?,
+            // P42.6 — closed generic roots (`Container<T> →
+            // {ArrayContainer<T>, MapContainer<T>}`) fall back to
+            // no-narrow until generic substitution is wired through
+            // the closure walker. Returning `None` keeps today's
+            // behavior at the `Generic { … }` bail-out site; revisit
+            // once the closure index is parameterized over type args.
+            _ => return None,
         };
+        if nullable {
+            Some(self.arena.nullable(inner))
+        } else {
+            Some(inner)
+        }
+    }
+
+    // P41.2
+    fn narrow_complement_union(&mut self, alts: &[TypeId], asserted: TypeId) -> Option<TypeId> {
         let mut survivors: Vec<TypeId> = Vec::with_capacity(alts.len());
         for alt in alts.iter() {
             // An alt survives the `is T` test only when it is NOT
@@ -1125,27 +1148,142 @@ impl<'a> Cx<'a> {
             survivors.push(*alt);
         }
         if survivors.is_empty() {
-            // Exhausted — P42's `exhaustive-is-check` owns the
+            // Exhausted — P42.5's `exhaustive-is-check` owns the
             // diagnostic. Returning `None` keeps the apply sites
             // untouched (no narrow lifted into the unreachable
             // continuation).
             return None;
         }
-        let collapsed = if survivors.len() == 1 {
-            survivors[0]
+        if survivors.len() == 1 {
+            Some(survivors[0])
         } else {
-            self.arena.alloc(Type {
+            Some(self.arena.alloc(Type {
                 kind: TypeKind::Union { alts: survivors },
                 nullable: false,
-            })
-        };
-        // Preserve the original `known`'s nullability — `is T`
-        // doesn't tell us anything about `null`.
-        if known_ty.nullable {
-            Some(self.arena.nullable(collapsed))
-        } else {
-            Some(collapsed)
+            }))
         }
+    }
+
+    // P42.2
+    /// Sealed-hierarchy `is`-complement: subtract `closure(asserted)`
+    /// from `closure(sup_decl)` and collapse the result.
+    ///
+    /// Both closures are canonically sorted (`subtype_closure` stores
+    /// each entry sorted by `Symbol`'s `Ord` impl), so the subtraction
+    /// is a linear merge over two sorted lists and the result is
+    /// itself sorted — feeding `abstract_by_closure_set.get(...)`
+    /// directly without re-canonicalization.
+    ///
+    /// Returns `None` when:
+    /// - `sup_decl` is not abstract (a concrete `Sup` is itself a
+    ///   runtime possibility, no subtraction is sound).
+    /// - `asserted` is not a `TypeKind::Type(d)`: `Generic { … }` is
+    ///   deferred per P42.6; other kinds (primitives, `Lambda`, …)
+    ///   don't participate in the sealed hierarchy.
+    /// - either side is missing from `subtype_closure` (sentinel /
+    ///   half-loaded project).
+    /// - the subtraction leaves zero leaves (exhausted; P42.5 owns
+    ///   the diagnostic).
+    fn narrow_complement_abstract(
+        &mut self,
+        sup_decl: greycat_analyzer_core::TypeDeclId,
+        asserted: TypeId,
+    ) -> Option<TypeId> {
+        let sup_sym = self.decl_registry.name(sup_decl)?;
+        if !self.index.is_abstract.contains(&sup_sym) {
+            return None;
+        }
+        let asserted_ty = self.arena.get(asserted);
+        let asserted_decl = match &asserted_ty.kind {
+            TypeKind::Type(d) => *d,
+            // P42.6 — defer generic-root asserts. Same comment as the
+            // outer dispatcher's `_` arm; flagged here too because a
+            // `TypeKind::Type` known with a `Generic` asserted is a
+            // distinct shape the closure walker can't model yet.
+            _ => return None,
+        };
+        let asserted_sym = self.decl_registry.name(asserted_decl)?;
+
+        let sup_closure = self.index.subtype_closure.get(&sup_sym)?.clone();
+        let asserted_closure = self
+            .index
+            .subtype_closure
+            .get(&asserted_sym)
+            .cloned()
+            .unwrap_or_default();
+
+        // Linear merge over two sorted Symbol lists.
+        let mut diff: Vec<Symbol> = Vec::with_capacity(sup_closure.len());
+        let mut j = 0usize;
+        for &s in sup_closure.iter() {
+            while j < asserted_closure.len() && asserted_closure[j] < s {
+                j += 1;
+            }
+            if j < asserted_closure.len() && asserted_closure[j] == s {
+                continue;
+            }
+            diff.push(s);
+        }
+
+        if diff.is_empty() {
+            // Exhausted — P42.5's `exhaustive-is-check` owns the
+            // diagnostic. Returning `None` keeps the apply sites
+            // untouched.
+            return None;
+        }
+
+        // Mandatory ancestor-collapse: if the remaining concrete set
+        // exactly equals `closure(A)` for some abstract `A`, the
+        // narrow renders as the nominal `Type(A)` rather than the
+        // explicit union. Applies only to TypeIds manufactured here
+        // (user-written unions in source are preserved verbatim
+        // elsewhere).
+        let diff_slice: Box<[Symbol]> = diff.clone().into_boxed_slice();
+        if let Some(&abstract_sym) = self.index.abstract_by_closure_set.get(&diff_slice)
+            && let Some(handle) = self.resolve_decl_handle_by_symbol(abstract_sym)
+        {
+            return Some(self.arena.alloc_type(handle));
+        }
+
+        // No collapse — build a Union (or singleton) over the
+        // surviving concrete leaves.
+        let mut alts: Vec<TypeId> = Vec::with_capacity(diff.len());
+        for sym in &diff {
+            if let Some(handle) = self.resolve_decl_handle_by_symbol(*sym) {
+                alts.push(self.arena.alloc_type(handle));
+            }
+        }
+        if alts.is_empty() {
+            return None;
+        }
+        if alts.len() == 1 {
+            return Some(alts[0]);
+        }
+        Some(self.arena.alloc(Type {
+            kind: TypeKind::Union { alts },
+            nullable: false,
+        }))
+    }
+
+    // P42.2
+    /// `Symbol`-keyed analogue of [`crate::project::resolve_decl_handle`]:
+    /// look up the type-namespace `TypeDeclId` for a `Symbol` already
+    /// interned in `index.symbols`. Used by `narrow_complement_abstract`
+    /// to convert closure-set symbols back into arena-bound decl
+    /// handles without round-tripping through the string text.
+    fn resolve_decl_handle_by_symbol(
+        &self,
+        sym: Symbol,
+    ) -> Option<greycat_analyzer_core::TypeDeclId> {
+        for (uri, _) in self
+            .index
+            .locate_decl_by_symbol_in_ns(sym, crate::stdlib::Namespace::Type)
+        {
+            if let Some(h) = self.decl_registry.lookup(uri, sym) {
+                return Some(h);
+            }
+        }
+        None
     }
 
     /// Lower a list of `is`-narrow type refs and join them into a
@@ -5516,6 +5654,201 @@ fn caller(c: Cat?, d: Dog?) {
                 .iter()
                 .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
             "supertype-asserted shape should not regress: {diags:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // P42 — sealed-hierarchy abstract-decl `is`-narrowing complement
+    // -------------------------------------------------------------------
+
+    /// Canonical reproducer (single-leaf-remaining): an abstract root
+    /// with exactly two concrete derivatives; `is Rect` else narrows
+    /// `s` to `Circle` (the lone survivor).
+    #[test]
+    fn p42_is_narrow_abstract_strips_to_lone_concrete() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+fn expect_circle(c: Circle) {}
+fn caller(s: Shape) {
+    if (s is Rect) { return; }
+    expect_circle(s);
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "expected zero is-narrow-related diagnostics: {diags:?}"
+        );
+    }
+
+    /// Multi-leaf-remaining: asserting one leaf out of three leaves
+    /// `Circle | Triangle` in the post-guard continuation. A call
+    /// that expects only `Circle` *should* still flag — confirms the
+    /// surviving Union shows up in the diagnostic and that we didn't
+    /// accidentally collapse two leaves into the parent abstract.
+    #[test]
+    fn p42_is_narrow_abstract_multi_leaf_returns_union() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+type Triangle extends Shape {}
+fn expect_circle(c: Circle) {}
+fn caller(s: Shape) {
+    if (s is Rect) { return; }
+    expect_circle(s);
+}
+"#;
+        let diags = analyze_project_src(src);
+        // Should flag — `s` is `Circle | Triangle` here, not `Circle`.
+        // We assert the diagnostic *names the union*, pinning that the
+        // narrow surfaced as the multi-arm shape (no spurious
+        // collapse).
+        let assign_errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("not assignable"))
+            .collect();
+        assert!(
+            !assign_errs.is_empty(),
+            "expected an assignability error on `Circle | Triangle` → `Circle`: {diags:?}"
+        );
+        let mentions_union = assign_errs
+            .iter()
+            .any(|d| d.message.contains("Circle") && d.message.contains("Triangle"));
+        assert!(
+            mentions_union,
+            "expected the diagnostic to surface the surviving union (`Circle | Triangle`): {assign_errs:#?}"
+        );
+    }
+
+    /// Mandatory ancestor-collapse: when the subtraction set exactly
+    /// equals `closure(A)` for some abstract `A`, the narrowed type
+    /// renders as `A`, not the explicit union. Strip `Mammal` from
+    /// `Animal` → `{Eagle, Penguin, Sparrow}` ≡ `closure(Bird)` →
+    /// narrow renders as `Bird`.
+    #[test]
+    fn p42_is_narrow_abstract_collapses_to_ancestor() {
+        let src = r#"
+abstract type Animal {}
+abstract type Mammal extends Animal {}
+abstract type Bird extends Animal {}
+type Dog extends Mammal {}
+type Cat extends Mammal {}
+type Eagle extends Bird {}
+type Penguin extends Bird {}
+type Sparrow extends Bird {}
+fn caller(a: Animal) {
+    if (a is Mammal) { return; }
+    var x = a;
+}
+"#;
+        // Post-guard `var x = a` reads `a`'s narrowed type via the
+        // narrow stack. The complement `closure(Animal) \ closure(Mammal)`
+        // = `{Eagle, Penguin, Sparrow}` matches `closure(Bird)` exactly,
+        // so the narrow collapses to the bare ancestor `Bird` rather
+        // than rendering as a 3-arm union.
+        assert_eq!(local_init_ty(src, "x").as_deref(), Some("Bird"));
+    }
+
+    /// Concrete root: `Shape` is not declared `abstract`, so the
+    /// runtime could legitimately have a `Shape` value at this binding.
+    /// `narrow_complement_abstract` returns `None`, the apply sites
+    /// are inert, and behavior is unchanged from before P42.
+    #[test]
+    fn p42_is_narrow_concrete_root_no_effect() {
+        let src = r#"
+type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+fn expect_circle(c: Circle) {}
+fn caller(s: Shape) {
+    if (s is Rect) { return; }
+    expect_circle(s);
+}
+"#;
+        let diags = analyze_project_src(src);
+        // No collapse — `s` stays as `Shape` in the continuation, so
+        // the call to `expect_circle` should still flag.
+        let assign_errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("not assignable"))
+            .collect();
+        assert!(
+            !assign_errs.is_empty(),
+            "concrete root must not lift a narrow (Shape itself is a runtime possibility): {diags:?}"
+        );
+    }
+
+    /// Asserting the root itself empties the subtraction set
+    /// (exhausted). The helper returns `None`; we expect no
+    /// diagnostic regression and no spurious narrow into the
+    /// (unreachable) continuation. P42.5 will add the
+    /// `exhaustive-is-check` warning at this shape.
+    #[test]
+    fn p42_is_narrow_abstract_exhausted_returns_none() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+fn caller(s: Shape) {
+    if (s is Shape) { return; }
+    var _ = s;
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "exhausted subtraction must not regress: {diags:?}"
+        );
+    }
+
+    /// Nested narrows compose via the narrow stack: the inner else
+    /// subtracts from the *currently narrowed* type (Mammal), not
+    /// from the original declaration (Animal). After `is Mammal`
+    /// then-branch, `a: Mammal`. Inside, `is Feline` else subtracts
+    /// `closure(Feline) = {Cat, Lynx}` from `closure(Mammal) = {Cat,
+    /// Lynx, Dog, Horse}` → `{Dog, Horse}`. That set has no abstract
+    /// ancestor (`Canid` only covers `{Dog}`), so the narrow renders
+    /// as the explicit union.
+    #[test]
+    fn p42_is_narrow_abstract_nested_subtracts_from_outer_narrow() {
+        let src = r#"
+abstract type Animal {}
+abstract type Mammal extends Animal {}
+abstract type Feline extends Mammal {}
+type Cat extends Feline {}
+type Lynx extends Feline {}
+type Dog extends Mammal {}
+type Horse extends Mammal {}
+type Eagle extends Animal {}
+fn caller(a: Animal) {
+    if (a is Mammal) {
+        if (a is Feline) {
+            return;
+        }
+        var x = a;
+    }
+}
+"#;
+        let ty = local_init_ty(src, "x").expect("init type");
+        // The two leaves of `Mammal \ Feline` are `Dog` and `Horse`,
+        // in canonical (Symbol-sorted) order. Source order in the
+        // type-decl listing matches; the union renders in that order.
+        assert!(
+            ty.contains("Dog") && ty.contains("Horse") && !ty.contains("Eagle"),
+            "expected narrow to subtract from Mammal (not Animal); got: {ty}"
+        );
+        // And not collapsed: there's no abstract `A` with
+        // `closure(A) = {Dog, Horse}`.
+        assert!(
+            ty.contains('|'),
+            "expected an explicit Union narrow (no ancestor-collapse here); got: {ty}"
         );
     }
 }
