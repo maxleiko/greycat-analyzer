@@ -2615,6 +2615,24 @@ fn sealed_hierarchy_is_narrow_does_not_false_positive() {
         then_branch_err.is_empty(),
         "`s` should narrow to `Rect` inside the then-branch; got: {then_branch_err:#?}",
     );
+
+    // 4. P42.3 — inside the else-branch, `s` must narrow to `Circle`
+    //    (the lone remaining concrete derivative of `Shape`) so the
+    //    `expect_circle(s)` call type-checks. Before P42 the analyzer
+    //    left `s` as `Shape` here and flagged "Shape not assignable
+    //    to Circle".
+    let else_branch_err: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message.contains("not assignable")
+                && d.message.contains("Circle")
+                && d.message.contains("Shape")
+        })
+        .collect();
+    assert!(
+        else_branch_err.is_empty(),
+        "`s` should narrow to `Circle` inside the else-branch; got: {else_branch_err:#?}",
+    );
 }
 
 /// Regression for symbol/handle mis-alignment under live LSP edits.
