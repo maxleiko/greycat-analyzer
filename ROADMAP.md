@@ -60,6 +60,7 @@ This is the long-arc plan for porting the [GreyCat](https://greycat.io) language
 - [Phase 40 — Project-pragma lint / fmt control (`@lint_off` / `@lint_on` / `@fmt_off` / `@fmt_on`)](#phase-40--project-pragma-lint--fmt-control-lint_off--lint_on--fmt_off--fmt_on-2-3-days)
 - [Phase 41 — Union-arm `is`-narrowing complement](#phase-41--union-arm-is-narrowing-complement-1-day)
 - [Phase 42 — Sealed-hierarchy exhaustive `is`-narrowing](#phase-42--sealed-hierarchy-exhaustive-is-narrowing-3-5-days)
+- [Phase 43 — CST error-recovery salvage in HIR lowering](#phase-43--cst-error-recovery-salvage-in-hir-lowering-3-4-days)
 
 ### Other sections
 
@@ -1688,6 +1689,73 @@ The push/pop on the `narrows` stack at else-branch entry already exists — only
 - Fold the exhaustion case into the existing `condition is always …` decidability pass. The decidable pass answers "is this condition impossible?"; sealed exhaustion answers "is the else-branch impossible?". Distinct questions — keep them in their own emission sites.
 - **Then-branch collapse to a single concrete leaf** when the asserted type is abstract with one derivative. `a: Animal; if (a is Feline)` keeps `a: Feline`, not `a: Cat`. Future siblings (`type Tiger extends Feline`) would silently break code that relied on the collapse. The user writes a further `is Cat` when they need Cat-specific access.
 - **Auto-collapsing user-written unions.** `var x: Eagle | Penguin | Sparrow` stays as-written even when set-equal to `closure(Bird)`. The mandatory collapse only applies to TypeIds manufactured by `narrow_complement` — user authoring intent is preserved verbatim everywhere else.
+
+---
+
+### Phase 43 — CST error-recovery salvage in HIR lowering (~3-4 days)
+
+**Goal:** make IDE capabilities work on the half-broken CSTs the user is actively editing. Today, when a small typo or mid-edit insertion (`if (c.sim.)`) causes tree-sitter to wrap a much larger subtree in `(ERROR …)`, every parseable inner shape the parser recovered (`(member_expr (ident "c") property: (ident "sim"))`) is dropped by HIR lowering. Completion, hover, goto-def, references, inlay hints — all the things the user reaches for at the exact moment the buffer is incomplete — silently degrade to "no result" because the HIR fast path has nothing to look at. Fix the layer that's throwing the salvage away (HIR lowering), so every downstream consumer benefits without per-capability patching.
+
+**Trigger:** user repro (2026-05-16) on `project.gcl`:
+
+```gcl
+type Ctx { sim: node<Simulation>?; }
+type Simulation { points_by_geo: nodeGeo<Tuple<float, float>>; }
+
+fn test(c: Ctx) {
+    if (c.sim.)   // typed `.` here; expected node<Simulation> members + Simulation members via `.→->` rewrite
+}
+```
+
+`receiver_type_at` in [`greycat-analyzer-analysis/src/ide/completion.rs`](../greycat-analyzer-analysis/src/ide/completion.rs) hands back `None` because (a) the HIR has no `Expr` ending at `recv_end` (the `member_expr(c.sim)` lives inside an `ERROR` child of the fn body's `block`, and `lower_block_inline` doesn't descend into `ERROR`), and (b) its CST fallback explicitly rejects anything except `ident` receivers. Fixing (a) at the HIR layer is the architectural move; (b) becomes moot once the HIR fast path has the expr.
+
+**Principle:** tree-sitter's error recovery is intentional — the grammar author chose what shapes survive when the wrapper rule fails. The asymmetry "we trust a `member_expr` child of `block` but not a `member_expr` *grandchild* through an `ERROR` child of `block`" has no principled basis. The HIR represents what tree-sitter salvaged, not just what cleanly parsed.
+
+**Mechanism:** one helper plus a narrow propagation flag.
+
+1. **`flatten_errors_named_children`** in [`greycat-analyzer-hir/src/lower.rs`](../greycat-analyzer-hir/src/lower.rs): an iterator-style helper that yields named children of a CST node, transparently descending **one level** into any `ERROR` child to yield *its* named children in place. Bounded descent — no unbounded ERROR-of-ERROR recursion; in practice tree-sitter recovery doesn't nest deeper than one level for the shapes we care about, and a depth bound keeps blast radius predictable.
+2. **Apply at every list-of-kinds site** in `lower.rs`: `block` (the user's case), `source_file` (top-level decls), `type_body` (attrs + methods), `enum_body` (variants), `args` (call sites), `fn_params`, `object_fields`. Every `node.named_children(&mut cursor)` walk that today drops unrecognised kinds gets replaced with the helper.
+3. **`Hir::salvaged_stmts: FxHashSet<Idx<Stmt>>`** (and `salvaged_exprs` if needed) records which lowered nodes came from inside an `ERROR`. Filled by the helper's caller when it lowers a salvaged child. The flag rides on `Hir`, not on each variant — keeps the variant ADTs clean and lets consumers ignore the salvage state when they don't care.
+4. **At expr-shaped salvage sites in stmt-list positions** (the user's case: `member_expr` salvaged into a `block`), wrap the expr as `Stmt::Expr` with `byte_range` matching the inner expr's range. The analyzer types it normally; the salvaged-stmt marker keeps lints quiet.
+5. **Lint suppression for salvaged stmts**: `expression-has-no-effect` (and any other "you wrote dead code" lint) consults `Hir::salvaged_stmts` and skips. The set is small (only the stmts the parser recovered from error), and the check is one hash lookup per emit. Other lints stay unchanged — typing, member resolution, unused-local on legitimately unused vars all proceed as if the salvaged stmt were authored.
+
+**What we do *not* do:**
+
+- Don't synthesise CST nodes or rewrite the parse tree. Tree-sitter trees are immutable; building a "fake" CST is a maintenance trap.
+- Don't recurse into `ERROR` deeper than one level. The recovered shapes tree-sitter produces are themselves shallow; deeper recursion would chase MISSING / partial nodes and the cost outpaces the value.
+- Don't try to "complete" partial decls (`type T { x: |`). The grammar's recovery doesn't preserve enough to type-check those soundly; a separate phase would be needed.
+- Don't reintroduce a single-file LSP shim. The cached `ProjectAnalysis` path is the only path; the fix lives in the lowering it consumes.
+
+**Touchpoints:**
+
+| Layer                              | Files                                                                                                              | Surface                                                                                                                                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Salvage helper                     | [`greycat-analyzer-hir/src/lower.rs`](../greycat-analyzer-hir/src/lower.rs)                                        | New `flatten_errors_named_children` (private), depth-bounded at 1.                                                                                                                |
+| Apply at list-of-kinds sites       | [`greycat-analyzer-hir/src/lower.rs`](../greycat-analyzer-hir/src/lower.rs)                                        | `lower_block_inline`, `lower_module` / `lower_source_file`, `lower_type_body`, `lower_enum_body`, `lower_args`, `lower_fn_params`, `lower_object_initializers` (wherever a list-of-kinds walk exists today). |
+| Salvaged-stmt marker               | [`greycat-analyzer-hir/src/lib.rs`](../greycat-analyzer-hir/src/lib.rs) (`Hir` struct)                              | `pub salvaged_stmts: FxHashSet<Idx<Stmt>>`. Optionally `salvaged_exprs` if a future call site needs it; start with stmts only.                                                     |
+| Wrap-expr-as-stmt at stmt-list ERR | [`greycat-analyzer-hir/src/lower.rs`](../greycat-analyzer-hir/src/lower.rs)                                        | When a salvaged child at a stmt-list site is expr-shaped, allocate `Stmt::Expr` and insert the resulting `Idx<Stmt>` into `salvaged_stmts`.                                       |
+| Lint skip                          | [`greycat-analyzer-analysis/src/lint.rs`](../greycat-analyzer-analysis/src/lint.rs)                                | Lints whose intent assumes complete code (start with `expression-has-no-effect`; extend per-rule on demand) check `hir.salvaged_stmts.contains(stmt_id)` before emitting.          |
+| Completion regression test         | [`greycat-analyzer-server/tests/lsp_capabilities.rs`](../greycat-analyzer-server/tests/lsp_capabilities.rs) or new file | `TestProject`-based: the user's `c.sim.` repro plus neighbors (`foo(bar.|)`, `var x = c.sim.|;`, attr-init position).                                                              |
+| HIR audit                          | [`greycat-analyzer-hir/tests/unsupported_audit.rs`](../greycat-analyzer-hir/tests/unsupported_audit.rs)              | Verify the audit's histogram-empty invariant still holds — salvaged exprs go through normal lowering, so no new `Unsupported`s should appear.                                     |
+
+**Chunks:**
+
+- [ ] **43.1 `flatten_errors_named_children` helper** (XS) — Private iterator helper in `lower.rs`. Walks `node.named_children()`; when it sees an `ERROR` child, yields *that child's* named children inline. Depth-bounded at 1 (an `ERROR` nested inside an `ERROR` is treated as opaque). Unit test against synthetic CSTs assembled from the existing parser.
+- [ ] **43.2 `Hir::salvaged_stmts` marker** (XS) — New field on `Hir` (default-empty `FxHashSet<Idx<Stmt>>`), threaded through `LowerCtx`. Lower-side helper `mark_salvaged(stmt_id)` for use by the apply-site chunks.
+- [ ] **43.3 Apply at `block`** (S) — Replace `lower_block_inline`'s `named_children` walk with the helper. For each yielded child: try `lower_stmt`; if `None`, try `lower_expr`; if `Some(expr)`, wrap in `Stmt::Expr` with the expr's byte_range and add to `salvaged_stmts`. Tests: user's `c.sim.` repro lands a `member_expr` Expr in the HIR with the right type; `expression-has-no-effect` does **not** fire on it.
+- [ ] **43.4 Apply at remaining list-of-kinds sites** (S) — `source_file`/`module`, `type_body`, `enum_body`, `args`, `fn_params`, `object_initializers`. Per-site test: a typo'd member surfaces the surrounding context normally (`foo(bar.|)` still types `foo`'s argument list around `bar.`'s ERROR; `type T { x: int = foo.| }` still types `x` and `foo`).
+- [ ] **43.5 Lint-side skip for salvaged stmts** (XS) — `expression-has-no-effect` (and any other completeness-dependent lint surfaced by the chunk 43.3/43.4 tests) consults `hir.salvaged_stmts` before emit. Add a one-line `LINT_RULES` doc note about the skip so future authors know the pattern.
+- [ ] **43.6 LSP capability regression sweep** (S) — `TestProject` cases for the user's repro plus: hover on `c.sim` inside ERROR, goto-def on `sim`, references-of-`sim`, inlay hint on the `c.sim` expression. Each should now produce the cached `ProjectAnalysis`'s normal result. This is the chunk where the architectural choice pays for itself — no new code per capability, just tests showing the fix lifts the entire surface.
+
+**M43:** typing `.` after `c.sim` in the user's `project.gcl` repro produces a completion list containing `node<Simulation>`'s members (`resolve`, etc.) and `Simulation`'s members (`points_by_geo` etc.) with `.`→`->` rewrite edits on the latter. Hover on `c.sim` returns `node<Simulation>?`. Goto-def on `sim` jumps to the `Ctx.sim` attr. `cargo test --workspace` and `cargo clippy --workspace --all-targets` clean.
+
+**Out of scope:**
+
+- Salvaging from `MISSING` nodes (tree-sitter's "expected X here" markers). Different shape — they're zero-width, not enclosing. Worth a separate chunk if it ever bites.
+- Recursive ERROR salvage (ERROR-inside-ERROR). The depth bound is intentional; deeper recovery shapes are rare and the value is unclear.
+- Diagnostics for incomplete code beyond what parse-errors already surface. The user knows the buffer is broken — they're editing it.
+- Touching `receiver_type_at`'s ident-only CST fallback to handle `member_expr` directly. Once the HIR fast path has the salvaged expr, the fallback isn't reached for this case. Leave the fallback as the safety net for ERROR shapes the helper can't reach (deep nesting, malformed grandchildren).
+- Cross-module impact: salvaged stmts in one module never alter another module's analysis (no signature contribution from a stmt; salvaged stmts only affect their owning module's `expr_types` / `def_types`). No `name_set_hash` / `sig_hash` invalidation work needed.
 
 ---
 
