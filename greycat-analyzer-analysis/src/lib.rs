@@ -43,6 +43,7 @@
 //!    CLI both consume them.
 
 pub mod analyzer;
+pub mod conv;
 pub mod directives;
 pub mod display;
 pub mod ide;

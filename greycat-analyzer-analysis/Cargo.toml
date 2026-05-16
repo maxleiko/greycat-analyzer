@@ -14,6 +14,8 @@ greycat-analyzer-hir.workspace = true
 greycat-analyzer-core.workspace = true
 greycat-analyzer-syntax.workspace = true
 rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 smol_str.workspace = true
 
 # P27.1 — rayon is unconditional on native targets and absent on wasm.

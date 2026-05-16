@@ -459,6 +459,8 @@ dependencies = [
  "greycat-analyzer-syntax",
  "rayon",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "smol_str",
 ]
 

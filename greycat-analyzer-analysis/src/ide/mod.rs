@@ -11,6 +11,7 @@
 //! conversion. See [`rename`] for the reference pattern.
 
 pub mod actions;
+pub mod completion;
 pub mod quickfix;
 pub mod rename;
 pub mod render;

@@ -1,23 +1,23 @@
 //! Completion subsystem — directive / pragma / library-version / scope /
 //! member / static / type-position / object-field completion. This is
 //! ~2700 lines of dense logic largely independent from the rest of the
-//! capability layer. The plan notes that most of this should move to an
-//! analysis-side service emitting `CompletionCandidate`s with the LSP
-//! layer doing only shape conversion; that's a follow-up.
+//! analysis pipeline. Currently emits `lsp_types::CompletionItem`
+//! directly; a future refactor will introduce a `CompletionCandidate`
+//! ADT and demote the LSP shapes to a thin server-side converter.
 
-use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
+use greycat_analyzer_core::lsp_types::{self, *};
 use greycat_analyzer_core::{Symbol, SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
-use lsp_types::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::conv::{byte_range_to_lsp, byte_to_position, position_to_byte, stmt_byte_range};
-use greycat_analyzer_analysis::ide::render::{
+use crate::ide::render::{
     RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_fn_signature,
     render_type_ref_with_subst,
 };
+use crate::project::{ModuleAnalysis, ProjectAnalysis};
 
 // P15.2.3
 /// Completion with project context. Same dispatcher chain as
@@ -615,7 +615,7 @@ fn pragma_items() -> Vec<CompletionItem> {
 ///   forms.
 /// - **Rule name** — when the cursor sits in a `// gcl-lint-off-* `
 ///   directive's rule list, emit one item per registered
-///   [`greycat_analyzer_analysis::lint::LINT_RULES`] entry.
+///   [`crate::lint::LINT_RULES`] entry.
 ///
 /// Returns `None` when the cursor isn't inside a `// gcl…` comment so
 /// the parent dispatcher can fall through to the other completion shapes.
@@ -684,7 +684,7 @@ fn directive_completion(text: &str, cursor_byte: usize) -> Option<Vec<Completion
         return None;
     }
     let rule_typed = current_word_around(payload_trimmed, after_payload_ws);
-    let mut items: Vec<CompletionItem> = greycat_analyzer_analysis::lint::LINT_RULES
+    let mut items: Vec<CompletionItem> = crate::lint::LINT_RULES
         .iter()
         .filter(|r| rule_typed.is_empty() || r.name.starts_with(rule_typed))
         .map(|r| CompletionItem {
@@ -816,6 +816,7 @@ fn current_word_around(s: &str, cursor: usize) -> &str {
 /// since dedicated type completion hasn't landed yet, we
 /// just bail when the cursor sits inside a `type_ident` so we don't
 /// pollute that slot with statement keywords.
+#[allow(dead_code)] // kept for the future plain-keyword completion path; callers were removed with the single-file shims.
 fn keyword_completion(
     text: &str,
     node: tree_sitter::Node<'_>,
@@ -1305,7 +1306,7 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
 fn scope_name_meta(
     module: &ModuleAnalysis,
     arena: &TypeArena,
-    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
+    decl_registry: &crate::well_known::DeclRegistry,
     symbols: &SymbolTable,
     source: &NameSource,
 ) -> (Option<String>, Option<Documentation>) {
@@ -1319,8 +1320,7 @@ fn scope_name_meta(
         }
         NameSource::Local(name_idx) | NameSource::Param(name_idx) => {
             let detail = module.analysis.def_types.get(name_idx).map(|ty| {
-                greycat_analyzer_analysis::project::display_type(arena, decl_registry, symbols, *ty)
-                    .to_string()
+                crate::project::display_type(arena, decl_registry, symbols, *ty).to_string()
             });
             (detail, None)
         }
@@ -1339,7 +1339,7 @@ fn foreign_decl_completion_meta(
     locs: &[(
         Uri,
         greycat_analyzer_hir::arena::Idx<Decl>,
-        greycat_analyzer_analysis::stdlib::Namespace,
+        crate::stdlib::Namespace,
     )],
 ) -> (Option<String>, Option<Documentation>, Option<String>) {
     let Some((uri, decl_id, _)) = locs.first() else {
@@ -1364,7 +1364,7 @@ fn decl_locs_kind(
     locs: &[(
         Uri,
         greycat_analyzer_hir::arena::Idx<Decl>,
-        greycat_analyzer_analysis::stdlib::Namespace,
+        crate::stdlib::Namespace,
     )],
 ) -> CompletionItemKind {
     if let Some((uri, decl_id, _)) = locs.first()
@@ -1723,7 +1723,7 @@ fn member_completion(
         if items.is_empty()
             && let Some((foreign_uri, foreign_decl_id)) = project
                 .index
-                .locate_decl_in_ns(name, greycat_analyzer_analysis::stdlib::Namespace::Type)
+                .locate_decl_in_ns(name, crate::stdlib::Namespace::Type)
                 .next()
             && let Some(fmod) = project.module(foreign_uri)
             && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
@@ -1765,7 +1765,7 @@ fn member_completion(
         if inner_items.is_empty()
             && let Some((foreign_uri, foreign_decl_id)) = project
                 .index
-                .locate_decl_in_ns(inner, greycat_analyzer_analysis::stdlib::Namespace::Type)
+                .locate_decl_in_ns(inner, crate::stdlib::Namespace::Type)
                 .next()
             && let Some(fmod) = project.module(foreign_uri)
             && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
@@ -1817,9 +1817,7 @@ fn member_completion(
         .iter()
         .filter(|(_, e)| e.byte_range().end == recv_end)
         .max_by_key(|(_, e)| e.byte_range().end - e.byte_range().start)
-        .map(|(id, _)| {
-            greycat_analyzer_analysis::lint::chain_has_upstream_nullsafe(&module.hir, id)
-        })
+        .map(|(id, _)| crate::lint::chain_has_upstream_nullsafe(&module.hir, id))
         .unwrap_or(false);
     if receiver_nullable && !already_nullsafe && !chain_protected {
         let insert_at = lsp_types::Range {
@@ -1903,7 +1901,7 @@ fn receiver_type_at(
     let r = recv_node.byte_range();
     // Stage 2: ident already lowered into the HIR — resolver path.
     if let Some((ident_idx, _)) = module.hir.idents.iter().find(|(_, i)| i.byte_range == r) {
-        use greycat_analyzer_analysis::resolver::Definition;
+        use crate::resolver::Definition;
         use greycat_analyzer_hir::types::Decl;
         if let Some(def) = module.resolutions.lookup(ident_idx) {
             // P35.10 — `Definition::Decl(decl_id)` for a top-level
@@ -1939,7 +1937,7 @@ fn receiver_type_at(
 fn lookup_name_type_at(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::AnalysisResult,
     cursor_byte: usize,
     name: &str,
 ) -> Option<TypeId> {
@@ -1997,7 +1995,7 @@ fn lookup_name_type_at(
 fn lookup_name_type_in_fn(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::AnalysisResult,
     cursor_byte: usize,
     fnd: &greycat_analyzer_hir::types::FnDecl,
     name: &str,
@@ -2017,7 +2015,7 @@ fn lookup_name_type_in_fn(
 fn lookup_name_type_in_block(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::AnalysisResult,
     cursor_byte: usize,
     block: &greycat_analyzer_hir::types::BlockStmt,
     name: &str,
@@ -2047,7 +2045,7 @@ fn lookup_name_type_in_block(
 fn lookup_name_type_in_stmt(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &greycat_analyzer_analysis::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::AnalysisResult,
     cursor_byte: usize,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
     name: &str,
@@ -2230,7 +2228,7 @@ fn doc_to_markup(doc: Option<&str>) -> Option<Documentation> {
 fn static_completion(
     text: &str,
     cursor_byte: usize,
-    project: &greycat_analyzer_analysis::project::ProjectAnalysis,
+    project: &crate::project::ProjectAnalysis,
 ) -> Option<Vec<CompletionItem>> {
     let ctx = static_receiver_at(text, cursor_byte)?;
     let prefix_lower = ctx.typed.to_lowercase();
@@ -2248,10 +2246,7 @@ fn static_completion(
     // here, the receiver is a static dispatch target.
     if let Some((foreign_uri, foreign_decl_id)) = project
         .index
-        .locate_decl_in_ns(
-            &ctx.recv,
-            greycat_analyzer_analysis::stdlib::Namespace::Type,
-        )
+        .locate_decl_in_ns(&ctx.recv, crate::stdlib::Namespace::Type)
         .next()
         && let Some(fmod) = project.module(foreign_uri)
     {
@@ -2474,7 +2469,7 @@ fn type_position_completion(
     node: tree_sitter::Node<'_>,
     cursor_byte: usize,
     uri: &Uri,
-    project: &greycat_analyzer_analysis::project::ProjectAnalysis,
+    project: &crate::project::ProjectAnalysis,
 ) -> Option<Vec<CompletionItem>> {
     ancestor_with_kind(node, "type_ident")?;
     // Bail if we're on the RHS of a member / static / annotation chain.
@@ -2589,7 +2584,7 @@ fn object_field_completion(
     node: tree_sitter::Node<'_>,
     cursor_byte: usize,
     uri: &Uri,
-    project: &greycat_analyzer_analysis::project::ProjectAnalysis,
+    project: &crate::project::ProjectAnalysis,
 ) -> Option<Vec<CompletionItem>> {
     // Walk up to find the enclosing `object_initializers` /
     // `object_fields` block. `object_field` walks one extra level.
@@ -2624,10 +2619,7 @@ fn object_field_completion(
     if items.is_empty()
         && let Some((foreign_uri, foreign_decl_id)) = project
             .index
-            .locate_decl_in_ns(
-                &type_name,
-                greycat_analyzer_analysis::stdlib::Namespace::Type,
-            )
+            .locate_decl_in_ns(&type_name, crate::stdlib::Namespace::Type)
             .next()
         && let Some(fmod) = project.module(foreign_uri)
         && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]

@@ -11,7 +11,6 @@
 //! for consistency.
 
 mod code_actions;
-mod completion;
 mod diagnostics;
 mod document_highlights;
 mod document_symbols;
@@ -27,10 +26,6 @@ mod signature_help;
 mod workspace_symbols;
 
 pub use code_actions::code_actions_with_project;
-pub use completion::{
-    LibVersionPayload, completion_with_project, extract_lib_version_placeholder,
-    resolve_library_version_completion,
-};
 pub use diagnostics::diagnostics_from_module;
 pub use document_highlights::document_highlights;
 pub use document_symbols::document_symbols;
@@ -40,6 +35,10 @@ pub use goto::{
     cross_module_decl_location, cross_module_member_location, cursor_ident_idx,
     goto_declaration_across_project, goto_definition, goto_definition_across_project,
     goto_implementation, goto_implementation_across_project, goto_module_segment,
+};
+pub use greycat_analyzer_analysis::ide::completion::{
+    LibVersionPayload, completion_with_project, extract_lib_version_placeholder,
+    resolve_library_version_completion,
 };
 pub use hover::hover_with_project;
 pub use inlay_hints::inlay_hints_with_project;
