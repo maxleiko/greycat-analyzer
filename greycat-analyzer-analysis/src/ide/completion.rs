@@ -1172,9 +1172,20 @@ fn ident_or_keyword_completion(
         if !seen.insert(name.to_string()) {
             continue;
         }
+        // `values` lumps non-native fns, top-level vars, and runtime
+        // value-position globals (`NaN`, `Infinity`) together. Emit
+        // FUNCTION only for actual fn names — otherwise the call-paren
+        // post-pass appends `($0)` and turns `NaN` into `NaN()`.
+        let kind = if project.index.non_native_fn_names.contains(name_sym) {
+            CompletionItemKind::FUNCTION
+        } else if project.index.runtime_globals.contains_key(name_sym) {
+            CompletionItemKind::CONSTANT
+        } else {
+            CompletionItemKind::VARIABLE
+        };
         items.push(CompletionItem {
             label: name.to_string(),
-            kind: Some(CompletionItemKind::FUNCTION),
+            kind: Some(kind),
             insert_text: Some(name.to_string()),
             sort_text: Some(format!("y_{name}")),
             ..Default::default()
