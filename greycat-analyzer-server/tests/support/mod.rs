@@ -14,24 +14,29 @@
 #![allow(dead_code)] // each test file imports a subset
 
 use std::cell::Ref;
+use std::path::Path;
 use std::str::FromStr;
 
-use greycat_analyzer_analysis::project::ProjectAnalysis;
+use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_core::Document;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
-use lsp_types::Position;
+use greycat_analyzer_server::capabilities;
+use lsp_types::{
+    CodeActionOrCommand, CompletionList, GotoDefinitionResponse, Hover, InlayHint, Location,
+    Position, WorkspaceEdit,
+};
 
 /// One-file project fixture — wraps a `SourceManager` populated with a
 /// single `project` module plus its `ProjectAnalysis`, mirroring the
 /// `Backend::project_for` state at the moment a request handler fires.
-pub struct Project {
+pub struct TestProject {
     pub manager: SourceManager,
     pub analysis: ProjectAnalysis,
     pub uri: Uri,
 }
 
-impl Project {
+impl TestProject {
     /// Single-file project at `file:///proj/main.gcl` with lib
     /// `"project"`. Use this for tests that don't need multi-module
     /// shapes — most hover / references / rename / completion /
@@ -62,6 +67,76 @@ impl Project {
             .get(&self.uri)
             .expect("fixture's main URI must be in the manager")
             .borrow()
+    }
+
+    /// Cached `ModuleAnalysis` for the entry-point module — required
+    /// by capabilities that consume it directly (`code_actions_with_project`,
+    /// `inlay_hints_with_project`).
+    pub fn module(&self) -> &ModuleAnalysis {
+        self.analysis
+            .module(&self.uri)
+            .expect("fixture's main URI must have a ModuleAnalysis")
+    }
+
+    // -- Capability shortcuts ---------------------------------------------------
+    //
+    // Each method forwards to the project-aware `capabilities::*_with_project`
+    // / `*_across_project` entry point with the fixture's cached state, so
+    // tests exercise the same path the LSP server dispatches to.
+
+    pub fn hover(&self, pos: Position) -> Option<Hover> {
+        let doc = self.doc();
+        capabilities::hover_with_project(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+            pos,
+            &self.uri,
+            &self.analysis,
+            &self.manager,
+        )
+    }
+
+    pub fn goto_definition(&self, pos: Position) -> Option<GotoDefinitionResponse> {
+        capabilities::goto_definition_across_project(&self.analysis, &self.manager, &self.uri, pos)
+    }
+
+    pub fn references(&self, pos: Position) -> Vec<Location> {
+        capabilities::references_across_project(&self.analysis, &self.manager, &self.uri, pos)
+    }
+
+    pub fn rename(&self, pos: Position, new_name: &str) -> Option<WorkspaceEdit> {
+        capabilities::rename_across_project(&self.analysis, &self.manager, &self.uri, pos, new_name)
+    }
+
+    pub fn completion(&self, pos: Position) -> Option<CompletionList> {
+        self.completion_at(pos, None)
+    }
+
+    pub fn completion_at(
+        &self,
+        pos: Position,
+        project_root: Option<&Path>,
+    ) -> Option<CompletionList> {
+        let doc = self.doc();
+        capabilities::completion_with_project(
+            &doc.text,
+            doc.root_node(),
+            pos,
+            &self.uri,
+            &self.analysis,
+            project_root,
+        )
+    }
+
+    pub fn inlay_hints(&self, range: &lsp_types::Range) -> Vec<InlayHint> {
+        let doc = self.doc();
+        capabilities::inlay_hints_with_project(self.module(), &self.analysis, &doc.text, range)
+    }
+
+    pub fn code_actions(&self, range: lsp_types::Range) -> Vec<CodeActionOrCommand> {
+        let doc = self.doc();
+        capabilities::code_actions_with_project(self.module(), &doc.text, &self.uri, range)
     }
 }
 

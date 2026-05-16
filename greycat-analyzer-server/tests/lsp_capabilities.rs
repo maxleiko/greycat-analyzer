@@ -18,6 +18,9 @@ use greycat_analyzer_server::capabilities;
 use greycat_analyzer_syntax::parse;
 use lsp_types::*;
 
+mod support;
+use support::TestProject;
+
 fn pos(line: u32, character: u32) -> Position {
     Position { line, character }
 }
@@ -68,9 +71,8 @@ fn synthetic_std_core_with_node() -> &'static str {
 #[test]
 fn hover_renders_param_type() {
     let src = "fn add(a: int, b: int): int { return a + b; }\n";
-    let tree = parse(src);
-    let h = capabilities::hover(src, "project", tree.root_node(), pos(0, 38));
-    let h = h.expect("hover present on `a`");
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project.hover(pos(0, 38)).expect("hover present on `a`");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
         panic!("expected markup hover");
     };
@@ -86,9 +88,10 @@ fn hover_renders_param_type() {
 #[test]
 fn hover_renders_full_fn_signature() {
     let src = "fn add(a: int, b: int): int { return a + b; }\nfn main() { add(1, 2); }\n";
-    let tree = parse(src);
-    let h = capabilities::hover(src, "project", tree.root_node(), pos(1, 12));
-    let h = h.expect("hover present on call-site `add`");
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(1, 12))
+        .expect("hover present on call-site `add`");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
         panic!("expected markup hover");
     };
@@ -102,9 +105,10 @@ fn hover_renders_full_fn_signature() {
 #[test]
 fn hover_includes_doc_comments() {
     let src = "/// adds two ints.\nfn add(a: int, b: int): int { return a + b; }\nfn main() { add(1, 2); }\n";
-    let tree = parse(src);
-    let h = capabilities::hover(src, "project", tree.root_node(), pos(2, 12));
-    let h = h.expect("hover present on call-site `add`");
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(2, 12))
+        .expect("hover present on call-site `add`");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
         panic!("expected markup hover");
     };
@@ -123,9 +127,10 @@ fn hover_includes_doc_comments() {
 #[test]
 fn hover_renders_generics_and_return_type() {
     let src = "fn pick<T>(xs: Array<T>, i: int): T { return xs[i]; }\nfn main() { pick(1, 2); }\n";
-    let tree = parse(src);
-    let h = capabilities::hover(src, "project", tree.root_node(), pos(1, 13));
-    let h = h.expect("hover present on call-site `pick`");
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(1, 13))
+        .expect("hover present on call-site `pick`");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
         panic!("expected markup hover");
     };
@@ -229,8 +234,8 @@ fn document_highlights_match_same_text() {
 #[test]
 fn rename_uses_resolver_for_locals() {
     let src = "fn id(x: int): int { return x; }\n";
-    let tree = parse(src);
-    let edit = capabilities::rename(src, tree.root_node(), &uri(), pos(0, 28), "y").unwrap();
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let edit = project.rename(pos(0, 28), "y").unwrap();
     #[allow(clippy::mutable_key_type)]
     let changes = edit.changes.unwrap();
     let edits = changes.values().next().unwrap();
@@ -244,8 +249,8 @@ fn rename_uses_resolver_for_locals() {
 #[test]
 fn references_returns_def_plus_uses() {
     let src = "fn id(x: int): int { return x; }\n";
-    let tree = parse(src);
-    let refs = capabilities::references(src, "project", tree.root_node(), &uri(), pos(0, 28));
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let refs = project.references(pos(0, 28));
     assert!(
         refs.len() >= 2,
         "expected at least 2 refs for `x`, got: {refs:?}"
@@ -538,9 +543,10 @@ fn completion_inside_at_include_lists_subdirs() {
     fs::create_dir_all(tmp.join("node_modules")).unwrap(); // should be skipped
 
     let src = "@include(\"\");\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor sits between the two quotes (col 10).
-    let list = capabilities::completion(src, tree.root_node(), pos(0, 10), Some(&tmp))
+    let list = project
+        .completion_at(pos(0, 10), Some(&tmp))
         .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
     assert!(
@@ -575,9 +581,10 @@ fn completion_inside_at_include_drills_into_subdirs() {
     fs::create_dir_all(tmp.join("playground/node_modules")).unwrap();
 
     let src = "@include(\"playground/\");\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor sits between the trailing `/` and the closing quote (col 21).
-    let list = capabilities::completion(src, tree.root_node(), pos(0, 21), Some(&tmp))
+    let list = project
+        .completion_at(pos(0, 21), Some(&tmp))
         .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
     assert!(
@@ -602,10 +609,9 @@ fn completion_inside_at_include_drills_into_subdirs() {
 #[test]
 fn completion_inside_at_library_version_emits_placeholder() {
     let src = "@library(\"std\", \"\");\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor between the two quotes of the version string (col 17).
-    let list =
-        capabilities::completion(src, tree.root_node(), pos(0, 17), None).expect("completion list");
+    let list = project.completion(pos(0, 17)).expect("completion list");
     assert_eq!(list.items.len(), 1, "got: {:?}", list.items);
     assert!(list.is_incomplete);
     let item = &list.items[0];
@@ -626,9 +632,9 @@ fn completion_inside_at_library_version_emits_placeholder() {
 #[test]
 fn completion_inside_at_library_name_does_not_emit_placeholder() {
     let src = "@library(\"\", \"\");\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor inside the empty first string (col 10).
-    let list = capabilities::completion(src, tree.root_node(), pos(0, 10), None);
+    let list = project.completion(pos(0, 10));
     let payload = list
         .as_ref()
         .and_then(capabilities::extract_lib_version_placeholder);
@@ -811,10 +817,9 @@ fn resolve_lib_version_biases_matching_channel_first() {
 #[test]
 fn completion_after_at_emits_pragma_list() {
     let src = "@\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor sits right after the `@` (col 1).
-    let list =
-        capabilities::completion(src, tree.root_node(), pos(0, 1), None).expect("completion list");
+    let list = project.completion(pos(0, 1)).expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
     for expected in [
         "@library",
@@ -847,10 +852,9 @@ fn completion_after_at_emits_pragma_list() {
 #[test]
 fn completion_at_stmt_emits_filtered_keywords() {
     let src = "fn body() {\n  re\n}\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor after `re` on line 1 col 4.
-    let list =
-        capabilities::completion(src, tree.root_node(), pos(1, 4), None).expect("completion list");
+    let list = project.completion(pos(1, 4)).expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
     assert!(
         labels.contains(&"return"),
@@ -866,9 +870,9 @@ fn completion_at_stmt_emits_filtered_keywords() {
 #[test]
 fn completion_inside_string_skips_keywords() {
     let src = "fn f() { var s: String = \"return\"; }\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor inside the string body, between `e` and `t` of `return`.
-    let list = capabilities::completion(src, tree.root_node(), pos(0, 28), None);
+    let list = project.completion(pos(0, 28));
     if let Some(list) = list {
         let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
         assert!(
@@ -1380,9 +1384,9 @@ fn completion_after_dot_cross_module() {
 #[test]
 fn completion_after_dot_skips_keywords() {
     let src = "fn f(p: int) { p.r }\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     // Cursor immediately after the `r` of `.r`.
-    let list = capabilities::completion(src, tree.root_node(), pos(0, 18), None);
+    let list = project.completion(pos(0, 18));
     if let Some(list) = list {
         let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
         assert!(
@@ -1397,9 +1401,8 @@ fn completion_after_dot_skips_keywords() {
 #[test]
 fn completion_after_at_prefix_filters() {
     let src = "@li\n";
-    let tree = parse(src);
-    let list =
-        capabilities::completion(src, tree.root_node(), pos(0, 3), None).expect("completion list");
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let list = project.completion(pos(0, 3)).expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
     assert!(labels.contains(&"@library"), "got: {labels:?}");
     assert!(!labels.contains(&"@include"), "got: {labels:?}");
@@ -2040,12 +2043,12 @@ fn signature_help_renders_params() {
 #[test]
 fn inlay_hints_emit_var_type() {
     let src = "fn body() {\n    var x = 1;\n}\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     let r = lsp_types::Range {
         start: pos(0, 0),
         end: pos(10, 0),
     };
-    let hints = capabilities::inlay_hints(src, "project", tree.root_node(), &r);
+    let hints = project.inlay_hints(&r);
     assert!(!hints.is_empty(), "inlay hints should annotate var x");
 }
 
@@ -2054,12 +2057,12 @@ fn inlay_hints_emit_argument_names() {
     // P13.7: `f(1, 2)` against `fn f(x: int, y: int)` emits `x:` / `y:`
     // hints anchored at each arg position.
     let src = "fn f(x: int, y: int) {}\nfn caller() {\n    f(1, 2);\n}\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     let r = lsp_types::Range {
         start: pos(0, 0),
         end: pos(10, 0),
     };
-    let hints = capabilities::inlay_hints(src, "project", tree.root_node(), &r);
+    let hints = project.inlay_hints(&r);
     let labels: Vec<String> = hints
         .iter()
         .filter_map(|h| match &h.label {
@@ -2082,12 +2085,12 @@ fn inlay_hints_emit_inferred_return_type() {
     // P13.7: a fn with no declared return type but a `return …;` body
     // gets a `: <inferred>` hint anchored after the fn name.
     let src = "fn ret() {\n    return 42;\n}\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     let r = lsp_types::Range {
         start: pos(0, 0),
         end: pos(10, 0),
     };
-    let hints = capabilities::inlay_hints(src, "project", tree.root_node(), &r);
+    let hints = project.inlay_hints(&r);
     let has_int = hints
         .iter()
         .any(|h| matches!(&h.label, lsp_types::InlayHintLabel::String(s) if s.contains("int")));
@@ -2117,12 +2120,12 @@ fn semantic_tokens_emit_for_idents() {
 #[test]
 fn code_actions_for_unused_local_emits_remove_edit() {
     let src = "fn body() {\n    var unused = 1;\n}\n";
-    let tree = parse(src);
+    let project = TestProject::single_file_at("/test.gcl", src);
     let r = lsp_types::Range {
         start: pos(1, 0),
         end: pos(1, 30),
     };
-    let actions = capabilities::code_actions(src, "project", tree.root_node(), &uri(), r);
+    let actions = project.code_actions(r);
     let any_remove = actions.iter().any(|a| {
         let CodeActionOrCommand::CodeAction(ca) = a else {
             return false;

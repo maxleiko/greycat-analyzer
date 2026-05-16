@@ -12,7 +12,7 @@ use greycat_analyzer_syntax::parse;
 use lsp_types::*;
 
 mod support;
-use support::{Project, position_of};
+use support::{TestProject, position_of};
 
 fn pos(line: u32, character: u32) -> Position {
     Position { line, character }
@@ -33,20 +33,10 @@ fn root<'a>(
 #[test]
 fn hover_on_param_returns_inferred_type() {
     let src = "fn id(name: String): String { return name; }\n";
-    let project = Project::single_file(src);
+    let test_project = TestProject::single_file(src);
     // Cursor on the `name` *use* inside the body (`name;` is unique).
     let cursor = position_of(src, "name;");
-    let doc = project.doc();
-    let h = capabilities::hover_with_project(
-        &doc.text,
-        &doc.lib,
-        doc.root_node(),
-        cursor,
-        &project.uri,
-        &project.analysis,
-        &project.manager,
-    )
-    .expect("hover present");
+    let h = test_project.hover(cursor).expect("hover present");
     let HoverContents::Markup(content) = h.contents else {
         panic!("expected markup contents")
     };
@@ -60,21 +50,9 @@ fn hover_on_param_returns_inferred_type() {
 #[test]
 fn hover_off_named_node_returns_none() {
     let src = "fn f() {}\n";
-    let project = Project::single_file(src);
-    let doc = project.doc();
+    let test_project = TestProject::single_file(src);
     // Far past EOF — no node at offset.
-    assert!(
-        capabilities::hover_with_project(
-            &doc.text,
-            &doc.lib,
-            doc.root_node(),
-            pos(99, 99),
-            &project.uri,
-            &project.analysis,
-            &project.manager,
-        )
-        .is_none()
-    );
+    assert!(test_project.hover(pos(99, 99)).is_none());
 }
 
 // =============================================================================
@@ -199,13 +177,10 @@ fn document_symbols_skips_empty_name_recovered_from_partial_edit() {
 #[test]
 fn references_finds_every_same_name_occurrence() {
     let src = "fn id(x: int): int { return x; }\nfn main(): int { return id(42); }\n";
-    let mut t = None;
-    let r = root(src, &mut t);
-    let uri = "file:///mod.gcl".parse::<Uri>().unwrap();
+    let test_project = TestProject::single_file(src);
     // Cursor on the `id` declaration on line 0.
-    let locs = capabilities::references(src, "project", r, &uri, pos(0, 3));
-    // Three idents named `id`: the decl, `id` again? actually just two: the
-    // decl and the use site in main. (The param `x` is a different name.)
+    let locs = test_project.references(pos(0, 3));
+    // Two idents named `id`: the decl and the use site in main.
     assert!(
         locs.len() >= 2,
         "expected at least 2 references, got {}",
@@ -216,14 +191,13 @@ fn references_finds_every_same_name_occurrence() {
 #[test]
 fn rename_emits_one_textedit_per_occurrence() {
     let src = "fn id(x: int): int { return x; }\nfn main(): int { return id(42); }\n";
-    let mut t = None;
-    let r = root(src, &mut t);
-    let uri = "file:///mod.gcl".parse::<Uri>().unwrap();
-    let edit =
-        capabilities::rename(src, r, &uri, pos(0, 3), "named").expect("rename produced an edit");
+    let test_project = TestProject::single_file(src);
+    let edit = test_project
+        .rename(pos(0, 3), "named")
+        .expect("rename produced an edit");
     #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice
     let changes = edit.changes.expect("changes map");
-    let edits = changes.get(&uri).expect("uri in changes");
+    let edits = changes.get(&test_project.uri).expect("uri in changes");
     assert!(edits.len() >= 2);
     assert!(edits.iter().all(|e| e.new_text == "named"));
 }
@@ -302,13 +276,12 @@ fn selection_ranges_form_an_ancestor_chain() {
 #[test]
 fn inlay_hints_annotate_typeless_locals() {
     let src = "fn f(): int { var n = 42; return n; }\n";
-    let mut t = None;
-    let r = root(src, &mut t);
+    let test_project = TestProject::single_file(src);
     let range = lsp_types::Range {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints(src, "project", r, &range);
+    let hints = test_project.inlay_hints(&range);
     assert_eq!(hints.len(), 1, "expected 1 inlay hint, got {}", hints.len());
     let hint = &hints[0];
     let InlayHintLabel::String(s) = &hint.label else {
@@ -1054,10 +1027,10 @@ fn unused_local_carries_unnecessary_tag() {
 #[test]
 fn completion_inside_gcl_directive_comment_lists_directives() {
     let src = "// gcl-\nfn f() {}\n";
-    let mut t = None;
-    let r = root(src, &mut t);
+    let test_project = TestProject::single_file(src);
     // Cursor right after `// gcl-` (line 0, character 7).
-    let list = capabilities::completion(src, r, pos(0, 7), None)
+    let list = test_project
+        .completion(pos(0, 7))
         .expect("expected completion items inside `// gcl-`");
     let labels: Vec<_> = list.items.into_iter().map(|c| c.label).collect();
     assert!(
@@ -1073,10 +1046,10 @@ fn completion_inside_gcl_directive_comment_lists_directives() {
 #[test]
 fn completion_inside_lint_off_rule_list_lists_known_rules() {
     let src = "// gcl-lint-off \nfn f() {}\n";
-    let mut t = None;
-    let r = root(src, &mut t);
+    let test_project = TestProject::single_file(src);
     // Cursor at the rule-list slot (right after the trailing space).
-    let list = capabilities::completion(src, r, pos(0, 16), None)
+    let list = test_project
+        .completion(pos(0, 16))
         .expect("expected rule-list completion inside `gcl-lint-off `");
     let labels: Vec<_> = list.items.into_iter().map(|c| c.label).collect();
     assert!(
@@ -1100,12 +1073,12 @@ fn completion_at_stmt_position_includes_breakpoint() {
     // prefix filter narrows `ALL_KEYWORDS` to entries starting with
     // `br` (`break` and `breakpoint`).
     let src = "fn f() {\n    br;\n}\n";
-    let mut t = None;
-    let r = root(src, &mut t);
+    let test_project = TestProject::single_file(src);
     let cursor = src.find("br;").unwrap() + 2;
     let line = src[..cursor].matches('\n').count() as u32;
     let col = (cursor - src[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
-    let list = capabilities::completion(src, r, pos(line, col), None)
+    let list = test_project
+        .completion(pos(line, col))
         .expect("expected keyword completion at statement position");
     let labels: Vec<_> = list.items.into_iter().map(|c| c.label).collect();
     assert!(
