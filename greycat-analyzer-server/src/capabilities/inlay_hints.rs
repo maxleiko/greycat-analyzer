@@ -75,10 +75,15 @@ fn inlay_hints_inner(
                 && let Some(ty) = inferred_fn_return(hir, analysis, body)
             {
                 let name_range = &hir.idents[fnd.name].byte_range;
-                if name_range.start <= want.1 && name_range.end >= want.0 {
+                // Anchor the hint right after the params `)` so it reads
+                // `fn foo(): int` — anchoring at the fn name end would
+                // print `fn foo: int()` which looks like the type belongs
+                // to the name, not the return slot.
+                let anchor = params_close_paren_end(text, name_range.end).unwrap_or(name_range.end);
+                if name_range.start <= want.1 && anchor >= want.0 {
                     let label = format!(": {}", render_ty(ty));
                     out.push(InlayHint {
-                        position: byte_to_position(text, name_range.end),
+                        position: byte_to_position(text, anchor),
                         label: InlayHintLabel::String(label),
                         kind: Some(InlayHintKind::TYPE),
                         text_edits: None,
@@ -98,6 +103,37 @@ fn inlay_hints_inner(
         }
     }
     out
+}
+
+/// Scan forward from the fn name's end to find the byte offset
+/// immediately after the params list's closing `)`. Tracks paren
+/// depth so a nested `(T)` inside a type annotation doesn't fool the
+/// scan. Returns `None` if the close paren can't be found (parse
+/// error / truncated source).
+fn params_close_paren_end(text: &str, after_name: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = after_name;
+    while i < bytes.len() && bytes[i] != b'(' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 // P13.7

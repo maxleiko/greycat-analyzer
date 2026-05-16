@@ -2083,7 +2083,8 @@ fn inlay_hints_emit_argument_names() {
 #[test]
 fn inlay_hints_emit_inferred_return_type() {
     // P13.7: a fn with no declared return type but a `return …;` body
-    // gets a `: <inferred>` hint anchored after the fn name.
+    // gets a `: <inferred>` hint anchored after the params `)` so it
+    // reads `fn ret(): int` (not `fn ret: int()`).
     let src = "fn ret() {\n    return 42;\n}\n";
     let project = TestProject::single_file_at("/test.gcl", src);
     let r = lsp_types::Range {
@@ -2091,10 +2092,17 @@ fn inlay_hints_emit_inferred_return_type() {
         end: pos(10, 0),
     };
     let hints = project.inlay_hints(&r);
-    let has_int = hints
+    let hint = hints
         .iter()
-        .any(|h| matches!(&h.label, lsp_types::InlayHintLabel::String(s) if s.contains("int")));
-    assert!(has_int, "expected return-type hint with `int`: {hints:?}");
+        .find(|h| matches!(&h.label, lsp_types::InlayHintLabel::String(s) if s.contains("int")))
+        .unwrap_or_else(|| panic!("expected return-type hint with `int`: {hints:?}"));
+    // `fn ret()` — the `)` is at column 7, so the hint anchors at
+    // column 8 (right after the close paren).
+    assert_eq!(
+        hint.position,
+        pos(0, 8),
+        "hint should sit immediately after the params `)`"
+    );
 }
 
 #[test]
