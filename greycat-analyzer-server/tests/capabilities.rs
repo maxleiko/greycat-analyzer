@@ -11,6 +11,9 @@ use greycat_analyzer_server::capabilities;
 use greycat_analyzer_syntax::parse;
 use lsp_types::*;
 
+mod support;
+use support::{Project, position_of};
+
 fn pos(line: u32, character: u32) -> Position {
     Position { line, character }
 }
@@ -30,13 +33,20 @@ fn root<'a>(
 #[test]
 fn hover_on_param_returns_inferred_type() {
     let src = "fn id(name: String): String { return name; }\n";
-    let mut t = None;
-    let r = root(src, &mut t);
-    // Position the cursor on the `name` use inside the body. Find it.
-    let offset = src.rfind("name").unwrap();
-    let line = src[..offset].matches('\n').count() as u32;
-    let col = (offset - src[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
-    let h = capabilities::hover(src, "project", r, pos(line, col)).expect("hover present");
+    let project = Project::single_file(src);
+    // Cursor on the `name` *use* inside the body (`name;` is unique).
+    let cursor = position_of(src, "name;");
+    let doc = project.doc();
+    let h = capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        cursor,
+        &project.uri,
+        &project.analysis,
+        &project.manager,
+    )
+    .expect("hover present");
     let HoverContents::Markup(content) = h.contents else {
         panic!("expected markup contents")
     };
@@ -50,10 +60,21 @@ fn hover_on_param_returns_inferred_type() {
 #[test]
 fn hover_off_named_node_returns_none() {
     let src = "fn f() {}\n";
-    let mut t = None;
-    let r = root(src, &mut t);
+    let project = Project::single_file(src);
+    let doc = project.doc();
     // Far past EOF — no node at offset.
-    assert!(capabilities::hover(src, "project", r, pos(99, 99)).is_none());
+    assert!(
+        capabilities::hover_with_project(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+            pos(99, 99),
+            &project.uri,
+            &project.analysis,
+            &project.manager,
+        )
+        .is_none()
+    );
 }
 
 // =============================================================================
