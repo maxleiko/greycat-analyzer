@@ -209,6 +209,16 @@ const fn advisory_rule(name: &'static str, summary: &'static str) -> LintRuleInf
 /// Includes both the pure-HIR rules (driven through [`run_lints`]) and
 /// the typed lints driven from the project pipeline (`arrow-on-non-deref`,
 /// the `nullability` family, `infer-return-type`).
+// P43.5
+/// When adding a new rule whose intent assumes the code is
+/// syntactically complete (e.g. "this expression has no effect",
+/// "this statement is unreachable in a complete chain"), consult
+/// [`greycat_analyzer_hir::Hir::salvaged_stmts`] before emitting on a
+/// statement id. The set tracks shapes tree-sitter recovered from
+/// inside an `ERROR` wrapper — emitting on them creates noise the user
+/// is already aware of (the parse error is right there). No current
+/// rule needs this skip; the hookpoint is documented here so future
+/// rule authors don't reinvent it.
 pub const LINT_RULES: &[LintRuleInfo] = &[
     rule(
         "unused-local",
