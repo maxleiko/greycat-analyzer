@@ -5359,4 +5359,163 @@ fn caller(f: Foo?, b: Bar?) {
         // (would have looked like `"Foo | Bar?"`).
         assert_eq!(display, "Foo | Bar | null");
     }
+
+    // -------------------------------------------------------------------
+    // P41 — union-arm `is`-narrowing complement
+    // -------------------------------------------------------------------
+
+    /// Repro shape from the plan: `?? `-produced union with an
+    /// `is`-guarded early-return strips the matched arm from the
+    /// post-if continuation.
+    #[test]
+    fn p41_is_narrow_strips_arm_via_then_terminates() {
+        let src = r#"
+type A {}
+type B {}
+fn use_a(a: A) {}
+fn caller(p: A?, q: B?) {
+    var x = p ?? q;
+    if (x == null) { return; }
+    if (x is B) { return; }
+    use_a(x);
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "expected zero is-narrow-related diagnostics: {diags:?}"
+        );
+    }
+
+    /// Explicit else-branch (no early return) gets the same
+    /// complement narrow applied at else-entry.
+    #[test]
+    fn p41_is_narrow_strips_arm_in_else_branch() {
+        let src = r#"
+type A {}
+type B {}
+fn use_a(a: A) {}
+fn caller(p: A?, q: B?) {
+    var x = p ?? q;
+    if (x == null) { return; }
+    if (x is B) {
+        // no-op
+    } else {
+        use_a(x);
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "expected zero is-narrow-related diagnostics: {diags:?}"
+        );
+    }
+
+    /// `!is` swaps the complement to the then-side. With an
+    /// `else { return; }` the complement lifts into the post-if
+    /// continuation via the `else_terminates` path.
+    #[test]
+    fn p41_is_narrow_negated_swaps_to_then_branch() {
+        let src = r#"
+type A {}
+type B {}
+fn use_a(a: A) {}
+fn caller(p: A?, q: B?) {
+    var x = p ?? q;
+    if (x == null) { return; }
+    if (!(x is B)) {
+        use_a(x);
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "expected zero is-narrow-related diagnostics on `!is` shape: {diags:?}"
+        );
+    }
+
+    /// Single-alt collapse: when the subtraction leaves one survivor,
+    /// the narrowed type is the bare alt, not a `Union { alts:
+    /// [single] }`. Inspect via `local_init_ty` on a post-guard
+    /// re-bind.
+    #[test]
+    fn p41_is_narrow_union_collapse_to_lone_alt() {
+        let src = r#"
+type A {}
+type B {}
+fn caller(p: A?, q: B?) {
+    var u = p ?? q;
+    if (u == null) { return; }
+    if (u is B) { return; }
+    var x = u;
+}
+"#;
+        // After the two guards `u` should narrow to `A` — a bare
+        // type, not a single-element union. The display path renders
+        // a `Union { alts: [A] }` as `A` regardless, so we also
+        // assert there's no residual nullable wrapper or stray alt.
+        assert_eq!(local_init_ty(src, "x").as_deref(), Some("A"));
+    }
+
+    /// Non-union source: the helper returns `None` and behavior is
+    /// unchanged from before P41. Existing then-side `is`-narrowing
+    /// still works.
+    #[test]
+    fn p41_is_narrow_non_union_source_no_effect() {
+        let src = r#"
+type Foo { v: int; }
+fn caller(f: Foo?) {
+    if (f == null) { return; }
+    if (f is Foo) {
+        var x = f.v;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "non-union source path should be unchanged: {diags:?}"
+        );
+    }
+
+    /// Asserted type that's a supertype of multiple arms strips all
+    /// of them. Documents runtime-faithful behavior: the runtime's
+    /// `is T` returns true for any subtype of `T`. When all arms are
+    /// subtypes of the asserted type, the subtraction empties out and
+    /// the helper returns `None` (exhaustion case — diagnostic
+    /// deferred to P42's `exhaustive-is-check`).
+    #[test]
+    fn p41_is_narrow_asserted_is_supertype_of_arms() {
+        let src = r#"
+abstract type Animal {}
+type Cat extends Animal {}
+type Dog extends Animal {}
+fn caller(c: Cat?, d: Dog?) {
+    var u = c ?? d;
+    if (u == null) { return; }
+    if (u is Animal) { return; }
+    // Unreachable in practice — both arms are subtypes of Animal.
+    // We don't lift any complement (helper returns None on zero
+    // survivors); no diagnostic regression expected here.
+    var _ = u;
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "supertype-asserted shape should not regress: {diags:?}"
+        );
+    }
 }

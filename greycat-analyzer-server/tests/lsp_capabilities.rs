@@ -1369,6 +1369,45 @@ fn completion_inside_object_literal_lists_attrs() {
     );
 }
 
+/// P41 — `is`-guard with early-return on a union-typed value strips
+/// the matched arm from the post-if scope so a subsequent cast /
+/// call on the surviving arm typechecks. Exercises the cached
+/// `ProjectAnalysis` path (single-file shim wouldn't catch any
+/// per-stage divergence; this is the real LSP code path).
+#[test]
+fn is_narrow_union_complement_lifts_past_early_return() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type A {}\n\
+         type B {}\n\
+         fn use_a(a: A) {}\n\
+         fn caller(p: A?, q: B?) {\n\
+             var x = p ?? q;\n\
+             if (x == null) { return; }\n\
+             if (x is B) { return; }\n\
+             use_a(x);\n\
+         }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let module = pa.module(&user_uri).expect("module");
+    let diags = capabilities::diagnostics_from_module(&doc.text, module, false);
+    assert!(
+        !diags.iter().any(|d| {
+            let msg = &d.message;
+            msg.contains("not assignable") || msg.contains("cannot cast")
+        }),
+        "expected zero is-narrow-related diagnostics: {diags:?}"
+    );
+}
+
 /// Empty body `Foo { | }` should list every non-static attr from the
 /// type, the user's most common case.
 #[test]
