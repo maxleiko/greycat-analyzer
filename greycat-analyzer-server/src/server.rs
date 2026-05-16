@@ -169,9 +169,8 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
                 DidCloseTextDocument::METHOD => {
                     server.did_close(notif.extract(DidCloseTextDocument::METHOD)?)?
                 }
-                DidChangeWatchedFiles::METHOD => {
-                    server.did_change_watched_files(notif.extract(DidChangeWatchedFiles::METHOD)?)?
-                }
+                DidChangeWatchedFiles::METHOD => server
+                    .did_change_watched_files(notif.extract(DidChangeWatchedFiles::METHOD)?)?,
                 DidChangeWorkspaceFolders::METHOD => server.did_change_workspace_folders(
                     notif.extract(DidChangeWorkspaceFolders::METHOD)?,
                 )?,
