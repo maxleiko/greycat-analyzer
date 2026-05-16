@@ -3801,3 +3801,214 @@ fn hover_on_free_function_no_subst_applied() {
         "free-fn hover should render the declared signature unchanged; got:\n{body}"
     );
 }
+
+// P43.6
+/// Fixture for the user's `project.gcl` repro (2026-05-16):
+///
+/// ```gcl
+/// type Ctx { sim: node<Simulation>?; }
+/// type Simulation { points_by_geo: nodeGeo<Tuple<float, float>>; }
+/// fn test(c: Ctx) {
+///     if (c.sim.)
+/// }
+/// ```
+///
+/// The trailing `.` (cursor position) causes tree-sitter to wrap the
+/// salvaged `member_expr(c.sim)` in `(ERROR ...)` inside the fn body's
+/// block. Before P43, the HIR dropped the salvaged expr entirely and
+/// every cached `ProjectAnalysis`-driven capability silently failed.
+/// After P43, the salvaged expr lands as `Stmt::Expr(Member(c.sim))`
+/// in the HIR (with the stmt id tagged in `Hir::salvaged_stmts`) so
+/// the same fast paths the analyzer uses on well-formed code now work
+/// mid-edit. Each test below pins one capability.
+fn p43_user_repro_project() -> (
+    greycat_analyzer_core::SourceManager,
+    greycat_analyzer_analysis::project::ProjectAnalysis,
+    Uri,
+) {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let std_uri = Uri::from_str("file:///proj/lib/std/core.gcl").unwrap();
+    let user_uri = Uri::from_str("file:///proj/project.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(std_uri, synthetic_std_core_with_node(), "std", false);
+    let src = "type Ctx { sim: node<Simulation>?; }\n\
+               type Simulation { points_by_geo: nodeGeo<Tuple<float, float>>; }\n\
+               fn test(c: Ctx) {\n    \
+               if (c.sim.)\n\
+               }\n";
+    mgr.add_simple(user_uri.clone(), src, "project", false);
+    let pa = ProjectAnalysis::analyze(&mgr);
+    (mgr, pa, user_uri)
+}
+
+// P43.6
+/// The headline user-visible win: typing `.` after `c.sim` produces a
+/// completion list that contains `node<T>`'s members (reachable via
+/// `.`) AND `Simulation`'s members (reachable via the `.`→`->` rewrite
+/// edits the completion provider attaches). Without the P43 salvage,
+/// `member_completion` returns `None` and the editor shows nothing.
+#[test]
+fn completion_after_dot_inside_if_error_recovery() {
+    let (mgr, pa, uri) = p43_user_repro_project();
+    let cell = mgr.get(&uri).unwrap();
+    let doc = cell.borrow();
+    // Source line 3 (0-indexed): `    if (c.sim.)`. The `.` after
+    // `sim` is at col 13; cursor sits at col 14 (immediately after).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(3, 14),
+        &uri,
+        &pa,
+        None,
+    )
+    .expect("completion list at the salvaged `c.sim.` cursor");
+    // The receiver `c.sim` has nullable type `node<Simulation>?`, so
+    // the completion provider's P19.17 null-safe wrapping prefixes
+    // each label with `?.` / `?->` (and attaches an `additional_text_edit`
+    // inserting `?` before the separator). `filter_text` carries the
+    // bare member name so the editor still filters by what the user
+    // types. Assert on `filter_text` (or stripped label) to stay
+    // robust to the cosmetic prefix.
+    let bare_names: Vec<String> = list
+        .items
+        .iter()
+        .map(|i| {
+            i.filter_text.clone().unwrap_or_else(|| {
+                i.label
+                    .trim_start_matches("?.")
+                    .trim_start_matches("?->")
+                    .into()
+            })
+        })
+        .collect();
+    assert!(
+        !bare_names.is_empty(),
+        "completion must surface at least one member; got empty list"
+    );
+    // `node<T>`'s own method, reachable through `.`.
+    assert!(
+        bare_names.iter().any(|s| s == "resolve"),
+        "`node<T>.resolve` should appear via direct `.` access; got: {bare_names:?}"
+    );
+    // `Simulation`'s attr, reachable through `.`→`->` rewrite. The
+    // `.`→`->` rewrite is carried in `additional_text_edits`; combined
+    // with the nullable `?` prefix the edit list contains both.
+    let pbg = list
+        .items
+        .iter()
+        .find(|i| {
+            i.filter_text.as_deref() == Some("points_by_geo")
+                || i.label == "points_by_geo"
+                || i.label == "?->points_by_geo"
+        })
+        .unwrap_or_else(|| {
+            let labels: Vec<&str> = list.items.iter().map(|i| i.label.as_str()).collect();
+            panic!("`Simulation.points_by_geo` should appear among completion items; got labels: {labels:?}")
+        });
+    let edits = pbg
+        .additional_text_edits
+        .as_ref()
+        .expect("inner-type completion item carries a `.`→`->` rewrite edit");
+    assert!(
+        edits.iter().any(|e| e.new_text == "->"),
+        "expected an additional `text_edit` rewriting `.` to `->`; got: {edits:?}"
+    );
+}
+
+// P43.6
+/// Hover on the `sim` ident inside the salvaged `c.sim` expression
+/// returns the attribute's documented type (`node<Simulation>?`),
+/// proving the cached `ProjectAnalysis` types the salvaged expr the
+/// same way it would inside a well-formed body. Without the P43
+/// salvage, no Expr would cover that span and hover returned `None`.
+#[test]
+fn hover_inside_if_error_recovery_resolves_member_type() {
+    let (mgr, pa, uri) = p43_user_repro_project();
+    let cell = mgr.get(&uri).unwrap();
+    let doc = cell.borrow();
+    // `sim` ident on line 3 occupies cols 10..13. Cursor at col 11.
+    let hover = capabilities::hover_with_project(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        pos(3, 11),
+        &uri,
+        &pa,
+        &mgr,
+    )
+    .expect("hover should resolve on the salvaged `sim` ident");
+    let body = match hover.contents {
+        HoverContents::Markup(m) => m.value,
+        HoverContents::Scalar(MarkedString::String(s)) => s,
+        HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+        HoverContents::Array(_) => panic!("unexpected array hover shape"),
+    };
+    assert!(
+        body.contains("node<Simulation>"),
+        "hover should mention the `node<Simulation>` declared type; got:\n{body}"
+    );
+}
+
+// P43.6
+/// Goto-def on the salvaged `sim` ident jumps to its declaration in
+/// `type Ctx`. Same cached resolutions table the analyzer used to
+/// type the salvaged expr now navigates correctly.
+#[test]
+fn goto_def_inside_if_error_recovery_jumps_to_decl() {
+    let (mgr, pa, uri) = p43_user_repro_project();
+    // Cursor on the `sim` use at line 3, col 11.
+    let resp = capabilities::goto_definition_across_project(&pa, &mgr, &uri, pos(3, 11))
+        .expect("goto-def should resolve on the salvaged `sim`");
+    let locs: Vec<Location> = match resp {
+        GotoDefinitionResponse::Scalar(l) => vec![l],
+        GotoDefinitionResponse::Array(v) => v,
+        GotoDefinitionResponse::Link(links) => links
+            .into_iter()
+            .map(|l| Location {
+                uri: l.target_uri,
+                range: l.target_selection_range,
+            })
+            .collect(),
+    };
+    assert_eq!(
+        locs.len(),
+        1,
+        "goto-def should produce exactly one target; got: {locs:?}"
+    );
+    let loc = &locs[0];
+    assert_eq!(
+        loc.uri.as_str(),
+        uri.as_str(),
+        "goto-def should land in the same module"
+    );
+    // `Ctx.sim` declaration is on line 0; `sim` ident starts at col 11
+    // (`type Ctx { sim: ...}`). The exact width of the highlighted
+    // range can vary; assert the line + start column.
+    assert_eq!(
+        loc.range.start.line, 0,
+        "goto-def landing on the wrong line: {loc:?}"
+    );
+    assert_eq!(
+        loc.range.start.character, 11,
+        "goto-def landing at the wrong column on line 0: {loc:?}"
+    );
+}
+
+// P43.6
+/// `textDocument/references` from the `sim` declaration finds the
+/// salvaged use inside the ERROR-wrapped `if (c.sim.)` body. The
+/// resolutions table built off the cached HIR carries the use through
+/// the same path well-formed uses take.
+#[test]
+fn references_include_salvaged_member_use() {
+    let (mgr, pa, uri) = p43_user_repro_project();
+    // Cursor on the `sim` declaration ident at line 0, col 11.
+    let refs = capabilities::references_across_project(&pa, &mgr, &uri, pos(0, 11));
+    assert!(
+        refs.iter()
+            .any(|l| l.range.start.line == 3 && l.range.start.character == 10),
+        "references should include the salvaged use at line 3, col 10; got: {refs:?}"
+    );
+}
