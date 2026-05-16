@@ -10,6 +10,8 @@ pub mod lower;
 pub mod types;
 
 use arena::Arena;
+use arena::Idx;
+use rustc_hash::FxHashSet;
 use types::*;
 
 /// Per-source-file HIR. Holds typed arenas plus the top-level [`Module`]
@@ -25,6 +27,13 @@ pub struct Hir {
     pub type_refs: Arena<TypeRef>,
     pub type_attrs: Arena<TypeAttr>,
     pub enum_fields: Arena<EnumField>,
+    // P43.2
+    /// Statement ids salvaged from inside a CST `ERROR` wrapper by
+    /// [`lower::flatten_errors_named_children`]. Downstream consumers
+    /// (lints whose intent assumes complete code, certain diagnostics)
+    /// consult this set so they don't fire on shapes the user is
+    /// mid-editing. Empty for well-formed sources.
+    pub salvaged_stmts: FxHashSet<Idx<Stmt>>,
 }
 
 pub use lower::{LowerCtx, lower_module};
