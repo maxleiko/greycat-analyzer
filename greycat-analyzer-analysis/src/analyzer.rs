@@ -1094,12 +1094,30 @@ impl<'a> Cx<'a> {
                 self.narrow_complement_union(&alts, asserted)?
             }
             TypeKind::Type(decl) => self.narrow_complement_abstract(*decl, asserted)?,
-            // P42.6 — closed generic roots (`Container<T> →
-            // {ArrayContainer<T>, MapContainer<T>}`) fall back to
-            // no-narrow until generic substitution is wired through
-            // the closure walker. Returning `None` keeps today's
-            // behavior at the `Generic { … }` bail-out site; revisit
-            // once the closure index is parameterized over type args.
+            // P42.6 — out of scope: generic-root sealed hierarchies.
+            //
+            // A `TypeKind::Generic { decl, args }` (e.g. abstract
+            // `Container<T>` with concrete `ArrayContainer<T>` /
+            // `MapContainer<T>` derivatives) would in principle admit
+            // the same closure-subtraction trick, but the closure
+            // index `ProjectIndex::subtype_closure` (built by
+            // `populate_subtype_indices` in `project.rs`) is keyed by
+            // bare `Symbol` — it ignores type args entirely. Honoring
+            // the receiver's instantiation would require either:
+            //
+            // 1. extending `subtype_closure` to map `(Symbol, args)`
+            //    keys to leaf sets parameterized over the same args
+            //    (most accurate, large change), or
+            // 2. building closures per-monomorphization on demand at
+            //    the call site (smaller change, slower per use).
+            //
+            // Bailing here keeps today's behavior at the
+            // `Generic { … }` shape — no narrow lifted, the user
+            // sees the original declared type in the continuation,
+            // and the rest of the analyzer behaves as it did before
+            // P41/P42. The two inner bail sites
+            // (`narrow_complement_abstract` and `narrow_is_exhausted`)
+            // refer back to this comment.
             _ => return None,
         };
         if nullable {
@@ -1196,10 +1214,11 @@ impl<'a> Cx<'a> {
         let asserted_ty = self.arena.get(asserted);
         let asserted_decl = match &asserted_ty.kind {
             TypeKind::Type(d) => *d,
-            // P42.6 — defer generic-root asserts. Same comment as the
-            // outer dispatcher's `_` arm; flagged here too because a
-            // `TypeKind::Type` known with a `Generic` asserted is a
-            // distinct shape the closure walker can't model yet.
+            // P42.6 — generic-root asserts. See the out-of-scope
+            // block on `narrow_complement`'s `_` arm (closure index
+            // is keyed by bare `Symbol`, doesn't carry type args).
+            // A `TypeKind::Type` known with a `Generic` asserted is
+            // the same closure-walker gap from the asserted side.
             _ => return None,
         };
         let asserted_sym = self.decl_registry.name(asserted_decl)?;
@@ -1343,10 +1362,12 @@ impl<'a> Cx<'a> {
                 for a_alt in &asserted_alts {
                     let a_ty = self.arena.get(*a_alt);
                     let TypeKind::Type(ad) = &a_ty.kind else {
-                        // P42.6 — generic-root asserts fall outside
-                        // the closure model. Return `false` (no
-                        // exhaustion diag) until generic substitution
-                        // is wired through the closure walker.
+                        // P42.6 — generic-root asserts. See the
+                        // out-of-scope block on
+                        // `narrow_complement`'s `_` arm. Returning
+                        // `false` here keeps today's behavior — no
+                        // exhaustion diag fires when the asserted
+                        // side is a `Generic { … }`.
                         return false;
                     };
                     let Some(asym) = self.decl_registry.name(*ad) else {
