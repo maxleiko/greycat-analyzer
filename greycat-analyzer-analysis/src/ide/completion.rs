@@ -849,6 +849,12 @@ fn keyword_completion(
 /// annotation (pragma completion handles that), not inside a string /
 /// comment, and not in a type-ident slot.
 fn is_keyword_position(text: &str, node: tree_sitter::Node<'_>, cursor_byte: usize) -> bool {
+    // `${...}` interpolation: the cursor lives inside a real expression
+    // slot nested in a `string`. Completion has to fire there same as
+    // any other expression context, so allow when `string_substitution`
+    // is an ancestor (cheap to check: the substitution wraps the expr
+    // but is itself a child of `string`).
+    let in_substitution = ancestor_with_kind(node, "string_substitution").is_some();
     // Skip strings, comments, doc-comments. These ancestors short-
     // circuit completely — completion has no business firing inside
     // them at this layer.
@@ -859,7 +865,7 @@ fn is_keyword_position(text: &str, node: tree_sitter::Node<'_>, cursor_byte: usi
         "_block_comment",
         "doc_comment",
     ] {
-        if ancestor_with_kind(node, kind).is_some() {
+        if ancestor_with_kind(node, kind).is_some() && !(kind == "string" && in_substitution) {
             return false;
         }
     }

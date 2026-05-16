@@ -1423,6 +1423,26 @@ fn completion_after_dot_cross_module() {
     assert!(labels.contains(&"y"), "got: {labels:?}");
 }
 
+/// Empty string-interpolation slot: completion at `"${|}"` is a real
+/// expression context, so the in-scope idents and keywords must
+/// surface. The blanket "skip everything inside a string" gate used
+/// to suppress this.
+#[test]
+fn completion_inside_empty_string_interpolation() {
+    let src = "fn main() { var greeting = 1; var s = \"${}\"; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // The cursor sits between `${` and `}`.
+    let cursor = support::position_after(src, "\"${", "");
+    let list = project
+        .completion(cursor)
+        .expect("expected a completion list inside `${|}`");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"greeting"),
+        "expected in-scope `greeting` inside `${{|}}`: {labels:?}"
+    );
+}
+
 /// P15.2.2 — keyword completion does not fire after `.` (member access
 /// RHS is owned by P15.2.4).
 #[test]
