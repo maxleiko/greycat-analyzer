@@ -1,79 +1,22 @@
-//! Find references + rename — both the single-file shim variants and
-//! the project-wide variants the LSP server actually dispatches to.
-//! Shares `RenameTarget` + `cursor_target` + `visit_target_sites` so the
-//! two project-wide capabilities walk the same target-site tree.
+//! Project-wide find-references + rename. Both capabilities share
+//! `RenameTarget` + `cursor_target` + `visit_target_sites` so they walk
+//! the same target-site tree. `prepare_rename` is the only single-file
+//! handler kept (it just validates the cursor sits on an ident — no
+//! analysis state needed).
 
 use std::ops::Range;
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
-use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
-use greycat_analyzer_core::{SourceManager, SymbolTable};
+use greycat_analyzer_analysis::resolver::Definition;
+use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_hir::Hir;
-use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::Decl;
-use greycat_analyzer_syntax::cst::{node_at_offset, walk_named};
+use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Location, Position, PrepareRenameResponse, TextEdit, Uri, WorkspaceEdit};
 
 use super::goto::cursor_ident_idx;
 use crate::conv::{byte_range_to_lsp, position_to_byte};
-
-pub fn references(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-    uri: &Uri,
-    pos: Position,
-) -> Vec<Location> {
-    let byte = position_to_byte(text, pos);
-    let Some(node) = node_at_offset(root, byte) else {
-        return Vec::new();
-    };
-    if node.kind() != "ident" {
-        return Vec::new();
-    }
-
-    // P8.1 scope-aware filter: resolve the cursor ident's binding via
-    // `Resolutions`, then collect every use whose `Definition` points
-    // back at the same binding. Falls back to text equality for
-    // `Definition::Project` (cross-module — P8.2 lifts it through the
-    // project pipeline).
-    let symbols = SymbolTable::new();
-    let hir = lower_module(text, &symbols, "module", lib, root);
-    let res = resolve(&hir, &symbols);
-    let Some(cursor_idx) = idx_for_node(&hir, node) else {
-        return Vec::new();
-    };
-    let Some(target) = target_binding(&hir, &res, cursor_idx) else {
-        // Cross-module / unresolved: fall back to text equality so the
-        // capability doesn't go silent on stdlib symbols.
-        return references_by_text(text, root, node, uri);
-    };
-
-    let mut out = Vec::new();
-    // Include the binding site itself.
-    out.push(Location {
-        uri: uri.clone(),
-        range: byte_range_to_lsp(text, &hir.idents[target].byte_range),
-    });
-    for (use_idx, def) in &res.uses {
-        let resolves_to = match def {
-            Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
-            Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
-            // Cross-module `ProjectDecl` use sites point at a foreign
-            // HIR — they don't share the local `target` ident. P11.4
-            // walks every doc's `Resolutions` to filter these by URI.
-            Definition::ProjectDecl { .. } | Definition::Project => None,
-        };
-        if resolves_to == Some(target) {
-            out.push(Location {
-                uri: uri.clone(),
-                range: byte_range_to_lsp(text, &hir.idents[*use_idx].byte_range),
-            });
-        }
-    }
-    out
-}
 
 /// Map a tree-sitter ident node back to its `Idx<Ident>` in the HIR
 /// arena by byte-range match. Returns `None` if no matching ident was
@@ -86,52 +29,6 @@ pub(super) fn idx_for_node(
         .iter()
         .find(|(_, i)| i.byte_range == node.byte_range())
         .map(|(idx, _)| idx)
-}
-
-/// Resolve `cursor_idx` to the *binding* `Idx<Ident>` (the def site
-/// the resolver would point at). Returns `None` for `Project` /
-/// unresolved idents — caller decides the fallback.
-fn target_binding(
-    hir: &Hir,
-    res: &Resolutions,
-    cursor_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
-) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
-    if let Some(def) = res.uses.get(&cursor_idx) {
-        return match def {
-            Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
-            Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
-            Definition::ProjectDecl { .. } | Definition::Project => None,
-        };
-    }
-    // Not a use site — cursor is on a binding. Treat the cursor as the
-    // binding itself.
-    Some(cursor_idx)
-}
-
-/// Pre- text-equality fallback. Used when the cursor doesn't
-/// resolve through `Resolutions` (e.g., cross-module names) so the
-/// capability still returns useful results.
-fn references_by_text(
-    text: &str,
-    root: tree_sitter::Node<'_>,
-    cursor_node: tree_sitter::Node<'_>,
-    uri: &Uri,
-) -> Vec<Location> {
-    let target_text = text.get(cursor_node.byte_range()).unwrap_or("").to_string();
-    if target_text.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    walk_named(root, |n| {
-        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
-            out.push(Location {
-                uri: uri.clone(),
-                range: byte_range_to_lsp(text, &n.byte_range()),
-            });
-        }
-        true
-    });
-    out
 }
 
 pub fn prepare_rename(
@@ -148,69 +45,6 @@ pub fn prepare_rename(
     Some(PrepareRenameResponse::RangeWithPlaceholder {
         range: byte_range_to_lsp(text, &node.byte_range()),
         placeholder,
-    })
-}
-
-pub fn rename(
-    text: &str,
-    root: tree_sitter::Node<'_>,
-    uri: &Uri,
-    pos: Position,
-    new_name: &str,
-) -> Option<WorkspaceEdit> {
-    let byte = position_to_byte(text, pos);
-    let node = node_at_offset(root, byte)?;
-    if node.kind() != "ident" {
-        return None;
-    }
-
-    // P8.1: same scope-aware filter as `references`. Falls back to
-    // text equality when the cursor name doesn't resolve through
-    // `Resolutions` (cross-module — P8.2 picks that up).
-    let symbols = SymbolTable::new();
-    let hir = lower_module(text, &symbols, "module", "project", root);
-    let res = resolve(&hir, &symbols);
-    let mut edits = Vec::new();
-    if let Some(cursor_idx) = idx_for_node(&hir, node)
-        && let Some(target) = target_binding(&hir, &res, cursor_idx)
-    {
-        edits.push(TextEdit {
-            range: byte_range_to_lsp(text, &hir.idents[target].byte_range),
-            new_text: new_name.to_string(),
-        });
-        for (use_idx, def) in &res.uses {
-            let resolves_to = match def {
-                Definition::Param(i) | Definition::Local(i) | Definition::Generic(i) => Some(*i),
-                Definition::Decl(decl_id) => hir.decls[*decl_id].name(),
-                Definition::ProjectDecl { .. } | Definition::Project => None,
-            };
-            if resolves_to == Some(target) {
-                edits.push(TextEdit {
-                    range: byte_range_to_lsp(text, &hir.idents[*use_idx].byte_range),
-                    new_text: new_name.to_string(),
-                });
-            }
-        }
-    } else {
-        // Fallback: text equality for unresolvable / cross-module names.
-        let target_text = text.get(node.byte_range())?.to_string();
-        walk_named(root, |n| {
-            if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
-                edits.push(TextEdit {
-                    range: byte_range_to_lsp(text, &n.byte_range()),
-                    new_text: new_name.to_string(),
-                });
-            }
-            true
-        });
-    }
-    #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(uri.clone(), edits);
-    Some(WorkspaceEdit {
-        changes: Some(changes),
-        document_changes: None,
-        change_annotations: None,
     })
 }
 

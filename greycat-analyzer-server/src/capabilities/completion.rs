@@ -19,64 +19,6 @@ use super::hover::{
 };
 use crate::conv::{byte_range_to_lsp, byte_to_position, position_to_byte, stmt_byte_range};
 
-// =============================================================================
-// P15.4 — completion (foundational; only @include path completion today)
-// =============================================================================
-
-/// LSP `textDocument/completion`. Foundational entry — today only handles
-/// `@include("<cursor>")` directory completion. Future chunks
-/// extend this to scope-aware ident completion, member
-/// completion after `.` / `->`, and `@library` version completion via
-/// the GreyCat registry.
-///
-/// Returns `None` (LSP-side: empty list) when the cursor isn't in a
-/// shape we know how to complete yet.
-pub fn completion(
-    text: &str,
-    root: tree_sitter::Node<'_>,
-    pos: Position,
-    project_root: Option<&std::path::Path>,
-) -> Option<CompletionList> {
-    let byte = position_to_byte(text, pos);
-    let node = node_at_offset(root, byte)?;
-    if let Some(items) = directive_completion(text, byte) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = include_dir_completion(text, node, byte, project_root) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = library_version_completion(text, node, byte) {
-        // P15.3 — lazy placeholder. The LSP layer will swap this for
-        // concrete versions before returning to the editor; in the
-        // foundational entry (no project context) we surface the
-        // placeholder verbatim so direct callers / tests can still
-        // observe it.
-        return Some(CompletionList {
-            is_incomplete: true,
-            items,
-        });
-    }
-    if let Some(items) = pragma_completion(text, byte) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    if let Some(items) = keyword_completion(text, node, byte) {
-        return Some(CompletionList {
-            is_incomplete: false,
-            items,
-        });
-    }
-    None
-}
-
 // P15.2.3
 /// Completion with project context. Same dispatcher chain as
 /// [`completion`], but the ident-position branch enumerates scope-

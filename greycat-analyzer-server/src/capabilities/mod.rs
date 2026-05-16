@@ -26,9 +26,9 @@ mod semantic_tokens;
 mod signature_help;
 mod workspace_symbols;
 
-pub use code_actions::{code_actions, code_actions_with_project};
+pub use code_actions::code_actions_with_project;
 pub use completion::{
-    LibVersionPayload, completion, completion_with_project, extract_lib_version_placeholder,
+    LibVersionPayload, completion_with_project, extract_lib_version_placeholder,
     resolve_library_version_completion,
 };
 pub use diagnostics::diagnostics_from_module;
@@ -41,11 +41,11 @@ pub use goto::{
     goto_declaration_across_project, goto_definition, goto_definition_across_project,
     goto_implementation, goto_implementation_across_project, goto_module_segment,
 };
-pub use hover::{hover, hover_with_project};
-pub use inlay_hints::{inlay_hints, inlay_hints_with_project};
+pub use hover::hover_with_project;
+pub use inlay_hints::inlay_hints_with_project;
 pub use references_rename::{
-    RenameTarget, prepare_rename, references, references_across_project, rename,
-    rename_across_project, resolve_rename_target,
+    RenameTarget, prepare_rename, references_across_project, rename_across_project,
+    resolve_rename_target,
 };
 pub use selection_ranges::selection_ranges;
 pub use semantic_tokens::{SEMANTIC_TOKEN_TYPES, semantic_tokens};

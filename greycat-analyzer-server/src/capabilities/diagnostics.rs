@@ -4,12 +4,8 @@
 //! lockstep.
 
 use greycat_analyzer_analysis::analyzer::Severity;
-use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity, run_lints};
+use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity};
 use greycat_analyzer_analysis::project::ModuleAnalysis;
-use greycat_analyzer_analysis::resolver::resolve;
-use greycat_analyzer_core::SymbolTable;
-use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 
 use crate::conv::byte_range_to_lsp;
@@ -78,55 +74,6 @@ pub fn diagnostics_from_module(
             code: Some(NumberOrString::String(lint.rule.into())),
             source: Some("lint".into()),
             message: lint.message.clone(),
-            tags: lint_tags(lint.tag),
-            ..Default::default()
-        });
-    }
-    out
-}
-
-/// Single-file pipeline (HIR lower → resolver → analyzer + lints) against
-/// `text`, returning every finding as `lsp_types::Diagnostic`. Used by
-/// the legacy `code_actions` shim — the LSP server's
-/// `code_actions_handler` reads from the project cache via
-/// `code_actions_with_project` / [`diagnostics_from_module`] instead.
-pub(crate) fn current_diagnostics(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-) -> Vec<Diagnostic> {
-    let symbols = SymbolTable::new();
-    let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir, &symbols);
-    let (_arena, _decl_registry, analysis) =
-        greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
-    let mut out: Vec<Diagnostic> = analysis
-        .diagnostics
-        .iter()
-        .map(|d| Diagnostic {
-            range: byte_range_to_lsp(text, &d.byte_range),
-            severity: Some(match d.severity {
-                Severity::Error => DiagnosticSeverity::ERROR,
-                Severity::Warning => DiagnosticSeverity::WARNING,
-                Severity::Hint => DiagnosticSeverity::HINT,
-            }),
-            code: Some(NumberOrString::String("semantic".into())),
-            source: Some("greycat-analyzer".into()),
-            message: d.message.clone(),
-            ..Default::default()
-        })
-        .collect();
-    for lint in run_lints(&hir, &resolutions, &symbols) {
-        out.push(Diagnostic {
-            range: byte_range_to_lsp(text, &lint.byte_range),
-            severity: Some(match lint.severity {
-                LintSeverity::Error => DiagnosticSeverity::ERROR,
-                LintSeverity::Warning => DiagnosticSeverity::WARNING,
-                LintSeverity::Hint => DiagnosticSeverity::HINT,
-            }),
-            code: Some(NumberOrString::String(lint.rule.into())),
-            source: Some("lint".into()),
-            message: lint.message,
             tags: lint_tags(lint.tag),
             ..Default::default()
         });

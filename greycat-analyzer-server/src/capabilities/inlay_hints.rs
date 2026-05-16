@@ -1,19 +1,14 @@
-//! Inlay hint handlers — emit type hints for `var x = expr` (no
-//! declared type), return-type hints for `fn` without `:T`, and
-//! parameter-name hints in call sites. Project-aware entry consumes
-//! the cached `ModuleAnalysis`; the single-file shim re-runs the
-//! pipeline for unit tests / CLI commands.
+//! Inlay hint handler — consumes the cached `ModuleAnalysis` to emit
+//! type hints for `var x = expr` (no declared type), return-type hints
+//! for `fn` without `:T`, and parameter-name hints in call sites.
 
 use greycat_analyzer_analysis::analyzer::AnalysisResult;
-use greycat_analyzer_analysis::directives::Directives;
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
-use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
+use greycat_analyzer_analysis::resolver::{Definition, Resolutions};
 use greycat_analyzer_core::{SymbolTable, TypeId};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Stmt};
-use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel};
 
 use crate::conv::{byte_to_position, position_to_byte};
@@ -44,41 +39,6 @@ pub fn inlay_hints_with_project(
     // `: b::Foo`, not the misleading bare `: Foo`.
     let render: &dyn Fn(TypeId) -> String = &|ty| project.display_type(ty).to_string();
     inlay_hints_inner(module, project.symbols(), render, text, range)
-}
-
-/// Single-file shim — only used by unit tests / single-file CLI
-/// commands. **The LSP server never calls this directly**; it goes
-/// through [`inlay_hints_with_project`] so the cross-module fixup
-/// passes apply. Marked `#[doc(hidden)]` to keep external consumers
-/// pointed at the project-aware path. Renders types with the bare
-/// arena printer — there's no project closure to consult for
-/// ambiguity.
-#[doc(hidden)]
-pub fn inlay_hints(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-    range: &lsp_types::Range,
-) -> Vec<InlayHint> {
-    let symbols = SymbolTable::new();
-    let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir, &symbols);
-    let (arena, decl_registry, analysis) =
-        greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
-    let module = ModuleAnalysis {
-        hir,
-        resolutions,
-        analysis,
-        lints: Vec::new(),
-        lib: lib.to_string(),
-        timings: Default::default(),
-        directives: Directives::default(),
-    };
-    let render: &dyn Fn(TypeId) -> String = &|ty| {
-        greycat_analyzer_analysis::project::display_type(&arena, &decl_registry, &symbols, ty)
-            .to_string()
-    };
-    inlay_hints_inner(&module, &symbols, render, text, range)
 }
 
 /// Shared emitter — takes a type-rendering closure so the

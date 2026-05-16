@@ -20,20 +20,6 @@ use rustc_hash::FxHashMap;
 
 use crate::conv::{byte_range_to_lsp, position_to_byte};
 
-/// Hover info at `pos`. Three layers of lookup:
-/// 1. Cursor on an `ident` node — surface the resolver `Definition`'s
-///    binding info (param/local type, decl signature, builtin name).
-/// 2. Cursor inside a non-ident HIR `Expr` — surface
-///    `<short-label>: <inferred-type>`.
-/// 3. No HIR shape covers the cursor — return `None`.
-///
-/// In-module hover only — for cross-module provenance and richer cross-
-/// module signatures, callers thread a `ProjectAnalysis` + `SourceManager`
-/// through [`hover_with_project`].
-pub fn hover(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) -> Option<Hover> {
-    hover_inner(text, lib, root, pos)
-}
-
 // P15.1
 /// Hover with project context. Restores cross-module hover
 /// content lost in earlier phases:

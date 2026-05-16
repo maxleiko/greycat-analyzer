@@ -1,16 +1,15 @@
-//! Code actions / quickfix synthesis. The project-aware variant reads
-//! the cached `ModuleAnalysis` diagnostics; the single-file shim
-//! re-runs the pipeline (legacy path, kept for callers that don't have
-//! a `ProjectAnalysis`).
+//! Code actions / quickfix synthesis. Reads the cached `ModuleAnalysis`
+//! diagnostics from `ProjectAnalysis` and maps each fixable finding to
+//! a `TextEdit`. The parse-safety gate re-parses with the edit applied
+//! and discards anything that would introduce new parse errors.
 
 use greycat_analyzer_analysis::project::ModuleAnalysis;
-use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, NumberOrString, TextEdit, Uri,
     WorkspaceEdit,
 };
 
-use super::diagnostics::{current_diagnostics, diagnostics_from_module};
+use super::diagnostics::diagnostics_from_module;
 use crate::conv::{byte_to_position, position_to_byte, ranges_overlap};
 
 /// Project-aware variant — reads the cached diagnostics + lints from
@@ -28,24 +27,6 @@ pub fn code_actions_with_project(
     // Code actions don't differentiate lib vs project — the user's
     // already pointing at a specific diagnostic when invoking them.
     let semantic = diagnostics_from_module(text, module, true);
-    code_actions_from_diagnostics(text, uri, range, semantic)
-}
-
-pub fn code_actions(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-    uri: &Uri,
-    range: lsp_types::Range,
-) -> Vec<CodeActionOrCommand> {
-    // P8.3: emit concrete `TextEdit`s for fixable diagnostics. The
-    // synthesizer maps the diagnostic's `code` to a fix shape:
-    //   - `missing-token` → insert the missing token at the gap
-    //   - `unused-local` / `unused-decl` → "remove" by collapsing the
-    //     declaring statement (best-effort — gives the user a single-
-    //     click delete)
-    //   - `unused-param` → prepend `_` to the parameter name
-    let semantic = current_diagnostics(text, lib, root);
     code_actions_from_diagnostics(text, uri, range, semantic)
 }
 
@@ -159,23 +140,4 @@ fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
             new_text: e.new_text,
         })
         .collect()
-}
-
-/// Scan forward from `from` over whitespace until we hit an access
-/// operator (`.`, `->`, `[`, or an existing `?`). Returns the operator's
-/// starting byte index, or `None` if the next non-whitespace byte isn't
-/// one of those.
-#[allow(dead_code)] // Dead at extraction time; kept verbatim, slated for removal.
-fn find_access_op_after(text: &str, from: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut i = from;
-    while i < bytes.len() {
-        match bytes[i] {
-            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
-            b'.' | b'[' | b'?' => return Some(i),
-            b'-' if bytes.get(i + 1) == Some(&b'>') => return Some(i),
-            _ => return None,
-        }
-    }
-    None
 }
