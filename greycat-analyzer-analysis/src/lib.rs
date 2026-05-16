@@ -35,21 +35,23 @@
 //!    runs steps 1-6 over every doc in one pass, sharing the index
 //!    and caching per-module `ModuleAnalysis` for LSP / CLI
 //!    consumers.
-//! 8. [`actions`] — `CodeActionCategory` vocabulary the LSP
-//!    layer consumes for code-action proposals.
+//! 8. [`ide`] — capability-shaped services consumed by editor-style
+//!    clients: `ide::actions` (`CodeActionCategory` vocabulary),
+//!    `ide::quickfix` (edit synthesis for `lint --fix` and LSP code
+//!    actions), `ide::rename` (rename / find-references target
+//!    discovery). Decoupled from `lsp_types` so the LSP server and the
+//!    CLI both consume them.
 
-pub mod actions;
 pub mod analyzer;
 pub mod directives;
 pub mod display;
+pub mod ide;
 pub mod lint;
 // P27.1
 pub mod parallel;
 pub mod pragmas;
 pub mod project;
-pub mod quickfix;
 pub mod reachability;
-pub mod rename;
 pub mod resolver;
 pub mod stdlib;
 // P35.1

@@ -1,21 +1,21 @@
 //! Project-wide find-references + rename. The analysis half
 //! ("which sites does this binding cover?") lives in
-//! [`greycat_analyzer_analysis::rename`]; this module is the thin LSP
+//! [`greycat_analyzer_analysis::ide::rename`]; this module is the thin LSP
 //! shape-converter that fetches each site's source text via the
 //! `SourceManager` and emits `Location` / `TextEdit` values.
 //!
 //! `prepare_rename` stays here as a pure single-file handler — it only
 //! validates the cursor sits on an ident, no analysis state needed.
 
+use greycat_analyzer_analysis::ide::rename;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
-use greycat_analyzer_analysis::rename;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Location, Position, PrepareRenameResponse, TextEdit, Uri, WorkspaceEdit};
 
-pub use greycat_analyzer_analysis::rename::RenameTarget;
+pub use greycat_analyzer_analysis::ide::rename::RenameTarget;
 
 use super::goto::cursor_ident_idx;
 use crate::conv::{byte_range_to_lsp, position_to_byte};

@@ -5,9 +5,9 @@
 //! `cargo test --test reachability` confirms the lint detects, tags,
 //! and fixes correctly.
 
+use greycat_analyzer_analysis::ide::quickfix;
 use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
-use greycat_analyzer_analysis::quickfix;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use std::str::FromStr;

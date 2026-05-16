@@ -17,7 +17,7 @@
 
 use std::ops::Range;
 
-use crate::actions::TextEdit;
+use super::actions::TextEdit;
 use greycat_analyzer_syntax::tree_sitter::Node;
 
 /// Compute the auto-fix edits for `diag` against `text`. Returns an

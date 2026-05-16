@@ -771,7 +771,7 @@ fn print_pretty_diagnostic(path: &str, source: &str, diag: &Diagnostic) {
 
 // P22.7
 /// Diagnostic → byte-range + replacement text. Routes through the
-/// shared [`greycat_analyzer_analysis::quickfix`] module.
+/// shared [`greycat_analyzer_analysis::ide::quickfix`] module.
 /// Returns `None` for diagnostics that don't have an automatic fix or
 /// whose preconditions don't hold.
 ///
@@ -785,7 +785,7 @@ fn diag_to_edit(text: &str, diag: &Diagnostic) -> Option<(std::ops::Range<usize>
     };
     let start = lsp_to_byte(text, diag.range.start);
     let end = lsp_to_byte(text, diag.range.end);
-    let edits = greycat_analyzer_analysis::quickfix::edit_for_diagnostic(
+    let edits = greycat_analyzer_analysis::ide::quickfix::edit_for_diagnostic(
         text,
         code,
         &(start..end),

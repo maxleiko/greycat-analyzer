@@ -115,7 +115,7 @@ fn would_break_parse(text: &str, edits: &[TextEdit]) -> bool {
 }
 
 /// Map a diagnostic to a concrete `Vec<TextEdit>`. Routes through the
-/// shared [`greycat_analyzer_analysis::quickfix`] module so the LSP and
+/// shared [`greycat_analyzer_analysis::ide::quickfix`] module so the LSP and
 /// the cli `lint --fix` path share a single source of truth.
 fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
     let code = match &diag.code {
@@ -124,7 +124,7 @@ fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
     };
     let start = position_to_byte(text, diag.range.start);
     let end = position_to_byte(text, diag.range.end);
-    let edits = greycat_analyzer_analysis::quickfix::edit_for_diagnostic(
+    let edits = greycat_analyzer_analysis::ide::quickfix::edit_for_diagnostic(
         text,
         code,
         &(start..end),

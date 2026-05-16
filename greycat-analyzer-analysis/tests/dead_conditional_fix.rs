@@ -5,9 +5,9 @@
 //! - the quickfix produces a single edit that re-parses cleanly
 //!   and removes / unwraps to the live branch.
 
+use greycat_analyzer_analysis::ide::quickfix;
 use greycat_analyzer_analysis::lint::LintSeverity;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
-use greycat_analyzer_analysis::quickfix;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use std::str::FromStr;

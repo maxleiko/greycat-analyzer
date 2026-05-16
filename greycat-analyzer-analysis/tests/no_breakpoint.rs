@@ -3,9 +3,9 @@
 // an auto-fix that deletes the statement plus its trailing newline when
 // the line is otherwise blank.
 
+use greycat_analyzer_analysis::ide::quickfix;
 use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
-use greycat_analyzer_analysis::quickfix;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use std::str::FromStr;
