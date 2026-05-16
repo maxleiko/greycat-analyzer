@@ -1740,7 +1740,7 @@ fn test(c: Ctx) {
 
 **Chunks:**
 
-- [ ] **43.1 `flatten_errors_named_children` helper** (XS) — Private iterator helper in `lower.rs`. Walks `node.named_children()`; when it sees an `ERROR` child, yields *that child's* named children inline. Depth-bounded at 1 (an `ERROR` nested inside an `ERROR` is treated as opaque). Unit test against synthetic CSTs assembled from the existing parser.
+- [x] **43.1 `flatten_errors_named_children` helper** (XS) — Private iterator helper in `lower.rs`. Walks `node.named_children()`; when it sees an `ERROR` child, yields *that child's* named children inline. Depth-bounded at 1 (an `ERROR` nested inside an `ERROR` is treated as opaque). Unit test against synthetic CSTs assembled from the existing parser.
 - [ ] **43.2 `Hir::salvaged_stmts` marker** (XS) — New field on `Hir` (default-empty `FxHashSet<Idx<Stmt>>`), threaded through `LowerCtx`. Lower-side helper `mark_salvaged(stmt_id)` for use by the apply-site chunks.
 - [ ] **43.3 Apply at `block`** (S) — Replace `lower_block_inline`'s `named_children` walk with the helper. For each yielded child: try `lower_stmt`; if `None`, try `lower_expr`; if `Some(expr)`, wrap in `Stmt::Expr` with the expr's byte_range and add to `salvaged_stmts`. Tests: user's `c.sim.` repro lands a `member_expr` Expr in the HIR with the right type; `expression-has-no-effect` does **not** fire on it.
 - [ ] **43.4 Apply at remaining list-of-kinds sites** (S) — `source_file`/`module`, `type_body`, `enum_body`, `args`, `fn_params`, `object_initializers`. Per-site test: a typo'd member surfaces the surrounding context normally (`foo(bar.|)` still types `foo`'s argument list around `bar.`'s ERROR; `type T { x: int = foo.| }` still types `x` and `foo`).

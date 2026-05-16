@@ -79,6 +79,51 @@ impl<'src, 'symbols> LowerCtx<'src, 'symbols> {
     }
 }
 
+// P43.1
+/// Yield named children of `node`, transparently flattening one level
+/// into any `ERROR` child so the grandchildren appear in place. Each
+/// item is `(child, salvaged_from_error)` — `true` when the child came
+/// from inside an `ERROR` wrapper, `false` for direct named children.
+///
+/// Tree-sitter's error recovery deliberately keeps the parseable inner
+/// shapes alive when an enclosing rule fails: `if (c.sim.)` produces
+/// `(block (ERROR (member_expr ...)))` rather than dropping `c.sim`
+/// entirely. Every list-of-kinds walk in this file goes through this
+/// helper so IDE capabilities downstream (completion, hover, goto-def,
+/// references) see those salvageable shapes via the cached HIR fast
+/// path instead of each capability reimplementing its own CST
+/// fallback.
+///
+/// Depth-bounded at one level — an `ERROR` nested inside an `ERROR`
+/// stays opaque. The recovered shapes tree-sitter produces are
+/// themselves shallow; chasing deeper costs more than it pays for.
+#[allow(dead_code)] // wired up at every list-of-kinds site in P43.3 / P43.4
+fn flatten_errors_named_children<'a>(
+    node: tree_sitter::Node<'a>,
+) -> Vec<(tree_sitter::Node<'a>, bool)> {
+    // Collect into a Vec — tree_sitter cursors are borrow-checker
+    // hostile to nested iteration. Child lists at every site we touch
+    // are short (a handful of stmts/decls at most), so the allocation
+    // isn't load-bearing.
+    let mut out: Vec<(tree_sitter::Node<'a>, bool)> = Vec::new();
+    let mut cur1 = node.walk();
+    for c in node.named_children(&mut cur1) {
+        if c.kind() == "ERROR" {
+            let mut cur2 = c.walk();
+            for g in c.named_children(&mut cur2) {
+                if g.kind() == "ERROR" {
+                    // Bounded descent: ERROR-in-ERROR stays opaque.
+                    continue;
+                }
+                out.push((g, true));
+            }
+        } else {
+            out.push((c, false));
+        }
+    }
+    out
+}
+
 pub fn lower_module(
     source: &str,
     symbols: &SymbolTable,
@@ -1969,4 +2014,97 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
 
 fn range_of(node: tree_sitter::Node<'_>) -> Range<usize> {
     node.byte_range()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greycat_analyzer_syntax::parse;
+
+    /// Locate the first descendant whose kind matches `kind` (DFS).
+    fn find_first<'tree>(
+        node: tree_sitter::Node<'tree>,
+        kind: &str,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for c in node.named_children(&mut cursor) {
+            if let Some(found) = find_first(c, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    // P43.1
+    /// Direct children of a non-`ERROR` node come through unchanged
+    /// with `salvaged = false`.
+    #[test]
+    fn flatten_errors_passes_through_direct_children() {
+        let src = "fn f() { var x = 1; var y = 2; }\n";
+        let tree = parse(src);
+        let block = find_first(tree.root_node(), "block").expect("block node");
+        let items = flatten_errors_named_children(block);
+        assert_eq!(items.len(), 2, "two stmts expected");
+        assert!(items.iter().all(|(_, salvaged)| !*salvaged));
+        assert_eq!(items[0].0.kind(), "var_decl");
+        assert_eq!(items[1].0.kind(), "var_decl");
+    }
+
+    // P43.1
+    /// `if (c.sim.)` — the user's repro shape. Tree-sitter wraps the
+    /// salvaged `member_expr` in `ERROR`; the helper flattens it back
+    /// into the block's child list with `salvaged = true`.
+    #[test]
+    fn flatten_errors_descends_one_level_into_error() {
+        let src = "type C { x: int; }\nfn test(c: C) {\n    if (c.x.)\n}\n";
+        let tree = parse(src);
+        let block = {
+            // The fn_decl's block has the ERROR-wrapped member_expr.
+            let root = tree.root_node();
+            let mut cursor = root.walk();
+            let fn_decl = root
+                .named_children(&mut cursor)
+                .find(|c| c.kind() == "fn_decl")
+                .expect("fn_decl");
+            fn_decl.child_by_field_name("body").expect("fn body")
+        };
+        let items = flatten_errors_named_children(block);
+        // Should see the salvaged member_expr (line_comments may also
+        // appear; filter by kind we care about).
+        let member_exprs: Vec<_> = items
+            .iter()
+            .filter(|(n, _)| n.kind() == "member_expr")
+            .collect();
+        assert_eq!(member_exprs.len(), 1, "salvaged member_expr surfaces");
+        assert!(member_exprs[0].1, "salvaged flag is set");
+    }
+
+    // P43.1
+    /// Invariant: yielded items are never themselves `ERROR`. The
+    /// helper either flattens through an ERROR (one level) or skips
+    /// any inner `ERROR` grandchildren. Run against a few error-prone
+    /// shapes (incomplete expr, trailing operator) so any future
+    /// grammar tweak still produces a depth-bounded walk.
+    #[test]
+    fn flatten_errors_never_yields_error_kind() {
+        let inputs = [
+            "type C { x: int; }\nfn test(c: C) {\n    if (c.x.)\n}\n",
+            "fn f() {\n    var x = ;\n}\n",
+            "fn f() {\n    foo(\n}\n",
+        ];
+        for src in inputs {
+            let tree = parse(src);
+            let block = find_first(tree.root_node(), "block").expect("a block");
+            for (n, _) in flatten_errors_named_children(block) {
+                assert_ne!(
+                    n.kind(),
+                    "ERROR",
+                    "yielded item must not be ERROR (src: {src:?})"
+                );
+            }
+        }
+    }
 }
