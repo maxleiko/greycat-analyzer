@@ -75,6 +75,53 @@ fn block_terminates(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -
     block.stmts.last().is_some_and(|s| stmt_terminates(hir, *s))
 }
 
+/// `true` if `block` contains a `Stmt::Break` whose target is the
+/// enclosing loop — i.e. not enclosed in a nested loop. GreyCat's
+/// `break` carries no labels (`Stmt::Break` is a unit variant per
+/// `greycat-analyzer-hir`), so a break inside a nested `while` /
+/// `for` / `do-while` / `for-in` unambiguously targets that inner
+/// loop; we stop walking at those. Used by the post-loop else-narrow
+/// lift in `Stmt::While` / `Stmt::For` / `Stmt::DoWhile` to gate the
+/// lift: if `break` can escape, exit wasn't necessarily via cond-
+/// false and the cond's negation may not hold post-loop.
+fn block_breaks_current_loop(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|s| stmt_breaks_current_loop(hir, *s))
+}
+
+fn stmt_breaks_current_loop(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
+    match &hir.stmts[stmt_id] {
+        Stmt::Break => true,
+        Stmt::While(_) | Stmt::For(_) | Stmt::DoWhile(_) | Stmt::ForIn(_) => false,
+        Stmt::Block(b) => block_breaks_current_loop(hir, b),
+        Stmt::If(IfStmt {
+            then_branch,
+            else_branch,
+            ..
+        }) => {
+            block_breaks_current_loop(hir, then_branch)
+                || else_branch.is_some_and(|eb| stmt_breaks_current_loop(hir, eb))
+        }
+        Stmt::Try(TryStmt {
+            try_block,
+            catch_block,
+            ..
+        }) => {
+            block_breaks_current_loop(hir, try_block) || block_breaks_current_loop(hir, catch_block)
+        }
+        Stmt::At(AtStmt { block, .. }) => block_breaks_current_loop(hir, block),
+        Stmt::Expr(_)
+        | Stmt::Var(_)
+        | Stmt::Assign(_)
+        | Stmt::Return(_)
+        | Stmt::Continue
+        | Stmt::Breakpoint
+        | Stmt::Throw(_) => false,
+    }
+}
+
 /// Severity sketch for analyzer diagnostics. Maps onto `lsp_types::DiagnosticSeverity`
 /// at the LSP boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1728,6 +1775,50 @@ impl<'a> Cx<'a> {
             self.write_narrow(*ident, null_ty);
         }
         for path in &narrows.then_member_null {
+            let null_ty = self.null();
+            self.write_member_typed(path.clone(), null_ty);
+        }
+    }
+
+    /// Lift `narrows`'s else-side lists into the current narrow frame.
+    /// Used by `Stmt::While` / `Stmt::For` / `Stmt::DoWhile` after the
+    /// loop body to install the cond's negation in post-loop scope
+    /// (sound when no `break` escapes the loop — the natural exit
+    /// path is cond-false, so the cond's negation holds at the
+    /// failing check, which IS the post-loop binding state). Mirrors
+    /// `apply_then_narrows` but reads `else_*` fields; no
+    /// `multi_typed` / contradiction interleaving (those are
+    /// If-specific).
+    fn apply_else_narrows(&mut self, narrows: &CondNarrows) {
+        for ident in &narrows.else_non_null {
+            if let Some(cur) = self.lookup_def_type(*ident) {
+                let stripped = self.strip_nullable(cur);
+                self.write_narrow(*ident, stripped);
+            }
+        }
+        for (ident, ty_ref) in &narrows.else_typed {
+            let ty = self.lower_type_ref(*ty_ref);
+            self.write_narrow(*ident, ty);
+        }
+        for (ident, ty_refs) in &narrows.else_typed_union {
+            let ty = self.lower_typed_union(ty_refs);
+            self.write_narrow(*ident, ty);
+        }
+        for (ident, ty) in &narrows.else_typed_id {
+            self.write_narrow(*ident, *ty);
+        }
+        for path in &narrows.else_member_non_null {
+            self.write_member_non_null(path.clone());
+        }
+        for (path, ty_ref) in &narrows.else_member_typed {
+            let ty = self.lower_type_ref(*ty_ref);
+            self.write_member_typed(path.clone(), ty);
+        }
+        for ident in &narrows.else_null {
+            let null_ty = self.null();
+            self.write_narrow(*ident, null_ty);
+        }
+        for path in &narrows.else_member_null {
             let null_ty = self.null();
             self.write_member_typed(path.clone(), null_ty);
         }
@@ -3598,6 +3689,16 @@ impl<'a> Cx<'a> {
                     self.visit_stmt(*s, return_ty);
                 }
                 self.pop_narrow();
+                // Post-loop else-narrow lift: if no `break` targets
+                // this loop, the only exit is via cond-false, so the
+                // cond's negation holds at the failing check — which
+                // IS the post-loop binding state, since no code runs
+                // between the failing check and the loop exit.
+                // `apply_else_narrows` writes to the now-innermost
+                // frame (the surrounding scope).
+                if !block_breaks_current_loop(self.hir, &body) {
+                    self.apply_else_narrows(&narrows);
+                }
             }
             Stmt::DoWhile(DoWhileStmt {
                 condition, body, ..
@@ -3616,6 +3717,15 @@ impl<'a> Cx<'a> {
                         "do-while condition is always false (body runs exactly once)"
                     };
                     self.diag(Severity::Warning, msg, range);
+                }
+                // Post-loop else-narrow lift. Body always runs at
+                // least once, so by the time we're past the loop the
+                // cond *was* evaluated (and was false, since we're
+                // past). No push/apply on the body side — that would
+                // be unsound on iter 1, before the cond is checked.
+                let narrows = self.derive_cond_narrows(condition);
+                if !block_breaks_current_loop(self.hir, &body) {
+                    self.apply_else_narrows(&narrows);
                 }
             }
             Stmt::For(ForStmt {
@@ -3665,6 +3775,12 @@ impl<'a> Cx<'a> {
                     let _ = self.visit_expr(i);
                 }
                 self.pop_narrow();
+                // Post-loop else-narrow lift. Skip when there's no
+                // condition (no narrow to derive) or when `break` can
+                // escape (exit may not have been via cond-false).
+                if condition.is_some() && !block_breaks_current_loop(self.hir, &body) {
+                    self.apply_else_narrows(&narrows);
+                }
             }
             Stmt::ForIn(ForInStmt {
                 params,
