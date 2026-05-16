@@ -140,6 +140,89 @@ fn hover_renders_generics_and_return_type() {
     );
 }
 
+/// Hover on a `type` identifier inlines up to 5 attrs in a body
+/// block so the reader sees the shape at a glance — no goto-def
+/// round-trip needed for a quick peek.
+#[test]
+fn hover_on_type_decl_renders_attrs_body() {
+    let src = "type Point { x: int; y: int; }\nfn use_(p: Point) { }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor on `Point` use-site (param type, line 1 col 11).
+    let h = project
+        .hover(pos(1, 11))
+        .expect("hover present on type ident");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("type Point {"),
+        "hover should open a body block, got: {value}"
+    );
+    assert!(
+        value.contains("x: int;"),
+        "hover should list `x: int`, got: {value}"
+    );
+    assert!(
+        value.contains("y: int;"),
+        "hover should list `y: int`, got: {value}"
+    );
+}
+
+/// Native types don't have a `.gcl` body — keep the existing
+/// single-line signature shape instead of opening an empty `{ … }`.
+#[test]
+fn hover_on_native_type_stays_single_line() {
+    // Synthetic stdlib-shape: a native type used at param position.
+    let src = "native type Foo { }\nfn use_(f: Foo) { }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(1, 11))
+        .expect("hover present on native type ident");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("native type Foo"),
+        "native type hover should include `native type Foo`, got: {value}"
+    );
+    // No body inlining for natives — the body open brace shouldn't
+    // appear on the same code-block line.
+    assert!(
+        !value.contains("native type Foo {\n"),
+        "native type hover should not open a multi-line body, got: {value}"
+    );
+}
+
+/// Types with more than 5 attrs truncate the body and add a
+/// `… N more` indicator so the hover stays glanceable.
+#[test]
+fn hover_on_type_decl_truncates_long_attrs_list() {
+    let src = "type Big { a: int; b: int; c: int; d: int; e: int; f: int; g: int; }\nfn use_(x: Big) { }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(1, 11))
+        .expect("hover present on type ident");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("a: int;"),
+        "first attr should appear: {value}"
+    );
+    assert!(
+        value.contains("e: int;"),
+        "fifth attr should appear: {value}"
+    );
+    assert!(
+        !value.contains("f: int;"),
+        "sixth attr should be elided: {value}"
+    );
+    assert!(
+        value.contains("… 2 more"),
+        "should report 2 elided attrs, got: {value}"
+    );
+}
+
 /// P15.1 — cross-module hover renders the foreign decl's signature,
 /// doc-comment, and a `defined in <module>` provenance footnote.
 #[test]

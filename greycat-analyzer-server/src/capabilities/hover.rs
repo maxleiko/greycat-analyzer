@@ -9,7 +9,8 @@ use std::ops::Range;
 
 use greycat_analyzer_analysis::analyzer::AnalysisResult;
 use greycat_analyzer_analysis::ide::render::{
-    RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_type_ref_with_subst,
+    RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_type_decl_with_body,
+    render_type_ref_with_subst,
 };
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
@@ -441,7 +442,15 @@ fn render_decl_hover_markdown(
     ctx: Option<&RenderCtx<'_>>,
 ) -> String {
     let mut out = String::new();
-    let signature = render_decl_signature(hir, symbols, decl, ctx);
+    // `Decl::Type` gets a multi-line render that inlines up to 5
+    // attrs in a `{ … }` body so the reader sees the shape without
+    // a goto-def. Native types fall back to the single-line form
+    // since they have no `.gcl` body to peek at. Every other decl
+    // kind keeps the existing one-line signature.
+    let signature = match decl {
+        Decl::Type(td) => render_type_decl_with_body(hir, symbols, td),
+        _ => render_decl_signature(hir, symbols, decl, ctx),
+    };
     out.push_str(&wrap_code(&signature));
     out.push('\n');
     push_doc_section(&mut out, decl_doc(decl));

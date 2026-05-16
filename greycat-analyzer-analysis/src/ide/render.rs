@@ -123,6 +123,51 @@ pub fn render_fn_signature(
     out
 }
 
+/// Render a `type` decl with up to 5 attrs inlined in a `{ ... }`
+/// body. Native types stay single-line (`native type Bar`) since
+/// they have no `.gcl` body to peek at. Use this in hover so the
+/// reader gets the shape at a glance without a goto-def round-trip.
+/// Methods are intentionally omitted — they're surfaced through
+/// hover on the method's own ident.
+pub fn render_type_decl_with_body(hir: &Hir, symbols: &SymbolTable, td: &TypeDecl) -> String {
+    let mut out = render_type_signature(hir, symbols, td);
+    if td.modifiers.native {
+        return out;
+    }
+    out.push_str(" {");
+    const MAX_ATTRS: usize = 5;
+    let shown = td.attrs.len().min(MAX_ATTRS);
+    for attr_id in td.attrs.iter().take(shown) {
+        let a = &hir.type_attrs[*attr_id];
+        out.push_str("\n    ");
+        if a.modifiers.private {
+            out.push_str("private ");
+        }
+        if a.modifiers.static_ {
+            out.push_str("static ");
+        }
+        out.push_str(&symbols[hir.idents[a.name].symbol]);
+        out.push_str(": ");
+        match a.ty {
+            Some(t) => out.push_str(&render_type_ref(hir, symbols, t)),
+            None => out.push_str("any"),
+        }
+        out.push(';');
+    }
+    let hidden = td.attrs.len().saturating_sub(shown);
+    if hidden > 0 {
+        out.push_str(&format!("\n    // … {hidden} more"));
+    }
+    if shown == 0 && hidden == 0 {
+        // Type with no attrs: keep the body on a single line so the
+        // signature reads `type Empty { }` rather than `type Empty {\n}`.
+        out.push_str(" }");
+    } else {
+        out.push_str("\n}");
+    }
+    out
+}
+
 fn render_type_signature(hir: &Hir, symbols: &SymbolTable, td: &TypeDecl) -> String {
     let mut out = String::new();
     if td.modifiers.private {
