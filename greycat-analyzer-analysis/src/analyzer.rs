@@ -652,6 +652,19 @@ struct CondNarrows {
     /// Same as `then_typed_union` but for the else branch (populated
     /// only via negation).
     else_typed_union: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)>,
+    // P41.1
+    /// Pre-lowered narrows — same `(binding, type)` shape as
+    /// `then_typed` / `else_typed`, but the type is a [`TypeId`]
+    /// computed by the analyzer (not a syntactic `Idx<TypeRef>` the
+    /// user wrote). Used for the `narrow_complement` dispatcher, which
+    /// returns the type the else-branch should narrow to when `is T`
+    /// rules out arms of a union (P41) or concrete derivatives of an
+    /// abstract sealed hierarchy (P42). Both sides surface here:
+    /// `else_typed_id` is the primary; `then_typed_id` only fills via
+    /// the `!` swap so `if (!(x is T)) { return; }` lifts the same
+    /// way `if (x is T) { } else { return; }` would.
+    then_typed_id: Vec<(Idx<Ident>, TypeId)>,
+    else_typed_id: Vec<(Idx<Ident>, TypeId)>,
 }
 
 /// One arm in an enum-equality chain.
@@ -2626,6 +2639,8 @@ impl<'a> Cx<'a> {
                     else_member_typed,
                     then_typed_union,
                     else_typed_union,
+                    then_typed_id,
+                    else_typed_id,
                 } = self.derive_cond_narrows(condition);
 
                 // Decide triviality BEFORE pushing any narrows — the
@@ -2677,6 +2692,13 @@ impl<'a> Cx<'a> {
                     let ty = self.lower_typed_union(ty_refs);
                     self.write_narrow(*ident, ty);
                 }
+                // P41.1 — pre-lowered narrows (today populated only
+                // via the `!` swap; the `Expr::Is` arm of
+                // `derive_cond_narrows` populates `else_typed_id` in
+                // P41.2).
+                for (ident, ty) in &then_typed_id {
+                    self.write_narrow(*ident, *ty);
+                }
                 // Skip the `is`-contradiction pass when the condition
                 // is already trivially decidable — it would re-emit a
                 // duplicate "always (true|false)" diag.
@@ -2724,6 +2746,10 @@ impl<'a> Cx<'a> {
                         for (ident, ty_refs) in &else_typed_union {
                             let ty = self.lower_typed_union(ty_refs);
                             self.write_narrow(*ident, ty);
+                        }
+                        // P41.1 — apply pre-lowered else-side narrows.
+                        for (ident, ty) in &else_typed_id {
+                            self.write_narrow(*ident, *ty);
                         }
                         for (path, ty_ref) in &else_member_typed {
                             let ty = self.lower_type_ref(*ty_ref);
@@ -2776,6 +2802,12 @@ impl<'a> Cx<'a> {
                         let ty = self.lower_typed_union(ty_refs);
                         self.write_narrow(*ident, ty);
                     }
+                    // P41.1 — load-bearing for the union-complement
+                    // shape: `if (x is T) { return; } use(x);` lifts
+                    // the complement into the post-if scope.
+                    for (ident, ty) in &else_typed_id {
+                        self.write_narrow(*ident, *ty);
+                    }
                     for (path, ty_ref) in &else_member_typed {
                         let ty = self.lower_type_ref(*ty_ref);
                         self.write_member_typed(path.clone(), ty);
@@ -2795,6 +2827,13 @@ impl<'a> Cx<'a> {
                     for (ident, ty_refs) in &then_typed_union {
                         let ty = self.lower_typed_union(ty_refs);
                         self.write_narrow(*ident, ty);
+                    }
+                    // P41.1 — `if (!(x is T)) { return; } use(x);` —
+                    // the `!` swap pushes the complement to
+                    // `then_typed_id`, the else-terminates path lifts
+                    // it.
+                    for (ident, ty) in &then_typed_id {
+                        self.write_narrow(*ident, *ty);
                     }
                     for path in &then_member_non_null {
                         self.write_member_non_null(path.clone());
@@ -3136,6 +3175,9 @@ impl<'a> Cx<'a> {
                     out.then_member_non_null.extend(r.then_member_non_null);
                     out.then_member_typed.extend(l.then_member_typed);
                     out.then_member_typed.extend(r.then_member_typed);
+                    // P41.1 — pre-lowered narrows propagate the same way.
+                    out.then_typed_id.extend(l.then_typed_id);
+                    out.then_typed_id.extend(r.then_typed_id);
                     // Else: at least one failed — can't narrow confidently.
                 }
                 BinOp::Or => {
@@ -3146,6 +3188,11 @@ impl<'a> Cx<'a> {
                     out.else_non_null.extend(r.else_non_null);
                     out.else_member_non_null.extend(l.else_member_non_null);
                     out.else_member_non_null.extend(r.else_member_non_null);
+                    // P41.1 — pre-lowered else-narrows are sound to
+                    // union for `||`: NOT(A || B) ≡ !A AND !B holds
+                    // both subtrees' else-side complements.
+                    out.else_typed_id.extend(l.else_typed_id);
+                    out.else_typed_id.extend(r.else_typed_id);
                     // Then: at least one side held. For `is`-narrows on
                     // the same ident across both sides (e.g.
                     // `x is int || x is float`), narrow `x` to the union
@@ -3239,6 +3286,10 @@ impl<'a> Cx<'a> {
                 out.else_member_typed = inner.then_member_typed;
                 out.then_typed_union = inner.else_typed_union;
                 out.else_typed_union = inner.then_typed_union;
+                // P41.1 — swap pre-lowered narrows alongside the
+                // existing pairs.
+                out.then_typed_id = inner.else_typed_id;
+                out.else_typed_id = inner.then_typed_id;
             }
             _ => {}
         }
@@ -3848,6 +3899,8 @@ impl<'a> Cx<'a> {
                             else_member_typed: _,
                             then_typed_union,
                             else_typed_union: _,
+                            then_typed_id: _,
+                            else_typed_id: _,
                         } = self.derive_cond_narrows(left);
                         let (non_null, typed, typed_union, member_non_null, member_typed) = match op
                         {
