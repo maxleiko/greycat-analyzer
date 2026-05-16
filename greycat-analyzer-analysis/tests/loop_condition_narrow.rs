@@ -1,9 +1,8 @@
-//! Regression tests for `fix(analyzer): apply condition truthy-narrows
-//! to while / for body (B1, B2)`.
+//! Regression tests for loop-body condition narrowing in `Stmt::While`
+//! and `Stmt::For`.
 //!
-//! Before the fix, `Stmt::While` / `Stmt::For` visited their body
-//! without applying the loop condition's narrows. So
-//! `while (x != null) { takesNonNull(x) }` and
+//! Before the fix, both arms visited the body without applying the
+//! condition's narrows. So `while (x != null) { takesNonNull(x) }` and
 //! `for (var p = init; p != null; ...) { takesNonNull(p) }` both
 //! reported `int? not assignable to int` inside the body, even though
 //! the loop condition guarantees non-null at body entry.
@@ -83,7 +82,9 @@ fn main() {
 
 #[test]
 fn for_c_style_condition_narrows_body_and_increment() {
-    // Kopr B1 shape: increment reads `p` which must be narrowed too.
+    // Increment reads `p` which must be narrowed too — without the
+    // narrow on the increment expression, the `nextOf(p)` call would
+    // see `p: int?` and error.
     let src = "\
 fn nextOf(x: int): int? {
     if (x > 0) { return x - 1; }

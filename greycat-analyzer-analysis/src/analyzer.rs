@@ -3526,9 +3526,9 @@ impl<'a> Cx<'a> {
             }) => {
                 self.expect_bool(condition, "while condition");
                 self.diagnose_decidable_loop_condition(stmt_id, condition, "while");
-                // B2 — apply the condition's truthy narrows to the body.
-                // `while (x != null) { use(x) }` should see `x` as
-                // non-null inside the body, mirroring `if (x != null)`.
+                // Apply the condition's truthy narrows to the body so
+                // `while (x != null) { use(x) }` sees `x` as non-null
+                // inside the body, mirroring `if (x != null)`.
                 // Inline the body stmts (instead of `visit_block`) so
                 // the loop's narrow frame is the innermost at body
                 // entry — matches `Stmt::If`'s pattern.
@@ -3584,10 +3584,10 @@ impl<'a> Cx<'a> {
                         .unwrap_or_else(|| self.any_nullable());
                     self.out.def_types.insert(name, bound_ty);
                 }
-                // B1 — apply the condition's truthy narrows to body and
-                // increment. `for (var p = init; p != null; p = next(p))`
-                // should see `p` as non-null inside both the body and
-                // the increment expression. Increment runs after body
+                // Apply the condition's truthy narrows to body and
+                // increment so `for (var p = init; p != null; p = next(p))`
+                // sees `p` as non-null inside both the body and the
+                // increment expression. Increment runs after body
                 // inside the same frame, matching runtime order
                 // (cond → body → incr → cond).
                 let narrows = if let Some(c) = condition {
@@ -3838,6 +3838,51 @@ impl<'a> Cx<'a> {
                             _ => {}
                         }
                     }
+                    // Chained optional access (`a?->b?->c`) on one side
+                    // of the comparison: if the comparison implies the
+                    // chain is non-null on some branch, every `?->` /
+                    // `?.` receiver in the chain must also be non-null
+                    // on that branch (since `?->` short-circuits to null
+                    // iff the receiver is null).
+                    //   chain != null         → then: receivers non-null
+                    //   null != chain         → then: receivers non-null
+                    //   chain == null         → else: receivers non-null
+                    //   null == chain         → else: receivers non-null
+                    //   chain == <non-null>   → then: receivers non-null
+                    //   <non-null> == chain   → then: receivers non-null
+                    let is_null = |id: Idx<Expr>| matches!(&self.hir.exprs[id], Expr::Null { .. });
+                    let is_chain = |id: Idx<Expr>| {
+                        matches!(self.hir.exprs[id], Expr::Member(_) | Expr::Arrow(_))
+                    };
+                    let chain_other = if is_chain(*left) {
+                        Some((*left, *right))
+                    } else if is_chain(*right) {
+                        Some((*right, *left))
+                    } else {
+                        None
+                    };
+                    if let Some((chain, other)) = chain_other {
+                        let (then_side, else_side) = match *op {
+                            BinOp::Neq if is_null(other) => (true, false),
+                            BinOp::Eq if is_null(other) => (false, true),
+                            BinOp::Eq if self.is_syntactically_non_null(other) => (true, false),
+                            _ => (false, false),
+                        };
+                        if then_side {
+                            self.collect_optional_chain_receivers(
+                                chain,
+                                &mut out.then_non_null,
+                                &mut out.then_member_non_null,
+                            );
+                        }
+                        if else_side {
+                            self.collect_optional_chain_receivers(
+                                chain,
+                                &mut out.else_non_null,
+                                &mut out.else_member_non_null,
+                            );
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -4082,6 +4127,107 @@ impl<'a> Cx<'a> {
             return self.member_path(r);
         }
         None
+    }
+
+    /// `true` when `expr` is a value whose runtime type cannot be null
+    /// without further reasoning — literals, strings, `Type::variant`,
+    /// `this`, array / object / tuple constructors, and `x!!`.
+    /// Conservative: returns `false` for idents and calls, even when
+    /// their declared type is non-nullable, because `derive_cond_narrows`
+    /// runs in `&self` context and cannot consult the type inference
+    /// state.
+    fn is_syntactically_non_null(&self, expr_id: Idx<Expr>) -> bool {
+        match &self.hir.exprs[expr_id] {
+            Expr::Literal(_)
+            | Expr::String(_)
+            | Expr::Static(_)
+            | Expr::QualifiedStatic { .. }
+            | Expr::This { .. }
+            | Expr::Array(..)
+            | Expr::Object(_)
+            | Expr::Tuple(..) => true,
+            Expr::Paren(inner, _) => self.is_syntactically_non_null(*inner),
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::NonNullAssert,
+                ..
+            }) => true,
+            _ => false,
+        }
+    }
+
+    /// Walk `chain` as a Member / Arrow chain. For each null-safe step
+    /// — either the step's own `pre_optional` (`?.` / `?->` with `?`
+    /// immediately before the property) or the step's `post_optional`
+    /// (`a.b?` / `a->b?` whose result is treated as nullable) —
+    /// record the path that must be non-null for the chain to be
+    /// non-null on the requested side. Stops at the first non-chain
+    /// node. Idents resolving to a Param / Local land in `out_idents`;
+    /// other expressions are recorded via `member_path` into `out_paths`.
+    ///
+    /// `pre_optional` narrows the step's RECEIVER (the value before
+    /// `?` — `t?.f` non-null implies `t` non-null).
+    ///
+    /// `post_optional` narrows the STEP ITSELF (`t.g?` non-null implies
+    /// `t.g` non-null). This case load-bears the chained `?.` shape:
+    /// the grammar parses `t.g?.f` as `(t.g?).f`, attaching the `?`
+    /// as `post_optional` on the inner `t.g` rather than `pre_optional`
+    /// on the outer `.f`. Both flags can be set on a single step
+    /// (`t?.g?` → pre=true, post=true) and are handled independently.
+    fn collect_optional_chain_receivers(
+        &self,
+        chain: Idx<Expr>,
+        out_idents: &mut Vec<Idx<Ident>>,
+        out_paths: &mut Vec<String>,
+    ) {
+        let mut cursor = chain;
+        loop {
+            let (receiver, pre_optional, post_optional) = match &self.hir.exprs[cursor] {
+                Expr::Member(MemberExpr {
+                    receiver,
+                    pre_optional,
+                    post_optional,
+                    ..
+                })
+                | Expr::Arrow(MemberExpr {
+                    receiver,
+                    pre_optional,
+                    post_optional,
+                    ..
+                }) => (*receiver, *pre_optional, *post_optional),
+                Expr::Paren(inner, _) => {
+                    cursor = *inner;
+                    continue;
+                }
+                _ => break,
+            };
+            if pre_optional {
+                self.narrow_path_or_ident(receiver, out_idents, out_paths);
+            }
+            if post_optional {
+                self.narrow_path_or_ident(cursor, out_idents, out_paths);
+            }
+            cursor = receiver;
+        }
+    }
+
+    /// Resolve `expr` to either an ident binding or a member path and
+    /// push it onto the matching out-vector. No-op for shapes that root
+    /// in a fresh computed value (call, offset, paren of those, ...).
+    fn narrow_path_or_ident(
+        &self,
+        expr: Idx<Expr>,
+        out_idents: &mut Vec<Idx<Ident>>,
+        out_paths: &mut Vec<String>,
+    ) {
+        if let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[expr] {
+            if let Some(Definition::Param(def) | Definition::Local(def)) =
+                self.res.lookup(*name_idx)
+            {
+                out_idents.push(def);
+            }
+        } else if let Some(path) = self.member_path(expr) {
+            out_paths.push(path);
+        }
     }
 
     fn expect_bool(&mut self, expr: Idx<Expr>, _label: &'static str) {
