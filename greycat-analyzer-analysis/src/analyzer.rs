@@ -1265,6 +1265,104 @@ impl<'a> Cx<'a> {
         }))
     }
 
+    // P42.5
+    /// Detect whether an `is`-check is *exhaustive*: every concrete
+    /// runtime case of `known` is also a runtime case of (one alt of)
+    /// `asserted`, so the negative side of the guard is unreachable.
+    /// Used to emit the `exhaustive-is-check` diagnostic without
+    /// having to distinguish "exhausted" from "no rule applies" in
+    /// `narrow_complement`'s `None` return.
+    ///
+    /// `asserted` may be either a single type (`Type(d)`) or a union
+    /// (`x is T1 || x is T2` lowers via `lower_typed_union` to
+    /// `Union { alts }`). Both shapes funnel through the same arm
+    /// here:
+    /// - **Union `known`** (e.g. `var x = a ?? b`): every alt must
+    ///   be assignable to *some* alt of `asserted`.
+    /// - **Abstract `Type(decl)` `known`**: `closure(known)` must be
+    ///   a subset of the union of every asserted alt's closure.
+    ///
+    /// Concrete `Type(decl)` `known` returns `false`: the existing
+    /// per-`is` decidability pass in
+    /// [`Self::diagnose_then_typed_contradictions`] already catches
+    /// `x: Rect; if (x is Shape)` as "always true" via assignability.
+    fn narrow_is_exhausted(&mut self, known: TypeId, asserted: TypeId) -> bool {
+        let asserted_alts: Vec<TypeId> = match &self.arena.get(asserted).kind {
+            TypeKind::Union { alts } => alts.clone(),
+            _ => vec![asserted],
+        };
+        let known_ty = self.arena.get(known).clone();
+        match &known_ty.kind {
+            TypeKind::Union { alts } => {
+                let alts = alts.clone();
+                alts.iter().all(|alt| {
+                    let alt_t = self.arena.get(*alt).clone();
+                    let alt_non_null = if alt_t.nullable {
+                        self.arena.alloc(Type {
+                            kind: alt_t.kind,
+                            nullable: false,
+                        })
+                    } else {
+                        *alt
+                    };
+                    asserted_alts.iter().any(|a_alt| {
+                        let a_t = self.arena.get(*a_alt).clone();
+                        let a_non_null = if a_t.nullable {
+                            self.arena.alloc(Type {
+                                kind: a_t.kind,
+                                nullable: false,
+                            })
+                        } else {
+                            *a_alt
+                        };
+                        crate::project::is_assignable_to_with_index(
+                            self.index,
+                            self.well_known,
+                            self.decl_registry,
+                            self.arena,
+                            alt_non_null,
+                            a_non_null,
+                        )
+                    })
+                })
+            }
+            TypeKind::Type(decl) => {
+                let Some(sup_sym) = self.decl_registry.name(*decl) else {
+                    return false;
+                };
+                if !self.index.is_abstract.contains(&sup_sym) {
+                    return false;
+                }
+                let Some(sup_closure) = self.index.subtype_closure.get(&sup_sym).cloned() else {
+                    return false;
+                };
+                if sup_closure.is_empty() {
+                    return false;
+                }
+                let mut asserted_set: FxHashSet<Symbol> = FxHashSet::default();
+                for a_alt in &asserted_alts {
+                    let a_ty = self.arena.get(*a_alt);
+                    let TypeKind::Type(ad) = &a_ty.kind else {
+                        // P42.6 — generic-root asserts fall outside
+                        // the closure model. Return `false` (no
+                        // exhaustion diag) until generic substitution
+                        // is wired through the closure walker.
+                        return false;
+                    };
+                    let Some(asym) = self.decl_registry.name(*ad) else {
+                        return false;
+                    };
+                    let Some(ac) = self.index.subtype_closure.get(&asym) else {
+                        return false;
+                    };
+                    asserted_set.extend(ac.iter().copied());
+                }
+                sup_closure.iter().all(|s| asserted_set.contains(s))
+            }
+            _ => false,
+        }
+    }
+
     // P42.4
     /// Chain `narrow_complement` over a list of asserted-type-refs,
     /// starting from `ident`'s currently-known type. Used by the
@@ -2957,6 +3055,92 @@ impl<'a> Cx<'a> {
                         if let Some(complement) = self.chain_narrow_complement(*ident, ty_refs) {
                             then_typed_id.push((*ident, complement));
                         }
+                    }
+                }
+
+                // P42.5 — `exhaustive-is-check`. When every concrete
+                // runtime case of a binding's known type is covered
+                // by the asserted type(s), the negative side of the
+                // guard is unreachable. Mirrors `non-exhaustive` (for
+                // enum chains); this is its inverse-shape sibling.
+                // Emit at most one warning per condition and mark
+                // `decidable_conditions` so the existing per-`is`
+                // contradiction pass doesn't also fire "is already
+                // of type …" on the same span.
+                if is_atomic_is {
+                    let mut hit: Option<(String, bool)> = None;
+                    let then_side_pairs: Vec<(Idx<Ident>, Idx<TypeRef>)> = then_typed.clone();
+                    let then_side_unions: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)> =
+                        then_typed_union.clone();
+                    let else_side_pairs: Vec<(Idx<Ident>, Idx<TypeRef>)> = else_typed.clone();
+                    let else_side_unions: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)> =
+                        else_typed_union.clone();
+                    for (ident, ty_ref) in &then_side_pairs {
+                        if hit.is_some() {
+                            break;
+                        }
+                        let Some(known) = self.lookup_def_type(*ident) else {
+                            continue;
+                        };
+                        let asserted = self.lower_type_ref(*ty_ref);
+                        if self.narrow_is_exhausted(known, asserted) {
+                            let known_disp = self.display(known).to_string();
+                            hit = Some((known_disp, false));
+                        }
+                    }
+                    for (ident, ty_refs) in &then_side_unions {
+                        if hit.is_some() {
+                            break;
+                        }
+                        let Some(known) = self.lookup_def_type(*ident) else {
+                            continue;
+                        };
+                        let asserted = self.lower_typed_union(ty_refs);
+                        if self.narrow_is_exhausted(known, asserted) {
+                            let known_disp = self.display(known).to_string();
+                            hit = Some((known_disp, false));
+                        }
+                    }
+                    // Else-side (under `!` swap): exhaustion means the
+                    // *then* branch is unreachable.
+                    for (ident, ty_ref) in &else_side_pairs {
+                        if hit.is_some() {
+                            break;
+                        }
+                        let Some(known) = self.lookup_def_type(*ident) else {
+                            continue;
+                        };
+                        let asserted = self.lower_type_ref(*ty_ref);
+                        if self.narrow_is_exhausted(known, asserted) {
+                            let known_disp = self.display(known).to_string();
+                            hit = Some((known_disp, true));
+                        }
+                    }
+                    for (ident, ty_refs) in &else_side_unions {
+                        if hit.is_some() {
+                            break;
+                        }
+                        let Some(known) = self.lookup_def_type(*ident) else {
+                            continue;
+                        };
+                        let asserted = self.lower_typed_union(ty_refs);
+                        if self.narrow_is_exhausted(known, asserted) {
+                            let known_disp = self.display(known).to_string();
+                            hit = Some((known_disp, true));
+                        }
+                    }
+                    if let Some((known_disp, is_negated)) = hit {
+                        let dead = if is_negated { "then" } else { "else" };
+                        let msg = format!(
+                            "exhaustive `is`-check: every concrete runtime case of `{known_disp}` is covered; the {dead}-branch is unreachable",
+                        );
+                        let range = self.hir.exprs[condition].byte_range();
+                        self.diag(Severity::Warning, msg, range);
+                        // `is_negated = false` means the if-cond is always
+                        // true (then-branch always runs). `is_negated = true`
+                        // means the cond is `!(…always-true…)` → always
+                        // false (else-branch runs).
+                        self.out.decidable_conditions.insert(stmt_id, !is_negated);
                     }
                 }
 
@@ -5973,6 +6157,159 @@ fn caller(s: Shape) {
         assert!(
             !assign_errs.is_empty(),
             "`&&` must not lift a disjunctive else-complement (would be unsound); got: {diags:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // P42.5 — exhaustive-is-check warning
+    // -------------------------------------------------------------------
+
+    /// Sealed-hierarchy exhaustion: a `||`-disjunction of `is`-checks
+    /// covers every concrete derivative of the abstract root. The
+    /// else-branch is unreachable; emit `exhaustive `is`-check`.
+    #[test]
+    fn p42_exhaustive_is_check_disjunction_covers_hierarchy() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+fn caller(s: Shape) {
+    if (s is Rect || s is Circle) {
+        var _ = s;
+    } else {
+        var _ = s;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        let hit: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .collect();
+        assert_eq!(
+            hit.len(),
+            1,
+            "expected exactly one exhaustive-is-check diagnostic; got: {diags:#?}"
+        );
+        assert!(
+            hit[0].message.contains("else-branch is unreachable"),
+            "diagnostic should name the unreachable branch; got: {}",
+            hit[0].message
+        );
+    }
+
+    /// Union source: every alt covered by the disjunction.
+    /// Closure-of-asserted equals known's full set → exhausted.
+    #[test]
+    fn p42_exhaustive_is_check_union_source() {
+        let src = r#"
+type A {}
+type B {}
+fn caller(p: A?, q: B?) {
+    var u = p ?? q;
+    if (u == null) { return; }
+    if (u is A || u is B) {
+        var _ = u;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        let hit: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .collect();
+        assert_eq!(
+            hit.len(),
+            1,
+            "expected exhaustive-is-check on union covering both alts: {diags:#?}"
+        );
+    }
+
+    /// `!`-swap: `if (!(s is Rect || s is Circle))` is the
+    /// negation of an exhausted check — the *then* branch is
+    /// unreachable. Confirms the symmetric emission path.
+    #[test]
+    fn p42_exhaustive_is_check_negated_then_unreachable() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+fn caller(s: Shape) {
+    if (!(s is Rect || s is Circle)) {
+        var _ = s;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        let hit: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .collect();
+        assert_eq!(hit.len(), 1, "expected one diagnostic; got: {diags:#?}");
+        assert!(
+            hit[0].message.contains("then-branch is unreachable"),
+            "negated form must flag the then-branch; got: {}",
+            hit[0].message
+        );
+    }
+
+    /// Partial coverage: hierarchy has three concrete derivatives,
+    /// disjunction covers two. NOT exhausted — no diagnostic.
+    #[test]
+    fn p42_exhaustive_is_check_partial_coverage_silent() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+type Triangle extends Shape {}
+fn caller(s: Shape) {
+    if (s is Rect || s is Circle) {
+        var _ = s;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        let hit: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .collect();
+        assert!(
+            hit.is_empty(),
+            "partial coverage must not flag exhaustion: {hit:#?}"
+        );
+    }
+
+    /// Concrete root: `Shape` is not abstract, so `is Shape`-style
+    /// "always-true" is the domain of the existing per-`is`
+    /// decidability pass. P42.5's exhaustion pass intentionally
+    /// returns `false` for concrete known types to avoid double-fire.
+    #[test]
+    fn p42_exhaustive_is_check_concrete_known_no_double_fire() {
+        let src = r#"
+type Rect {}
+fn caller(r: Rect) {
+    if (r is Rect) {
+        var _ = r;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        let exhaustion: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .collect();
+        assert!(
+            exhaustion.is_empty(),
+            "concrete known must not fire exhaustion (the `condition is always true` path covers it): {diags:#?}"
+        );
+        // Existing always-true pass must still fire.
+        let always_true: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("condition is always true"))
+            .collect();
+        assert!(
+            !always_true.is_empty(),
+            "existing always-true diag should fire for `r: Rect; r is Rect`: {diags:#?}"
         );
     }
 
