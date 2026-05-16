@@ -16,6 +16,10 @@ use greycat_analyzer_analysis::directives::Directives;
 use greycat_analyzer_hir::arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::conv::{
+    byte_range_to_lsp, byte_to_position, position_to_byte, ranges_overlap, stmt_byte_range,
+};
+
 use greycat_analyzer_analysis::analyzer::{AnalysisResult, Severity};
 use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity, run_lints};
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
@@ -27,61 +31,6 @@ use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, FnDecl, Ident, Stmt, Ty
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset, walk_named};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::*;
-
-// =============================================================================
-// Position helpers
-// =============================================================================
-
-pub(crate) fn position_to_byte(text: &str, pos: Position) -> usize {
-    let mut line = 0u32;
-    let mut byte = 0usize;
-    for c in text.chars() {
-        if line == pos.line {
-            break;
-        }
-        byte += c.len_utf8();
-        if c == '\n' {
-            line += 1;
-        }
-    }
-    // advance `character` byte columns, capping at next newline / EOF.
-    let mut col = 0u32;
-    let bytes = text.as_bytes();
-    while col < pos.character && byte < bytes.len() {
-        if bytes[byte] == b'\n' {
-            break;
-        }
-        let c = text[byte..].chars().next().unwrap();
-        byte += c.len_utf8();
-        col += c.len_utf8() as u32;
-    }
-    byte
-}
-
-pub(crate) fn byte_to_position(text: &str, byte: usize) -> Position {
-    let mut line = 0u32;
-    let mut col = 0u32;
-    let prefix = &text[..byte.min(text.len())];
-    for c in prefix.chars() {
-        if c == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += c.len_utf8() as u32;
-        }
-    }
-    Position {
-        line,
-        character: col,
-    }
-}
-
-pub(crate) fn byte_range_to_lsp(text: &str, range: &Range<usize>) -> lsp_types::Range {
-    lsp_types::Range {
-        start: byte_to_position(text, range.start),
-        end: byte_to_position(text, range.end),
-    }
-}
 
 // =============================================================================
 // P3.1 + P15.1 — hover
@@ -2474,13 +2423,6 @@ fn find_access_op_after(text: &str, from: usize) -> Option<usize> {
     None
 }
 
-fn ranges_overlap(a: &lsp_types::Range, b: &lsp_types::Range) -> bool {
-    !(a.end.line < b.start.line
-        || a.start.line > b.end.line
-        || (a.end.line == b.start.line && a.end.character < b.start.character)
-        || (a.start.line == b.end.line && a.start.character > b.end.character))
-}
-
 // =============================================================================
 // P3.7 — inlay hints
 // =============================================================================
@@ -4369,7 +4311,7 @@ fn apply_call_paren_snippet(items: &mut [CompletionItem], text: &str, cursor_byt
     let ident_end = cursor_byte + suffix_len;
     let parens_already_there = next_non_ws_is_open_paren(text.as_bytes(), ident_end);
     let replace_range =
-        (suffix_len > 0).then(|| byte_range_to_lsp_range(text, &(ident_start..ident_end)));
+        (suffix_len > 0).then(|| byte_range_to_lsp(text, &(ident_start..ident_end)));
 
     for item in items.iter_mut() {
         // 1) Append `($0)` to FUNCTION / METHOD items unless the
@@ -4736,29 +4678,6 @@ fn collect_stmt_scope(
         }
         HS::At(s) => collect_block_scope(hir, symbols, &s.block, cursor_byte, out),
         _ => {}
-    }
-}
-
-fn stmt_byte_range(
-    hir: &greycat_analyzer_hir::Hir,
-    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
-) -> std::ops::Range<usize> {
-    use greycat_analyzer_hir::types::Stmt as HS;
-    match &hir.stmts[stmt_id] {
-        HS::Block(b) => b.byte_range.clone(),
-        HS::Var(s) => s.byte_range.clone(),
-        HS::Assign(s) => s.byte_range.clone(),
-        HS::If(s) => s.byte_range.clone(),
-        HS::While(s) => s.byte_range.clone(),
-        HS::DoWhile(s) => s.byte_range.clone(),
-        HS::For(s) => s.byte_range.clone(),
-        HS::ForIn(s) => s.byte_range.clone(),
-        HS::Try(s) => s.byte_range.clone(),
-        HS::At(s) => s.byte_range.clone(),
-        HS::Expr(e) => hir.exprs[*e].byte_range(),
-        HS::Return(Some(e)) => hir.exprs[*e].byte_range(),
-        HS::Throw(e) => hir.exprs[*e].byte_range(),
-        HS::Return(None) | HS::Break | HS::Continue | HS::Breakpoint => 0..0,
     }
 }
 
@@ -5853,7 +5772,7 @@ pub(crate) fn current_diagnostics(
         .diagnostics
         .iter()
         .map(|d| Diagnostic {
-            range: byte_range_to_lsp_range(text, &d.byte_range),
+            range: byte_range_to_lsp(text, &d.byte_range),
             severity: Some(match d.severity {
                 Severity::Error => DiagnosticSeverity::ERROR,
                 Severity::Warning => DiagnosticSeverity::WARNING,
@@ -5867,7 +5786,7 @@ pub(crate) fn current_diagnostics(
         .collect();
     for lint in run_lints(&hir, &resolutions, &symbols) {
         out.push(Diagnostic {
-            range: byte_range_to_lsp_range(text, &lint.byte_range),
+            range: byte_range_to_lsp(text, &lint.byte_range),
             severity: Some(match lint.severity {
                 LintSeverity::Error => DiagnosticSeverity::ERROR,
                 LintSeverity::Warning => DiagnosticSeverity::WARNING,
@@ -5924,7 +5843,7 @@ pub fn diagnostics_from_module(
         .diagnostics
         .iter()
         .map(|d| Diagnostic {
-            range: byte_range_to_lsp_range(text, &d.byte_range),
+            range: byte_range_to_lsp(text, &d.byte_range),
             severity: Some(match d.severity {
                 Severity::Error => DiagnosticSeverity::ERROR,
                 Severity::Warning => DiagnosticSeverity::WARNING,
@@ -5938,7 +5857,7 @@ pub fn diagnostics_from_module(
         .collect();
     for lint in &module.lints {
         out.push(Diagnostic {
-            range: byte_range_to_lsp_range(text, &lint.byte_range),
+            range: byte_range_to_lsp(text, &lint.byte_range),
             severity: Some(match lint.severity {
                 LintSeverity::Error => DiagnosticSeverity::ERROR,
                 LintSeverity::Warning => DiagnosticSeverity::WARNING,
@@ -5952,11 +5871,4 @@ pub fn diagnostics_from_module(
         });
     }
     out
-}
-
-fn byte_range_to_lsp_range(text: &str, range: &std::ops::Range<usize>) -> lsp_types::Range {
-    lsp_types::Range {
-        start: byte_to_position(text, range.start),
-        end: byte_to_position(text, range.end),
-    }
 }

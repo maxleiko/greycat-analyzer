@@ -24,6 +24,7 @@
 
 mod backend;
 pub mod capabilities;
+pub(crate) mod conv;
 pub mod registry;
 mod server;
 
