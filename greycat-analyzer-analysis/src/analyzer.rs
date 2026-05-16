@@ -1265,6 +1265,43 @@ impl<'a> Cx<'a> {
         }))
     }
 
+    // P42.4
+    /// Chain `narrow_complement` over a list of asserted-type-refs,
+    /// starting from `ident`'s currently-known type. Used by the
+    /// disjunctive `(x is T1) || (x is T2)` shape — each asserted
+    /// type subtracts from the running complement, equivalent to
+    /// `closure(known) \ closure(T1) \ closure(T2) \ …`. Returns
+    /// `None` when the helper had nothing to do at the first step
+    /// (no rule applies for the binding's known shape) or when any
+    /// step in the chain bails out — keeping the apply sites inert
+    /// rather than committing a partially-subtracted narrow.
+    fn chain_narrow_complement(
+        &mut self,
+        ident: Idx<Ident>,
+        ty_refs: &[Idx<TypeRef>],
+    ) -> Option<TypeId> {
+        let known = self.lookup_def_type(ident)?;
+        let mut complement = known;
+        let mut changed = false;
+        for ty_ref in ty_refs {
+            let asserted = self.lower_type_ref(*ty_ref);
+            match self.narrow_complement(complement, asserted) {
+                Some(next) => {
+                    complement = next;
+                    changed = true;
+                }
+                // First-step bail: nothing to narrow here. Mid-chain
+                // bail: either no rule applied for the partial
+                // complement (e.g. it collapsed to a kind the helper
+                // doesn't model) or the asserted type exhausted the
+                // remaining set — P42.5 owns the exhaustion diag.
+                // Either way, drop the partial narrow.
+                None => return None,
+            }
+        }
+        if changed { Some(complement) } else { None }
+    }
+
     // P42.2
     /// `Symbol`-keyed analogue of [`crate::project::resolve_decl_handle`]:
     /// look up the type-namespace `TypeDeclId` for a `Symbol` already
@@ -2876,15 +2913,15 @@ impl<'a> Cx<'a> {
                     is_atomic_is,
                 } = self.derive_cond_narrows(condition);
 
-                // P41.2 — compute the else-side complement narrow for
-                // atomic `is`-conditions. `derive_cond_narrows` runs
-                // in `&self` context (`lower_type_ref` is `&mut self`),
+                // P41.2 / P42.4 — compute the else-side complement
+                // narrow for atomic `is`-conditions. `derive_cond_narrows`
+                // runs in `&self` context (`lower_type_ref` is `&mut self`),
                 // so the complement is computed here in `Stmt::If`
                 // where we have mutable access. Gated on
-                // `is_atomic_is` because compound boolean conditions
-                // (`A && B`, `A || B`) can't soundly derive
-                // per-binding complements from `then_typed` / `else_typed`
-                // alone — disjunctive support is owned by P42.4.
+                // `is_atomic_is`: atomic for `Expr::Is` (P41) and for
+                // pure `||`-chains of `is`-checks (P42.4); never set
+                // through `&&` (an `&&` else might be either operand
+                // failing — per-ident complements would be unsound).
                 if is_atomic_is {
                     for (ident, ty_ref) in &then_typed {
                         let Some(known) = self.lookup_def_type(*ident) else {
@@ -2901,6 +2938,23 @@ impl<'a> Cx<'a> {
                         };
                         let asserted = self.lower_type_ref(*ty_ref);
                         if let Some(complement) = self.narrow_complement(known, asserted) {
+                            then_typed_id.push((*ident, complement));
+                        }
+                    }
+                    // P42.4 — disjunctive complement for
+                    // `(x is T1) || (x is T2)` shape (`then_typed_union`
+                    // carries the merged asserted list). Chain
+                    // `narrow_complement` over each asserted type, so
+                    // `closure(known) \ closure(T1) \ closure(T2)` falls
+                    // out for free via repeated subtraction. Mirror for
+                    // `else_typed_union` (populated by the `!` swap).
+                    for (ident, ty_refs) in &then_typed_union {
+                        if let Some(complement) = self.chain_narrow_complement(*ident, ty_refs) {
+                            else_typed_id.push((*ident, complement));
+                        }
+                    }
+                    for (ident, ty_refs) in &else_typed_union {
+                        if let Some(complement) = self.chain_narrow_complement(*ident, ty_refs) {
                             then_typed_id.push((*ident, complement));
                         }
                     }
@@ -3456,6 +3510,14 @@ impl<'a> Cx<'a> {
                     // both subtrees' else-side complements.
                     out.else_typed_id.extend(l.else_typed_id);
                     out.else_typed_id.extend(r.else_typed_id);
+                    // P42.4 — a `||` of two pure-`is` subtrees stays
+                    // "atomic" for the purposes of the else-side
+                    // complement: NOT(A || B) ≡ !A AND !B propagates
+                    // both atomicity guarantees. Any `&&` underneath
+                    // would have left its subtree's `is_atomic_is = false`
+                    // (the `&&` arm never sets it), so the flag here
+                    // only stays true for pure `||`-chains of `is`-checks.
+                    out.is_atomic_is = l.is_atomic_is && r.is_atomic_is;
                     // Then: at least one side held. For `is`-narrows on
                     // the same ident across both sides (e.g.
                     // `x is int || x is float`), narrow `x` to the union
@@ -5805,6 +5867,112 @@ fn caller(s: Shape) {
                 .iter()
                 .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
             "exhausted subtraction must not regress: {diags:?}"
+        );
+    }
+
+    /// Disjunctive `is || is`: in the else of
+    /// `if (s is Rect || s is Circle)`, both arms have been ruled
+    /// out — narrow `s` to the remaining concrete leaf. Exercises the
+    /// `then_typed_union` → `else_typed_id` chained-subtraction path.
+    #[test]
+    fn p42_is_narrow_disjunctive_is_or_is_else_branch() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+type Triangle extends Shape {}
+fn expect_triangle(t: Triangle) {}
+fn caller(s: Shape) {
+    if (s is Rect || s is Circle) { return; }
+    expect_triangle(s);
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "expected zero is-narrow-related diagnostics on disjunctive shape: {diags:?}"
+        );
+    }
+
+    /// `!`-swapped disjunction: `if (!(s is Rect || s is Circle))`
+    /// pushes the chained complement into `then_typed_id` via the
+    /// `else_typed_union` path. Then-branch narrows `s` to the lone
+    /// remaining leaf.
+    #[test]
+    fn p42_is_narrow_disjunctive_negated_then_branch() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+type Triangle extends Shape {}
+fn expect_triangle(t: Triangle) {}
+fn caller(s: Shape) {
+    if (!(s is Rect || s is Circle)) {
+        expect_triangle(s);
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("not assignable") || d.message.contains("cannot cast")),
+            "expected zero is-narrow-related diagnostics on `!(is||is)` shape: {diags:?}"
+        );
+    }
+
+    /// Disjunction with ancestor-collapse: stripping two concrete
+    /// leaves from an abstract root with three concrete derivatives
+    /// could land on `closure(A)` for some other abstract `A`. Here
+    /// `closure(Animal) \ closure(Cat) \ closure(Dog)` = `{Eagle}`
+    /// — single leaf, no ancestor match — so the narrow collapses to
+    /// `Eagle`. Demonstrates the chained-subtraction composes with
+    /// the abstract-decl arm of `narrow_complement`.
+    #[test]
+    fn p42_is_narrow_disjunctive_chain_collapses() {
+        let src = r#"
+abstract type Animal {}
+type Cat extends Animal {}
+type Dog extends Animal {}
+type Eagle extends Animal {}
+fn caller(a: Animal) {
+    if (a is Cat || a is Dog) { return; }
+    var x = a;
+}
+"#;
+        assert_eq!(local_init_ty(src, "x").as_deref(), Some("Eagle"));
+    }
+
+    /// Disjunction guarded by `&&`: the `&&` arm intentionally leaves
+    /// `is_atomic_is = false` (an `&&` else might be either operand
+    /// failing — per-binding complements would be unsound). The
+    /// disjunctive loop stays inert and the call to `expect_circle`
+    /// still flags. Regression guard against accidentally extending
+    /// `is_atomic_is` propagation through `&&`.
+    #[test]
+    fn p42_is_narrow_disjunctive_under_and_no_lift() {
+        let src = r#"
+abstract type Shape {}
+type Rect extends Shape {}
+type Circle extends Shape {}
+type Triangle extends Shape {}
+fn ok(): bool { return true; }
+fn expect_triangle(t: Triangle) {}
+fn caller(s: Shape) {
+    if ((s is Rect || s is Circle) && ok()) { return; }
+    expect_triangle(s);
+}
+"#;
+        let diags = analyze_project_src(src);
+        let assign_errs: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("not assignable"))
+            .collect();
+        assert!(
+            !assign_errs.is_empty(),
+            "`&&` must not lift a disjunctive else-complement (would be unsound); got: {diags:?}"
         );
     }
 
