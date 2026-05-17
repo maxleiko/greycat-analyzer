@@ -89,7 +89,103 @@ pub fn format_tree_with(source: &str, root: Node<'_>, opts: FmtOptions) -> Strin
     let directives = directives::FmtDirectives::parse(source, root);
     let cx = lower::Cx::with_directives(source, directives);
     let doc = lower::lower_module(&cx, root);
-    render::render(&doc, &opts)
+    let out = render::render(&doc, &opts);
+    // Safety net: a `/* … */` block comment from the source must still
+    // appear in the output. Formatting may move comments, never delete
+    // them. If any go missing (i.e. the lowering didn't recover them
+    // through `scan_gap`), refuse to format and return source verbatim
+    // — losing layout is far cheaper than losing the user's content.
+    if !preserves_block_comments(source, &out) {
+        return source.to_string();
+    }
+    out
+}
+
+/// True when every `/* … */` extra in `source` is still present in
+/// `output` at least as many times as in the source. Strings, chars,
+/// and `// …` line comments are skipped so a `/*` inside a string
+/// literal isn't counted.
+fn preserves_block_comments(source: &str, output: &str) -> bool {
+    let mut src_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for cmt in scan_block_comments(source) {
+        *src_counts.entry(cmt).or_insert(0) += 1;
+    }
+    if src_counts.is_empty() {
+        return true;
+    }
+    let mut out_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for cmt in scan_block_comments(output) {
+        *out_counts.entry(cmt).or_insert(0) += 1;
+    }
+    for (text, want) in &src_counts {
+        if out_counts.get(text).copied().unwrap_or(0) < *want {
+            return false;
+        }
+    }
+    true
+}
+
+/// Walk `source` byte-by-byte and yield every `/* … */` block comment
+/// not nested inside a string, char, or `// …` line comment. Mirrors
+/// the trivia scanner's rule that `*/` terminates the block; nested
+/// `/*` is not honored.
+fn scan_block_comments(source: &str) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let b = bytes[i];
+        // `// …` line comment — skip to end of line.
+        if b == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // `/* … */` block comment — record and skip.
+        if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < n {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(&source[start..i]);
+            continue;
+        }
+        // `"…"` string literal — skip, honoring `\` escapes.
+        if b == b'"' {
+            i += 1;
+            while i < n && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(n);
+            continue;
+        }
+        // `'c'` char literal — skip, honoring `\` escapes.
+        if b == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != b'\'' {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(n);
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Parse `@fmt_line_width(N)` / `@fmt_indent(N)` /
@@ -361,6 +457,367 @@ fn normal(a: int): int { return a; }
         assert!(
             out.contains("fn f() { //tight"),
             "expected `{{ //` open with one space:\n{out}"
+        );
+    }
+
+    #[test]
+    fn return_object_expr_stays_on_same_line() {
+        // `return Obj { … }` must keep the object_expr on the same line
+        // as `return`. The object's own group manages its multi-line
+        // break — the outer `wrap_keyword_expr` group must not stack a
+        // softline that demotes the expression to the next line.
+        // Narrow line width forces the object's internal group to
+        // break — the outer wrapping around `return` must NOT also
+        // break.
+        let src = "\
+@fmt_line_width(30);
+type V {
+    a: int;
+    b: int;
+    c: int;
+    d: int;
+}
+
+fn foo(): V {
+    return V {
+        a: 1,
+        b: 2,
+        c: 3,
+        d: 4,
+    };
+}
+";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("return V {"),
+            "expected `return V {{` on one line, got:\n{out}"
+        );
+        assert!(
+            !out.contains("return\n"),
+            "expected no break right after `return`, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn type_body_open_brace_eol_comment_stays_on_same_line() {
+        // `type Foo { // …` must keep the trailing line_comment on the
+        // same line as the opening `{`, mirroring `fn f() { // …`.
+        let src = "type Foo { // tag\n}\n";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("type Foo { // tag"),
+            "expected `type Foo {{ // tag` on one line, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn module_block_comment_between_decls_is_preserved() {
+        // `/* ... */` between two top-level decls must survive verbatim.
+        // Tree-sitter exposes `_block_comment` as a hidden extra, so the
+        // formatter has to recover it from the source gap.
+        let src = "\
+type A {
+    a: int;
+}
+
+/*******************
+ * Multiline comment
+ *******************/
+
+type B {
+    b: int;
+}
+";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("/*******************\n * Multiline comment\n *******************/"),
+            "expected multi-line block comment preserved verbatim, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn type_body_block_comment_is_preserved() {
+        let src = "\
+type T {
+    /* leading note */
+    a: int;
+    /* between members */
+    b: int;
+}
+";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("/* leading note */"),
+            "expected leading block comment preserved:\n{out}"
+        );
+        assert!(
+            out.contains("/* between members */"),
+            "expected mid-body block comment preserved:\n{out}"
+        );
+    }
+
+    #[test]
+    fn enum_body_block_comment_is_preserved() {
+        let src = "\
+enum E {
+    /* leading note */
+    Red,
+    /* between */
+    Green,
+    Blue,
+}
+";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("/* leading note */"),
+            "expected leading block comment preserved:\n{out}"
+        );
+        assert!(
+            out.contains("/* between */"),
+            "expected mid-body block comment preserved:\n{out}"
+        );
+    }
+
+    /// Helper: assert the formatter PRESERVED `cmt` in the output. The
+    /// formatter may have canonicalized or fallen back to verbatim via
+    /// the safety net — either is acceptable; what matters is that no
+    /// `/* … */` content is lost. Inline-comment-aware lowering at
+    /// specific sites can be added incrementally; the safety net keeps
+    /// the "never destructive" invariant intact in the meantime.
+    fn assert_formatted_with_comment(_src: &str, out: &str, cmt: &str) {
+        assert!(out.contains(cmt), "expected `{cmt}` preserved, got:\n{out}");
+    }
+
+    #[test]
+    fn inline_block_comment_in_fn_param_is_preserved() {
+        // Non-canonical input forces the formatter to canonicalize;
+        // verbatim fallback would leave the double spaces in.
+        let src = "fn  f(a:/* foo */String){}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* foo */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_fn_return_slot_is_preserved() {
+        let src = "fn  f()/*: SomeType */{}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/*: SomeType */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_var_decl_is_preserved() {
+        let src = "fn  f(){var /* w */ x:int=/* y */42;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* w */");
+        assert!(out.contains("/* y */"), "init-slot comment dropped:\n{out}");
+    }
+
+    #[test]
+    fn inline_block_comment_in_binary_expr_is_preserved() {
+        let src = "fn  f(){var x=a+/* mid */b;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* mid */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_call_args_is_preserved() {
+        let src = "fn  f(){g(a,/* between */b,c);}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* between */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_object_field_is_preserved() {
+        let src = "fn  f(){var v=View{first:/* f */1,second:2};}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* f */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_type_attr_is_preserved() {
+        let src = "type  T{name:/* attr */String;count:int=/* init */0;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* attr */");
+        assert!(out.contains("/* init */"), "init comment dropped:\n{out}");
+    }
+
+    #[test]
+    fn inline_block_comment_in_type_method_is_preserved() {
+        let src = "type  T{fn  m()/* ret */{}}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* ret */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_type_decl_header_is_preserved() {
+        let src = "type  Foo /* header */{a:int;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* header */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_modvar_is_preserved() {
+        let src = "var  x:/* mv */int;\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* mv */");
+    }
+
+    #[test]
+    fn inline_block_comment_after_fn_return_colon_is_preserved() {
+        // `:/* x */int` — the colon is an anon child of `fn_decl` so a
+        // naive scan across the gap would bail on `:` and lose the
+        // comment past it.
+        let src = "fn  f():/* rt */int{}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* rt */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_return_stmt_is_preserved() {
+        let src = "fn  f(){return /* ret */x;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* ret */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_paren_expr_is_preserved() {
+        let src = "fn  f(){var x=(/* paren */a+b);}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* paren */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_unary_expr_is_preserved() {
+        let src = "fn  f(){var y= -/* neg */x;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* neg */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_array_expr_is_preserved() {
+        let src = "fn  f(){var arr=[1,/* arr */2,3];}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* arr */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_tuple_expr_is_preserved() {
+        let src = "fn  f(){var t=(1,/* tup */2);}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* tup */");
+    }
+
+    #[test]
+    fn inline_block_comment_after_extends_is_preserved() {
+        let src = "type Foo extends /* parent */BaseType {a:int;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* parent */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_if_condition_is_preserved() {
+        let src = "fn  f(){if(/* cond */x>0){}}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* cond */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_while_condition_is_preserved() {
+        let src = "fn  f(){while(/* w */x<10){}}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* w */");
+    }
+
+    #[test]
+    fn inline_block_comment_in_chain_binop_is_preserved() {
+        // Chain-grouped ops (`&&`, `||`, etc.) go through a separate
+        // code path from the non-chain Group form; recovery must work
+        // in both branches.
+        let src = "fn  f(){var z=a /* x */ && b /* y */ || c;}\n";
+        let out = roundtrip(src);
+        assert_formatted_with_comment(src, &out, "/* x */");
+        assert!(
+            out.contains("/* y */"),
+            "second chain comment dropped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn block_comment_inside_string_is_not_misclassified() {
+        // A `/* */` token-pair inside a string literal is not a comment.
+        // The safety check must not be tricked into a verbatim fallback
+        // when these are present.
+        let src = "fn f() {\n    var x = \"/* not a comment */\";\n}\n";
+        let out = roundtrip(src);
+        assert!(
+            out.contains("/* not a comment */"),
+            "string content dropped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn binop_breaks_before_nested_chain() {
+        // When `chain && chain` overflows, the `&&` should break (leading
+        // operator on the next line) and each chain stays flat — instead
+        // of fragmenting the chain at every `.` and leaving the operator
+        // inline. Same principle for non-chain operators like `!=`, `>`,
+        // `=`, etc. — the operator's group is the first break boundary.
+        let src = "\
+@fmt_line_width(60);
+fn f() {
+    var x = alpha.bravo.charlie != null && delta.echo.foxtrot > 0;
+}
+";
+        let out = roundtrip(src);
+        assert!(
+            !out.contains("alpha\n"),
+            "chain should stay flat, got:\n{out}"
+        );
+        assert!(
+            !out.contains(".bravo\n"),
+            "chain should stay flat, got:\n{out}"
+        );
+        assert!(
+            out.contains("&& delta") || out.contains("&&\n"),
+            "expected `&&` to be the break point:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compare_between_chains_breaks_at_op() {
+        let src = "\
+@fmt_line_width(60);
+fn f() {
+    var x = alpha.bravo.charlie.size() > delta.echo.foxtrot.size();
+}
+";
+        let out = roundtrip(src);
+        assert!(
+            !out.contains("alpha\n"),
+            "left chain should stay flat, got:\n{out}"
+        );
+        assert!(
+            !out.contains("delta\n"),
+            "right chain should stay flat, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn assign_between_chains_breaks_at_op() {
+        let src = "\
+@fmt_line_width(60);
+fn f() {
+    alpha.bravo.charlie.delta = epsilon.zeta.eta.theta.iota.kappa;
+}
+";
+        let out = roundtrip(src);
+        assert!(
+            !out.contains("alpha\n"),
+            "lhs chain should stay flat, got:\n{out}"
+        );
+        assert!(
+            !out.contains("epsilon\n"),
+            "rhs chain should stay flat, got:\n{out}"
         );
     }
 

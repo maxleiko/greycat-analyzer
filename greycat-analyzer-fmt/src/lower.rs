@@ -17,7 +17,6 @@
 
 use crate::directives::FmtDirectives;
 use crate::doc::Doc;
-use crate::trivia::{GapItem, scan_gap};
 use greycat_analyzer_syntax::tree_sitter::Node;
 
 /// Lowering context — owns the source, threads through every visitor.
@@ -68,6 +67,10 @@ impl<'a> Cx<'a> {
 }
 
 /// Top-level entry — lower the `module` root node into a Doc.
+///
+/// `block_comment` is a named extra in the grammar (alongside
+/// `line_comment`), so it appears in `named_children()` between decls
+/// and is emitted naturally — no source-byte gap-scanning needed.
 pub fn lower_module<'a>(cx: &Cx<'a>, root: Node<'a>) -> Doc {
     let mut parts: Vec<Doc> = Vec::new();
     let mut prev: Option<Node<'a>> = None;
@@ -78,18 +81,15 @@ pub fn lower_module<'a>(cx: &Cx<'a>, root: Node<'a>) -> Doc {
             // the gap and emit (count) hardlines so the user's vertical
             // spacing survives, capped at 4 (one terminator + 3 blanks).
             let nls = cx.newlines_between(p, child).min(4);
-            // Doc-comments live inside their host decl (in the `doc`
-            // field), so module level just preserves the raw newline
-            // count for decl-to-decl gaps.
             if nls == 0 {
-                // Zero newlines — the child is on the same source line
-                // as `p`. The common case is an EOL `line_comment`
-                // trailing a top-level decl (`fn foo() {} // note`);
-                // emit a single space so the comment stays on the same
-                // line in the output. Other on-same-line top-level
-                // constructs (two decls on one line — unusual) get
+                // Zero newlines — the child shares a source line with
+                // `p`. The common case is an EOL trailing comment after
+                // a top-level decl (`fn foo() {} // note` or
+                // `fn foo() {} /* note */`); emit a single space so the
+                // comment stays on the same line. Other on-same-line
+                // top-level constructs (two decls on one line) get
                 // forced onto separate lines for legibility.
-                if child.kind() == "line_comment" {
+                if matches!(child.kind(), "line_comment" | "block_comment") {
                     parts.push(Doc::text(" "));
                 } else {
                     parts.push(Doc::hardline());
@@ -142,6 +142,7 @@ fn lower_node<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         "doc" => lower_doc_block(cx, node),
         "doc_comment" => Doc::text(cx.text(node)),
         "line_comment" => Doc::text(cx.text(node)),
+        "block_comment" => Doc::text(cx.text(node)),
         // Stmts
         "var_decl" => lower_var_decl(cx, node),
         "return_stmt" => lower_return_stmt(cx, node),
@@ -375,7 +376,7 @@ fn push_decl_header<'a>(cx: &Cx<'a>, node: Node<'a>, parts: &mut Vec<Doc>) {
                     needs_hardline_before_next = true;
                     continue;
                 }
-                "line_comment" => {
+                "line_comment" | "block_comment" => {
                     if needs_hardline_before_next {
                         parts.push(Doc::hardline());
                     }
@@ -422,24 +423,26 @@ fn lower_type_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if members.is_empty() {
         return Doc::text("{}");
     }
+    // Seed `prev` with the opening `{` so an EOL `line_comment` /
+    // `block_comment` on the same source line as `{` is detected and
+    // glued with a single space instead of demoted.
     let mut inner = Vec::new();
-    let mut prev: Option<Node<'_>> = None;
+    let mut prev: Option<Node<'_>> = node.child(0);
+    let mut seen_member = false;
     for m in &members {
-        // EOL `// ...` line comment that lives on the same source line as
-        // the previous member: glue it to that member with a single space
-        // instead of demoting it to the next line. Mirrors the TS
-        // reference's `cst_format.ts` behavior for type / enum bodies.
-        if m.kind() == "line_comment"
+        let is_comment = matches!(m.kind(), "line_comment" | "block_comment");
+        if is_comment
             && let Some(p) = prev
             && cx.newlines_between(p, *m) == 0
         {
+            // EOL trailing comment — glue with one space.
             inner.push(Doc::text(" "));
             inner.push(Doc::text(cx.text(*m).to_string()));
             prev = Some(*m);
+            seen_member = true;
             continue;
         }
-        if let Some(p) = prev {
-            // Preserve user blank lines between members.
+        if seen_member && let Some(p) = prev {
             let nls = cx.newlines_between(p, *m);
             inner.push(Doc::hardline());
             if nls >= 2 {
@@ -450,6 +453,7 @@ fn lower_type_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
         inner.push(lower_node(cx, *m));
         prev = Some(*m);
+        seen_member = true;
     }
     Doc::concat(vec![
         Doc::text("{"),
@@ -463,8 +467,8 @@ fn lower_enum_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     // Always multi-line, like the TS reference's `rules.stmts` indent.
     // Walk every child in source order so the separator between fields
     // (either `,` or `;`) survives verbatim, and so a leading
-    // `line_comment` / `doc_comment` extra binds to the next field on
-    // its own line. Empty body still collapses to `{}`.
+    // `line_comment` / `block_comment` / `doc_comment` extra binds to
+    // the next field on its own line.
     let mut walker = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut walker).collect();
     let has_field = children.iter().any(|c| c.kind() == "enum_field");
@@ -492,12 +496,12 @@ fn lower_enum_body<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
                 inner.push(lower_node(cx, *c));
                 needs_hardline = true;
             }
-            "line_comment" => {
-                // EOL line comment on the same source line as whatever
-                // came before (typically the trailing `,` or `;`): glue
-                // it with a single space instead of demoting it. The
-                // pending separator is emitted first so the comment
-                // lands as `Field, // text`.
+            "line_comment" | "block_comment" => {
+                // EOL trailing comment on the same source line as
+                // whatever came before (typically the trailing `,` or
+                // `;`): glue it with a single space instead of demoting
+                // it. The pending separator is emitted first so the
+                // comment lands as `Field, // text` or `Field, /* … */`.
                 let is_eol = prev_node.is_some_and(|p| cx.newlines_between(p, *c) == 0);
                 if let Some(sep) = pending_sep.take() {
                     inner.push(Doc::text(sep.to_string()));
@@ -556,55 +560,39 @@ fn lower_block<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut walker = node.walk();
     let stmts: Vec<Node<'_>> = node.named_children(&mut walker).collect();
     if stmts.is_empty() {
-        // Edge: an empty `{}` may carry an EOL line_comment between
-        // braces. Detect it from the source for fixture parity.
         return lower_block_empty(cx, node);
     }
-    let lbrace_end = node
-        .child(0)
-        .map(|c| c.end_byte())
-        .unwrap_or(node.start_byte() + 1);
+    // Seed `prev` with the opening `{` so an EOL `line_comment` /
+    // `block_comment` on the same source line as `{` is glued with one
+    // space instead of demoted.
     let mut inner = Vec::new();
-    let mut prev_end: usize = lbrace_end;
+    let mut prev: Option<Node<'_>> = node.child(0);
+    let mut seen_stmt = false;
     for s in &stmts {
-        // Recover block comments + extra blank lines from the source
-        // gap. The grammar drops `_block_comment` (hidden), so the
-        // tree alone doesn't show them.
-        let gap_items = scan_gap(cx.source, prev_end..s.start_byte());
-        let mut nl_total: u32 = 0;
-        for it in gap_items {
-            match it {
-                GapItem::Newlines(n) => {
-                    nl_total += n;
-                }
-                GapItem::BlockComment(text) => {
-                    inner.push(Doc::hardline());
-                    if nl_total >= 2 {
-                        inner.push(Doc::hardline());
-                    }
-                    inner.push(Doc::text(text.to_string()));
-                    nl_total = 0;
-                }
-            }
-        }
-        // EOL `// ...` line comment on the same source line as whatever
-        // came before. Always glue with exactly one space — both after
-        // `{` (`{ //...`) and after a stmt (`<stmt>; //...`). The
-        // previous "no whitespace after stmt" rule was tracked as a
-        // bug in TODO.md (`var x; // comment` formatted to
-        // `var x;// comment`).
-        if s.kind() == "line_comment" && nl_total == 0 {
+        let is_comment = matches!(s.kind(), "line_comment" | "block_comment");
+        if is_comment
+            && let Some(p) = prev
+            && cx.newlines_between(p, *s) == 0
+        {
+            // EOL trailing comment — glue with exactly one space.
             inner.push(Doc::text(" "));
             inner.push(Doc::text(cx.text(*s).to_string()));
-            prev_end = s.end_byte();
+            prev = Some(*s);
+            seen_stmt = true;
             continue;
         }
-        inner.push(Doc::hardline());
-        if nl_total >= 2 {
+        if seen_stmt && let Some(p) = prev {
+            let nls = cx.newlines_between(p, *s);
+            inner.push(Doc::hardline());
+            if nls >= 2 {
+                inner.push(Doc::hardline());
+            }
+        } else {
             inner.push(Doc::hardline());
         }
         inner.push(lower_node(cx, *s));
-        prev_end = s.end_byte();
+        prev = Some(*s);
+        seen_stmt = true;
     }
     Doc::concat(vec![
         Doc::text("{"),
@@ -738,39 +726,47 @@ fn lower_type_params<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_type_decorator<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // `: <type_ident>` for both `attr_type` and `type_decorator`.
+    // `: <type_ident>` for both `attr_type` and `type_decorator`. With
+    // `block_comment` as a named extra, the fallback "first named
+    // child" lookup must skip comments so it lands on the real type.
     let mut parts = vec![Doc::text(": ")];
-    if let Some(t) = node.child_by_field_name("type") {
-        parts.push(lower_node(cx, t));
-    } else {
-        // attr_type's grammar doesn't carry the field name on its
-        // type_ident — it's the only named child.
+    let type_node = node.child_by_field_name("type").or_else(|| {
         let mut walker = node.walk();
-        for c in node.named_children(&mut walker) {
-            parts.push(lower_node(cx, c));
-        }
+        node.named_children(&mut walker)
+            .find(|c| !matches!(c.kind(), "block_comment" | "line_comment"))
+    });
+    if let Some(t) = type_node {
+        parts.push(lower_node(cx, t));
     }
     Doc::concat(parts)
 }
 
 fn lower_initializer<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // `= <expr>` for both `initializer` and `attr_init`.
-    let expr = node
-        .child_by_field_name("expr")
-        .or_else(|| {
-            let mut walker = node.walk();
-            node.named_children(&mut walker).next()
-        })
-        .map(|n| lower_node(cx, n))
-        .unwrap_or(Doc::nil());
-    Doc::concat(vec![Doc::text("= "), expr])
+    // `= <expr>` for both `initializer` and `attr_init`. The fallback
+    // "first named child" lookup must skip comments so it lands on the
+    // real expr.
+    let expr = node.child_by_field_name("expr").or_else(|| {
+        let mut walker = node.walk();
+        node.named_children(&mut walker)
+            .find(|c| !matches!(c.kind(), "block_comment" | "line_comment"))
+    });
+    let expr_doc = expr.map(|n| lower_node(cx, n)).unwrap_or(Doc::nil());
+    Doc::concat(vec![Doc::text("= "), expr_doc])
 }
 
 // -------- Args (call-site) --------
 
 fn lower_args_call<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut walker = node.walk();
-    let args: Vec<Node<'_>> = node.named_children(&mut walker).collect();
+    // Filter out comments — they'd otherwise be picked up as "args"
+    // and emitted in place of an actual argument. Inline-comment
+    // recovery at this site is left as future work; for now any
+    // file with `/* */` inside call args falls back to verbatim via
+    // the safety net in `format_tree_with`.
+    let args: Vec<Node<'_>> = node
+        .named_children(&mut walker)
+        .filter(|c| !matches!(c.kind(), "block_comment" | "line_comment"))
+        .collect();
     if args.is_empty() {
         return Doc::text("()");
     }
@@ -814,8 +810,11 @@ fn lower_var_decl<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_return_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    // Pick the first non-comment named child as the expr.
     let mut walker = node.walk();
-    let expr = node.named_children(&mut walker).next();
+    let expr = node
+        .named_children(&mut walker)
+        .find(|c| !matches!(c.kind(), "block_comment" | "line_comment"));
     if let Some(e) = expr {
         Doc::concat(vec![
             Doc::text("return "),
@@ -829,7 +828,9 @@ fn lower_return_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 
 fn lower_keyword_expr_stmt<'a>(cx: &Cx<'a>, node: Node<'a>, kw: &'static str) -> Doc {
     let mut walker = node.walk();
-    let expr = node.named_children(&mut walker).next();
+    let expr = node
+        .named_children(&mut walker)
+        .find(|c| !matches!(c.kind(), "block_comment" | "line_comment"));
     if let Some(e) = expr {
         Doc::concat(vec![
             Doc::text(format!("{kw} ")),
@@ -866,6 +867,12 @@ fn is_self_wrapping_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> bool {
         "binary_expr" => binary_op_text(cx, node)
             .and_then(|op| chain_group(&op))
             .is_some(),
+        // Brace-led constructs already wrap themselves in a Group at the
+        // `{` / `[` so they can break internally. Wrapping again under
+        // `return` / `throw` would demote the leading brace onto its own
+        // line ("return\n    Obj {…}"); pass them through instead so the
+        // open brace stays glued to the keyword.
+        "object_expr" => true,
         _ => false,
     }
 }
@@ -889,7 +896,6 @@ fn lower_if_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if let Some(t) = node.child_by_field_name("then_branch") {
         parts.push(lower_node(cx, t));
     }
-    // else_branch is optional, lives via _else_branch hidden rule
     let mut walker = node.walk();
     let mut saw_then = false;
     for c in node.named_children(&mut walker) {
@@ -1186,19 +1192,31 @@ fn lower_binary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
     }
 
-    let left = node.child_by_field_name("left").map(|n| lower_node(cx, n));
-    let right = node.child_by_field_name("right").map(|n| lower_node(cx, n));
-    let mut parts = Vec::new();
-    if let Some(l) = left {
-        parts.push(l);
-    }
-    parts.push(Doc::space());
-    parts.push(Doc::text(op));
-    parts.push(Doc::space());
-    if let Some(r) = right {
-        parts.push(r);
-    }
-    Doc::concat(parts)
+    let left = node
+        .child_by_field_name("left")
+        .map(|n| lower_node(cx, n))
+        .unwrap_or(Doc::nil());
+    let right = node
+        .child_by_field_name("right")
+        .map(|n| lower_node(cx, n))
+        .unwrap_or(Doc::nil());
+    // Wrap non-chain binops (`==`, `!=`, `<`, `>`, `<=`, `>=`, `=`, `?=`,
+    // `as`, `is`) in their own Group with a `Line` break-point before
+    // the operator. This makes the operator the outer break boundary —
+    // when the surrounding expression overflows, the binop breaks at the
+    // operator first, and any nested member/arrow chain inside `left` /
+    // `right` re-measures with the tighter column and stays flat when
+    // it fits. Without this group, the chain group is the only break
+    // opportunity and it fragments at every `.` instead.
+    Doc::group(Doc::concat(vec![
+        left,
+        Doc::indent(Doc::concat(vec![
+            Doc::line(),
+            Doc::text(op),
+            Doc::space(),
+            right,
+        ])),
+    ]))
 }
 
 /// Extract the operator text from a `binary_expr` — the first non-empty
@@ -1268,33 +1286,21 @@ fn collect_op_chain<'a>(
 }
 
 fn lower_unary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // Two shapes: prefix (`-x` / `!x` / `+x` / `*x` / `--x` / `++x`)
-    // and postfix (`x--` / `x++` / `x!!`). Distinguish by source order
-    // — the operator is anonymous; the operand is the named `_expr`
-    // sub-node.
+    // Prefix (`-x`, `!x`, `++x`) or postfix (`x++`, `x!!`). The
+    // operator is anonymous; the operand is the only named child
+    // (filter out `block_comment` / `line_comment` since they're now
+    // named extras).
     let mut walker = node.walk();
-    let mut leading: Vec<Doc> = Vec::new();
-    let mut trailing: Vec<Doc> = Vec::new();
-    let mut saw_named = false;
+    let mut parts: Vec<Doc> = Vec::new();
     for c in node.children(&mut walker) {
         if c.is_named() {
-            leading.push(lower_node(cx, c));
-            saw_named = true;
-        } else if !c.byte_range().is_empty() {
-            let text = cx.text(c).to_string();
-            if saw_named {
-                trailing.push(Doc::text(text));
-            } else {
-                leading.insert(leading.len().saturating_sub(0), Doc::text(text));
+            if !matches!(c.kind(), "block_comment" | "line_comment") {
+                parts.push(lower_node(cx, c));
             }
+        } else if !c.byte_range().is_empty() {
+            parts.push(Doc::text(cx.text(c).to_string()));
         }
     }
-    // Reorder: `leading` already has prefix-op then operand in source
-    // order if the prefix came first; the `insert` above is a no-op
-    // because we only encountered ops before any named child.
-    let mut parts = Vec::new();
-    parts.extend(leading);
-    parts.extend(trailing);
     Doc::concat(parts)
 }
 
@@ -1350,11 +1356,13 @@ fn lower_object_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 
 fn lower_object_initializers<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut walker = node.walk();
-    let inits: Vec<Node<'_>> = node.named_children(&mut walker).collect();
+    let inits: Vec<Node<'_>> = node
+        .named_children(&mut walker)
+        .filter(|c| !matches!(c.kind(), "block_comment" | "line_comment"))
+        .collect();
     if inits.is_empty() {
         return Doc::text("{}");
     }
-    // `{ a, b, c }` — fields_spaced when fits, multiline otherwise.
     let mut inner = Vec::new();
     inner.push(Doc::line());
     for (i, e) in inits.iter().enumerate() {
@@ -1374,7 +1382,10 @@ fn lower_object_initializers<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 
 fn lower_object_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut walker = node.walk();
-    let fields: Vec<Node<'_>> = node.named_children(&mut walker).collect();
+    let fields: Vec<Node<'_>> = node
+        .named_children(&mut walker)
+        .filter(|c| !matches!(c.kind(), "block_comment" | "line_comment"))
+        .collect();
     if fields.is_empty() {
         return Doc::text("{}");
     }
@@ -1409,7 +1420,10 @@ fn lower_object_field<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 
 fn lower_array_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     let mut walker = node.walk();
-    let elems: Vec<Node<'_>> = node.named_children(&mut walker).collect();
+    let elems: Vec<Node<'_>> = node
+        .named_children(&mut walker)
+        .filter(|c| !matches!(c.kind(), "block_comment" | "line_comment"))
+        .collect();
     if elems.is_empty() {
         return Doc::text("[]");
     }

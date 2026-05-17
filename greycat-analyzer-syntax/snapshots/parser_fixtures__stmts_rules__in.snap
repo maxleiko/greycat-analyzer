@@ -1,5 +1,6 @@
 ---
 source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
 expression: "/// Foo\n@bar\n/// Baz\n\n\nfn main() {\n    var x = 0;\n        var y = 1;\nvar z = 2;\n\n    /* block comment */\n    if (x < z) {\n        var x = 1;\n\nprintln(\"hello\");\n    }\n}\n"
 ---
 (module
@@ -40,6 +41,7 @@ expression: "/// Foo\n@bar\n/// Baz\n\n\nfn main() {\n    var x = 0;\n        va
           )
         )
       )
+      (block_comment '/* block comment */')
       (if_stmt
         condition: (binary_expr
           left: (ident 'x')
