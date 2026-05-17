@@ -195,33 +195,41 @@ fn build(n: String, a: int): Foo {
         assert_eq!(&symbols[hir.idents[*name_use].symbol], "n");
     }
 
-    // P43.3
-    /// `if (c.sim.)` — the user's repro shape. Tree-sitter recovers
-    /// `(block (ERROR (member_expr (ident "c") property: (ident "sim"))))`.
-    /// Lowering must salvage the `member_expr` into the block's stmts
-    /// (wrapped as `Stmt::Expr`) and tag the stmt id as salvaged so
-    /// completion's HIR fast path finds the typed receiver — without
-    /// this every IDE capability silently degrades to "no result"
-    /// inside ERROR recovery.
+    /// `if (c.sim.)` — the user's repro shape. Originally
+    /// (P43.3) the grammar required a property after `.` so the
+    /// trailing `.` triggered tree-sitter ERROR-recovery wrapping
+    /// the inner `member_expr (c, sim)`, and HIR salvage lifted it
+    /// into the block's stmts so completion could see the receiver.
+    /// The grammar later relaxed `member_expr.property` to optional
+    /// (mirroring `static_expr`) so `c.sim.` now parses as a
+    /// well-formed nested `member_expr` — no ERROR. The salvage
+    /// invariant moved: `salvage_incomplete_members_in_block` now
+    /// walks the block's CST for member/arrow exprs with a missing
+    /// property and lifts their receivers as `Stmt::Expr` salvage,
+    /// so the analyzer types them and IDE capabilities still work
+    /// on the receiver.
     #[test]
-    fn block_lowering_salvages_member_expr_inside_error() {
+    fn block_lowering_salvages_incomplete_member_receiver() {
         let src = "type Ctx { sim: int; }\nfn test(c: Ctx) {\n    if (c.sim.)\n}\n";
         let tree = parse(src);
         let symbols = SymbolTable::default();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
         let module = hir.module.as_ref().unwrap();
-        // The fn_decl is the second top-level decl (Ctx is first).
-        let fn_decl = module.decls.iter().find_map(|d| match &hir.decls[*d] {
-            Decl::Fn(fnd) => Some(fnd),
-            _ => None,
-        });
-        let fn_decl = fn_decl.expect("fn_decl lowered");
+        let fn_decl = module
+            .decls
+            .iter()
+            .find_map(|d| match &hir.decls[*d] {
+                Decl::Fn(fnd) => Some(fnd),
+                _ => None,
+            })
+            .expect("fn_decl lowered");
         let body = fn_decl.body.expect("fn body lowered");
         let Stmt::Block(block) = &hir.stmts[body] else {
             panic!("body is a block");
         };
-        // Expect exactly one salvaged Stmt::Expr wrapping `c.sim`.
-        let salvaged_member_exprs: Vec<_> = block
+        // Expect exactly one salvaged Stmt::Expr wrapping a
+        // `Member(c, sim)` receiver, tagged salvaged so lints skip it.
+        let salvaged_members: Vec<_> = block
             .stmts
             .iter()
             .filter(|s| match &hir.stmts[**s] {
@@ -230,13 +238,13 @@ fn build(n: String, a: int): Foo {
             })
             .collect();
         assert_eq!(
-            salvaged_member_exprs.len(),
+            salvaged_members.len(),
             1,
-            "exactly one salvaged member_expr stmt expected in the block"
+            "exactly one salvaged member-receiver stmt expected, got: {:?}",
+            block.stmts
         );
-        let stmt_id = *salvaged_member_exprs[0];
         assert!(
-            hir.salvaged_stmts.contains(&stmt_id),
+            hir.salvaged_stmts.contains(salvaged_members[0]),
             "salvaged stmt id must be tagged in Hir::salvaged_stmts"
         );
     }

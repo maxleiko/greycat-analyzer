@@ -559,10 +559,60 @@ fn lower_block_inline(
         }
         stmts.push(s_id);
     }
+    salvage_incomplete_members_in_block(cx, node, &mut stmts);
     Some(crate::types::BlockStmt {
         stmts: stmts.into_boxed_slice(),
         byte_range: node.byte_range(),
     })
+}
+
+/// Walk the block's CST subtree (stopping at nested `block` nodes)
+/// for `member_expr` / `arrow_expr` whose `property` field is missing,
+/// lower each receiver as a `Stmt::Expr` salvage, and append it to
+/// the block's stmt list with the `salvaged` tag.
+///
+/// Why: the grammar accepts `s.` / `c.sim.` mid-typing (no
+/// ERROR-cascade) but the outer incomplete member lowers as
+/// `Expr::Unsupported` — the analyzer never visits its receiver, so
+/// completion / hover / goto-def / references on the receiver return
+/// nothing. Lifting the receiver into the block's stmt list mirrors
+/// the original P43.3 ERROR-recovery salvage path: the analyzer
+/// types the salvaged expr normally and IDE capabilities find it
+/// via the cached HIR fast path.
+fn salvage_incomplete_members_in_block(
+    cx: &mut LowerCtx,
+    block: tree_sitter::Node<'_>,
+    stmts: &mut Vec<Idx<Stmt>>,
+) {
+    fn walk(cx: &mut LowerCtx, node: tree_sitter::Node<'_>, out: &mut Vec<Idx<Stmt>>) {
+        let kind = node.kind();
+        if (kind == "member_expr" || kind == "arrow_expr")
+            && node.child_by_field_name("property").is_none()
+            && let Some(receiver) = node.named_child(0)
+            && let Some(e) = lower_expr(cx, receiver)
+        {
+            let s_id = cx.hir.stmts.alloc(Stmt::Expr(e));
+            cx.hir.salvaged_stmts.insert(s_id);
+            out.push(s_id);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            // Don't descend into nested blocks — their own
+            // `lower_block` invocation will salvage their incomplete
+            // members.
+            if child.kind() == "block" {
+                continue;
+            }
+            walk(cx, child, out);
+        }
+    }
+    let mut cursor = block.walk();
+    for child in block.children(&mut cursor) {
+        if child.kind() == "block" {
+            continue;
+        }
+        walk(cx, child, stmts);
+    }
 }
 
 fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt>> {
@@ -927,7 +977,21 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             Expr::Paren(inner, node.byte_range())
         }
         "member_expr" => {
-            let prop = node.child_by_field_name("property")?;
+            // Same lax-parser rationale as `static_expr` below: the
+            // grammar accepts `s.` so mid-typing doesn't ERROR-cascade.
+            // Lower the no-property case as Unsupported; the hard
+            // diagnostic comes from `core::diagnostics`. The receiver
+            // is salvaged into the enclosing block as a `Stmt::Expr`
+            // by `lower_block`'s `salvage_incomplete_members_in_block`
+            // post-pass so the analyzer types it and IDE capabilities
+            // (completion / hover / goto-def / references) still work.
+            let Some(prop) = node.child_by_field_name("property") else {
+                let id = cx.hir.exprs.alloc(Expr::Unsupported {
+                    kind: "member_expr_missing_property",
+                    byte_range: node.byte_range(),
+                });
+                return Some(id);
+            };
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_property_name(prop);
@@ -941,7 +1005,14 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "arrow_expr" => {
-            let prop = node.child_by_field_name("property")?;
+            // See `member_expr` arm.
+            let Some(prop) = node.child_by_field_name("property") else {
+                let id = cx.hir.exprs.alloc(Expr::Unsupported {
+                    kind: "arrow_expr_missing_property",
+                    byte_range: node.byte_range(),
+                });
+                return Some(id);
+            };
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_property_name(prop);

@@ -30,11 +30,12 @@ pub const DIAGNOSTIC_SOURCE: &str = "greycat-analyzer";
 /// `ERROR` / `MISSING` recoveries plus the "permissive-grammar,
 /// strict-analyzer" shape checks for constructs the grammar accepts
 /// to keep mid-edit recovery clean but the analyzer rejects on
-/// semantic grounds (`Foo::` with no property, non-native/non-abstract
-/// functions without a body, `var` with no name, `var` terminated by
-/// auto-semi rather than an explicit `;`, …). Every call site (CLI
-/// lint, LSP backend, WASM bridge) goes through this single entry
-/// point so a new shape check is one edit here, not five.
+/// semantic grounds (`Foo::` / `s.` / `s->` with no property,
+/// non-native/non-abstract functions without a body, `var` with no
+/// name, `var` terminated by auto-semi rather than an explicit `;`,
+/// …). Every call site (CLI lint, LSP backend, WASM bridge) goes
+/// through this single entry point so a new shape check is one edit
+/// here, not five.
 pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     if root.has_error() || root.is_missing() {
@@ -50,9 +51,21 @@ pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagn
 /// walker wired at every call site.
 fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
     match node.kind() {
-        "static_expr" => check_static_property(node, source, out),
+        "static_expr" => check_property_after(node, source, out, "::"),
+        "member_expr" => check_property_after(node, source, out, "."),
+        "arrow_expr" => check_property_after(node, source, out, "->"),
         "fn_decl" | "type_method" => check_function_body(node, source, out),
-        "var_decl" => check_var_decl(node, source, out),
+        "var_decl" => {
+            check_var_name(node, source, out);
+            check_explicit_semi(node, source, out);
+        }
+        // Every stmt kind whose terminator is `choice(_semi, _automatic_semicolon)`
+        // in grammar.js — the ASI is a parser convenience for mid-edit
+        // recovery, never semantically valid GreyCat.
+        "expr_stmt" | "return_stmt" | "throw_stmt" | "break_stmt" | "continue_stmt"
+        | "breakpoint_stmt" | "do_while_stmt" | "modvar" => {
+            check_explicit_semi(node, source, out);
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -61,21 +74,34 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
     }
 }
 
-/// `Foo::` parses as a well-formed `static_expr` under the
-/// permissive grammar; the semantic requirement that an identifier
-/// or string property follow `::` is enforced here. Diagnostic
-/// range points at the dangling `::` token.
-fn check_static_property(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+/// `Foo::` / `s.` / `s->` all parse as well-formed `static_expr` /
+/// `member_expr` / `arrow_expr` under the permissive grammar so a
+/// mid-edit caret doesn't ERROR-recover the following statement; the
+/// semantic requirement that an identifier or string property follow
+/// the separator is enforced here. `sep` is the literal separator
+/// token (`"::"`, `"."`, `"->"`) — diagnostic range points at it.
+fn check_property_after(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    out: &mut Vec<Diagnostic>,
+    sep: &str,
+) {
     if node.child_by_field_name("property").is_some() {
         return;
     }
-    let sep_range = static_separator_range(node, source).unwrap_or(node.byte_range());
+    let sep_range = separator_range(node, source, sep).unwrap_or(node.byte_range());
+    let code = match sep {
+        "::" => "missing-static-property",
+        "." => "missing-member-property",
+        "->" => "missing-arrow-property",
+        _ => "missing-property",
+    };
     out.push(Diagnostic {
         range: byte_range_to_lsp(source, &sep_range),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: Some(NumberOrString::String("missing-static-property".into())),
+        code: Some(NumberOrString::String(code.into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
-        message: "expected identifier or string property after `::`".into(),
+        message: format!("expected identifier or string property after `{sep}`"),
         ..Default::default()
     });
 }
@@ -108,27 +134,34 @@ fn check_function_body(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
     });
 }
 
-/// `var` parses with optional `name` and accepts an auto-semi terminator
-/// so mid-edit `var ` doesn't ERROR-recover the next line. Real GreyCat
-/// requires both: a name AND an explicit `;`. Two diagnostics may fire
-/// per stmt (name and semi are independent).
-fn check_var_decl(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
-    // Missing name → caret just after the `var` keyword.
-    if node.child_by_field_name("name").is_none() {
-        let after_var = keyword_end(node, source, "var").unwrap_or(node.end_byte());
-        let range = after_var..after_var;
-        out.push(Diagnostic {
-            range: byte_range_to_lsp(source, &range),
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String("missing-var-name".into())),
-            source: Some(DIAGNOSTIC_SOURCE.into()),
-            message: "expected variable name after `var`".into(),
-            ..Default::default()
-        });
+/// `var` parses with optional `name` so mid-edit `var ` doesn't
+/// ERROR-recover the next line. Real GreyCat requires a name. Caret
+/// just after the `var` keyword.
+fn check_var_name(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    if node.child_by_field_name("name").is_some() {
+        return;
     }
-    // Auto-semi (zero-width external token) is permitted by the
-    // grammar but not by the analyzer. Walk children; explicit `;`
-    // has a one-byte source range, auto-semi is zero-width.
+    let after_var = keyword_end(node, source, "var").unwrap_or(node.end_byte());
+    let range = after_var..after_var;
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("missing-var-name".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: "expected variable name after `var`".into(),
+        ..Default::default()
+    });
+}
+
+/// Every stmt whose terminator is `choice(_semi, _automatic_semicolon)`
+/// can be closed by the external scanner's zero-width auto-semi token
+/// (newline / `}` / EOF) so partial source parses cleanly while editing.
+/// Auto-semi is a parser convenience, not valid GreyCat — an explicit
+/// `;` is required. Walk the node's children: an explicit `;` is a
+/// one-byte token whose source text is `";"`; auto-semi is zero-width
+/// and has no source text. Caret points at the end of the last real
+/// token (where the `;` should have been written).
+fn check_explicit_semi(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
     let mut explicit_semi = false;
     let mut last_real_end = node.start_byte();
     let mut cursor = node.walk();
@@ -142,17 +175,18 @@ fn check_var_decl(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagn
             explicit_semi = true;
         }
     }
-    if !explicit_semi {
-        let range = last_real_end..last_real_end;
-        out.push(Diagnostic {
-            range: byte_range_to_lsp(source, &range),
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String("missing-semicolon".into())),
-            source: Some(DIAGNOSTIC_SOURCE.into()),
-            message: "expected `;` at end of `var` statement".into(),
-            ..Default::default()
-        });
+    if explicit_semi {
+        return;
     }
+    let range = last_real_end..last_real_end;
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("missing-semicolon".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: "expected `;` at end of statement".into(),
+        ..Default::default()
+    });
 }
 
 /// End-byte of the first child of `node` whose source text equals
@@ -181,13 +215,14 @@ fn has_modifier(node: Option<tree_sitter::Node<'_>>, source: &str, needle: &str)
     false
 }
 
-/// Find the byte range of the `::` token inside a `static_expr` —
-/// the unnamed child that isn't the receiver and isn't the property.
-/// Falls back to the whole node range when the operator can't be
-/// isolated.
-fn static_separator_range(
+/// Find the byte range of the literal separator token `sep` (`::` /
+/// `.` / `->`) inside a static_/member_/arrow_expr — the unnamed
+/// child whose source text matches. Falls back to the whole node
+/// range when the operator can't be isolated.
+fn separator_range(
     node: tree_sitter::Node<'_>,
     source: &str,
+    sep: &str,
 ) -> Option<std::ops::Range<usize>> {
     let mut cursor = node.walk();
     for c in node.children(&mut cursor) {
@@ -195,7 +230,7 @@ fn static_separator_range(
             continue;
         }
         let range = c.byte_range();
-        if source.get(range.clone()) == Some("::") {
+        if source.get(range.clone()) == Some(sep) {
             return Some(range);
         }
     }
@@ -704,6 +739,39 @@ mod tests {
         );
     }
 
+    /// `s.` (no property) parses cleanly under the permissive
+    /// grammar; `missing-member-property` fires here.
+    #[test]
+    fn missing_member_property_surfaces() {
+        let src = "fn f(s: String) {\n    s.\n    if (true) {}\n}\n";
+        let ds = diags(src);
+        let cs = codes(&ds);
+        assert!(cs.contains(&"missing-member-property"), "got: {ds:?}");
+        // Following `if` should parse, not ERROR-cascade.
+        assert!(!cs.contains(&"parse-error"), "got: {ds:?}");
+    }
+
+    /// `s->` (no property) parses cleanly under the permissive
+    /// grammar; `missing-arrow-property` fires here.
+    #[test]
+    fn missing_arrow_property_surfaces() {
+        let src = "fn f(s: node) {\n    s->\n    if (true) {}\n}\n";
+        let ds = diags(src);
+        let cs = codes(&ds);
+        assert!(cs.contains(&"missing-arrow-property"), "got: {ds:?}");
+        assert!(!cs.contains(&"parse-error"), "got: {ds:?}");
+    }
+
+    /// Well-formed `s.length` and `s->name` don't trip the
+    /// missing-property diagnostics.
+    #[test]
+    fn well_formed_member_arrow_no_diag() {
+        let ds = diags("fn f(s: String, n: node) {\n    s.length;\n    n->name;\n}\n");
+        let cs = codes(&ds);
+        assert!(!cs.contains(&"missing-member-property"), "got: {ds:?}");
+        assert!(!cs.contains(&"missing-arrow-property"), "got: {ds:?}");
+    }
+
     /// Non-native, non-abstract function declared without a body
     /// surfaces a `missing-function-body` error. Catches both
     /// top-level `fn_decl` and `type_method` shapes.
@@ -775,6 +843,50 @@ mod tests {
         let cs = codes(&ds);
         assert!(!cs.contains(&"missing-var-name"), "got: {ds:?}");
         assert!(!cs.contains(&"missing-semicolon"), "got: {ds:?}");
+    }
+
+    /// Expression statement terminated by ASI (newline before `}`)
+    /// fires `missing-semicolon`. The arrow_expr `f->n` parses cleanly
+    /// (with property `n`); only the missing `;` is flagged.
+    #[test]
+    fn expr_stmt_asi_termination_flagged() {
+        let src = "fn f() {\n    bar()\n}\n";
+        let ds = diags(src);
+        assert!(codes(&ds).contains(&"missing-semicolon"), "got: {ds:?}");
+    }
+
+    /// `return value` terminated by ASI fires `missing-semicolon`.
+    #[test]
+    fn return_stmt_asi_termination_flagged() {
+        let src = "fn f(): int {\n    return 1\n}\n";
+        let ds = diags(src);
+        assert!(codes(&ds).contains(&"missing-semicolon"), "got: {ds:?}");
+    }
+
+    /// `break` / `continue` / `throw` / `breakpoint` ASI-terminated
+    /// all flagged.
+    #[test]
+    fn stmt_keywords_asi_termination_flagged() {
+        for src in [
+            "fn f() {\n    while (true) {\n        break\n    }\n}\n",
+            "fn f() {\n    while (true) {\n        continue\n    }\n}\n",
+            "fn f() {\n    throw 0\n}\n",
+            "fn f() {\n    breakpoint\n}\n",
+        ] {
+            let ds = diags(src);
+            assert!(
+                codes(&ds).contains(&"missing-semicolon"),
+                "missing-semicolon expected for: {src:?}, got: {ds:?}"
+            );
+        }
+    }
+
+    /// Well-formed statements with explicit `;` don't fire.
+    #[test]
+    fn explicit_semi_no_diag() {
+        let src = "fn f(): int {\n    bar();\n    throw 0;\n    return 1;\n}\n";
+        let ds = diags(src);
+        assert!(!codes(&ds).contains(&"missing-semicolon"), "got: {ds:?}");
     }
 
     // P15.5
