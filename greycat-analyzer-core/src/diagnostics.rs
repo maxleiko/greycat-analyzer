@@ -600,9 +600,9 @@ pub fn format_cli(path: &str, diag: &Diagnostic, color: bool) -> String {
             _ => "\x1b[1m",                                  // bold
         };
         let reset = "\x1b[0m";
-        let bold = "\x1b[1m";
+        let grey = "\x1b[90m";
         format!(
-            "{bold}{}:{}:{}:{reset} {sev_color}{severity}{code}{reset}: {}",
+            "{grey}{}:{}:{}:{reset} {sev_color}{severity}{code}{reset}: {}",
             path,
             diag.range.start.line + 1,
             diag.range.start.character + 1,
@@ -1105,9 +1105,10 @@ mod tests {
         );
     }
 
-    /// With `color=true` the path is bolded and the `severity[code]`
-    /// is bold-colored (red for error, yellow for warning, …). ANSI
-    /// reset closes both runs. Plain text remains in the message.
+    /// With `color=true` the path:line:col is grey (bright black)
+    /// and the `severity[code]` is bold-colored per severity (red /
+    /// yellow / blue / cyan). ANSI reset closes both runs. The
+    /// message stays plain.
     #[test]
     fn format_cli_color_ansi() {
         let diag = Diagnostic {
@@ -1129,7 +1130,7 @@ mod tests {
         let out = format_cli("a.gcl", &diag, true);
         assert_eq!(
             out,
-            "\x1b[1ma.gcl:1:1:\x1b[0m \x1b[1;31merror[unknown-member]\x1b[0m: boom"
+            "\x1b[90ma.gcl:1:1:\x1b[0m \x1b[1;31merror[unknown-member]\x1b[0m: boom"
         );
     }
 }

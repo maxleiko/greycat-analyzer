@@ -559,20 +559,35 @@ impl Lint {
             OutputFormat::Csv => render_csv_timings(&mut entries)?,
             OutputFormat::Compact | OutputFormat::Pretty => {
                 entries.sort_by(|a, b| a.path.cmp(&b.path));
+                // When color is on (terminal-readable), shorten paths
+                // relative to the project root (parent of project.gcl)
+                // so the eye lands on the file/line, not on a long
+                // absolute prefix. When color is off, keep absolute
+                // paths — grep, the parity oracle, and CI consumers
+                // depend on the stable absolute shape.
+                let color = self.color.enabled();
+                let project_root = project_filepath.parent();
                 for e in &entries {
-                    let path = e.path.display().to_string();
+                    let path = if color {
+                        project_root
+                            .and_then(|root| e.path.strip_prefix(root).ok())
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| e.path.display().to_string())
+                    } else {
+                        e.path.display().to_string()
+                    };
                     let source = std::fs::read_to_string(&e.path).unwrap_or_default();
                     for diag in &e.diagnostics {
                         match render {
                             OutputFormat::Compact => {
-                                println!("{}", format_cli(&path, diag, self.color.enabled()))
+                                println!("{}", format_cli(&path, diag, color))
                             }
                             OutputFormat::Pretty => print_pretty_diagnostic(&path, &source, diag),
                             OutputFormat::Csv | OutputFormat::Quiet => {}
                         }
                     }
                 }
-                print_summary(&entries, total, self.color.enabled());
+                print_summary(&entries, total, color);
             }
             OutputFormat::Quiet => print_summary(&entries, total, self.color.enabled()),
         }
