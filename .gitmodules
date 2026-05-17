@@ -1,3 +1,6 @@
 [submodule "tree-sitter-greycat"]
 	path = tree-sitter-greycat
 	url = git@github.com:maxleiko/tree-sitter-greycat.git
+[submodule "editors/zed"]
+	path = editors/zed
+	url = git@github.com:maxleiko/zed-greycat-extension.git

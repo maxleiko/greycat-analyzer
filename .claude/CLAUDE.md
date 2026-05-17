@@ -22,6 +22,27 @@ Rust edition 2024. Workspace resolver `"3"`. Workspace metadata (`license = "MIT
 
 Dependency direction: `syntax → core → hir → types → analysis → {ls, cli, wasm, fmt}`.
 
+### Editor integrations
+
+| Path | Source-of-truth | Notes |
+|---|---|---|
+| [editors/code/](../editors/code/) | Committed in this repo | VSCode extension. TextMate grammar (`grammar/Greycat.tmLanguage.json`) + snippets + LSP client glue. |
+| [editors/zed/](../editors/zed/) | **Git submodule** → [maxleiko/zed-greycat-extension](https://github.com/maxleiko/zed-greycat-extension) | Zed extension. Two things to know:<br>1. `extension.toml` has `[grammars.greycat] commit = "<sha>"` — it pins a `tree-sitter-greycat` SHA **independently** of this repo's submodule pointer. Whenever you push a new commit to `maxleiko/tree-sitter-greycat`, that SHA needs to be bumped here too.<br>2. The query files under `languages/greycat/` (`highlights.scm`, `folds.scm`, `indents.scm`, `brackets.scm`) are **separate copies**, not inherited from `tree-sitter-greycat/queries/`. Edits to grammar queries must be mirrored here. |
+
+#### Grammar-edit propagation checklist
+
+When a commit lands in `tree-sitter-greycat`, the propagation order is:
+
+1. Commit + push the grammar change in the submodule (→ `maxleiko/tree-sitter-greycat`).
+2. Bump this repo's `tree-sitter-greycat` submodule pointer (Rust crates build against the new SHA).
+3. **If the change affects grammar queries** (`queries/*.scm`) — copy the diff into `editors/zed/languages/greycat/*.scm`.
+4. **Always** bump the grammar SHA inside `editors/zed/extension.toml` (`[grammars.greycat] commit`).
+5. Commit + push inside `editors/zed/` (→ `maxleiko/zed-greycat-extension`).
+6. Bump this repo's `editors/zed/` submodule pointer.
+7. Publishing the new Zed extension version to `zed-industries/extensions` is a separate flow handled by the [`publish-zed-extension`](../.claude/commands/) skill (only when shipping a user-visible release).
+
+Steps 3 + 4 are the easy-to-miss part: queries don't propagate automatically and a stale `extension.toml` SHA means Zed users compile against the old grammar.
+
 ## Project model
 
 GreyCat projects have a single entrypoint (conventionally `project.gcl`) whose `@library` / `@include` mod-pragmas form the closure of analyzed modules. **Never flat-walk a directory for `.gcl` files** — go through [`SourceManager::load_project(entrypoint)`](../greycat-analyzer-core/src/manager.rs), which:
@@ -201,6 +222,7 @@ Whenever you teach the analyzer about a new reserved word or statement form (ver
 | LSP `stmt_byte_range` arm | [greycat-analyzer-server/src/conv.rs](../greycat-analyzer-server/src/conv.rs) (the `match stmt` in `stmt_byte_range`) | When you added a new `Stmt` variant. If the HIR variant has no `byte_range` field (unit variant like `Break` / `Continue` / `Breakpoint`), the arm returns `0..0` and capability handlers fall back to the surrounding CST node — same shape as the existing precedent. |
 | VSCode TextMate grammar | [editors/code/grammar/Greycat.tmLanguage.json](../editors/code/grammar/Greycat.tmLanguage.json) | When the keyword should highlight in editors that don't speak tree-sitter (the bundled VSCode extension uses TM, not tree-sitter, for syntax). Add to whichever alternation matches the keyword's category (control-flow exit-shape, declaration, modifier, etc.). |
 | Snippets (optional) | [editors/code/snippets/snippets.json](../editors/code/snippets/snippets.json) | When the keyword is verbose enough that a short trigger helps (`bp` → `breakpoint;`). |
+| Zed extension grammar SHA + queries | [editors/zed/extension.toml](../editors/zed/extension.toml) (`[grammars.greycat] commit`) + [editors/zed/languages/greycat/](../editors/zed/languages/greycat/) (`highlights.scm` / `folds.scm` / `indents.scm` / `brackets.scm`) | **Always** when the grammar SHA moves; **also** when `queries/*.scm` in the grammar change (the Zed extension carries its own copies — they don't propagate). Then commit + push inside the submodule (→ `maxleiko/zed-greycat-extension`) and bump this repo's `editors/zed/` submodule pointer. See "Grammar-edit propagation checklist" above. |
 
 Verification before commit: `cd tree-sitter-greycat && npx tree-sitter test && npx tree-sitter parse project.gcl | grep -c ERROR` (expect `0`); from the parent, `cargo test --workspace` (the unsupported_audit and any new corpus tests run here) and a manual `cargo run -p greycat-analyzer -- fmt path/to/snippet.gcl --mode=stdout` round-trip on a file using the new construct.
 
