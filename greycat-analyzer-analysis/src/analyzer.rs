@@ -155,6 +155,12 @@ pub enum DiagCategory {
 #[derive(Debug, Clone)]
 pub struct SemanticDiagnostic {
     pub severity: Severity,
+    /// Stable kebab-case rule / check identifier used by the editor's
+    /// `[code]` rendering, the cli's compact `severity[code]:` line,
+    /// and the LSP `Diagnostic.code` field. Every emission site picks
+    /// a fixed `&'static str` (not derived from `message`) so tooling
+    /// can stably reference a check.
+    pub code: &'static str,
     pub message: String,
     pub byte_range: Range<usize>,
     pub category: DiagCategory,
@@ -165,9 +171,15 @@ impl SemanticDiagnostic {
     /// that emit non-type-relation diagnostics. Type-relation
     /// callers (only the project pipeline's validation pass) must
     /// build the struct literally so the category is explicit.
-    pub fn structural(severity: Severity, message: String, byte_range: Range<usize>) -> Self {
+    pub fn structural(
+        severity: Severity,
+        code: &'static str,
+        message: String,
+        byte_range: Range<usize>,
+    ) -> Self {
         Self {
             severity,
+            code,
             message,
             byte_range,
             category: DiagCategory::Structural,
@@ -498,6 +510,7 @@ pub fn analyze_with_index_into(
         let ident = &hir.idents[ident_idx];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
+            "unresolved-name",
             format!("unresolved name `{}`", &index.symbols[ident.symbol]),
             ident.byte_range.clone(),
         ));
@@ -520,6 +533,7 @@ pub fn analyze_with_index_into(
         let name = &index.symbols[ident.symbol];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
+            "ambiguous-symbol",
             format!(
                 "ambiguous-symbol: `{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
                 module_names.len(),
@@ -547,6 +561,7 @@ pub fn analyze_with_index_into(
             let first_over_limit = generics[MAX_GENERICS];
             out.diagnostics.push(SemanticDiagnostic::structural(
                 Severity::Error,
+                "too-many-generics",
                 format!(
                     "{kind_label} `{}` has {} generic parameters; \
                      the GreyCat runtime supports at most {MAX_GENERICS}",
@@ -578,6 +593,7 @@ pub fn analyze_with_index_into(
         };
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
+            "invalid-literal",
             message,
             byte_range.clone(),
         ));
@@ -1622,13 +1638,20 @@ impl<'a> Cx<'a> {
         });
     }
 
-    fn diag(&mut self, severity: Severity, message: impl Into<String>, range: Range<usize>) {
+    fn diag(
+        &mut self,
+        severity: Severity,
+        code: &'static str,
+        message: impl Into<String>,
+        range: Range<usize>,
+    ) {
         // The analyzer's first pass only emits structural diagnostics
         // (unresolved names, member-resolution failures, exhaustiveness,
         // …). Type-relation diagnostics live in the project pipeline's
         // `validate_type_relations` post-pass — see `DiagCategory`.
         self.out.diagnostics.push(SemanticDiagnostic::structural(
             severity,
+            code,
             message.into(),
             range,
         ));
@@ -2052,15 +2075,22 @@ impl<'a> Cx<'a> {
             .to_string();
             let prop_text = self.ident_text(property).to_string();
             let prop_range = self.hir.idents[property].byte_range.clone();
-            let message = if instance_access {
-                format!(
-                    "enum `{recv_display}` has no instance members; access fields via `{recv_display}::{prop_text}`"
+            let (code, message) = if instance_access {
+                (
+                    "enum-no-instance-members",
+                    format!(
+                        "enum `{recv_display}` has no instance members; access fields via `{recv_display}::{prop_text}`"
+                    ),
                 )
             } else {
-                format!("enum `{recv_display}` has no field `{prop_text}`")
+                (
+                    "unknown-enum-field",
+                    format!("enum `{recv_display}` has no field `{prop_text}`"),
+                )
             };
             self.out.diagnostics.push(SemanticDiagnostic::structural(
                 Severity::Error,
+                code,
                 message,
                 prop_range,
             ));
@@ -2183,13 +2213,14 @@ impl<'a> Cx<'a> {
         .to_string();
         let prop_text_owned = prop_text.to_string();
         let prop_range = self.hir.idents[property].byte_range.clone();
-        let kind = if instance_access {
-            "member"
+        let (code, kind) = if instance_access {
+            ("unknown-member", "member")
         } else {
-            "static member"
+            ("unknown-static-member", "static member")
         };
         self.out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
+            code,
             format!("type `{recv_display}` has no {kind} `{prop_text_owned}`"),
             prop_range,
         ));
@@ -2875,6 +2906,7 @@ impl<'a> Cx<'a> {
         let type_name: &str = &self.index.symbols[head_sym];
         self.diag(
             Severity::Error,
+            "missing-required-fields",
             format!(
                 "missing required field{plural} for `{type_name}`: {joined} (non-nullable and no default)"
             ),
@@ -3057,7 +3089,12 @@ impl<'a> Cx<'a> {
                         self.display(prior),
                         self.display(witness),
                     );
-                    self.diag(Severity::Error, msg, call_range.clone());
+                    self.diag(
+                        Severity::Error,
+                        "generic-inference-conflict",
+                        msg,
+                        call_range.clone(),
+                    );
                 }
                 return;
             }
@@ -3138,6 +3175,7 @@ impl<'a> Cx<'a> {
                 .unwrap_or_else(|| self.hir.idents[d.name].byte_range.clone());
             self.diag(
                 Severity::Error,
+                "inheritance-too-deep",
                 format!(
                     "inheritance chain too deep: `{type_name}` is {chain_len} levels deep; \
                      greycat allows at most {limit}"
@@ -3460,7 +3498,7 @@ impl<'a> Cx<'a> {
                             "exhaustive `is`-check: every concrete runtime case of `{known_disp}` is covered; the {dead}-branch is unreachable",
                         );
                         let range = self.hir.exprs[condition].byte_range();
-                        self.diag(Severity::Warning, msg, range);
+                        self.diag(Severity::Warning, "exhaustive-is-check", msg, range);
                         // `is_negated = false` means the if-cond is always
                         // true (then-branch always runs). `is_negated = true`
                         // means the cond is `!(…always-true…)` → always
@@ -5229,7 +5267,7 @@ impl<'a> Cx<'a> {
                         self.display(from_ty),
                         self.display(to_ty),
                     );
-                    self.diag(Severity::Error, msg, r);
+                    self.diag(Severity::Error, "invalid-cast", msg, r);
                 }
                 to_ty
             }

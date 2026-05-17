@@ -82,8 +82,9 @@ fn instance_access_on_enum() {
     let (pa, uri) = analyze(src);
     let msgs = error_messages(&pa, &uri);
     assert!(
-        msgs.iter().any(|m| m.contains("enum `E` has no instance members")
-            && m.contains("access fields via `E::a`")),
+        msgs.iter()
+            .any(|m| m.contains("enum `E` has no instance members")
+                && m.contains("access fields via `E::a`")),
         "got: {msgs:?}"
     );
 }

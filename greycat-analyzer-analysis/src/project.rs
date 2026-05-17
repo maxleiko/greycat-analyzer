@@ -1985,6 +1985,7 @@ impl ProjectAnalysis {
                 let plural = if expected == 1 { "" } else { "s" };
                 out.push(SemanticDiagnostic {
                     severity: Severity::Error,
+                    code: "call-arity",
                     message: format!(
                         "function `{fn_name}` expects {expected} argument{plural}, but got {actual}"
                     ),
@@ -2066,6 +2067,7 @@ impl ProjectAnalysis {
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     out.push(SemanticDiagnostic {
                         severity: Severity::Error,
+                        code: "argument-type-mismatch",
                         message: format!(
                             "value of type `{}` is not assignable to parameter `{}: {}`",
                             display_type(arena, decl_registry, &index.symbols, arg_ty),
@@ -3508,6 +3510,7 @@ fn validate_module_type_relations(
         let want = display_type(arena, decl_registry, &index.symbols, declared_ty);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
+            code: "type-mismatch",
             message: format!(
                 "{value_label} of type `{got}` is not assignable to {target_label} `{want}`"
             ),
@@ -3537,6 +3540,7 @@ fn validate_module_type_relations(
         let got = display_type(arena, decl_registry, &index.symbols, ty);
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
+            code: "non-bool-condition",
             message: format!("{label} must be `bool`, got `{got}`"),
             byte_range: expr_byte_range(hir, expr_id),
             category: DiagCategory::TypeRelation,

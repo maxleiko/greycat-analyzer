@@ -327,7 +327,7 @@ impl Lint {
                             Severity::Warning => DiagnosticSeverity::WARNING,
                             Severity::Hint => DiagnosticSeverity::HINT,
                         }),
-                        code: Some(NumberOrString::String("semantic".into())),
+                        code: Some(NumberOrString::String(d.code.into())),
                         source: Some("greycat-analyzer".into()),
                         message: d.message.clone(),
                         ..Default::default()
@@ -507,7 +507,7 @@ impl Lint {
                                     Severity::Warning => DiagnosticSeverity::WARNING,
                                     Severity::Hint => DiagnosticSeverity::HINT,
                                 }),
-                                code: Some(NumberOrString::String("semantic".into())),
+                                code: Some(NumberOrString::String(d.code.into())),
                                 source: Some("greycat-analyzer".into()),
                                 message: d.message.clone(),
                                 ..Default::default()

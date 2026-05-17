@@ -578,12 +578,21 @@ pub fn format_cli(path: &str, diag: &Diagnostic) -> String {
         Some(DiagnosticSeverity::HINT) => "hint",
         _ => "diag",
     };
+    // Append the rule / diagnostic code when present so users see
+    // which lint or analyzer rule fired — same info the pretty
+    // (miette) renderer surfaces; rustc-style `severity[code]`.
+    let code = match &diag.code {
+        Some(NumberOrString::String(s)) => format!("[{s}]"),
+        Some(NumberOrString::Number(n)) => format!("[{n}]"),
+        None => String::new(),
+    };
     format!(
-        "{}:{}:{}: {}: {}",
+        "{}:{}:{}: {}{}: {}",
         path,
         diag.range.start.line + 1,
         diag.range.start.character + 1,
         severity,
+        code,
         diag.message,
     )
 }
@@ -1043,5 +1052,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(format_cli("a.gcl", &diag), "a.gcl:5:8: error: boom");
+    }
+
+    /// When a diagnostic carries a `code`, the cli line includes
+    /// `severity[code]:` so users see which rule / analyzer check
+    /// fired — matches the miette pretty renderer's output.
+    #[test]
+    fn format_cli_includes_code() {
+        let diag = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("missing-function-body".into())),
+            message: "boom".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_cli("a.gcl", &diag),
+            "a.gcl:1:1: error[missing-function-body]: boom"
+        );
     }
 }
