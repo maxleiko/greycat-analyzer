@@ -15,11 +15,11 @@ Pre-built binaries are attached to each [GitHub release](https://github.com/maxl
 
 ## Usage
 
-```text
-greycat-analyzer lint     parse + type-check + lint a project
-greycat-analyzer fmt      format a project
-greycat-analyzer server   start the LSP server (stdio)
-greycat-analyzer cst      print the CST of a file (debug)
+```sh
+greycat-analyzer lint     # parse + type-check + lint a project
+greycat-analyzer fmt      # format a project
+greycat-analyzer server   # start the LSP server (stdio)
+greycat-analyzer cst      # print the CST of a file (debug)
 ```
 
 All subcommands take a path to a `project.gcl` (or a directory containing one). With no argument they use `./project.gcl`. Modules are discovered through the entrypoint's `@library` / `@include` pragmas — there is no flat directory walk.
