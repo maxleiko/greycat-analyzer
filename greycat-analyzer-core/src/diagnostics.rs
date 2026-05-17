@@ -26,82 +26,84 @@ use crate::resolver::{Context, global_std_dir, library_dir};
 /// module produces. Lets editors filter / group them.
 pub const DIAGNOSTIC_SOURCE: &str = "greycat-analyzer";
 
-/// Walk `root` and return one diagnostic per `ERROR` or `MISSING` node.
-/// `source` is the document text — used to render a 1-line snippet of
-/// the offending range in the diagnostic message when the node is
-/// non-empty.
+/// Walk `root` and return every parse-stage diagnostic: tree-sitter
+/// `ERROR` / `MISSING` recoveries plus the "permissive-grammar,
+/// strict-analyzer" shape checks for constructs the grammar accepts
+/// to keep mid-edit recovery clean but the analyzer rejects on
+/// semantic grounds (`Foo::` with no property, non-native/non-abstract
+/// functions without a body, …). Every call site (CLI lint, LSP
+/// backend, WASM bridge) goes through this single entry point so a
+/// new shape check is one edit here, not five.
 pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    if !root.has_error() && !root.is_missing() {
-        return out;
+    if root.has_error() || root.is_missing() {
+        walk(root, source, &mut out);
     }
-    walk(root, source, &mut out);
+    walk_shape_checks(root, source, &mut out);
     out
 }
 
-/// Walk `root` for `static_expr` nodes whose `property` field is
-/// missing and append one diagnostic each to `out`. The grammar
-/// accepts `Foo::` as a well-formed `static_expr` so that mid-typing
-/// a `Foo::|` doesn't ERROR-recover the whole surrounding statement;
-/// the missing property is a hard semantic requirement that lives
-/// here instead. Diagnostic range points at the dangling `::`.
-pub fn static_property_diagnostics(
-    node: tree_sitter::Node<'_>,
-    source: &str,
-    out: &mut Vec<Diagnostic>,
-) {
-    if node.kind() == "static_expr" && node.child_by_field_name("property").is_none() {
-        let sep_range = static_separator_range(node, source).unwrap_or(node.byte_range());
-        out.push(Diagnostic {
-            range: byte_range_to_lsp(source, &sep_range),
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String("missing-static-property".into())),
-            source: Some(DIAGNOSTIC_SOURCE.into()),
-            message: "expected identifier or string property after `::`".into(),
-            ..Default::default()
-        });
+/// Single recursive walk that fires every CST-shape check. Folded
+/// together so we only traverse the tree once and adding a new
+/// check is a single match arm rather than another standalone
+/// walker wired at every call site.
+fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    match node.kind() {
+        "static_expr" => check_static_property(node, source, out),
+        "fn_decl" | "type_method" => check_function_body(node, source, out),
+        _ => {}
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        static_property_diagnostics(child, source, out);
+        walk_shape_checks(child, source, out);
     }
 }
 
-/// Walk `root` for `fn_decl` / `type_method` nodes whose `body`
-/// field is missing and whose `modifiers` do not include `native`
-/// or `abstract`. Both modifiers legitimately permit a body-less
-/// declaration (`native` ≈ FFI-bound, `abstract` ≈ subclass-fills-it);
-/// every other function must define a body. Diagnostic range points
-/// at the function name.
-pub fn function_body_diagnostics(
-    node: tree_sitter::Node<'_>,
-    source: &str,
-    out: &mut Vec<Diagnostic>,
-) {
-    let kind = node.kind();
-    if (kind == "fn_decl" || kind == "type_method") && node.child_by_field_name("body").is_none() {
-        let mods = node.child_by_field_name("modifiers");
-        if !has_modifier(mods, source, "native")
-            && !has_modifier(mods, source, "abstract")
-            && let Some(name) = node.child_by_field_name("name")
-        {
-            let name_text = source.get(name.byte_range()).unwrap_or("?");
-            out.push(Diagnostic {
-                range: byte_range_to_lsp(source, &name.byte_range()),
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String("missing-function-body".into())),
-                source: Some(DIAGNOSTIC_SOURCE.into()),
-                message: format!(
-                    "function '{name_text}' must define a body (only `native` and `abstract` functions may omit it)"
-                ),
-                ..Default::default()
-            });
-        }
+/// `Foo::` parses as a well-formed `static_expr` under the
+/// permissive grammar; the semantic requirement that an identifier
+/// or string property follow `::` is enforced here. Diagnostic
+/// range points at the dangling `::` token.
+fn check_static_property(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    if node.child_by_field_name("property").is_some() {
+        return;
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        function_body_diagnostics(child, source, out);
+    let sep_range = static_separator_range(node, source).unwrap_or(node.byte_range());
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &sep_range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("missing-static-property".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: "expected identifier or string property after `::`".into(),
+        ..Default::default()
+    });
+}
+
+/// `native` and `abstract` legitimately permit a body-less function
+/// (`native` ≈ FFI-bound, `abstract` ≈ subclass-fills-it); every
+/// other function must define a body. Diagnostic range points at
+/// the function name.
+fn check_function_body(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    if node.child_by_field_name("body").is_some() {
+        return;
     }
+    let mods = node.child_by_field_name("modifiers");
+    if has_modifier(mods, source, "native") || has_modifier(mods, source, "abstract") {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name_text = source.get(name.byte_range()).unwrap_or("?");
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &name.byte_range()),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("missing-function-body".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: format!(
+            "function '{name_text}' must define a body (only `native` and `abstract` functions may omit it)"
+        ),
+        ..Default::default()
+    });
 }
 
 /// `true` iff the `modifiers` node (if any) contains a child token
@@ -590,21 +592,35 @@ mod tests {
         assert!(ds.iter().any(|d| d.message.starts_with("syntax error")));
     }
 
+    fn codes(ds: &[Diagnostic]) -> Vec<&str> {
+        ds.iter()
+            .filter_map(|d| match &d.code {
+                Some(NumberOrString::String(s)) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// `Foo::` (no property) parses as a well-formed `static_expr`
     /// under the permissive grammar; the semantic requirement that a
     /// property follow `::` is enforced here.
     #[test]
     fn missing_static_property_surfaces() {
         let src = "fn main() { var _ = Foo::; }\n";
-        let tree = greycat_analyzer_syntax::parse(src);
-        let mut out = Vec::new();
-        static_property_diagnostics(tree.root_node(), src, &mut out);
-        assert_eq!(out.len(), 1, "expected exactly one diag, got: {out:?}");
-        let d = &out[0];
-        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
-        assert!(
-            matches!(&d.code, Some(NumberOrString::String(s)) if s == "missing-static-property"),
+        let ds = diags(src);
+        let static_diags: Vec<_> = ds
+            .iter()
+            .filter(|d| {
+                matches!(&d.code, Some(NumberOrString::String(s)) if s == "missing-static-property")
+            })
+            .collect();
+        assert_eq!(
+            static_diags.len(),
+            1,
+            "expected exactly one diag, got: {ds:?}"
         );
+        let d = static_diags[0];
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
         assert!(d.message.contains("after `::`"));
         // Range points at the `::` token.
         let start_byte: usize = src
@@ -620,11 +636,11 @@ mod tests {
     /// diagnostic.
     #[test]
     fn well_formed_static_expr_no_diag() {
-        let src = "fn main() { var _ = Foo::bar; }\n";
-        let tree = greycat_analyzer_syntax::parse(src);
-        let mut out = Vec::new();
-        static_property_diagnostics(tree.root_node(), src, &mut out);
-        assert!(out.is_empty(), "expected no diags, got: {out:?}");
+        let ds = diags("fn main() { var _ = Foo::bar; }\n");
+        assert!(
+            !codes(&ds).contains(&"missing-static-property"),
+            "expected no missing-static-property, got: {ds:?}"
+        );
     }
 
     /// Non-native, non-abstract function declared without a body
@@ -633,18 +649,19 @@ mod tests {
     #[test]
     fn missing_function_body_surfaces() {
         let src = "type T {\n    static fn not_valid();\n}\nfn top_level();\n";
-        let tree = greycat_analyzer_syntax::parse(src);
-        let mut out = Vec::new();
-        function_body_diagnostics(tree.root_node(), src, &mut out);
-        assert_eq!(out.len(), 2, "expected two diags, got: {out:?}");
-        for d in &out {
+        let ds = diags(src);
+        let body_diags: Vec<_> = ds
+            .iter()
+            .filter(|d| {
+                matches!(&d.code, Some(NumberOrString::String(s)) if s == "missing-function-body")
+            })
+            .collect();
+        assert_eq!(body_diags.len(), 2, "expected two diags, got: {ds:?}");
+        for d in &body_diags {
             assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
-            assert!(
-                matches!(&d.code, Some(NumberOrString::String(s)) if s == "missing-function-body"),
-            );
         }
-        assert!(out[0].message.contains("not_valid"));
-        assert!(out[1].message.contains("top_level"));
+        assert!(body_diags[0].message.contains("not_valid"));
+        assert!(body_diags[1].message.contains("top_level"));
     }
 
     /// `native` and `abstract` functions may legitimately omit the
@@ -653,10 +670,11 @@ mod tests {
     #[test]
     fn body_or_exempt_modifier_no_diag() {
         let src = "type T {\n    abstract fn a();\n    native fn b();\n    fn c() {}\n}\nnative fn top();\nfn ok() {}\n";
-        let tree = greycat_analyzer_syntax::parse(src);
-        let mut out = Vec::new();
-        function_body_diagnostics(tree.root_node(), src, &mut out);
-        assert!(out.is_empty(), "expected no diags, got: {out:?}");
+        let ds = diags(src);
+        assert!(
+            !codes(&ds).contains(&"missing-function-body"),
+            "expected no missing-function-body, got: {ds:?}"
+        );
     }
 
     // P15.5
