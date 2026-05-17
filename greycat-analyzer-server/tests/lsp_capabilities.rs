@@ -1536,6 +1536,40 @@ fn completion_after_double_colon_lists_static_methods() {
     );
 }
 
+/// `Type::|` static completion also lists the type's `static` attrs,
+/// not just its static methods. Regression: previously the
+/// `Decl::Type(td)` arm only iterated `td.methods`, so a type with
+/// only static attrs (`type Constants { static pi: float = 3.14; }`)
+/// returned an empty list and fell through to no completion.
+#[test]
+fn completion_after_double_colon_lists_static_attrs() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Constants { static pi: float = 3.1415; }\nfn main() { Constants:: }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `Constants::` (line 1 col 23).
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(1, 23),
+        &user_uri,
+        &pa,
+        None,
+    )
+    .expect("completion list");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"pi"), "got: {labels:?}");
+}
+
 /// P15.2.5 — `module::|` static completion lists the foreign module's
 /// top-level decls.
 #[test]

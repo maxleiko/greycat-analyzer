@@ -2298,6 +2298,30 @@ fn static_completion(
                         documentation,
                     ));
                 }
+                for attr_id in &td.attrs {
+                    let attr = &fmod.hir.type_attrs[*attr_id];
+                    if !attr.modifiers.static_ {
+                        continue;
+                    }
+                    let name = project.symbols()[fmod.hir.idents[attr.name].symbol].to_string();
+                    if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+                        continue;
+                    }
+                    let detail = attr.ty.map(|tr| {
+                        format!(
+                            ": {}",
+                            crate::ide::render::render_type_ref(&fmod.hir, project.symbols(), tr,)
+                        )
+                    });
+                    let documentation = doc_to_markup(attr.doc.as_deref());
+                    items.push(static_completion_item(
+                        name,
+                        CompletionItemKind::CONSTANT,
+                        replace_range,
+                        detail,
+                        documentation,
+                    ));
+                }
             }
             Decl::Enum(ed) => {
                 // `Foo::|` where `Foo` is an enum — surface every

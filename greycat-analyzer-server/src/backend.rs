@@ -12,7 +12,7 @@ use greycat_analyzer_core::{
     Document, SourceManager, StdResolution,
     diagnostics::{
         missing_std_diagnostic, multi_project_owner_diagnostic, orphan_module_diagnostic,
-        parse_diagnostics, pragma_diagnostics,
+        parse_diagnostics, pragma_diagnostics, static_property_diagnostics,
     },
 };
 use log::{debug, info, warn};
@@ -266,6 +266,7 @@ impl Backend {
         if let Some(cell) = self.orphans.get(uri) {
             let doc = cell.borrow();
             let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
+            static_property_diagnostics(doc.root_node(), &doc.text, &mut diags);
             diags.push(orphan_module_diagnostic(&doc.text));
             let version = doc.version;
             drop(doc);
@@ -279,6 +280,7 @@ impl Backend {
         };
         let doc = cell.borrow();
         let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
+        static_property_diagnostics(doc.root_node(), &doc.text, &mut diags);
         if let Some(module) = project.analysis.module(uri) {
             diags.extend(diagnostics_from_module(&doc.text, module, self.lint_libs));
         }

@@ -39,6 +39,55 @@ pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagn
     out
 }
 
+/// Walk `root` for `static_expr` nodes whose `property` field is
+/// missing and append one diagnostic each to `out`. The grammar
+/// accepts `Foo::` as a well-formed `static_expr` so that mid-typing
+/// a `Foo::|` doesn't ERROR-recover the whole surrounding statement;
+/// the missing property is a hard semantic requirement that lives
+/// here instead. Diagnostic range points at the dangling `::`.
+pub fn static_property_diagnostics(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    if node.kind() == "static_expr" && node.child_by_field_name("property").is_none() {
+        let sep_range = static_separator_range(node, source).unwrap_or(node.byte_range());
+        out.push(Diagnostic {
+            range: byte_range_to_lsp(source, &sep_range),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("missing-static-property".into())),
+            source: Some(DIAGNOSTIC_SOURCE.into()),
+            message: "expected identifier or string property after `::`".into(),
+            ..Default::default()
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        static_property_diagnostics(child, source, out);
+    }
+}
+
+/// Find the byte range of the `::` token inside a `static_expr` —
+/// the unnamed child that isn't the receiver and isn't the property.
+/// Falls back to the whole node range when the operator can't be
+/// isolated.
+fn static_separator_range(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+) -> Option<std::ops::Range<usize>> {
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if c.is_named() {
+            continue;
+        }
+        let range = c.byte_range();
+        if source.get(range.clone()) == Some("::") {
+            return Some(range);
+        }
+    }
+    None
+}
+
 fn walk(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
     if node.is_missing() {
         out.push(missing_diagnostic(node));
@@ -488,6 +537,43 @@ mod tests {
         let ds = diags("fn main( {\n");
         assert!(!ds.is_empty(), "expected at least one diagnostic");
         assert!(ds.iter().any(|d| d.message.starts_with("syntax error")));
+    }
+
+    /// `Foo::` (no property) parses as a well-formed `static_expr`
+    /// under the permissive grammar; the semantic requirement that a
+    /// property follow `::` is enforced here.
+    #[test]
+    fn missing_static_property_surfaces() {
+        let src = "fn main() { var _ = Foo::; }\n";
+        let tree = greycat_analyzer_syntax::parse(src);
+        let mut out = Vec::new();
+        static_property_diagnostics(tree.root_node(), src, &mut out);
+        assert_eq!(out.len(), 1, "expected exactly one diag, got: {out:?}");
+        let d = &out[0];
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            matches!(&d.code, Some(NumberOrString::String(s)) if s == "missing-static-property"),
+        );
+        assert!(d.message.contains("after `::`"));
+        // Range points at the `::` token.
+        let start_byte: usize = src
+            .lines()
+            .take(d.range.start.line as usize)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            + d.range.start.character as usize;
+        assert_eq!(src.get(start_byte..start_byte + 2), Some("::"));
+    }
+
+    /// Well-formed `Foo::bar` doesn't trip the missing-property
+    /// diagnostic.
+    #[test]
+    fn well_formed_static_expr_no_diag() {
+        let src = "fn main() { var _ = Foo::bar; }\n";
+        let tree = greycat_analyzer_syntax::parse(src);
+        let mut out = Vec::new();
+        static_property_diagnostics(tree.root_node(), src, &mut out);
+        assert!(out.is_empty(), "expected no diags, got: {out:?}");
     }
 
     // P15.5

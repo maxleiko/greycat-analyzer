@@ -9,7 +9,7 @@ use std::{
 use greycat_analyzer_analysis::{analyzer::Severity, lint::LintSeverity, project::ProjectAnalysis};
 use greycat_analyzer_core::{
     SourceManager,
-    diagnostics::{format_cli, parse_diagnostics},
+    diagnostics::{format_cli, parse_diagnostics, static_property_diagnostics},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
     resolver::FsContext,
 };
@@ -301,6 +301,7 @@ impl Lint {
             let load = load_by_uri.get(uri).copied().unwrap_or_default();
             let timings = analysis.module(uri).map(|m| m.timings).unwrap_or_default();
             let mut diagnostics = parse_diagnostics(root, text);
+            static_property_diagnostics(root, text, &mut diagnostics);
             if let Some(proot) = pragma_root.as_ref() {
                 let desc =
                     greycat_analyzer_core::module_desc::parse_module_desc(uri.clone(), text, root);
@@ -483,6 +484,7 @@ impl Lint {
                         .map(|m| m.timings)
                         .unwrap_or_default();
                     let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
+                    static_property_diagnostics(doc.root_node(), &doc.text, &mut diagnostics);
                     if let Some(root) = pragma_root.as_ref() {
                         let desc = greycat_analyzer_core::module_desc::parse_module_desc(
                             uri.clone(),

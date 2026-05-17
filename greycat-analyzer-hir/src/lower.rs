@@ -961,7 +961,19 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             // `type_ident`. Detect the chain and lower as
             // `Expr::QualifiedStatic { chain: Vec<Idx<Ident>> }` with
             // every segment as a flat ident.
-            let prop = node.child_by_field_name("property")?;
+            // The grammar accepts `Foo::` (no property) so the editor
+            // doesn't ERROR-recover the whole containing statement
+            // mid-typing; lower that case as Unsupported so downstream
+            // analysis sees an opaque expression instead of silently
+            // dropping it. The hard diagnostic is emitted by
+            // `core::diagnostics::static_property_diagnostics`.
+            let Some(prop) = node.child_by_field_name("property") else {
+                let id = cx.hir.exprs.alloc(Expr::Unsupported {
+                    kind: "static_expr_missing_property",
+                    byte_range: node.byte_range(),
+                });
+                return Some(id);
+            };
             let head = first_named_child_excluding(node, prop.id())?;
             if head.kind() == "static_expr" {
                 let mut chain = Vec::new();
