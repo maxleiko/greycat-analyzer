@@ -38,6 +38,7 @@ use greycat_analyzer_hir::types::{
     UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
 };
 
+use crate::lint::{LintDiagnostic, LintSeverity};
 use crate::resolver::{Definition, Resolutions};
 use crate::stdlib::ProjectIndex;
 
@@ -260,6 +261,22 @@ pub struct AnalysisResult {
     /// (which lacked a rule code), this flow integrates with the
     /// shared directive / quickfix machinery.
     pub non_exhaustive_findings: Vec<NonExhaustiveFinding>,
+    /// Lints surfaced by the typed analyzer rather than by a pure-HIR
+    /// rule. Each entry is a fully-formed [`LintDiagnostic`] — rule
+    /// code + severity + message all baked in at the site. The
+    /// project-level typed-lint runner pipes each entry through
+    /// `emit_typed` so `// gcl-lint-off …` directives can suppress
+    /// them uniformly with every other rule.
+    ///
+    /// Use this when the analyzer needs to *speak as* a lint and the
+    /// finding has no structured payload a quickfix needs. When a
+    /// quickfix needs structured data (see `non_exhaustive_findings`),
+    /// keep a typed Vec instead. The current users:
+    ///
+    /// - `decidable-condition` — the 6 "condition is always true / false"
+    ///   emit sites on `if` / `while` / `for` / `do-while` and the
+    ///   `is`-narrow contradiction / triviality checks.
+    pub surfaced_lints: Vec<LintDiagnostic>,
     /// Conditional statements (`if` / `while` / `do_while` / `for`)
     /// whose condition is statically decidable to a constant truth
     /// value. The key is the statement id; the value is the decided
@@ -886,7 +903,7 @@ impl<'a> Cx<'a> {
         } else {
             format!("{kind} condition is always false (body never runs)")
         };
-        self.diag(Severity::Warning, msg, range);
+        self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
         // Only record always-false: the `unreachable` lint only
         // flags dead bodies. Always-true loops are intentional.
         if !b {
@@ -1046,7 +1063,7 @@ impl<'a> Cx<'a> {
                             pretty.join(" and "),
                         );
                         let range = self.hir.exprs[condition].byte_range();
-                        self.diag(Severity::Warning, msg, range);
+                        self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
                         emitted = true;
                         self.out.decidable_conditions.insert(stmt_id, false);
                     }
@@ -1083,7 +1100,12 @@ impl<'a> Cx<'a> {
                                     self.display(known),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
-                                self.diag(Severity::Warning, msg, range);
+                                self.surface_lint(
+                                    "decidable-condition",
+                                    LintSeverity::Warning,
+                                    msg,
+                                    range,
+                                );
                                 emitted = true;
                                 self.out.decidable_conditions.insert(stmt_id, true);
                             }
@@ -1112,7 +1134,12 @@ impl<'a> Cx<'a> {
                                     self.display(asserted),
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
-                                self.diag(Severity::Warning, msg, range);
+                                self.surface_lint(
+                                    "decidable-condition",
+                                    LintSeverity::Warning,
+                                    msg,
+                                    range,
+                                );
                                 emitted = true;
                                 self.out.decidable_conditions.insert(stmt_id, false);
                             }
@@ -1574,6 +1601,27 @@ impl<'a> Cx<'a> {
     fn record(&mut self, expr: Idx<Expr>, ty: TypeId) {
         self.out.expr_types.insert(expr, ty);
     }
+    /// Push a fully-formed [`LintDiagnostic`] into
+    /// [`AnalysisResult::surfaced_lints`]. The project-level typed-lint
+    /// runner pipes the buffer through `emit_typed`, so a
+    /// `// gcl-lint-off <rule>` directive at the right scope will
+    /// silence the emit just like any pure-HIR rule.
+    fn surface_lint(
+        &mut self,
+        rule: &'static str,
+        severity: LintSeverity,
+        message: impl Into<String>,
+        range: Range<usize>,
+    ) {
+        self.out.surfaced_lints.push(LintDiagnostic {
+            rule,
+            severity,
+            message: message.into(),
+            byte_range: range,
+            tag: None,
+        });
+    }
+
     fn diag(&mut self, severity: Severity, message: impl Into<String>, range: Range<usize>) {
         // The analyzer's first pass only emits structural diagnostics
         // (unresolved names, member-resolution failures, exhaustiveness,
@@ -3354,7 +3402,7 @@ impl<'a> Cx<'a> {
                     } else {
                         "condition is always false"
                     };
-                    self.diag(Severity::Warning, msg, range);
+                    self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
                     self.out.decidable_conditions.insert(stmt_id, b);
                 }
 
@@ -3762,7 +3810,7 @@ impl<'a> Cx<'a> {
                     } else {
                         "do-while condition is always false (body runs exactly once)"
                     };
-                    self.diag(Severity::Warning, msg, range);
+                    self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
                 }
                 // Post-loop else-narrow lift. Body always runs at
                 // least once, so by the time we're past the loop the
@@ -6771,6 +6819,8 @@ fn caller(s: Shape) {
     /// returns `false` for concrete known types to avoid double-fire.
     #[test]
     fn p42_exhaustive_is_check_concrete_known_no_double_fire() {
+        use greycat_analyzer_core::SourceManager;
+        use std::str::FromStr;
         let src = r#"
 type Rect {}
 fn caller(r: Rect) {
@@ -6779,7 +6829,12 @@ fn caller(r: Rect) {
     }
 }
 "#;
-        let diags = analyze_project_src(src);
+        let mut mgr = SourceManager::new();
+        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(uri.clone(), src, "project", false);
+        let pa = crate::project::ProjectAnalysis::analyze(&mgr);
+        let module = pa.module(&uri).unwrap();
+        let diags = &module.analysis.diagnostics;
         let exhaustion: Vec<_> = diags
             .iter()
             .filter(|d| d.message.contains("exhaustive `is`-check"))
@@ -6788,14 +6843,19 @@ fn caller(r: Rect) {
             exhaustion.is_empty(),
             "concrete known must not fire exhaustion (the `condition is always true` path covers it): {diags:#?}"
         );
-        // Existing always-true pass must still fire.
-        let always_true: Vec<_> = diags
+        // Existing always-true pass must still fire — now surfaced as a
+        // suppressible `decidable-condition` lint rather than a raw
+        // semantic warning.
+        let lints = &module.lints;
+        let always_true: Vec<_> = lints
             .iter()
-            .filter(|d| d.message.contains("condition is always true"))
+            .filter(|l| {
+                l.rule == "decidable-condition" && l.message.contains("condition is always true")
+            })
             .collect();
         assert!(
             !always_true.is_empty(),
-            "existing always-true diag should fire for `r: Rect; r is Rect`: {diags:#?}"
+            "existing always-true diag should fire for `r: Rect; r is Rect`: {lints:#?}"
         );
     }
 
