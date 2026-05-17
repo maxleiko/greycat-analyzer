@@ -31,9 +31,10 @@ pub const DIAGNOSTIC_SOURCE: &str = "greycat-analyzer";
 /// strict-analyzer" shape checks for constructs the grammar accepts
 /// to keep mid-edit recovery clean but the analyzer rejects on
 /// semantic grounds (`Foo::` with no property, non-native/non-abstract
-/// functions without a body, …). Every call site (CLI lint, LSP
-/// backend, WASM bridge) goes through this single entry point so a
-/// new shape check is one edit here, not five.
+/// functions without a body, `var` with no name, `var` terminated by
+/// auto-semi rather than an explicit `;`, …). Every call site (CLI
+/// lint, LSP backend, WASM bridge) goes through this single entry
+/// point so a new shape check is one edit here, not five.
 pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     if root.has_error() || root.is_missing() {
@@ -51,6 +52,7 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
     match node.kind() {
         "static_expr" => check_static_property(node, source, out),
         "fn_decl" | "type_method" => check_function_body(node, source, out),
+        "var_decl" => check_var_decl(node, source, out),
         _ => {}
     }
     let mut cursor = node.walk();
@@ -104,6 +106,65 @@ fn check_function_body(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
         ),
         ..Default::default()
     });
+}
+
+/// `var` parses with optional `name` and accepts an auto-semi terminator
+/// so mid-edit `var ` doesn't ERROR-recover the next line. Real GreyCat
+/// requires both: a name AND an explicit `;`. Two diagnostics may fire
+/// per stmt (name and semi are independent).
+fn check_var_decl(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    // Missing name → caret just after the `var` keyword.
+    if node.child_by_field_name("name").is_none() {
+        let after_var = keyword_end(node, source, "var").unwrap_or(node.end_byte());
+        let range = after_var..after_var;
+        out.push(Diagnostic {
+            range: byte_range_to_lsp(source, &range),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("missing-var-name".into())),
+            source: Some(DIAGNOSTIC_SOURCE.into()),
+            message: "expected variable name after `var`".into(),
+            ..Default::default()
+        });
+    }
+    // Auto-semi (zero-width external token) is permitted by the
+    // grammar but not by the analyzer. Walk children; explicit `;`
+    // has a one-byte source range, auto-semi is zero-width.
+    let mut explicit_semi = false;
+    let mut last_real_end = node.start_byte();
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        let br = c.byte_range();
+        if br.is_empty() {
+            continue;
+        }
+        last_real_end = br.end;
+        if source.get(br) == Some(";") {
+            explicit_semi = true;
+        }
+    }
+    if !explicit_semi {
+        let range = last_real_end..last_real_end;
+        out.push(Diagnostic {
+            range: byte_range_to_lsp(source, &range),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("missing-semicolon".into())),
+            source: Some(DIAGNOSTIC_SOURCE.into()),
+            message: "expected `;` at end of `var` statement".into(),
+            ..Default::default()
+        });
+    }
+}
+
+/// End-byte of the first child of `node` whose source text equals
+/// `kw`. `None` if no such child exists.
+fn keyword_end(node: tree_sitter::Node<'_>, source: &str, kw: &str) -> Option<usize> {
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if source.get(c.byte_range()) == Some(kw) {
+            return Some(c.end_byte());
+        }
+    }
+    None
 }
 
 /// `true` iff the `modifiers` node (if any) contains a child token
@@ -675,6 +736,45 @@ mod tests {
             !codes(&ds).contains(&"missing-function-body"),
             "expected no missing-function-body, got: {ds:?}"
         );
+    }
+
+    /// `var` with no name AND no explicit `;` fires both diagnostics.
+    #[test]
+    fn var_decl_missing_name_and_semi() {
+        let src = "fn f() {\n    var\n}\n";
+        let ds = diags(src);
+        let cs = codes(&ds);
+        assert!(cs.contains(&"missing-var-name"), "got: {ds:?}");
+        assert!(cs.contains(&"missing-semicolon"), "got: {ds:?}");
+    }
+
+    /// `var x` (name present, auto-semi at `}`) fires only the
+    /// missing-`;` diagnostic.
+    #[test]
+    fn var_decl_missing_semi_only() {
+        let src = "fn f() {\n    var x\n}\n";
+        let ds = diags(src);
+        let cs = codes(&ds);
+        assert!(!cs.contains(&"missing-var-name"), "got: {ds:?}");
+        assert!(cs.contains(&"missing-semicolon"), "got: {ds:?}");
+    }
+
+    /// Well-formed `var x = 1;` fires neither diagnostic.
+    #[test]
+    fn var_decl_well_formed() {
+        let ds = diags("fn f() {\n    var x = 1;\n}\n");
+        let cs = codes(&ds);
+        assert!(!cs.contains(&"missing-var-name"), "got: {ds:?}");
+        assert!(!cs.contains(&"missing-semicolon"), "got: {ds:?}");
+    }
+
+    /// `var x: int;` (no initializer, explicit `;`) is well-formed.
+    #[test]
+    fn var_decl_type_only() {
+        let ds = diags("fn f() {\n    var x: int;\n}\n");
+        let cs = codes(&ds);
+        assert!(!cs.contains(&"missing-var-name"), "got: {ds:?}");
+        assert!(!cs.contains(&"missing-semicolon"), "got: {ds:?}");
     }
 
     // P15.5
