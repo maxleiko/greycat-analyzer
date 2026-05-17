@@ -67,6 +67,57 @@ pub fn static_property_diagnostics(
     }
 }
 
+/// Walk `root` for `fn_decl` / `type_method` nodes whose `body`
+/// field is missing and whose `modifiers` do not include `native`
+/// or `abstract`. Both modifiers legitimately permit a body-less
+/// declaration (`native` ≈ FFI-bound, `abstract` ≈ subclass-fills-it);
+/// every other function must define a body. Diagnostic range points
+/// at the function name.
+pub fn function_body_diagnostics(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    let kind = node.kind();
+    if (kind == "fn_decl" || kind == "type_method") && node.child_by_field_name("body").is_none() {
+        let mods = node.child_by_field_name("modifiers");
+        if !has_modifier(mods, source, "native")
+            && !has_modifier(mods, source, "abstract")
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            let name_text = source.get(name.byte_range()).unwrap_or("?");
+            out.push(Diagnostic {
+                range: byte_range_to_lsp(source, &name.byte_range()),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String("missing-function-body".into())),
+                source: Some(DIAGNOSTIC_SOURCE.into()),
+                message: format!(
+                    "function '{name_text}' must define a body (only `native` and `abstract` functions may omit it)"
+                ),
+                ..Default::default()
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        function_body_diagnostics(child, source, out);
+    }
+}
+
+/// `true` iff the `modifiers` node (if any) contains a child token
+/// whose source text matches `needle`. Modifier children are unnamed
+/// keyword tokens (`private` / `static` / `abstract` / `native`).
+fn has_modifier(node: Option<tree_sitter::Node<'_>>, source: &str, needle: &str) -> bool {
+    let Some(node) = node else { return false };
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if source.get(c.byte_range()) == Some(needle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Find the byte range of the `::` token inside a `static_expr` —
 /// the unnamed child that isn't the receiver and isn't the property.
 /// Falls back to the whole node range when the operator can't be
@@ -573,6 +624,38 @@ mod tests {
         let tree = greycat_analyzer_syntax::parse(src);
         let mut out = Vec::new();
         static_property_diagnostics(tree.root_node(), src, &mut out);
+        assert!(out.is_empty(), "expected no diags, got: {out:?}");
+    }
+
+    /// Non-native, non-abstract function declared without a body
+    /// surfaces a `missing-function-body` error. Catches both
+    /// top-level `fn_decl` and `type_method` shapes.
+    #[test]
+    fn missing_function_body_surfaces() {
+        let src = "type T {\n    static fn not_valid();\n}\nfn top_level();\n";
+        let tree = greycat_analyzer_syntax::parse(src);
+        let mut out = Vec::new();
+        function_body_diagnostics(tree.root_node(), src, &mut out);
+        assert_eq!(out.len(), 2, "expected two diags, got: {out:?}");
+        for d in &out {
+            assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+            assert!(
+                matches!(&d.code, Some(NumberOrString::String(s)) if s == "missing-function-body"),
+            );
+        }
+        assert!(out[0].message.contains("not_valid"));
+        assert!(out[1].message.contains("top_level"));
+    }
+
+    /// `native` and `abstract` functions may legitimately omit the
+    /// body — no diagnostic for either; functions with a real body
+    /// stay silent too.
+    #[test]
+    fn body_or_exempt_modifier_no_diag() {
+        let src = "type T {\n    abstract fn a();\n    native fn b();\n    fn c() {}\n}\nnative fn top();\nfn ok() {}\n";
+        let tree = greycat_analyzer_syntax::parse(src);
+        let mut out = Vec::new();
+        function_body_diagnostics(tree.root_node(), src, &mut out);
         assert!(out.is_empty(), "expected no diags, got: {out:?}");
     }
 

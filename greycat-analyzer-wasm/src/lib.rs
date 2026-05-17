@@ -37,7 +37,9 @@ use greycat_analyzer_analysis::{
 };
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::SymbolTable;
-use greycat_analyzer_core::diagnostics::{parse_diagnostics, static_property_diagnostics};
+use greycat_analyzer_core::diagnostics::{
+    function_body_diagnostics, parse_diagnostics, static_property_diagnostics,
+};
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -877,6 +879,7 @@ pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
     let tree = greycat_analyzer_syntax::parse(source);
     let mut parse_diags = parse_diagnostics(tree.root_node(), source);
     static_property_diagnostics(tree.root_node(), source, &mut parse_diags);
+    function_body_diagnostics(tree.root_node(), source, &mut parse_diags);
     let mut out: Vec<WasmDiagnostic> = parse_diags
         .into_iter()
         .map(|d| {
