@@ -97,6 +97,19 @@ impl Document {
             return;
         }
 
+        // Tree-sitter's incremental parse contract is "share structure
+        // with subtrees the edit didn't touch" — NOT "produce the same
+        // tree a fresh parse would." When the pre-edit tree carries an
+        // `ERROR` subtree from a prior recovery, the next incremental
+        // parse keeps that subtree's byte range as "unedited" and
+        // reuses it, even when the new text inside it is now
+        // syntactically valid. The result is stale `ERROR` nodes that
+        // persist across edits and can't be cleared without a fresh
+        // parse. Capture the pre-edit error state here; when it was
+        // dirty, skip the incremental path below and re-parse from
+        // scratch after applying the text mutations.
+        let old_tree_had_errors = self.tree.root_node().has_error();
+
         let mut any_edit = false;
         for change in changes {
             let Some(range) = change.range else { continue };
@@ -154,7 +167,17 @@ impl Document {
         }
 
         if any_edit {
-            let new_tree = parse(&mut self.parser, &self.text, Some(&self.tree));
+            // Incremental reuse only when the pre-edit tree was clean
+            // (see the comment above `old_tree_had_errors`). When the
+            // old tree was dirty, drop it and re-parse from scratch
+            // so any committed-from-recovery `ERROR` subtree doesn't
+            // get carried forward.
+            let old_tree = if old_tree_had_errors {
+                None
+            } else {
+                Some(&self.tree)
+            };
+            let new_tree = parse(&mut self.parser, &self.text, old_tree);
             self.tree = new_tree;
         }
     }

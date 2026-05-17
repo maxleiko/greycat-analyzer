@@ -944,3 +944,505 @@ fn long_module_insert_then_delete_keeps_clean_parse() {
         parse_error_summary(&m)
     );
 }
+
+// =============================================================================
+// Incremental reparse through a syntactically-INVALID intermediate state
+// =============================================================================
+//
+// The cycles above all transition `valid → valid` (insert a letter
+// inside an identifier, delete it). That keeps tree-sitter on the
+// happy path: no error recovery is triggered, so no mis-recovered
+// subtrees end up baked into the old tree.
+//
+// The user-reported symptom requires `valid → INVALID → valid`. The
+// invalid intermediate forces tree-sitter to commit an error recovery
+// somewhere in the tree. Incremental reparse on the *next* edit treats
+// that old tree as the baseline and reuses the mis-recovered subtree —
+// even when the new text is once again valid. The result: an
+// incremental reparse of a clean-text final state retains spurious
+// `ERROR` / `MISSING` nodes that a fresh parse of the same bytes would
+// not produce.
+//
+// The reproducer matches the kopr scenario: in the middle of a long
+// function body, delete a semicolon so the next statement parses as
+// part of the previous one (tree-sitter has to recover), then put the
+// semicolon back. Compare against a fresh parse of the now-restored
+// text.
+
+/// Realistic ~50-line module with an `if` chain after the edit site,
+/// mirroring the kopr `processLine` shape where the bug surfaced. The
+/// chain matters: the user's symptom is "many lines downstream of the
+/// edit go red", and that requires statements after the edit site for
+/// the mis-recovery to splash onto.
+fn fixture_with_chain() -> &'static str {
+    r#"@library("std", "0.0.1-dev");
+
+fn process(value: int, label: String): int {
+    var prefix = "got: ";
+    var local = value * 2;
+    if (value < 0) {
+        return -1;
+    }
+    if (value == 0) {
+        return 0;
+    }
+    if (value < 10) {
+        return local;
+    } else if (value < 100) {
+        return local + 1;
+    } else if (value < 1000) {
+        return local + 2;
+    } else {
+        return local + 3;
+    }
+}
+
+fn caller(): int {
+    var a = process(42, "a");
+    var b = process(100, "b");
+    var c = process(999, "c");
+    return a + b + c;
+}
+"#
+}
+
+/// Edit cycle through a syntactically-invalid intermediate state.
+/// The fresh parse of the FINAL text has zero parse errors; the
+/// incremental parse MUST match. This is the exact bug shape the user
+/// reported: the editor's tree gets stuck with spurious `ERROR` /
+/// `MISSING` nodes that a fresh parse wouldn't produce.
+#[test]
+fn delete_then_restore_semicolon_keeps_incremental_clean() {
+    let src = fixture_with_chain();
+    let mut m = open(src);
+    assert_eq!(
+        parse_error_count(&m),
+        0,
+        "fixture must parse cleanly before the test mutates it: {}",
+        parse_error_summary(&m)
+    );
+
+    // Target: the semicolon ending `var local = value * 2;`. Deleting
+    // it forces the next statement (`if (value < 0) { ... }`) to be
+    // re-parsed inside the broken var-decl, which triggers tree-
+    // sitter's error recovery and can cascade through the trailing
+    // `if` chain.
+    let stmt = "var local = value * 2;";
+    let off = unique_offset(src, stmt);
+    let semi_byte = off + stmt.len() - 1; // index of `;`
+    assert_eq!(&src[semi_byte..semi_byte + 1], ";");
+
+    // Step 1: delete the semicolon. Intermediate state is invalid.
+    let semi_pos = pos_utf8(src, semi_byte);
+    let semi_pos_end = pos_utf8(src, semi_byte + 1);
+    edit(
+        &mut m,
+        Range {
+            start: semi_pos,
+            end: semi_pos_end,
+        },
+        "",
+        2,
+        SourceEncoding::UTF8,
+    );
+    let mid_text = full_text(&m);
+    assert!(
+        !mid_text.contains(stmt),
+        "intermediate state should be missing the semicolon"
+    );
+    // Sanity: the intermediate text should have at least one parse
+    // error — otherwise we're not actually exercising recovery.
+    assert!(
+        parse_error_count(&m) > 0,
+        "intermediate (semicolon-deleted) state should produce parse errors but got 0:\n{}",
+        parse_error_summary(&m)
+    );
+
+    // Step 2: put the semicolon back. The text is now byte-identical
+    // to the original. Both fresh and incremental parses MUST agree.
+    let mid_text_for_pos = mid_text.clone();
+    let reinsert_pos = pos_utf8(&mid_text_for_pos, semi_byte);
+    edit(
+        &mut m,
+        Range {
+            start: reinsert_pos,
+            end: reinsert_pos,
+        },
+        ";",
+        3,
+        SourceEncoding::UTF8,
+    );
+
+    let final_text = full_text(&m);
+    assert_eq!(
+        final_text, src,
+        "after delete+restore cycle the text should be byte-identical to original"
+    );
+
+    // The incremental parse's error count must match a fresh parse of
+    // the same bytes. If incremental retains a mis-recovered subtree
+    // from the intermediate invalid state, this assertion fires —
+    // which IS the user-reported bug.
+    let inc_count = parse_error_count(&m);
+    let fresh = open(&final_text);
+    let fresh_count = parse_error_count(&fresh);
+    assert_eq!(
+        fresh_count,
+        0,
+        "fresh parse of the final text must be clean (sanity check): {}",
+        parse_error_summary(&fresh)
+    );
+    assert_eq!(
+        inc_count,
+        fresh_count,
+        "incremental reparse of the final text retained {inc_count} spurious errors that a fresh parse of the same bytes does not produce:\n\
+         incremental:\n{}\nfresh:\n{}",
+        parse_error_summary(&m),
+        parse_error_summary(&fresh),
+    );
+}
+
+/// Same shape but the intermediate-state edit is wider: drop both the
+/// semicolon AND the newline after it. This is closer to the kopr
+/// case (deleting a full `;` + line break makes the next `if` more
+/// likely to be re-classified inside the broken statement).
+#[test]
+fn delete_semicolon_and_newline_then_restore_keeps_incremental_clean() {
+    let src = fixture_with_chain();
+    let mut m = open(src);
+    let stmt = "var local = value * 2;";
+    let off = unique_offset(src, stmt);
+    let cut_start = off + stmt.len() - 1; // `;`
+    let cut_end = cut_start + 2; // `;\n`
+    assert_eq!(&src[cut_start..cut_end], ";\n");
+
+    let p_start = pos_utf8(src, cut_start);
+    let p_end = pos_utf8(src, cut_end);
+    edit(
+        &mut m,
+        Range {
+            start: p_start,
+            end: p_end,
+        },
+        "",
+        2,
+        SourceEncoding::UTF8,
+    );
+    assert!(
+        parse_error_count(&m) > 0,
+        "intermediate state should produce parse errors but got 0:\n{}",
+        parse_error_summary(&m)
+    );
+
+    let after_delete = full_text(&m);
+    let reinsert_pos = pos_utf8(&after_delete, cut_start);
+    edit(
+        &mut m,
+        Range {
+            start: reinsert_pos,
+            end: reinsert_pos,
+        },
+        ";\n",
+        3,
+        SourceEncoding::UTF8,
+    );
+
+    let final_text = full_text(&m);
+    assert_eq!(final_text, src, "text drifted after delete+restore cycle");
+
+    let inc_count = parse_error_count(&m);
+    let fresh = open(&final_text);
+    let fresh_count = parse_error_count(&fresh);
+    assert_eq!(
+        fresh_count,
+        0,
+        "fresh parse of the final text must be clean: {}",
+        parse_error_summary(&fresh)
+    );
+    assert_eq!(
+        inc_count,
+        fresh_count,
+        "incremental reparse retained {inc_count} spurious errors that fresh does not:\n\
+         incremental:\n{}\nfresh:\n{}",
+        parse_error_summary(&m),
+        parse_error_summary(&fresh),
+    );
+}
+
+/// Closest mirror of the kopr scenario: a `var x` with no initializer
+/// inserted at the top of an `if` block, then the missing semicolon
+/// added. The kopr screenshot shows lines 122+ go red after the user
+/// types `var x` and stay red even after they add the `;`.
+#[test]
+fn insert_var_decl_then_add_semicolon_keeps_incremental_clean() {
+    let src = fixture_with_chain();
+    let mut m = open(src);
+
+    // Insert `var x\n        ` right after the `{` of the `if (value < 0) {`
+    // block opener. The intermediate state is `var x` (no `;`), then
+    // the rest of the block — exactly the kopr shape.
+    let anchor = "if (value < 0) {\n";
+    let off = unique_offset(src, anchor);
+    let insert_at = off + anchor.len();
+    let insert_pos = pos_utf8(src, insert_at);
+    edit(
+        &mut m,
+        Range {
+            start: insert_pos,
+            end: insert_pos,
+        },
+        "        var x\n",
+        2,
+        SourceEncoding::UTF8,
+    );
+    assert!(
+        parse_error_count(&m) > 0,
+        "intermediate state with `var x` (no semicolon) should produce parse errors but got 0:\n{}",
+        parse_error_summary(&m)
+    );
+
+    // Now add the missing `;` after `var x`. The text is now valid —
+    // `var x;` is a legal (if useless) declaration.
+    let mid = full_text(&m);
+    let added = "        var x";
+    let x_off = mid.find(added).expect("inserted text present");
+    let semi_at = x_off + added.len();
+    let semi_pos = pos_utf8(&mid, semi_at);
+    edit(
+        &mut m,
+        Range {
+            start: semi_pos,
+            end: semi_pos,
+        },
+        ";",
+        3,
+        SourceEncoding::UTF8,
+    );
+
+    let final_text = full_text(&m);
+    // The final text is the original PLUS one `var x;` line — must
+    // parse cleanly fresh.
+    let fresh = open(&final_text);
+    let fresh_count = parse_error_count(&fresh);
+    assert_eq!(
+        fresh_count,
+        0,
+        "fresh parse of the final text must be clean: {}",
+        parse_error_summary(&fresh)
+    );
+    let inc_count = parse_error_count(&m);
+    assert_eq!(
+        inc_count,
+        fresh_count,
+        "incremental reparse retained {inc_count} spurious errors that fresh does not:\n\
+         incremental:\n{}\nfresh:\n{}",
+        parse_error_summary(&m),
+        parse_error_summary(&fresh),
+    );
+}
+
+/// Fixture engineered to bait tree-sitter into committing a stale
+/// `ERROR` subtree during incremental parsing. Three structural
+/// elements are simultaneously load-bearing:
+///
+/// 1. A long, multi-line `if (...) { ... } else if (...) { ... }`
+///    chain whose conditions wrap across newlines (parenthesised
+///    `&&` / `||` with arrow-deref accesses against `Type::variant`
+///    enum compares).
+/// 2. A trailing `while (...) { ... }` containing a nested
+///    `node<T> { T { ... } };` constructor.
+/// 3. A handful of `?? ` chained `Map::get` calls + `is`-typed guards
+///    earlier in the body.
+///
+/// Removing any single one of those drops the repro rate to zero on
+/// the same fixture — the smaller hand-built fixtures above
+/// (`fixture_with_chain`, `fixture_stable_module`) lack one or more
+/// and therefore don't expose the bug.
+fn fixture_recovery_trap() -> &'static str {
+    // Symbol names (`Record`, `VType`, `Kind`, `Spot`, `Section`,
+    // `Common`, `lookupById`, `handleV`, `parseN`) are intentionally
+    // undefined — the analyzer would flag them as unresolved at the
+    // analysis stage, but at the tree-sitter level they are just
+    // identifiers and the parse is clean. Only parse-level errors
+    // are counted in this test.
+    r#"private fn process_(
+    line: Record, virtualSpots: Map<String, VType>, endSpotCombinations: Map<int, int>
+) {
+    var endSpot1 = lookupById.get(line.F11) ?? virtualSpots.get(line.F11);
+    var endSpot2 = lookupById.get(line.F12) ?? virtualSpots.get(line.F12);
+    if (endSpot1 == null || endSpot2 == null || (endSpot1 is VType && endSpot2 is VType)) {
+        return;
+    }
+
+    if (endSpot1 is VType) {
+        handleV(endSpot1, endSpot2 as node<Spot>, line);
+        return;
+    }
+
+    if (endSpot2 is VType) {
+        handleV(endSpot2, endSpot1 as node<Spot>, line);
+        return;
+    }
+
+    endSpot1 = endSpot1 as node<Spot>;
+    endSpot2 = endSpot2 as node<Spot>;
+
+    if ((endSpot1->pointType == Kind::aa || endSpot1->pointType == Kind::bb) && (endSpot2->pointType
+        == Kind::cc
+        || endSpot2->pointType == Kind::dd)) {
+        Common::relA(endSpot1, endSpot2);
+        return;
+    } else if ((endSpot2->pointType == Kind::aa || endSpot2->pointType == Kind::bb) && (endSpot1->pointType
+        == Kind::cc
+        || endSpot1->pointType == Kind::dd)) {
+        Common::relA(endSpot2, endSpot1);
+        return;
+    } else if (endSpot1->pointType == Kind::aa && endSpot2->pointType == Kind::bb) {
+        Common::relB(endSpot1, endSpot2);
+        return;
+    } else if (endSpot1->pointType == Kind::bb && endSpot2->pointType == Kind::aa) {
+        Common::relB(endSpot2, endSpot1);
+        return;
+    } else if (endSpot1->pointType == Kind::ee && endSpot2->pointType == Kind::aa) {
+        Common::relC(endSpot1, endSpot2);
+        return;
+    } else if (endSpot2->pointType == Kind::ee && endSpot1->pointType == Kind::aa) {
+        Common::relC(endSpot2, endSpot1);
+        return;
+    } else if ((endSpot1->parent != null && endSpot2->parent != null && endSpot1->parent == endSpot2->parent) || (endSpotCombinations.get(
+        endSpot1 as int
+    )
+        == (endSpot2 as int)
+        || endSpotCombinations.get(endSpot2 as int) == (endSpot1 as int))) {
+        return;
+    }
+
+    endSpotCombinations.set(endSpot1 as int, endSpot2 as int);
+    endSpotCombinations.set(endSpot2 as int, endSpot1 as int);
+
+    var totalGeoDistance_m = 0.0;
+    var sections = nodeList<node<Section>> {};
+    var vertices = line.F13.split('\t');
+    var firstEndSpot = endSpot1->getCoords()!!;
+    var lastEndSpot = endSpot2->getCoords()!!;
+    var sectionIdx = 0;
+    var i = 0;
+    var previousEndSpot = firstEndSpot;
+    while (i != vertices.size()) {
+        var coordinates = geo { parseN(vertices.get(i)) as float, parseN(vertices.get(i + 1)) as float };
+        var section = node<Section> {
+            Section {
+                endSpot1: previousEndSpot,
+                endSpot2: coordinates,
+                geoDistance_m: previousEndSpot.distance(coordinates)
+            }
+        };
+        totalGeoDistance_m = totalGeoDistance_m + previousEndSpot.distance(coordinates);
+        sections.set(sectionIdx, section);
+        sectionIdx = sectionIdx + 1;
+        previousEndSpot = coordinates;
+        i = i + 2;
+    }
+}
+"#
+}
+
+/// Regression for the tree-sitter incremental-reparse-after-recovery
+/// shortcoming. Tree-sitter promises that parsing with `Some(old_tree)`
+/// shares structure with subtrees the edit didn't touch — it does NOT
+/// promise the result equals a fresh parse of the same bytes. When
+/// the old tree contains an `ERROR` subtree (committed during a prior
+/// recovery), the next incremental parse trusts that subtree's byte
+/// range as "unedited" and keeps it, even when the new text inside
+/// it is now syntactically valid. Result: stale `ERROR` diagnostics
+/// persist across an edit that should have cleared them.
+///
+/// Cycle: delete a `;` somewhere mid-body (forces recovery), then put
+/// it back (text is now byte-identical to original). Fresh parse of
+/// the final text is clean; incremental parse retains the recovery's
+/// committed corruption.
+///
+/// The fix lives in `Document::apply_changes`: when the pre-edit tree
+/// already had errors, drop it and re-parse from scratch instead of
+/// passing it to `Parser::parse` as the incremental baseline.
+#[test]
+fn incremental_reparse_matches_fresh_when_old_tree_had_errors() {
+    let src = fixture_recovery_trap();
+    let mut m = open(src);
+    assert_eq!(
+        parse_error_count(&m),
+        0,
+        "fixture must parse cleanly initially: {}",
+        parse_error_summary(&m)
+    );
+
+    // Pick a `;` inside the SECOND `else if` arm of the long chain.
+    // The first arm doesn't expose the bug — tree-sitter's recovery
+    // happens to resync at the next `else if` boundary. Editing
+    // deeper into the chain forces recovery to consume more of the
+    // tail, and that's the configuration where the stale ERROR
+    // subtree survives the restore.
+    let target = "Common::relA(endSpot2, endSpot1);";
+    let off = unique_offset(src, target);
+    let semi_byte = off + target.len() - 1;
+    assert_eq!(&src[semi_byte..semi_byte + 1], ";");
+
+    // Step 1: delete the `;`. Intermediate state must have parse
+    // errors — otherwise we're not actually exercising recovery.
+    let p_start = pos_utf8(src, semi_byte);
+    let p_end = pos_utf8(src, semi_byte + 1);
+    edit(
+        &mut m,
+        Range {
+            start: p_start,
+            end: p_end,
+        },
+        "",
+        2,
+        SourceEncoding::UTF8,
+    );
+    let mid_count = parse_error_count(&m);
+    assert!(
+        mid_count > 0,
+        "intermediate (semicolon-deleted) state should produce parse errors but got 0:\n{}",
+        parse_error_summary(&m)
+    );
+
+    // Step 2: put the `;` back. The text is byte-identical to
+    // original; fresh and incremental MUST agree.
+    let after = full_text(&m);
+    let reinsert_pos = pos_utf8(&after, semi_byte);
+    edit(
+        &mut m,
+        Range {
+            start: reinsert_pos,
+            end: reinsert_pos,
+        },
+        ";",
+        3,
+        SourceEncoding::UTF8,
+    );
+
+    let final_text = full_text(&m);
+    assert_eq!(
+        final_text, src,
+        "after delete+restore cycle the text should match the original"
+    );
+    let fresh = open(&final_text);
+    let fresh_count = parse_error_count(&fresh);
+    assert_eq!(
+        fresh_count,
+        0,
+        "fresh parse of the final text must be clean: {}",
+        parse_error_summary(&fresh)
+    );
+    let inc_count = parse_error_count(&m);
+    assert_eq!(
+        inc_count,
+        fresh_count,
+        "incremental reparse retained {inc_count} spurious errors that fresh does not:\n\
+         incremental:\n{}\nfresh:\n{}",
+        parse_error_summary(&m),
+        parse_error_summary(&fresh),
+    );
+}
