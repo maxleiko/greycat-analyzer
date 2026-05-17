@@ -2028,14 +2028,14 @@ impl<'a> Cx<'a> {
         instance_access: bool,
     ) {
         let ty = self.arena.get(recv_ty);
-        // Enums have no instance members in GreyCat — variants are
-        // queried via `Enum::variant` (static_expr). Two cases:
+        // Enums have no instance members in GreyCat — fields are
+        // queried via `Enum::field` (static_expr). Two cases:
         //   - instance access (`e.x` / `e->x`) → always wrong; the
         //     diagnostic points the user at the static_expr form.
         //   - static access (`E::x`) → valid only when `x` is a
-        //     declared variant; non-variant names error here. (The
+        //     declared field; non-field names error here. (The
         //     Static arm in `infer_expr` separately type-checks the
-        //     variant lookup and produces the enum's `TypeId` for
+        //     field lookup and produces the enum's `TypeId` for
         //     value-position use; this diag is purely the rejection
         //     side.)
         if let TypeKind::Enum { variants, .. } = &ty.kind {
@@ -2054,10 +2054,10 @@ impl<'a> Cx<'a> {
             let prop_range = self.hir.idents[property].byte_range.clone();
             let message = if instance_access {
                 format!(
-                    "enum `{recv_display}` has no instance members; access variants via `{recv_display}::{prop_text}` (static_expr)"
+                    "enum `{recv_display}` has no instance members; access fields via `{recv_display}::{prop_text}`"
                 )
             } else {
-                format!("enum `{recv_display}` has no variant `{prop_text}`")
+                format!("enum `{recv_display}` has no field `{prop_text}`")
             };
             self.out.diagnostics.push(SemanticDiagnostic::structural(
                 Severity::Error,

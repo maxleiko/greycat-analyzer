@@ -75,36 +75,35 @@ fn known_local_member_no_error() {
 }
 
 /// Instance access on an enum is always wrong; the diagnostic points
-/// the user at the `static_expr` form (`Enum::variant`).
+/// the user at the `static_expr` form (`Enum::field`).
 #[test]
 fn instance_access_on_enum() {
     let src = "enum E { a, b }\nfn f(e: E) {\n    e.a;\n}\n";
     let (pa, uri) = analyze(src);
     let msgs = error_messages(&pa, &uri);
     assert!(
-        msgs.iter()
-            .any(|m| m.contains("enum `E` has no instance members")
-                && m.contains("`E::a` (static_expr)")),
+        msgs.iter().any(|m| m.contains("enum `E` has no instance members")
+            && m.contains("access fields via `E::a`")),
         "got: {msgs:?}"
     );
 }
 
-/// Static access on an enum with a non-variant name errors with a
-/// targeted "no variant `X`" message.
+/// Static access on an enum with a non-field name errors with a
+/// targeted "no field `X`" message.
 #[test]
-fn static_access_on_enum_non_variant() {
+fn static_access_on_enum_non_field() {
     let src = "enum E { a, b }\nfn f() {\n    var _ = E::nope;\n}\n";
     let (pa, uri) = analyze(src);
     let msgs = error_messages(&pa, &uri);
     assert!(
-        msgs.iter().any(|m| m == "enum `E` has no variant `nope`"),
+        msgs.iter().any(|m| m == "enum `E` has no field `nope`"),
         "got: {msgs:?}"
     );
 }
 
-/// Valid enum variant access via static_expr must not fire any error.
+/// Valid enum field access via static_expr must not fire any error.
 #[test]
-fn enum_variant_access_no_error() {
+fn enum_field_access_no_error() {
     let src = "enum E { a, b }\nfn f() {\n    var _ = E::a;\n    var _ = E::b;\n}\n";
     let (pa, uri) = analyze(src);
     let msgs = error_messages(&pa, &uri);
