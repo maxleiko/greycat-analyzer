@@ -2028,6 +2028,44 @@ impl<'a> Cx<'a> {
         instance_access: bool,
     ) {
         let ty = self.arena.get(recv_ty);
+        // Enums have no instance members in GreyCat — variants are
+        // queried via `Enum::variant` (static_expr). Two cases:
+        //   - instance access (`e.x` / `e->x`) → always wrong; the
+        //     diagnostic points the user at the static_expr form.
+        //   - static access (`E::x`) → valid only when `x` is a
+        //     declared variant; non-variant names error here. (The
+        //     Static arm in `infer_expr` separately type-checks the
+        //     variant lookup and produces the enum's `TypeId` for
+        //     value-position use; this diag is purely the rejection
+        //     side.)
+        if let TypeKind::Enum { variants, .. } = &ty.kind {
+            let prop_sym = self.hir.idents[property].symbol;
+            if !instance_access && variants.contains(&prop_sym) {
+                return;
+            }
+            let recv_display = crate::project::display_type(
+                self.arena,
+                self.decl_registry,
+                &self.index.symbols,
+                recv_ty,
+            )
+            .to_string();
+            let prop_text = self.ident_text(property).to_string();
+            let prop_range = self.hir.idents[property].byte_range.clone();
+            let message = if instance_access {
+                format!(
+                    "enum `{recv_display}` has no instance members; access variants via `{recv_display}::{prop_text}` (static_expr)"
+                )
+            } else {
+                format!("enum `{recv_display}` has no variant `{prop_text}`")
+            };
+            self.out.diagnostics.push(SemanticDiagnostic::structural(
+                Severity::Error,
+                message,
+                prop_range,
+            ));
+            return;
+        }
         let type_name: Option<SmolStr> = match &ty.kind {
             // P35.7 — handle-keyed variants read the name from the
             // arena's parallel decl-names table.
@@ -2039,6 +2077,12 @@ impl<'a> Cx<'a> {
             // the same `type_decls` / `decl_locations` lookup path so
             // `"hello".size()` and friends bind correctly.
             TypeKind::Primitive(p) => Some(p.name().into()),
+            // `Any` / `Unresolved` / `GenericParam` / `Lambda` / `Null`
+            // / `Never` / `Union` — receivers where we either can't
+            // know the member set (any is the escape hatch by design,
+            // unresolved already errored upstream) or where a member
+            // access doesn't apply. Silent so we don't pile false
+            // positives onto unrelated upstream errors.
             _ => None,
         };
         let Some(name) = type_name else {
@@ -2112,7 +2156,43 @@ impl<'a> Cx<'a> {
                     member: MemberDef::Method(method_id),
                 },
             );
+            return;
         }
+        // All four lookups exhausted. Before erroring, gate on
+        // "we actually know this type's full member set" — if neither
+        // the local module nor the project index has it, the type's
+        // body hasn't been loaded (e.g. stdlib not present in a
+        // single-file test harness, or a built-in name like `node`
+        // whose body lives in `lib/std/core.gcl` that isn't on disk).
+        // Claiming "no member" in that state would be a false positive.
+        // Real CLI / LSP runs always load stdlib, so this gate only
+        // silences synthetic-test cases.
+        let known_to_project =
+            local_type_decl.is_some() || self.index.type_members_for(name.as_str()).is_some();
+        if !known_to_project {
+            return;
+        }
+        // `display_type` renders generics (`node<String>` not `node`)
+        // for clearer messages.
+        let recv_display = crate::project::display_type(
+            self.arena,
+            self.decl_registry,
+            &self.index.symbols,
+            recv_ty,
+        )
+        .to_string();
+        let prop_text_owned = prop_text.to_string();
+        let prop_range = self.hir.idents[property].byte_range.clone();
+        let kind = if instance_access {
+            "member"
+        } else {
+            "static member"
+        };
+        self.out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            format!("type `{recv_display}` has no {kind} `{prop_text_owned}`"),
+            prop_range,
+        ));
     }
 
     fn resolve_member(&mut self, recv_ty: TypeId, property: Idx<Ident>) {
