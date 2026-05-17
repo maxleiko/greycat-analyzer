@@ -804,6 +804,40 @@ fn semantic_tokens_emits_typed_idents_and_literals() {
 }
 
 #[test]
+fn semantic_tokens_emits_enum_member_for_variant_decl_and_ref() {
+    // Declaration sites (`Red`, `Green`, `Blue` inside `enum Color { ... }`)
+    // and the reference site (`Color::Red`) should both emit ENUM_MEMBER
+    // (index 3), while the type `Color` itself stays ENUM (index 2).
+    let src = "enum Color { Red, Green, Blue }\nfn pick(): Color { return Color::Red; }\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    let tokens = capabilities::semantic_tokens(src, "project", r);
+    let enum_idx = 2u32;
+    let enum_member_idx = 3u32;
+    // Three decl-site variants + one variant ref = 4 ENUM_MEMBER tokens.
+    let enum_member_count = tokens
+        .data
+        .iter()
+        .filter(|t| t.token_type == enum_member_idx)
+        .count();
+    assert_eq!(
+        enum_member_count, 4,
+        "expected 4 ENUM_MEMBER tokens (3 decl-site + 1 ref), got {enum_member_count}"
+    );
+    // `Color` appears twice as a type: return-type annotation and static
+    // receiver. Both should be ENUM.
+    let enum_count = tokens
+        .data
+        .iter()
+        .filter(|t| t.token_type == enum_idx)
+        .count();
+    assert_eq!(
+        enum_count, 2,
+        "expected 2 ENUM tokens (return-type + static receiver), got {enum_count}"
+    );
+}
+
+#[test]
 fn semantic_tokens_typed_suffix_distinct_from_digits() {
     // Painting the whole `number` node as NUMBER hides the textual
     // suffix in `42_time`, `3day_2hour42s`, `3.14f`. Tokenize each

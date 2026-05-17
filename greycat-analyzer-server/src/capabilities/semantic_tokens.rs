@@ -89,6 +89,49 @@ pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Se
                     push(&mut events, TOK_KEYWORD);
                     return true;
                 }
+                // Enum-variant declaration sites: `enum E { A, B }` — the
+                // `A` / `B` idents live as direct children of `enum_field`
+                // and would otherwise resolve as `Decl::Enum` (their HIR
+                // ident points back at the enclosing enum decl) and paint
+                // TOK_ENUM. Emit ENUM_MEMBER instead so they match variant
+                // *references* visually.
+                if let Some(parent) = n.parent()
+                    && parent.kind() == "enum_field"
+                {
+                    push(&mut events, TOK_ENUM_MEMBER);
+                    return true;
+                }
+                // Enum-variant references (`MyEnum::Foo`) are CST-shaped as
+                // `static_expr { receiver :: property }`. The property ident
+                // doesn't bind to a resolver `Definition` (member access is
+                // not a scope binding), so we'd otherwise emit nothing and
+                // fall back to tree-sitter highlights. Detect the parent
+                // shape, resolve the receiver chain's type, and emit
+                // ENUM_MEMBER when it points at a `Decl::Enum`.
+                if let Some(parent) = n.parent()
+                    && parent.kind() == "static_expr"
+                    && parent.child_by_field_name("property").map(|c| c.id()) == Some(n.id())
+                {
+                    let mut recv = parent.named_child(0);
+                    while let Some(node) = recv
+                        && node.kind() == "static_expr"
+                    {
+                        recv = node.named_child(0);
+                    }
+                    if let Some(type_ident) = recv
+                        && type_ident.kind() == "type_ident"
+                        && let Some(name_ident) = type_ident.child_by_field_name("name")
+                        && let Some((recv_idx, _)) = hir
+                            .idents
+                            .iter()
+                            .find(|(_, i)| i.byte_range == name_ident.byte_range())
+                        && let Some(Definition::Decl(d)) = resolutions.lookup(recv_idx)
+                        && matches!(&hir.decls[d], Decl::Enum(_))
+                    {
+                        push(&mut events, TOK_ENUM_MEMBER);
+                        return true;
+                    }
+                }
                 if let Some((idx, _)) = hir
                     .idents
                     .iter()
