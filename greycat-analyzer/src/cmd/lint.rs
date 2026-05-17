@@ -564,7 +564,9 @@ impl Lint {
                     let source = std::fs::read_to_string(&e.path).unwrap_or_default();
                     for diag in &e.diagnostics {
                         match render {
-                            OutputFormat::Compact => println!("{}", format_cli(&path, diag)),
+                            OutputFormat::Compact => {
+                                println!("{}", format_cli(&path, diag, self.color.enabled()))
+                            }
                             OutputFormat::Pretty => print_pretty_diagnostic(&path, &source, diag),
                             OutputFormat::Csv | OutputFormat::Quiet => {}
                         }

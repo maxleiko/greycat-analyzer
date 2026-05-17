@@ -570,7 +570,7 @@ pub fn multi_project_owner_diagnostic(text: &str, roots: &[std::path::PathBuf]) 
 /// shape the cli lint subcommand prints. The `_` prefix on `code` is a
 /// reminder that the rich struct fields (related info, code, tags) get
 /// dropped for cli output.
-pub fn format_cli(path: &str, diag: &Diagnostic) -> String {
+pub fn format_cli(path: &str, diag: &Diagnostic, color: bool) -> String {
     let severity = match diag.severity {
         Some(DiagnosticSeverity::ERROR) => "error",
         Some(DiagnosticSeverity::WARNING) => "warning",
@@ -586,15 +586,39 @@ pub fn format_cli(path: &str, diag: &Diagnostic) -> String {
         Some(NumberOrString::Number(n)) => format!("[{n}]"),
         None => String::new(),
     };
-    format!(
-        "{}:{}:{}: {}{}: {}",
-        path,
-        diag.range.start.line + 1,
-        diag.range.start.character + 1,
-        severity,
-        code,
-        diag.message,
-    )
+    if color {
+        // ANSI: bold + per-severity color on `severity[code]`, bold
+        // on the path; everything else plain. Matches the visual
+        // hierarchy the pretty (miette) renderer uses on the same
+        // information so terminal users see the same emphasis in
+        // both modes.
+        let sev_color = match diag.severity {
+            Some(DiagnosticSeverity::ERROR) => "\x1b[1;31m", // bold red
+            Some(DiagnosticSeverity::WARNING) => "\x1b[1;33m", // bold yellow
+            Some(DiagnosticSeverity::INFORMATION) => "\x1b[1;34m", // bold blue
+            Some(DiagnosticSeverity::HINT) => "\x1b[1;36m",  // bold cyan
+            _ => "\x1b[1m",                                  // bold
+        };
+        let reset = "\x1b[0m";
+        let bold = "\x1b[1m";
+        format!(
+            "{bold}{}:{}:{}:{reset} {sev_color}{severity}{code}{reset}: {}",
+            path,
+            diag.range.start.line + 1,
+            diag.range.start.character + 1,
+            diag.message,
+        )
+    } else {
+        format!(
+            "{}:{}:{}: {}{}: {}",
+            path,
+            diag.range.start.line + 1,
+            diag.range.start.character + 1,
+            severity,
+            code,
+            diag.message,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1051,7 +1075,7 @@ mod tests {
             message: "boom".into(),
             ..Default::default()
         };
-        assert_eq!(format_cli("a.gcl", &diag), "a.gcl:5:8: error: boom");
+        assert_eq!(format_cli("a.gcl", &diag, false), "a.gcl:5:8: error: boom");
     }
 
     /// When a diagnostic carries a `code`, the cli line includes
@@ -1076,8 +1100,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            format_cli("a.gcl", &diag),
+            format_cli("a.gcl", &diag, false),
             "a.gcl:1:1: error[missing-function-body]: boom"
+        );
+    }
+
+    /// With `color=true` the path is bolded and the `severity[code]`
+    /// is bold-colored (red for error, yellow for warning, …). ANSI
+    /// reset closes both runs. Plain text remains in the message.
+    #[test]
+    fn format_cli_color_ansi() {
+        let diag = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 1,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String("unknown-member".into())),
+            message: "boom".into(),
+            ..Default::default()
+        };
+        let out = format_cli("a.gcl", &diag, true);
+        assert_eq!(
+            out,
+            "\x1b[1ma.gcl:1:1:\x1b[0m \x1b[1;31merror[unknown-member]\x1b[0m: boom"
         );
     }
 }
