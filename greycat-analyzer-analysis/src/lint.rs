@@ -287,6 +287,13 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
          doesn't cover every variant (and has no catch-all final `else`)",
     ),
     rule(
+        "decidable-condition",
+        "warn when an `if` / `while` / `do-while` / `for` condition is statically \
+         decidable to `true` or `false` (e.g. `if (x is int && x is float)`, \
+         `while (true) {}`). Suppress with `// gcl-lint-off decidable-condition` \
+         when the always-true / always-false outcome is intentional.",
+    ),
+    rule(
         "unused-suppression",
         "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
     ),
@@ -2153,6 +2160,40 @@ pub fn lint_non_exhaustive_with_directives(
         );
     }
 }
+
+/// Pipe every `LintDiagnostic` the typed analyzer pre-built into
+/// [`AnalysisResult::surfaced_lints`] through `emit_typed`, so
+/// `// gcl-lint-off <rule>` directives can suppress them uniformly
+/// with every other rule.
+///
+/// New analyzer-surfaced rules slot in by calling
+/// [`crate::analyzer::Cx::surface_lint`] at the emit site; nothing new
+/// is needed here. The set of rule codes the analyzer can surface is
+/// declared in [`SURFACED_RULES`].
+pub fn lint_surfaced_with_directives(
+    analysis: &AnalysisResult,
+    out: &mut Vec<LintDiagnostic>,
+    directives: &mut Directives,
+    bypass_suppressions: bool,
+) {
+    for diag in &analysis.surfaced_lints {
+        emit_typed(
+            out,
+            Some(&mut *directives),
+            bypass_suppressions,
+            diag.clone(),
+        );
+    }
+}
+
+/// Rule codes the typed analyzer can surface through
+/// [`AnalysisResult::surfaced_lints`]. The typed-lint runner's
+/// `retain` filter uses this slice to drop stale entries before
+/// re-piping, so incremental edits in the LSP don't accumulate dupes.
+///
+/// Add a new entry here whenever a new analyzer emit site uses
+/// [`crate::analyzer::Cx::surface_lint`].
+pub const SURFACED_RULES: &[&str] = &["decidable-condition"];
 
 fn collect_dead_in_fn(
     hir: &Hir,

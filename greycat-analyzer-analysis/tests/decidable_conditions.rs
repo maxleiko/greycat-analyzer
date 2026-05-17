@@ -25,13 +25,23 @@ fn analyze(src: &str) -> (Uri, ProjectAnalysis) {
     (uri, ProjectAnalysis::analyze(&mgr))
 }
 
+/// Collect every user-visible message from both semantic diagnostics
+/// (`analysis.diagnostics`) and lints (`module.lints`). The "condition
+/// is always true / false" findings used to live in the diagnostics
+/// stream but were migrated to the suppressible `decidable-condition`
+/// lint rule, so the tests below match against the union of both. The
+/// LSP / CLI surface them the same way (publishDiagnostics merges them
+/// downstream), so the union is the right unit.
 fn diag_messages(pa: &ProjectAnalysis, uri: &Uri) -> Vec<String> {
     let m = pa.module(uri).expect("module");
-    m.analysis
+    let mut out: Vec<String> = m
+        .analysis
         .diagnostics
         .iter()
         .map(|d| d.message.clone())
-        .collect()
+        .collect();
+    out.extend(m.lints.iter().map(|l| l.message.clone()));
+    out
 }
 
 fn assignability_diagnostics(pa: &ProjectAnalysis, uri: &Uri) -> Vec<String> {

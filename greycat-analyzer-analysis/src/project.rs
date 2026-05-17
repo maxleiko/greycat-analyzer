@@ -33,11 +33,11 @@ use crate::analyzer::{
 };
 use crate::directives::Directives;
 use crate::lint::{
-    LintDiagnostic, lint_arrow_on_non_deref_with_directives, lint_catch_empty_parens,
-    lint_inferred_return_type_with_directives, lint_no_breakpoint,
+    LintDiagnostic, SURFACED_RULES, lint_arrow_on_non_deref_with_directives,
+    lint_catch_empty_parens, lint_inferred_return_type_with_directives, lint_no_breakpoint,
     lint_non_exhaustive_with_directives, lint_nullability_with_directives,
-    lint_redundant_semicolon, lint_unreachable_with_directives, lint_unused_suppressions,
-    run_lints_with_directives,
+    lint_redundant_semicolon, lint_surfaced_with_directives, lint_unreachable_with_directives,
+    lint_unused_suppressions, run_lints_with_directives,
 };
 use crate::resolver::{Resolutions, resolve_with_index_for};
 use crate::stdlib::{FnSignature, ProjectIndex};
@@ -2915,7 +2915,7 @@ fn run_typed_lints_for_module(
                 | "catch-empty-parens"
                 | "redundant-semicolon"
                 | "no-breakpoint"
-        )
+        ) && !SURFACED_RULES.contains(&l.rule)
     });
     if let Some((text, tree)) = doc_data.get(uri) {
         lint_catch_empty_parens(
@@ -2981,6 +2981,12 @@ fn run_typed_lints_for_module(
         bypass,
     );
     lint_non_exhaustive_with_directives(
+        &module.analysis,
+        &mut module.lints,
+        &mut module.directives,
+        bypass,
+    );
+    lint_surfaced_with_directives(
         &module.analysis,
         &mut module.lints,
         &mut module.directives,
