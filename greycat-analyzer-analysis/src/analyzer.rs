@@ -2275,7 +2275,7 @@ impl<'a> Cx<'a> {
             Severity::Error,
             "private-attr-write",
             format!(
-                "attribute `{prop_text}` is `private` — only the type's constructor (`Foo {{ {prop_text}: ... }}`) can write to it; direct assignment is forbidden",
+                "attribute `{prop_text}` is `private` only the type's constructor can write to it",
             ),
             span,
         ));
