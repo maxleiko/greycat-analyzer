@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use rustc_hash::FxHashMap;
 
-use greycat_analyzer_core::{SymbolTable, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_core::{ItemId, SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -1365,16 +1365,15 @@ fn lint_arrow_on_non_deref_inner(
         let Some(recv_ty) = analysis.expr_types.get(receiver).copied() else {
             continue;
         };
-        let head = receiver_head_name(arena, decl_registry, &index.symbols, recv_ty);
-        let Some(name) = head else {
+        let Some((name, head_id)) =
+            receiver_head_name(arena, decl_registry, &index.symbols, recv_ty)
+        else {
             // Conservative: receiver is `any` / lambda / tuple / etc. —
             // no head name to classify. Skip.
             continue;
         };
-        if index
-            .symbols
-            .lookup(&name)
-            .and_then(|sym| index.type_flags.get(&sym))
+        if head_id
+            .and_then(|id| index.type_flags.get(&id))
             .is_some_and(|f| f.deref.is_some())
         {
             continue;
@@ -1428,15 +1427,15 @@ fn receiver_head_name(
     _decl_registry: &DeclRegistry,
     symbols: &SymbolTable,
     ty: TypeId,
-) -> Option<String> {
+) -> Option<(String, Option<ItemId>)> {
     let t = arena.get(ty);
     match &t.kind {
         // `TypeKind::Type(item)` / `Generic` carry their decl's
         // `ItemId` directly — the name half indexes into the
         // project's symbol table without going through the registry.
-        TypeKind::Type(decl) => Some(symbols[decl.name].to_string()),
-        TypeKind::Generic { decl, .. } => Some(symbols[decl.name].to_string()),
-        TypeKind::Primitive(p) => Some(p.name().to_string()),
+        TypeKind::Type(decl) => Some((symbols[decl.name].to_string(), Some(*decl))),
+        TypeKind::Generic { decl, .. } => Some((symbols[decl.name].to_string(), Some(*decl))),
+        TypeKind::Primitive(p) => Some((p.name().to_string(), None)),
         _ => None,
     }
 }

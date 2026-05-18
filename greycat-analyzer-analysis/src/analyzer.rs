@@ -2299,9 +2299,23 @@ impl<'a> Cx<'a> {
             let ret = fnd.return_type?;
             return Some(self.lower_type_ref(ret));
         }
+        // Bare-name fallback: walk every non-private fn-namespace
+        // candidate; first match wins. Same shape as
+        // `resolve_decl_handle_from`.
         let fn_sym = self.hir.idents[name_idx].symbol;
-        if let Some(sig) = self.index.fn_signatures.get(&fn_sym) {
-            return Some(sig.return_ty);
+        for (uri, decl) in self
+            .index
+            .locate_decl_in_ns(fn_sym, crate::stdlib::Namespace::Fn)
+        {
+            if self.index.is_decl_private(uri, decl) {
+                continue;
+            }
+            let Some(fn_id) = self.index.item_id_for(uri, fn_sym) else {
+                continue;
+            };
+            if let Some(sig) = self.index.fn_signatures.get(&fn_id) {
+                return Some(sig.return_ty);
+            }
         }
         None
     }
@@ -2316,8 +2330,14 @@ impl<'a> Cx<'a> {
     fn qualified_static_call_return(&mut self, chain: &[Idx<Ident>]) -> Option<TypeId> {
         match chain.len() {
             2 => {
-                let fn_sym = self.hir.idents[chain[1]].symbol;
-                let sig = self.index.fn_signatures.get(&fn_sym)?;
+                // `module::fn(...)` — `(chain[0], chain[1])` is the
+                // fn's full `ItemId` since module symbols are
+                // project-wide unique.
+                let fn_id = ItemId::new(
+                    self.hir.idents[chain[0]].symbol,
+                    self.hir.idents[chain[1]].symbol,
+                );
+                let sig = self.index.fn_signatures.get(&fn_id)?;
                 Some(sig.return_ty)
             }
             3 => {
@@ -2532,7 +2552,7 @@ impl<'a> Cx<'a> {
                 let module_sym = self.hir.idents[chain[0]].symbol;
                 let sym = self.hir.idents[chain[1]].symbol;
                 let item = ItemId::new(module_sym, sym);
-                if self.index.fn_signatures.contains_key(&sym) {
+                if self.index.fn_signatures.contains_key(&item) {
                     Some(self.function_ty())
                 } else if self.index.values.contains(&sym) {
                     // Non-native fn (`private fn foo()` or fn without
@@ -2557,8 +2577,7 @@ impl<'a> Cx<'a> {
                 // Enum variant: `module::Foo::a` types as `Foo` (the
                 // enum), matching the analyzer's `Static` enum-variant
                 // arm so call-arg validation against `_: Foo` passes.
-                // `enum_types` is still Symbol-keyed (flips in chunk 4).
-                if let Some(ty_id) = self.index.enum_types.get(&type_sym).copied()
+                if let Some(ty_id) = self.index.enum_types.get(&type_id).copied()
                     && let TypeKind::Enum { variants, .. } = &self.arena.get(ty_id).kind
                     && variants.contains(&member_sym)
                 {
@@ -2717,8 +2736,12 @@ impl<'a> Cx<'a> {
                 if !tr.params.is_empty() {
                     let args: Vec<TypeId> =
                         tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
-                    match crate::project::resolve_decl_handle_from(self.index, self.decl_registry, Some(self.module_uri), &name)
-                    {
+                    match crate::project::resolve_decl_handle_from(
+                        self.index,
+                        self.decl_registry,
+                        Some(self.module_uri),
+                        &name,
+                    ) {
                         Some(handle) => self.arena.generic(handle, args),
                         None => self
                             .arena
@@ -2741,8 +2764,12 @@ impl<'a> Cx<'a> {
                     // raw-form bridge in `is_assignable_to`.
                     let any_q = self.arena.any_nullable();
                     let args: Vec<TypeId> = vec![any_q; arity];
-                    match crate::project::resolve_decl_handle_from(self.index, self.decl_registry, Some(self.module_uri), &name)
-                    {
+                    match crate::project::resolve_decl_handle_from(
+                        self.index,
+                        self.decl_registry,
+                        Some(self.module_uri),
+                        &name,
+                    ) {
                         Some(handle) => self.arena.generic(handle, args),
                         None => self
                             .arena
@@ -2750,7 +2777,14 @@ impl<'a> Cx<'a> {
                     }
                 } else if let Some(id) = self.out.registry.lookup(name_sym) {
                     id
-                } else if let Some(enum_id) = self.index.enum_types.get(&name_sym).copied() {
+                } else if let Some(enum_id) = crate::project::resolve_decl_handle_from(
+                    self.index,
+                    self.decl_registry,
+                    Some(self.module_uri),
+                    &name,
+                )
+                .and_then(|item| self.index.enum_types.get(&item).copied())
+                {
                     // P19.10 — canonical enum TypeId from the
                     // project signature index. Same reason as
                     // `lower_type_ref_project`: a cross-module enum
@@ -2762,9 +2796,12 @@ impl<'a> Cx<'a> {
                     // recognise it as the same type as the foreign
                     // declaration site.
                     enum_id
-                } else if let Some(handle) =
-                    crate::project::resolve_decl_handle_from(self.index, self.decl_registry, Some(self.module_uri), &name)
-                {
+                } else if let Some(handle) = crate::project::resolve_decl_handle_from(
+                    self.index,
+                    self.decl_registry,
+                    Some(self.module_uri),
+                    &name,
+                ) {
                     // P38.2 — non-generic foreign concrete type with
                     // an interned decl handle: mint `Type(handle)` so
                     // the shape matches what `lower_type_ref_project`
@@ -3062,7 +3099,9 @@ impl<'a> Cx<'a> {
                 }
                 Some(tbl.substitute(self.arena, declared_return))
             }
-            Definition::ProjectDecl { .. } => {
+            Definition::ProjectDecl {
+                uri: ref dec_uri, ..
+            } => {
                 // **P19.15** — cross-module generic call inference.
                 // The S7-S11 stage pre-lowered every fn's params and
                 // return type into the shared arena (`FnSignature`);
@@ -3073,7 +3112,8 @@ impl<'a> Cx<'a> {
                 // (GenericParam) and downstream arithmetic on the
                 // result fell through to `any`.
                 let fn_sym = self.hir.idents[name_idx].symbol;
-                let sig = self.index.fn_signatures.get(&fn_sym)?;
+                let fn_id = self.index.item_id_for(dec_uri, fn_sym)?;
+                let sig = self.index.fn_signatures.get(&fn_id)?;
                 if sig.generics.is_empty() {
                     return None;
                 }
@@ -4715,9 +4755,11 @@ impl<'a> Cx<'a> {
                     // `values`) and type as `type`, breaking
                     // for-in iteration over the foreign var.
                     let sym = self.hir.idents[idx].symbol;
-                    if let Some(var_ty) = self.index.var_types.get(&sym).copied() {
+                    let item = self.index.item_id_for(dec_uri, sym);
+                    if let Some(var_ty) = item.and_then(|id| self.index.var_types.get(&id)).copied()
+                    {
                         var_ty
-                    } else if self.index.fn_signatures.contains_key(&sym)
+                    } else if item.is_some_and(|id| self.index.fn_signatures.contains_key(&id))
                         || self.index.non_native_fn_names.contains(&sym)
                     {
                         // P38.1 — native fns live in `fn_signatures`,

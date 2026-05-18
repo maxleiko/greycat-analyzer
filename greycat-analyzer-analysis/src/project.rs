@@ -189,16 +189,15 @@ struct ModuleSigCache {
     /// `(type_id, method_sym, ty)`.
     methods: Vec<(ItemId, Symbol, TypeId)>,
     // P19.9
-    /// `(fn_sym, signature)`. Still Symbol-keyed; `fn_signatures`
-    /// flips to ItemId in chunk 4.
-    fns: Vec<(Symbol, FnSignature)>,
+    /// `(fn_id, signature)`.
+    fns: Vec<(ItemId, FnSignature)>,
     // P19.10
-    /// `(var_sym, ty)`. Top-level `var` declared types.
+    /// `(var_id, ty)`. Top-level `var` declared types.
     /// Lowered alongside the other signatures in
     /// [`lower_module_signatures`] so the analyzer's bare-Ident path
     /// can type a cross-module `Definition::ProjectDecl` pointing at
     /// a var.
-    vars: Vec<(Symbol, TypeId)>,
+    vars: Vec<(ItemId, TypeId)>,
     /// `(type_id, supertype_ty)`. Pre-lowered direct supertype shape
     /// (e.g. `Generic { decl: Base, args: [int] }` for
     /// `Sub extends Base<int>`). Populated alongside the other
@@ -1249,16 +1248,13 @@ fn populate_subtype_indices(index: &mut ProjectIndex) {
 
 fn populate_deref_caches(index: &mut ProjectIndex) {
     use rustc_hash::FxHashMap;
-    // Two-pass: build a snapshot of (type_id → method_sym) pairs
-    // from `type_flags`, then resolve each via the chain-walking
-    // method-return lookup. Avoids holding `&type_members` + `&mut
-    // type_members` borrows simultaneously.
-    //
-    // `type_flags` is still Symbol-keyed (flips in chunk 4); the
-    // name → ItemId resolution here walks every TypeMembers entry
-    // whose `.name` matches. Cheap, runs once per ingest.
+    // Two-pass: build a snapshot of (type_id → ret_ty) pairs from
+    // `type_flags`, then write back. Avoids holding `&type_members`
+    // + `&mut type_members` borrows simultaneously. With `type_flags`
+    // now keyed by `ItemId`, each entry maps 1:1 to its type_members
+    // entry — no name-match scan needed.
     let mut resolutions: FxHashMap<ItemId, TypeId> = FxHashMap::default();
-    for (type_sym, flags) in &index.type_flags {
+    for (type_id, flags) in &index.type_flags {
         let Some(method_name) = flags.deref.as_deref() else {
             continue;
         };
@@ -1268,16 +1264,8 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
         let Some(method_sym) = index.symbols.lookup(method_name) else {
             continue;
         };
-        for type_id in index
-            .type_members
-            .keys()
-            .copied()
-            .filter(|id| id.name == *type_sym)
-            .collect::<Vec<_>>()
-        {
-            if let Some(ret) = index.type_method_return_chain(type_id, method_sym) {
-                resolutions.insert(type_id, ret);
-            }
+        if let Some(ret) = index.type_method_return_chain(*type_id, method_sym) {
+            resolutions.insert(*type_id, ret);
         }
     }
     for (type_id, ret_ty) in resolutions {
@@ -1457,6 +1445,9 @@ fn lower_module_signatures(
             }
             Decl::Fn(fnd) => {
                 let fn_sym = hir.idents[fnd.name].symbol;
+                let Some(fn_id) = index.item_id_for(uri, fn_sym) else {
+                    continue;
+                };
                 let Some(ret) = fnd.return_type else {
                     continue;
                 };
@@ -1497,7 +1488,7 @@ fn lower_module_signatures(
                     params.push(pt);
                 }
                 entry.fns.push((
-                    fn_sym,
+                    fn_id,
                     FnSignature {
                         home_uri: uri.clone(),
                         return_ty: ret_ty,
@@ -1516,6 +1507,9 @@ fn lower_module_signatures(
                 // contribute nothing — the analyzer's local body
                 // walker types them from the initializer.
                 let var_sym = hir.idents[vd.name].symbol;
+                let Some(var_id) = index.item_id_for(uri, var_sym) else {
+                    continue;
+                };
                 let Some(tr) = vd.ty else {
                     continue;
                 };
@@ -1523,7 +1517,7 @@ fn lower_module_signatures(
                 let empty: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 let var_ty =
                     lower_type_ref_project(hir, tr, arena_mut, &*index, decl_registry, &empty);
-                entry.vars.push((var_sym, var_ty));
+                entry.vars.push((var_id, var_ty));
             }
             _ => {}
         }
@@ -1976,27 +1970,27 @@ pub(crate) fn is_castable_with_index(
 /// preserve the "first decl wins" collision rule that the rest of
 /// the pipeline assumes.
 fn apply_module_contributions(index: &mut ProjectIndex, c: &ModuleSigCache) {
-    for (type_sym, attr_sym, ty) in &c.attrs {
-        if let Some(tm) = index.type_members.get_mut(type_sym) {
+    for (type_id, attr_sym, ty) in &c.attrs {
+        if let Some(tm) = index.type_members.get_mut(type_id) {
             tm.attr_types.insert(*attr_sym, *ty);
         }
     }
-    for (type_sym, method_sym, ty) in &c.methods {
-        if let Some(tm) = index.type_members.get_mut(type_sym) {
+    for (type_id, method_sym, ty) in &c.methods {
+        if let Some(tm) = index.type_members.get_mut(type_id) {
             tm.method_returns.insert(*method_sym, *ty);
         }
     }
-    for (fn_sym, sig) in &c.fns {
+    for (fn_id, sig) in &c.fns {
         index
             .fn_signatures
-            .entry(*fn_sym)
+            .entry(*fn_id)
             .or_insert_with(|| sig.clone());
     }
-    for (sym, ty) in &c.vars {
-        index.var_types.entry(*sym).or_insert(*ty);
+    for (var_id, ty) in &c.vars {
+        index.var_types.entry(*var_id).or_insert(*ty);
     }
-    for (type_sym, ty) in &c.supertypes {
-        if let Some(tm) = index.type_members.get_mut(type_sym)
+    for (type_id, ty) in &c.supertypes {
+        if let Some(tm) = index.type_members.get_mut(type_id)
             && tm.supertype_ty.is_none()
         {
             tm.supertype_ty = Some(*ty);
@@ -4064,27 +4058,27 @@ fn lower_type_ref_project(
                 }
             } else if let Some(owner) = generics_in_scope.get(&name_sym) {
                 arena.generic_param(name_sym, *owner)
-            } else if let Some(arity) = index
-                .type_members
-                .iter()
-                .find(|(id, _)| id.name == name_sym)
-                .map(|(_, m)| m.generics.len())
+            } else if let Some(arity) = resolve_decl_handle(index, decl_registry, name)
+                .and_then(|item| index.type_members.get(&item))
+                .map(|m| m.generics.len())
                 .filter(|n| *n > 0)
             {
                 // Raw-form generic reference: `Tensor` (no params)
                 // ≡ `Tensor<any?, any?>`. Expand at lowering time so
                 // the body walker and validation pass agree on the
                 // same shape; kills the need for any raw-form bridge
-                // in `is_assignable_to`. Bare-name fallback walks
-                // every `type_members` entry whose name matches —
-                // first match wins, mirroring `resolve_decl_handle`.
+                // in `is_assignable_to`. Routes through
+                // `resolve_decl_handle` so the ItemId picks the same
+                // non-private candidate as everywhere else.
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
                 match resolve_decl_handle(index, decl_registry, name) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
-            } else if let Some(enum_id) = index.enum_types.get(&name_sym).copied() {
+            } else if let Some(enum_id) = resolve_decl_handle(index, decl_registry, name)
+                .and_then(|item| index.enum_types.get(&item).copied())
+            {
                 // P19.10 — canonical enum TypeId from S7-S11.
                 // Without this, a cross-module enum reference would
                 // mint `Named(name)` (kind != Enum), which breaks
@@ -4304,7 +4298,9 @@ fn lower_type_ref_id(
                 }
             } else if let Some(id) = registry.lookup(name_sym) {
                 id
-            } else if let Some(enum_id) = index.enum_types.get(&name_sym).copied() {
+            } else if let Some(enum_id) = resolve_decl_handle(index, decl_registry, name)
+                .and_then(|item| index.enum_types.get(&item).copied())
+            {
                 // Canonical enum TypeId from S7-S11. The body walker's
                 // `lower_type_ref` and `lower_type_ref_project` both
                 // hit this branch ahead of `resolve_decl_handle`; the
@@ -4351,13 +4347,22 @@ fn generic_arity_for(
     {
         return Some(td.generics.len());
     }
-    // Bare-name foreign fallback: first non-zero arity wins.
-    let arity = index
-        .type_members
-        .iter()
-        .find(|(id, _)| id.name == name_sym)
-        .map(|(_, m)| m.generics.len())?;
-    (arity > 0).then_some(arity)
+    // Bare-name foreign fallback: walk every non-private Type-ns
+    // candidate (mirrors `resolve_decl_handle`'s shape); first with
+    // non-zero arity wins.
+    for (uri, decl) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
+        if index.is_decl_private(uri, decl) {
+            continue;
+        }
+        let Some(item) = index.item_id_for(uri, name_sym) else {
+            continue;
+        };
+        let arity = index.type_members.get(&item)?.generics.len();
+        if arity > 0 {
+            return Some(arity);
+        }
+    }
+    None
 }
 
 // P15.7
@@ -4683,8 +4688,11 @@ mod tests {
             false,
         );
         let mut pa = ProjectAnalysis::analyze(&mgr);
-        let a_sym = pa.index.symbols.lookup("a").expect("a interned");
-        assert!(pa.index.fn_signatures.contains_key(&a_sym));
+        let a_id = pa
+            .index
+            .item_id_for(&uri("/proj/a.gcl"), pa.index.symbols.lookup("a").unwrap())
+            .expect("a item id");
+        assert!(pa.index.fn_signatures.contains_key(&a_id));
 
         // Change the return type — signature hash must differ.
         mgr.add_simple(
@@ -4697,7 +4705,7 @@ mod tests {
         let sig = pa
             .index
             .fn_signatures
-            .get(&a_sym)
+            .get(&a_id)
             .expect("a sig present after invalidate");
         let display = pa.display_type(sig.return_ty).to_string();
         assert!(

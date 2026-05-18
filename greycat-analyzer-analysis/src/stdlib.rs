@@ -204,7 +204,7 @@ pub struct ProjectIndex {
     /// Per-type flag bits drawn from `@iterable` / `@deref` /
     /// `@primitive` annotations on a `type` decl. Keyed by the
     /// declared type name (`Array`, `nodeTime`, …).
-    pub type_flags: FxHashMap<Symbol, TypeFlags>,
+    pub type_flags: FxHashMap<ItemId, TypeFlags>,
     // P13.6
     /// Per-module `@permission("name")` pragmas. Lets later
     /// chunks light up "is this module allowed to call X?" checks the
@@ -242,13 +242,13 @@ pub struct ProjectIndex {
     /// `arena.substitute` at the call site for generic fns. Built
     /// by `ProjectAnalysis::stage_lower_signatures` after every
     /// module is loaded but before any body walks.
-    pub fn_signatures: FxHashMap<Symbol, FnSignature>,
+    pub fn_signatures: FxHashMap<ItemId, FnSignature>,
     // P23
     /// Enum types pre-registered in the shared project
     /// arena, keyed by enum name. Lets the analyzer's
     /// `QualifiedStatic` value-position typing recognise
     /// `other_module::Foo::a` as the enum `Foo` (not `any`).
-    pub enum_types: FxHashMap<Symbol, TypeId>,
+    pub enum_types: FxHashMap<ItemId, TypeId>,
     // P19.10
     /// Pre-lowered top-level `var` declared types,
     /// keyed by var name. First-decl-wins (same collision rule as
@@ -259,7 +259,7 @@ pub struct ProjectIndex {
     /// without this, `for (k, v in foreign_groups)` over a
     /// `nodeIndex<String, node<Group>>` declared in another module
     /// would type the iterable as `type` and bind `v` to `any`.
-    pub var_types: FxHashMap<Symbol, TypeId>,
+    pub var_types: FxHashMap<ItemId, TypeId>,
     // P19.16
     /// Runtime-implemented value-position globals
     /// (`Infinity`, `NaN`, `-Infinity`) and their declared type.
@@ -800,7 +800,7 @@ impl ProjectIndex {
                     // flag bits into the per-type table.
                     let flags = derive_type_flags(&td.modifiers.annotations);
                     if flags.iterable || flags.deref.is_some() || flags.primitive {
-                        self.type_flags.entry(name_sym).or_insert(flags);
+                        self.type_flags.entry(item).or_insert(flags);
                     }
                     // P21 — populate the member shape index. Keyed
                     // by `(module, name)` so two same-named types in
@@ -911,9 +911,8 @@ impl ProjectIndex {
                     // Project-wide decl handle (enums get one too — the
                     // resolver / lowering paths route foreign enum refs
                     // through `Type(handle)` for some shapes).
-                    if let Some(item) = self.item_id_for(uri, name_sym) {
-                        decl_registry.record(item, *decl_id);
-                    }
+                    let enum_item = ItemId::new(module_sym, name_sym);
+                    decl_registry.record(enum_item, *decl_id);
                     // Alloc the canonical `TypeKind::Enum` into the
                     // shared arena and publish to `enum_types`
                     // immediately. Doing it here (rather than as a
@@ -926,7 +925,7 @@ impl ProjectIndex {
                     // cross-module, and same-module enum lowering
                     // uses the per-module `out.registry` path.
                     if !is_private {
-                        self.enum_types.entry(name_sym).or_insert_with(|| {
+                        self.enum_types.entry(enum_item).or_insert_with(|| {
                             let variants: Box<[Symbol]> = ed
                                 .fields
                                 .iter()
@@ -1321,10 +1320,15 @@ type Company {
             &mut decl_registry,
             &mut well_known,
         );
-        let color_sym = idx.symbols.lookup("Color").expect("Color interned");
+        let color_id = idx
+            .item_id_for(
+                &uri("/proj/color.gcl"),
+                idx.symbols.lookup("Color").expect("Color interned"),
+            )
+            .expect("Color item id");
         let id = idx
             .enum_types
-            .get(&color_sym)
+            .get(&color_id)
             .copied()
             .expect("Color registered");
         let ty = arena.get(id);
@@ -1610,20 +1614,21 @@ type Plain {}
         let u = uri("/proj/m.gcl");
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
-        let bag_sym = idx.symbols.lookup("Bag").unwrap();
-        let bag = idx.type_flags.get(&bag_sym).expect("Bag flags");
+        let item = |name: &str| {
+            idx.item_id_for(&u, idx.symbols.lookup(name).unwrap())
+                .unwrap()
+        };
+        let bag = idx.type_flags.get(&item("Bag")).expect("Bag flags");
         assert!(bag.iterable);
         assert_eq!(bag.deref.as_deref(), Some("resolve"));
         assert!(!bag.primitive);
 
-        let marker_sym = idx.symbols.lookup("Marker").unwrap();
-        let marker = idx.type_flags.get(&marker_sym).expect("Marker flags");
+        let marker = idx.type_flags.get(&item("Marker")).expect("Marker flags");
         assert!(marker.primitive);
         assert!(!marker.iterable);
 
         // Plain has no annotations — kept out of the map.
-        let plain_sym = idx.symbols.lookup("Plain").unwrap();
-        assert!(!idx.type_flags.contains_key(&plain_sym));
+        assert!(!idx.type_flags.contains_key(&item("Plain")));
     }
 
     #[test]
