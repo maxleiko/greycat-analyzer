@@ -391,7 +391,7 @@ fn lower_type_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Typ
 
 fn lower_type_attr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<TypeAttr> {
     let name_node = node.child_by_field_name("name")?;
-    let name = cx.alloc_ident(name_node);
+    let name = cx.alloc_property_ident(name_node);
     let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
     modifiers.annotations = lower_annotations(cx, node);
     let ty = node
@@ -1251,12 +1251,15 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                                 continue;
                             }
                             // `name` is graphed as `_expr` in the grammar
-                            // but is conventionally a bare ident; only
-                            // record the binding when it actually is one.
+                            // but is conventionally a bare ident or a
+                            // quoted string (e.g. `Foo { "a.b": 1 }`).
+                            // Canonicalize both forms to the unquoted
+                            // symbol so member binding matches the attr
+                            // declaration.
                             let name = of
                                 .child_by_field_name("name")
-                                .filter(|n| n.kind() == "ident")
-                                .map(|n| cx.alloc_ident(n));
+                                .filter(|n| matches!(n.kind(), "ident" | "string"))
+                                .map(|n| cx.alloc_property_ident(n));
                             let value = of
                                 .child_by_field_name("value")
                                 .and_then(|v| lower_expr(cx, v));
