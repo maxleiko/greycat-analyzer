@@ -23,8 +23,7 @@ enum Command {
     Lint(Lint),
     /// Format a GreyCat project (`--mode=write|check|stdout|diff`).
     Fmt(Fmt),
-    /// Start the LSP server. Alias: `lang-server`.
-    #[clap(alias = "lang-server")]
+    /// Start the LSP server.
     Server(LangServer),
     /// Print the tree-sitter CST s-expression for a `.gcl` file (debug).
     Cst(Cst),

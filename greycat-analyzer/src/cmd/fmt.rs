@@ -21,19 +21,13 @@ pub struct Fmt {
         long,
         value_enum,
         default_value_t = FmtMode::Write,
-        help = "write    rewrites resolved files in place\n\
-                check    exits non-zero on drift, listing every file that would change\n\
-                stdout   formats only the entrypoint and prints to stdout (the @library / @include closure is ignored)\n\
-                diff     prints a unified diff per file (colored when stdout is a TTY)\n"
     )]
     mode: FmtMode,
     #[clap(
         long,
         value_enum,
         default_value_t = ColorMode::Auto,
-        help = "auto    color when stdout is a TTY and `NO_COLOR` is unset (default)\n\
-                always  always emit ANSI color escapes — use with `less -R` to view a colored diff through a pager\n\
-                never   never color\n"
+        help = "Controls color display"
     )]
     color: ColorMode,
     #[clap(
@@ -46,9 +40,13 @@ pub struct Fmt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum FmtMode {
+    /// rewrites resolved files in place
     Write,
+    /// exits non-zero on drift, listing every file that would change
     Check,
+    /// formats only the entrypoint and prints to stdout (the @library / @include closure is ignored)
     Stdout,
+    /// prints a unified diff per file (colored when stdout is a TTY)
     Diff,
 }
 

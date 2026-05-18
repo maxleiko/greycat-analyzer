@@ -9,7 +9,7 @@ use std::{
 use greycat_analyzer_analysis::{analyzer::Severity, lint::LintSeverity, project::ProjectAnalysis};
 use greycat_analyzer_core::{
     SourceManager,
-    diagnostics::{print_compact_diagnostic, parse_diagnostics},
+    diagnostics::{parse_diagnostics, print_compact_diagnostic},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
     resolver::FsContext,
 };
@@ -27,15 +27,7 @@ pub struct Lint {
         help = "Apply auto-fixable lint suggestions in place (max 5 passes)"
     )]
     fix: bool,
-    #[clap(
-        long,
-        value_enum,
-        help = "Diagnostic rendering style\n\
-                compact  `path:line:col: severity: message` per diagnostic, plus summary\n\
-                pretty   source-snippet, caret, colors, plus summary\n\
-                csv      per-file timing rows (sorted by total descending), no summary\n\
-                quiet    summary line only (exit code is the gate)\n"
-    )]
+    #[clap(long, value_enum, help = "Diagnostic rendering style")]
     format: Option<OutputFormat>,
     #[clap(long, help = "Also lint `lib/<name>/` modules (default: project only)")]
     lint_libs: bool,
@@ -61,16 +53,14 @@ pub struct Lint {
         value_name = "RULE",
         value_delimiter = ',',
         help = "Enable advisory lint rule(s) that ship off by default (repeatable / \
-                comma-list, see --list-rules). Today: `no-breakpoint`."
+                comma-list, see --list-rules)"
     )]
     on: Vec<String>,
     #[clap(
         long,
         value_enum,
         default_value_t = ColorMode::Auto,
-        help = "auto    color when stdout is a TTY and `NO_COLOR` is unset (default)\n\
-                always  always emit ANSI color escapes\n\
-                never   never color\n"
+        help = "Controls color display"
     )]
     color: ColorMode,
 }
@@ -80,16 +70,14 @@ pub enum OutputFormat {
     /// `path:line:col: severity: message` per diagnostic, plus the
     /// trailing severity-count summary.
     Compact,
-    /// `miette` source-snippet + caret rendering per diagnostic,
+    /// source-snippet + caret rendering per diagnostic,
     /// plus the trailing summary. Default on a TTY.
     Pretty,
-    /// Per-file timing rows, sorted by total descending. No
-    /// per-diagnostic dump and no summary — the consumer is a script
-    /// piping into `awk` / a spreadsheet, not a human.
+    /// per-file timing rows, sorted by total descending. No
+    /// per-diagnostic dump and no summary.
     Csv,
-    /// Trailing severity-count summary only (no per-diagnostic
-    /// output). Useful in CI / pre-commit where the exit code is
-    /// the gate and you want a one-line pulse in the build log.
+    /// Trailing severity-count summary only where the exit code is
+    /// the gate.
     Quiet,
 }
 

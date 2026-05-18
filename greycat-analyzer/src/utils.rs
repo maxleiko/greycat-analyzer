@@ -14,9 +14,12 @@ pub type AnyError = Box<dyn std::error::Error + Sync + Send>;
 /// crates the way `#[derive(Args)]` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ColorMode {
+    /// color when stdout is a TTY and `NO_COLOR` is unset (default)
     #[default]
     Auto,
+    /// always emit ANSI color escapes
     Always,
+    /// never color
     Never,
 }
 
