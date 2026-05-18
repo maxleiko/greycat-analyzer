@@ -340,19 +340,25 @@ fn main() {
         !compact.contains('@'),
         "compact label must not include annotations, got {compact:?}"
     );
-    // `detail` (side panel) still carries the full signature, but
-    // also annotation-free — pragmas live in hover only.
+    // `detail` mirrors the compact form for clients (like Zed) that
+    // render `detail` in the popup row and ignore
+    // `label_details.detail`. Hover provides the full source-form
+    // signature, so the duplication doesn't lose information.
     let detail = push_item
         .detail
         .as_deref()
         .expect("method completion items must carry `detail`");
+    assert_eq!(
+        detail, "(value: int): int",
+        "`detail` should mirror the compact form so Zed's popup row reads cleanly"
+    );
     assert!(
         !detail.contains('@'),
         "completion `detail` must not include annotations, got {detail:?}"
     );
     assert!(
-        detail.contains("push(value: int): int"),
-        "`detail` should carry the full signature, got {detail:?}"
+        !detail.contains("fn "),
+        "completion `detail` must not include the `fn` keyword or modifiers, got {detail:?}"
     );
 }
 

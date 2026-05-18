@@ -3415,10 +3415,13 @@ fn completion_in_module_decl_carries_signature_detail() {
         .iter()
         .find(|i| i.label == "helper")
         .expect("`helper` should appear");
+    // `detail` mirrors `label_details.detail` for clients that
+    // render the popup row from `detail` (Zed). VSCode reads
+    // `label_details.detail`. Either way the row reads `name(args): Ret`.
     assert_eq!(
         helper.detail.as_deref(),
-        Some("fn helper(x: int): String"),
-        "expected the in-module fn's full signature in detail; got {:?}",
+        Some("(x: int): String"),
+        "expected the compact `(args): Ret` form in detail; got {:?}",
         helper.detail
     );
     let ld = helper

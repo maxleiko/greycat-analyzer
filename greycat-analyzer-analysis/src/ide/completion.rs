@@ -15,8 +15,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::conv::{byte_range_to_lsp, byte_to_position, position_to_byte, stmt_byte_range};
 use crate::ide::render::{
-    RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_fn_signature,
-    render_fn_signature_compact, render_type_ref_with_subst,
+    RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_fn_signature_compact,
+    render_type_ref_with_subst,
 };
 use crate::project::{ModuleAnalysis, ProjectAnalysis};
 
@@ -1337,19 +1337,29 @@ fn scope_name_meta(
     match source {
         NameSource::ModuleDecl(decl_id) => {
             let decl = &module.hir.decls[*decl_id];
-            let label_details = if let Decl::Fn(fnd) = decl {
-                Some(CompletionItemLabelDetails {
-                    detail: Some(render_fn_signature_compact(&module.hir, symbols, fnd, None)),
-                    description: None,
-                })
-            } else {
-                None
+            // For fns the compact `(args): Ret` form goes into BOTH
+            // `label_details.detail` (VSCode renders it inline next
+            // to label) AND `detail` (Zed shows `detail` as the
+            // popup-row suffix, ignoring `label_details.detail`).
+            // Hover provides the full source-form signature, so the
+            // duplication isn't a regression.
+            let (label_details, detail) = match decl {
+                Decl::Fn(fnd) => {
+                    let compact = render_fn_signature_compact(&module.hir, symbols, fnd, None);
+                    (
+                        Some(CompletionItemLabelDetails {
+                            detail: Some(compact.clone()),
+                            description: None,
+                        }),
+                        Some(compact),
+                    )
+                }
+                _ => (
+                    None,
+                    Some(render_decl_signature(&module.hir, symbols, decl, None)),
+                ),
             };
-            (
-                label_details,
-                Some(render_decl_signature(&module.hir, symbols, decl, None)),
-                doc_to_markup(decl_doc(decl)),
-            )
+            (label_details, detail, doc_to_markup(decl_doc(decl)))
         }
         NameSource::Local(name_idx) | NameSource::Param(name_idx) => {
             let detail = module.analysis.def_types.get(name_idx).map(|ty| {
@@ -1389,24 +1399,28 @@ fn foreign_decl_completion_meta(
         return (None, None, None);
     };
     let decl = &m.hir.decls[*decl_id];
-    let detail = render_decl_signature(&m.hir, project.symbols(), decl, None);
     let documentation = doc_to_markup(decl_doc(decl));
     let description = module_label_for_uri(uri);
-    let compact = if let Decl::Fn(fnd) = decl {
-        Some(render_fn_signature_compact(
-            &m.hir,
-            project.symbols(),
-            fnd,
+    // Mirror the compact form into `detail` for fns so Zed's popup
+    // row reads `name(args): Ret` instead of `name <full sig>`. The
+    // VSCode path uses `label_details.detail` (rendered inline next
+    // to label); Zed ignores `label_details.detail` and shows
+    // `detail`. Hover keeps the full source-form signature.
+    let (compact, detail) = match decl {
+        Decl::Fn(fnd) => {
+            let c = render_fn_signature_compact(&m.hir, project.symbols(), fnd, None);
+            (Some(c.clone()), Some(c))
+        }
+        _ => (
             None,
-        ))
-    } else {
-        None
+            Some(render_decl_signature(&m.hir, project.symbols(), decl, None)),
+        ),
     };
     let label_details = Some(CompletionItemLabelDetails {
         detail: compact,
         description: Some(description),
     });
-    (label_details, Some(detail), documentation)
+    (label_details, detail, documentation)
 }
 
 /// Pick the `CompletionItemKind` for a name resolving through the
@@ -2244,15 +2258,16 @@ fn collect_type_members(
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
+        let compact = render_fn_signature_compact(hir, symbols, m, ctx);
         items.push(CompletionItem {
             label: name.clone(),
             label_details: Some(CompletionItemLabelDetails {
-                detail: Some(render_fn_signature_compact(hir, symbols, m, ctx)),
+                detail: Some(compact.clone()),
                 description: None,
             }),
             kind: Some(CompletionItemKind::METHOD),
             insert_text: Some(name),
-            detail: Some(render_fn_signature(hir, symbols, m, ctx)),
+            detail: Some(compact),
             documentation: doc_to_markup(m.doc.as_deref()),
             ..Default::default()
         });
@@ -2330,14 +2345,10 @@ fn static_completion(
                     if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
                         continue;
                     }
-                    let detail = Some(render_fn_signature(&fmod.hir, project.symbols(), m, None));
+                    let compact =
+                        render_fn_signature_compact(&fmod.hir, project.symbols(), m, None);
                     let label_details = Some(CompletionItemLabelDetails {
-                        detail: Some(render_fn_signature_compact(
-                            &fmod.hir,
-                            project.symbols(),
-                            m,
-                            None,
-                        )),
+                        detail: Some(compact.clone()),
                         description: None,
                     });
                     let documentation = doc_to_markup(m.doc.as_deref());
@@ -2346,7 +2357,7 @@ fn static_completion(
                         CompletionItemKind::METHOD,
                         replace_range,
                         label_details,
-                        detail,
+                        Some(compact),
                         documentation,
                     ));
                 }
@@ -2421,24 +2432,31 @@ fn static_completion(
                 Decl::Var(_) => CompletionItemKind::VARIABLE,
                 Decl::Pragma(_) => continue,
             };
-            let detail = Some(render_decl_signature(
-                &mod_analysis.hir,
-                project.symbols(),
-                decl,
-                None,
-            ));
-            let label_details = if let Decl::Fn(fnd) = decl {
-                Some(CompletionItemLabelDetails {
-                    detail: Some(render_fn_signature_compact(
+            let (label_details, detail) = match decl {
+                Decl::Fn(fnd) => {
+                    let compact = render_fn_signature_compact(
                         &mod_analysis.hir,
                         project.symbols(),
                         fnd,
                         None,
+                    );
+                    (
+                        Some(CompletionItemLabelDetails {
+                            detail: Some(compact.clone()),
+                            description: None,
+                        }),
+                        Some(compact),
+                    )
+                }
+                _ => (
+                    None,
+                    Some(render_decl_signature(
+                        &mod_analysis.hir,
+                        project.symbols(),
+                        decl,
+                        None,
                     )),
-                    description: None,
-                })
-            } else {
-                None
+                ),
             };
             let documentation = doc_to_markup(decl_doc(decl));
             items.push(static_completion_item(
