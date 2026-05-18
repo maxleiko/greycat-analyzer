@@ -164,6 +164,127 @@ fn main() {
 }
 
 #[test]
+fn hover_on_fn_decl_shows_annotations_above_signature() {
+    let src = "\
+@expose(\"renamed\")
+@deref(\"resolve\")
+fn helper(): int { return 1; }
+fn main(): int { return helper(); }
+";
+    let test_project = TestProject::single_file(src);
+    // Cursor on the *use* of `helper` inside main.
+    let cursor = position_of(src, "helper();");
+    let h = test_project.hover(cursor).expect("hover present on fn use");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("@expose(\"renamed\")"),
+        "expected `@expose(\"renamed\")` in hover, got {v}"
+    );
+    assert!(
+        v.contains("@deref(\"resolve\")"),
+        "expected `@deref(\"resolve\")` in hover, got {v}"
+    );
+    assert!(
+        v.contains("fn helper(): int"),
+        "expected signature in hover, got {v}"
+    );
+    // Annotations must precede the signature within the same code
+    // block (no blank line between them).
+    let expose_at = v.find("@expose").expect("annotation present");
+    let fn_at = v.find("fn helper").expect("signature present");
+    assert!(
+        expose_at < fn_at,
+        "annotations must render before the signature, got {v}"
+    );
+}
+
+#[test]
+fn hover_on_type_decl_shows_annotations_above_signature() {
+    let src = "\
+@iterable
+@deref(\"resolve\")
+type Iter {}
+fn main(): Iter { return Iter {}; }
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "Iter { return");
+    let h = test_project.hover(cursor).expect("hover on type use");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("@iterable"),
+        "expected `@iterable` in hover, got {v}"
+    );
+    assert!(
+        v.contains("@deref(\"resolve\")"),
+        "expected `@deref(\"resolve\")` in hover, got {v}"
+    );
+    let ann_at = v.find("@iterable").unwrap();
+    let ty_at = v.find("type Iter").unwrap();
+    assert!(
+        ann_at < ty_at,
+        "annotations must render before `type` signature, got {v}"
+    );
+}
+
+#[test]
+fn hover_on_enum_decl_shows_annotations_above_signature() {
+    let src = "\
+@iterable
+enum Color { red; green; blue; }
+fn main(): Color { return Color::red; }
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "Color::red");
+    let h = test_project.hover(cursor).expect("hover on enum use");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("@iterable"),
+        "expected `@iterable` in enum hover, got {v}"
+    );
+    let ann_at = v.find("@iterable").unwrap();
+    let kw_at = v.find("enum Color").unwrap();
+    assert!(
+        ann_at < kw_at,
+        "annotations must render before `enum` signature, got {v}"
+    );
+}
+
+#[test]
+fn hover_on_var_decl_shows_annotations_above_signature() {
+    let src = "\
+@volatile
+var counter: int = 0;
+fn main(): int { return counter; }
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "counter;");
+    let h = test_project.hover(cursor).expect("hover on var use");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("@volatile"),
+        "expected `@volatile` in var hover, got {v}"
+    );
+    let ann_at = v.find("@volatile").unwrap();
+    let kw_at = v.find("var counter").unwrap();
+    assert!(
+        ann_at < kw_at,
+        "annotations must render before `var` signature, got {v}"
+    );
+}
+
+#[test]
 fn hover_on_unknown_object_field_skips_object_field_path() {
     let src = "\
 type Reader {

@@ -17,7 +17,7 @@ use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{Symbol, SymbolTable, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, FnDecl, TypeDecl, TypeRef};
+use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeDecl, TypeRef};
 use rustc_hash::FxHashMap;
 
 use crate::project::ProjectAnalysis;
@@ -28,6 +28,30 @@ use crate::project::ProjectAnalysis;
 pub struct RenderCtx<'a> {
     pub project: &'a ProjectAnalysis,
     pub subst: &'a FxHashMap<Symbol, TypeId>,
+}
+
+/// Prepend each annotation on its own line in source-form
+/// (`@name` or `@name("arg", "arg2")`). Used by every decl signature
+/// renderer so pragmas show in hover / completion alongside the
+/// declaration shape.
+fn push_annotations(out: &mut String, annotations: &[Annotation]) {
+    for ann in annotations {
+        out.push('@');
+        out.push_str(&ann.name);
+        if !ann.args.is_empty() {
+            out.push('(');
+            for (i, arg) in ann.args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push('"');
+                out.push_str(arg);
+                out.push('"');
+            }
+            out.push(')');
+        }
+        out.push('\n');
+    }
 }
 
 pub fn decl_doc(decl: &Decl) -> Option<&str> {
@@ -59,12 +83,24 @@ pub fn render_decl_signature(
     match decl {
         Decl::Fn(d) => render_fn_signature(hir, symbols, d, ctx),
         Decl::Type(d) => render_type_signature(hir, symbols, d),
-        Decl::Enum(d) => format!("enum {}", &symbols[hir.idents[d.name].symbol]),
+        Decl::Enum(d) => {
+            let mut out = String::new();
+            push_annotations(&mut out, &d.modifiers.annotations);
+            out.push_str("enum ");
+            out.push_str(&symbols[hir.idents[d.name].symbol]);
+            out
+        }
         Decl::Var(d) => {
+            let mut out = String::new();
+            push_annotations(&mut out, &d.modifiers.annotations);
+            out.push_str("var ");
+            out.push_str(&symbols[hir.idents[d.name].symbol]);
+            out.push_str(": ");
             let ty =
                 d.ty.map(|t| render_type_ref_with_subst(hir, symbols, t, ctx))
                     .unwrap_or_else(|| "any".into());
-            format!("var {}: {}", &symbols[hir.idents[d.name].symbol], ty)
+            out.push_str(&ty);
+            out
         }
         Decl::Pragma(p) => format!("@{}", &symbols[hir.idents[p.name].symbol]),
     }
@@ -78,6 +114,7 @@ pub fn render_fn_signature(
 ) -> String {
     let name = &symbols[hir.idents[fnd.name].symbol];
     let mut out = String::new();
+    push_annotations(&mut out, &fnd.modifiers.annotations);
     if fnd.modifiers.private {
         out.push_str("private ");
     }
@@ -170,6 +207,7 @@ pub fn render_type_decl_with_body(hir: &Hir, symbols: &SymbolTable, td: &TypeDec
 
 fn render_type_signature(hir: &Hir, symbols: &SymbolTable, td: &TypeDecl) -> String {
     let mut out = String::new();
+    push_annotations(&mut out, &td.modifiers.annotations);
     if td.modifiers.private {
         out.push_str("private ");
     }
