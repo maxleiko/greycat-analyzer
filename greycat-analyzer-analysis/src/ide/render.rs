@@ -31,10 +31,12 @@ pub struct RenderCtx<'a> {
 }
 
 /// Prepend each annotation on its own line in source-form
-/// (`@name` or `@name("arg", "arg2")`). Used by every decl signature
-/// renderer so pragmas show in hover / completion alongside the
-/// declaration shape.
-fn push_annotations(out: &mut String, annotations: &[Annotation]) {
+/// (`@name` or `@name("arg", "arg2")`). Hover prepends these above a
+/// signature so the rendered block reads like the declaration's
+/// source form; the signature renderers themselves stay annotation-
+/// free so completion `detail` strings (which clients flatten to a
+/// single line) don't get buried under pragma noise.
+pub fn push_annotations(out: &mut String, annotations: &[Annotation]) {
     for ann in annotations {
         out.push('@');
         out.push_str(&ann.name);
@@ -51,6 +53,19 @@ fn push_annotations(out: &mut String, annotations: &[Annotation]) {
             out.push(')');
         }
         out.push('\n');
+    }
+}
+
+/// Annotations attached to a top-level decl. `Pragma` carries no
+/// modifiers (it *is* an annotation-like construct), so it returns
+/// an empty slice.
+pub fn decl_modifier_annotations(decl: &Decl) -> &[Annotation] {
+    match decl {
+        Decl::Fn(d) => &d.modifiers.annotations,
+        Decl::Type(d) => &d.modifiers.annotations,
+        Decl::Enum(d) => &d.modifiers.annotations,
+        Decl::Var(d) => &d.modifiers.annotations,
+        Decl::Pragma(_) => &[],
     }
 }
 
@@ -83,27 +98,51 @@ pub fn render_decl_signature(
     match decl {
         Decl::Fn(d) => render_fn_signature(hir, symbols, d, ctx),
         Decl::Type(d) => render_type_signature(hir, symbols, d),
-        Decl::Enum(d) => {
-            let mut out = String::new();
-            push_annotations(&mut out, &d.modifiers.annotations);
-            out.push_str("enum ");
-            out.push_str(&symbols[hir.idents[d.name].symbol]);
-            out
-        }
+        Decl::Enum(d) => format!("enum {}", &symbols[hir.idents[d.name].symbol]),
         Decl::Var(d) => {
-            let mut out = String::new();
-            push_annotations(&mut out, &d.modifiers.annotations);
-            out.push_str("var ");
-            out.push_str(&symbols[hir.idents[d.name].symbol]);
-            out.push_str(": ");
             let ty =
                 d.ty.map(|t| render_type_ref_with_subst(hir, symbols, t, ctx))
                     .unwrap_or_else(|| "any".into());
-            out.push_str(&ty);
-            out
+            format!("var {}: {}", &symbols[hir.idents[d.name].symbol], ty)
         }
         Decl::Pragma(p) => format!("@{}", &symbols[hir.idents[p.name].symbol]),
     }
+}
+
+/// Compact `(param: T, param2: U): ReturnType` rendering for
+/// completion-popup `CompletionItemLabelDetails::detail`. The name
+/// is intentionally *omitted* — `label_details.detail` renders
+/// inline right after `CompletionItem::label`, which already
+/// carries the bare name, producing `name(args): Ret` in the popup
+/// row. Also drops `fn`, modifiers (`private` / `static` /
+/// `abstract` / `native`), and generic param lists. Same receiver-
+/// substitution semantics as the full renderer.
+pub fn render_fn_signature_compact(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    fnd: &FnDecl,
+    ctx: Option<&RenderCtx<'_>>,
+) -> String {
+    let mut out = String::new();
+    out.push('(');
+    for (i, param_id) in fnd.params.iter().enumerate() {
+        let p = &hir.fn_params[*param_id];
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&symbols[hir.idents[p.name].symbol]);
+        out.push_str(": ");
+        match p.ty {
+            Some(t) => out.push_str(&render_type_ref_with_subst(hir, symbols, t, ctx)),
+            None => out.push_str("any"),
+        }
+    }
+    out.push(')');
+    if let Some(ret) = fnd.return_type {
+        out.push_str(": ");
+        out.push_str(&render_type_ref_with_subst(hir, symbols, ret, ctx));
+    }
+    out
 }
 
 pub fn render_fn_signature(
@@ -114,7 +153,6 @@ pub fn render_fn_signature(
 ) -> String {
     let name = &symbols[hir.idents[fnd.name].symbol];
     let mut out = String::new();
-    push_annotations(&mut out, &fnd.modifiers.annotations);
     if fnd.modifiers.private {
         out.push_str("private ");
     }
@@ -207,7 +245,6 @@ pub fn render_type_decl_with_body(hir: &Hir, symbols: &SymbolTable, td: &TypeDec
 
 fn render_type_signature(hir: &Hir, symbols: &SymbolTable, td: &TypeDecl) -> String {
     let mut out = String::new();
-    push_annotations(&mut out, &td.modifiers.annotations);
     if td.modifiers.private {
         out.push_str("private ");
     }

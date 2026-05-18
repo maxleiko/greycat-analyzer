@@ -3380,10 +3380,12 @@ fn completion_pragma_snippet_not_clobbered_by_call_parens() {
     );
 }
 
-/// In-module module-level decls surface their full signature in
-/// `CompletionItem.detail`. No `label_details.description` because the
-/// decl is intra-module — the foreign-provenance footnote only applies
-/// to cross-module surfaces.
+/// In-module module-level fns surface the full signature in
+/// `CompletionItem.detail` and the compact rust-analyzer-style
+/// `(args): Ret` form in `label_details.detail` (rendered inline
+/// next to the label in VSCode). `label_details.description` stays
+/// `None` for intra-module decls — the foreign-provenance hint
+/// only applies to cross-module surfaces.
 #[test]
 fn completion_in_module_decl_carries_signature_detail() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -3419,10 +3421,19 @@ fn completion_in_module_decl_carries_signature_detail() {
         "expected the in-module fn's full signature in detail; got {:?}",
         helper.detail
     );
+    let ld = helper
+        .label_details
+        .as_ref()
+        .expect("fn completion items must carry `label_details` with the compact signature");
+    assert_eq!(
+        ld.detail.as_deref(),
+        Some("(x: int): String"),
+        "expected the compact `(args): Ret` form in label_details.detail"
+    );
     assert!(
-        helper.label_details.is_none(),
+        ld.description.is_none(),
         "intra-module decl should not carry a foreign-module description; got {:?}",
-        helper.label_details
+        ld.description
     );
 }
 

@@ -9,8 +9,8 @@ use std::ops::Range;
 
 use greycat_analyzer_analysis::analyzer::{AnalysisResult, MemberDef};
 use greycat_analyzer_analysis::ide::render::{
-    RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_type_decl_with_body,
-    render_type_ref, render_type_ref_with_subst,
+    RenderCtx, decl_doc, decl_modifier_annotations, module_label_for_uri, push_annotations,
+    render_decl_signature, render_type_decl_with_body, render_type_ref, render_type_ref_with_subst,
 };
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
@@ -550,10 +550,19 @@ fn render_decl_hover_markdown(
     // a goto-def. Native types fall back to the single-line form
     // since they have no `.gcl` body to peek at. Every other decl
     // kind keeps the existing one-line signature.
-    let signature = match decl {
+    //
+    // Pragmas / annotations live above the signature inside the
+    // same code block — hover is the only surface that wants the
+    // full source-form rendering. The signature renderers
+    // intentionally don't emit them (completion `detail` strings
+    // get flattened to a single line and would be buried).
+    let mut signature = String::new();
+    push_annotations(&mut signature, decl_modifier_annotations(decl));
+    let body = match decl {
         Decl::Type(td) => render_type_decl_with_body(hir, symbols, td),
         _ => render_decl_signature(hir, symbols, decl, ctx),
     };
+    signature.push_str(&body);
     out.push_str(&wrap_code(&signature));
     out.push('\n');
     push_doc_section(&mut out, decl_doc(decl));

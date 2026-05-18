@@ -16,7 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::conv::{byte_range_to_lsp, byte_to_position, position_to_byte, stmt_byte_range};
 use crate::ide::render::{
     RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_fn_signature,
-    render_type_ref_with_subst,
+    render_fn_signature_compact, render_type_ref_with_subst,
 };
 use crate::project::{ModuleAnalysis, ProjectAnalysis};
 
@@ -996,11 +996,13 @@ fn static_completion_item(
     name: String,
     kind: CompletionItemKind,
     replace_range: lsp_types::Range,
+    label_details: Option<CompletionItemLabelDetails>,
     detail: Option<String>,
     documentation: Option<Documentation>,
 ) -> CompletionItem {
     CompletionItem {
         label: name.clone(),
+        label_details,
         kind: Some(kind),
         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
             range: replace_range,
@@ -1105,7 +1107,7 @@ fn ident_or_keyword_completion(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let (detail, documentation) = scope_name_meta(
+            let (label_details, detail, documentation) = scope_name_meta(
                 module,
                 project.arena(),
                 project.decl_registry(),
@@ -1114,6 +1116,7 @@ fn ident_or_keyword_completion(
             );
             items.push(CompletionItem {
                 label: name.clone(),
+                label_details,
                 kind: Some(kind),
                 insert_text: Some(name),
                 sort_text: Some(sort_pri.to_string()),
@@ -1156,7 +1159,7 @@ fn ident_or_keyword_completion(
             continue;
         }
         let kind = decl_locs_kind(project, locs);
-        let (detail, documentation, description) = foreign_decl_completion_meta(project, locs);
+        let (label_details, detail, documentation) = foreign_decl_completion_meta(project, locs);
         items.push(CompletionItem {
             label: name.to_string(),
             kind: Some(kind),
@@ -1164,10 +1167,7 @@ fn ident_or_keyword_completion(
             sort_text: Some(format!("y_{name}")),
             detail,
             documentation,
-            label_details: description.map(|d| CompletionItemLabelDetails {
-                description: Some(d),
-                ..Default::default()
-            }),
+            label_details,
             ..Default::default()
         });
     }
@@ -1317,21 +1317,36 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
     i < bytes.len() && bytes[i] == b'('
 }
 
-/// Render `(detail, documentation)` for a scope-visible name.
-/// Module-level decls show their full signature plus their doc-comment;
-/// locals / params surface their inferred type from `def_types` (no
-/// docs, since locals carry none); generics return both as `None`.
+/// Render completion-popup metadata for a scope-visible name:
+/// `(label_details, detail, documentation)`. `label_details.detail`
+/// renders inline next to the label in the popup row (rust-analyzer
+/// style — `(args): Ret` for fns); `detail` is the larger side-panel
+/// signature; `documentation` is the doc-comment. Locals / params
+/// surface their inferred type as `detail` only.
 fn scope_name_meta(
     module: &ModuleAnalysis,
     arena: &TypeArena,
     decl_registry: &crate::well_known::DeclRegistry,
     symbols: &SymbolTable,
     source: &NameSource,
-) -> (Option<String>, Option<Documentation>) {
+) -> (
+    Option<CompletionItemLabelDetails>,
+    Option<String>,
+    Option<Documentation>,
+) {
     match source {
         NameSource::ModuleDecl(decl_id) => {
             let decl = &module.hir.decls[*decl_id];
+            let label_details = if let Decl::Fn(fnd) = decl {
+                Some(CompletionItemLabelDetails {
+                    detail: Some(render_fn_signature_compact(&module.hir, symbols, fnd, None)),
+                    description: None,
+                })
+            } else {
+                None
+            };
             (
+                label_details,
                 Some(render_decl_signature(&module.hir, symbols, decl, None)),
                 doc_to_markup(decl_doc(decl)),
             )
@@ -1340,17 +1355,20 @@ fn scope_name_meta(
             let detail = module.analysis.def_types.get(name_idx).map(|ty| {
                 crate::project::display_type(arena, decl_registry, symbols, *ty).to_string()
             });
-            (detail, None)
+            (None, detail, None)
         }
-        NameSource::Generic => (None, None),
+        NameSource::Generic => (None, None, None),
     }
 }
 
-/// Render `(detail, documentation, description)` for a cross-module
-/// decl surfaced via [`ProjectIndex::decl_locations`]. `detail` is
-/// the foreign decl's signature; `description` is the home module's
-/// stem (`model` for `file:///proj/src/model.gcl`); `documentation`
-/// is the foreign decl's doc-comment. All three fall through to
+/// Render completion-popup metadata for a cross-module decl
+/// surfaced via [`ProjectIndex::decl_locations`]:
+/// `(label_details, detail, documentation)`. `label_details.detail`
+/// renders the compact fn signature (rust-analyzer style) when the
+/// foreign decl is a `Decl::Fn`; `label_details.description` always
+/// carries the home module's stem (`model` for
+/// `file:///proj/src/model.gcl`); `detail` is the full signature;
+/// `documentation` is the doc-comment. All three fall through to
 /// `None` when the decl's home module isn't cached.
 fn foreign_decl_completion_meta(
     project: &ProjectAnalysis,
@@ -1359,7 +1377,11 @@ fn foreign_decl_completion_meta(
         greycat_analyzer_hir::arena::Idx<Decl>,
         crate::stdlib::Namespace,
     )],
-) -> (Option<String>, Option<Documentation>, Option<String>) {
+) -> (
+    Option<CompletionItemLabelDetails>,
+    Option<String>,
+    Option<Documentation>,
+) {
     let Some((uri, decl_id, _)) = locs.first() else {
         return (None, None, None);
     };
@@ -1370,7 +1392,21 @@ fn foreign_decl_completion_meta(
     let detail = render_decl_signature(&m.hir, project.symbols(), decl, None);
     let documentation = doc_to_markup(decl_doc(decl));
     let description = module_label_for_uri(uri);
-    (Some(detail), documentation, Some(description))
+    let compact = if let Decl::Fn(fnd) = decl {
+        Some(render_fn_signature_compact(
+            &m.hir,
+            project.symbols(),
+            fnd,
+            None,
+        ))
+    } else {
+        None
+    };
+    let label_details = Some(CompletionItemLabelDetails {
+        detail: compact,
+        description: Some(description),
+    });
+    (label_details, Some(detail), documentation)
 }
 
 /// Pick the `CompletionItemKind` for a name resolving through the
@@ -2210,6 +2246,10 @@ fn collect_type_members(
         }
         items.push(CompletionItem {
             label: name.clone(),
+            label_details: Some(CompletionItemLabelDetails {
+                detail: Some(render_fn_signature_compact(hir, symbols, m, ctx)),
+                description: None,
+            }),
             kind: Some(CompletionItemKind::METHOD),
             insert_text: Some(name),
             detail: Some(render_fn_signature(hir, symbols, m, ctx)),
@@ -2291,11 +2331,21 @@ fn static_completion(
                         continue;
                     }
                     let detail = Some(render_fn_signature(&fmod.hir, project.symbols(), m, None));
+                    let label_details = Some(CompletionItemLabelDetails {
+                        detail: Some(render_fn_signature_compact(
+                            &fmod.hir,
+                            project.symbols(),
+                            m,
+                            None,
+                        )),
+                        description: None,
+                    });
                     let documentation = doc_to_markup(m.doc.as_deref());
                     items.push(static_completion_item(
                         name,
                         CompletionItemKind::METHOD,
                         replace_range,
+                        label_details,
                         detail,
                         documentation,
                     ));
@@ -2320,6 +2370,7 @@ fn static_completion(
                         name,
                         CompletionItemKind::CONSTANT,
                         replace_range,
+                        None,
                         detail,
                         documentation,
                     ));
@@ -2376,11 +2427,25 @@ fn static_completion(
                 decl,
                 None,
             ));
+            let label_details = if let Decl::Fn(fnd) = decl {
+                Some(CompletionItemLabelDetails {
+                    detail: Some(render_fn_signature_compact(
+                        &mod_analysis.hir,
+                        project.symbols(),
+                        fnd,
+                        None,
+                    )),
+                    description: None,
+                })
+            } else {
+                None
+            };
             let documentation = doc_to_markup(decl_doc(decl));
             items.push(static_completion_item(
                 name,
                 kind,
                 replace_range,
+                label_details,
                 detail,
                 documentation,
             ));

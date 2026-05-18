@@ -285,6 +285,78 @@ fn main(): int { return counter; }
 }
 
 #[test]
+fn completion_method_label_details_is_compact_signature() {
+    // Methods should show as `fnName(args): Ret` in the popup row —
+    // not buried under `static private @expose("...") fn name(...)`.
+    // The `label` is the bare name; `label_details.detail` carries
+    // the compact `(args): Ret` form right next to it (rust-analyzer
+    // style). The full signature stays in `detail` for the side
+    // panel. Annotations belong in hover, not the popup row.
+    let src = "\
+type Bag {
+    @expose(\"pushItem\")
+    @deref(\"resolve\")
+    fn push(value: int): int { return value; }
+}
+
+fn main() {
+    var b = Bag {};
+    b.;
+}
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "b.;");
+    let cursor = Position {
+        line: cursor.line,
+        character: cursor.character + 2, // skip "b."
+    };
+    let list = test_project
+        .completion(cursor)
+        .expect("completion list at b.|");
+    let push_item = list
+        .items
+        .iter()
+        .find(|c| c.label == "push")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected `push` in completion items, got {:?}",
+                list.items.iter().map(|c| &c.label).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(push_item.label, "push", "label must be the bare name");
+    let ld = push_item
+        .label_details
+        .as_ref()
+        .expect("method completion items must carry label_details");
+    let compact = ld
+        .detail
+        .as_deref()
+        .expect("label_details.detail must carry the compact signature");
+    assert_eq!(
+        compact, "(value: int): int",
+        "label_details.detail should be the compact `(args): Ret` form"
+    );
+    assert!(
+        !compact.contains('@'),
+        "compact label must not include annotations, got {compact:?}"
+    );
+    // `detail` (side panel) still carries the full signature, but
+    // also annotation-free — pragmas live in hover only.
+    let detail = push_item
+        .detail
+        .as_deref()
+        .expect("method completion items must carry `detail`");
+    assert!(
+        !detail.contains('@'),
+        "completion `detail` must not include annotations, got {detail:?}"
+    );
+    assert!(
+        detail.contains("push(value: int): int"),
+        "`detail` should carry the full signature, got {detail:?}"
+    );
+}
+
+#[test]
 fn hover_on_unknown_object_field_skips_object_field_path() {
     let src = "\
 type Reader {
