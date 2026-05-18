@@ -350,6 +350,13 @@ pub struct TypeMembers {
     /// Attr name → HIR index. Symbol-keyed; resolve to
     /// text via [`ProjectIndex::symbols`].
     pub attrs: FxHashMap<Symbol, Idx<TypeAttr>>,
+    /// Attr names in declaration order (including statics). Lets
+    /// cross-module consumers iterate attrs deterministically without
+    /// reaching back into the home module's HIR — the `attrs` /
+    /// `attr_types` hashmaps don't preserve declaration order. Source
+    /// of truth for the "missing required fields" diagnostic's wording,
+    /// which lists attrs in the order the user declared them.
+    pub attr_order: Box<[Symbol]>,
     // P19.9
     /// Method name → HIR index. Symbol-keyed.
     pub methods: FxHashMap<Symbol, Idx<Decl>>,
@@ -942,9 +949,15 @@ impl ProjectIndex {
                                 Some(parent_sym)
                             }
                         });
+                        let attr_order: Box<[Symbol]> = td
+                            .attrs
+                            .iter()
+                            .map(|attr_id| hir.idents[hir.type_attrs[*attr_id].name].symbol)
+                            .collect();
                         let mut m = TypeMembers {
                             home_uri: uri.clone(),
                             attrs: FxHashMap::default(),
+                            attr_order,
                             methods: FxHashMap::default(),
                             generics,
                             // P22 — `attr_types` / `method_returns`

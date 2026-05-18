@@ -55,6 +55,7 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
         "member_expr" => check_property_after(node, source, out, "."),
         "arrow_expr" => check_property_after(node, source, out, "->"),
         "fn_decl" | "type_method" => check_function_body(node, source, out),
+        "type_attr" => check_attr_init_modifier(node, source, out),
         "var_decl" => {
             check_var_name(node, source, out);
             check_explicit_semi(node, source, out);
@@ -129,6 +130,36 @@ fn check_function_body(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
         source: Some(DIAGNOSTIC_SOURCE.into()),
         message: format!(
             "function '{name_text}' must define a body (only `native` and `abstract` functions may omit it)"
+        ),
+        ..Default::default()
+    });
+}
+
+/// Grammar lets every `type_attr` carry an optional `init` slot (one
+/// rule covers both `static k: int = 0;` — legal — and
+/// `a: int = 0;` — illegal). The GreyCat runtime rejects an
+/// initializer on a non-static attribute, so emit a diagnostic at
+/// parse-shape time before lowering walks the same construct. Range
+/// covers the `init` field so the offending `= expr` is highlighted.
+fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let Some(init) = node.child_by_field_name("init") else {
+        return;
+    };
+    let mods = node.child_by_field_name("modifiers");
+    if has_modifier(mods, source, "static") {
+        return;
+    }
+    let name_text = node
+        .child_by_field_name("name")
+        .and_then(|n| source.get(n.byte_range()))
+        .unwrap_or("?");
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &init.byte_range()),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("non-static-attr-initializer".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: format!(
+            "attribute `{name_text}` cannot have an initializer — only `static` attributes may"
         ),
         ..Default::default()
     });
@@ -836,6 +867,41 @@ mod tests {
         assert!(
             !codes(&ds).contains(&"missing-function-body"),
             "expected no missing-function-body, got: {ds:?}"
+        );
+    }
+
+    /// Non-static instance attribute with an initializer is rejected
+    /// by the runtime; the grammar lets it parse (one `type_attr` rule
+    /// covers both static and non-static) so we flag it at parse-shape
+    /// time. `static k: int = 0;` is legal and must stay silent.
+    #[test]
+    fn non_static_attr_initializer_surfaces() {
+        let src = "type T {\n    a: int = 0;\n    static k: int = 1;\n}\n";
+        let ds = diags(src);
+        let hits: Vec<_> = ds
+            .iter()
+            .filter(|d| {
+                matches!(&d.code, Some(NumberOrString::String(s)) if s == "non-static-attr-initializer")
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "expected one diag for `a`, got: {ds:?}");
+        assert!(hits[0].message.contains('`'), "got: {}", hits[0].message);
+        assert!(
+            hits[0].message.contains("`a`"),
+            "should name `a`, got: {}",
+            hits[0].message
+        );
+    }
+
+    /// Both well-formed shapes — instance attr without init, static
+    /// attr with init — stay silent.
+    #[test]
+    fn attr_initializer_well_formed_no_diag() {
+        let src = "type T {\n    a: int;\n    b: String?;\n    static k: int = 1;\n}\n";
+        let ds = diags(src);
+        assert!(
+            !codes(&ds).contains(&"non-static-attr-initializer"),
+            "expected no non-static-attr-initializer, got: {ds:?}"
         );
     }
 

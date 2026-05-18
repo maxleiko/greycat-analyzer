@@ -34,8 +34,8 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     AssignStmt, AtStmt, BinOp, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt,
     ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr, ObjectExpr,
-    OffsetExpr, Pragma, StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef,
-    UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
+    ObjectField, OffsetExpr, Pragma, StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl,
+    TypeRef, UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
 };
 
 use crate::lint::{LintDiagnostic, LintSeverity};
@@ -2794,37 +2794,35 @@ impl<'a> Cx<'a> {
     }
 
     /// Object-expr completeness check: `Foo {}` / `Foo { a: 1 }`
-    /// against `type Foo { a: int; b: int = 0; c: String? }` should
-    /// require `a` (non-nullable, no default) and skip `b` (defaulted)
-    /// and `c` (nullable — runtime auto-initializes to `null`).
+    /// against `type Foo { a: int; c: String? }` should require `a`
+    /// (non-nullable) and skip `c` (nullable — runtime auto-initializes
+    /// to `null`). Static attrs are skipped: they aren't part of
+    /// instantiation, and they're the only attrs that can carry an
+    /// initializer in GreyCat anyway.
     ///
-    /// Walks the local supertype chain so a `type Sub extends Super`
-    /// inherits `Super`'s required attrs. The walk stops at the first
-    /// cross-module link (qualified supertype, or a name without a
-    /// local `Decl::Type` entry) — we still emit errors for the
-    /// portion of the chain we could resolve, but stop short of
-    /// claiming "all required attrs initialized" in that case. False
-    /// negatives over false positives.
+    /// Walks the supertype chain (cross-module) so a `type Sub extends
+    /// Super` inherits `Super`'s required attrs. Driven by
+    /// [`ProjectIndex::type_members`] so foreign types from
+    /// `@library` / `@include` modules participate the same way as
+    /// local ones — the previous module-local path silently skipped
+    /// any object expression whose head lived in `std` or any included
+    /// module.
     ///
     /// Skipped when:
-    /// - the type ref is qualified (`b::Foo {}`) — same cross-module
-    ///   gap, top-level edition;
-    /// - the receiver isn't a local `Decl::Type` (primitive / generic-
-    ///   param / runtime-generic without a `.gcl` decl);
+    /// - the type ref is qualified (`b::Foo {}`) — the qualified leaf
+    ///   resolves through a different path that isn't wired in here yet;
+    /// - the head name isn't in [`ProjectIndex::type_members`] (so it's
+    ///   a primitive / runtime-generic / unresolved typo — nothing to
+    ///   check against);
     /// - any field is positional (`Foo { 1, 2 }`) — those fill in
     ///   declaration order and need a different check.
-    fn check_object_required_attrs(
-        &mut self,
-        type_ref: Idx<TypeRef>,
-        fields: &[greycat_analyzer_hir::types::ObjectField],
-        expr_id: Idx<Expr>,
-    ) {
+    fn check_object_required_attrs(&mut self, type_ref: Idx<TypeRef>, fields: &[ObjectField]) {
         let tr = &self.hir.type_refs[type_ref];
-        let head_sym = self.hir.idents[tr.name].symbol;
-        let Some(head_decl_id) = self.out.type_decls.get(&head_sym).copied() else {
+        if !tr.qualifier.is_empty() {
             return;
-        };
-        if !matches!(&self.hir.decls[head_decl_id], Decl::Type(_)) {
+        }
+        let head_sym = self.hir.idents[tr.name].symbol;
+        if !self.index.type_members.contains_key(&head_sym) {
             return;
         }
         // Bail on positional / mixed: positional fields fill in attr
@@ -2833,79 +2831,96 @@ impl<'a> Cx<'a> {
         if fields.iter().any(|f| f.name.is_none()) {
             return;
         }
-        let supplied: rustc_hash::FxHashSet<Symbol> = fields
+        let supplied: FxHashSet<Symbol> = fields
             .iter()
             .filter_map(|f| f.name.map(|n| self.hir.idents[n].symbol))
             .collect();
 
-        // Walk Sub → Super → SuperSuper. Cap the depth as a cheap guard
-        // against cycles — the analyzer is supposed to reject those
-        // elsewhere, but the walk here mustn't loop forever even if a
-        // cycle slips through.
+        // Walk Sub → Super → SuperSuper via `members.supertype`,
+        // collecting:
+        // - `missing`: required (non-nullable, non-static) attrs that
+        //   weren't supplied.
+        // - `known`: every instance attr the user *could* legitimately
+        //   supply — drives the converse unknown-field check below.
+        // Cap depth as a cheap cycle guard — the analyzer rejects
+        // cycles elsewhere, but the walk here mustn't loop forever
+        // even if one slips through.
         let mut missing: Vec<SmolStr> = Vec::new();
-        let mut seen_names: rustc_hash::FxHashSet<Symbol> = rustc_hash::FxHashSet::default();
-        let mut cursor_decl: Option<Idx<Decl>> = Some(head_decl_id);
-        let mut cursor_name = head_sym;
+        let mut known: FxHashSet<Symbol> = FxHashSet::default();
+        let mut seen: FxHashSet<Symbol> = FxHashSet::default();
+        let mut cursor = Some(head_sym);
         let mut hops = 0usize;
-        while let Some(decl_id) = cursor_decl {
-            if !seen_names.insert(cursor_name) {
+        while let Some(name_sym) = cursor {
+            if !seen.insert(name_sym) {
                 break;
             }
             if hops > 32 {
                 break;
             }
             hops += 1;
-            let Decl::Type(td) = &self.hir.decls[decl_id] else {
+            let Some(members) = self.index.type_members.get(&name_sym) else {
                 break;
             };
-            for attr_id in td.attrs.iter() {
-                let attr = &self.hir.type_attrs[*attr_id];
-                if attr.modifiers.static_ {
+            for attr_sym in members.attr_order.iter() {
+                if members.static_attrs.contains(attr_sym) {
                     continue;
                 }
-                if attr.init.is_some() {
+                known.insert(*attr_sym);
+                let nullable = members
+                    .attr_types
+                    .get(attr_sym)
+                    .is_some_and(|ty| self.arena.get(*ty).nullable);
+                if nullable {
                     continue;
                 }
-                let Some(ty_ref) = attr.ty else { continue };
-                if self.hir.type_refs[ty_ref].optional {
+                if supplied.contains(attr_sym) {
                     continue;
                 }
-                let attr_sym = self.hir.idents[attr.name].symbol;
-                if supplied.contains(&attr_sym) {
-                    continue;
-                }
-                let attr_name: &str = &self.index.symbols[attr_sym];
+                let attr_name: &str = &self.index.symbols[*attr_sym];
                 let smol = SmolStr::new(attr_name);
                 if !missing.iter().any(|m| m == &smol) {
                     missing.push(smol);
                 }
             }
-            let Some(sup_ref) = td.supertype else { break };
-            let sup_tr = &self.hir.type_refs[sup_ref];
-            if !sup_tr.qualifier.is_empty() {
-                // Cross-module ancestor — stop, keep what we've got.
-                break;
+            cursor = members.supertype;
+        }
+
+        let type_name: &str = &self.index.symbols[head_sym];
+
+        // Unknown-field check: any supplied name that isn't an
+        // instance attr anywhere on the chain. Emit once per
+        // occurrence so each red squiggly points at the actual
+        // mistake (two `oops: 1, oops: 2` get two diagnostics).
+        // Static attrs intentionally aren't in `known` — they can't
+        // be assigned via object syntax, so naming one here is
+        // unknown in the assignment sense.
+        for f in fields {
+            let Some(name_id) = f.name else { continue };
+            let attr_sym = self.hir.idents[name_id].symbol;
+            if known.contains(&attr_sym) {
+                continue;
             }
-            let sup_name_sym = self.hir.idents[sup_tr.name].symbol;
-            cursor_name = sup_name_sym;
-            cursor_decl = self.out.type_decls.get(&sup_name_sym).copied();
+            let attr_name: &str = &self.index.symbols[attr_sym];
+            let span = self.hir.idents[name_id].byte_range.clone();
+            self.diag(
+                Severity::Error,
+                "unknown-field",
+                format!("unknown field `{attr_name}` on type `{type_name}`"),
+                span,
+            );
         }
 
         if missing.is_empty() {
             return;
         }
-        let span = self.hir.exprs[expr_id].byte_range();
         let names: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
         let joined = names.join(", ");
         let plural = if missing.len() > 1 { "s" } else { "" };
-        let type_name: &str = &self.index.symbols[head_sym];
         self.diag(
             Severity::Error,
             "missing-required-fields",
-            format!(
-                "missing required field{plural} for `{type_name}`: {joined} (non-nullable and no default)"
-            ),
-            span,
+            format!("missing required field{plural} for `{type_name}`: {joined} (non-nullable)"),
+            tr.byte_range.clone(),
         );
     }
 
@@ -4764,7 +4779,7 @@ impl<'a> Cx<'a> {
                 }
                 if let Some(t) = ty {
                     let lowered = self.lower_type_ref(t);
-                    self.check_object_required_attrs(t, &fields, expr_id);
+                    self.check_object_required_attrs(t, &fields);
                     lowered
                 } else {
                     self.any_nullable()
@@ -6219,11 +6234,14 @@ fn caller(f: Foo?, b: Bar) {
         );
     }
 
-    /// `Foo {}` against a type whose every attr is nullable or has a
-    /// default produces no missing-field diagnostic.
+    /// `Foo {}` against a type whose every attr is nullable produces
+    /// no missing-field diagnostic. GreyCat forbids initializers on
+    /// non-static attrs (caught by `non-static-attr-initializer` at
+    /// parse-shape time), so "has a default" is not a way for an
+    /// instance attr to opt out of required-ness — only `T?` is.
     #[test]
     fn object_expr_all_optional_no_error() {
-        let src = "type Foo { a: int = 0; b: String?; }\nfn main() { var _ = Foo {}; }\n";
+        let src = "type Foo { a: int?; b: String?; }\nfn main() { var _ = Foo {}; }\n";
         let diags = analyze_project_src(src);
         assert!(
             !diags
@@ -6247,16 +6265,82 @@ fn caller(f: Foo?, b: Bar) {
     }
 
     /// Static attrs aren't part of the per-instance schema and must
-    /// not be counted as required.
+    /// not be counted as required — even when they carry an initializer
+    /// (the only attr kind that legally can). Test pairs a static-with-
+    /// init against a required instance attr `b`, then asserts the
+    /// diagnostic names `b` but not the static `k`.
     #[test]
     fn object_expr_static_attr_not_required() {
-        let src = "type Foo { static k: int = 0; a: int = 0; }\nfn main() { var _ = Foo {}; }\n";
+        let src =
+            "type Foo { static k: int = 0; a: int?; b: int; }\nfn main() { var _ = Foo {}; }\n";
+        let diags = analyze_project_src(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("missing required field"))
+            .unwrap_or_else(|| panic!("expected diag for `b`: {diags:?}"));
+        assert!(
+            hit.message.contains("`b`"),
+            "should name `b`: {}",
+            hit.message
+        );
+        assert!(
+            !hit.message.contains("`k`"),
+            "static `k` should not appear: {}",
+            hit.message
+        );
+    }
+
+    /// A supplied field whose name isn't declared (instance) on the
+    /// type or any supertype is an `unknown-field` error.
+    #[test]
+    fn object_expr_unknown_field_errors() {
+        let src = "type Foo { a: int?; }\nfn main() { var _ = Foo { a: 1, oops: 2 }; }\n";
+        let diags = analyze_project_src(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("unknown field"))
+            .unwrap_or_else(|| panic!("expected unknown-field diag: {diags:?}"));
+        assert!(
+            hit.message.contains("`oops`"),
+            "should name `oops`: {}",
+            hit.message
+        );
+        assert!(
+            hit.message.contains("`Foo`"),
+            "should name `Foo`: {}",
+            hit.message
+        );
+    }
+
+    /// Inherited attrs count as known — supplying a parent attr on a
+    /// child instance is fine, only truly-unknown names fire.
+    #[test]
+    fn object_expr_inherited_field_is_known() {
+        let src = "type Animal { name: String?; }\n\
+                   type Dog extends Animal { breed: String?; }\n\
+                   fn main() { var _ = Dog { name: \"rex\", breed: \"lab\" }; }\n";
         let diags = analyze_project_src(src);
         assert!(
-            !diags
-                .iter()
-                .any(|d| d.message.contains("missing required field")),
-            "static attr `k` should not be required: {diags:?}"
+            !diags.iter().any(|d| d.message.contains("unknown field")),
+            "inherited `name` should be known: {diags:?}"
+        );
+    }
+
+    /// Static attrs aren't assignable via object syntax — naming one
+    /// in `Foo { k: 1 }` is an unknown-field error in this context.
+    #[test]
+    fn object_expr_static_field_is_unknown_in_instance_construction() {
+        let src = "type Foo { static k: int = 0; a: int?; }\n\
+                   fn main() { var _ = Foo { k: 1 }; }\n";
+        let diags = analyze_project_src(src);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("unknown field"))
+            .unwrap_or_else(|| panic!("expected unknown-field diag: {diags:?}"));
+        assert!(
+            hit.message.contains("`k`"),
+            "should name `k`: {}",
+            hit.message
         );
     }
 
@@ -6331,11 +6415,11 @@ fn caller(f: Foo?, b: Bar) {
         }
     }
 
-    /// Inherited attrs with defaults stay optional — the parent's
-    /// `init` shouldn't get scrubbed by the chain walk.
+    /// Inherited nullable attrs stay optional — the chain walk must
+    /// not turn a parent's `T?` into a required field on the child.
     #[test]
-    fn object_expr_inherited_default_attr_not_required() {
-        let src = "type Animal { species: String = \"unknown\"; }\n\
+    fn object_expr_inherited_nullable_attr_not_required() {
+        let src = "type Animal { species: String?; }\n\
                    type Dog extends Animal { breed: String; }\n\
                    fn main() { var _ = Dog { breed: \"lab\" }; }\n";
         let diags = analyze_project_src(src);
@@ -6343,7 +6427,7 @@ fn caller(f: Foo?, b: Bar) {
             !diags
                 .iter()
                 .any(|d| d.message.contains("missing required field")),
-            "no missing-field diag expected when defaulted inherited attr is omitted: {diags:?}"
+            "no missing-field diag expected when nullable inherited attr is omitted: {diags:?}"
         );
     }
 

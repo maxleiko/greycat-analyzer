@@ -16,6 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use greycat_analyzer_hir::arena::Idx;
+use greycat_analyzer_syntax::tree_sitter::{Node, Tree};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::TypeRegistry;
@@ -517,13 +518,7 @@ impl ProjectAnalysis {
         // P40.5 — capture the entrypoint URI now so the per-module
         // pragma walker can flip behavior when it's NOT the entrypoint.
         let entrypoint_uri: Option<Uri> = manager.entrypoint_uri().cloned();
-        let docs: Vec<(
-            Uri,
-            String,
-            String,
-            greycat_analyzer_syntax::tree_sitter::Tree,
-            bool,
-        )> = manager
+        let docs: Vec<(Uri, String, String, Tree, bool)> = manager
             .iter()
             .map(|(uri, cell)| {
                 let doc = cell.borrow();
@@ -2097,15 +2092,17 @@ impl ProjectAnalysis {
         decl_registry: &crate::well_known::DeclRegistry,
         cur_uri: &Uri,
         arena: &mut TypeArena,
-    ) -> Vec<crate::analyzer::SemanticDiagnostic> {
+        diags: &mut Vec<SemanticDiagnostic>,
+    ) {
         use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
         use greycat_analyzer_hir::types::Expr;
 
         let cur_module = match modules.get(cur_uri) {
             Some(m) => m,
-            None => return Vec::new(),
+            None => {
+                return;
+            }
         };
-        let mut out = Vec::new();
         for (_call_id, call_expr) in cur_module.hir.exprs.iter() {
             let Expr::Call(call) = call_expr else {
                 continue;
@@ -2136,7 +2133,7 @@ impl ProjectAnalysis {
                 let fn_name = SmolStr::from(&index.symbols[fn_module.hir.idents[fnd.name].symbol]);
                 let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
                 let plural = if expected == 1 { "" } else { "s" };
-                out.push(SemanticDiagnostic {
+                diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
                     code: "call-arity",
                     message: format!(
@@ -2218,7 +2215,7 @@ impl ProjectAnalysis {
                 ) {
                     let p_name = SmolStr::from(&index.symbols[fn_module.hir.idents[p.name].symbol]);
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
-                    out.push(SemanticDiagnostic {
+                    diags.push(SemanticDiagnostic {
                         severity: Severity::Error,
                         code: "argument-type-mismatch",
                         message: format!(
@@ -2233,7 +2230,190 @@ impl ProjectAnalysis {
                 }
             }
         }
-        out
+    }
+
+    /// Sibling of [`Self::collect_call_arg_diags_split`] for the
+    /// object-construction shape: `Foo<int> { quantizers: false }`.
+    /// Every supplied field's value type must be assignable to the
+    /// attr's declared type, after substituting the object expr's own
+    /// generic args for the decl's `GenericParam` slots. Walks the
+    /// supertype chain so inherited attrs (`type Dog extends Animal`,
+    /// `Dog { name: ... }`) check against `Animal`'s declared `name`
+    /// type. Statics are skipped — the analyzer's unknown-field check
+    /// handles `Foo { static_attr_name: ... }` separately.
+    ///
+    /// Sibling of the structural `check_object_required_attrs` (in
+    /// the analyzer) which does name-level completeness. Type-relation
+    /// work lives here per the architectural invariant on
+    /// [`Self::validate_type_relations`].
+    #[allow(clippy::mutable_key_type)]
+    fn collect_object_field_diags_split(
+        modules: &FxHashMap<Uri, ModuleAnalysis>,
+        index: &ProjectIndex,
+        well_known: &crate::well_known::WellKnown,
+        decl_registry: &crate::well_known::DeclRegistry,
+        cur_uri: &Uri,
+        arena: &mut TypeArena,
+        diags: &mut Vec<SemanticDiagnostic>,
+    ) {
+        use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+        use greycat_analyzer_hir::types::{Expr, ObjectExpr};
+
+        let cur_module = match modules.get(cur_uri) {
+            Some(m) => m,
+            None => {
+                return;
+            }
+        };
+        for (obj_expr_id, expr) in cur_module.hir.exprs.iter() {
+            let Expr::Object(ObjectExpr {
+                ty: Some(tr_id),
+                fields,
+                ..
+            }) = expr
+            else {
+                continue;
+            };
+            let tr = &cur_module.hir.type_refs[*tr_id];
+            if !tr.qualifier.is_empty() {
+                continue;
+            }
+            let head_sym = cur_module.hir.idents[tr.name].symbol;
+            let Some(head_members) = index.type_members.get(&head_sym) else {
+                continue;
+            };
+            // Positional / mixed fields use a different completeness
+            // model (declaration order); skip for now.
+            if fields.iter().any(|f| f.name.is_none()) {
+                continue;
+            }
+            // Build substitution from the object expr's own settled
+            // TypeId. Non-generic head ⇒ empty subst (a no-op). Arity
+            // mismatch ⇒ skip the whole expr; the head's lowering pass
+            // has already flagged it elsewhere and substituting with
+            // the wrong shape would surface noise.
+            let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
+                continue;
+            };
+            let init_subst: FxHashMap<Symbol, TypeId> = match &arena.get(obj_ty).kind {
+                TypeKind::Generic { args, .. } if args.len() == head_members.generics.len() => {
+                    head_members
+                        .generics
+                        .iter()
+                        .copied()
+                        .zip(args.iter().copied())
+                        .collect()
+                }
+                TypeKind::Type(_) if head_members.generics.is_empty() => FxHashMap::default(),
+                _ => continue,
+            };
+            // Walk the chain Sub → Base<int> → Base<int>'s parent …,
+            // accumulating each level's subst so an attr inherited from
+            // a generic parent (`val: T` on `Base<T>`) gets `T`
+            // substituted with the concrete arg the child instantiates
+            // (`Sub extends Base<int>` → `val: int`). Mirrors the
+            // [`walk_substituted_supertype_chain`] flow used by
+            // assignability; we can't share that helper here because
+            // we need each hop's attr table, not just the final
+            // assignability result.
+            //
+            // `chain_attrs` stores the *already-substituted* declared
+            // type per attr, so the per-field check is a direct lookup
+            // — no second-pass substitution needed.
+            let mut chain_attrs: FxHashMap<Symbol, (TypeId, bool)> = FxHashMap::default();
+            let mut cur_decl = head_sym;
+            let mut cur_subst = init_subst;
+            let mut seen: FxHashSet<Symbol> = FxHashSet::default();
+            for _ in 0..32 {
+                if !seen.insert(cur_decl) {
+                    break;
+                }
+                let Some(m) = index.type_members.get(&cur_decl) else {
+                    break;
+                };
+                for (sym, raw_ty) in &m.attr_types {
+                    let ty = if cur_subst.is_empty() {
+                        *raw_ty
+                    } else {
+                        arena.substitute(*raw_ty, &cur_subst)
+                    };
+                    let is_static = m.static_attrs.contains(sym);
+                    chain_attrs.entry(*sym).or_insert((ty, is_static));
+                }
+                let Some(sup_ty_raw) = m.supertype_ty else {
+                    break;
+                };
+                let sup_ty = if cur_subst.is_empty() {
+                    sup_ty_raw
+                } else {
+                    arena.substitute(sup_ty_raw, &cur_subst)
+                };
+                match arena.get(sup_ty).kind.clone() {
+                    TypeKind::Generic { decl, args } => {
+                        let Some(parent_sym) = decl_registry.name(decl) else {
+                            break;
+                        };
+                        let Some(parent_m) = index.type_members.get(&parent_sym) else {
+                            break;
+                        };
+                        if parent_m.generics.len() != args.len() {
+                            break;
+                        }
+                        cur_decl = parent_sym;
+                        cur_subst = parent_m
+                            .generics
+                            .iter()
+                            .copied()
+                            .zip(args.iter().copied())
+                            .collect();
+                    }
+                    TypeKind::Type(decl) => {
+                        let Some(parent_sym) = decl_registry.name(decl) else {
+                            break;
+                        };
+                        cur_decl = parent_sym;
+                        cur_subst.clear();
+                    }
+                    _ => break,
+                }
+            }
+            for f in fields.iter() {
+                let Some(name_id) = f.name else { continue };
+                let attr_sym = cur_module.hir.idents[name_id].symbol;
+                let Some(&(declared_ty, is_static)) = chain_attrs.get(&attr_sym) else {
+                    continue; // unknown-field handled by the structural pass
+                };
+                if is_static {
+                    continue; // unknown-field also handles static-as-instance
+                }
+                let Some(value_ty) = cur_module.analysis.expr_types.get(&f.value).copied() else {
+                    continue;
+                };
+                if !is_assignable_to_with_index(
+                    index,
+                    well_known,
+                    decl_registry,
+                    arena,
+                    value_ty,
+                    declared_ty,
+                ) {
+                    let attr_name = SmolStr::from(&index.symbols[attr_sym]);
+                    let r = cur_module.hir.exprs[f.value].byte_range();
+                    diags.push(SemanticDiagnostic {
+                        severity: Severity::Error,
+                        code: "field-type-mismatch",
+                        message: format!(
+                            "value of type `{}` is not assignable to field `{}: {}`",
+                            display_type(arena, decl_registry, &index.symbols, value_ty),
+                            attr_name,
+                            display_type(arena, decl_registry, &index.symbols, declared_ty),
+                        ),
+                        byte_range: r,
+                        category: DiagCategory::TypeRelation,
+                    });
+                }
+            }
+        }
     }
 
     /// Pass 3.7 — unified type-relation validation. Walks every
@@ -2301,7 +2481,7 @@ impl ProjectAnalysis {
         // Vec and dispatch through the `parallel::par_for_each` shim —
         // rayon on native, serial loop on wasm.
         #[allow(clippy::mutable_key_type)]
-        let doc_data: FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)> = self
+        let doc_data: FxHashMap<Uri, (String, Tree)> = self
             .modules
             .keys()
             .filter(|uri| in_scope(uri))
@@ -2389,14 +2569,24 @@ impl ProjectAnalysis {
             // free walker. Note: we hold `arena_mut` here, so call into
             // a helper that accepts `&self.modules` + `&self.index` +
             // `arena` instead of borrowing `&self`.
-            diags.extend(Self::collect_call_arg_diags_split(
+            Self::collect_call_arg_diags_split(
                 &self.modules,
                 index,
                 well_known,
                 decl_registry,
                 cur_uri,
                 arena_mut,
-            ));
+                &mut diags,
+            );
+            Self::collect_object_field_diags_split(
+                &self.modules,
+                index,
+                well_known,
+                decl_registry,
+                cur_uri,
+                arena_mut,
+                &mut diags,
+            );
             if !diags.is_empty() {
                 diag_updates.insert(cur_uri.clone(), diags);
             }
@@ -2823,20 +3013,13 @@ impl ProjectAnalysis {
 /// `["runtime", "ResponseCode", "ok"]`. The leftmost segment comes
 /// from the chain root's `type_ident.name`; subsequent segments come
 /// from each enclosing `static_expr.property`.
-fn qualified_chain(
-    node: greycat_analyzer_syntax::tree_sitter::Node<'_>,
-    text: &str,
-) -> Vec<String> {
+fn qualified_chain(node: Node<'_>, text: &str) -> Vec<String> {
     let mut out = Vec::new();
     collect_chain(node, text, &mut out);
     out
 }
 
-fn collect_chain(
-    node: greycat_analyzer_syntax::tree_sitter::Node<'_>,
-    text: &str,
-    out: &mut Vec<String>,
-) {
+fn collect_chain(node: Node<'_>, text: &str, out: &mut Vec<String>) {
     if node.kind() == "static_expr" {
         // Recurse into the left side first, then append our property.
         let property = node.child_by_field_name("property");
@@ -3047,7 +3230,7 @@ fn run_typed_lints_for_module(
     decl_registry: &DeclRegistry,
     bypass: bool,
     enabled_rules: &FxHashSet<String>,
-    doc_data: &FxHashMap<Uri, (String, greycat_analyzer_syntax::tree_sitter::Tree)>,
+    doc_data: &FxHashMap<Uri, (String, Tree)>,
 ) {
     // P40.1 + P40.5 — a rule fires if any project-wide opt-in surface
     // (CLI `--on`, entrypoint `@lint_on`) enables it. Module-scope
