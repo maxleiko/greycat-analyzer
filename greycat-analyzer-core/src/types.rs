@@ -1,7 +1,6 @@
 //! Type system for greycat — foundation port.
 //!
-//! Ports the core of `packages/lang/src/analysis/types.ts` (~2,811 LoC of
-//! TS). This crate is the foundation the analyzer builds on; it owns
+//! This crate is the foundation the analyzer builds on; it owns
 //! the `Type` enum, type interning, and subtyping rules.
 //!
 //! What's here:
@@ -13,15 +12,6 @@
 //! - Subtyping (`is_assignable_to`) covering the cases the analyzer needs
 //!   in primitive widening, null-into-nullable, generic invariance,
 //!   any/never, lambda variance.
-//!
-//! What's deferred:
-//! - Full TS subtyping rules around node types and runtime tagging.
-//! - Variance for user-declared generics (TS treats them invariantly).
-//! - Inference table / unification beyond simple substitution.
-//!
-//! Decision B: single typed AST + type arena (no separate hir-def/hir-ty
-//! split). Inference table is a thin map from `Idx<Expr>` to `TypeId`
-//! and lives in the analyzer crate, not here.
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
