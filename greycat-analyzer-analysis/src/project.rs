@@ -1184,6 +1184,22 @@ fn lower_module_signatures(
         return entry;
     };
     for d_id in &module.decls {
+        // Privacy filter: skip private decls' signatures from the
+        // module sig cache so `apply_module_contributions` never
+        // populates the cross-module `fn_signatures` / `var_types`
+        // for them. Same-module access still sees them via the
+        // per-module `out.type_decls` / `out.registry` / body-walker
+        // paths.
+        let is_private = match &hir.decls[*d_id] {
+            Decl::Type(td) => td.modifiers.private,
+            Decl::Enum(ed) => ed.modifiers.private,
+            Decl::Fn(fnd) => fnd.modifiers.private,
+            Decl::Var(vd) => vd.modifiers.private,
+            _ => false,
+        };
+        if is_private {
+            continue;
+        }
         match &hir.decls[*d_id] {
             Decl::Type(td) => {
                 let type_sym = hir.idents[td.name].symbol;

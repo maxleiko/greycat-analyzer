@@ -887,9 +887,17 @@ impl ProjectIndex {
             let modifiers = match &hir.decls[*decl_id] {
                 Decl::Type(td) => {
                     let name_sym = hir.idents[td.name].symbol;
+                    let is_private = td.modifiers.private;
                     // Recognised type name (drives `has_name` and the
-                    // sig-cache fingerprint).
-                    self.type_names.insert(name_sym);
+                    // sig-cache fingerprint). Private decls aren't
+                    // cross-module visible: same-module access goes
+                    // through the per-module `out.type_decls` /
+                    // `out.registry` paths, which see the private
+                    // type from its own HIR without needing it in the
+                    // shared name set.
+                    if !is_private {
+                        self.type_names.insert(name_sym);
+                    }
                     // P41.1
                     if td.modifiers.abstract_ {
                         self.is_abstract.insert(name_sym);
@@ -912,8 +920,12 @@ impl ProjectIndex {
                     // collision semantics). Lets the per-module
                     // analyzer's `resolve_member` bind foreign attrs /
                     // methods inline instead of deferring to a post
-                    // pass.
-                    if !self.type_members.contains_key(&name_sym) {
+                    // pass. Private types are skipped — they're only
+                    // resolvable in their own module, where
+                    // `out.type_decls` already provides the local
+                    // attr / method lookup without going through this
+                    // shared map.
+                    if !is_private && !self.type_members.contains_key(&name_sym) {
                         let generics: Vec<Symbol> =
                             td.generics.iter().map(|g| hir.idents[*g].symbol).collect();
                         // **P19.14** — capture the direct supertype
@@ -1009,7 +1021,10 @@ impl ProjectIndex {
                 }
                 Decl::Enum(ed) => {
                     let name_sym = hir.idents[ed.name].symbol;
-                    self.type_names.insert(name_sym);
+                    let is_private = ed.modifiers.private;
+                    if !is_private {
+                        self.type_names.insert(name_sym);
+                    }
                     // Project-wide decl handle (enums get one too — the
                     // resolver / lowering paths route foreign enum refs
                     // through `Type(handle)` for some shapes).
@@ -1022,36 +1037,47 @@ impl ProjectIndex {
                     // downstream lowering pass — including method
                     // return-type lowering for methods declared in
                     // the same module — sees the canonical TypeId.
-                    self.enum_types.entry(name_sym).or_insert_with(|| {
-                        let variants: Box<[Symbol]> = ed
-                            .fields
-                            .iter()
-                            .map(|f| hir.idents[hir.enum_fields[*f].name].symbol)
-                            .collect();
-                        arena.alloc(Type {
-                            kind: TypeKind::Enum {
-                                name: name_sym,
-                                variants,
-                            },
-                            nullable: false,
-                        })
-                    });
+                    // Private enums are skipped — they're invisible
+                    // cross-module, and same-module enum lowering
+                    // uses the per-module `out.registry` path.
+                    if !is_private {
+                        self.enum_types.entry(name_sym).or_insert_with(|| {
+                            let variants: Box<[Symbol]> = ed
+                                .fields
+                                .iter()
+                                .map(|f| hir.idents[hir.enum_fields[*f].name].symbol)
+                                .collect();
+                            arena.alloc(Type {
+                                kind: TypeKind::Enum {
+                                    name: name_sym,
+                                    variants,
+                                },
+                                nullable: false,
+                            })
+                        });
+                    }
                     self.record_decl_location(name_sym, uri, *decl_id, Namespace::Type);
                     Some(&ed.modifiers)
                 }
                 Decl::Fn(fnd) => {
                     let name_sym = hir.idents[fnd.name].symbol;
+                    let is_private = fnd.modifiers.private;
                     if fnd.modifiers.native {
-                        let sig = native_signature_for(
-                            hir,
-                            fnd,
-                            arena,
-                            decl_registry,
-                            &self.decl_locations,
-                            &self.symbols,
-                        );
-                        self.natives.register(name_sym, sig);
-                    } else {
+                        // Natives aren't user-written; `private` here is
+                        // unusual but kept consistent: a private native
+                        // wouldn't be reachable from outside its module.
+                        if !is_private {
+                            let sig = native_signature_for(
+                                hir,
+                                fnd,
+                                arena,
+                                decl_registry,
+                                &self.decl_locations,
+                                &self.symbols,
+                            );
+                            self.natives.register(name_sym, sig);
+                        }
+                    } else if !is_private {
                         self.values.insert(name_sym);
                         // P38.1 — tag non-native fn names so the
                         // analyzer's `Definition::ProjectDecl`
@@ -1065,7 +1091,9 @@ impl ProjectIndex {
                 }
                 Decl::Var(vd) => {
                     let name_sym = hir.idents[vd.name].symbol;
-                    self.values.insert(name_sym);
+                    if !vd.modifiers.private {
+                        self.values.insert(name_sym);
+                    }
                     self.record_decl_location(name_sym, uri, *decl_id, Namespace::Var);
                     Some(&vd.modifiers)
                 }
@@ -1459,11 +1487,14 @@ type Company {
     #[test]
     fn ingest_captures_native_signatures() {
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
+        // Non-private natives — `private` would (correctly) cause
+        // ingest to skip them from the cross-module `natives`
+        // registry, which is not the property under test here.
         let hir = lower(
             &idx.symbols,
             r#"
-private native fn read_file(path: String): String;
-private native fn now(): time;
+native fn read_file(path: String): String;
+native fn now(): time;
 "#,
         );
         idx.ingest(
