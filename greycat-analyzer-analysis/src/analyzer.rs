@@ -257,6 +257,14 @@ pub struct AnalysisResult {
     /// hover / goto-def show the right content for each segment of
     /// `runtime::Identity::create`.
     pub foreign_decl_uses: FxHashMap<Idx<Ident>, ForeignDecl>,
+    /// Object-expression field-name binding. Each `name` ident in
+    /// `Foo { name: value }` that resolves against the constructed
+    /// type's attr chain (including inherited attrs) is recorded here.
+    /// Keyed by the field-name `Idx<Ident>`. Lets IDE features
+    /// (hover, goto-def, rename) treat object-construction sites the
+    /// same way they treat `a.b` member access — the field name is a
+    /// reference to a `TypeAttr`, just at a constructor position.
+    pub object_field_uses: FxHashMap<Idx<Ident>, ObjectFieldBinding>,
     pub diagnostics: Vec<SemanticDiagnostic>,
     // P24.2
     /// Head if-stmt ids of enum-eq chains that
@@ -330,6 +338,20 @@ pub struct ForeignDecl {
     pub decl: Idx<Decl>,
 }
 
+/// Object-expression field-name binding. `declaring_type` names the
+/// type that actually declares the attr — which may be a supertype
+/// of the constructed type, since attrs can be inherited across
+/// module boundaries. The `ItemId` carries both the home module
+/// symbol (mapped to a `Uri` via `ProjectIndex::module_names`) and
+/// the type's leaf name, so IDE consumers can render `module::Type`
+/// provenance without re-walking the supertype graph. `attr` is the
+/// `TypeAttr` index into the home module's HIR.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectFieldBinding {
+    pub declaring_type: ItemId,
+    pub attr: Idx<TypeAttr>,
+}
+
 impl AnalysisResult {
     pub fn type_of(&self, expr: Idx<Expr>) -> Option<TypeId> {
         self.expr_types.get(&expr).copied()
@@ -355,6 +377,13 @@ impl AnalysisResult {
     /// `runtime::Identity::create` -> the foreign type decl).
     pub fn foreign_decl_lookup(&self, ident: Idx<Ident>) -> Option<&ForeignDecl> {
         self.foreign_decl_uses.get(&ident)
+    }
+
+    /// Look up an object-expression field-name binding. Returns the
+    /// `(home module, TypeAttr)` pair declaring the attribute the
+    /// field initialises. `None` for unknown / positional fields.
+    pub fn object_field_lookup(&self, ident: Idx<Ident>) -> Option<&ObjectFieldBinding> {
+        self.object_field_uses.get(&ident)
     }
 }
 
@@ -2978,6 +3007,11 @@ impl<'a> Cx<'a> {
         // even if one slips through.
         let mut missing: Vec<SmolStr> = Vec::new();
         let mut known: FxHashSet<Symbol> = FxHashSet::default();
+        // Tracks where each known attr is declared so the IDE-side
+        // `object_field_uses` binding below can point at the right
+        // declaring type (inherited attrs live on a supertype, which
+        // may be in a different module).
+        let mut declarers: FxHashMap<Symbol, (ItemId, Idx<TypeAttr>)> = FxHashMap::default();
         let mut seen: FxHashSet<ItemId> = FxHashSet::default();
         let mut cursor = Some(head_id);
         let mut hops = 0usize;
@@ -2997,6 +3031,10 @@ impl<'a> Cx<'a> {
                     continue;
                 }
                 known.insert(*attr_sym);
+                if let Some(attr_idx) = members.attrs.get(attr_sym) {
+                    // Child level wins on shadowed attr names.
+                    declarers.entry(*attr_sym).or_insert((cur_id, *attr_idx));
+                }
                 let nullable = members
                     .attr_types
                     .get(attr_sym)
@@ -3014,6 +3052,24 @@ impl<'a> Cx<'a> {
                 }
             }
             cursor = members.supertype;
+        }
+
+        // Bind each known field-name ident to its declaring attr for
+        // IDE consumers (hover, goto-def, rename). Unknown fields are
+        // intentionally skipped — they get an `unknown-field`
+        // diagnostic below and have no attr to point at.
+        for f in fields {
+            let Some(name_id) = f.name else { continue };
+            let attr_sym = self.hir.idents[name_id].symbol;
+            if let Some((declaring_type, attr_idx)) = declarers.get(&attr_sym) {
+                self.out.object_field_uses.insert(
+                    name_id,
+                    ObjectFieldBinding {
+                        declaring_type: *declaring_type,
+                        attr: *attr_idx,
+                    },
+                );
+            }
         }
 
         let type_name: &str = &self.index.symbols[head_sym];

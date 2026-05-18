@@ -10,7 +10,7 @@ use std::ops::Range;
 use greycat_analyzer_analysis::analyzer::{AnalysisResult, MemberDef};
 use greycat_analyzer_analysis::ide::render::{
     RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_type_decl_with_body,
-    render_type_ref_with_subst,
+    render_type_ref, render_type_ref_with_subst,
 };
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
@@ -19,7 +19,7 @@ use greycat_analyzer_core::{SourceManager, SymbolTable, TypeArena, TypeId};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Expr, Ident};
+use greycat_analyzer_hir::types::{Decl, Expr, Ident, TypeAttr};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Uri};
@@ -97,6 +97,41 @@ pub fn hover_with_project(
                         ));
                     }
                 }
+            }
+            // TypeAttr-defining ident (cursor on the `path` in
+            // `private path: String;` inside a type body). Same hover
+            // shape as the object-construction site so both ends of
+            // the attr binding render consistently. Find the
+            // enclosing `Decl::Type` so the provenance footer can
+            // name it (`module::Type`).
+            if let Some((attr_idx, attr)) = module
+                .hir
+                .type_attrs
+                .iter()
+                .find(|(_, a)| module.hir.idents[a.name].byte_range == node.byte_range())
+            {
+                let owner_name = module.hir.decls.iter().find_map(|(_, decl)| match decl {
+                    Decl::Type(td) if td.attrs.contains(&attr_idx) => {
+                        Some(&project.symbols()[module.hir.idents[td.name].symbol])
+                    }
+                    _ => None,
+                });
+                let provenance = match owner_name {
+                    Some(ty_name) => format!("{}::{}", module_label_for_uri(uri), ty_name),
+                    None => module_label_for_uri(uri),
+                };
+                let markdown = object_field_hover_markdown(
+                    &module.hir,
+                    project.symbols(),
+                    attr,
+                    &module.hir.idents[attr.name],
+                    &provenance,
+                );
+                return Some(hover_from_markdown(
+                    markdown,
+                    module.hir.idents[attr.name].byte_range.clone(),
+                    text,
+                ));
             }
         }
         // --- Layer 2: non-ident expression hover (cached analysis).
@@ -240,6 +275,38 @@ fn ident_hover_markdown(
     project: Option<HoverProjectCtx<'_>>,
 ) -> Option<String> {
     let ident_name = &symbols[ident.symbol];
+    // Object-expression field name (`name` in `Foo { name: value }`).
+    // Recorded by the analyzer against the declaring attr — which
+    // may live on a *supertype* whose home module is a different
+    // file. The binding carries the declaring type's `ItemId`, so the
+    // provenance footer points at the chain origin (`module::Type`)
+    // rather than just the file: hovering an inherited field on a
+    // `Derived { ... }` call site reveals it came from `Base`.
+    if let Some(ctx) = project
+        && let Some(binding) = analysis.object_field_lookup(ident_idx)
+        && let Some(home_uri) = ctx
+            .project
+            .index
+            .module_names
+            .get(&binding.declaring_type.module)
+            .cloned()
+        && let Some(fmod) = ctx.project.module(&home_uri)
+        && (binding.attr.into_raw() as usize) < fmod.hir.type_attrs.len()
+    {
+        let attr = &fmod.hir.type_attrs[binding.attr];
+        let provenance = format!(
+            "{}::{}",
+            module_label_for_uri(&home_uri),
+            &symbols[binding.declaring_type.name],
+        );
+        return Some(object_field_hover_markdown(
+            &fmod.hir,
+            symbols,
+            attr,
+            ident,
+            &provenance,
+        ));
+    }
     // P6.3: property idents in `a.b` aren't in `Resolutions` — they
     // bind to a `TypeAttr` / method via the analyzer's member pass.
     // Check that first so member hovers render with the right shape.
@@ -387,6 +454,43 @@ fn member_hover_markdown(
             render_decl_hover_markdown(hir, symbols, decl, None, ctx)
         }
     }
+}
+
+/// Hover markdown for an object-expression field name. Always
+/// includes modifiers (`private` / `static`), declared type, doc, and
+/// a `defined in <module>` footnote — useful even when the attr's
+/// home module is the same as the construction site, because the
+/// type body can be far from the constructor.
+fn object_field_hover_markdown(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    attr: &TypeAttr,
+    ident: &Ident,
+    provenance: &str,
+) -> String {
+    let ty_str = attr
+        .ty
+        .map(|t| render_type_ref(hir, symbols, t))
+        .unwrap_or_else(|| "any".into());
+    let mut signature = String::new();
+    if attr.modifiers.private {
+        signature.push_str("private ");
+    }
+    if attr.modifiers.static_ {
+        signature.push_str("static ");
+    }
+    signature.push_str(&symbols[ident.symbol]);
+    signature.push_str(": ");
+    signature.push_str(&ty_str);
+
+    let mut out = String::new();
+    out.push_str(&wrap_code(&signature));
+    out.push('\n');
+    push_doc_section(&mut out, attr.doc.as_deref());
+    out.push_str("\n*defined in `");
+    out.push_str(provenance);
+    out.push_str("`*");
+    out
 }
 
 // P15.x

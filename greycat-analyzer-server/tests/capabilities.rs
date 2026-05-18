@@ -55,6 +55,149 @@ fn hover_off_named_node_returns_none() {
     assert!(test_project.hover(pos(99, 99)).is_none());
 }
 
+#[test]
+fn hover_on_object_expr_field_shows_attr_signature_doc_and_provenance() {
+    let src = "\
+type Reader {
+    /// The documentation
+    private path: String;
+}
+
+fn main() {
+    var r = Reader { path: \"\" };
+}
+";
+    let test_project = TestProject::single_file(src);
+    // Cursor on the `path` field name inside the object expression.
+    let cursor = position_of(src, "path: \"\"");
+    let h = test_project
+        .hover(cursor)
+        .expect("hover present on object-expr field");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("private path: String"),
+        "expected `private path: String` in hover, got {v}"
+    );
+    assert!(
+        v.contains("The documentation"),
+        "expected attr doc in hover, got {v}"
+    );
+    assert!(
+        v.contains("*defined in `main::Reader`*"),
+        "expected `module::Type` provenance footer in hover, got {v}"
+    );
+}
+
+#[test]
+fn hover_on_type_attr_declaration_shows_same_shape_as_object_field() {
+    let src = "\
+type Reader {
+    /// The documentation
+    private path: String;
+}
+
+fn main() {
+    var r = Reader { path: \"\" };
+}
+";
+    let test_project = TestProject::single_file(src);
+    // Cursor on the `path` in the type body — the declaring site.
+    let cursor = position_of(src, "path: String");
+    let h = test_project
+        .hover(cursor)
+        .expect("hover present on type-attr decl site");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("private path: String"),
+        "expected `private path: String` in hover, got {v}"
+    );
+    assert!(
+        v.contains("The documentation"),
+        "expected attr doc in hover, got {v}"
+    );
+    assert!(
+        v.contains("*defined in `main::Reader`*"),
+        "expected `module::Type` provenance footer in hover, got {v}"
+    );
+}
+
+#[test]
+fn hover_on_object_expr_field_resolves_inherited_attr() {
+    let src = "\
+type Base {
+    /// inherited doc
+    label: String;
+}
+type Derived extends Base {}
+
+fn main() {
+    var d = Derived { label: \"hi\" };
+}
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "label: \"hi\"");
+    let h = test_project
+        .hover(cursor)
+        .expect("hover present on inherited object-expr field");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("label: String"),
+        "expected `label: String` in hover, got {v}"
+    );
+    assert!(
+        v.contains("inherited doc"),
+        "expected inherited attr doc, got {v}"
+    );
+    assert!(
+        v.contains("*defined in `main::Base`*"),
+        "provenance must name the *declaring* type (Base), not the constructed one (Derived), got {v}"
+    );
+}
+
+#[test]
+fn hover_on_unknown_object_field_skips_object_field_path() {
+    let src = "\
+type Reader {
+    path: String;
+}
+fn main() {
+    var r = Reader { nope: \"\" };
+}
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "nope:");
+    // Unknown field — no binding recorded, the object-field hover
+    // branch must not synthesise a fake signature for `nope`. The
+    // generic ancestor-expression hover may still fire (and that's
+    // fine), but the object-field markdown shape — modifier prefix +
+    // provenance footer pointing at a non-existent attr — must not
+    // appear.
+    let h = test_project.hover(cursor);
+    if let Some(Hover {
+        contents: HoverContents::Markup(MarkupContent { value, .. }),
+        ..
+    }) = h
+    {
+        assert!(
+            !value.contains("nope:"),
+            "unknown field must not produce object-field hover markdown, got {value}"
+        );
+        assert!(
+            !value.contains("*defined in"),
+            "unknown field must not produce provenance footer, got {value}"
+        );
+    }
+}
+
 // =============================================================================
 // signature_help
 // =============================================================================
