@@ -3,7 +3,8 @@
 //! Three small layers on a Wadler/Leijen pretty printer:
 //!
 //! - [`doc`] — the layout IR (`Doc::Text`, `Doc::Group`, `Doc::Indent`,
-//!   `Doc::Line`, `Doc::Hard`, `Doc::IfBroken`, `Doc::BlankLine`).
+//!   `Doc::IndentIfBroken`, `Doc::Line`, `Doc::Hard`, `Doc::IfBroken`,
+//!   `Doc::Expand`, `Doc::BlankLine`).
 //! - [`lower`] — CST → Doc visitor that walks the tree-sitter tree in
 //!   named-structure order.
 //! - [`render`] — width-aware printer that picks flat-vs-broken per

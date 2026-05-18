@@ -781,7 +781,7 @@ fn lower_args_call<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     }
     Doc::group(Doc::concat(vec![
         Doc::text("("),
-        Doc::indent(Doc::concat(inner)),
+        Doc::indent_if_broken(Doc::concat(inner)),
         Doc::softline(),
         Doc::text(")"),
     ]))
@@ -1372,12 +1372,12 @@ fn lower_object_initializers<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
         inner.push(lower_node(cx, *e));
     }
-    Doc::group(Doc::concat(vec![
+    Doc::expand(Doc::group(Doc::concat(vec![
         Doc::text("{"),
-        Doc::indent(Doc::concat(inner)),
+        Doc::indent_if_broken(Doc::concat(inner)),
         Doc::line(),
         Doc::text("}"),
-    ]))
+    ])))
 }
 
 fn lower_object_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
@@ -1398,12 +1398,12 @@ fn lower_object_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
         inner.push(lower_node(cx, *f));
     }
-    Doc::group(Doc::concat(vec![
+    Doc::expand(Doc::group(Doc::concat(vec![
         Doc::text("{"),
-        Doc::indent(Doc::concat(inner)),
+        Doc::indent_if_broken(Doc::concat(inner)),
         Doc::line(),
         Doc::text("}"),
-    ]))
+    ])))
 }
 
 fn lower_object_field<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
@@ -1436,12 +1436,12 @@ fn lower_array_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
         inner.push(lower_node(cx, *e));
     }
-    Doc::group(Doc::concat(vec![
+    Doc::expand(Doc::group(Doc::concat(vec![
         Doc::text("["),
-        Doc::indent(Doc::concat(inner)),
+        Doc::indent_if_broken(Doc::concat(inner)),
         Doc::softline(),
         Doc::text("]"),
-    ]))
+    ])))
 }
 
 fn lower_call_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
@@ -1481,17 +1481,35 @@ fn lower_chain_root<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         return head_doc;
     }
 
-    let mut parts: Vec<Doc> = Vec::new();
+    // Split the link content into a head-glued prefix (pre-softline)
+    // and a chain-indented tail (post-softline). The tail goes inside
+    // an IndentIfBroken so the chain's indent step only fires when the
+    // chain itself breaks — leaving inner expandable groups (args /
+    // object inits / arrays) to drive their own indent on their own
+    // break decision when the chain stays flat.
+    let mut prefix: Vec<Doc> = Vec::new();
+    let mut tail: Vec<Doc> = Vec::new();
+    let mut crossed_softline = false;
     for link in links {
         if !is_doc_nil(&link.leading) {
-            parts.push(link.leading);
+            if crossed_softline {
+                tail.push(link.leading);
+            } else {
+                prefix.push(link.leading);
+            }
         }
         if let Some(trail) = link.after_break {
-            parts.push(Doc::softline());
-            parts.push(trail);
+            crossed_softline = true;
+            tail.push(Doc::softline());
+            tail.push(trail);
         }
     }
-    Doc::group(Doc::concat(vec![head_doc, Doc::indent(Doc::concat(parts))]))
+    let mut result: Vec<Doc> = vec![head_doc];
+    result.extend(prefix);
+    if !tail.is_empty() {
+        result.push(Doc::indent_if_broken(Doc::concat(tail)));
+    }
+    Doc::group(Doc::concat(result))
 }
 
 fn is_doc_nil(d: &Doc) -> bool {

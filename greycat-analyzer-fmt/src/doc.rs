@@ -39,6 +39,22 @@ pub enum Doc {
     /// use is a trailing comma before a closing `)` or `]`: present when
     /// the group has been broken (one arg per line), absent inline.
     IfBroken(Box<Doc>),
+    /// Indent the inner doc by one step *only when the enclosing
+    /// `Group` is in Break mode*. In Flat mode, behaves like the inner
+    /// doc with no added indent. The canonical use is a chain root
+    /// wrapping its post-softline content: the chain's indent step
+    /// only matters once the chain breaks; if it stays flat (because
+    /// an inner expandable absorbs the width), no extra indent is
+    /// imposed on the leading content.
+    IndentIfBroken(Box<Doc>),
+    /// "Expandable child" — the inner doc renders normally but
+    /// contributes **zero width** to the *enclosing* group's
+    /// fits-check. The inner doc is expected to be a `Group` that can
+    /// break independently. Used to wrap delimited blocks (`{...}`,
+    /// `[...]`, call `(...)`) so that a parent chain or expression
+    /// can stay flat even when the inner block has to break across
+    /// lines.
+    Expand(Box<Doc>),
 }
 
 impl Doc {
@@ -101,6 +117,18 @@ impl Doc {
     /// Render only when the enclosing `Group` is broken.
     pub fn if_broken(inner: Doc) -> Doc {
         Doc::IfBroken(Box::new(inner))
+    }
+
+    /// Indent the inner doc by one step only when the enclosing
+    /// `Group` is in Break mode.
+    pub fn indent_if_broken(inner: Doc) -> Doc {
+        Doc::IndentIfBroken(Box::new(inner))
+    }
+
+    /// Wrap an expandable child whose width should not poison the
+    /// enclosing group's fits-check.
+    pub fn expand(inner: Doc) -> Doc {
+        Doc::Expand(Box::new(inner))
     }
 
     /// User-driven blank line — collapsed if previous output already ended

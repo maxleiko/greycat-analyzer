@@ -72,6 +72,13 @@ pub fn render(doc: &Doc, opts: &FmtOptions) -> String {
                     stack.push((indent, mode, inner));
                 }
             }
+            Doc::IndentIfBroken(inner) => {
+                let extra = if mode == Mode::Break { opts.indent } else { 0 };
+                stack.push((indent + extra, mode, inner));
+            }
+            Doc::Expand(inner) => {
+                stack.push((indent, mode, inner));
+            }
         }
     }
     finalize(&mut out, opts);
@@ -177,6 +184,15 @@ fn fits(doc: &Doc, width: usize, outer: &[(usize, Mode, &Doc)], opts: &FmtOption
             Doc::IfBroken(_) => {
                 // In flat mode, IfBroken contributes nothing.
             }
+            Doc::IndentIfBroken(inner) => {
+                // In flat mode the indent step is suppressed; just
+                // measure the inner content at the current indent.
+                local.push((indent, mode, inner));
+            }
+            Doc::Expand(_) => {
+                // The whole point: an expandable child's width does
+                // not count toward the enclosing group's flat width.
+            }
         }
     }
 }
@@ -188,8 +204,10 @@ fn is_zero_width_flat(doc: &Doc) -> bool {
             space_if_flat: false,
         } => true,
         Doc::Concat(parts) => parts.iter().all(is_zero_width_flat),
-        Doc::Group(inner) | Doc::Indent(inner) => is_zero_width_flat(inner),
-        Doc::IfBroken(_) => true,
+        Doc::Group(inner) | Doc::Indent(inner) | Doc::IndentIfBroken(inner) => {
+            is_zero_width_flat(inner)
+        }
+        Doc::IfBroken(_) | Doc::Expand(_) => true,
         _ => false,
     }
 }
