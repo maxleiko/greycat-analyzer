@@ -32,31 +32,6 @@ impl TypeId {
 }
 
 // P35.1
-/// Stable, project-wide handle to a resolved type-decl
-/// (`Decl::Type` or `Decl::Enum`). Dense `u32` newtype, `Copy`,
-/// hashable in one register-sized compare. Issued by the project's
-/// `DeclRegistry`; resolves back to its `(Uri, Idx<Decl>)` source
-/// through that registry.
-///
-/// Two `TypeDeclId`s compare equal iff they point at the same decl in
-/// the same module. A user-declared `type node<T>` and the std-core
-/// `node<T>` therefore get different handles — the soundness gap where
-/// the previous SmolStr-keyed identity collapsed them is closed at
-/// the type-system level.
-///
-/// Not comparable across distinct `DeclRegistry` instances.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TypeDeclId(u32);
-
-impl TypeDeclId {
-    pub const fn from_raw(raw: u32) -> Self {
-        Self(raw)
-    }
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-}
-
 /// Project-wide unique identifier for a top-level item in a module.
 ///
 /// Composed of `(module, name)` where both halves are [`Symbol`]s
@@ -109,25 +84,25 @@ pub enum TypeKind {
     Primitive(Primitive),
     // P35.2
     /// A resolved non-generic type — user-defined `type Foo {...}` or
-    /// a non-generic native type from `std/core`. The decl handle is
-    /// the identity; cross-module references to the same decl share
-    /// the same `TypeDeclId`, so equality is one register-sized
-    /// compare.
+    /// a non-generic native type from `std/core`. The decl's [`ItemId`]
+    /// `(module, name)` is the identity; cross-module references to
+    /// the same decl share the same `ItemId`, so equality is two
+    /// register-sized symbol compares.
     ///
     /// Distinct from [`TypeKind::Generic`] with empty args.
     /// Non-generic types and zero-arg instantiations are different
     /// concepts — separating them by variant lets the substitution /
     /// variance / node-tag-dispatch machinery match only the latter
     /// without runtime `args.is_empty()` checks.
-    Type(TypeDeclId),
+    Type(ItemId),
     // P35.2
     /// An instantiation of a generic decl — `Array<int>`, `node<int?>`,
-    /// `Map<String, V>`. `decl` is the generic template's handle;
+    /// `Map<String, V>`. `decl` is the generic template's [`ItemId`];
     /// `args` are the per-use-site type arguments and are guaranteed
     /// non-empty by the lowering pass (zero-arg uses of a generic
     /// decl are an analysis error caught upstream).
     Generic {
-        decl: TypeDeclId,
+        decl: ItemId,
         /// Cannot be zero-length (ensured by the lowering phase)
         args: SmallVec<[TypeId; 2]>,
     },
@@ -217,12 +192,12 @@ pub enum GenericOwner {
 /// the same [`TypeId`]; comparing for equality is then just an integer
 /// comparison.
 ///
-/// The arena intentionally does **not** store decl names. Rendering a
-/// `TypeKind::Type` / `TypeKind::Generic` to a printable string needs
-/// a `DeclRegistry` to recover the source name from a `TypeDeclId` —
-/// see `greycat_analyzer_analysis::project::display_type` and
-/// `greycat_analyzer_analysis::display_fqn`. Core has no concept of a
-/// decl registry by design.
+/// The arena does **not** itself store decl names — `TypeKind::Type` /
+/// `TypeKind::Generic` carry an [`ItemId`] `(module_sym, name_sym)`
+/// pair. Rendering them to a printable string needs the project's
+/// [`SymbolTable`] to resolve the symbols back to text; see
+/// `greycat_analyzer_analysis::project::display_type` and
+/// `greycat_analyzer_analysis::display_fqn`.
 #[derive(Debug, Default, Clone)]
 pub struct TypeArena {
     pub items: Vec<Type>,
@@ -317,7 +292,7 @@ impl TypeArena {
 
     // P35.2
     /// Allocate a resolved non-generic [`TypeKind::Type`].
-    pub fn alloc_type(&mut self, decl: TypeDeclId) -> TypeId {
+    pub fn alloc_type(&mut self, decl: ItemId) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Type(decl),
             nullable: false,
@@ -329,7 +304,7 @@ impl TypeArena {
     /// instantiation). Caller guarantees `args` is non-empty —
     /// zero-arg uses of a generic decl are an upstream lowering
     /// error, not a value-shaped concept.
-    pub fn generic(&mut self, decl: TypeDeclId, args: Vec<TypeId>) -> TypeId {
+    pub fn generic(&mut self, decl: ItemId, args: Vec<TypeId>) -> TypeId {
         debug_assert!(!args.is_empty(), "Generic must have non-empty args");
         self.alloc(Type {
             kind: TypeKind::Generic {
@@ -378,7 +353,7 @@ impl TypeArena {
     /// else, so the type is always a pair. `decl` is the std-core
     /// `Tuple` decl handle the caller has pulled from
     /// `WellKnown::tuple_decl`.
-    pub fn tuple(&mut self, decl: TypeDeclId, x: TypeId, y: TypeId) -> TypeId {
+    pub fn tuple(&mut self, decl: ItemId, x: TypeId, y: TypeId) -> TypeId {
         self.generic(decl, vec![x, y])
     }
 
@@ -607,9 +582,10 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::GenericParam { .. } => false,
         },
 
-        // P35.2 — decl-handle identity. Cross-module references to the
-        // same decl share the same `TypeDeclId`. Supertype-chain
-        // assignability lives in `is_assignable_to_with_index`.
+        // P35.2 — decl identity via `ItemId`. Cross-module references
+        // to the same decl share the same `(module, name)` pair.
+        // Supertype-chain assignability lives in
+        // `is_assignable_to_with_index`.
         TypeKind::Type(da) => match &b.kind {
             TypeKind::Any | TypeKind::Unresolved { .. } => {
                 unreachable!("filtered by top-level guards")
@@ -1076,9 +1052,8 @@ fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
 // Type display (decl-name aware) lives in the analysis crate —
 // see `greycat_analyzer_analysis::project::display_type` for the
 // `TypeWithDecls` wrapper, `greycat_analyzer_analysis::display_fqn`
-// for fully-qualified rendering. Core does not own a `DeclRegistry`
-// and therefore cannot render `TypeKind::Type` / `TypeKind::Generic`
-// by source name.
+// for fully-qualified rendering. Core does not own a `SymbolTable`
+// and therefore cannot resolve `ItemId` halves back to source text.
 
 #[cfg(test)]
 mod tests {
@@ -1089,6 +1064,15 @@ mod tests {
     struct TextCx {
         arena: TypeArena,
         symbols: SymbolTable,
+    }
+
+    impl TextCx {
+        /// Mint a synthetic [`ItemId`] for tests — every test module
+        /// shares the same fake module symbol `"test_mod"`, so two
+        /// items with the same `name` collapse to the same identity.
+        fn item(&self, name: &str) -> ItemId {
+            ItemId::new(self.symbols.intern("test_mod"), self.symbols.intern(name))
+        }
     }
 
     #[test]
@@ -1113,7 +1097,7 @@ mod tests {
     fn typekind_name_dedups_across_smolstr_and_string_paths() {
         let mut cx = TextCx::default();
         let arg_string = cx.arena.primitive(Primitive::Int);
-        let array_decl = TypeDeclId::from_raw(0);
+        let array_decl = cx.item("Array");
         let g_a = cx.arena.generic(array_decl, vec![arg_string]);
         let g_b = cx.arena.generic(array_decl, vec![arg_string]);
         assert_eq!(g_a, g_b);
@@ -1184,7 +1168,7 @@ mod tests {
         let mut cx = TextCx::default();
         let int = cx.arena.primitive(Primitive::Int);
         let float = cx.arena.primitive(Primitive::Float);
-        let array_decl = TypeDeclId::from_raw(0);
+        let array_decl = cx.item("Array");
         let arr_int = cx.arena.generic(array_decl, vec![int]);
         let arr_float = cx.arena.generic(array_decl, vec![float]);
         // P12.2 (matches the GreyCat runtime, *not* the TS reference
@@ -1201,8 +1185,8 @@ mod tests {
     fn generic_name_mismatch_stays_unassignable() {
         let mut cx = TextCx::default();
         let int = cx.arena.primitive(Primitive::Int);
-        let array_decl = TypeDeclId::from_raw(0);
-        let set_decl = TypeDeclId::from_raw(1);
+        let array_decl = cx.item("Array");
+        let set_decl = cx.item("Set");
         let arr_int = cx.arena.generic(array_decl, vec![int]);
         let set_int = cx.arena.generic(set_decl, vec![int]);
         // Different generic names with the same args still mismatch.
@@ -1263,7 +1247,7 @@ mod tests {
     fn registry_lookup() {
         let mut cx = TextCx::default();
         let mut reg = TypeRegistry::new();
-        let foo_decl = TypeDeclId::from_raw(0);
+        let foo_decl = cx.item("Foo");
         let foo = cx.arena.alloc_type(foo_decl);
         let foo_sym = cx.symbols.intern("Foo");
         let bar_sym = cx.symbols.intern("Bar");
@@ -1296,9 +1280,9 @@ mod tests {
         // args[0] assigns to to` rule into `is_assignable_to`; the
         // runtime oracle disagreed.
         let mut cx = TextCx::default();
-        let person_decl = TypeDeclId::from_raw(1);
+        let person_decl = cx.item("Person");
         let person = cx.arena.alloc_type(person_decl);
-        let node_decl = TypeDeclId::from_raw(0);
+        let node_decl = cx.item("node");
         let node_person = cx.arena.generic(node_decl, vec![person]);
         assert!(!is_assignable_to(&cx.arena, node_person, person));
         assert!(!is_assignable_to(&cx.arena, person, node_person));
@@ -1317,7 +1301,7 @@ mod tests {
             },
             nullable: false,
         });
-        let array_decl = TypeDeclId::from_raw(0);
+        let array_decl = cx.item("Array");
         let arr_t = cx.arena.generic(array_decl, vec![t_param]);
 
         let mut tbl = InferenceTable::new();
@@ -1355,8 +1339,8 @@ mod tests {
             },
             nullable: false,
         });
-        let array_decl = TypeDeclId::from_raw(0);
-        let map_decl = TypeDeclId::from_raw(1);
+        let array_decl = cx.item("Array");
+        let map_decl = cx.item("Map");
         let map_tu = cx.arena.generic(map_decl, vec![t_param, u_param]);
 
         let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
@@ -1389,7 +1373,7 @@ mod tests {
     fn arena_substitute_no_op_on_empty_subst() {
         let mut cx = TextCx::default();
         let int = cx.arena.primitive(Primitive::Int);
-        let array_decl = TypeDeclId::from_raw(0);
+        let array_decl = cx.item("Array");
         let arr = cx.arena.generic(array_decl, vec![int]);
         let empty: FxHashMap<Symbol, TypeId> = FxHashMap::default();
         assert_eq!(cx.arena.substitute(arr, &empty), arr);

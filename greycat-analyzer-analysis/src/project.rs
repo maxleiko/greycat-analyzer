@@ -22,12 +22,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    GenericOwner, Primitive, SourceManager, Symbol, SymbolTable, TypeArena, TypeDeclId, TypeId,
+    GenericOwner, ItemId, Primitive, SourceManager, Symbol, SymbolTable, TypeArena, TypeId,
     TypeKind, is_assignable_to, is_castable,
 };
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Stmt, TypeRef};
 use greycat_analyzer_hir::{Hir, lower_module};
-use smol_str::SmolStr;
 
 use crate::analyzer::{
     AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into, seed_builtins,
@@ -281,10 +280,10 @@ impl ProjectAnalysis {
         &self.index.symbols[*sym]
     }
 
-    /// Resolve a `TypeDeclId` to its declared source name through
-    /// `decl_registry.name(id) → Symbol → SymbolTable`.
-    pub fn decl_name(&self, id: TypeDeclId) -> Option<&str> {
-        self.decl_registry.name(id).map(|sym| self.symbol(&sym))
+    /// Resolve an [`ItemId`] to its declared source name through
+    /// `id.name → Symbol → SymbolTable`.
+    pub fn decl_name(&self, id: ItemId) -> &str {
+        &self.index.symbols[id.name]
     }
 
     /// Build a `{ generic_param_symbol → concrete_TypeId }` map for the
@@ -307,7 +306,7 @@ impl ProjectAnalysis {
             TypeKind::Generic { decl, args } if !args.is_empty() => (*decl, args.clone()),
             _ => return None,
         };
-        let name_sym = self.decl_registry.name(decl_id)?;
+        let name_sym = decl_id.name;
         let (foreign_uri, foreign_decl_id) = self
             .index
             .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
@@ -549,8 +548,7 @@ impl ProjectAnalysis {
             // `(lib, module, name)` triples. Default `"module"`
             // only kicks in for URIs without a recognisable
             // filename, which the recognizer ignores anyway.
-            let module_name =
-                crate::stdlib::module_name_from_uri(&uri).unwrap_or_else(|| "module".to_string());
+            let module_name = crate::stdlib::module_name_from_uri(&uri).unwrap_or("module");
             let hir = lower_module(
                 &text,
                 &self.index.symbols,
@@ -771,17 +769,14 @@ impl std::fmt::Display for TypeWithDecls<'_> {
 fn write_type_with_decls(
     f: &mut std::fmt::Formatter<'_>,
     arena: &TypeArena,
-    decl_registry: &crate::well_known::DeclRegistry,
+    _decl_registry: &crate::well_known::DeclRegistry,
     symbols: &SymbolTable,
     id: TypeId,
 ) -> std::fmt::Result {
     use greycat_analyzer_core::TypeKind;
     let ty = arena.get(id);
-    let decl_name = |d: TypeDeclId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
-        match decl_registry.name(d) {
-            Some(sym) => f.write_str(&symbols[sym]),
-            None => write!(f, "<unregistered decl {}>", d.raw()),
-        }
+    let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
+        f.write_str(&symbols[d.name])
     };
     match &ty.kind {
         TypeKind::Null => f.write_str("null")?,
@@ -796,7 +791,7 @@ fn write_type_with_decls(
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write_type_with_decls(f, arena, decl_registry, symbols, *a)?;
+                write_type_with_decls(f, arena, _decl_registry, symbols, *a)?;
             }
             f.write_str(">")?;
         }
@@ -808,10 +803,10 @@ fn write_type_with_decls(
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write_type_with_decls(f, arena, decl_registry, symbols, *p)?;
+                write_type_with_decls(f, arena, _decl_registry, symbols, *p)?;
             }
             f.write_str(") -> ")?;
-            write_type_with_decls(f, arena, decl_registry, symbols, *ret)?;
+            write_type_with_decls(f, arena, _decl_registry, symbols, *ret)?;
         }
         TypeKind::Enum { name, .. } => f.write_str(&symbols[*name])?,
         TypeKind::Union { alts } => {
@@ -819,7 +814,7 @@ fn write_type_with_decls(
                 if i > 0 {
                     f.write_str(" | ")?;
                 }
-                write_type_with_decls(f, arena, decl_registry, symbols, *a)?;
+                write_type_with_decls(f, arena, _decl_registry, symbols, *a)?;
             }
             if ty.nullable
                 && !alts
@@ -839,19 +834,15 @@ fn write_type_with_decls(
 fn write_decl_qualified(
     f: &mut std::fmt::Formatter<'_>,
     project: &ProjectAnalysis,
-    decl: TypeDeclId,
+    decl: ItemId,
 ) -> std::fmt::Result {
-    let Some(name_sym) = project.decl_registry.name(decl) else {
-        return write!(f, "<unregistered decl {}>", decl.raw());
-    };
-    if project.index.locate_decl(name_sym).len() > 1
-        && let Some((uri, _)) = project.decl_registry.resolve(decl)
-        && let Some(module) = crate::stdlib::module_name_from_uri(uri)
-    {
-        f.write_str(&module)?;
+    // Two same-named items in different modules → render with the
+    // `module::` qualifier; otherwise the bare name is unambiguous.
+    if project.index.locate_decl(decl.name).len() > 1 {
+        f.write_str(&project.index.symbols[decl.module])?;
         f.write_str("::")?;
     }
-    f.write_str(&project.index.symbols[name_sym])
+    f.write_str(&project.index.symbols[decl.name])
 }
 
 // P19.6
@@ -1429,7 +1420,7 @@ fn lower_module_signatures(
 pub(crate) fn is_assignable_to_with_index(
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
-    decl_registry: &DeclRegistry,
+    _decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     from: TypeId,
     to: TypeId,
@@ -1464,14 +1455,14 @@ pub(crate) fn is_assignable_to_with_index(
         TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => false,
 
         TypeKind::Union { alts } => alts.into_iter().all(|alt| {
-            is_assignable_to_with_index(index, well_known, decl_registry, arena, alt, to)
+            is_assignable_to_with_index(index, well_known, _decl_registry, arena, alt, to)
         }),
 
         // Handle-keyed subtype chain — the inheritance layer this
         // wrapper exists to add. `Type(sub) → Type(sup)` when `sub`
         // is a transitive descendant of `sup` in `index.type_members`.
         TypeKind::Type(sub) => match b_kind {
-            TypeKind::Type(sup) => index.is_subtype_of_decl(decl_registry, sub, sup),
+            TypeKind::Type(sup) => index.is_subtype_of_decl(sub, sup),
             // `Type(sub) → Generic(sup<args>)` — `sub` is a non-
             // generic concrete type whose `extends` chain reaches the
             // generic shape on the right (e.g. `PointChangeView
@@ -1483,16 +1474,13 @@ pub(crate) fn is_assignable_to_with_index(
             // check. No substitution needed at this layer — `sub`
             // is non-generic, so its parent's args are already
             // fully concrete.
-            TypeKind::Generic { .. } => walk_substituted_supertype_chain(
-                index,
-                decl_registry,
-                arena,
-                sub,
-                &[],
-                |arena, hop| is_assignable_to(arena, hop, to),
-            ),
+            TypeKind::Generic { .. } => {
+                walk_substituted_supertype_chain(index, arena, sub, &[], |arena, hop| {
+                    is_assignable_to(arena, hop, to)
+                })
+            }
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, alt)
+                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1524,7 +1512,7 @@ pub(crate) fn is_assignable_to_with_index(
                 // Recurse so a chain like node<DeepSub> ->
                 // node<MidSub> -> node<Super> works in one hop.
                 let (a0, b0) = (aa[0], ab[0]);
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, a0, b0)
+                is_assignable_to_with_index(index, well_known, _decl_registry, arena, a0, b0)
             }
             // Cross-decl generic source: walk `da`'s pre-lowered
             // supertype_ty chain, substituting `aa` for `da`'s own
@@ -1533,16 +1521,13 @@ pub(crate) fn is_assignable_to_with_index(
             // `MultiQuantizer<T> extends Quantizer<Array<T>>` —
             // passing `MultiQuantizer<int>` to a parameter typed
             // `Quantizer<Array<int>>`.
-            TypeKind::Generic { .. } => walk_substituted_supertype_chain(
-                index,
-                decl_registry,
-                arena,
-                da,
-                &aa,
-                |arena, hop| is_assignable_to(arena, hop, to),
-            ),
+            TypeKind::Generic { .. } => {
+                walk_substituted_supertype_chain(index, arena, da, &aa, |arena, hop| {
+                    is_assignable_to(arena, hop, to)
+                })
+            }
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, alt)
+                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1565,7 +1550,7 @@ pub(crate) fn is_assignable_to_with_index(
         | TypeKind::Enum { .. }
         | TypeKind::GenericParam { .. } => match b_kind {
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, alt)
+                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1598,9 +1583,8 @@ pub(crate) fn is_assignable_to_with_index(
 /// in dependent passes already.
 fn walk_substituted_supertype_chain<F>(
     index: &ProjectIndex,
-    decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
-    sub_decl: TypeDeclId,
+    sub_decl: ItemId,
     sub_args: &[TypeId],
     mut on_hop: F,
 ) -> bool
@@ -1610,9 +1594,7 @@ where
     let mut current_decl = sub_decl;
     let mut current_args: Vec<TypeId> = sub_args.to_vec();
     for _ in 0..32 {
-        let Some(name_sym) = decl_registry.name(current_decl) else {
-            return false;
-        };
+        let name_sym = current_decl.name;
         let Some(members) = index.type_members.get(&name_sym) else {
             return false;
         };
@@ -1663,7 +1645,7 @@ where
 pub(crate) fn is_castable_with_index(
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
-    decl_registry: &DeclRegistry,
+    _decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     from: TypeId,
     to: TypeId,
@@ -1692,7 +1674,7 @@ pub(crate) fn is_castable_with_index(
         // would silently undo core's fix.
         TypeKind::Union { alts } => alts
             .into_iter()
-            .any(|alt| is_castable_with_index(index, well_known, decl_registry, arena, alt, to)),
+            .any(|alt| is_castable_with_index(index, well_known, _decl_registry, arena, alt, to)),
 
         // Source Type: bidirectional inheritance with Type / Generic
         // targets; target-Union retry. No node-tag-int rule applies
@@ -1701,24 +1683,18 @@ pub(crate) fn is_castable_with_index(
         // strictness only kicks in when both sides are Generic.
         TypeKind::Type(fd) => match to_kind {
             TypeKind::Type(td) => {
-                index.is_subtype_of_decl(decl_registry, fd, td)
-                    || index.is_subtype_of_decl(decl_registry, td, fd)
+                index.is_subtype_of_decl(fd, td) || index.is_subtype_of_decl(td, fd)
             }
             TypeKind::Generic { decl: td, .. } => {
                 // Upcast (Sub:Type → Sup<args>): walk Sub's chain
                 // looking for a hop whose decl matches Sup; that hop
                 // is already in fully concrete form, so use core's
                 // `is_castable` per-hop.
-                if index.is_subtype_of_decl(decl_registry, fd, td) {
-                    walk_substituted_supertype_chain(
-                        index,
-                        decl_registry,
-                        arena,
-                        fd,
-                        &[],
-                        |arena, hop| is_castable(arena, hop, to),
-                    )
-                } else if index.is_subtype_of_decl(decl_registry, td, fd) {
+                if index.is_subtype_of_decl(fd, td) {
+                    walk_substituted_supertype_chain(index, arena, fd, &[], |arena, hop| {
+                        is_castable(arena, hop, to)
+                    })
+                } else if index.is_subtype_of_decl(td, fd) {
                     // Downcast (Sup → Sub<args>): walk Sub (the more-
                     // specific side) with its concrete args, find a
                     // hop matching Sup. Source is non-generic, so the
@@ -1730,7 +1706,6 @@ pub(crate) fn is_castable_with_index(
                     };
                     walk_substituted_supertype_chain(
                         index,
-                        decl_registry,
                         arena,
                         td,
                         &to_decl_args,
@@ -1741,7 +1716,7 @@ pub(crate) fn is_castable_with_index(
                 }
             }
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
+                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1763,30 +1738,20 @@ pub(crate) fn is_castable_with_index(
         // a 64-bit int.
         TypeKind::Generic { decl: fd, args: fa } => match to_kind {
             TypeKind::Type(td) => {
-                if index.is_subtype_of_decl(decl_registry, fd, td) {
+                if index.is_subtype_of_decl(fd, td) {
                     // Upcast (Sub<args>:Generic → Sup:Type): walk
                     // Sub's chain with its args; hop matching Sup
                     // (non-generic) is the destination.
-                    walk_substituted_supertype_chain(
-                        index,
-                        decl_registry,
-                        arena,
-                        fd,
-                        &fa,
-                        |arena, hop| is_castable(arena, hop, to),
-                    )
-                } else if index.is_subtype_of_decl(decl_registry, td, fd) {
+                    walk_substituted_supertype_chain(index, arena, fd, &fa, |arena, hop| {
+                        is_castable(arena, hop, to)
+                    })
+                } else if index.is_subtype_of_decl(td, fd) {
                     // Downcast: target is non-generic but its decl is
                     // a subtype of source's decl. Walk target's chain
                     // (no args), per-hop check against source.
-                    walk_substituted_supertype_chain(
-                        index,
-                        decl_registry,
-                        arena,
-                        td,
-                        &[],
-                        |arena, hop| is_castable(arena, hop, from),
-                    )
+                    walk_substituted_supertype_chain(index, arena, td, &[], |arena, hop| {
+                        is_castable(arena, hop, from)
+                    })
                 } else {
                     false
                 }
@@ -1802,36 +1767,26 @@ pub(crate) fn is_castable_with_index(
                     // mirrors `is_assignable_to_with_index` so the two
                     // layers agree on what's allowed for tag args.
                     fa.len() == ta.len() && well_known.is_node_tag(fd)
-                } else if index.is_subtype_of_decl(decl_registry, fd, td) {
+                } else if index.is_subtype_of_decl(fd, td) {
                     // Upcast: walk source's chain with source's args.
-                    walk_substituted_supertype_chain(
-                        index,
-                        decl_registry,
-                        arena,
-                        fd,
-                        &fa,
-                        |arena, hop| is_castable(arena, hop, to),
-                    )
-                } else if index.is_subtype_of_decl(decl_registry, td, fd) {
+                    walk_substituted_supertype_chain(index, arena, fd, &fa, |arena, hop| {
+                        is_castable(arena, hop, to)
+                    })
+                } else if index.is_subtype_of_decl(td, fd) {
                     // Downcast: walk target's chain with target's args,
                     // per-hop compare against source. Args are checked
                     // invariantly by core's `is_castable`.
                     let ta_owned = ta.to_vec();
-                    walk_substituted_supertype_chain(
-                        index,
-                        decl_registry,
-                        arena,
-                        td,
-                        &ta_owned,
-                        |arena, hop| is_castable(arena, hop, from),
-                    )
+                    walk_substituted_supertype_chain(index, arena, td, &ta_owned, |arena, hop| {
+                        is_castable(arena, hop, from)
+                    })
                 } else {
                     false
                 }
             }
             TypeKind::Primitive(Primitive::Int) if well_known.is_node_tag(fd) => true,
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
+                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1850,7 +1805,7 @@ pub(crate) fn is_castable_with_index(
         TypeKind::Primitive(Primitive::Int) => match to_kind {
             TypeKind::Generic { decl: td, .. } if well_known.is_node_tag(td) => true,
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
+                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1872,7 +1827,7 @@ pub(crate) fn is_castable_with_index(
         | TypeKind::Enum { .. }
         | TypeKind::GenericParam { .. } => match to_kind {
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
+                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -2164,7 +2119,7 @@ impl ProjectAnalysis {
             let expected = fnd.params.len();
             let actual = call.args.len();
             if expected != actual {
-                let fn_name = SmolStr::from(&index.symbols[fn_module.hir.idents[fnd.name].symbol]);
+                let fn_name = &index.symbols[fn_module.hir.idents[fnd.name].symbol];
                 let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
                 let plural = if expected == 1 { "" } else { "s" };
                 diags.push(SemanticDiagnostic {
@@ -2206,7 +2161,6 @@ impl ProjectAnalysis {
                 cur_module,
                 fn_module,
                 index,
-                decl_registry,
                 &cur_module.hir.exprs[call.callee],
             );
             let pair_count = fnd.params.len().min(call.args.len());
@@ -2247,7 +2201,7 @@ impl ProjectAnalysis {
                     arg_ty,
                     declared_ty,
                 ) {
-                    let p_name = SmolStr::from(&index.symbols[fn_module.hir.idents[p.name].symbol]);
+                    let p_name = &index.symbols[fn_module.hir.idents[p.name].symbol];
                     let r = cur_module.hir.exprs[call.args[i]].byte_range();
                     diags.push(SemanticDiagnostic {
                         severity: Severity::Error,
@@ -2384,9 +2338,7 @@ impl ProjectAnalysis {
                 };
                 match arena.get(sup_ty).kind.clone() {
                     TypeKind::Generic { decl, args } => {
-                        let Some(parent_sym) = decl_registry.name(decl) else {
-                            break;
-                        };
+                        let parent_sym = decl.name;
                         let Some(parent_m) = index.type_members.get(&parent_sym) else {
                             break;
                         };
@@ -2402,10 +2354,7 @@ impl ProjectAnalysis {
                             .collect();
                     }
                     TypeKind::Type(decl) => {
-                        let Some(parent_sym) = decl_registry.name(decl) else {
-                            break;
-                        };
-                        cur_decl = parent_sym;
+                        cur_decl = decl.name;
                         cur_subst.clear();
                     }
                     _ => break,
@@ -2431,7 +2380,7 @@ impl ProjectAnalysis {
                     value_ty,
                     declared_ty,
                 ) {
-                    let attr_name = SmolStr::from(&index.symbols[attr_sym]);
+                    let attr_name = &index.symbols[attr_sym];
                     let r = cur_module.hir.exprs[f.value].byte_range();
                     diags.push(SemanticDiagnostic {
                         severity: Severity::Error,
@@ -2814,8 +2763,7 @@ impl ProjectAnalysis {
             let doc = cell.borrow();
             let start = Instant::now();
             // P35.1 — module name from URI for the well-known recogniser.
-            let module_name =
-                crate::stdlib::module_name_from_uri(uri).unwrap_or_else(|| "module".to_string());
+            let module_name = crate::stdlib::module_name_from_uri(uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
                 &self.index.symbols,
@@ -2881,8 +2829,7 @@ impl ProjectAnalysis {
             }
             let doc = cell.borrow();
             // P35.1 — module name from URI for the well-known recogniser.
-            let module_name = crate::stdlib::module_name_from_uri(other_uri)
-                .unwrap_or_else(|| "module".to_string());
+            let module_name = crate::stdlib::module_name_from_uri(other_uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
                 &self.index.symbols,
@@ -4046,13 +3993,15 @@ pub fn resolve_decl_handle(
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
     name: &str,
-) -> Option<TypeDeclId> {
+) -> Option<ItemId> {
     let name_sym = index.symbols.lookup(name)?;
-    // Type-namespace only: this mints a [`TypeDeclId`], so a
+    // Type-namespace only: this mints an [`ItemId`], so a
     // same-named `Fn` / `Var` decl must never be returned.
     for (uri, _) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
-        if let Some(h) = decl_registry.lookup(uri, name_sym) {
-            return Some(h);
+        if let Some(item) = index.item_id_for(uri, name_sym)
+            && decl_registry.lookup(item).is_some()
+        {
+            return Some(item);
         }
     }
     None
@@ -4094,8 +4043,11 @@ fn lower_qualified_type_ref_project(
                 lower_type_ref_project(hir, *p, arena, index, decl_registry, generics_in_scope)
             })
             .collect();
-        let mut base = match decl_registry.lookup(module_uri, leaf_name) {
-            Some(handle) => arena.generic(handle, args),
+        let mut base = match index
+            .item_id_for(module_uri, leaf_name)
+            .filter(|item| decl_registry.lookup(*item).is_some())
+        {
+            Some(item) => arena.generic(item, args),
             None => arena.unresolved(leaf_name, byte_span),
         };
         if tr.optional {
@@ -4104,8 +4056,11 @@ fn lower_qualified_type_ref_project(
         return base;
     }
 
-    let mut base = match decl_registry.lookup(module_uri, leaf_name) {
-        Some(handle) => arena.alloc_type(handle),
+    let mut base = match index
+        .item_id_for(module_uri, leaf_name)
+        .filter(|item| decl_registry.lookup(*item).is_some())
+    {
+        Some(item) => arena.alloc_type(item),
         None => arena.unresolved(leaf_name, byte_span),
     };
     if tr.optional {
@@ -4266,7 +4221,6 @@ fn method_subst_from_receiver(
     cur_module: &ModuleAnalysis,
     fn_module: &ModuleAnalysis,
     index: &ProjectIndex,
-    decl_registry: &DeclRegistry,
     callee_expr: &greycat_analyzer_hir::types::Expr,
 ) -> (GenericsInScope, MethodSubst) {
     use greycat_analyzer_hir::types::Expr;
@@ -4285,10 +4239,7 @@ fn method_subst_from_receiver(
     };
     let recv = arena.get(receiver_ty);
     let (recv_name, recv_args): (&str, &[TypeId]) = match &recv.kind {
-        TypeKind::Generic { decl, args } => match decl_registry.name(*decl) {
-            Some(n) => (&index.symbols[n], args.as_slice()),
-            None => return empty(),
-        },
+        TypeKind::Generic { decl, args } => (&index.symbols[decl.name], args.as_slice()),
         _ => return empty(),
     };
     let Some(module) = fn_module.hir.module.as_ref() else {

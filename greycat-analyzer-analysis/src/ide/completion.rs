@@ -1682,10 +1682,8 @@ fn member_completion(
     let _ = well_known;
     let inner_head: Option<String> = (|| {
         let (recv_sym, recv_args): (Symbol, Vec<TypeId>) = match &arena.get(recv_ty).kind {
-            TypeKind::Type(d) => (project.decl_registry().name(*d)?, Vec::new()),
-            TypeKind::Generic { decl, args } => {
-                (project.decl_registry().name(*decl)?, args.to_vec())
-            }
+            TypeKind::Type(d) => (d.name, Vec::new()),
+            TypeKind::Generic { decl, args } => (decl.name, args.to_vec()),
             _ => return None,
         };
         let members = project.index.type_members.get(&recv_sym)?;
@@ -2152,10 +2150,9 @@ fn type_head_name<'a>(
     use greycat_analyzer_core::TypeKind;
     let t = arena.get(id);
     match &t.kind {
-        // P35.7 — handle-keyed variants read the name from the project's
-        // decl-registry.
-        TypeKind::Type(d) => pa.decl_name(*d),
-        TypeKind::Generic { decl, .. } => pa.decl_name(*decl),
+        // P35.7 — handle-keyed variants carry the name in the `ItemId`.
+        TypeKind::Type(d) => Some(pa.decl_name(*d)),
+        TypeKind::Generic { decl, .. } => Some(pa.decl_name(*decl)),
         TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }

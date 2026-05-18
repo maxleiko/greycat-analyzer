@@ -20,17 +20,23 @@
 //! against the live stdlib. Tests below assert the runtime outcome.
 
 use greycat_analyzer_core::{
-    GenericOwner, Primitive, SymbolTable, TypeArena, TypeDeclId, is_assignable_to, is_castable,
+    GenericOwner, ItemId, Primitive, SymbolTable, TypeArena, is_assignable_to, is_castable,
 };
 
 fn arena() -> TypeArena {
     TypeArena::new()
 }
 
-// Synthetic decl handles for tests: the pure `types` crate has no
-// `DeclRegistry`, so we mint stable raw ids per generic name.
-const ARRAY_DECL: TypeDeclId = TypeDeclId::from_raw(0);
-const TUPLE_DECL: TypeDeclId = TypeDeclId::from_raw(2);
+// Synthetic decl handles for tests. Every test shares the same fake
+// module symbol so distinct names get distinct `ItemId`s — mirrors
+// what `ProjectIndex::ingest` would mint at runtime from
+// `(module_sym, name_sym)`. Cheap (rodeo dedupes on intern), no
+// coordination required across tests.
+fn synth_decl(name: &str) -> ItemId {
+    static SYMS: std::sync::OnceLock<SymbolTable> = std::sync::OnceLock::new();
+    let syms = SYMS.get_or_init(SymbolTable::new);
+    ItemId::new(syms.intern("test_mod"), syms.intern(name))
+}
 
 // =============================================================================
 // Primitive widening (none — runtime rejects every cross-primitive flow)
@@ -159,7 +165,7 @@ fn rt_null_to_nullable_allowed() {
 fn rt_array_int_to_array_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
-    let arr_i = a.generic(ARRAY_DECL, vec![i]);
+    let arr_i = a.generic(synth_decl("Array"), vec![i]);
     assert!(is_assignable_to(&a, arr_i, arr_i));
 }
 
@@ -170,8 +176,8 @@ fn rt_array_int_to_array_float_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let f = a.primitive(Primitive::Float);
-    let arr_i = a.generic(ARRAY_DECL, vec![i]);
-    let arr_f = a.generic(ARRAY_DECL, vec![f]);
+    let arr_i = a.generic(synth_decl("Array"), vec![i]);
+    let arr_f = a.generic(synth_decl("Array"), vec![f]);
     assert!(!is_assignable_to(&a, arr_i, arr_f));
     assert!(!is_assignable_to(&a, arr_f, arr_i));
 }
@@ -186,8 +192,8 @@ fn rt_array_int_to_array_nullable_int_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic(ARRAY_DECL, vec![i]);
-    let arr_iq = a.generic(ARRAY_DECL, vec![i_q]);
+    let arr_i = a.generic(synth_decl("Array"), vec![i]);
+    let arr_iq = a.generic(synth_decl("Array"), vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
 }
 
@@ -200,8 +206,8 @@ fn rt_tuple_identity_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let s = a.primitive(Primitive::String);
-    let t1 = a.tuple(TUPLE_DECL, i, s);
-    let t2 = a.tuple(TUPLE_DECL, i, s);
+    let t1 = a.tuple(synth_decl("Tuple"), i, s);
+    let t2 = a.tuple(synth_decl("Tuple"), i, s);
     assert!(is_assignable_to(&a, t1, t2));
 }
 
@@ -211,8 +217,8 @@ fn rt_tuple_element_mismatch_rejected() {
     let i = a.primitive(Primitive::Int);
     let s = a.primitive(Primitive::String);
     let f = a.primitive(Primitive::Float);
-    let t1 = a.tuple(TUPLE_DECL, i, s);
-    let t2 = a.tuple(TUPLE_DECL, f, s);
+    let t1 = a.tuple(synth_decl("Tuple"), i, s);
+    let t2 = a.tuple(synth_decl("Tuple"), f, s);
     assert!(!is_assignable_to(&a, t1, t2));
 }
 
@@ -301,8 +307,8 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic(ARRAY_DECL, vec![i]);
-    let arr_iq = a.generic(ARRAY_DECL, vec![i_q]);
+    let arr_i = a.generic(synth_decl("Array"), vec![i]);
+    let arr_iq = a.generic(synth_decl("Array"), vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
     assert!(!is_assignable_to(&a, arr_iq, arr_i));
 }
@@ -369,8 +375,7 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
 #[test]
 fn rt_cast_nullable_decl_to_non_nullable_decl() {
     let mut a = arena();
-    let foo_decl = TypeDeclId::from_raw(20);
-    let foo = a.alloc_type(foo_decl);
+    let foo = a.alloc_type(synth_decl("Foo"));
     let foo_q = a.nullable(foo);
     assert!(is_castable(&a, foo_q, foo));
 }
@@ -404,7 +409,6 @@ fn rt_cast_non_nullable_decl_to_self_still_works() {
     // standard `is_assignable_to` path; identical decl-keyed shapes
     // must still pass.
     let mut a = arena();
-    let foo_decl = TypeDeclId::from_raw(21);
-    let foo = a.alloc_type(foo_decl);
+    let foo = a.alloc_type(synth_decl("FooSelf"));
     assert!(is_castable(&a, foo, foo));
 }

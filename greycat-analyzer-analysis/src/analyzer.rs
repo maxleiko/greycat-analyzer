@@ -26,7 +26,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 use greycat_analyzer_core::{
-    GenericOwner, InferenceTable, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId,
+    GenericOwner, InferenceTable, ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId,
     TypeKind, TypeRegistry, is_assignable_to,
 };
 use greycat_analyzer_hir::Hir;
@@ -395,7 +395,9 @@ pub fn analyze(
                 Decl::Enum(ed) => hir.idents[ed.name].symbol,
                 _ => continue,
             };
-            let _ = decl_registry.get_or_insert(&module_uri, name, *d_id);
+            if let Some(item) = index.item_id_for(&module_uri, name) {
+                decl_registry.record(item, *d_id);
+            }
         }
     }
     let out = analyze_with_index_into(
@@ -412,7 +414,7 @@ pub fn analyze(
 
 /// Convenience wrapper that allocates a private arena and decl
 /// registry. Same caveat as [`analyze`]: both are returned to the
-/// caller alongside the result so any [`TypeId`] / [`TypeDeclId`] in
+/// caller alongside the result so any [`TypeId`] / [`ItemId`] in
 /// the result can still be looked up.
 pub fn analyze_with_index(
     hir: &Hir,
@@ -435,7 +437,9 @@ pub fn analyze_with_index(
                 Decl::Enum(ed) => hir.idents[ed.name].symbol,
                 _ => continue,
             };
-            let _ = decl_registry.get_or_insert(&module_uri, name, *d_id);
+            if let Some(item) = index.item_id_for(&module_uri, name) {
+                decl_registry.record(item, *d_id);
+            }
         }
     }
     let out = analyze_with_index_into(
@@ -473,7 +477,7 @@ pub fn analyze_with_index_into(
 ) -> AnalysisResult {
     let mut out = AnalysisResult::default();
     seed_builtins(arena);
-    register_module_types(hir, arena, &mut out, decl_registry, module_uri);
+    register_module_types(hir, arena, &mut out, index, decl_registry, module_uri);
 
     let Some(module) = hir.module.as_ref() else {
         return out;
@@ -524,11 +528,9 @@ pub fn analyze_with_index_into(
     // [`crate::quickfix`].
     for (ident_idx, candidates) in &res.ambiguous {
         let ident = &hir.idents[*ident_idx];
-        let module_names: Vec<String> = candidates
+        let module_names: Vec<&str> = candidates
             .iter()
-            .map(|(uri, _)| {
-                crate::stdlib::module_name_from_uri(uri).unwrap_or_else(|| "<unknown>".to_string())
-            })
+            .map(|(uri, _)| crate::stdlib::module_name_from_uri(uri).unwrap_or("<unknown>"))
             .collect();
         let name = &index.symbols[ident.symbol];
         out.diagnostics.push(SemanticDiagnostic::structural(
@@ -538,7 +540,7 @@ pub fn analyze_with_index_into(
                 "ambiguous-symbol: `{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
                 module_names.len(),
                 module_names.join(", "),
-                module_names.first().map(String::as_str).unwrap_or("<module>"),
+                module_names.first().copied().unwrap_or("<module>"),
             ),
             ident.byte_range.clone(),
         ));
@@ -650,6 +652,7 @@ fn register_module_types(
     hir: &Hir,
     arena: &mut TypeArena,
     out: &mut AnalysisResult,
+    index: &ProjectIndex,
     decl_registry: &crate::well_known::DeclRegistry,
     module_uri: &greycat_analyzer_core::lsp_types::Uri,
 ) {
@@ -668,8 +671,11 @@ fn register_module_types(
                 // pre-walk. A missing handle here would mean the
                 // caller bypassed both — `Unresolved` is the
                 // safest fallback (behaves like `any?`).
-                let id = match decl_registry.lookup(module_uri, name) {
-                    Some(handle) => arena.alloc_type(handle),
+                let id = match index
+                    .item_id_for(module_uri, name)
+                    .filter(|item| decl_registry.lookup(*item).is_some())
+                {
+                    Some(item) => arena.alloc_type(item),
                     None => arena.unresolved(name, (0, 0)),
                 };
                 out.registry.register(name, id);
@@ -1307,12 +1313,8 @@ impl<'a> Cx<'a> {
     ///   half-loaded project).
     /// - the subtraction leaves zero leaves (exhausted; P42.5 owns
     ///   the diagnostic).
-    fn narrow_complement_abstract(
-        &mut self,
-        sup_decl: greycat_analyzer_core::TypeDeclId,
-        asserted: TypeId,
-    ) -> Option<TypeId> {
-        let sup_sym = self.decl_registry.name(sup_decl)?;
+    fn narrow_complement_abstract(&mut self, sup_decl: ItemId, asserted: TypeId) -> Option<TypeId> {
+        let sup_sym = sup_decl.name;
         if !self.index.is_abstract.contains(&sup_sym) {
             return None;
         }
@@ -1326,7 +1328,7 @@ impl<'a> Cx<'a> {
             // the same closure-walker gap from the asserted side.
             _ => return None,
         };
-        let asserted_sym = self.decl_registry.name(asserted_decl)?;
+        let asserted_sym = asserted_decl.name;
 
         let sup_closure = self.index.subtype_closure.get(&sup_sym)?.clone();
         let asserted_closure = self
@@ -1451,9 +1453,7 @@ impl<'a> Cx<'a> {
                 })
             }
             TypeKind::Type(decl) => {
-                let Some(sup_sym) = self.decl_registry.name(*decl) else {
-                    return false;
-                };
+                let sup_sym = decl.name;
                 if !self.index.is_abstract.contains(&sup_sym) {
                     return false;
                 }
@@ -1475,9 +1475,7 @@ impl<'a> Cx<'a> {
                         // side is a `Generic { … }`.
                         return false;
                     };
-                    let Some(asym) = self.decl_registry.name(*ad) else {
-                        return false;
-                    };
+                    let asym = ad.name;
                     let Some(ac) = self.index.subtype_closure.get(&asym) else {
                         return false;
                     };
@@ -1528,20 +1526,19 @@ impl<'a> Cx<'a> {
 
     // P42.2
     /// `Symbol`-keyed analogue of [`crate::project::resolve_decl_handle`]:
-    /// look up the type-namespace `TypeDeclId` for a `Symbol` already
+    /// look up the type-namespace [`ItemId`] for a `Symbol` already
     /// interned in `index.symbols`. Used by `narrow_complement_abstract`
     /// to convert closure-set symbols back into arena-bound decl
     /// handles without round-tripping through the string text.
-    fn resolve_decl_handle_by_symbol(
-        &self,
-        sym: Symbol,
-    ) -> Option<greycat_analyzer_core::TypeDeclId> {
+    fn resolve_decl_handle_by_symbol(&self, sym: Symbol) -> Option<ItemId> {
         for (uri, _) in self
             .index
             .locate_decl_in_ns(sym, crate::stdlib::Namespace::Type)
         {
-            if let Some(h) = self.decl_registry.lookup(uri, sym) {
-                return Some(h);
+            if let Some(item) = self.index.item_id_for(uri, sym)
+                && self.decl_registry.lookup(item).is_some()
+            {
+                return Some(item);
             }
         }
         None
@@ -2002,10 +1999,8 @@ impl<'a> Cx<'a> {
         let (type_sym, instantiation): (Symbol, Vec<TypeId>) = {
             let ty = self.arena.get(recv_ty);
             match &ty.kind {
-                TypeKind::Type(d) => (self.decl_registry.name(*d)?, Vec::new()),
-                TypeKind::Generic { decl, args } => {
-                    (self.decl_registry.name(*decl)?, args.to_vec())
-                }
+                TypeKind::Type(d) => (d.name, Vec::new()),
+                TypeKind::Generic { decl, args } => (decl.name, args.to_vec()),
                 _ => return None,
             }
         };
@@ -2098,8 +2093,8 @@ impl<'a> Cx<'a> {
         let type_sym: Option<Symbol> = match &ty.kind {
             // P35.7 — handle-keyed variants read the name from the
             // arena's parallel decl-names table.
-            TypeKind::Type(d) => self.decl_registry.name(*d),
-            TypeKind::Generic { decl, .. } => self.decl_registry.name(*decl),
+            TypeKind::Type(d) => Some(d.name),
+            TypeKind::Generic { decl, .. } => Some(decl.name),
             // P16.2 — primitives (`String`, `int`, ...) carry methods
             // declared as `native type String { ... }` in stdlib.
             // Map the primitive back to its name and fall through to
@@ -2367,11 +2362,11 @@ impl<'a> Cx<'a> {
         let recv = self.arena.get(lookup_ty).clone();
         let (type_sym, instantiation): (Symbol, Vec<TypeId>) = match recv.kind {
             TypeKind::Primitive(p) => (self.index.symbols.lookup(p.name())?, Vec::new()),
-            // P35.7 — handle-keyed variants: resolve back to the
-            // decl's Symbol via the registry.
-            TypeKind::Type(decl) => (self.decl_registry.name(decl)?, Vec::new()),
+            // P35.7 — handle-keyed variants carry the name as part
+            // of the `ItemId`.
+            TypeKind::Type(decl) => (decl.name, Vec::new()),
             // P25.7
-            TypeKind::Generic { decl, args } => (self.decl_registry.name(decl)?, args.into_vec()),
+            TypeKind::Generic { decl, args } => (decl.name, args.into_vec()),
             _ => return None,
         };
         // **P19.14** — chain-walking lookup so methods declared on
@@ -2478,8 +2473,8 @@ impl<'a> Cx<'a> {
             // receiver's type. The receiver is the `Type::` part
             // of the static expr; we have its lowered TypeId.
             let owner_sym: Option<Symbol> = match &self.arena.get(recv_ty).kind {
-                TypeKind::Type(d) => self.decl_registry.name(*d),
-                TypeKind::Generic { decl, .. } => self.decl_registry.name(*decl),
+                TypeKind::Type(d) => Some(d.name),
+                TypeKind::Generic { decl, .. } => Some(decl.name),
                 TypeKind::Enum { name, .. } => Some(*name),
                 // **P19.14** — primitives carry static methods /
                 // attrs in stdlib (`time::max`, `int::max`, etc.);
@@ -2600,9 +2595,9 @@ impl<'a> Cx<'a> {
         // mutable for `substitute`).
         let (type_sym, instantiation): (Symbol, Vec<TypeId>) = match &self.arena.get(recv_ty).kind {
             // P35.7 — handle-keyed variants.
-            TypeKind::Type(d) => (self.decl_registry.name(*d)?, Vec::new()),
+            TypeKind::Type(d) => (d.name, Vec::new()),
             // P25.7
-            TypeKind::Generic { decl, args } => (self.decl_registry.name(*decl)?, args.to_vec()),
+            TypeKind::Generic { decl, args } => (decl.name, args.to_vec()),
             TypeKind::Primitive(p) => (self.index.symbols.lookup(p.name())?, Vec::new()),
             _ => return None,
         };
@@ -2932,8 +2927,12 @@ impl<'a> Cx<'a> {
         // been ingested yet.
         if !tr.params.is_empty() {
             let args: Vec<TypeId> = tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
-            let mut base = match self.decl_registry.lookup(&module_uri, leaf_sym) {
-                Some(handle) => self.arena.generic(handle, args),
+            let mut base = match self
+                .index
+                .item_id_for(&module_uri, leaf_sym)
+                .filter(|item| self.decl_registry.lookup(*item).is_some())
+            {
+                Some(item) => self.arena.generic(item, args),
                 None => self.arena.unresolved(leaf_sym, byte_span),
             };
             if tr.optional {
@@ -2943,10 +2942,14 @@ impl<'a> Cx<'a> {
         }
 
         // Non-generic. Prefer the handle-keyed shape so cross-module
-        // identity collapses to the same TypeDeclId both sides of the
+        // identity collapses to the same ItemId both sides of the
         // call boundary.
-        let mut base = match self.decl_registry.lookup(&module_uri, leaf_sym) {
-            Some(handle) => self.arena.alloc_type(handle),
+        let mut base = match self
+            .index
+            .item_id_for(&module_uri, leaf_sym)
+            .filter(|item| self.decl_registry.lookup(*item).is_some())
+        {
+            Some(item) => self.arena.alloc_type(item),
             None => self.arena.unresolved(leaf_sym, byte_span),
         };
         if tr.optional {
@@ -4027,7 +4030,7 @@ impl<'a> Cx<'a> {
                 // args — **P19.15**) carry the same decl handle.
                 // Fold them so the dispatch is one pass with the
                 // args slice empty in the bare case.
-                let decl_and_args: Option<(greycat_analyzer_core::TypeDeclId, Vec<TypeId>)> =
+                let decl_and_args: Option<(ItemId, Vec<TypeId>)> =
                     match &self.arena.get(underlying_ty).kind {
                         TypeKind::Generic { decl, args } => Some((*decl, args.to_vec())),
                         TypeKind::Type(decl) => Some((*decl, Vec::new())),

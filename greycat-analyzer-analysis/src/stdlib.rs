@@ -17,7 +17,7 @@ use smol_str::SmolStr;
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    Primitive, Symbol, SymbolTable, Type, TypeArena, TypeDeclId, TypeId, TypeKind,
+    ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
 };
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
@@ -525,6 +525,16 @@ impl ProjectIndex {
         self.symbols.lookup(name)
     }
 
+    /// Build an [`ItemId`] for `(uri, name)`. Returns `None` if `uri`
+    /// doesn't have a recognisable module-name stem. Cheap (one
+    /// `module_name_from_uri` call + one symbol intern). Use this
+    /// anywhere you have a URI and an item-name symbol and need the
+    /// composed identity for `decl_registry` / `type_members` / etc.
+    pub fn item_id_for(&self, uri: &Uri, name: Symbol) -> Option<ItemId> {
+        let module_sym = self.symbols.intern(module_name_from_uri(uri)?);
+        Some(ItemId::new(module_sym, name))
+    }
+
     // P19.14
     /// Walk the supertype chain starting at `type_name`,
     /// returning the first `TypeMembers` entry that contains the
@@ -702,31 +712,15 @@ impl ProjectIndex {
     }
 
     // P36.1
-    /// Handle-keyed variant of [`Self::is_subtype_of`]. Resolves both
-    /// handles to their declared names via `registry` and delegates
-    /// to the name-keyed implementation. Returns `false` when either
-    /// handle isn't in the registry (callers that mint handles via
-    /// the project pipeline always insert both via the same registry,
-    /// so a registered-but-missing handle is a programming error,
-    /// not a user-facing case).
-    ///
-    /// Replaces every `is_subtype_of(&str, &str)` call site as the
-    /// migration progresses; the string form is kept during the
-    /// `Named` -> `Type(handle)` cascade and deleted in P36.7.
-    pub fn is_subtype_of_decl(
-        &self,
-        decl_registry: &DeclRegistry,
-        sub: TypeDeclId,
-        sup: TypeDeclId,
-    ) -> bool {
+    /// [`ItemId`]-keyed variant of [`Self::is_subtype_of`]. Type-system
+    /// handles in the body walker carry the full `(module, name)`
+    /// identity, so the chain-walk can be invoked directly without
+    /// re-resolving symbols.
+    pub fn is_subtype_of_decl(&self, sub: ItemId, sup: ItemId) -> bool {
         if sub == sup {
             return true;
         }
-        let (Some(sub_sym), Some(sup_sym)) = (decl_registry.name(sub), decl_registry.name(sup))
-        else {
-            return false;
-        };
-        self.is_subtype_of(sub_sym, sup_sym)
+        self.is_subtype_of(sub.name, sup.name)
     }
     // P38.4
     /// `true` iff the decl at `(uri, decl_id)` was ingested with the
@@ -738,10 +732,10 @@ impl ProjectIndex {
     }
 
     /// Walk a HIR module's top-level decls and register everything
-    /// that's a type-name (type / enum) or a native function. Mints
-    /// every encountered decl into `decl_registry` (the project-wide
-    /// `(uri, decl_id) → TypeDeclId` interner) and well-known
-    /// `(lib, module, name)` slots, allocates the enum's
+    /// that's a type-name (type / enum) or a native function. Records
+    /// every encountered decl into `decl_registry` (`ItemId →
+    /// Idx<Decl>` map) and well-known `(lib, module, name)` slots,
+    /// allocates the enum's
     /// `TypeKind::Enum` shape into the shared [`TypeArena`], and
     /// publishes the canonical enum `TypeId` to [`Self::enum_types`]
     /// — so by the time any signature-lowering pass runs,
@@ -773,24 +767,25 @@ impl ProjectIndex {
         // hard error explaining why the file is excluded. Re-ingest
         // of the same URI for the same module name (LSP invalidate
         // cycle) is idempotent — not a duplicate.
-        if let Some(name) = module_name_from_uri(uri) {
-            let sym = self.symbols.intern(&name);
-            match self.module_names.get(&sym) {
-                Some(existing) if existing != uri => {
-                    self.duplicate_modules
-                        .insert(uri.clone(), (sym, existing.clone()));
-                    return;
-                }
-                _ => {
-                    self.module_names.insert(sym, uri.clone());
-                    // P32.x — the duplicate registry is keyed by URI,
-                    // not module-name. If a file moves from "duplicate"
-                    // back to "winner" across invalidate cycles (e.g.
-                    // the previous winner was deleted from the project),
-                    // clear its duplicate flag so the diagnostic doesn't
-                    // linger.
-                    self.duplicate_modules.remove(uri);
-                }
+        let Some(stem) = module_name_from_uri(uri) else {
+            return;
+        };
+        let module_sym = self.symbols.intern(stem);
+        match self.module_names.get(&module_sym) {
+            Some(existing) if existing != uri => {
+                self.duplicate_modules
+                    .insert(uri.clone(), (module_sym, existing.clone()));
+                return;
+            }
+            _ => {
+                self.module_names.insert(module_sym, uri.clone());
+                // P32.x — the duplicate registry is keyed by URI,
+                // not module-name. If a file moves from "duplicate"
+                // back to "winner" across invalidate cycles (e.g.
+                // the previous winner was deleted from the project),
+                // clear its duplicate flag so the diagnostic doesn't
+                // linger.
+                self.duplicate_modules.remove(uri);
             }
         }
         for decl_id in &module.decls {
@@ -812,13 +807,13 @@ impl ProjectIndex {
                     if td.modifiers.abstract_ {
                         self.is_abstract.insert(name_sym);
                     }
-                    // Project-wide handle for this decl + well-known
-                    // slot recording. Folded in from the former
-                    // standalone pre-pass in
-                    // `stage_lower_signatures` so the project has a
-                    // single decl-registration point.
-                    let handle = decl_registry.get_or_insert(uri, name_sym, *decl_id);
-                    well_known.record(&module.lib, &module.name, &self.symbols[name_sym], handle);
+                    // Project-wide identity + well-known slot
+                    // recording. Folded in from the former standalone
+                    // pre-pass in `stage_lower_signatures` so the
+                    // project has a single decl-registration point.
+                    let item = ItemId::new(module_sym, name_sym);
+                    decl_registry.record(item, *decl_id);
+                    well_known.record(&module.lib, &module.name, &self.symbols[name_sym], item);
                     // P13.5: capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
                     let flags = derive_type_flags(&td.modifiers.annotations);
@@ -938,7 +933,9 @@ impl ProjectIndex {
                     // Project-wide decl handle (enums get one too — the
                     // resolver / lowering paths route foreign enum refs
                     // through `Type(handle)` for some shapes).
-                    let _ = decl_registry.get_or_insert(uri, name_sym, *decl_id);
+                    if let Some(item) = self.item_id_for(uri, name_sym) {
+                        decl_registry.record(item, *decl_id);
+                    }
                     // Alloc the canonical `TypeKind::Enum` into the
                     // shared arena and publish to `enum_types`
                     // immediately. Doing it here (rather than as a
@@ -1124,17 +1121,16 @@ impl ProjectIndex {
 // P15.x
 /// Extract the module name from a URI (filename without
 /// `.gcl`). Mirrors [`Document::name`](greycat_analyzer_core::Document)
-/// without the borrow on a manager.
-pub fn module_name_from_uri(uri: &Uri) -> Option<String> {
+/// without the borrow on a manager. Returns a slice of the URI text —
+/// no allocation. Callers that need an owned `String` go through
+/// `.to_string()` at the call site; callers that intern into a
+/// `SymbolTable` (the common case) consume the `&str` directly.
+pub fn module_name_from_uri(uri: &Uri) -> Option<&str> {
     let s = uri.as_str();
     let stripped = s.strip_prefix("file://").unwrap_or(s);
     let last = stripped.rsplit(['/', '\\']).next()?;
     let stem = last.strip_suffix(".gcl").unwrap_or(last);
-    if stem.is_empty() {
-        None
-    } else {
-        Some(stem.to_string())
-    }
+    if stem.is_empty() { None } else { Some(stem) }
 }
 
 /// Names the analyzer treats as known without an `.gcl` declaration in
@@ -1239,8 +1235,11 @@ fn lower_native_type_ref(
             // Resolve the decl handle once (the same lookup powers both
             // the generic and non-generic branches).
             let handle = locate_decl.get(&name_sym).and_then(|locs| {
-                locs.iter()
-                    .find_map(|(uri, _, _)| decl_registry.lookup(uri, name_sym))
+                locs.iter().find_map(|(uri, _, _)| {
+                    let module_sym = symbols.intern(module_name_from_uri(uri)?);
+                    let item = ItemId::new(module_sym, name_sym);
+                    decl_registry.lookup(item).map(|_| item)
+                })
             });
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
@@ -1515,11 +1514,12 @@ fn helper(): int { return 1; }
         for decl_id in &module.decls {
             if let Decl::Type(td) = &hir.decls[*decl_id] {
                 let name_sym = hir.idents[td.name].symbol;
-                let id = registry.get_or_insert(&u, name_sym, *decl_id);
-                arena.alloc_type(id);
+                let item = idx.item_id_for(&u, name_sym).unwrap();
+                registry.record(item, *decl_id);
+                arena.alloc_type(item);
                 match &idx.symbols[name_sym] {
-                    "Animal" => animal = Some(id),
-                    "Cat" => cat = Some(id),
+                    "Animal" => animal = Some(item),
+                    "Cat" => cat = Some(item),
                     _ => {}
                 }
             }
@@ -1527,20 +1527,18 @@ fn helper(): int { return 1; }
         let animal = animal.unwrap();
         let cat = cat.unwrap();
 
-        assert!(idx.is_subtype_of_decl(&registry, cat, animal));
-        assert!(!idx.is_subtype_of_decl(&registry, animal, cat));
+        assert!(idx.is_subtype_of_decl(cat, animal));
+        assert!(!idx.is_subtype_of_decl(animal, cat));
         // Reflexivity short-circuits regardless of registry membership.
-        assert!(idx.is_subtype_of_decl(&registry, animal, animal));
+        assert!(idx.is_subtype_of_decl(animal, animal));
 
         // A handle whose name was never registered in the arena returns
         // false (no panic).
         let dangling_name = idx.symbols.intern("__dangling__");
-        let dangling = registry.get_or_insert(
-            &uri("/other.gcl"),
-            dangling_name,
-            Idx::<Decl>::from_raw(99u32),
-        );
-        assert!(!idx.is_subtype_of_decl(&registry, dangling, animal));
+        let dangling_uri = uri("/other.gcl");
+        let dangling = idx.item_id_for(&dangling_uri, dangling_name).unwrap();
+        registry.record(dangling, Idx::<Decl>::from_raw(99u32));
+        assert!(!idx.is_subtype_of_decl(dangling, animal));
     }
 
     #[test]

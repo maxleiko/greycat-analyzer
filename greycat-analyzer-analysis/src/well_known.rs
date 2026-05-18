@@ -2,61 +2,38 @@
 //! Project-wide stable handles for resolved type decls and the
 //! "well-known" std/core slots the analyzer dispatches against.
 //!
-//! Decl-handle identity replaces SmolStr-name identity:
+//! Decl identity is the [`ItemId`] `(module_sym, name_sym)` pair —
+//! globally unique per project because module names are unique (the
+//! [`ProjectIndex::duplicate_modules`] gate enforces it at ingest).
+//! Two `ItemId`s compare equal iff they refer to the same item in the
+//! same module; a user-declared `type node<T>` and the std-core
+//! `node<T>` therefore get distinct identities, closing the soundness
+//! gap where the previous SmolStr-keyed identity collapsed them.
 //!
-//! - [`DeclRegistry`] interns `(Uri, Symbol)` pairs into dense
-//!   `Copy` [`TypeDeclId`] handles. Used by the project orchestrator
-//!   while lowering signatures.
-//! - [`WellKnown`] holds one `Option<TypeDeclId>` slot per native type
-//!   the analyzer special-cases (`node`, `Array`, `function`, etc.).
-//!   Populated as decls flow through the signature lowering pass; a
-//!   `Decl::Type` whose `(module.lib, module.name, decl_name)` matches
-//!   `("std", "core", N)` stashes its handle into slot `N`.
+//! - [`DeclRegistry`] maps `ItemId → Idx<Decl>` so consumers holding
+//!   a type-system handle can navigate back to the source `Decl` in
+//!   the owning module's HIR. Refreshed on every ingest so the cached
+//!   `Idx<Decl>` stays valid against the current HIR.
+//! - [`WellKnown`] holds one `Option<ItemId>` slot per native type the
+//!   analyzer special-cases (`node`, `Array`, `function`, etc.).
+//!   Populated as decls flow through ingest; a `Decl::Type` whose
+//!   `(module.lib, module.name, decl_name)` matches
+//!   `("std", "core", N)` stashes its identity into slot `N`.
 
-use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{Symbol, TypeDeclId};
+use greycat_analyzer_core::ItemId;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use rustc_hash::FxHashMap;
 
-/// Append-only registry mapping `(Uri, Symbol)` pairs to dense
-/// [`TypeDeclId`]s. Idempotent — the same pair always resolves to the
-/// same handle within a single registry instance.
-///
-/// Two `TypeDeclId`s from the same registry compare equal iff they
-/// were issued for the same `(uri, name)` pair. Across registry
-/// instances, handles are not comparable.
-///
-/// The key is `(Uri, Symbol)` rather than `(Uri, Idx<Decl>)` because
-/// `Idx<Decl>` is HIR-allocation-order — a property of the *current*
-/// lower, not of the decl. Re-lowering the same source after a body
-/// edit (which may shift an unrelated decl into a different Idx slot)
-/// would otherwise return a stale handle whose `name` field is from
-/// a now-deleted neighbour, surfacing as wrong type names in
-/// diagnostics. Keying on the name makes the handle stable across
-/// edits that don't rename, and renames correctly orphan the old
-/// handle (different name → different identity).
-///
-/// The `Idx<Decl>` field on each entry is a *mutable cache* of the
-/// current HIR's allocation slot, refreshed on every cache hit so
-/// [`resolve`] keeps returning a navigable index against the current
-/// HIR.
-#[derive(Debug, Clone)]
-struct DeclEntry {
-    uri: Uri,
-    /// Current `Idx<Decl>` for this decl in its owning module's HIR.
-    /// Refreshed on every `get_or_insert` cache hit. Only meaningful
-    /// against the most recently-ingested HIR for `uri`.
-    decl: Idx<Decl>,
-    /// Decl's source name — immutable identity (part of the intern
-    /// key). Joined with the project's `SymbolTable` to get a `&str`.
-    name: Symbol,
-}
-
+/// Maps every interned [`ItemId`] to the current HIR's `Idx<Decl>` in
+/// the owning module. The `Idx<Decl>` is HIR-allocation-order — a
+/// property of the *current* lower, not of the decl — so it gets
+/// refreshed on every `record` call (which happens once per decl per
+/// ingest). The URI of the owning module isn't stored here; recover
+/// it via `ProjectIndex::module_names[item.module]`.
 #[derive(Debug, Default, Clone)]
 pub struct DeclRegistry {
-    items: Vec<DeclEntry>,
-    intern: FxHashMap<(Uri, Symbol), TypeDeclId>,
+    indices: FxHashMap<ItemId, Idx<Decl>>,
 }
 
 impl DeclRegistry {
@@ -64,60 +41,32 @@ impl DeclRegistry {
         Self::default()
     }
 
-    /// Intern `(uri, name)`. Idempotent on `(uri, name)` — re-calling
-    /// with the same pair returns the previously-issued handle and
-    /// refreshes the cached `decl` field to the new `Idx<Decl>` so
-    /// [`resolve`] stays valid against the current HIR.
-    pub fn get_or_insert(&mut self, uri: &Uri, name: Symbol, decl: Idx<Decl>) -> TypeDeclId {
-        let key = (uri.clone(), name);
-        if let Some(&id) = self.intern.get(&key) {
-            // Refresh the cached decl idx — the HIR may have just
-            // been re-lowered with the decl at a different position.
-            self.items[id.raw() as usize].decl = decl;
-            return id;
-        }
-        let id = TypeDeclId::from_raw(self.items.len() as u32);
-        self.items.push(DeclEntry {
-            uri: uri.clone(),
-            decl,
-            name,
-        });
-        self.intern.insert(key, id);
-        id
+    /// Idempotent on `item` — re-calling with the same `ItemId`
+    /// refreshes the cached `Idx<Decl>` so [`Self::lookup`] stays
+    /// valid against the most recently-ingested HIR.
+    pub fn record(&mut self, item: ItemId, decl: Idx<Decl>) {
+        self.indices.insert(item, decl);
     }
 
-    /// Resolve a handle to the [`Symbol`] for its declared name.
-    /// Combine with the project's [`SymbolTable`] to get the `&str`.
-    pub fn name(&self, id: TypeDeclId) -> Option<Symbol> {
-        self.items.get(id.raw() as usize).map(|e| e.name)
-    }
-
-    /// Read-only lookup: returns the handle for `(uri, name)` or
-    /// `None` if no one has interned it yet.
-    pub fn lookup(&self, uri: &Uri, name: Symbol) -> Option<TypeDeclId> {
-        self.intern.get(&(uri.clone(), name)).copied()
-    }
-
-    /// Resolve a handle back to its `(uri, decl)` source. `decl` is
-    /// the *current* HIR's Idx for this decl — refreshed on every
-    /// `get_or_insert` cache hit. Only valid against the most
-    /// recently-ingested HIR for `uri`.
-    pub fn resolve(&self, id: TypeDeclId) -> Option<(&Uri, Idx<Decl>)> {
-        self.items.get(id.raw() as usize).map(|e| (&e.uri, e.decl))
+    /// Current `Idx<Decl>` for `item` in its owning module's HIR.
+    /// Only meaningful against the most recently-ingested HIR for
+    /// `item.module`.
+    pub fn lookup(&self, item: ItemId) -> Option<Idx<Decl>> {
+        self.indices.get(&item).copied()
     }
 
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.indices.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.indices.is_empty()
     }
 }
 
-/// Well-known std/core type decl handles. Each slot is `Some` once
-/// the corresponding `Decl::Type` has been seen during signature
-/// lowering; `None` when std hasn't been loaded yet (the
+/// Well-known std/core type decl identities. Each slot is `Some` once
+/// the corresponding `Decl::Type` has been seen during ingest;
+/// `None` when std hasn't been loaded yet (the
 /// [`crate::project::ProjectAnalysis::analyze`] entry on a project
 /// without std) or before that decl has flowed through the pipeline.
 ///
@@ -130,50 +79,49 @@ impl DeclRegistry {
 pub struct WellKnown {
     // Primitive-shaped natives. The analyzer also has
     // `TypeKind::Primitive` for the same conceptual things; the decl
-    // handles let cross-module references know they're talking about
-    // the std-core decl specifically, not an unrelated user-defined
-    // type that happens to share the name.
-    pub bool_decl: Option<TypeDeclId>,
-    pub char_decl: Option<TypeDeclId>,
-    pub int_decl: Option<TypeDeclId>,
-    pub float_decl: Option<TypeDeclId>,
-    pub string_decl: Option<TypeDeclId>,
-    pub time_decl: Option<TypeDeclId>,
-    pub duration_decl: Option<TypeDeclId>,
-    pub geo_decl: Option<TypeDeclId>,
+    // identities let cross-module references know they're talking
+    // about the std-core decl specifically, not an unrelated user-
+    // defined type that happens to share the name.
+    pub bool_decl: Option<ItemId>,
+    pub char_decl: Option<ItemId>,
+    pub int_decl: Option<ItemId>,
+    pub float_decl: Option<ItemId>,
+    pub string_decl: Option<ItemId>,
+    pub time_decl: Option<ItemId>,
+    pub duration_decl: Option<ItemId>,
+    pub geo_decl: Option<ItemId>,
 
     // Top / bottom equivalents — `any` and `null` are also declared
     // as `native type` in std/core.
-    pub any_decl: Option<TypeDeclId>,
-    pub null_decl: Option<TypeDeclId>,
+    pub any_decl: Option<ItemId>,
+    pub null_decl: Option<ItemId>,
 
     // Runtime sentinels — `type`, `field`, `function`. The
     // `function_ty()` / `type_ty()` / `field_ty()` minter sites in
-    // [`crate::analyzer`] read from these handles.
-    pub type_decl: Option<TypeDeclId>,
-    pub field_decl: Option<TypeDeclId>,
-    pub function_decl: Option<TypeDeclId>,
+    // [`crate::analyzer`] read from these identities.
+    pub type_decl: Option<ItemId>,
+    pub field_decl: Option<ItemId>,
+    pub function_decl: Option<ItemId>,
 
-    // Node-tag generics — the auto-deref family. P35.5 rewrites
-    // [`greycat_analyzer_core::is_node_tag`] as a comparison against
-    // these handles.
-    pub node_decl: Option<TypeDeclId>,
-    pub node_time_decl: Option<TypeDeclId>,
-    pub node_index_decl: Option<TypeDeclId>,
-    pub node_list_decl: Option<TypeDeclId>,
-    pub node_geo_decl: Option<TypeDeclId>,
+    // Node-tag generics — the auto-deref family.
+    // [`Self::is_node_tag`] is the comparison primitive.
+    pub node_decl: Option<ItemId>,
+    pub node_time_decl: Option<ItemId>,
+    pub node_index_decl: Option<ItemId>,
+    pub node_list_decl: Option<ItemId>,
+    pub node_geo_decl: Option<ItemId>,
 
     // Common generic collections.
-    pub array_decl: Option<TypeDeclId>,
-    pub map_decl: Option<TypeDeclId>,
-    pub buffer_decl: Option<TypeDeclId>,
-    pub table_decl: Option<TypeDeclId>,
-    pub tensor_decl: Option<TypeDeclId>,
+    pub array_decl: Option<ItemId>,
+    pub map_decl: Option<ItemId>,
+    pub buffer_decl: Option<ItemId>,
+    pub table_decl: Option<ItemId>,
+    pub tensor_decl: Option<ItemId>,
     /// `Tuple<T, U>` from `lib/std/core.gcl`. `(x, y)` tuple-literal
     /// syntax desugars to `Tuple<T, U>{x, y}` per the compiler, so
     /// the analyzer's `Expr::Tuple` typing mints
     /// `Generic(tuple_decl, [T, U])` when this slot is populated.
-    pub tuple_decl: Option<TypeDeclId>,
+    pub tuple_decl: Option<ItemId>,
 }
 
 impl WellKnown {
@@ -181,12 +129,12 @@ impl WellKnown {
         Self::default()
     }
 
-    /// `true` when `id` is one of the node-tag decl handles
+    /// `true` when `id` is one of the node-tag decl identities
     /// (`node`, `nodeTime`, `nodeIndex`, `nodeList`, `nodeGeo`).
-    /// Direct replacement for [`greycat_analyzer_core::is_node_tag`]
-    /// — handle-keyed rather than string-keyed, so a user-declared
+    /// Direct replacement for the SmolStr-keyed predicate this
+    /// crate used to expose — handle-keyed, so a user-declared
     /// `type node<T>` is not mistaken for the std-core tag.
-    pub fn is_node_tag(&self, id: TypeDeclId) -> bool {
+    pub fn is_node_tag(&self, id: ItemId) -> bool {
         Some(id) == self.node_decl
             || Some(id) == self.node_time_decl
             || Some(id) == self.node_index_decl
@@ -197,7 +145,7 @@ impl WellKnown {
     /// Stash `id` into the slot matching `name` when `(lib, module)`
     /// is `("std", "core")`. No-op otherwise — a user-defined `node`
     /// in their own module doesn't flow into the well-known slots.
-    pub fn record(&mut self, lib: &str, module: &str, name: &str, id: TypeDeclId) {
+    pub fn record(&mut self, lib: &str, module: &str, name: &str, id: ItemId) {
         if lib != "std" || module != "core" {
             return;
         }
@@ -236,6 +184,7 @@ impl WellKnown {
 mod tests {
     use super::*;
     use greycat_analyzer_core::SourceManager;
+    use greycat_analyzer_core::lsp_types::Uri;
     use std::str::FromStr;
 
     /// Synthetic `std/core.gcl` with the well-known native types we
@@ -328,19 +277,19 @@ mod tests {
         assert!(w.array_decl.is_none(), "no std-core Array decl seen");
     }
 
-    /// `DeclRegistry::get_or_insert` is idempotent within a single
-    /// registry instance.
+    /// `DeclRegistry::record` is idempotent: re-recording the same
+    /// `ItemId` refreshes the cached `Idx<Decl>` without bloating the
+    /// map.
     #[test]
-    fn decl_registry_get_or_insert_is_idempotent() {
+    fn decl_registry_record_is_idempotent() {
         use greycat_analyzer_core::SymbolTable;
         let mut r = DeclRegistry::new();
-        let uri = Uri::from_str("file:///x.gcl").unwrap();
         let decl = Idx::<Decl>::from_raw(0u32);
         let symbols = SymbolTable::new();
-        let name = symbols.intern("Foo");
-        let a = r.get_or_insert(&uri, name, decl);
-        let b = r.get_or_insert(&uri, name, decl);
-        assert_eq!(a, b);
+        let item = ItemId::new(symbols.intern("m"), symbols.intern("Foo"));
+        r.record(item, decl);
+        r.record(item, decl);
+        assert_eq!(r.lookup(item), Some(decl));
         assert_eq!(r.len(), 1);
     }
 }

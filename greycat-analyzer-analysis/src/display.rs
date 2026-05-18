@@ -1,10 +1,10 @@
-//! Registry-aware type display.
+//! Type display (`TypeKind::Type` / `TypeKind::Generic` rendering).
 //!
 //! Lives in the analysis crate because rendering decl-keyed types
-//! (`TypeKind::Type` / `TypeKind::Generic`) needs a [`DeclRegistry`] to
-//! recover the source name from a [`TypeDeclId`]. The bare core
-//! [`TypeArena`] intentionally does not store names — see
-//! `greycat_analyzer_core::types` for the rationale.
+//! needs the project's [`SymbolTable`] to recover the source name
+//! from the `ItemId`'s `name` symbol. The bare core [`TypeArena`]
+//! does not own a symbol table — see `greycat_analyzer_core::types`
+//! for the rationale.
 
 use greycat_analyzer_core::{SymbolTable, TypeArena, TypeId, TypeKind};
 
@@ -26,7 +26,7 @@ use crate::well_known::DeclRegistry;
 /// `| null` alt to avoid the suffix visually binding to the last alt).
 pub fn display_fqn(
     arena: &TypeArena,
-    decl_registry: &DeclRegistry,
+    _decl_registry: &DeclRegistry,
     symbols: &SymbolTable,
     id: TypeId,
     home_lib: &dyn Fn(&str) -> Option<String>,
@@ -40,23 +40,17 @@ pub fn display_fqn(
         TypeKind::Never => "core::never".to_string(),
         TypeKind::Primitive(p) => format!("core::{}", p.name()),
         TypeKind::Type(d) => {
-            let name = decl_registry
-                .name(*d)
-                .map(|sym| &symbols[sym])
-                .unwrap_or("<unregistered>");
+            let name = &symbols[d.name];
             format!(
                 "{}::{name}",
                 home_lib(name).unwrap_or_else(|| "core".to_string()),
             )
         }
         TypeKind::Generic { decl, args } => {
-            let name = decl_registry
-                .name(*decl)
-                .map(|sym| &symbols[sym])
-                .unwrap_or("<unregistered>");
+            let name = &symbols[decl.name];
             let parts: Box<[String]> = args
                 .iter()
-                .map(|a| display_fqn(arena, decl_registry, symbols, *a, home_lib))
+                .map(|a| display_fqn(arena, _decl_registry, symbols, *a, home_lib))
                 .collect();
             format!(
                 "{}::{name}<{}>",
@@ -77,12 +71,12 @@ pub fn display_fqn(
         TypeKind::Lambda { params, ret } => {
             let parts: Box<[String]> = params
                 .iter()
-                .map(|p| display_fqn(arena, decl_registry, symbols, *p, home_lib))
+                .map(|p| display_fqn(arena, _decl_registry, symbols, *p, home_lib))
                 .collect();
             format!(
                 "({}) -> {}",
                 parts.join(", "),
-                display_fqn(arena, decl_registry, symbols, *ret, home_lib)
+                display_fqn(arena, _decl_registry, symbols, *ret, home_lib)
             )
         }
         TypeKind::Enum { name, .. } => {
@@ -95,7 +89,7 @@ pub fn display_fqn(
         TypeKind::Union { alts } => {
             let mut parts: Vec<String> = alts
                 .iter()
-                .map(|a| display_fqn(arena, decl_registry, symbols, *a, home_lib))
+                .map(|a| display_fqn(arena, _decl_registry, symbols, *a, home_lib))
                 .collect();
             if ty.nullable
                 && !alts

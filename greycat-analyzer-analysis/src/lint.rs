@@ -1425,17 +1425,17 @@ fn emit_typed(
 /// anonymous / union / enum / generic-param).
 fn receiver_head_name(
     arena: &TypeArena,
-    decl_registry: &DeclRegistry,
+    _decl_registry: &DeclRegistry,
     symbols: &SymbolTable,
     ty: TypeId,
 ) -> Option<String> {
     let t = arena.get(ty);
-    let decl_name = |d| decl_registry.name(d).map(|sym| symbols[sym].to_string());
     match &t.kind {
-        // P35.7 — `TypeKind::Type(handle)` / `Generic` recover
-        // their decl name via the project's `DeclRegistry`.
-        TypeKind::Type(decl) => decl_name(*decl),
-        TypeKind::Generic { decl, .. } => decl_name(*decl),
+        // `TypeKind::Type(item)` / `Generic` carry their decl's
+        // `ItemId` directly — the name half indexes into the
+        // project's symbol table without going through the registry.
+        TypeKind::Type(decl) => Some(symbols[decl.name].to_string()),
+        TypeKind::Generic { decl, .. } => Some(symbols[decl.name].to_string()),
         TypeKind::Primitive(p) => Some(p.name().to_string()),
         _ => None,
     }
