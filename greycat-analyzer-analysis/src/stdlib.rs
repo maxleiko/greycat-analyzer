@@ -435,43 +435,6 @@ pub struct TypeMembers {
     pub deref_return_ty: Option<TypeId>,
 }
 
-impl TypeMembers {
-    // P19.9
-    /// `&str` lookup of an attr's HIR index. Returns
-    /// `None` if `name` isn't interned in `symbols` or if no attr
-    /// of that name exists on this type.
-    pub fn attr_id(&self, symbols: &SymbolTable, name: &str) -> Option<Idx<TypeAttr>> {
-        symbols
-            .lookup(name)
-            .and_then(|s| self.attrs.get(&s))
-            .copied()
-    }
-    // P19.9
-    /// `&str` lookup of a method's HIR index.
-    pub fn method_id(&self, symbols: &SymbolTable, name: &str) -> Option<Idx<Decl>> {
-        symbols
-            .lookup(name)
-            .and_then(|s| self.methods.get(&s))
-            .copied()
-    }
-    // P19.9
-    /// `&str` lookup of an attr's pre-lowered type.
-    pub fn attr_ty(&self, symbols: &SymbolTable, name: &str) -> Option<TypeId> {
-        symbols
-            .lookup(name)
-            .and_then(|s| self.attr_types.get(&s))
-            .copied()
-    }
-    // P19.9
-    /// `&str` lookup of a method's pre-lowered return type.
-    pub fn method_return(&self, symbols: &SymbolTable, name: &str) -> Option<TypeId> {
-        symbols
-            .lookup(name)
-            .and_then(|s| self.method_returns.get(&s))
-            .copied()
-    }
-}
-
 // P13.5
 /// Annotation-derived flag bits on a type declaration.
 ///
@@ -554,45 +517,6 @@ impl ProjectIndex {
         self.symbols.lookup(name)
     }
 
-    // P19.9
-    /// `&str`-keyed lookup helpers preserved for
-    /// callers that don't (yet) hold a [`Symbol`]. Each does one
-    /// `symbols.lookup` then a Symbol-keyed map probe.
-    pub fn type_members_for(&self, name: &str) -> Option<&TypeMembers> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.type_members.get(&s))
-    }
-    pub fn fn_signature_for(&self, name: &str) -> Option<&FnSignature> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.fn_signatures.get(&s))
-    }
-    pub fn enum_type_for(&self, name: &str) -> Option<TypeId> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.enum_types.get(&s))
-            .copied()
-    }
-    // P19.10
-    /// `&str` lookup of a top-level var's declared type.
-    pub fn var_type_for(&self, name: &str) -> Option<TypeId> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.var_types.get(&s))
-            .copied()
-    }
-    // P19.16
-    /// `&str` lookup of a runtime-exposed value
-    /// global's type (e.g. `Infinity` → `float`). See
-    /// [`BUILTIN_RUNTIME_GLOBALS`].
-    pub fn runtime_global_for(&self, name: &str) -> Option<TypeId> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.runtime_globals.get(&s))
-            .copied()
-    }
-
     // P19.14
     /// Walk the supertype chain starting at `type_name`,
     /// returning the first `TypeMembers` entry that contains the
@@ -603,10 +527,8 @@ impl ProjectIndex {
     /// type itself. Returns 0 when `type_name` is unknown. Stops
     /// counting at [`MAX_SUPERTYPE_CHAIN_DEPTH`] + 1 — the caller only
     /// needs to distinguish "within limit" from "exceeds limit".
-    pub fn supertype_chain_length(&self, type_name: &str) -> usize {
-        let Some(mut cur) = self.symbols.lookup(type_name) else {
-            return 0;
-        };
+    pub fn supertype_chain_length(&self, type_name: Symbol) -> usize {
+        let mut cur = type_name;
         let mut len: usize = 0;
         for _ in 0..=MAX_SUPERTYPE_CHAIN_DEPTH {
             let Some(members) = self.type_members.get(&cur) else {
@@ -630,11 +552,11 @@ impl ProjectIndex {
     /// Bounded at [`MAX_SUPERTYPE_CHAIN_DEPTH`] hops to match the
     /// runtime's inheritance-depth ceiling and defend against accidental
     /// cycles in in-progress source.
-    fn walk_member_chain<P>(&self, type_name: &str, mut pred: P) -> Option<&TypeMembers>
+    fn walk_member_chain<P>(&self, type_name: Symbol, mut pred: P) -> Option<&TypeMembers>
     where
         P: FnMut(&TypeMembers) -> bool,
     {
-        let mut cur = self.symbols.lookup(type_name)?;
+        let mut cur = type_name;
         for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let members = self.type_members.get(&cur)?;
             if pred(members) {
@@ -653,30 +575,28 @@ impl ProjectIndex {
     /// the right module.
     pub fn type_attr_id_chain(
         &self,
-        type_name: &str,
-        attr_name: &str,
+        type_name: Symbol,
+        attr_name: Symbol,
     ) -> Option<(Uri, Idx<TypeAttr>)> {
-        let attr_sym = self.symbols.lookup(attr_name)?;
-        let members = self.walk_member_chain(type_name, |m| m.attrs.contains_key(&attr_sym))?;
+        let members = self.walk_member_chain(type_name, |m| m.attrs.contains_key(&attr_name))?;
         members
             .attrs
-            .get(&attr_sym)
+            .get(&attr_name)
             .map(|id| (members.home_uri.clone(), *id))
     }
 
     // P19.14
-    /// `&str` lookup of a method's HIR index, walking
-    /// the supertype chain.
+    /// Method's HIR index, walking the supertype chain.
     pub fn type_method_id_chain(
         &self,
-        type_name: &str,
-        method_name: &str,
+        type_name: Symbol,
+        method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
-        let method_sym = self.symbols.lookup(method_name)?;
-        let members = self.walk_member_chain(type_name, |m| m.methods.contains_key(&method_sym))?;
+        let members =
+            self.walk_member_chain(type_name, |m| m.methods.contains_key(&method_name))?;
         members
             .methods
-            .get(&method_sym)
+            .get(&method_name)
             .map(|id| (members.home_uri.clone(), *id))
     }
 
@@ -688,16 +608,15 @@ impl ProjectIndex {
     /// method of the same name.
     pub fn type_instance_method_id_chain(
         &self,
-        type_name: &str,
-        method_name: &str,
+        type_name: Symbol,
+        method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
-        let method_sym = self.symbols.lookup(method_name)?;
         let members = self.walk_member_chain(type_name, |m| {
-            m.methods.contains_key(&method_sym) && !m.static_methods.contains(&method_sym)
+            m.methods.contains_key(&method_name) && !m.static_methods.contains(&method_name)
         })?;
         members
             .methods
-            .get(&method_sym)
+            .get(&method_name)
             .map(|id| (members.home_uri.clone(), *id))
     }
 
@@ -710,17 +629,15 @@ impl ProjectIndex {
     /// `textDocument/implementation`.
     pub fn find_abstract_ancestor_method(
         &self,
-        type_name: &str,
-        method_name: &str,
+        type_name: Symbol,
+        method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
-        let method_sym = self.symbols.lookup(method_name)?;
-        let start = self.symbols.lookup(type_name)?;
-        let start_members = self.type_members.get(&start)?;
+        let start_members = self.type_members.get(&type_name)?;
         let mut cur = start_members.supertype?;
         for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let members = self.type_members.get(&cur)?;
-            if members.abstract_methods.contains(&method_sym)
-                && let Some(decl_id) = members.methods.get(&method_sym)
+            if members.abstract_methods.contains(&method_name)
+                && let Some(decl_id) = members.methods.get(&method_name)
             {
                 return Some((members.home_uri.clone(), *decl_id));
             }
@@ -734,36 +651,33 @@ impl ProjectIndex {
     /// chain. The `TypeId` lives in the project arena and may
     /// reference `GenericParam(T, owner=parent_type)` if the attr
     /// is declared on a generic parent.
-    pub fn type_attr_ty_chain(&self, type_name: &str, attr_name: &str) -> Option<TypeId> {
-        let attr_sym = self.symbols.lookup(attr_name)?;
+    pub fn type_attr_ty_chain(&self, type_name: Symbol, attr_name: Symbol) -> Option<TypeId> {
         let members =
-            self.walk_member_chain(type_name, |m| m.attr_types.contains_key(&attr_sym))?;
-        members.attr_types.get(&attr_sym).copied()
+            self.walk_member_chain(type_name, |m| m.attr_types.contains_key(&attr_name))?;
+        members.attr_types.get(&attr_name).copied()
     }
 
     // P19.14
     /// Pre-lowered method return type, walking the
     /// supertype chain.
-    pub fn type_method_return_chain(&self, type_name: &str, method_name: &str) -> Option<TypeId> {
-        let method_sym = self.symbols.lookup(method_name)?;
+    pub fn type_method_return_chain(
+        &self,
+        type_name: Symbol,
+        method_name: Symbol,
+    ) -> Option<TypeId> {
         let members =
-            self.walk_member_chain(type_name, |m| m.method_returns.contains_key(&method_sym))?;
-        members.method_returns.get(&method_sym).copied()
+            self.walk_member_chain(type_name, |m| m.method_returns.contains_key(&method_name))?;
+        members.method_returns.get(&method_name).copied()
     }
 
     // P19.14
     /// `true` iff `sub` is `sup` or any of its
     /// transitive supertypes is `sup`. Bounded at 32 hops.
-    pub fn is_subtype_of(&self, sub: &str, sup: &str) -> bool {
+    pub fn is_subtype_of(&self, sub: Symbol, sup: Symbol) -> bool {
         if sub == sup {
             return true;
         }
-        let Some(target) = self.symbols.lookup(sup) else {
-            return false;
-        };
-        let Some(mut cur) = self.symbols.lookup(sub) else {
-            return false;
-        };
+        let mut cur = sub;
         for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let Some(members) = self.type_members.get(&cur) else {
                 return false;
@@ -771,7 +685,7 @@ impl ProjectIndex {
             let Some(parent) = members.supertype else {
                 return false;
             };
-            if parent == target {
+            if parent == sup {
                 return true;
             }
             cur = parent;
@@ -804,45 +718,7 @@ impl ProjectIndex {
         else {
             return false;
         };
-        let sub_name = &self.symbols[sub_sym];
-        let sup_name = &self.symbols[sup_sym];
-        self.is_subtype_of(sub_name, sup_name)
-    }
-    pub fn native_for(&self, name: &str) -> Option<&NativeSignature> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.natives.lookup_sym(s))
-    }
-    pub fn type_flags_for(&self, name: &str) -> Option<&TypeFlags> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.type_flags.get(&s))
-    }
-    pub fn contains_value(&self, name: &str) -> bool {
-        self.symbols
-            .lookup(name)
-            .is_some_and(|s| self.values.contains(&s))
-    }
-    pub fn contains_type_member(&self, name: &str) -> bool {
-        self.symbols
-            .lookup(name)
-            .is_some_and(|s| self.type_members.contains_key(&s))
-    }
-    pub fn contains_fn_signature(&self, name: &str) -> bool {
-        self.symbols
-            .lookup(name)
-            .is_some_and(|s| self.fn_signatures.contains_key(&s))
-    }
-    // P38.1
-    /// `true` iff `name` was ingested as a non-native top-level `fn`
-    /// in any module. Distinct from [`Self::contains_fn_signature`]
-    /// (natives only). Lets the analyzer's `Definition::ProjectDecl`
-    /// value-typing arm produce `function` for cross-module bare fn
-    /// idents without first walking the foreign HIR.
-    pub fn contains_non_native_fn(&self, name: &str) -> bool {
-        self.symbols
-            .lookup(name)
-            .is_some_and(|s| self.non_native_fn_names.contains(&s))
+        self.is_subtype_of(sub_sym, sup_sym)
     }
     // P38.4
     /// `true` iff the decl at `(uri, decl_id)` was ingested with the
@@ -1178,14 +1054,7 @@ impl ProjectIndex {
     /// primitives have no `.gcl` decl and so never appear here — use
     /// [`Self::has_name`] to ask the broader "is this name known?"
     /// question.
-    pub fn locate_decl(&self, name: &str) -> &[(Uri, Idx<Decl>, Namespace)] {
-        match self.symbols.lookup(name) {
-            Some(s) => self.locate_decl_by_symbol(s),
-            None => &[],
-        }
-    }
-
-    pub fn locate_decl_by_symbol(&self, name: Symbol) -> &[(Uri, Idx<Decl>, Namespace)] {
+    pub fn locate_decl(&self, name: Symbol) -> &[(Uri, Idx<Decl>, Namespace)] {
         self.decl_locations
             .get(&name)
             .map(|v| v.as_slice())
@@ -1198,22 +1067,10 @@ impl ProjectIndex {
     /// matches (e.g. `type geo` vs `fn geo()`).
     pub fn locate_decl_in_ns(
         &self,
-        name: &str,
+        name: Symbol,
         ns: Namespace,
     ) -> impl Iterator<Item = (&Uri, Idx<Decl>)> {
         self.locate_decl(name)
-            .iter()
-            .filter(move |(_, _, n)| *n == ns)
-            .map(|(u, d, _)| (u, *d))
-    }
-
-    /// `Symbol`-keyed variant of [`Self::locate_decl_in_ns`].
-    pub fn locate_decl_by_symbol_in_ns(
-        &self,
-        sym: Symbol,
-        ns: Namespace,
-    ) -> impl Iterator<Item = (&Uri, Idx<Decl>)> {
-        self.locate_decl_by_symbol(sym)
             .iter()
             .filter(move |(_, _, n)| *n == ns)
             .map(|(u, d, _)| (u, *d))
@@ -1223,32 +1080,10 @@ impl ProjectIndex {
     /// a registered type / enum, a native fn signature, or a top-level
     /// non-native fn / var. Resolver uses this as the post-local-scope
     /// fallback.
-    pub fn has_name(&self, name: &str) -> bool {
-        let Some(sym) = self.symbols.lookup(name) else {
-            return false;
-        };
-        self.type_names.contains(&sym)
-            || self.natives.signatures.contains_key(&sym)
-            || self.values.contains(&sym)
-    }
-
-    // P15.x
-    /// `true` iff `name` matches a known module (any ingested
-    /// doc whose filename stem equals `name`). Lets the resolver
-    /// recognize `runtime` in `runtime::Identity::create` as a module.
-    pub fn has_module(&self, name: &str) -> bool {
-        self.symbols
-            .lookup(name)
-            .is_some_and(|s| self.module_names.contains_key(&s))
-    }
-
-    // P15.x
-    /// Return the URI of the module whose filename stem
-    /// matches `name`, if any.
-    pub fn module_uri(&self, name: &str) -> Option<&Uri> {
-        self.symbols
-            .lookup(name)
-            .and_then(|s| self.module_names.get(&s))
+    pub fn has_name(&self, name: Symbol) -> bool {
+        self.type_names.contains(&name)
+            || self.natives.signatures.contains_key(&name)
+            || self.values.contains(&name)
     }
 }
 
@@ -1460,8 +1295,8 @@ type Company {
             &mut well_known,
         );
         assert_eq!(idx.modules_ingested, 1);
-        assert!(idx.has_name("Person"));
-        assert!(idx.has_name("Company"));
+        assert!(idx.has_name(idx.symbols.lookup("Person").unwrap()));
+        assert!(idx.has_name(idx.symbols.lookup("Company").unwrap()));
     }
 
     #[test]
@@ -1475,7 +1310,12 @@ type Company {
             &mut decl_registry,
             &mut well_known,
         );
-        let id = idx.enum_type_for("Color").expect("Color registered");
+        let color_sym = idx.symbols.lookup("Color").expect("Color interned");
+        let id = idx
+            .enum_types
+            .get(&color_sym)
+            .copied()
+            .expect("Color registered");
         let ty = arena.get(id);
         let TypeKind::Enum { variants, .. } = &ty.kind else {
             panic!("expected enum, got {ty:?}");
@@ -1504,9 +1344,11 @@ native fn now(): time;
             &mut decl_registry,
             &mut well_known,
         );
-        let read = idx.native_for("read_file").expect("read_file present");
+        let read_sym = idx.symbols.lookup("read_file").unwrap();
+        let read = idx.natives.lookup_sym(read_sym).expect("read_file present");
         assert_eq!(read.params.len(), 1);
-        let now = idx.native_for("now").expect("now present");
+        let now_sym = idx.symbols.lookup("now").unwrap();
+        let now = idx.natives.lookup_sym(now_sym).expect("now present");
         assert!(now.params.is_empty());
     }
 
@@ -1522,7 +1364,7 @@ native fn now(): time;
         assert_eq!(idx.modules_ingested, 2);
         // decl_locations is also idempotent — the same (uri, decl_id)
         // pair shouldn't be appended twice.
-        assert_eq!(idx.locate_decl("T").len(), 1);
+        assert_eq!(idx.locate_decl(idx.symbols.lookup("T").unwrap()).len(), 1);
     }
 
     #[test]
@@ -1543,7 +1385,7 @@ native fn now(): time;
             &mut well_known,
         );
 
-        let hits = idx.locate_decl("Permission");
+        let hits = idx.locate_decl(idx.symbols.lookup("Permission").unwrap());
         assert_eq!(hits.len(), 1, "exactly one Permission decl across project");
         let (found_uri, decl_id, ns) = &hits[0];
         assert_eq!(found_uri, &permission_uri);
@@ -1590,15 +1432,13 @@ fn helper(): int { return 1; }
             assert_eq!(idx.symbols.resolve(&sym), n);
         }
 
-        // The new `&str` accessors hit through the symbol table.
-        let bag = idx.type_members_for("Bag").expect("Bag in type_members");
-        assert!(bag.attr_id(&idx.symbols, "weight").is_some());
-        assert!(bag.method_id(&idx.symbols, "lift").is_some());
-
-        // Same Symbol is shared between the outer index and the
-        // inner TypeMembers — interning preserves identity.
+        // Direct Symbol-keyed field access — one interner, no &str round-trip.
+        let bag_sym = idx.symbol("Bag").expect("Bag interned");
+        let bag = idx.type_members.get(&bag_sym).expect("Bag in type_members");
         let weight_sym = idx.symbol("weight").expect("weight interned via ingest");
+        let lift_sym = idx.symbol("lift").expect("lift interned via ingest");
         assert!(bag.attrs.contains_key(&weight_sym));
+        assert!(bag.methods.contains_key(&lift_sym));
     }
 
     // P36.1
@@ -1691,7 +1531,7 @@ fn helper(): int { return 1; }
             &mut decl_registry,
             &mut well_known,
         );
-        let hits = idx.locate_decl("Helper");
+        let hits = idx.locate_decl(idx.symbols.lookup("Helper").unwrap());
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, uri("/proj/a.gcl"));
         assert_eq!(hits[1].0, uri("/proj/b.gcl"));
@@ -1758,17 +1598,20 @@ type Plain {}
         let u = uri("/proj/m.gcl");
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
-        let bag = idx.type_flags_for("Bag").expect("Bag flags");
+        let bag_sym = idx.symbols.lookup("Bag").unwrap();
+        let bag = idx.type_flags.get(&bag_sym).expect("Bag flags");
         assert!(bag.iterable);
         assert_eq!(bag.deref.as_deref(), Some("resolve"));
         assert!(!bag.primitive);
 
-        let marker = idx.type_flags_for("Marker").expect("Marker flags");
+        let marker_sym = idx.symbols.lookup("Marker").unwrap();
+        let marker = idx.type_flags.get(&marker_sym).expect("Marker flags");
         assert!(marker.primitive);
         assert!(!marker.iterable);
 
         // Plain has no annotations — kept out of the map.
-        assert!(idx.type_flags_for("Plain").is_none());
+        let plain_sym = idx.symbols.lookup("Plain").unwrap();
+        assert!(!idx.type_flags.contains_key(&plain_sym));
     }
 
     #[test]
@@ -1803,8 +1646,18 @@ var TOP: int = 1;
         );
         let u = uri("/proj/m.gcl");
         idx.ingest(&u, &hir, &mut arena, &mut decl_registry, &mut well_known);
-        assert_eq!(idx.locate_decl("helper").len(), 1);
-        assert_eq!(idx.locate_decl("TOP").len(), 1);
-        assert!(idx.locate_decl("missing").is_empty());
+        assert_eq!(
+            idx.locate_decl(idx.symbols.lookup("helper").unwrap()).len(),
+            1
+        );
+        assert_eq!(
+            idx.locate_decl(idx.symbols.lookup("TOP").unwrap()).len(),
+            1
+        );
+        assert!(
+            idx.symbols
+                .lookup("missing")
+                .is_none_or(|sym| idx.locate_decl(sym).is_empty())
+        );
     }
 }

@@ -279,7 +279,8 @@ impl<'a> Cx<'a> {
     }
 
     fn record_use(&mut self, idx: Idx<Ident>, pos: Position) {
-        let name = self.ident_text(idx).to_string();
+        let name = self.ident_text(idx);
+        let name_sym = self.hir.idents[idx].symbol;
         // Bare-name resolution order, applied per namespace in the
         // priority list for `pos`:
         //
@@ -311,7 +312,7 @@ impl<'a> Cx<'a> {
         // namespace short-circuits the whole walk.
 
         // 1. Nested scopes are namespace-agnostic.
-        if let Some(def) = self.lookup_scope(&name) {
+        if let Some(def) = self.lookup_scope(name) {
             if let Definition::Decl(decl_id) = &def {
                 *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
             }
@@ -325,8 +326,8 @@ impl<'a> Cx<'a> {
             // namespace. Module-local always shadows cross-module.
             if let Some(def) = self
                 .module_public(ns)
-                .get(&name)
-                .or_else(|| self.module_private(ns).get(&name))
+                .get(name)
+                .or_else(|| self.module_private(ns).get(name))
                 .cloned()
             {
                 if let Definition::Decl(decl_id) = &def {
@@ -339,7 +340,7 @@ impl<'a> Cx<'a> {
             // current-module and `private` filters.
             let cross_module_hits: Vec<(Uri, Idx<Decl>)> = self
                 .index
-                .locate_decl_in_ns(&name, ns)
+                .locate_decl_in_ns(name_sym, ns)
                 .filter(|(uri, decl)| {
                     let from_other_module = self.current_uri.map(|cur| uri != &cur).unwrap_or(true);
                     from_other_module && !self.index.is_decl_private(uri, *decl)
@@ -364,7 +365,7 @@ impl<'a> Cx<'a> {
         }
 
         // 4. Project-level fallback.
-        if self.index.has_name(&name) {
+        if self.index.has_name(name_sym) {
             self.res.uses.insert(idx, Definition::Project);
             return;
         }
@@ -372,7 +373,7 @@ impl<'a> Cx<'a> {
         // `module::Decl` chain). Bind to `Project` so it's not
         // flagged unresolved; goto-def hits via `goto_module_segment`
         // (P15.9), inference via pass 3.5.
-        if self.index.has_module(&name) {
+        if self.index.module_names.contains_key(&name_sym) {
             self.res.uses.insert(idx, Definition::Project);
             return;
         }
@@ -397,10 +398,10 @@ impl<'a> Cx<'a> {
             .qualifier
             .last()
             .expect("bind_qualified_type_leaf called with empty qualifier");
-        let module_name = self.ident_text(module_segment).to_string();
+        let module_sym = self.hir.idents[module_segment].symbol;
         let leaf = ty.name;
-        let leaf_name = self.ident_text(leaf).to_string();
-        let Some(module_uri) = self.index.module_uri(&module_name).cloned() else {
+        let leaf_sym = self.hir.idents[leaf].symbol;
+        let Some(module_uri) = self.index.module_names.get(&module_sym).cloned() else {
             self.res.unresolved.push(leaf);
             return;
         };
@@ -408,7 +409,7 @@ impl<'a> Cx<'a> {
         // out same-named values declared in the module.
         let hit = self
             .index
-            .locate_decl_in_ns(&leaf_name, Namespace::Type)
+            .locate_decl_in_ns(leaf_sym, Namespace::Type)
             .find(|(uri, _)| *uri == &module_uri)
             .map(|(uri, decl)| (uri.clone(), decl));
         match hit {

@@ -1681,14 +1681,14 @@ fn member_completion(
     // head name of the resulting type.
     let _ = well_known;
     let inner_head: Option<String> = (|| {
-        let (recv_name, recv_args): (String, Vec<TypeId>) = match &arena.get(recv_ty).kind {
-            TypeKind::Type(d) => (project.decl_name(*d)?.to_string(), Vec::new()),
+        let (recv_sym, recv_args): (Symbol, Vec<TypeId>) = match &arena.get(recv_ty).kind {
+            TypeKind::Type(d) => (project.decl_registry().name(*d)?, Vec::new()),
             TypeKind::Generic { decl, args } => {
-                (project.decl_name(*decl)?.to_string(), args.to_vec())
+                (project.decl_registry().name(*decl)?, args.to_vec())
             }
             _ => return None,
         };
-        let members = project.index.type_members_for(&recv_name)?;
+        let members = project.index.type_members.get(&recv_sym)?;
         let deref_ret = members.deref_return_ty?;
         // Substitute the receiver's generic args into the cached
         // (still-abstract) deref-method return type.
@@ -1725,7 +1725,8 @@ fn member_completion(
     // `arrow_deref_receiver` mirrors this dispatch.
     let list_tag_members = !(is_arrow && inner_head.is_some());
     if list_tag_members {
-        if let Some(name_sym) = project.symbols().lookup(name)
+        let name_sym = project.symbols().lookup(name);
+        if let Some(name_sym) = name_sym
             && let Some(decl_id) = module.analysis.type_decls.get(&name_sym).copied()
             && let Decl::Type(td) = &module.hir.decls[decl_id]
         {
@@ -1739,9 +1740,10 @@ fn member_completion(
             );
         }
         if items.is_empty()
+            && let Some(name_sym) = name_sym
             && let Some((foreign_uri, foreign_decl_id)) = project
                 .index
-                .locate_decl_in_ns(name, crate::stdlib::Namespace::Type)
+                .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
                 .next()
             && let Some(fmod) = project.module(foreign_uri)
             && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
@@ -1766,8 +1768,9 @@ fn member_completion(
     // the shared project arena. Inner-method rendering stays in the
     // declared form for the deref branch.
     if let Some(inner) = inner_head.as_deref() {
+        let inner_sym = project.symbols().lookup(inner);
         let mut inner_items: Vec<CompletionItem> = Vec::new();
-        if let Some(inner_sym) = project.symbols().lookup(inner)
+        if let Some(inner_sym) = inner_sym
             && let Some(decl_id) = module.analysis.type_decls.get(&inner_sym).copied()
             && let Decl::Type(td) = &module.hir.decls[decl_id]
         {
@@ -1781,9 +1784,10 @@ fn member_completion(
             );
         }
         if inner_items.is_empty()
+            && let Some(inner_sym) = inner_sym
             && let Some((foreign_uri, foreign_decl_id)) = project
                 .index
-                .locate_decl_in_ns(inner, crate::stdlib::Namespace::Type)
+                .locate_decl_in_ns(inner_sym, crate::stdlib::Namespace::Type)
                 .next()
             && let Some(fmod) = project.module(foreign_uri)
             && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
@@ -2269,10 +2273,11 @@ fn static_completion(
     // module (resolved through the project decl table). Filter to the
     // type namespace — a value-namespace `fn ctx.recv()` is irrelevant
     // here, the receiver is a static dispatch target.
-    if let Some((foreign_uri, foreign_decl_id)) = project
-        .index
-        .locate_decl_in_ns(&ctx.recv, crate::stdlib::Namespace::Type)
-        .next()
+    if let Some(recv_sym) = project.symbols().lookup(&ctx.recv)
+        && let Some((foreign_uri, foreign_decl_id)) = project
+            .index
+            .locate_decl_in_ns(recv_sym, crate::stdlib::Namespace::Type)
+            .next()
         && let Some(fmod) = project.module(foreign_uri)
     {
         match &fmod.hir.decls[foreign_decl_id] {
@@ -2347,7 +2352,8 @@ fn static_completion(
     }
 
     // Module-receiver branch: enumerate the module's top-level decls.
-    if let Some(mod_uri) = project.index.module_uri(&ctx.recv).cloned()
+    if let Some(recv_sym) = project.symbols().lookup(&ctx.recv)
+        && let Some(mod_uri) = project.index.module_names.get(&recv_sym).cloned()
         && let Some(mod_analysis) = project.module(&mod_uri)
         && let Some(module_hir) = mod_analysis.hir.module.as_ref()
     {
@@ -2707,9 +2713,10 @@ fn object_field_completion(
         }
     }
     if items.is_empty()
+        && let Some(type_sym) = project.symbols().lookup(type_name.as_str())
         && let Some((foreign_uri, foreign_decl_id)) = project
             .index
-            .locate_decl_in_ns(&type_name, crate::stdlib::Namespace::Type)
+            .locate_decl_in_ns(type_sym, crate::stdlib::Namespace::Type)
             .next()
         && let Some(fmod) = project.module(foreign_uri)
         && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]

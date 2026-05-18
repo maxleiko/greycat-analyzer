@@ -1538,7 +1538,7 @@ impl<'a> Cx<'a> {
     ) -> Option<greycat_analyzer_core::TypeDeclId> {
         for (uri, _) in self
             .index
-            .locate_decl_by_symbol_in_ns(sym, crate::stdlib::Namespace::Type)
+            .locate_decl_in_ns(sym, crate::stdlib::Namespace::Type)
         {
             if let Some(h) = self.decl_registry.lookup(uri, sym) {
                 return Some(h);
@@ -1656,16 +1656,13 @@ impl<'a> Cx<'a> {
             range,
         ));
     }
-    fn ident_text(&self, idx: Idx<Ident>) -> &str {
-        &self.index.symbols[self.hir.idents[idx].symbol]
+
+    fn ident(&self, idx: Idx<Ident>) -> &Ident {
+        &self.hir.idents[idx]
     }
 
-    /// Resolve a `TypeDeclId` to its source name through
-    /// `decl_registry → SymbolTable`.
-    fn decl_name(&self, id: greycat_analyzer_core::TypeDeclId) -> Option<&str> {
-        self.decl_registry
-            .name(id)
-            .map(|sym| &self.index.symbols[sym] as &str)
+    fn ident_text(&self, idx: Idx<Ident>) -> &str {
+        &self.index.symbols[self.hir.idents[idx].symbol]
     }
 
     /// Registry-aware type-display wrapper. Renders `Foo` / `Map<int,
@@ -2002,11 +1999,13 @@ impl<'a> Cx<'a> {
         // shapes carry a discoverable type name:
         //   - `Type(decl)`           — non-generic concrete decl.
         //   - `Generic { decl, args }` — handle-keyed generic.
-        let (type_name, instantiation): (SmolStr, Vec<TypeId>) = {
+        let (type_sym, instantiation): (Symbol, Vec<TypeId>) = {
             let ty = self.arena.get(recv_ty);
             match &ty.kind {
-                TypeKind::Type(d) => (self.decl_name(*d)?.into(), Vec::new()),
-                TypeKind::Generic { decl, args } => (self.decl_name(*decl)?.into(), args.to_vec()),
+                TypeKind::Type(d) => (self.decl_registry.name(*d)?, Vec::new()),
+                TypeKind::Generic { decl, args } => {
+                    (self.decl_registry.name(*decl)?, args.to_vec())
+                }
                 _ => return None,
             }
         };
@@ -2016,7 +2015,7 @@ impl<'a> Cx<'a> {
         // needed) and stashed it on `TypeMembers::deref_return_ty`.
         // The cached `TypeId` is in abstract `GenericParam(T, …)`
         // form — substitute the receiver's instantiation here.
-        let members = self.index.type_members_for(&type_name)?;
+        let members = self.index.type_members.get(&type_sym)?;
         let method_ret = members.deref_return_ty?;
         if instantiation.is_empty() {
             return Some(method_ret);
@@ -2096,17 +2095,17 @@ impl<'a> Cx<'a> {
             ));
             return;
         }
-        let type_name: Option<SmolStr> = match &ty.kind {
+        let type_sym: Option<Symbol> = match &ty.kind {
             // P35.7 — handle-keyed variants read the name from the
             // arena's parallel decl-names table.
-            TypeKind::Type(d) => self.decl_name(*d).map(SmolStr::from),
-            TypeKind::Generic { decl, .. } => self.decl_name(*decl).map(SmolStr::from),
+            TypeKind::Type(d) => self.decl_registry.name(*d),
+            TypeKind::Generic { decl, .. } => self.decl_registry.name(*decl),
             // P16.2 — primitives (`String`, `int`, ...) carry methods
             // declared as `native type String { ... }` in stdlib.
             // Map the primitive back to its name and fall through to
             // the same `type_decls` / `decl_locations` lookup path so
             // `"hello".size()` and friends bind correctly.
-            TypeKind::Primitive(p) => Some(p.name().into()),
+            TypeKind::Primitive(p) => self.index.symbols.lookup(p.name()),
             // `Any` / `Unresolved` / `GenericParam` / `Lambda` / `Null`
             // / `Never` / `Union` — receivers where we either can't
             // know the member set (any is the escape hatch by design,
@@ -2115,26 +2114,25 @@ impl<'a> Cx<'a> {
             // positives onto unrelated upstream errors.
             _ => None,
         };
-        let Some(name) = type_name else {
+        let Some(name_sym) = type_sym else {
             return;
         };
         let prop_sym = self.hir.idents[property].symbol;
-        let prop_text = self.ident_text(property);
 
         // Resolution order: attrs first (local then inherited), methods
         // second (local then inherited). Attrs always win over methods
         // of the same name — the runtime resolves `this.from` to an
         // inherited `from: time` attr even when a `static fn from(...)`
         // is declared on the receiver type.
-        let local_type_decl = self
-            .index
-            .symbols
-            .lookup(name.as_str())
-            .and_then(|sym| self.out.type_decls.get(&sym).copied())
-            .and_then(|id| match &self.hir.decls[id] {
-                Decl::Type(td) => Some(td.clone()),
-                _ => None,
-            });
+        let local_type_decl =
+            self.out
+                .type_decls
+                .get(&name_sym)
+                .copied()
+                .and_then(|id| match &self.hir.decls[id] {
+                    Decl::Type(td) => Some(td.clone()),
+                    _ => None,
+                });
 
         if let Some(type_decl) = local_type_decl.as_ref() {
             for attr_id in &type_decl.attrs {
@@ -2147,7 +2145,7 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        if let Some((uri, attr_id)) = self.index.type_attr_id_chain(&name, prop_text) {
+        if let Some((uri, attr_id)) = self.index.type_attr_id_chain(name_sym, prop_sym) {
             self.out.foreign_member_uses.insert(
                 property,
                 ForeignMember {
@@ -2174,9 +2172,9 @@ impl<'a> Cx<'a> {
             }
         }
         let method_lookup = if instance_access {
-            self.index.type_instance_method_id_chain(&name, prop_text)
+            self.index.type_instance_method_id_chain(name_sym, prop_sym)
         } else {
-            self.index.type_method_id_chain(&name, prop_text)
+            self.index.type_method_id_chain(name_sym, prop_sym)
         };
         if let Some((uri, method_id)) = method_lookup {
             self.out.foreign_member_uses.insert(
@@ -2198,7 +2196,7 @@ impl<'a> Cx<'a> {
         // Real CLI / LSP runs always load stdlib, so this gate only
         // silences synthetic-test cases.
         let known_to_project =
-            local_type_decl.is_some() || self.index.type_members_for(name.as_str()).is_some();
+            local_type_decl.is_some() || self.index.type_members.contains_key(&name_sym);
         if !known_to_project {
             return;
         }
@@ -2210,6 +2208,7 @@ impl<'a> Cx<'a> {
             &self.index.symbols,
             recv_ty,
         );
+        let prop_text = self.ident_text(property);
         let prop_range = self.hir.idents[property].byte_range.clone();
         let (code, kind) = if instance_access {
             ("unknown-member", "member")
@@ -2317,8 +2316,8 @@ impl<'a> Cx<'a> {
             let ret = fnd.return_type?;
             return Some(self.lower_type_ref(ret));
         }
-        let fn_name = self.ident_text(name_idx);
-        if let Some(sig) = self.index.fn_signature_for(fn_name) {
+        let fn_sym = self.hir.idents[name_idx].symbol;
+        if let Some(sig) = self.index.fn_signatures.get(&fn_sym) {
             return Some(sig.return_ty);
         }
         None
@@ -2334,15 +2333,15 @@ impl<'a> Cx<'a> {
     fn qualified_static_call_return(&mut self, chain: &[Idx<Ident>]) -> Option<TypeId> {
         match chain.len() {
             2 => {
-                let fn_name = self.ident_text(chain[1]);
-                let sig = self.index.fn_signature_for(fn_name)?;
+                let fn_sym = self.hir.idents[chain[1]].symbol;
+                let sig = self.index.fn_signatures.get(&fn_sym)?;
                 Some(sig.return_ty)
             }
             3 => {
-                let type_name = self.ident_text(chain[1]);
-                let method_name = self.ident_text(chain[2]);
+                let type_sym = self.hir.idents[chain[1]].symbol;
+                let method_sym = self.hir.idents[chain[2]].symbol;
                 // P19.14 — chain-walking lookup.
-                self.index.type_method_return_chain(type_name, method_name)
+                self.index.type_method_return_chain(type_sym, method_sym)
             }
             _ => None,
         }
@@ -2366,30 +2365,22 @@ impl<'a> Cx<'a> {
             recv_ty
         };
         let recv = self.arena.get(lookup_ty).clone();
-        let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match recv.kind {
-            TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
+        let (type_sym, instantiation): (Symbol, Vec<TypeId>) = match recv.kind {
+            TypeKind::Primitive(p) => (self.index.symbols.lookup(p.name())?, Vec::new()),
             // P35.7 — handle-keyed variants: resolve back to the
-            // decl name via the arena's decl-names table so the
-            // downstream chain-walking lookup (still SmolStr-keyed)
-            // finds the type.
-            TypeKind::Type(decl) => match self.decl_name(decl) {
-                Some(n) => (n.into(), Vec::new()),
-                None => return None,
-            },
+            // decl's Symbol via the registry.
+            TypeKind::Type(decl) => (self.decl_registry.name(decl)?, Vec::new()),
             // P25.7
-            TypeKind::Generic { decl, args } => match self.decl_name(decl) {
-                Some(n) => (n.into(), args.into_vec()),
-                None => return None,
-            },
+            TypeKind::Generic { decl, args } => (self.decl_registry.name(decl)?, args.into_vec()),
             _ => return None,
         };
         // **P19.14** — chain-walking lookup so methods declared on
         // a parent type resolve through a `Sub` receiver.
-        let property_text = self.ident_text(property);
+        let property_sym = self.hir.idents[property].symbol;
         let ret_ty = self
             .index
-            .type_method_return_chain(&type_name, property_text)?;
-        let members = self.index.type_members_for(&type_name)?;
+            .type_method_return_chain(type_sym, property_sym)?;
+        let members = self.index.type_members.get(&type_sym)?;
         let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
         for (i, gp_sym) in members.generics.iter().enumerate() {
             if let Some(arg) = instantiation.get(i) {
@@ -2410,46 +2401,47 @@ impl<'a> Cx<'a> {
         if chain.len() < 2 {
             return;
         }
-        // Snapshot decl-location: the &Uri from `locate_decl` borrows
-        // `self.index`, so we'd otherwise collide with the `&mut
-        // self.out` insert below. Cloning the Uri is the necessary
-        // owned copy here, not the laziness kind.
-        // Intentionally namespace-agnostic: `chain[1]` in a
-        // `module::Decl(::member)` shape may be either a type or a
-        // value (free fn invoked as `module::fn(args)`). Downstream
-        // `type_members_for` disambiguates by member kind.
-        let (host_uri, host_decl_id) =
-            match self.index.locate_decl(self.ident_text(chain[1])).first() {
-                Some((uri, decl_id, _)) => (uri.clone(), *decl_id),
-                None => return,
-            };
+        let (host_uri, host_decl_id) = match self
+            .index
+            .locate_decl(self.hir.idents[chain[1]].symbol)
+            .first()
+        {
+            Some((uri, decl_id, _)) => (uri, *decl_id),
+            None => return,
+        };
         self.out.foreign_decl_uses.insert(
             chain[1],
             ForeignDecl {
-                uri: host_uri,
+                uri: host_uri.clone(),
                 decl: host_decl_id,
             },
         );
         if chain.len() == 3 {
-            // Resolve the (uri, member) pair without holding an
-            // `&self.index` borrow across the `&mut self.out` insert.
+            // Resolve the (uri, member) pair
+            let type_ident = self.ident(chain[1]);
             let resolved = self
                 .index
-                .type_members_for(self.ident_text(chain[1]))
+                .type_members
+                .get(&type_ident.symbol)
                 .and_then(|members| {
-                    let prop = &self.index.symbols[self.hir.idents[chain[2]].symbol];
-                    if let Some(attr_id) = members.attr_id(&self.index.symbols, prop) {
-                        Some((members.home_uri.clone(), MemberDef::Attr(attr_id)))
+                    let prop = self.hir.idents[chain[2]].symbol;
+                    if let Some(attr_id) = members.attrs.get(&prop) {
+                        Some((&members.home_uri, MemberDef::Attr(*attr_id)))
                     } else {
                         members
-                            .method_id(&self.index.symbols, prop)
-                            .map(|decl_id| (members.home_uri.clone(), MemberDef::Method(decl_id)))
+                            .methods
+                            .get(&prop)
+                            .map(|decl_id| (&members.home_uri, MemberDef::Method(*decl_id)))
                     }
                 });
             if let Some((uri, member)) = resolved {
-                self.out
-                    .foreign_member_uses
-                    .insert(chain[2], ForeignMember { uri, member });
+                self.out.foreign_member_uses.insert(
+                    chain[2],
+                    ForeignMember {
+                        uri: uri.clone(),
+                        member,
+                    },
+                );
             }
         }
     }
@@ -2468,7 +2460,7 @@ impl<'a> Cx<'a> {
     /// (the analyzer never crosses module boundaries during the
     /// body walk).
     fn static_value_type(&mut self, recv_ty: TypeId, property: Idx<Ident>) -> Option<TypeId> {
-        let prop_text = &self.index.symbols[self.hir.idents[property].symbol];
+        let prop_sym = self.hir.idents[property].symbol;
         if let Some(MemberDef::Attr(attr_id)) = self.out.member_uses.get(&property).copied() {
             let attr = &self.hir.type_attrs[attr_id];
             if attr.modifiers.static_ {
@@ -2485,28 +2477,25 @@ impl<'a> Cx<'a> {
             // Cross-module attr — consult `static_attrs` for the
             // receiver's type. The receiver is the `Type::` part
             // of the static expr; we have its lowered TypeId.
-            let owner_name: Option<SmolStr> = match &self.arena.get(recv_ty).kind {
-                TypeKind::Type(d) => self.decl_name(*d).map(SmolStr::from),
-                TypeKind::Generic { decl, .. } => self.decl_name(*decl).map(SmolStr::from),
-                TypeKind::Enum { name, .. } => Some(SmolStr::from(&self.index.symbols[*name])),
+            let owner_sym: Option<Symbol> = match &self.arena.get(recv_ty).kind {
+                TypeKind::Type(d) => self.decl_registry.name(*d),
+                TypeKind::Generic { decl, .. } => self.decl_registry.name(*decl),
+                TypeKind::Enum { name, .. } => Some(*name),
                 // **P19.14** — primitives carry static methods /
                 // attrs in stdlib (`time::max`, `int::max`, etc.);
                 // map them to the stdlib type name so the
                 // static-attr lookup hits.
-                TypeKind::Primitive(p) => Some(p.name().into()),
+                TypeKind::Primitive(p) => self.index.symbols.lookup(p.name()),
                 _ => None,
             };
-            if let Some(name) = owner_name
-                && let Some(members) = self.index.type_members_for(&name)
+            if let Some(sym) = owner_sym
+                && let Some(members) = self.index.type_members.get(&sym)
+                && members.static_attrs.contains(&prop_sym)
             {
-                let prop_sym = self.index.symbol(prop_text);
-                let is_static = prop_sym.is_some_and(|s| members.static_attrs.contains(&s));
-                if is_static {
-                    if let Some(ty) = members.attr_ty(&self.index.symbols, prop_text) {
-                        return Some(ty);
-                    }
-                    return Some(self.any_nullable());
+                if let Some(ty) = members.attr_types.get(&prop_sym).copied() {
+                    return Some(ty);
                 }
+                return Some(self.any_nullable());
             }
             return Some(self.field_ty());
         }
@@ -2535,52 +2524,48 @@ impl<'a> Cx<'a> {
     fn qualified_static_value_type(&mut self, chain: &[Idx<Ident>]) -> Option<TypeId> {
         match chain.len() {
             2 => {
-                let name = self.ident_text(chain[1]);
-                if self.index.contains_fn_signature(name) {
+                let sym = self.hir.idents[chain[1]].symbol;
+                if self.index.fn_signatures.contains_key(&sym) {
                     Some(self.function_ty())
-                } else if self.index.contains_value(name) {
+                } else if self.index.values.contains(&sym) {
                     // Non-native fn (`private fn foo()` or fn without
                     // declared return type) — present in `values` but
                     // skipped from `fn_signatures`. The runtime still
                     // treats `module::fn_name` as a function ref, so
                     // type it as `function` (not `type`).
                     Some(self.function_ty())
-                } else if self.index.contains_type_member(name) || self.index.has_name(name) {
+                } else if self.index.type_members.contains_key(&sym) || self.index.has_name(sym) {
                     Some(self.type_ty())
                 } else {
                     None
                 }
             }
             3 => {
-                let type_name = self.ident_text(chain[1]).to_string();
-                let member_name = self.ident_text(chain[2]).to_string();
+                let type_sym = self.hir.idents[chain[1]].symbol;
+                let member_sym = self.hir.idents[chain[2]].symbol;
                 // Enum variant: `module::Foo::a` types as `Foo` (the
                 // enum), matching the analyzer's `Static` enum-variant
                 // arm so call-arg validation against `_: Foo` passes.
-                if let Some(ty_id) = self.index.enum_type_for(&type_name)
+                if let Some(ty_id) = self.index.enum_types.get(&type_sym).copied()
                     && let TypeKind::Enum { variants, .. } = &self.arena.get(ty_id).kind
-                    && let Some(member_sym) = self.index.symbols.lookup(&member_name)
                     && variants.contains(&member_sym)
                 {
                     return Some(ty_id);
                 }
-                let members = self.index.type_members_for(&type_name)?;
-                if members
-                    .method_id(&self.index.symbols, &member_name)
-                    .is_some()
-                {
+                let members = self.index.type_members.get(&type_sym)?;
+                if members.methods.contains_key(&member_sym) {
                     Some(self.function_ty())
-                } else if members.attr_id(&self.index.symbols, &member_name).is_some() {
+                } else if members.attrs.contains_key(&member_sym) {
                     // P19.13 — static-attr value access from a
                     // `module::Type::name` chain. Returns the
                     // attr's declared type for static attrs;
                     // `field` handle otherwise.
-                    let prop_sym = self.index.symbol(&member_name);
-                    let is_static = prop_sym.is_some_and(|s| members.static_attrs.contains(&s));
-                    if is_static {
+                    if members.static_attrs.contains(&member_sym) {
                         Some(
                             members
-                                .attr_ty(&self.index.symbols, &member_name)
+                                .attr_types
+                                .get(&member_sym)
+                                .copied()
                                 .unwrap_or_else(|| self.any_nullable()),
                         )
                     } else {
@@ -2613,19 +2598,12 @@ impl<'a> Cx<'a> {
         // Attr — extract receiver shape (need owned name + args because
         // the arena entry borrow has to drop before we re-borrow as
         // mutable for `substitute`).
-        let (type_name, instantiation): (SmolStr, Vec<TypeId>) = match &self.arena.get(recv_ty).kind
-        {
+        let (type_sym, instantiation): (Symbol, Vec<TypeId>) = match &self.arena.get(recv_ty).kind {
             // P35.7 — handle-keyed variants.
-            TypeKind::Type(d) => match self.decl_name(*d) {
-                Some(n) => (n.into(), Vec::new()),
-                None => return None,
-            },
+            TypeKind::Type(d) => (self.decl_registry.name(*d)?, Vec::new()),
             // P25.7
-            TypeKind::Generic { decl, args } => match self.decl_name(*decl) {
-                Some(n) => (n.into(), args.to_vec()),
-                None => return None,
-            },
-            TypeKind::Primitive(p) => (p.name().into(), Vec::new()),
+            TypeKind::Generic { decl, args } => (self.decl_registry.name(*decl)?, args.to_vec()),
+            TypeKind::Primitive(p) => (self.index.symbols.lookup(p.name())?, Vec::new()),
             _ => return None,
         };
         // Build the substitution map *before* mutably borrowing the
@@ -2633,13 +2611,13 @@ impl<'a> Cx<'a> {
         // **P19.14** — chain-walking lookup so attrs declared on a
         // parent type (`type Sub extends Super { ... }`) resolve
         // when accessed through a `Sub` receiver.
-        let property_text = &self.index.symbols[self.hir.idents[property].symbol];
+        let property_sym = self.hir.idents[property].symbol;
         let (attr_ty, subst) = {
-            let attr_ty = self.index.type_attr_ty_chain(&type_name, property_text)?;
+            let attr_ty = self.index.type_attr_ty_chain(type_sym, property_sym)?;
             // Generic substitution is driven by the *receiver type*'s
             // own generic params, not the parent's — `node<Foo<int>>`
             // accessing a `Foo`-declared attr substitutes `T → int`.
-            let members = self.index.type_members_for(&type_name)?;
+            let members = self.index.type_members.get(&type_sym)?;
             let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
             for (i, gp_sym) in members.generics.iter().enumerate() {
                 if let Some(arg) = instantiation.get(i) {
@@ -2661,18 +2639,17 @@ impl<'a> Cx<'a> {
     // declaration shadows the project-wide index. Returns `None`
     // for non-generic decls (arity 0) — those go through the
     // existing non-generic branches.
-    fn generic_arity_for(&self, name: &str) -> Option<usize> {
+    fn generic_arity_for(&self, name_sym: Symbol) -> Option<usize> {
         use greycat_analyzer_hir::types::Decl;
         // Local: find the decl by name and inspect its generics.
-        if let Some(name_sym) = self.index.symbols.lookup(name)
-            && let Some(decl_id) = self.out.type_decls.get(&name_sym)
+        if let Some(decl_id) = self.out.type_decls.get(&name_sym)
             && let Decl::Type(td) = &self.hir.decls[*decl_id]
             && !td.generics.is_empty()
         {
             return Some(td.generics.len());
         }
         // Foreign: project-index pre-lowered generics list.
-        let arity = self.index.type_members_for(name)?.generics.len();
+        let arity = self.index.type_members.get(&name_sym)?.generics.len();
         (arity > 0).then_some(arity)
     }
 
@@ -2719,7 +2696,7 @@ impl<'a> Cx<'a> {
                     // bare `Named`, so call-site inference can record
                     // witnesses for it.
                     self.arena.generic_param(name_sym, owner)
-                } else if let Some(arity) = self.generic_arity_for(&name) {
+                } else if let Some(arity) = self.generic_arity_for(name_sym) {
                     // Raw-form generic reference: `Tensor` (no params)
                     // is equivalent to `Tensor<any?, any?>` per the
                     // language semantics ("`nodeIndex {}` ===
@@ -2739,7 +2716,7 @@ impl<'a> Cx<'a> {
                     }
                 } else if let Some(id) = self.out.registry.lookup(name_sym) {
                     id
-                } else if let Some(enum_id) = self.index.enum_type_for(&name) {
+                } else if let Some(enum_id) = self.index.enum_types.get(&name_sym).copied() {
                     // P19.10 — canonical enum TypeId from the
                     // project signature index. Same reason as
                     // `lower_type_ref_project`: a cross-module enum
@@ -2934,11 +2911,11 @@ impl<'a> Cx<'a> {
             .qualifier
             .last()
             .expect("lower_qualified_type_ref called with empty qualifier");
-        let module_name = self.ident_text(module_segment).to_string();
+        let module_sym = self.hir.idents[module_segment].symbol;
         let leaf_sym = self.hir.idents[tr.name].symbol;
         let byte_span = (tr.byte_range.start, tr.byte_range.end);
 
-        let Some(module_uri) = self.index.module_uri(&module_name).cloned() else {
+        let Some(module_uri) = self.index.module_names.get(&module_sym).cloned() else {
             // Qualifier doesn't name a known module — the resolver
             // already flagged it as unresolved. Surface the leaf as
             // an Unresolved type so downstream typing doesn't cascade.
@@ -3050,8 +3027,8 @@ impl<'a> Cx<'a> {
                 // `abs<T>(x: T): T` typed every call as `T`
                 // (GenericParam) and downstream arithmetic on the
                 // result fell through to `any`.
-                let fn_name = self.ident_text(name_idx);
-                let sig = self.index.fn_signature_for(fn_name)?;
+                let fn_sym = self.hir.idents[name_idx].symbol;
+                let sig = self.index.fn_signatures.get(&fn_sym)?;
                 if sig.generics.is_empty() {
                     return None;
                 }
@@ -3176,7 +3153,7 @@ impl<'a> Cx<'a> {
         // "too depth inheritance: <name>". Surface it as a structural
         // error at the type's declaration site so the user sees the
         // problem before they hit `greycat build`.
-        let chain_len = self.index.supertype_chain_length(&type_name);
+        let chain_len = self.index.supertype_chain_length(type_name_sym);
         if chain_len > crate::stdlib::ProjectIndex::MAX_INHERITANCE_DEPTH {
             let limit = crate::stdlib::ProjectIndex::MAX_INHERITANCE_DEPTH;
             let span = d
@@ -4683,11 +4660,11 @@ impl<'a> Cx<'a> {
                     // through to `index.has_name` (vars are in
                     // `values`) and type as `type`, breaking
                     // for-in iteration over the foreign var.
-                    let name = self.ident_text(idx);
-                    if let Some(var_ty) = self.index.var_type_for(name) {
+                    let sym = self.hir.idents[idx].symbol;
+                    if let Some(var_ty) = self.index.var_types.get(&sym).copied() {
                         var_ty
-                    } else if self.index.contains_fn_signature(name)
-                        || self.index.contains_non_native_fn(name)
+                    } else if self.index.fn_signatures.contains_key(&sym)
+                        || self.index.non_native_fn_names.contains(&sym)
                     {
                         // P38.1 — native fns live in `fn_signatures`,
                         // non-native (user / stdlib `.gcl`) fns in
@@ -4696,7 +4673,8 @@ impl<'a> Cx<'a> {
                         // bare; only the `type_ty()` fallback below
                         // remains for genuine type / enum names.
                         self.function_ty()
-                    } else if self.index.contains_type_member(name) || self.index.has_name(name) {
+                    } else if self.index.type_members.contains_key(&sym) || self.index.has_name(sym)
+                    {
                         self.type_ty()
                     } else {
                         self.any_nullable()
@@ -4708,9 +4686,11 @@ impl<'a> Cx<'a> {
                     // type the runtime owns; without this lookup the
                     // body walker would type them as `any` and float
                     // dispatch downstream would fail.
-                    let name = self.ident_text(idx);
+                    let sym = self.hir.idents[idx].symbol;
                     self.index
-                        .runtime_global_for(name)
+                        .runtime_globals
+                        .get(&sym)
+                        .copied()
                         .unwrap_or_else(|| self.any_nullable())
                 }
                 Some(Definition::Generic(_)) | None => self.any_nullable(),

@@ -394,11 +394,11 @@ pub fn goto_implementation_across_project(
             let Decl::Type(td) = &module.hir.decls[*decl_id] else {
                 continue;
             };
-            let candidate_type = &project.symbols()[module.hir.idents[td.name].symbol];
-            if !project
-                .index
-                .is_subtype_of(candidate_type, declaring_type.as_str())
-            {
+            let candidate_sym = module.hir.idents[td.name].symbol;
+            let Some(declaring_sym) = project.symbols().lookup(declaring_type.as_str()) else {
+                continue;
+            };
+            if !project.index.is_subtype_of(candidate_sym, declaring_sym) {
                 continue;
             }
             for method_id in &td.methods {
@@ -465,8 +465,14 @@ pub fn goto_declaration_across_project(
     };
 
     let ancestor = project
-        .index
-        .find_abstract_ancestor_method(declaring_type.as_str(), cursor_text.as_str());
+        .symbols()
+        .lookup(declaring_type.as_str())
+        .zip(project.symbols().lookup(cursor_text.as_str()))
+        .and_then(|(declaring_sym, method_sym)| {
+            project
+                .index
+                .find_abstract_ancestor_method(declaring_sym, method_sym)
+        });
     let Some((foreign_uri, decl_id)) = ancestor else {
         // No abstract ancestor — fall through to goto-definition so
         // the client still produces a useful jump for the cursor.
@@ -547,6 +553,7 @@ fn type_implementations(
     manager: &SourceManager,
     target_type: &str,
 ) -> Option<GotoDefinitionResponse> {
+    let target_sym = project.symbols().lookup(target_type)?;
     let mut locations = Vec::new();
     for (uri, module) in project.iter() {
         let Some(module_root) = module.hir.module.as_ref() else {
@@ -565,8 +572,8 @@ fn type_implementations(
             if td.modifiers.abstract_ || td.modifiers.native {
                 continue;
             }
-            let candidate = &project.symbols()[module.hir.idents[td.name].symbol];
-            if !project.index.is_subtype_of(candidate, target_type) {
+            let candidate_sym = module.hir.idents[td.name].symbol;
+            if !project.index.is_subtype_of(candidate_sym, target_sym) {
                 continue;
             }
             locations.push(Location {

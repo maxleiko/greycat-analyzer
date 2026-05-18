@@ -1372,7 +1372,9 @@ fn lint_arrow_on_non_deref_inner(
             continue;
         };
         if index
-            .type_flags_for(&name)
+            .symbols
+            .lookup(&name)
+            .and_then(|sym| index.type_flags.get(&sym))
             .is_some_and(|f| f.deref.is_some())
         {
             continue;

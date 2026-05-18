@@ -307,10 +307,10 @@ impl ProjectAnalysis {
             TypeKind::Generic { decl, args } if !args.is_empty() => (*decl, args.clone()),
             _ => return None,
         };
-        let name = self.decl_name(decl_id)?;
+        let name_sym = self.decl_registry.name(decl_id)?;
         let (foreign_uri, foreign_decl_id) = self
             .index
-            .locate_decl_in_ns(name, crate::stdlib::Namespace::Type)
+            .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
             .next()?;
         let fmod = self.module(foreign_uri)?;
         let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id] else {
@@ -825,17 +825,17 @@ fn write_decl_qualified(
     project: &ProjectAnalysis,
     decl: TypeDeclId,
 ) -> std::fmt::Result {
-    let Some(name) = project.decl_name(decl) else {
+    let Some(name_sym) = project.decl_registry.name(decl) else {
         return write!(f, "<unregistered decl {}>", decl.raw());
     };
-    if project.index.locate_decl(name).len() > 1
+    if project.index.locate_decl(name_sym).len() > 1
         && let Some((uri, _)) = project.decl_registry.resolve(decl)
         && let Some(module) = crate::stdlib::module_name_from_uri(uri)
     {
         f.write_str(&module)?;
         f.write_str("::")?;
     }
-    f.write_str(name)
+    f.write_str(&project.index.symbols[name_sym])
 }
 
 // P19.6
@@ -1142,8 +1142,10 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
         if method_name.is_empty() {
             continue;
         }
-        let type_name = &index.symbols[*type_sym];
-        if let Some(ret) = index.type_method_return_chain(type_name, method_name) {
+        let Some(method_sym) = index.symbols.lookup(method_name) else {
+            continue;
+        };
+        if let Some(ret) = index.type_method_return_chain(*type_sym, method_sym) {
             resolutions.insert(*type_sym, ret);
         }
     }
@@ -3168,7 +3170,7 @@ fn resolve_qualified_chain(
     let module_name_sym = cur.hir.idents[chain[0]].symbol;
     let type_name_sym = cur.hir.idents[chain[1]].symbol;
     let member_name_sym = cur.hir.idents[chain[2]].symbol;
-    let module_uri = index.module_uri(&index.symbols[module_name_sym])?.clone();
+    let module_uri = index.module_names.get(&module_name_sym)?.clone();
     let foreign = modules.get(&module_uri)?;
     let foreign_root = foreign.hir.module.as_ref()?;
     // Look for the named decl — could be a `type` or `enum`.
@@ -3972,7 +3974,8 @@ fn lower_type_ref_project(
             } else if let Some(owner) = generics_in_scope.get(&name_sym) {
                 arena.generic_param(name_sym, *owner)
             } else if let Some(arity) = index
-                .type_members_for(name)
+                .type_members
+                .get(&name_sym)
                 .map(|m| m.generics.len())
                 .filter(|n| *n > 0)
             {
@@ -3987,7 +3990,7 @@ fn lower_type_ref_project(
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
-            } else if let Some(enum_id) = index.enum_type_for(name) {
+            } else if let Some(enum_id) = index.enum_types.get(&name_sym).copied() {
                 // P19.10 — canonical enum TypeId from S7-S11.
                 // Without this, a cross-module enum reference would
                 // mint `Named(name)` (kind != Enum), which breaks
@@ -4031,7 +4034,7 @@ pub fn resolve_decl_handle(
     let name_sym = index.symbols.lookup(name)?;
     // Type-namespace only: this mints a [`TypeDeclId`], so a
     // same-named `Fn` / `Var` decl must never be returned.
-    for (uri, _) in index.locate_decl_in_ns(name, crate::stdlib::Namespace::Type) {
+    for (uri, _) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
         if let Some(h) = decl_registry.lookup(uri, name_sym) {
             return Some(h);
         }
@@ -4154,7 +4157,7 @@ fn lower_type_ref_id(
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
-            } else if let Some(arity) = generic_arity_for(name, hir, type_decls, index) {
+            } else if let Some(arity) = generic_arity_for(name_sym, hir, type_decls, index) {
                 // Raw-form generic reference: `Tensor` (no params)
                 // ≡ `Tensor<any?, any?>`. Expand here so the
                 // validation pass and the body walker's
@@ -4167,7 +4170,7 @@ fn lower_type_ref_id(
                 }
             } else if let Some(id) = registry.lookup(name_sym) {
                 id
-            } else if let Some(enum_id) = index.enum_type_for(name) {
+            } else if let Some(enum_id) = index.enum_types.get(&name_sym).copied() {
                 // Canonical enum TypeId from S7-S11. The body walker's
                 // `lower_type_ref` and `lower_type_ref_project` both
                 // hit this branch ahead of `resolve_decl_handle`; the
@@ -4203,19 +4206,18 @@ fn lower_type_ref_id(
 /// index. Returns `None` for non-generic decls (arity 0) so the
 /// caller can fall through to the non-generic branches.
 fn generic_arity_for(
-    name: &str,
+    name_sym: Symbol,
     hir: &greycat_analyzer_hir::Hir,
     type_decls: &rustc_hash::FxHashMap<Symbol, Idx<Decl>>,
     index: &ProjectIndex,
 ) -> Option<usize> {
-    if let Some(name_sym) = index.symbols.lookup(name)
-        && let Some(decl_id) = type_decls.get(&name_sym)
+    if let Some(decl_id) = type_decls.get(&name_sym)
         && let Decl::Type(td) = &hir.decls[*decl_id]
         && !td.generics.is_empty()
     {
         return Some(td.generics.len());
     }
-    let arity = index.type_members_for(name)?.generics.len();
+    let arity = index.type_members.get(&name_sym)?.generics.len();
     (arity > 0).then_some(arity)
 }
 
@@ -4378,8 +4380,9 @@ mod tests {
         mgr.add_simple(uri("/proj/main.gcl"), "fn f() {}\n", "p", false);
 
         let pa = ProjectAnalysis::analyze(&mgr);
+        let point_sym = pa.index.symbols.lookup("Point").expect("Point interned");
         assert!(
-            pa.index.has_name("Point"),
+            pa.index.has_name(point_sym),
             "shared index should know about Point declared in another module"
         );
     }
@@ -4491,9 +4494,11 @@ mod tests {
         );
         let mut pa = ProjectAnalysis::analyze(&mgr);
         assert_eq!(pa.sig_cache_len(), 2, "both modules cached after rebuild");
+        let pair_sym = pa.index.symbols.lookup("Pair").expect("Pair interned");
         let cached_attrs_before = pa
             .index
-            .type_members_for("Pair")
+            .type_members
+            .get(&pair_sym)
             .map(|tm| tm.attr_types.len())
             .unwrap_or(0);
 
@@ -4512,7 +4517,8 @@ mod tests {
         );
         let cached_attrs_after = pa
             .index
-            .type_members_for("Pair")
+            .type_members
+            .get(&pair_sym)
             .map(|tm| tm.attr_types.len())
             .unwrap_or(0);
         assert_eq!(
@@ -4536,7 +4542,8 @@ mod tests {
             false,
         );
         let mut pa = ProjectAnalysis::analyze(&mgr);
-        assert!(pa.index.contains_fn_signature("a"));
+        let a_sym = pa.index.symbols.lookup("a").expect("a interned");
+        assert!(pa.index.fn_signatures.contains_key(&a_sym));
 
         // Change the return type — signature hash must differ.
         mgr.add_simple(
@@ -4548,7 +4555,8 @@ mod tests {
         pa.invalidate(&mgr, &uri("/proj/a.gcl"));
         let sig = pa
             .index
-            .fn_signature_for("a")
+            .fn_signatures
+            .get(&a_sym)
             .expect("a sig present after invalidate");
         let display = pa.display_type(sig.return_ty).to_string();
         assert!(

@@ -261,7 +261,8 @@ fn module_stem_from_uri(uri: &Uri) -> Option<String> {
 /// `runtime.gcl`, etc. Returns `None` for builtins / unresolved names;
 /// callers fall back to `core` (matches TS).
 fn home_lib_for(index: &ProjectIndex, name: &str) -> Option<String> {
-    let locs = index.locate_decl(name);
+    let sym = index.symbols.lookup(name)?;
+    let locs = index.locate_decl(sym);
     locs.first()
         .and_then(|(uri, _, _)| module_stem_from_uri(uri))
 }
