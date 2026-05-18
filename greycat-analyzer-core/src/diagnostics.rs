@@ -597,7 +597,7 @@ pub fn print_compact_diagnostic(path: &str, diag: &Diagnostic, color: bool) -> S
             Some(DiagnosticSeverity::WARNING) => "\x1b[33m", // bold yellow
             Some(DiagnosticSeverity::INFORMATION) => "\x1b[34m", // bold blue
             Some(DiagnosticSeverity::HINT) => "\x1b[36m",  // bold cyan
-            _ => "\x1b[1m",                                  // bold
+            _ => "\x1b[1m",                                // bold
         };
         let reset = "\x1b[0m";
         let grey = "\x1b[90m";
@@ -1075,7 +1075,10 @@ mod tests {
             message: "boom".into(),
             ..Default::default()
         };
-        assert_eq!(print_compact_diagnostic("a.gcl", &diag, false), "a.gcl:5:8: error: boom");
+        assert_eq!(
+            print_compact_diagnostic("a.gcl", &diag, false),
+            "a.gcl:5:8: error: boom"
+        );
     }
 
     /// When a diagnostic carries a `code`, the cli line includes
@@ -1130,7 +1133,7 @@ mod tests {
         let out = print_compact_diagnostic("a.gcl", &diag, true);
         assert_eq!(
             out,
-            "\x1b[90ma.gcl:1:1:\x1b[0m \x1b[1;31merror[unknown-member]\x1b[0m: boom"
+            "\x1b[90ma.gcl:1:1:\x1b[0m \x1b[31merror[unknown-member]\x1b[0m: boom"
         );
     }
 }
