@@ -1113,6 +1113,7 @@ fn ident_or_keyword_completion(
                 project.decl_registry(),
                 project.symbols(),
                 &source,
+                uri,
             );
             items.push(CompletionItem {
                 label: name.clone(),
@@ -1329,6 +1330,7 @@ fn scope_name_meta(
     decl_registry: &crate::well_known::DeclRegistry,
     symbols: &SymbolTable,
     source: &NameSource,
+    uri: &Uri,
 ) -> (
     Option<CompletionItemLabelDetails>,
     Option<String>,
@@ -1343,6 +1345,12 @@ fn scope_name_meta(
             // popup-row suffix, ignoring `label_details.detail`).
             // Hover provides the full source-form signature, so the
             // duplication isn't a regression.
+            //
+            // For types / enums / vars `render_decl_signature` would
+            // just repeat the label (`type Reader` next to label
+            // `Reader`), wasting popup-row width. Surface the home
+            // module's stem instead so the row distinguishes
+            // same-named decls from different modules.
             let (label_details, detail) = match decl {
                 Decl::Fn(fnd) => {
                     let compact = render_fn_signature_compact(&module.hir, symbols, fnd, None);
@@ -1352,6 +1360,16 @@ fn scope_name_meta(
                             description: None,
                         }),
                         Some(compact),
+                    )
+                }
+                Decl::Type(_) | Decl::Enum(_) | Decl::Var(_) => {
+                    let module_label = module_label_for_uri(uri);
+                    (
+                        Some(CompletionItemLabelDetails {
+                            detail: None,
+                            description: Some(module_label.clone()),
+                        }),
+                        Some(module_label),
                     )
                 }
                 _ => (
@@ -1401,23 +1419,26 @@ fn foreign_decl_completion_meta(
     let decl = &m.hir.decls[*decl_id];
     let documentation = doc_to_markup(decl_doc(decl));
     let description = module_label_for_uri(uri);
-    // Mirror the compact form into `detail` for fns so Zed's popup
-    // row reads `name(args): Ret` instead of `name <full sig>`. The
-    // VSCode path uses `label_details.detail` (rendered inline next
-    // to label); Zed ignores `label_details.detail` and shows
-    // `detail`. Hover keeps the full source-form signature.
-    let (compact, detail) = match decl {
+    // Fns: mirror the compact `(args): Ret` form into both
+    //   `label_details.detail` (VSCode reads this) and `detail`
+    //   (Zed reads this). Hover keeps the full source-form signature.
+    // Types / enums / vars: `render_decl_signature` would just
+    //   repeat the label (`type Reader` next to label `Reader`).
+    //   Surface the home module's stem in `detail` instead — that's
+    //   the useful signal for disambiguating same-named decls.
+    let (compact_inline, detail) = match decl {
         Decl::Fn(fnd) => {
             let c = render_fn_signature_compact(&m.hir, project.symbols(), fnd, None);
             (Some(c.clone()), Some(c))
         }
+        Decl::Type(_) | Decl::Enum(_) | Decl::Var(_) => (None, Some(description.clone())),
         _ => (
             None,
             Some(render_decl_signature(&m.hir, project.symbols(), decl, None)),
         ),
     };
     let label_details = Some(CompletionItemLabelDetails {
-        detail: compact,
+        detail: compact_inline,
         description: Some(description),
     });
     (label_details, detail, documentation)
@@ -2446,6 +2467,16 @@ fn static_completion(
                             description: None,
                         }),
                         Some(compact),
+                    )
+                }
+                Decl::Type(_) | Decl::Enum(_) | Decl::Var(_) => {
+                    let module_label = module_label_for_uri(&mod_uri);
+                    (
+                        Some(CompletionItemLabelDetails {
+                            detail: None,
+                            description: Some(module_label.clone()),
+                        }),
+                        Some(module_label),
                     )
                 }
                 _ => (

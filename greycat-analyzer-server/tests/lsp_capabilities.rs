@@ -2460,10 +2460,16 @@ fn completion_cross_module_decl_carries_signature_and_module_label() {
         .iter()
         .find(|i| i.label == "groups")
         .expect("`groups` should appear");
+    // `detail` for foreign types / enums / vars is the home module
+    // label, not `render_decl_signature`. Repeating `var groups: …`
+    // next to a label of `groups` just wastes popup-row width; the
+    // module name is the useful signal for disambiguating same-
+    // named decls across modules. The full signature is still
+    // available via hover.
     assert_eq!(
         groups.detail.as_deref(),
-        Some("var groups: nodeIndex<String, node<Group>>"),
-        "expected the foreign var's full signature in detail; got {:?}",
+        Some("model"),
+        "expected the home module label in detail; got {:?}",
         groups.detail
     );
     assert_eq!(
@@ -3214,10 +3220,12 @@ fn completion_member_items_carry_detail_and_documentation() {
         .iter()
         .find(|i| i.label == "get")
         .expect("`get` method should appear");
+    // Compact `(args): Ret` form; `fn` keyword and modifiers live
+    // in hover, not in the popup row.
     assert_eq!(
         get.detail.as_deref(),
-        Some("fn get(): String"),
-        "expected the rendered method signature"
+        Some("(): String"),
+        "expected compact method signature in detail"
     );
     let get_doc = match get.documentation.as_ref() {
         Some(Documentation::MarkupContent(c)) => c.value.clone(),
@@ -3262,11 +3270,14 @@ fn completion_static_items_carry_detail_and_documentation() {
         .iter()
         .find(|i| i.label == "make")
         .expect("`make` static method should appear");
+    // `detail` carries the compact `(args): Ret` form (mirrored
+    // from `label_details.detail` for Zed). Modifiers / `fn`
+    // keyword live in hover, not in the popup row.
     assert!(
         make.detail
             .as_deref()
-            .is_some_and(|d| d.contains("static fn make()") && d.contains(": Box")),
-        "expected static method signature in detail; got {:?}",
+            .is_some_and(|d| d.starts_with("()") && d.contains(": Box")),
+        "expected compact static-method signature in detail; got {:?}",
         make.detail
     );
     let make_doc = match make.documentation.as_ref() {
