@@ -2210,6 +2210,77 @@ impl<'a> Cx<'a> {
         self.resolve_member_with(recv_ty, property, true);
     }
 
+    /// Check the LHS of an `=` / `?=` for assignment to a `private`
+    /// attr. GreyCat's `private` on an attr is read-public / write-
+    /// private — direct assignment `obj.attr = x` from outside the
+    /// type's constructor is illegal. The constructor uses
+    /// `Foo { attr: 1 }` syntax (an `Expr::Object`), which is a
+    /// different AST node — `Expr::Binary(op="=")` LHS being a
+    /// member access is always the disallowed shape.
+    fn check_private_attr_write(&mut self, lhs: Idx<Expr>) {
+        let property = match &self.hir.exprs[lhs] {
+            Expr::Member(m) => m.property.ident(),
+            Expr::Arrow(m) => m.property.ident(),
+            _ => return,
+        };
+        // Local attr — read `private` directly off the resolved HIR.
+        let is_private_local = self
+            .out
+            .member_uses
+            .get(&property)
+            .and_then(|m| match m {
+                MemberDef::Attr(attr_id) => Some(*attr_id),
+                _ => None,
+            })
+            .is_some_and(|attr_id| self.hir.type_attrs[attr_id].modifiers.private);
+        // Foreign attr — chain-walk `private_attrs` from the receiver's
+        // ItemId. The cross-module decl's HIR isn't directly reachable
+        // from here; the per-type `private_attrs` set is the bridge.
+        let is_private_foreign = (|| {
+            let foreign = self.out.foreign_member_uses.get(&property)?;
+            if !matches!(foreign.member, MemberDef::Attr(_)) {
+                return None;
+            }
+            let prop_sym = self.hir.idents[property].symbol;
+            // Walk from the receiver's type to find the chain level
+            // that owns the attr; check that level's `private_attrs`.
+            let recv = match &self.hir.exprs[lhs] {
+                Expr::Member(m) => m.receiver,
+                Expr::Arrow(m) => m.receiver,
+                _ => return None,
+            };
+            let recv_ty = self.out.expr_types.get(&recv).copied()?;
+            let recv_id = match &self.arena.get(recv_ty).kind {
+                TypeKind::Type(d) => *d,
+                TypeKind::Generic { decl, .. } => *decl,
+                TypeKind::Primitive(p) => {
+                    let core_mod = self.index.symbols.intern("core");
+                    let pname = self.index.symbols.intern(p.name());
+                    ItemId::new(core_mod, pname)
+                }
+                _ => return None,
+            };
+            // Walk supertype chain looking for the level whose
+            // `private_attrs` claims this attr.
+            let members = self.index.walk_chain_for_private_attr(recv_id, prop_sym)?;
+            members.private_attrs.contains(&prop_sym).then_some(())
+        })()
+        .is_some();
+        if !is_private_local && !is_private_foreign {
+            return;
+        }
+        let prop_text = self.ident_text(property);
+        let span = self.hir.idents[property].byte_range.clone();
+        self.out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            "private-attr-write",
+            format!(
+                "attribute `{prop_text}` is `private` — only the type's constructor (`Foo {{ {prop_text}: ... }}`) can write to it; direct assignment is forbidden",
+            ),
+            span,
+        ));
+    }
+
     // P23
     /// Inline call-return typing for Member / Arrow /
     /// Static callees. Looks up the method's pre-lowered return
@@ -2299,10 +2370,19 @@ impl<'a> Cx<'a> {
             let ret = fnd.return_type?;
             return Some(self.lower_type_ref(ret));
         }
-        // Bare-name fallback: walk every non-private fn-namespace
-        // candidate; first match wins. Same shape as
-        // `resolve_decl_handle_from`.
         let fn_sym = self.hir.idents[name_idx].symbol;
+        // Cross-module — the resolver already picked the specific
+        // module that owns this fn, so we can construct the ItemId
+        // directly without re-walking the candidate set.
+        if let Definition::ProjectDecl {
+            uri: ref dec_uri, ..
+        } = def
+        {
+            let fn_id = self.index.item_id_for(dec_uri, fn_sym)?;
+            return self.index.fn_signatures.get(&fn_id).map(|s| s.return_ty);
+        }
+        // `Definition::Project` fallback (no specific owning module):
+        // walk non-private fn-ns candidates, first match wins.
         for (uri, decl) in self
             .index
             .locate_decl_in_ns(fn_sym, crate::stdlib::Namespace::Fn)
@@ -5213,8 +5293,10 @@ impl<'a> Cx<'a> {
                 // The post-if join logic then lifts narrows that
                 // hold along every path.
                 if matches!(op, BinOp::Other("=")) {
+                    self.check_private_attr_write(left);
                     self.record_assign_narrow(left, rt);
                 } else if matches!(op, BinOp::Other("?=")) {
+                    self.check_private_attr_write(left);
                     self.record_coalesce_assign_narrow(left, rt);
                 }
                 self.infer_binary(op, lt, rt)

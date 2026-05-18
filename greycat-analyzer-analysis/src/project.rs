@@ -1305,22 +1305,17 @@ fn lower_module_signatures(
         return entry;
     };
     for d_id in &module.decls {
-        // Privacy filter: skip private decls' signatures from the
-        // module sig cache so `apply_module_contributions` never
-        // populates the cross-module `fn_signatures` / `var_types`
-        // for them. Same-module access still sees them via the
-        // per-module `out.type_decls` / `out.registry` / body-walker
-        // paths.
-        let is_private = match &hir.decls[*d_id] {
-            Decl::Type(td) => td.modifiers.private,
-            Decl::Enum(ed) => ed.modifiers.private,
-            Decl::Fn(fnd) => fnd.modifiers.private,
-            Decl::Var(vd) => vd.modifiers.private,
-            _ => false,
-        };
-        if is_private {
-            continue;
-        }
+        // Private decls go through full signature lowering. With every
+        // per-item map now keyed by `ItemId` (chunks 3+4), two same-
+        // named decls in different modules — including the common
+        // public+private collision shape — no longer fight for a
+        // single slot. Same-module typing of private fn calls / member
+        // access on private-type values / reads of private vars all
+        // need the populated `fn_signatures` / `attr_types` /
+        // `method_returns` / `var_types` entries. The cross-module
+        // bare-name filter is still applied at resolution time via
+        // `private_locations`; sig lowering doesn't need a parallel
+        // gate.
         match &hir.decls[*d_id] {
             Decl::Type(td) => {
                 let type_sym = hir.idents[td.name].symbol;

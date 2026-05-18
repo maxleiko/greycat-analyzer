@@ -390,6 +390,14 @@ pub struct TypeMembers {
     /// a runtime `field` handle). Empty for types with no static
     /// attrs.
     pub static_attrs: FxHashSet<Symbol>,
+    /// Names of attrs declared with the `private` modifier. GreyCat's
+    /// `private` on an attr is read-public / write-private — anyone
+    /// can read `obj.attr`, only the type's constructor (`object_expr`,
+    /// `Foo { attr: 1 }`) can write. The body walker's
+    /// `Expr::Binary(op="=")` arm consults this set on the receiver's
+    /// `TypeMembers` to emit `private-attr-write` on direct
+    /// assignments from outside the constructor.
+    pub private_attrs: FxHashSet<Symbol>,
     /// Names of methods declared with the `static` modifier. Lets
     /// `resolve_member` filter them out of instance access — the
     /// runtime resolves `this.from` to an inherited `from: time` attr
@@ -595,6 +603,20 @@ impl ProjectIndex {
             .attrs
             .get(&attr_name)
             .map(|id| (members.home_uri.clone(), *id))
+    }
+
+    /// Find the `TypeMembers` entry in `type_id`'s supertype chain
+    /// that owns `attr_name` (the first hop that has the attr in
+    /// `attrs`). Used by the body walker's `check_private_attr_write`
+    /// to consult the *defining* type's `private_attrs` set rather
+    /// than the receiver's — `private` is sourced from the
+    /// declaration, not the use site.
+    pub fn walk_chain_for_private_attr(
+        &self,
+        type_id: ItemId,
+        attr_name: Symbol,
+    ) -> Option<&TypeMembers> {
+        self.walk_member_chain(type_id, |m| m.attrs.contains_key(&attr_name))
     }
 
     // P19.14
@@ -806,12 +828,15 @@ impl ProjectIndex {
                     // by `(module, name)` so two same-named types in
                     // different modules coexist unambiguously. The
                     // first ingested decl for a given `ItemId` wins
-                    // (re-ingest is a no-op). Private types are
-                    // skipped — they're only resolvable in their own
-                    // module, where `out.type_decls` already provides
-                    // the local attr / method lookup without going
-                    // through this shared map.
-                    if !is_private && !self.type_members.contains_key(&item) {
+                    // (re-ingest is a no-op). Private types ARE
+                    // included — `private` in GreyCat gates only
+                    // cross-module *bare-name* resolution (handled
+                    // by `type_names` / `private_locations`), not
+                    // member shape. Same-module inherited-attr walks
+                    // for a `private type Sub extends Public` need
+                    // this entry to start from `Sub` and climb the
+                    // chain.
+                    if !self.type_members.contains_key(&item) {
                         let generics: Vec<Symbol> =
                             td.generics.iter().map(|g| hir.idents[*g].symbol).collect();
                         let attr_order: Box<[Symbol]> = td
@@ -862,6 +887,7 @@ impl ProjectIndex {
                             attr_types: FxHashMap::default(),
                             method_returns: FxHashMap::default(),
                             static_attrs: FxHashSet::default(),
+                            private_attrs: FxHashSet::default(),
                             static_methods: FxHashSet::default(),
                             abstract_methods: FxHashSet::default(),
                             supertype: supertype_guess,
@@ -883,6 +909,13 @@ impl ProjectIndex {
                             // handle, even for cross-module attrs.
                             if attr.modifiers.static_ {
                                 m.static_attrs.insert(attr_sym);
+                            }
+                            // Capture `private` flag — read-public /
+                            // write-private. The body walker checks
+                            // this set on assignment LHS to emit
+                            // `private-attr-write`.
+                            if attr.modifiers.private {
+                                m.private_attrs.insert(attr_sym);
                             }
                         }
                         for method_id in &td.methods {
@@ -920,26 +953,27 @@ impl ProjectIndex {
                     // `apply_module_contributions`) ensures every
                     // downstream lowering pass — including method
                     // return-type lowering for methods declared in
-                    // the same module — sees the canonical TypeId.
-                    // Private enums are skipped — they're invisible
-                    // cross-module, and same-module enum lowering
-                    // uses the per-module `out.registry` path.
-                    if !is_private {
-                        self.enum_types.entry(enum_item).or_insert_with(|| {
-                            let variants: Box<[Symbol]> = ed
-                                .fields
-                                .iter()
-                                .map(|f| hir.idents[hir.enum_fields[*f].name].symbol)
-                                .collect();
-                            arena.alloc(Type {
-                                kind: TypeKind::Enum {
-                                    name: name_sym,
-                                    variants,
-                                },
-                                nullable: false,
-                            })
-                        });
-                    }
+                    // the same module, and qualified-static value
+                    // typing for `mod::PrivColor::Variant` access —
+                    // sees the canonical TypeId. Private enums are
+                    // included: `private` gates cross-module *bare-
+                    // name* resolution, not the canonical shape;
+                    // FQN access to a private enum's variants needs
+                    // `enum_types` populated to recognise them.
+                    self.enum_types.entry(enum_item).or_insert_with(|| {
+                        let variants: Box<[Symbol]> = ed
+                            .fields
+                            .iter()
+                            .map(|f| hir.idents[hir.enum_fields[*f].name].symbol)
+                            .collect();
+                        arena.alloc(Type {
+                            kind: TypeKind::Enum {
+                                name: name_sym,
+                                variants,
+                            },
+                            nullable: false,
+                        })
+                    });
                     self.record_decl_location(name_sym, uri, *decl_id, Namespace::Type);
                     Some(&ed.modifiers)
                 }
