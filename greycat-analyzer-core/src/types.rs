@@ -57,6 +57,33 @@ impl TypeDeclId {
     }
 }
 
+/// Project-wide unique identifier for a top-level item in a module.
+///
+/// Composed of `(module, name)` where both halves are [`Symbol`]s
+/// interned in the shared `SymbolTable`. Uniqueness across the project
+/// is enforced at module-ingest time: any file whose stem collides
+/// with an already-ingested module gets a `duplicate-module-name`
+/// hard error and is excluded from the project closure.
+///
+/// Replaces name-only keying on every per-item project map
+/// (`type_members`, `fn_signatures`, `enum_types`, `var_types`,
+/// `type_flags`, …) so two same-named items in different modules
+/// (`foo::Load` and `bar::Load`) coexist unambiguously. Two `ItemId`s
+/// compare equal iff they refer to the same item in the same module —
+/// one register-sized compare, since both fields are `Copy` u32
+/// newtypes under the hood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ItemId {
+    pub module: Symbol,
+    pub name: Symbol,
+}
+
+impl ItemId {
+    pub const fn new(module: Symbol, name: Symbol) -> Self {
+        Self { module, name }
+    }
+}
+
 /// The central type representation.
 ///
 /// The TS reference uses a class hierarchy with `nullable` flags per type

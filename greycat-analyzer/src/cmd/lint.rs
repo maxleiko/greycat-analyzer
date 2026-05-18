@@ -8,7 +8,7 @@ use std::{
 
 use greycat_analyzer_analysis::{analyzer::Severity, lint::LintSeverity, project::ProjectAnalysis};
 use greycat_analyzer_core::{
-    SourceManager,
+    LoadTimings, SourceManager,
     diagnostics::{parse_diagnostics, print_compact_diagnostic},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
     resolver::FsContext,
@@ -260,10 +260,8 @@ impl Lint {
         // build an index so the manager.iter() loop below can pick the
         // matching read / parse durations per file.
         #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
-        let load_by_uri: std::collections::HashMap<
-            Uri,
-            greycat_analyzer_core::LoadTimings,
-        > = report.loaded.iter().cloned().collect();
+        let load_by_uri: std::collections::HashMap<Uri, LoadTimings> =
+            report.loaded.iter().cloned().collect();
 
         // Hydrate cli `Entry`s from the manager's loaded set.
         //
@@ -303,6 +301,16 @@ impl Lint {
                 diagnostics.push(greycat_analyzer_core::diagnostics::missing_std_diagnostic(
                     text,
                 ));
+            }
+            if let Some((name, existing)) = analysis.index.duplicate_modules.get(uri) {
+                let module_name = &analysis.index.symbols[*name];
+                diagnostics.push(
+                    greycat_analyzer_core::diagnostics::duplicate_module_name_diagnostic(
+                        text,
+                        module_name,
+                        existing,
+                    ),
+                );
             }
             if let Some(module) = analysis.module(uri)
                 && (lint_libs || module.lib == "project")

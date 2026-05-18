@@ -535,7 +535,7 @@ impl ProjectAnalysis {
 
         // Phase B (parallel on native, serial on wasm): lower each
         // module + parse its directives. No shared mutable state.
-        let lowered: Vec<(
+        let mut lowered: Vec<(
             Uri,
             Hir,
             String,
@@ -576,6 +576,22 @@ impl ProjectAnalysis {
         // folded in so every decl-registration step happens in one
         // place rather than spread across `stage_lower` +
         // `stage_lower_signatures`.
+        //
+        // Order matters: `ProjectIndex::ingest` is first-wins for
+        // module-name claims (later files with the same stem land in
+        // `duplicate_modules`). Sort so (a) the entrypoint always wins
+        // its module slot — the user's own `project.gcl` should never
+        // be flagged as a duplicate of a vendored `lib/foo/project.gcl`
+        // — and (b) remaining ties resolve in deterministic URI order
+        // so CI runs and local runs agree on which file gets the
+        // `duplicate-module-name` diagnostic.
+        lowered.sort_by(|(a_uri, _, _, _, _, _), (b_uri, _, _, _, _, _)| {
+            let a_is_entry = entrypoint_uri.as_ref() == Some(a_uri);
+            let b_is_entry = entrypoint_uri.as_ref() == Some(b_uri);
+            b_is_entry
+                .cmp(&a_is_entry)
+                .then_with(|| a_uri.as_str().cmp(b_uri.as_str()))
+        });
         for (uri, hir, _lib, _lower_took, _directives, _pragmas) in &lowered {
             self.index.ingest(
                 uri,

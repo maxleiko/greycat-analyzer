@@ -11,8 +11,8 @@ use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
     Document, SourceManager, StdResolution,
     diagnostics::{
-        missing_std_diagnostic, multi_project_owner_diagnostic, orphan_module_diagnostic,
-        parse_diagnostics, pragma_diagnostics,
+        duplicate_module_name_diagnostic, missing_std_diagnostic, multi_project_owner_diagnostic,
+        orphan_module_diagnostic, parse_diagnostics, pragma_diagnostics,
     },
 };
 use log::{debug, info, warn};
@@ -310,6 +310,17 @@ impl Backend {
             && project.entrypoint_uri.as_ref() == Some(uri)
         {
             diags.push(missing_std_diagnostic(&doc.text));
+        }
+        // `duplicate-module-name` overlays any file whose stem
+        // collides with an already-ingested module's. Hard error so
+        // the user knows the file is excluded from project analysis.
+        if let Some((name, existing)) = project.analysis.index.duplicate_modules.get(uri) {
+            let module_name = &project.analysis.index.symbols[*name];
+            diags.push(duplicate_module_name_diagnostic(
+                &doc.text,
+                module_name,
+                existing,
+            ));
         }
         self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }

@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Uri};
 use rustc_hash::FxHashSet;
 
 use greycat_analyzer_syntax::tree_sitter;
@@ -557,6 +557,41 @@ pub fn missing_std_diagnostic(text: &str) -> Diagnostic {
         code: Some(NumberOrString::String("missing-std".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
         message: "GreyCat `std` library not found. Looked under `<project>/lib/std/` and `$HOME/.greycat/lib/std/`. Run `greycat install` (or populate the local `lib/std/`) — without std the analyzer can't resolve built-in types.".into(),
+        tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+        ..Default::default()
+    }
+}
+
+/// File-spanning hard error: this `.gcl` file's stem matches the
+/// module name of another file already ingested into the project.
+/// GreyCat requires module names to be unique within a project — two
+/// files named `foo.gcl` in different directories both claim module
+/// `foo`, so only the first is analysed and the rest are excluded.
+///
+/// Severity is `Error` (this is a project-structure invariant
+/// violation, not a hint) AND tagged `UNNECESSARY` so editors dim the
+/// excluded file as a visual cue. Not in `LINT_RULES` and not
+/// suppressible via `// gcl-lint-off` — same gravity as a parse error.
+pub fn duplicate_module_name_diagnostic(
+    text: &str,
+    module_name: &str,
+    existing_uri: &Uri,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: position_at(text, text.len()),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("duplicate-module-name".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: format!(
+            "module name `{module_name}` is already used by `{}`; rename this file (or move it to a different library) so every module in the project has a unique name",
+            existing_uri.as_str()
+        ),
         tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
         ..Default::default()
     }

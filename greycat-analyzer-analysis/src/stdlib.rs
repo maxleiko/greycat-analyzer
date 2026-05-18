@@ -217,6 +217,14 @@ pub struct ProjectIndex {
     /// module name (rather than flagging it as unresolved), and lets
     /// pass 3.5 infer types for `module::Decl` static expressions.
     pub module_names: FxHashMap<Symbol, Uri>,
+    /// Files whose stem collides with an already-ingested module's
+    /// stem. The duplicate is excluded from the project closure
+    /// (its decls don't land in `type_members` / `fn_signatures` /
+    /// etc.). The LSP / CLI overlay a `duplicate-module-name`
+    /// Error+UNNECESSARY diagnostic on the duplicate file so the
+    /// user sees both the dim treatment AND the hard error. Records
+    /// `(duplicate_uri → (module_name, existing_uri))`.
+    pub duplicate_modules: FxHashMap<Uri, (Symbol, Uri)>,
     // P21
     /// Pre-computed cross-module structure index. Keyed by type
     /// name (as it appears in source). For each type, records the
@@ -755,9 +763,35 @@ impl ProjectIndex {
         // P15.x — capture the module's name (URI's filename stem
         // without `.gcl`) so resolver / pass 3.5 can recognize
         // `module::Decl` chains.
+        //
+        // Duplicate detection: if another file already claimed this
+        // module name, the current file is recorded in
+        // `duplicate_modules` and excluded from project ingest (we
+        // return before walking the decl list). The LSP / CLI overlay
+        // a `duplicate-module-name` Error+UNNECESSARY diagnostic on
+        // every duplicate so the user sees the dim treatment and the
+        // hard error explaining why the file is excluded. Re-ingest
+        // of the same URI for the same module name (LSP invalidate
+        // cycle) is idempotent — not a duplicate.
         if let Some(name) = module_name_from_uri(uri) {
             let sym = self.symbols.intern(&name);
-            self.module_names.insert(sym, uri.clone());
+            match self.module_names.get(&sym) {
+                Some(existing) if existing != uri => {
+                    self.duplicate_modules
+                        .insert(uri.clone(), (sym, existing.clone()));
+                    return;
+                }
+                _ => {
+                    self.module_names.insert(sym, uri.clone());
+                    // P32.x — the duplicate registry is keyed by URI,
+                    // not module-name. If a file moves from "duplicate"
+                    // back to "winner" across invalidate cycles (e.g.
+                    // the previous winner was deleted from the project),
+                    // clear its duplicate flag so the diagnostic doesn't
+                    // linger.
+                    self.duplicate_modules.remove(uri);
+                }
+            }
         }
         for decl_id in &module.decls {
             let modifiers = match &hir.decls[*decl_id] {
@@ -1650,10 +1684,7 @@ var TOP: int = 1;
             idx.locate_decl(idx.symbols.lookup("helper").unwrap()).len(),
             1
         );
-        assert_eq!(
-            idx.locate_decl(idx.symbols.lookup("TOP").unwrap()).len(),
-            1
-        );
+        assert_eq!(idx.locate_decl(idx.symbols.lookup("TOP").unwrap()).len(), 1);
         assert!(
             idx.symbols
                 .lookup("missing")
