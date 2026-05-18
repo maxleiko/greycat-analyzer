@@ -156,11 +156,12 @@ impl Scope {
 
 struct Cx<'a> {
     hir: &'a Hir,
-    // P38.3 — module-scope bindings split by visibility. `module_public_*`
-    // participates in normal bare-name lookup (first-tier, alongside
-    // nested scopes); `module_private_*` is a LAST-RESORT fallback,
-    // consulted only after the global-public lookup misses. See the
-    // commentary in `record_use` for the runtime-conformance rationale.
+    // Module-scope bindings split by visibility. Both tiers are
+    // consulted in the same step of `record_use` — module-local decls
+    // (public OR private) shadow cross-module hits. The split is kept
+    // because privacy still gates *cross-module* visibility (the
+    // `is_decl_private` filter in step 3 of `record_use`) and because
+    // hover / goto-def want to know which tier a binding came from.
     //
     // Within each visibility tier, decls split by [`Namespace`] (type,
     // fn, var) — validated against `greycat build` 8.0.301-dev: every
@@ -186,13 +187,13 @@ struct Cx<'a> {
     /// Per-file callers pass an empty [`ProjectIndex::new`]; the project
     /// pipeline passes the index it just rebuilt.
     index: &'a ProjectIndex,
-    // P38.3 — current module's URI, when known. The project pipeline
-    // passes the module's URI through; per-file callers (tests, lint
-    // pipeline without project context) pass `None`. Lets the global-
-    // public lookup filter out the current module's own entries from
-    // `ProjectIndex::locate_decl` so a same-module private decl
-    // doesn't accidentally win at step 2 (it should reach the
-    // last-resort step 3 instead).
+    // Current module's URI, when known. The project pipeline passes
+    // the module's URI through; per-file callers (tests, lint pipeline
+    // without project context) pass `None`. Lets the cross-module
+    // lookup filter out the current module's own entries from
+    // `ProjectIndex::locate_decl` so module-local decls are always
+    // served from `module_public_*` / `module_private_*` rather than
+    // re-entering through the cross-module path.
     current_uri: Option<&'a Uri>,
     res: Resolutions,
 }
@@ -279,28 +280,28 @@ impl<'a> Cx<'a> {
 
     fn record_use(&mut self, idx: Idx<Ident>, pos: Position) {
         let name = self.ident_text(idx).to_string();
-        // P38.3 — Bare-name resolution order matches the GreyCat
-        // runtime oracle (validated against `greycat build`
-        // 8.0.301-dev). The order, applied per namespace in the
+        // Bare-name resolution order, applied per namespace in the
         // priority list for `pos`:
         //
         //   1. Non-module scopes (universal, walked once at the top).
-        //   2. Module-level PUBLIC decls in this namespace.
-        //   3. Global PUBLIC across the project closure
-        //      (`ProjectIndex::locate_decl_in_ns`). Multiple hits in
-        //      the same namespace collapse to *ambiguous-symbol*
+        //   2. Module-local decls in this namespace — PUBLIC or
+        //      PRIVATE. Module-local always shadows cross-module.
+        //   3. Cross-module PUBLIC across the project closure
+        //      (`ProjectIndex::locate_decl_in_ns`, filtered to drop
+        //      foreign private decls). Multiple hits in the same
+        //      namespace collapse to *ambiguous-symbol*
         //      (Severity::Error with FQN quick-fixes).
-        //   4. Module-level PRIVATE decls in this namespace
-        //      — LAST-RESORT, only reached when both 2 and 3 missed
-        //      in every namespace in the priority list.
-        //   5. `Project` placeholder (runtime-implemented types,
+        //   4. `Project` placeholder (runtime-implemented types,
         //      primitives by name, native fns), known module names,
         //      or unresolved.
         //
-        // The 2-→3-→4 ordering matches the runtime even though it
-        // makes a local PRIVATE decl NOT shadow a remote PUBLIC. See
-        // `cross_module_private_fallback.rs` for the test mirror of
-        // probes p3/p8/p9.
+        // Module-local-first matches the GreyCat runtime: e.g. a
+        // `private type Load` declared in module M shadows a public
+        // `type Load` declared elsewhere in the project closure when
+        // resolution happens *inside* M. The previous ordering (which
+        // demoted module-local PRIVATE below cross-module PUBLIC) was
+        // wrong about runtime conformance — see the now-inverted
+        // `cross_module_private_fallback.rs::local_private_shadows_remote_public`.
         //
         // Across namespaces: at a value position the priority is fn
         // before var (matches the analyzer's
@@ -320,8 +321,14 @@ impl<'a> Cx<'a> {
 
         // 2 + 3, per namespace in the position's priority order.
         for &ns in pos.namespaces() {
-            // Step 2: module-public in this namespace.
-            if let Some(def) = self.module_public(ns).get(&name).cloned() {
+            // Step 2: module-local (public OR private) in this
+            // namespace. Module-local always shadows cross-module.
+            if let Some(def) = self
+                .module_public(ns)
+                .get(&name)
+                .or_else(|| self.module_private(ns).get(&name))
+                .cloned()
+            {
                 if let Definition::Decl(decl_id) = &def {
                     *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
                 }
@@ -356,19 +363,7 @@ impl<'a> Cx<'a> {
             }
         }
 
-        // 4. Last-resort: module-private, also walked per-namespace
-        // in priority order.
-        for &ns in pos.namespaces() {
-            if let Some(def) = self.module_private(ns).get(&name).cloned() {
-                if let Definition::Decl(decl_id) = &def {
-                    *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
-                }
-                self.res.uses.insert(idx, def);
-                return;
-            }
-        }
-
-        // 5. Project-level fallback.
+        // 4. Project-level fallback.
         if self.index.has_name(&name) {
             self.res.uses.insert(idx, Definition::Project);
             return;

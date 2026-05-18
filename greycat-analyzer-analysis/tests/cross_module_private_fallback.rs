@@ -1,15 +1,18 @@
-//! P38.3 — bare-name resolution order: local-private is a LAST-RESORT
-//! fallback, not a first-tier hit. Matches the GreyCat runtime
-//! (8.0.291-dev) probe results:
+//! Bare-name resolution order: module-local decls (PUBLIC or PRIVATE)
+//! always shadow cross-module hits. Matches the GreyCat runtime —
+//! re-verified against `greycat run` after the earlier 8.0.291-dev
+//! "p9" probe turned out to disagree with the runtime in the wild
+//! (a `private type Load` inside an `@include`d module was correctly
+//! preferred over a public `type Load` in `project.gcl`).
+//!
+//! Probe outcomes encoded by the tests below:
 //!
 //! - p3 (local private, no global same-name) → bare ref binds to local.
 //! - p8 (local public + remote public) → local public wins.
-//! - p9 (local private + remote public) → REMOTE public wins.
+//! - p9 (local private + remote public) → LOCAL private wins.
 //!
-//! The asymmetry between p8 and p9 is the runtime's choice — we
-//! intentionally conform even though most language designers would
-//! expect "module-local first, regardless of visibility." See the
-//! commentary in `resolver::Cx::record_use` for the full rationale.
+//! See the commentary in `resolver::Cx::record_use` for the lookup
+//! ladder itself.
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::Definition;
@@ -105,10 +108,10 @@ fn caller(): String {
 }
 
 #[test]
-fn local_private_does_not_shadow_remote_public() {
-    // p9 mirror: this is THE runtime-conformance surprise. Bare
-    // `greeting()` inside `b.gcl` resolves to `a.gcl`'s PUBLIC
-    // greeting, not to `b.gcl`'s local private.
+fn local_private_shadows_remote_public() {
+    // p9 mirror: bare `greeting()` inside `b.gcl` binds to b.gcl's
+    // local PRIVATE, not to a.gcl's remote PUBLIC. Module-local
+    // always wins over cross-module regardless of visibility.
     let mut mgr = SourceManager::new();
     let local_uri = add(
         &mut mgr,
@@ -119,7 +122,7 @@ fn caller(): String {
 }
 ",
     );
-    let remote_uri = add(
+    add(
         &mut mgr,
         "/proj/src/a.gcl",
         "fn greeting(): String { return \"from-a-public\"; }
@@ -128,21 +131,14 @@ fn caller(): String {
     let pa = ProjectAnalysis::analyze(&mgr);
     let bindings = callee_bindings(&pa, &local_uri, "greeting");
     assert_eq!(bindings.len(), 1, "expected one binding: {:#?}", bindings);
-    // Crucial assertion: the bare `greeting()` inside `b.gcl` did NOT
-    // bind to b.gcl's local private. It bound to the remote public.
-    match &bindings[0] {
-        Definition::ProjectDecl { uri, .. } => {
-            assert_eq!(
-                uri, &remote_uri,
-                "expected the remote public from a.gcl, got {:?}",
-                uri
-            );
-        }
-        other => panic!(
-            "expected ProjectDecl pointing at remote a.gcl, got {:?}",
-            other
-        ),
-    }
+    // Crucial assertion: the bare `greeting()` inside `b.gcl` binds
+    // to b.gcl's local private (`Definition::Decl`), not to the
+    // remote public (`Definition::ProjectDecl`).
+    assert!(
+        matches!(bindings[0], Definition::Decl(_)),
+        "expected Decl (local private), got {:?}",
+        bindings[0]
+    );
 }
 
 #[test]
