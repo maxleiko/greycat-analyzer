@@ -570,7 +570,7 @@ pub fn multi_project_owner_diagnostic(text: &str, roots: &[std::path::PathBuf]) 
 /// shape the cli lint subcommand prints. The `_` prefix on `code` is a
 /// reminder that the rich struct fields (related info, code, tags) get
 /// dropped for cli output.
-pub fn format_cli(path: &str, diag: &Diagnostic, color: bool) -> String {
+pub fn print_compact_diagnostic(path: &str, diag: &Diagnostic, color: bool) -> String {
     let severity = match diag.severity {
         Some(DiagnosticSeverity::ERROR) => "error",
         Some(DiagnosticSeverity::WARNING) => "warning",
@@ -593,10 +593,10 @@ pub fn format_cli(path: &str, diag: &Diagnostic, color: bool) -> String {
         // information so terminal users see the same emphasis in
         // both modes.
         let sev_color = match diag.severity {
-            Some(DiagnosticSeverity::ERROR) => "\x1b[1;31m", // bold red
-            Some(DiagnosticSeverity::WARNING) => "\x1b[1;33m", // bold yellow
-            Some(DiagnosticSeverity::INFORMATION) => "\x1b[1;34m", // bold blue
-            Some(DiagnosticSeverity::HINT) => "\x1b[1;36m",  // bold cyan
+            Some(DiagnosticSeverity::ERROR) => "\x1b[31m", // bold red
+            Some(DiagnosticSeverity::WARNING) => "\x1b[33m", // bold yellow
+            Some(DiagnosticSeverity::INFORMATION) => "\x1b[34m", // bold blue
+            Some(DiagnosticSeverity::HINT) => "\x1b[36m",  // bold cyan
             _ => "\x1b[1m",                                  // bold
         };
         let reset = "\x1b[0m";
@@ -1075,7 +1075,7 @@ mod tests {
             message: "boom".into(),
             ..Default::default()
         };
-        assert_eq!(format_cli("a.gcl", &diag, false), "a.gcl:5:8: error: boom");
+        assert_eq!(print_compact_diagnostic("a.gcl", &diag, false), "a.gcl:5:8: error: boom");
     }
 
     /// When a diagnostic carries a `code`, the cli line includes
@@ -1100,7 +1100,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            format_cli("a.gcl", &diag, false),
+            print_compact_diagnostic("a.gcl", &diag, false),
             "a.gcl:1:1: error[missing-function-body]: boom"
         );
     }
@@ -1127,7 +1127,7 @@ mod tests {
             message: "boom".into(),
             ..Default::default()
         };
-        let out = format_cli("a.gcl", &diag, true);
+        let out = print_compact_diagnostic("a.gcl", &diag, true);
         assert_eq!(
             out,
             "\x1b[90ma.gcl:1:1:\x1b[0m \x1b[1;31merror[unknown-member]\x1b[0m: boom"

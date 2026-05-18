@@ -9,7 +9,7 @@ use std::{
 use greycat_analyzer_analysis::{analyzer::Severity, lint::LintSeverity, project::ProjectAnalysis};
 use greycat_analyzer_core::{
     SourceManager,
-    diagnostics::{format_cli, parse_diagnostics},
+    diagnostics::{print_compact_diagnostic, parse_diagnostics},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
     resolver::FsContext,
 };
@@ -580,7 +580,7 @@ impl Lint {
                     for diag in &e.diagnostics {
                         match render {
                             OutputFormat::Compact => {
-                                println!("{}", format_cli(&path, diag, color))
+                                println!("{}", print_compact_diagnostic(&path, diag, color))
                             }
                             OutputFormat::Pretty => print_pretty_diagnostic(&path, &source, diag),
                             OutputFormat::Csv | OutputFormat::Quiet => {}
@@ -763,6 +763,7 @@ fn print_summary(entries: &[Entry], total: Duration, color: bool) {
 /// if the byte range can't be resolved (e.g., zero-length spans).
 fn print_pretty_diagnostic(path: &str, source: &str, diag: &Diagnostic) {
     use miette::{LabeledSpan, MietteDiagnostic, Severity as MietteSeverity};
+
     let start = lsp_to_byte(source, diag.range.start);
     let end = lsp_to_byte(source, diag.range.end).max(start + 1);
     let span = LabeledSpan::at(start..end.min(source.len()), diag.message.clone());
@@ -777,7 +778,7 @@ fn print_pretty_diagnostic(path: &str, source: &str, diag: &Diagnostic) {
         Some(NumberOrString::String(s)) => s.clone(),
         _ => "diag".into(),
     };
-    let mietted = MietteDiagnostic::new(diag.message.clone())
+    let mietted = MietteDiagnostic::new(&diag.message)
         .with_code(code)
         .with_severity(severity)
         .with_label(span);
