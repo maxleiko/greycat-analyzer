@@ -1401,18 +1401,23 @@ pub(crate) fn is_assignable_to_with_index(
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
     decl_registry: &DeclRegistry,
-    arena: &TypeArena,
+    arena: &mut TypeArena,
     from: TypeId,
     to: TypeId,
 ) -> bool {
     if is_assignable_to(arena, from, to) {
         return true;
     }
-    let a = arena.get(from);
-    let b = arena.get(to);
-    if a.nullable && !b.nullable {
+    let a_nullable = arena.get(from).nullable;
+    let b_nullable = arena.get(to).nullable;
+    if a_nullable && !b_nullable {
         return false;
     }
+    // Clone kinds upfront so the immutable arena borrow ends before
+    // any recursive call needs `&mut arena` (substitute hops in the
+    // generic-supertype walks allocate fresh `Generic` nodes).
+    let a_kind = arena.get(from).kind.clone();
+    let b_kind = arena.get(to).kind.clone();
     // Exhaustive nested match. Same rationale as core's
     // `is_assignable_to`: a `_ => false` would absorb future
     // `TypeKind` variants and re-introduce the `Union → supertype`
@@ -1423,21 +1428,21 @@ pub(crate) fn is_assignable_to_with_index(
     // Union arms recurse into `_with_index` (not core) so each
     // per-alt check picks up the supertype chain. Source-Union
     // fires first; target-Union recurses against each alt.
-    match &a.kind {
+    match a_kind {
         // Caught by the `is_assignable_to(...)` early-return above:
         // these source kinds short-circuit in core (Null via target
         // nullability; Never/Any/Unresolved as top/bottom rules).
         TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => false,
 
-        TypeKind::Union { alts } => alts.iter().all(|alt| {
-            is_assignable_to_with_index(index, well_known, decl_registry, arena, *alt, to)
+        TypeKind::Union { alts } => alts.into_iter().all(|alt| {
+            is_assignable_to_with_index(index, well_known, decl_registry, arena, alt, to)
         }),
 
         // Handle-keyed subtype chain — the inheritance layer this
         // wrapper exists to add. `Type(sub) → Type(sup)` when `sub`
         // is a transitive descendant of `sup` in `index.type_members`.
-        TypeKind::Type(sub) => match &b.kind {
-            TypeKind::Type(sup) => index.is_subtype_of_decl(decl_registry, *sub, *sup),
+        TypeKind::Type(sub) => match b_kind {
+            TypeKind::Type(sup) => index.is_subtype_of_decl(decl_registry, sub, sup),
             // `Type(sub) → Generic(sup<args>)` — `sub` is a non-
             // generic concrete type whose `extends` chain reaches the
             // generic shape on the right (e.g. `PointChangeView
@@ -1449,11 +1454,16 @@ pub(crate) fn is_assignable_to_with_index(
             // check. No substitution needed at this layer — `sub`
             // is non-generic, so its parent's args are already
             // fully concrete.
-            TypeKind::Generic { .. } => {
-                find_generic_supertype(index, decl_registry, arena, *sub, to)
-            }
-            TypeKind::Union { alts } => alts.iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
+            TypeKind::Generic { .. } => walk_substituted_supertype_chain(
+                index,
+                decl_registry,
+                arena,
+                sub,
+                &[],
+                |arena, hop| is_assignable_to(arena, hop, to),
+            ),
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1465,27 +1475,45 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::GenericParam { .. } => false,
         },
 
-        // Node-tag bivariance + node<T> covariance. Other generics
-        // stay invariant (handled by core's same-handle args check).
-        TypeKind::Generic { decl: da, args: aa } => match &b.kind {
-            TypeKind::Generic { decl: db, args: ab }
-                if da == db && aa.len() == ab.len() && well_known.is_node_tag(*da) =>
-            {
-                true
-            }
-            TypeKind::Generic { decl: db, args: ab }
-                if da == db
-                    && aa.len() == 1
-                    && ab.len() == 1
-                    && well_known.node_decl.is_some_and(|nd| nd == *da) =>
+        // Node-tag bivariance + node<T> covariance + cross-decl
+        // generic supertype walk. Same-decl generics stay invariant
+        // (handled by core's same-handle args check).
+        TypeKind::Generic { decl: da, args: aa } => match b_kind {
+            TypeKind::Generic {
+                decl: db,
+                args: ref ab,
+            } if da == db && aa.len() == ab.len() && well_known.is_node_tag(da) => true,
+            TypeKind::Generic {
+                decl: db,
+                args: ref ab,
+            } if da == db
+                && aa.len() == 1
+                && ab.len() == 1
+                && well_known.node_decl.is_some_and(|nd| nd == da) =>
             {
                 // node<Sub> -> node<Super> when Sub extends Super.
                 // Recurse so a chain like node<DeepSub> ->
                 // node<MidSub> -> node<Super> works in one hop.
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, aa[0], ab[0])
+                let (a0, b0) = (aa[0], ab[0]);
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, a0, b0)
             }
-            TypeKind::Union { alts } => alts.iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
+            // Cross-decl generic source: walk `da`'s pre-lowered
+            // supertype_ty chain, substituting `aa` for `da`'s own
+            // `GenericParam` slots at each hop, then check the
+            // substituted shape against `to`. Covers
+            // `MultiQuantizer<T> extends Quantizer<Array<T>>` —
+            // passing `MultiQuantizer<int>` to a parameter typed
+            // `Quantizer<Array<int>>`.
+            TypeKind::Generic { .. } => walk_substituted_supertype_chain(
+                index,
+                decl_registry,
+                arena,
+                da,
+                &aa,
+                |arena, hop| is_assignable_to(arena, hop, to),
+            ),
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1493,7 +1521,6 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Unresolved { .. }
             | TypeKind::Primitive(_)
             | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
             | TypeKind::GenericParam { .. } => false,
@@ -1507,9 +1534,9 @@ pub(crate) fn is_assignable_to_with_index(
         TypeKind::Primitive(_)
         | TypeKind::Lambda { .. }
         | TypeKind::Enum { .. }
-        | TypeKind::GenericParam { .. } => match &b.kind {
-            TypeKind::Union { alts } => alts.iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, *alt)
+        | TypeKind::GenericParam { .. } => match b_kind {
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1525,53 +1552,68 @@ pub(crate) fn is_assignable_to_with_index(
     }
 }
 
-/// Walk a non-generic concrete type's pre-lowered `supertype_ty` chain
-/// looking for a hop whose shape is assignable to `target`. Returns
-/// `true` iff such a hop exists. Stops at the first match — chains are
-/// short in practice and we don't need every reachable supertype.
+/// Walk `sub_decl`'s pre-lowered `supertype_ty` chain, substituting
+/// `sub_args` for `sub_decl`'s own `GenericParam` slots at each hop,
+/// and call `on_hop` with each hop's substituted `TypeId`. Returns
+/// the first `true` from `on_hop`; returns `false` if the chain
+/// exhausts without a match (or if the budget trips).
 ///
-/// `sub_decl` must be the source-side `TypeDeclId` for a non-generic
-/// `Type(decl)`; the source's own args are empty, so each hop's
-/// `supertype_ty` is already in fully concrete form (any
-/// `GenericParam` in it came from the parent's own decl-level
-/// generics, which a non-generic child cannot bind — that is the
-/// next-hop substitution case, deferred until the same call needs
-/// it for generic sources).
-fn find_generic_supertype(
+/// Handles the non-generic-source case uniformly: a decl with zero
+/// generics produces an empty substitution map, so `arena.substitute`
+/// is a no-op and the walk proceeds the same way. Pass `sub_args = &[]`.
+///
+/// Shared by assignability and cast — each caller supplies its own
+/// per-hop predicate (assignability uses core `is_assignable_to`; cast
+/// uses a bidirectional per-arg cast-compat check). Hop budget (32)
+/// mirrors `is_subtype_of` — deeper chains would have stack-overflowed
+/// in dependent passes already.
+fn walk_substituted_supertype_chain<F>(
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
-    arena: &TypeArena,
+    arena: &mut TypeArena,
     sub_decl: TypeDeclId,
-    target: TypeId,
-) -> bool {
-    let mut current = sub_decl;
-    // Same hop budget as `is_subtype_of` — a deep diamond would have
-    // surfaced as a stack-overflow long before exceeding this.
+    sub_args: &[TypeId],
+    mut on_hop: F,
+) -> bool
+where
+    F: FnMut(&mut TypeArena, TypeId) -> bool,
+{
+    let mut current_decl = sub_decl;
+    let mut current_args: Vec<TypeId> = sub_args.to_vec();
     for _ in 0..32 {
-        let Some(name_sym) = decl_registry.name(current) else {
+        let Some(name_sym) = decl_registry.name(current_decl) else {
             return false;
         };
         let Some(members) = index.type_members.get(&name_sym) else {
             return false;
         };
-        let Some(sup_ty) = members.supertype_ty else {
+        if members.generics.len() != current_args.len() {
+            return false;
+        }
+        let Some(sup_ty_raw) = members.supertype_ty else {
             return false;
         };
-        // Core's `is_assignable_to` handles the all-Any wildcard target,
-        // generic-arg invariance, and same-decl identity. If this hop
-        // is the right one, we are done.
-        if is_assignable_to(arena, sup_ty, target) {
+        let subst: FxHashMap<Symbol, TypeId> = members
+            .generics
+            .iter()
+            .copied()
+            .zip(current_args.iter().copied())
+            .collect();
+        let sup_ty = arena.substitute(sup_ty_raw, &subst);
+        if on_hop(arena, sup_ty) {
             return true;
         }
-        // Otherwise advance one hop along the chain. The next decl
-        // is either `Type(d)` or `Generic { decl: d, .. }` — anything
-        // else (a primitive parent that slipped past the ingest
-        // filter, say) ends the walk.
-        current = match &arena.get(sup_ty).kind {
-            TypeKind::Type(d) => *d,
-            TypeKind::Generic { decl, .. } => *decl,
+        match arena.get(sup_ty).kind.clone() {
+            TypeKind::Generic { decl, args } => {
+                current_decl = decl;
+                current_args = args.to_vec();
+            }
+            TypeKind::Type(d) => {
+                current_decl = d;
+                current_args.clear();
+            }
             _ => return false,
-        };
+        }
     }
     false
 }
@@ -1582,54 +1624,95 @@ fn find_generic_supertype(
 /// nodeTime<T>` both succeed. Dispatch via `WellKnown::is_node_tag
 /// (decl)` so a user-declared `type node<T>` (which has its own
 /// handle) doesn't accidentally pick up these rules.
+///
+/// Inheritance-aware: cross-decl generic casts (`Sub<T> as Sup<F<T>>`)
+/// go through the shared [`walk_substituted_supertype_chain`] with a
+/// cast-style per-hop predicate, so the wrapper rejects obviously-wrong
+/// casts like `MultiQuantizer<int> as Quantizer<Array<String>>`. The
+/// runtime drops `as` casts entirely — the analyzer is the only safety
+/// net, so generic-arg strictness here matches assignability's.
 pub(crate) fn is_castable_with_index(
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
     decl_registry: &DeclRegistry,
-    arena: &TypeArena,
+    arena: &mut TypeArena,
     from: TypeId,
     to: TypeId,
 ) -> bool {
     if is_castable(arena, from, to) {
         return true;
     }
-    let from_t = arena.get(from);
-    let to_t = arena.get(to);
-    // Helper: bidirectional handle-keyed inheritance for the cast
-    // operator. `Sub as Sup` (upcast, widening) and `Sup as Sub`
-    // (downcast, runtime-checked) are both valid. Generic shapes
-    // compare by head-decl identity (matches the call-site
-    // `inheritance_ok` semantics).
-    let bidi_inherits = |fd: TypeDeclId, td: TypeDeclId| -> bool {
-        index.is_subtype_of_decl(decl_registry, fd, td)
-            || index.is_subtype_of_decl(decl_registry, td, fd)
-    };
+    // Clone kinds upfront so the immutable arena borrow ends before
+    // any recursive call needs `&mut arena` (the chain walker
+    // substitutes, which allocates fresh `Generic` nodes).
+    let from_kind = arena.get(from).kind.clone();
+    let to_kind = arena.get(to).kind.clone();
     // Exhaustive nested match. Same rationale as the assignability
     // wrapper: no `_ => false` so future `TypeKind` variants can't
     // silently slip past inheritance / node-tag rules. Union arms
     // recurse into self so each alt picks up everything below.
-    match &from_t.kind {
+    match from_kind {
         // Caught by the `is_castable(...)` early-return above.
         TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => false,
 
         // Union source: mirror core's `.any()` semantics — `as` is a
-        // runtime-checked downcast, so the wrapper's inheritance-
-        // aware extension also accepts the union when AT LEAST ONE
-        // alt could possibly cast. Switching from `.all()` to `.any()`
-        // here keeps the two layers in lockstep; otherwise the
-        // inheritance-aware retry would silently undo core's fix.
+        // downcast intent, so the wrapper's inheritance-aware extension
+        // also accepts the union when AT LEAST ONE alt could possibly
+        // cast. Switching from `.all()` to `.any()` here keeps the two
+        // layers in lockstep; otherwise the inheritance-aware retry
+        // would silently undo core's fix.
         TypeKind::Union { alts } => alts
-            .iter()
-            .any(|alt| is_castable_with_index(index, well_known, decl_registry, arena, *alt, to)),
+            .into_iter()
+            .any(|alt| is_castable_with_index(index, well_known, decl_registry, arena, alt, to)),
 
         // Source Type: bidirectional inheritance with Type / Generic
         // targets; target-Union retry. No node-tag-int rule applies
-        // (Type is non-generic, can't be a node tag).
-        TypeKind::Type(fd) => match &to_t.kind {
-            TypeKind::Type(td) => bidi_inherits(*fd, *td),
-            TypeKind::Generic { decl: td, .. } => bidi_inherits(*fd, *td),
-            TypeKind::Union { alts } => alts.iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+        // (Type is non-generic, can't be a node tag). Non-generic
+        // source has no args to substitute — the cross-decl arg
+        // strictness only kicks in when both sides are Generic.
+        TypeKind::Type(fd) => match to_kind {
+            TypeKind::Type(td) => {
+                index.is_subtype_of_decl(decl_registry, fd, td)
+                    || index.is_subtype_of_decl(decl_registry, td, fd)
+            }
+            TypeKind::Generic { decl: td, .. } => {
+                // Upcast (Sub:Type → Sup<args>): walk Sub's chain
+                // looking for a hop whose decl matches Sup; that hop
+                // is already in fully concrete form, so use core's
+                // `is_castable` per-hop.
+                if index.is_subtype_of_decl(decl_registry, fd, td) {
+                    walk_substituted_supertype_chain(
+                        index,
+                        decl_registry,
+                        arena,
+                        fd,
+                        &[],
+                        |arena, hop| is_castable(arena, hop, to),
+                    )
+                } else if index.is_subtype_of_decl(decl_registry, td, fd) {
+                    // Downcast (Sup → Sub<args>): walk Sub (the more-
+                    // specific side) with its concrete args, find a
+                    // hop matching Sup. Source is non-generic, so the
+                    // hop must equal `from` for the cast to make sense.
+                    // Defer to core via `is_castable(hop, from)`.
+                    let to_decl_args = match arena.get(to).kind.clone() {
+                        TypeKind::Generic { args, .. } => args.to_vec(),
+                        _ => return false,
+                    };
+                    walk_substituted_supertype_chain(
+                        index,
+                        decl_registry,
+                        arena,
+                        td,
+                        &to_decl_args,
+                        |arena, hop| is_castable(arena, hop, from),
+                    )
+                } else {
+                    false
+                }
+            }
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1641,15 +1724,85 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::GenericParam { .. } => false,
         },
 
-        // Source Generic: bidirectional inheritance with Type /
-        // Generic targets. `<node-tag> as int` succeeds because the
-        // runtime handle is a 64-bit int. Target-Union retry.
-        TypeKind::Generic { decl: fd, .. } => match &to_t.kind {
-            TypeKind::Type(td) => bidi_inherits(*fd, *td),
-            TypeKind::Generic { decl: td, .. } => bidi_inherits(*fd, *td),
-            TypeKind::Primitive(Primitive::Int) if well_known.is_node_tag(*fd) => true,
-            TypeKind::Union { alts } => alts.iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+        // Source Generic: same-decl trusts core (which has already
+        // rejected before we got here, so further wrapper work means
+        // mismatched args — except node-tag bivariance, mirroring
+        // assignability). Different decls: walk the more-specific
+        // side's chain with substituted args, per-hop compare via
+        // core `is_castable` so args are checked invariantly.
+        // `<node-tag> as int` succeeds because the runtime handle is
+        // a 64-bit int.
+        TypeKind::Generic { decl: fd, args: fa } => match to_kind {
+            TypeKind::Type(td) => {
+                if index.is_subtype_of_decl(decl_registry, fd, td) {
+                    // Upcast (Sub<args>:Generic → Sup:Type): walk
+                    // Sub's chain with its args; hop matching Sup
+                    // (non-generic) is the destination.
+                    walk_substituted_supertype_chain(
+                        index,
+                        decl_registry,
+                        arena,
+                        fd,
+                        &fa,
+                        |arena, hop| is_castable(arena, hop, to),
+                    )
+                } else if index.is_subtype_of_decl(decl_registry, td, fd) {
+                    // Downcast: target is non-generic but its decl is
+                    // a subtype of source's decl. Walk target's chain
+                    // (no args), per-hop check against source.
+                    walk_substituted_supertype_chain(
+                        index,
+                        decl_registry,
+                        arena,
+                        td,
+                        &[],
+                        |arena, hop| is_castable(arena, hop, from),
+                    )
+                } else {
+                    false
+                }
+            }
+            TypeKind::Generic {
+                decl: td,
+                args: ref ta,
+            } => {
+                if fd == td {
+                    // Same decl: core's `is_castable` already gave its
+                    // verdict (false, otherwise the early-return fired).
+                    // Wrapper-side relaxation: node-tag bivariance —
+                    // mirrors `is_assignable_to_with_index` so the two
+                    // layers agree on what's allowed for tag args.
+                    fa.len() == ta.len() && well_known.is_node_tag(fd)
+                } else if index.is_subtype_of_decl(decl_registry, fd, td) {
+                    // Upcast: walk source's chain with source's args.
+                    walk_substituted_supertype_chain(
+                        index,
+                        decl_registry,
+                        arena,
+                        fd,
+                        &fa,
+                        |arena, hop| is_castable(arena, hop, to),
+                    )
+                } else if index.is_subtype_of_decl(decl_registry, td, fd) {
+                    // Downcast: walk target's chain with target's args,
+                    // per-hop compare against source. Args are checked
+                    // invariantly by core's `is_castable`.
+                    let ta_owned = ta.to_vec();
+                    walk_substituted_supertype_chain(
+                        index,
+                        decl_registry,
+                        arena,
+                        td,
+                        &ta_owned,
+                        |arena, hop| is_castable(arena, hop, from),
+                    )
+                } else {
+                    false
+                }
+            }
+            TypeKind::Primitive(Primitive::Int) if well_known.is_node_tag(fd) => true,
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1665,10 +1818,10 @@ pub(crate) fn is_castable_with_index(
         // Other primitives have no wrapper-side rules — core handled
         // them already (and returned false here, otherwise the
         // early-return would have fired).
-        TypeKind::Primitive(Primitive::Int) => match &to_t.kind {
-            TypeKind::Generic { decl: td, .. } if well_known.is_node_tag(*td) => true,
-            TypeKind::Union { alts } => alts.iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+        TypeKind::Primitive(Primitive::Int) => match to_kind {
+            TypeKind::Generic { decl: td, .. } if well_known.is_node_tag(td) => true,
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -1688,9 +1841,9 @@ pub(crate) fn is_castable_with_index(
         TypeKind::Primitive(_)
         | TypeKind::Lambda { .. }
         | TypeKind::Enum { .. }
-        | TypeKind::GenericParam { .. } => match &to_t.kind {
-            TypeKind::Union { alts } => alts.iter().any(|alt| {
-                is_castable_with_index(index, well_known, decl_registry, arena, from, *alt)
+        | TypeKind::GenericParam { .. } => match to_kind {
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_castable_with_index(index, well_known, decl_registry, arena, from, alt)
             }),
             TypeKind::Null
             | TypeKind::Any
@@ -3485,7 +3638,7 @@ fn validate_module_type_relations(
         index: &ProjectIndex,
         well_known: &WellKnown,
         decl_registry: &DeclRegistry,
-        arena: &TypeArena,
+        arena: &mut TypeArena,
         value_id: Idx<Expr>,
         declared_ty: TypeId,
         value_label: &str,

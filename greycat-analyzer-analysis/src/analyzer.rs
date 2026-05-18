@@ -1681,7 +1681,7 @@ impl<'a> Cx<'a> {
     /// `Sub` assigns to `Sup` whenever `type Sub extends Sup` (and
     /// transitively). Use this for any decidability check on user
     /// types — the bare core relation only knows decl-handle identity.
-    fn is_assignable(&self, from: TypeId, to: TypeId) -> bool {
+    fn is_assignable(&mut self, from: TypeId, to: TypeId) -> bool {
         crate::project::is_assignable_to_with_index(
             self.index,
             self.well_known,
@@ -2209,9 +2209,7 @@ impl<'a> Cx<'a> {
             self.decl_registry,
             &self.index.symbols,
             recv_ty,
-        )
-        .to_string();
-        let prop_text_owned = prop_text.to_string();
+        );
         let prop_range = self.hir.idents[property].byte_range.clone();
         let (code, kind) = if instance_access {
             ("unknown-member", "member")
@@ -2221,7 +2219,7 @@ impl<'a> Cx<'a> {
         self.out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             code,
-            format!("type `{recv_display}` has no {kind} `{prop_text_owned}`"),
+            format!("type `{recv_display}` has no {kind} `{prop_text}`"),
             prop_range,
         ));
     }
@@ -2822,9 +2820,6 @@ impl<'a> Cx<'a> {
         expr_id: Idx<Expr>,
     ) {
         let tr = &self.hir.type_refs[type_ref];
-        if !tr.qualifier.is_empty() {
-            return;
-        }
         let head_sym = self.hir.idents[tr.name].symbol;
         let Some(head_decl_id) = self.out.type_decls.get(&head_sym).copied() else {
             return;
@@ -5214,53 +5209,27 @@ impl<'a> Cx<'a> {
                 let from_ty = self.visit_expr(value);
                 let to_ty = self.lower_type_ref(ty);
                 // P12.3: validate the cast against the GreyCat `as`
-                // rules (mirrors TS `isCastable`). Surfaces invalid
-                // casts as a diagnostic; the resulting expression
-                // type is still `to_ty` so downstream inference
-                // doesn't cascade.
-                // **P19.14** — inheritance-aware cast: allow up- /
-                // down-cast within a supertype chain (e.g.
-                // `pvEntity as PVInstallation` where `PVInstallation
-                // extends PVEntity`). Both directions are runtime-
-                // permitted (downcast may fail at runtime, upcast
-                // is widening). Strip nullability so `T?` casts the
-                // same way as `T`.
-                let inheritance_ok = {
-                    let from_kind = &self.arena.get(from_ty).kind;
-                    let to_kind = &self.arena.get(to_ty).kind;
-                    // P36.3 — handle-keyed shapes resolve their name
-                    // via the project's decl registry + symbol table.
-                    let decl_registry = self.decl_registry;
-                    let symbols = &self.index.symbols;
-                    let extract_name = |k: &TypeKind| -> Option<SmolStr> {
-                        match k {
-                            TypeKind::Type(d) => {
-                                decl_registry.name(*d).map(|s| SmolStr::from(&symbols[s]))
-                            }
-                            TypeKind::Generic { decl, .. } => decl_registry
-                                .name(*decl)
-                                .map(|s| SmolStr::from(&symbols[s])),
-                            _ => None,
-                        }
-                    };
-                    match (extract_name(from_kind), extract_name(to_kind)) {
-                        (Some(fn_), Some(tn)) => {
-                            self.index.is_subtype_of(&fn_, &tn)
-                                || self.index.is_subtype_of(&tn, &fn_)
-                        }
-                        _ => false,
-                    }
-                };
-                if !inheritance_ok
-                    && !crate::project::is_castable_with_index(
-                        self.index,
-                        self.well_known,
-                        self.decl_registry,
-                        self.arena,
-                        from_ty,
-                        to_ty,
-                    )
-                {
+                // rules. Surfaces invalid casts as a diagnostic; the
+                // resulting expression type is still `to_ty` so
+                // downstream inference doesn't cascade.
+                //
+                // Inheritance-aware up/down-casts within a supertype
+                // chain (e.g. `pvEntity as PVInstallation` where
+                // `PVInstallation extends PVEntity`) are accepted by
+                // `is_castable_with_index`, which walks the more-
+                // specific side's chain with substituted args and
+                // verifies the hop's args match the other side. The
+                // GreyCat runtime drops `as` casts entirely — this is
+                // the only safety net, so the wrapper is the single
+                // source of truth for what's allowed.
+                if !crate::project::is_castable_with_index(
+                    self.index,
+                    self.well_known,
+                    self.decl_registry,
+                    self.arena,
+                    from_ty,
+                    to_ty,
+                ) {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",
