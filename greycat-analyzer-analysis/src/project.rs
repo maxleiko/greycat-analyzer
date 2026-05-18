@@ -182,13 +182,15 @@ struct ModuleSigCache {
     /// reference to a now-known type would silently stay `any()`.
     name_set_hash: u64,
     // P19.9
-    /// `(type_sym, attr_sym, ty)`.
-    attrs: Vec<(Symbol, Symbol, TypeId)>,
+    /// `(type_id, attr_sym, ty)` — attr name stays bare Symbol
+    /// (per-type-internal).
+    attrs: Vec<(ItemId, Symbol, TypeId)>,
     // P19.9
-    /// `(type_sym, method_sym, ty)`.
-    methods: Vec<(Symbol, Symbol, TypeId)>,
+    /// `(type_id, method_sym, ty)`.
+    methods: Vec<(ItemId, Symbol, TypeId)>,
     // P19.9
-    /// `(fn_sym, signature)`.
+    /// `(fn_sym, signature)`. Still Symbol-keyed; `fn_signatures`
+    /// flips to ItemId in chunk 4.
     fns: Vec<(Symbol, FnSignature)>,
     // P19.10
     /// `(var_sym, ty)`. Top-level `var` declared types.
@@ -197,14 +199,14 @@ struct ModuleSigCache {
     /// can type a cross-module `Definition::ProjectDecl` pointing at
     /// a var.
     vars: Vec<(Symbol, TypeId)>,
-    /// `(type_sym, supertype_ty)`. Pre-lowered direct supertype shape
+    /// `(type_id, supertype_ty)`. Pre-lowered direct supertype shape
     /// (e.g. `Generic { decl: Base, args: [int] }` for
     /// `Sub extends Base<int>`). Populated alongside the other
     /// signatures so `apply_module_contributions` can write back the
     /// instantiated parent TypeId into `TypeMembers::supertype_ty`
     /// — used by `is_assignable_to_with_index` to walk the chain with
     /// real generic args, not just decl identity.
-    supertypes: Vec<(Symbol, TypeId)>,
+    supertypes: Vec<(ItemId, TypeId)>,
 }
 
 impl ProjectAnalysis {
@@ -1037,6 +1039,11 @@ fn lower_signatures_into(
         cache.insert((*uri).clone(), entry);
     }
 
+    // Post-pass: resolve each type's `supertype` field from its
+    // source `extends` TypeRef to the parent's `ItemId`. Deferred to
+    // here because at ingest time the parent module may not have
+    // been ingested yet (and ingest order is not topological).
+    link_supertypes(index, lowered);
     // Post-pass: cache the deref-method return type on every type
     // whose decl carried `@deref("methodName")`. Runs after every
     // module's `method_returns` is in place so the lookup never
@@ -1047,6 +1054,107 @@ fn lower_signatures_into(
     populate_deref_caches(index);
     // P41.1
     populate_subtype_indices(index);
+}
+
+/// Walks every type decl across the project and patches each
+/// [`TypeMembers::supertype`] field with the parent's resolved
+/// [`ItemId`]. Same-module supertypes are looked up directly; bare-
+/// name cross-module supertypes filter `decl_locations` for the Type
+/// namespace, skipping private decls (matches GreyCat's bare-name
+/// visibility rule); qualified `mod::Super` supertypes route through
+/// `module_names`. Primitives (`int`, `String`, …) are intentionally
+/// dropped — they never form a `TypeMembers` entry to walk to.
+#[allow(clippy::mutable_key_type)]
+fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
+    use crate::stdlib::Namespace;
+    use greycat_analyzer_hir::types::Decl;
+
+    // Two-pass to dodge the `&mut index` + `&index` aliasing the
+    // resolution helper would otherwise need: first collect every
+    // (self_id, parent_id) pair, then apply.
+    let mut links: Vec<(ItemId, ItemId)> = Vec::new();
+    for (uri, hir) in lowered {
+        let Some(module) = hir.module.as_ref() else {
+            continue;
+        };
+        let Some(stem) = crate::stdlib::module_name_from_uri(uri) else {
+            continue;
+        };
+        let Some(module_sym) = index.symbols.lookup(stem) else {
+            continue;
+        };
+        for decl_id in &module.decls {
+            let Decl::Type(td) = &hir.decls[*decl_id] else {
+                continue;
+            };
+            let Some(super_tr) = td.supertype else {
+                continue;
+            };
+            let parent_ref = &hir.type_refs[super_tr];
+            let parent_name = hir.idents[parent_ref.name].symbol;
+            // Primitives can never be a user type's supertype — skip
+            // so the chain walker's lookup doesn't spend a probe on a
+            // name guaranteed to miss.
+            if matches!(
+                &index.symbols[parent_name],
+                "bool"
+                    | "int"
+                    | "float"
+                    | "char"
+                    | "String"
+                    | "time"
+                    | "duration"
+                    | "geo"
+                    | "any"
+                    | "null"
+            ) {
+                continue;
+            }
+            let parent_id = if let Some(last) = parent_ref.qualifier.last() {
+                // Qualified `mod::Super` — the qualifier's last
+                // segment names the owning module.
+                let qual_sym = hir.idents[*last].symbol;
+                let Some(qual_uri) = index.module_names.get(&qual_sym) else {
+                    continue;
+                };
+                let Some(qual_stem) = crate::stdlib::module_name_from_uri(qual_uri) else {
+                    continue;
+                };
+                let parent_module = index.symbols.intern(qual_stem);
+                ItemId::new(parent_module, parent_name)
+            } else {
+                // Bare `Super` — same-module wins first, then cross-
+                // module via the resolver's name-set (filtered to
+                // non-private Type-namespace candidates).
+                let local = ItemId::new(module_sym, parent_name);
+                if index.type_members.contains_key(&local) {
+                    local
+                } else {
+                    let mut hit: Option<ItemId> = None;
+                    for (cand_uri, decl) in index.locate_decl_in_ns(parent_name, Namespace::Type) {
+                        if index.is_decl_private(cand_uri, decl) {
+                            continue;
+                        }
+                        let Some(cand_stem) = crate::stdlib::module_name_from_uri(cand_uri) else {
+                            continue;
+                        };
+                        let cand_module = index.symbols.intern(cand_stem);
+                        hit = Some(ItemId::new(cand_module, parent_name));
+                        break;
+                    }
+                    let Some(found) = hit else { continue };
+                    found
+                }
+            };
+            let self_id = ItemId::new(module_sym, hir.idents[td.name].symbol);
+            links.push((self_id, parent_id));
+        }
+    }
+    for (self_id, parent_id) in links {
+        if let Some(tm) = index.type_members.get_mut(&self_id) {
+            tm.supertype = Some(parent_id);
+        }
+    }
 }
 
 // P41.1
@@ -1070,40 +1178,37 @@ fn lower_signatures_into(
 fn populate_subtype_indices(index: &mut ProjectIndex) {
     use rustc_hash::FxHashSet;
 
-    // Snapshot every type name we'll need to compute closures for.
-    // `decl_locations` also covers cross-module decls, but we only
-    // need entries that have a `TypeMembers` record — those are the
-    // ones with a `supertype` edge to walk.
-    let all_types: Vec<Symbol> = index.type_members.keys().copied().collect();
+    // Snapshot every type ItemId we'll need to compute closures for.
+    let all_types: Vec<ItemId> = index.type_members.keys().copied().collect();
 
     // Step 1: invert supertype to direct-child.
-    let mut children: FxHashMap<Symbol, Vec<Symbol>> = FxHashMap::default();
-    for (name, members) in &index.type_members {
+    let mut children: FxHashMap<ItemId, Vec<ItemId>> = FxHashMap::default();
+    for (id, members) in &index.type_members {
         if let Some(parent) = members.supertype {
-            children.entry(parent).or_default().push(*name);
+            children.entry(parent).or_default().push(*id);
         }
     }
 
     // Step 2: memoized closure build. Recursive helper; `memo` is
     // shared across roots so sibling subtrees don't redo work.
     fn build(
-        name: Symbol,
-        children: &FxHashMap<Symbol, Vec<Symbol>>,
-        is_abstract: &FxHashSet<Symbol>,
-        memo: &mut FxHashMap<Symbol, Box<[Symbol]>>,
+        id: ItemId,
+        children: &FxHashMap<ItemId, Vec<ItemId>>,
+        is_abstract: &FxHashSet<ItemId>,
+        memo: &mut FxHashMap<ItemId, Box<[ItemId]>>,
     ) {
-        if memo.contains_key(&name) {
+        if memo.contains_key(&id) {
             return;
         }
         // Sentinel insert defends against accidental cycles in
         // `supertype` (shouldn't occur, but corrupt fixtures or
         // half-loaded projects could otherwise loop here).
-        memo.insert(name, Box::default());
-        let mut set: FxHashSet<Symbol> = FxHashSet::default();
-        if !is_abstract.contains(&name) {
-            set.insert(name);
+        memo.insert(id, Box::default());
+        let mut set: FxHashSet<ItemId> = FxHashSet::default();
+        if !is_abstract.contains(&id) {
+            set.insert(id);
         }
-        if let Some(ch) = children.get(&name) {
+        if let Some(ch) = children.get(&id) {
             for c in ch.clone() {
                 build(c, children, is_abstract, memo);
                 if let Some(c_closure) = memo.get(&c) {
@@ -1111,23 +1216,30 @@ fn populate_subtype_indices(index: &mut ProjectIndex) {
                 }
             }
         }
-        let mut sorted: Vec<Symbol> = set.into_iter().collect();
+        let mut sorted: Vec<ItemId> = set.into_iter().collect();
         sorted.sort();
-        memo.insert(name, sorted.into_boxed_slice());
+        memo.insert(id, sorted.into_boxed_slice());
     }
 
-    let mut closure: FxHashMap<Symbol, Box<[Symbol]>> = FxHashMap::default();
-    for name in &all_types {
-        build(*name, &children, &index.is_abstract, &mut closure);
+    let mut closure: FxHashMap<ItemId, Box<[ItemId]>> = FxHashMap::default();
+    for id in &all_types {
+        build(*id, &children, &index.is_abstract, &mut closure);
     }
 
-    // Step 3: reverse index, abstracts only, Symbol-alpha order.
-    let mut abstract_names: Vec<Symbol> = index.is_abstract.iter().copied().collect();
-    abstract_names.sort_by(|a, b| index.symbols[*a].cmp(&index.symbols[*b]));
-    let mut reverse: FxHashMap<Box<[Symbol]>, Symbol> = FxHashMap::default();
-    for name in abstract_names {
-        if let Some(c) = closure.get(&name) {
-            reverse.entry(c.clone()).or_insert(name);
+    // Step 3: reverse index, abstracts only, ordered alphabetically
+    // by (module-name, item-name) text so collisions resolve
+    // deterministically across re-lowers. `Symbol::Ord` is u32-order
+    // (intern-timing dependent), so resolve back through the symbol
+    // table for stable string-order comparison.
+    let mut abstract_ids: Vec<ItemId> = index.is_abstract.iter().copied().collect();
+    abstract_ids.sort_by(|a, b| {
+        (&index.symbols[a.module], &index.symbols[a.name])
+            .cmp(&(&index.symbols[b.module], &index.symbols[b.name]))
+    });
+    let mut reverse: FxHashMap<Box<[ItemId]>, ItemId> = FxHashMap::default();
+    for id in abstract_ids {
+        if let Some(c) = closure.get(&id) {
+            reverse.entry(c.clone()).or_insert(id);
         }
     }
 
@@ -1137,11 +1249,15 @@ fn populate_subtype_indices(index: &mut ProjectIndex) {
 
 fn populate_deref_caches(index: &mut ProjectIndex) {
     use rustc_hash::FxHashMap;
-    // Two-pass: build a snapshot of (type_sym → method_sym) pairs
+    // Two-pass: build a snapshot of (type_id → method_sym) pairs
     // from `type_flags`, then resolve each via the chain-walking
     // method-return lookup. Avoids holding `&type_members` + `&mut
     // type_members` borrows simultaneously.
-    let mut resolutions: FxHashMap<Symbol, TypeId> = FxHashMap::default();
+    //
+    // `type_flags` is still Symbol-keyed (flips in chunk 4); the
+    // name → ItemId resolution here walks every TypeMembers entry
+    // whose `.name` matches. Cheap, runs once per ingest.
+    let mut resolutions: FxHashMap<ItemId, TypeId> = FxHashMap::default();
     for (type_sym, flags) in &index.type_flags {
         let Some(method_name) = flags.deref.as_deref() else {
             continue;
@@ -1152,12 +1268,20 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
         let Some(method_sym) = index.symbols.lookup(method_name) else {
             continue;
         };
-        if let Some(ret) = index.type_method_return_chain(*type_sym, method_sym) {
-            resolutions.insert(*type_sym, ret);
+        for type_id in index
+            .type_members
+            .keys()
+            .copied()
+            .filter(|id| id.name == *type_sym)
+            .collect::<Vec<_>>()
+        {
+            if let Some(ret) = index.type_method_return_chain(type_id, method_sym) {
+                resolutions.insert(type_id, ret);
+            }
         }
     }
-    for (type_sym, ret_ty) in resolutions {
-        if let Some(tm) = index.type_members.get_mut(&type_sym) {
+    for (type_id, ret_ty) in resolutions {
+        if let Some(tm) = index.type_members.get_mut(&type_id) {
             tm.deref_return_ty = Some(ret_ty);
         }
     }
@@ -1212,6 +1336,9 @@ fn lower_module_signatures(
         match &hir.decls[*d_id] {
             Decl::Type(td) => {
                 let type_sym = hir.idents[td.name].symbol;
+                let Some(type_id) = index.item_id_for(uri, type_sym) else {
+                    continue;
+                };
                 let owner = GenericOwner::Type(type_sym);
                 let mut generics_in_scope: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
                 for g in &td.generics {
@@ -1249,7 +1376,7 @@ fn lower_module_signatures(
                             decl_registry,
                             &generics_in_scope,
                         );
-                        entry.supertypes.push((type_sym, ty));
+                        entry.supertypes.push((type_id, ty));
                     }
                 }
                 for attr_id in &td.attrs {
@@ -1266,7 +1393,7 @@ fn lower_module_signatures(
                         decl_registry,
                         &generics_in_scope,
                     );
-                    entry.attrs.push((type_sym, attr_sym, ty));
+                    entry.attrs.push((type_id, attr_sym, ty));
                 }
                 for method_id in &td.methods {
                     let Decl::Fn(fnd) = &hir.decls[*method_id] else {
@@ -1310,7 +1437,7 @@ fn lower_module_signatures(
                             }
                         }
                     }
-                    entry.methods.push((type_sym, method_sym, ty));
+                    entry.methods.push((type_id, method_sym, ty));
                 }
             }
             Decl::Enum(_) => {
@@ -1594,8 +1721,7 @@ where
     let mut current_decl = sub_decl;
     let mut current_args: Vec<TypeId> = sub_args.to_vec();
     for _ in 0..32 {
-        let name_sym = current_decl.name;
-        let Some(members) = index.type_members.get(&name_sym) else {
+        let Some(members) = index.type_members.get(&current_decl) else {
             return false;
         };
         if members.generics.len() != current_args.len() {
@@ -2267,7 +2393,10 @@ impl ProjectAnalysis {
                 continue;
             }
             let head_sym = cur_module.hir.idents[tr.name].symbol;
-            let Some(head_members) = index.type_members.get(&head_sym) else {
+            let Some(head_id) = index.item_id_for(cur_uri, head_sym) else {
+                continue;
+            };
+            let Some(head_members) = index.type_members.get(&head_id) else {
                 continue;
             };
             // Positional / mixed fields use a different completeness
@@ -2309,9 +2438,9 @@ impl ProjectAnalysis {
             // type per attr, so the per-field check is a direct lookup
             // — no second-pass substitution needed.
             let mut chain_attrs: FxHashMap<Symbol, (TypeId, bool)> = FxHashMap::default();
-            let mut cur_decl = head_sym;
+            let mut cur_decl = head_id;
             let mut cur_subst = init_subst;
-            let mut seen: FxHashSet<Symbol> = FxHashSet::default();
+            let mut seen: FxHashSet<ItemId> = FxHashSet::default();
             for _ in 0..32 {
                 if !seen.insert(cur_decl) {
                     break;
@@ -2338,14 +2467,13 @@ impl ProjectAnalysis {
                 };
                 match arena.get(sup_ty).kind.clone() {
                     TypeKind::Generic { decl, args } => {
-                        let parent_sym = decl.name;
-                        let Some(parent_m) = index.type_members.get(&parent_sym) else {
+                        let Some(parent_m) = index.type_members.get(&decl) else {
                             break;
                         };
                         if parent_m.generics.len() != args.len() {
                             break;
                         }
-                        cur_decl = parent_sym;
+                        cur_decl = decl;
                         cur_subst = parent_m
                             .generics
                             .iter()
@@ -2354,7 +2482,7 @@ impl ProjectAnalysis {
                             .collect();
                     }
                     TypeKind::Type(decl) => {
-                        cur_decl = decl.name;
+                        cur_decl = decl;
                         cur_subst.clear();
                     }
                     _ => break,
@@ -3938,15 +4066,18 @@ fn lower_type_ref_project(
                 arena.generic_param(name_sym, *owner)
             } else if let Some(arity) = index
                 .type_members
-                .get(&name_sym)
-                .map(|m| m.generics.len())
+                .iter()
+                .find(|(id, _)| id.name == name_sym)
+                .map(|(_, m)| m.generics.len())
                 .filter(|n| *n > 0)
             {
                 // Raw-form generic reference: `Tensor` (no params)
                 // ≡ `Tensor<any?, any?>`. Expand at lowering time so
                 // the body walker and validation pass agree on the
                 // same shape; kills the need for any raw-form bridge
-                // in `is_assignable_to`.
+                // in `is_assignable_to`. Bare-name fallback walks
+                // every `type_members` entry whose name matches —
+                // first match wins, mirroring `resolve_decl_handle`.
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
                 match resolve_decl_handle(index, decl_registry, name) {
@@ -3994,10 +4125,42 @@ pub fn resolve_decl_handle(
     decl_registry: &DeclRegistry,
     name: &str,
 ) -> Option<ItemId> {
+    resolve_decl_handle_from(index, decl_registry, None, name)
+}
+
+/// Same as [`resolve_decl_handle`] but takes the *current* module
+/// URI so same-module access wins over cross-module candidates and
+/// can reach private decls in its own module (matches GreyCat's
+/// `private` semantics — bare-name only requires FQN *across*
+/// modules, not within).
+pub fn resolve_decl_handle_from(
+    index: &ProjectIndex,
+    decl_registry: &DeclRegistry,
+    current_uri: Option<&Uri>,
+    name: &str,
+) -> Option<ItemId> {
     let name_sym = index.symbols.lookup(name)?;
     // Type-namespace only: this mints an [`ItemId`], so a
     // same-named `Fn` / `Var` decl must never be returned.
-    for (uri, _) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
+    //
+    // Two-pass: same-module candidates first (unfiltered — private
+    // is visible from within its own module), then cross-module
+    // non-private candidates (private gets filtered to mirror the
+    // resolver's `is_decl_private` rule in `record_use`).
+    if let Some(cur) = current_uri {
+        for (uri, _) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
+            if uri == cur
+                && let Some(item) = index.item_id_for(uri, name_sym)
+                && decl_registry.lookup(item).is_some()
+            {
+                return Some(item);
+            }
+        }
+    }
+    for (uri, decl) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
+        if index.is_decl_private(uri, decl) {
+            continue;
+        }
         if let Some(item) = index.item_id_for(uri, name_sym)
             && decl_registry.lookup(item).is_some()
         {
@@ -4188,7 +4351,12 @@ fn generic_arity_for(
     {
         return Some(td.generics.len());
     }
-    let arity = index.type_members.get(&name_sym)?.generics.len();
+    // Bare-name foreign fallback: first non-zero arity wins.
+    let arity = index
+        .type_members
+        .iter()
+        .find(|(id, _)| id.name == name_sym)
+        .map(|(_, m)| m.generics.len())?;
     (arity > 0).then_some(arity)
 }
 
@@ -4461,11 +4629,17 @@ mod tests {
         );
         let mut pa = ProjectAnalysis::analyze(&mgr);
         assert_eq!(pa.sig_cache_len(), 2, "both modules cached after rebuild");
-        let pair_sym = pa.index.symbols.lookup("Pair").expect("Pair interned");
+        let pair_id = pa
+            .index
+            .item_id_for(
+                &uri("/proj/b.gcl"),
+                pa.index.symbols.lookup("Pair").unwrap(),
+            )
+            .expect("Pair item id");
         let cached_attrs_before = pa
             .index
             .type_members
-            .get(&pair_sym)
+            .get(&pair_id)
             .map(|tm| tm.attr_types.len())
             .unwrap_or(0);
 
@@ -4485,7 +4659,7 @@ mod tests {
         let cached_attrs_after = pa
             .index
             .type_members
-            .get(&pair_sym)
+            .get(&pair_id)
             .map(|tm| tm.attr_types.len())
             .unwrap_or(0);
         assert_eq!(
@@ -4600,14 +4774,18 @@ mod tests {
 
     /// Collect a closure's concrete leaves as `&str` names so assertions
     /// don't depend on Symbol identity (which changes per `SymbolTable`).
+    /// Tests place every type in `/proj/main.gcl` (module `main`), so
+    /// the lookup is a direct ItemId construction.
     fn closure_names<'a>(pa: &'a ProjectAnalysis, root: &str) -> Vec<&'a str> {
         let root_sym = sym(pa, root);
+        let main_mod = pa.index.symbols.intern("main");
+        let root_id = ItemId::new(main_mod, root_sym);
         pa.index
             .subtype_closure
-            .get(&root_sym)
+            .get(&root_id)
             .expect("closure entry present")
             .iter()
-            .map(|s| &pa.index.symbols[*s])
+            .map(|id| &pa.index.symbols[id.name])
             .collect()
     }
 
@@ -4710,11 +4888,12 @@ mod tests {
             false,
         );
         let pa = ProjectAnalysis::analyze(&mgr);
-        let bird_sym = sym(&pa, "Bird");
+        let main_mod = pa.index.symbols.intern("main");
+        let bird_id = ItemId::new(main_mod, sym(&pa, "Bird"));
         let bird_closure = pa
             .index
             .subtype_closure
-            .get(&bird_sym)
+            .get(&bird_id)
             .expect("Bird closure present");
         let resolved = pa
             .index
@@ -4722,7 +4901,7 @@ mod tests {
             .get(bird_closure.as_ref())
             .copied()
             .expect("reverse lookup hits");
-        assert_eq!(resolved, bird_sym);
+        assert_eq!(resolved, bird_id);
     }
 
     #[test]
@@ -4754,13 +4933,15 @@ mod tests {
 
         let collect_sorted = |pa: &ProjectAnalysis, name: &str| -> Vec<String> {
             let s = sym(pa, name);
+            let main_mod = pa.index.symbols.intern("main");
+            let id = ItemId::new(main_mod, s);
             let mut names: Vec<String> = pa
                 .index
                 .subtype_closure
-                .get(&s)
+                .get(&id)
                 .unwrap()
                 .iter()
-                .map(|sym| pa.index.symbols[*sym].to_string())
+                .map(|id| pa.index.symbols[id.name].to_string())
                 .collect();
             names.sort();
             names
@@ -4774,16 +4955,18 @@ mod tests {
         // The reverse index hits in both projects via each project's
         // own (canonical) closure key — the within-project byte
         // stability is what matters at narrow-time.
+        let bird_id_a = ItemId::new(pa_a.index.symbols.intern("main"), sym(&pa_a, "Bird"));
+        let bird_id_b = ItemId::new(pa_b.index.symbols.intern("main"), sym(&pa_b, "Bird"));
         assert!(
             pa_a.index
                 .abstract_by_closure_set
-                .contains_key(pa_a.index.subtype_closure.get(&sym(&pa_a, "Bird")).unwrap()),
+                .contains_key(pa_a.index.subtype_closure.get(&bird_id_a).unwrap()),
             "reverse index must resolve Bird's closure (src_a)",
         );
         assert!(
             pa_b.index
                 .abstract_by_closure_set
-                .contains_key(pa_b.index.subtype_closure.get(&sym(&pa_b, "Bird")).unwrap()),
+                .contains_key(pa_b.index.subtype_closure.get(&bird_id_b).unwrap()),
             "reverse index must resolve Bird's closure (src_b)",
         );
     }
@@ -4807,15 +4990,16 @@ mod tests {
         // closure(Felidae) == closure(CatLike) == {Cat, Lynx} —
         // `CatLike` sorts alphabetically before `Felidae`, so it wins
         // the reverse-index slot.
-        let catlike_sym = sym(&pa, "CatLike");
-        let cl = pa.index.subtype_closure.get(&catlike_sym).unwrap();
+        let main_mod = pa.index.symbols.intern("main");
+        let catlike_id = ItemId::new(main_mod, sym(&pa, "CatLike"));
+        let cl = pa.index.subtype_closure.get(&catlike_id).unwrap();
         let winner = pa
             .index
             .abstract_by_closure_set
             .get(cl.as_ref())
             .copied()
             .expect("reverse lookup hits");
-        let winner_name = &pa.index.symbols[winner];
+        let winner_name = &pa.index.symbols[winner.name];
         assert_eq!(
             winner_name, "CatLike",
             "tie-break must pick alphabetically-earlier abstract"
@@ -4837,8 +5021,10 @@ mod tests {
             false,
         );
         let pa = ProjectAnalysis::analyze(&mgr);
-        assert!(pa.index.is_abstract.contains(&sym(&pa, "Animal")));
-        assert!(pa.index.is_abstract.contains(&sym(&pa, "Bird")));
-        assert!(!pa.index.is_abstract.contains(&sym(&pa, "Cat")));
+        let main_mod = pa.index.symbols.intern("main");
+        let id = |n: &str| ItemId::new(main_mod, sym(&pa, n));
+        assert!(pa.index.is_abstract.contains(&id("Animal")));
+        assert!(pa.index.is_abstract.contains(&id("Bird")));
+        assert!(!pa.index.is_abstract.contains(&id("Cat")));
     }
 }

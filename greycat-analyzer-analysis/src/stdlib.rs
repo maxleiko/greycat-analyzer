@@ -226,21 +226,13 @@ pub struct ProjectIndex {
     /// `(duplicate_uri → (module_name, existing_uri))`.
     pub duplicate_modules: FxHashMap<Uri, (Symbol, Uri)>,
     // P21
-    /// Pre-computed cross-module structure index. Keyed by type
-    /// name (as it appears in source). For each type, records the
-    /// home module URI and a (property name → HIR `Idx`) lookup for
-    /// both attrs and methods. Built incrementally by [`Self::ingest`].
-    ///
-    /// The first ingested decl for a given name wins (matches the
-    /// existing `decl_locations` collision semantics — disambiguation
-    /// across libs happens at the use site via the importing module's
-    /// lib/include closure. Pass 3
-    /// (`resolve_cross_module_members`) used to drain a per-module
-    /// `deferred_member_uses` against `decl_locations` after the
-    /// per-module analyzer pass; with this index the analyzer's
-    /// `resolve_member` resolves cross-module hits inline at body-walk
-    /// time, removing the deferral.
-    pub type_members: FxHashMap<Symbol, TypeMembers>,
+    /// Pre-computed cross-module structure index. Keyed by the type's
+    /// [`ItemId`] `(module, name)` so two same-named types in
+    /// different modules coexist unambiguously. For each type,
+    /// records the home module URI and a (property name → HIR `Idx`)
+    /// lookup for both attrs and methods. Built incrementally by
+    /// [`Self::ingest`].
+    pub type_members: FxHashMap<ItemId, TypeMembers>,
     // P23
     /// Pre-lowered top-level fn signatures, keyed by fn
     /// name. First-decl-wins, matching `type_members` collision
@@ -280,11 +272,11 @@ pub struct ProjectIndex {
     /// `any`, masking float/int dispatch downstream.
     pub runtime_globals: FxHashMap<Symbol, TypeId>,
     // P41.1
-    /// Names of types declared with the `abstract` modifier. Centralized
-    /// so the sealed-hierarchy narrowing pass can ask "is this type
-    /// abstract?" without chasing the owning module's HIR. Populated
-    /// during [`Self::ingest`].
-    pub is_abstract: FxHashSet<Symbol>,
+    /// [`ItemId`]s of types declared with the `abstract` modifier.
+    /// Centralized so the sealed-hierarchy narrowing pass can ask
+    /// "is this type abstract?" without chasing the owning module's
+    /// HIR. Populated during [`Self::ingest`].
+    pub is_abstract: FxHashSet<ItemId>,
     // P41.1
     /// For every type (abstract *and* concrete), the canonically-sorted
     /// set of concrete leaves reachable through `extends`:
@@ -294,20 +286,21 @@ pub struct ProjectIndex {
     ///            ∪ ⋃ closure(child) for each direct child of X
     /// ```
     ///
-    /// Stored sorted by `Symbol`'s `Ord` impl so the reverse-index
+    /// Stored sorted by `ItemId`'s `Ord` impl so the reverse-index
     /// lookup in [`Self::abstract_by_closure_set`] is order-independent.
     /// Built by [`populate_subtype_indices`] at the tail of
     /// [`crate::project::lower_signatures_into`], after every module's
     /// `supertype` edges are in place.
-    pub subtype_closure: FxHashMap<Symbol, Box<[Symbol]>>,
+    pub subtype_closure: FxHashMap<ItemId, Box<[ItemId]>>,
     // P41.1
     /// Reverse index for the mandatory ancestor-collapse: maps each
-    /// abstract's canonical-sorted closure to that abstract's `Symbol`.
+    /// abstract's canonical-sorted closure to that abstract's `ItemId`.
     /// `narrow_complement` consults this when its subtraction set
-    /// exactly matches some `closure(A)` — collapsing the narrow value
-    /// to `Type(A)` instead of emitting a `Union`. Symbol-alpha
-    /// tie-break on collision (deterministic across re-ingest).
-    pub abstract_by_closure_set: FxHashMap<Box<[Symbol]>, Symbol>,
+    /// exactly matches some `closure(A)` — collapsing the narrow
+    /// value to `Type(A)` instead of emitting a `Union`. ItemId
+    /// (module-then-name) tie-break on collision (deterministic
+    /// across re-ingest).
+    pub abstract_by_closure_set: FxHashMap<Box<[ItemId]>, ItemId>,
     /// Total number of modules ingested. Useful for "did stdlib actually
     /// load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
@@ -409,14 +402,16 @@ pub struct TypeMembers {
     /// foreign module's HIR.
     pub abstract_methods: FxHashSet<Symbol>,
     // P19.14
-    /// Direct supertype name (the `Super` in
-    /// `type Sub extends Super`). Drives inheritance: member
-    /// lookup walks `supertype` chains to find inherited
-    /// attrs / methods, and assignability recognises
-    /// `Named(Sub)` → `Named(Super)` (and `node<Sub>` →
-    /// `node<Super>`) when `Sub` is a descendant of `Super`.
-    /// `None` for types without an explicit `extends` clause.
-    pub supertype: Option<Symbol>,
+    /// Direct supertype's [`ItemId`] (the `Super` in
+    /// `type Sub extends Super`). Drives inheritance: member lookup
+    /// walks `supertype` chains to find inherited attrs / methods,
+    /// and assignability recognises `Type(Sub)` → `Type(Super)`
+    /// (and `node<Sub>` → `node<Super>`) when `Sub` is a descendant
+    /// of `Super`. `None` for types without an explicit `extends`
+    /// clause OR when the parent name didn't resolve to a known item
+    /// at supertype-link time (post-ingest pass — see
+    /// [`crate::project::link_supertypes`]).
+    pub supertype: Option<ItemId>,
     /// Pre-lowered direct supertype as a project-arena `TypeId`. Holds
     /// the *instantiated* parent shape: for `Sub extends Base<int>`
     /// this is `Generic { decl: Base, args: [int] }`; for the generic
@@ -541,12 +536,12 @@ impl ProjectIndex {
     /// member matched by `pred`. Used to find inherited attrs /
     /// methods (`pvInstallation->timezone` resolves through
     /// `PVInstallation extends PVEntity`'s `timezone: TimeZone`).
-    /// Number of types in `type_name`'s supertype chain, counting the
-    /// type itself. Returns 0 when `type_name` is unknown. Stops
+    /// Number of types in `type_id`'s supertype chain, counting the
+    /// type itself. Returns 0 when `type_id` is unknown. Stops
     /// counting at [`MAX_SUPERTYPE_CHAIN_DEPTH`] + 1 — the caller only
     /// needs to distinguish "within limit" from "exceeds limit".
-    pub fn supertype_chain_length(&self, type_name: Symbol) -> usize {
-        let mut cur = type_name;
+    pub fn supertype_chain_length(&self, type_id: ItemId) -> usize {
+        let mut cur = type_id;
         let mut len: usize = 0;
         for _ in 0..=MAX_SUPERTYPE_CHAIN_DEPTH {
             let Some(members) = self.type_members.get(&cur) else {
@@ -570,11 +565,11 @@ impl ProjectIndex {
     /// Bounded at [`MAX_SUPERTYPE_CHAIN_DEPTH`] hops to match the
     /// runtime's inheritance-depth ceiling and defend against accidental
     /// cycles in in-progress source.
-    fn walk_member_chain<P>(&self, type_name: Symbol, mut pred: P) -> Option<&TypeMembers>
+    fn walk_member_chain<P>(&self, type_id: ItemId, mut pred: P) -> Option<&TypeMembers>
     where
         P: FnMut(&TypeMembers) -> bool,
     {
-        let mut cur = type_name;
+        let mut cur = type_id;
         for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let members = self.type_members.get(&cur)?;
             if pred(members) {
@@ -586,17 +581,16 @@ impl ProjectIndex {
     }
 
     // P19.14
-    /// `&str` lookup of an attr's HIR index, walking
-    /// the supertype chain. Returns the `(home_uri, attr_id)` of
-    /// the type that owns the attr (which may be the type itself
-    /// or a parent), so cross-module hover / goto-def points at
-    /// the right module.
+    /// Attr's HIR index, walking the supertype chain. Returns the
+    /// `(home_uri, attr_id)` of the type that owns the attr (which
+    /// may be the type itself or a parent), so cross-module hover /
+    /// goto-def points at the right module.
     pub fn type_attr_id_chain(
         &self,
-        type_name: Symbol,
+        type_id: ItemId,
         attr_name: Symbol,
     ) -> Option<(Uri, Idx<TypeAttr>)> {
-        let members = self.walk_member_chain(type_name, |m| m.attrs.contains_key(&attr_name))?;
+        let members = self.walk_member_chain(type_id, |m| m.attrs.contains_key(&attr_name))?;
         members
             .attrs
             .get(&attr_name)
@@ -607,11 +601,10 @@ impl ProjectIndex {
     /// Method's HIR index, walking the supertype chain.
     pub fn type_method_id_chain(
         &self,
-        type_name: Symbol,
+        type_id: ItemId,
         method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
-        let members =
-            self.walk_member_chain(type_name, |m| m.methods.contains_key(&method_name))?;
+        let members = self.walk_member_chain(type_id, |m| m.methods.contains_key(&method_name))?;
         members
             .methods
             .get(&method_name)
@@ -626,10 +619,10 @@ impl ProjectIndex {
     /// method of the same name.
     pub fn type_instance_method_id_chain(
         &self,
-        type_name: Symbol,
+        type_id: ItemId,
         method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
-        let members = self.walk_member_chain(type_name, |m| {
+        let members = self.walk_member_chain(type_id, |m| {
             m.methods.contains_key(&method_name) && !m.static_methods.contains(&method_name)
         })?;
         members
@@ -638,7 +631,7 @@ impl ProjectIndex {
             .map(|id| (members.home_uri.clone(), *id))
     }
 
-    /// Walk the *strict* supertype chain of `type_name` (skipping the
+    /// Walk the *strict* supertype chain of `type_id` (skipping the
     /// type itself) looking for an ancestor that declares
     /// `method_name` with the `abstract` modifier. Returns
     /// `(home_uri, Idx<Decl>)` of the abstract declaration, or `None`
@@ -647,10 +640,10 @@ impl ProjectIndex {
     /// `textDocument/implementation`.
     pub fn find_abstract_ancestor_method(
         &self,
-        type_name: Symbol,
+        type_id: ItemId,
         method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
-        let start_members = self.type_members.get(&type_name)?;
+        let start_members = self.type_members.get(&type_id)?;
         let mut cur = start_members.supertype?;
         for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let members = self.type_members.get(&cur)?;
@@ -665,33 +658,27 @@ impl ProjectIndex {
     }
 
     // P19.14
-    /// Pre-lowered attr type, walking the supertype
-    /// chain. The `TypeId` lives in the project arena and may
-    /// reference `GenericParam(T, owner=parent_type)` if the attr
-    /// is declared on a generic parent.
-    pub fn type_attr_ty_chain(&self, type_name: Symbol, attr_name: Symbol) -> Option<TypeId> {
-        let members =
-            self.walk_member_chain(type_name, |m| m.attr_types.contains_key(&attr_name))?;
+    /// Pre-lowered attr type, walking the supertype chain. The
+    /// `TypeId` lives in the project arena and may reference
+    /// `GenericParam(T, owner=parent_type)` if the attr is declared
+    /// on a generic parent.
+    pub fn type_attr_ty_chain(&self, type_id: ItemId, attr_name: Symbol) -> Option<TypeId> {
+        let members = self.walk_member_chain(type_id, |m| m.attr_types.contains_key(&attr_name))?;
         members.attr_types.get(&attr_name).copied()
     }
 
     // P19.14
-    /// Pre-lowered method return type, walking the
-    /// supertype chain.
-    pub fn type_method_return_chain(
-        &self,
-        type_name: Symbol,
-        method_name: Symbol,
-    ) -> Option<TypeId> {
+    /// Pre-lowered method return type, walking the supertype chain.
+    pub fn type_method_return_chain(&self, type_id: ItemId, method_name: Symbol) -> Option<TypeId> {
         let members =
-            self.walk_member_chain(type_name, |m| m.method_returns.contains_key(&method_name))?;
+            self.walk_member_chain(type_id, |m| m.method_returns.contains_key(&method_name))?;
         members.method_returns.get(&method_name).copied()
     }
 
     // P19.14
-    /// `true` iff `sub` is `sup` or any of its
-    /// transitive supertypes is `sup`. Bounded at 32 hops.
-    pub fn is_subtype_of(&self, sub: Symbol, sup: Symbol) -> bool {
+    /// `true` iff `sub` is `sup` or any of its transitive supertypes
+    /// is `sup`. Bounded at 32 hops.
+    pub fn is_subtype_of(&self, sub: ItemId, sup: ItemId) -> bool {
         if sub == sup {
             return true;
         }
@@ -711,16 +698,11 @@ impl ProjectIndex {
         false
     }
 
-    // P36.1
-    /// [`ItemId`]-keyed variant of [`Self::is_subtype_of`]. Type-system
-    /// handles in the body walker carry the full `(module, name)`
-    /// identity, so the chain-walk can be invoked directly without
-    /// re-resolving symbols.
+    // P36.1 — kept as a thin alias for symmetry with the chain
+    // walkers above. `is_subtype_of` now takes `ItemId` directly so
+    // the wrapper is purely cosmetic; consumers can call either.
     pub fn is_subtype_of_decl(&self, sub: ItemId, sup: ItemId) -> bool {
-        if sub == sup {
-            return true;
-        }
-        self.is_subtype_of(sub.name, sup.name)
+        self.is_subtype_of(sub, sup)
     }
     // P38.4
     /// `true` iff the decl at `(uri, decl_id)` was ingested with the
@@ -803,10 +785,6 @@ impl ProjectIndex {
                     if !is_private {
                         self.type_names.insert(name_sym);
                     }
-                    // P41.1
-                    if td.modifiers.abstract_ {
-                        self.is_abstract.insert(name_sym);
-                    }
                     // Project-wide identity + well-known slot
                     // recording. Folded in from the former standalone
                     // pre-pass in `stage_lower_signatures` so the
@@ -814,42 +792,48 @@ impl ProjectIndex {
                     let item = ItemId::new(module_sym, name_sym);
                     decl_registry.record(item, *decl_id);
                     well_known.record(&module.lib, &module.name, &self.symbols[name_sym], item);
+                    // P41.1
+                    if td.modifiers.abstract_ {
+                        self.is_abstract.insert(item);
+                    }
                     // P13.5: capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
                     let flags = derive_type_flags(&td.modifiers.annotations);
                     if flags.iterable || flags.deref.is_some() || flags.primitive {
                         self.type_flags.entry(name_sym).or_insert(flags);
                     }
-                    // P21 — populate the cross-module member index.
-                    // First-decl-wins (matches `decl_locations`'s
-                    // collision semantics). Lets the per-module
-                    // analyzer's `resolve_member` bind foreign attrs /
-                    // methods inline instead of deferring to a post
-                    // pass. Private types are skipped — they're only
-                    // resolvable in their own module, where
-                    // `out.type_decls` already provides the local
-                    // attr / method lookup without going through this
-                    // shared map.
-                    if !is_private && !self.type_members.contains_key(&name_sym) {
+                    // P21 — populate the member shape index. Keyed
+                    // by `(module, name)` so two same-named types in
+                    // different modules coexist unambiguously. The
+                    // first ingested decl for a given `ItemId` wins
+                    // (re-ingest is a no-op). Private types are
+                    // skipped — they're only resolvable in their own
+                    // module, where `out.type_decls` already provides
+                    // the local attr / method lookup without going
+                    // through this shared map.
+                    if !is_private && !self.type_members.contains_key(&item) {
                         let generics: Vec<Symbol> =
                             td.generics.iter().map(|g| hir.idents[*g].symbol).collect();
-                        // **P19.14** — capture the direct supertype
-                        // name (the `Super` in `type Sub extends
-                        // Super`). Resolved as a Symbol now (without
-                        // looking up the supertype's TypeMembers,
-                        // which may not be ingested yet — order is
-                        // module-dependent). Lookup walks the chain
-                        // lazily on access.
-                        let supertype = td.supertype.and_then(|tr| {
-                            let parent_sym = hir.idents[hir.type_refs[tr].name].symbol;
-                            let parent_text = &self.symbols[parent_sym];
-                            // Skip the trivial primitives that can
-                            // never be a user type's supertype —
-                            // they'd never resolve to a TypeMembers
-                            // entry anyway and the noise pollutes
-                            // the symbol table only marginally.
+                        let attr_order: Box<[Symbol]> = td
+                            .attrs
+                            .iter()
+                            .map(|attr_id| hir.idents[hir.type_attrs[*attr_id].name].symbol)
+                            .collect();
+                        // Best-guess supertype linkage at ingest:
+                        // unqualified `extends Super` is *probably*
+                        // same-module, so mint the same-module ItemId
+                        // immediately. The `link_supertypes` post-
+                        // pass refines for cross-module unqualified
+                        // and qualified cases. Skips primitives —
+                        // they never form a TypeMembers entry.
+                        let supertype_guess = td.supertype.and_then(|tr| {
+                            let parent_ref = &hir.type_refs[tr];
+                            if !parent_ref.qualifier.is_empty() {
+                                return None;
+                            }
+                            let parent_sym = hir.idents[parent_ref.name].symbol;
                             if matches!(
-                                parent_text,
+                                &self.symbols[parent_sym],
                                 "bool"
                                     | "int"
                                     | "float"
@@ -861,16 +845,10 @@ impl ProjectIndex {
                                     | "any"
                                     | "null"
                             ) {
-                                None
-                            } else {
-                                Some(parent_sym)
+                                return None;
                             }
+                            Some(ItemId::new(module_sym, parent_sym))
                         });
-                        let attr_order: Box<[Symbol]> = td
-                            .attrs
-                            .iter()
-                            .map(|attr_id| hir.idents[hir.type_attrs[*attr_id].name].symbol)
-                            .collect();
                         let mut m = TypeMembers {
                             home_uri: uri.clone(),
                             attrs: FxHashMap::default(),
@@ -886,7 +864,7 @@ impl ProjectIndex {
                             static_attrs: FxHashSet::default(),
                             static_methods: FxHashSet::default(),
                             abstract_methods: FxHashSet::default(),
-                            supertype,
+                            supertype: supertype_guess,
                             // Filled in by `apply_module_contributions`
                             // after signature lowering — see
                             // `populate_deref_caches` in
@@ -919,7 +897,7 @@ impl ProjectIndex {
                                 }
                             }
                         }
-                        self.type_members.insert(name_sym, m);
+                        self.type_members.insert(item, m);
                     }
                     self.record_decl_location(name_sym, uri, *decl_id, Namespace::Type);
                     Some(&td.modifiers)
@@ -1465,9 +1443,11 @@ fn helper(): int { return 1; }
             assert_eq!(idx.symbols.resolve(&sym), n);
         }
 
-        // Direct Symbol-keyed field access — one interner, no &str round-trip.
-        let bag_sym = idx.symbol("Bag").expect("Bag interned");
-        let bag = idx.type_members.get(&bag_sym).expect("Bag in type_members");
+        // Direct ItemId-keyed field access — `m.gcl` → module `m`.
+        let bag_id = idx
+            .item_id_for(&uri("/proj/m.gcl"), idx.symbol("Bag").unwrap())
+            .expect("Bag item id");
+        let bag = idx.type_members.get(&bag_id).expect("Bag in type_members");
         let weight_sym = idx.symbol("weight").expect("weight interned via ingest");
         let lift_sym = idx.symbol("lift").expect("lift interned via ingest");
         assert!(bag.attrs.contains_key(&weight_sym));

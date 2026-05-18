@@ -6,7 +6,7 @@
 //! ADT and demote the LSP shapes to a thin server-side converter.
 
 use greycat_analyzer_core::lsp_types::{self, *};
-use greycat_analyzer_core::{Symbol, SymbolTable, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_core::{ItemId, Symbol, SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::cst::node_at_offset;
@@ -1681,12 +1681,12 @@ fn member_completion(
     // head name of the resulting type.
     let _ = well_known;
     let inner_head: Option<String> = (|| {
-        let (recv_sym, recv_args): (Symbol, Vec<TypeId>) = match &arena.get(recv_ty).kind {
-            TypeKind::Type(d) => (d.name, Vec::new()),
-            TypeKind::Generic { decl, args } => (decl.name, args.to_vec()),
+        let (recv_id, recv_args): (ItemId, Vec<TypeId>) = match &arena.get(recv_ty).kind {
+            TypeKind::Type(d) => (*d, Vec::new()),
+            TypeKind::Generic { decl, args } => (*decl, args.to_vec()),
             _ => return None,
         };
-        let members = project.index.type_members.get(&recv_sym)?;
+        let members = project.index.type_members.get(&recv_id)?;
         let deref_ret = members.deref_return_ty?;
         // Substitute the receiver's generic args into the cached
         // (still-abstract) deref-method return type.

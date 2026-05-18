@@ -51,8 +51,12 @@ fn duplicate_module_decls_are_excluded_from_project_closure() {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let a_sym = pa.index.symbols.lookup("A").expect("A interned");
+    let a_id = pa
+        .index
+        .item_id_for(&Uri::from_str("file:///proj/foo.gcl").unwrap(), a_sym)
+        .expect("A item id");
     assert!(
-        pa.index.type_members.contains_key(&a_sym),
+        pa.index.type_members.contains_key(&a_id),
         "first file's decls land in type_members"
     );
 

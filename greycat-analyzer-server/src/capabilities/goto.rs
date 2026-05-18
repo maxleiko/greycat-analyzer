@@ -395,10 +395,27 @@ pub fn goto_implementation_across_project(
                 continue;
             };
             let candidate_sym = module.hir.idents[td.name].symbol;
+            let Some(candidate_id) = project.index.item_id_for(uri, candidate_sym) else {
+                continue;
+            };
             let Some(declaring_sym) = project.symbols().lookup(declaring_type.as_str()) else {
                 continue;
             };
-            if !project.index.is_subtype_of(candidate_sym, declaring_sym) {
+            // Cross-module: find ANY non-private candidate whose name
+            // matches `declaring_type` to seed the subtype query.
+            // Bare-name semantics — the first match wins.
+            let Some(declaring_id) = project
+                .index
+                .locate_decl_in_ns(
+                    declaring_sym,
+                    greycat_analyzer_analysis::stdlib::Namespace::Type,
+                )
+                .find(|(u, d)| !project.index.is_decl_private(u, *d))
+                .and_then(|(u, _)| project.index.item_id_for(u, declaring_sym))
+            else {
+                continue;
+            };
+            if !project.index.is_subtype_of(candidate_id, declaring_id) {
                 continue;
             }
             for method_id in &td.methods {
@@ -464,14 +481,25 @@ pub fn goto_declaration_across_project(
         return goto_definition_across_project(project, manager, cursor_uri, cursor_pos);
     };
 
+    // Cross-module find: pick the first non-private candidate whose
+    // name matches `declaring_type`, then walk for the abstract
+    // ancestor of `cursor_text`.
     let ancestor = project
         .symbols()
         .lookup(declaring_type.as_str())
         .zip(project.symbols().lookup(cursor_text.as_str()))
         .and_then(|(declaring_sym, method_sym)| {
+            let declaring_id = project
+                .index
+                .locate_decl_in_ns(
+                    declaring_sym,
+                    greycat_analyzer_analysis::stdlib::Namespace::Type,
+                )
+                .find(|(u, d)| !project.index.is_decl_private(u, *d))
+                .and_then(|(u, _)| project.index.item_id_for(u, declaring_sym))?;
             project
                 .index
-                .find_abstract_ancestor_method(declaring_sym, method_sym)
+                .find_abstract_ancestor_method(declaring_id, method_sym)
         });
     let Some((foreign_uri, decl_id)) = ancestor else {
         // No abstract ancestor — fall through to goto-definition so
@@ -554,6 +582,17 @@ fn type_implementations(
     target_type: &str,
 ) -> Option<GotoDefinitionResponse> {
     let target_sym = project.symbols().lookup(target_type)?;
+    // Pick the first non-private candidate whose name matches the
+    // bare `target_type` — mirrors the cross-module bare-name shape
+    // used everywhere else.
+    let target_id = project
+        .index
+        .locate_decl_in_ns(
+            target_sym,
+            greycat_analyzer_analysis::stdlib::Namespace::Type,
+        )
+        .find(|(u, d)| !project.index.is_decl_private(u, *d))
+        .and_then(|(u, _)| project.index.item_id_for(u, target_sym))?;
     let mut locations = Vec::new();
     for (uri, module) in project.iter() {
         let Some(module_root) = module.hir.module.as_ref() else {
@@ -573,7 +612,10 @@ fn type_implementations(
                 continue;
             }
             let candidate_sym = module.hir.idents[td.name].symbol;
-            if !project.index.is_subtype_of(candidate_sym, target_sym) {
+            let Some(candidate_id) = project.index.item_id_for(uri, candidate_sym) else {
+                continue;
+            };
+            if !project.index.is_subtype_of(candidate_id, target_id) {
                 continue;
             }
             locations.push(Location {
