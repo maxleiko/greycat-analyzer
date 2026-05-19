@@ -2014,6 +2014,27 @@ fn module_prefixed_type_ref_infers_typeof() {
     );
 }
 
+/// Hover on the declaring ident of a local `var name = ...;`
+/// renders `var name: <inferred type>`. The cursor sits on the
+/// declarator, not a use-site, so `resolutions.lookup` returns
+/// `None` and the dispatch needs an explicit `Stmt::Var.name`
+/// branch.
+#[test]
+fn hover_local_var_decl_ident() {
+    let src = "fn main() { var count = 7; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(0, 16))
+        .expect("hover present on `count` declarator");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("var count: int"),
+        "hover should render `var count: int`, got: {value}"
+    );
+}
+
 /// Hover on a fn declared with a `typeof T` param renders the
 /// signature with the `typeof` keyword preserved. Regression guard
 /// for the [`crate::ide::render::render_type_ref_with_subst`] path

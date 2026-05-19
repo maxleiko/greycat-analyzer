@@ -19,7 +19,7 @@ use greycat_analyzer_core::{SourceManager, SymbolTable, TypeArena, TypeId};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Expr, Ident, TypeAttr};
+use greycat_analyzer_hir::types::{Decl, Expr, Ident, Stmt, TypeAttr};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Uri};
@@ -97,6 +97,19 @@ pub fn hover_with_project(
                         ));
                     }
                 }
+            }
+            // Local `var name = ...;` declaring ident inside a fn body.
+            // Top-level `Decl::Var` rides the loop above; `Stmt::Var`
+            // does not, so the cursor on the declaring `name` would
+            // otherwise miss every hover branch.
+            if let Some(markdown) =
+                local_var_decl_hover(&module.hir, project, &module.analysis, ident_idx)
+            {
+                return Some(hover_from_markdown(
+                    markdown,
+                    ident.byte_range.clone(),
+                    text,
+                ));
             }
             // TypeAttr-defining ident (cursor on the `path` in
             // `private path: String;` inside a type body). Same hover
@@ -225,6 +238,21 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
                     ));
                 }
             }
+        }
+        // Local var-decl ident — mirror of the cached path's branch.
+        if let Some(markdown) = local_var_decl_hover_inmodule(
+            &hir,
+            &symbols,
+            &arena,
+            &decl_registry,
+            &analysis,
+            ident_idx,
+        ) {
+            return Some(hover_from_markdown(
+                markdown,
+                ident.byte_range.clone(),
+                text,
+            ));
         }
     }
 
@@ -591,6 +619,53 @@ fn receiver_ty_for_property(
         _ => None,
     })?;
     analysis.expr_types.get(&receiver_id).copied()
+}
+
+/// Render a hover string for a cursor on the declaring ident of a
+/// local `var` statement (`Stmt::Var.name`). Returns `None` when the
+/// ident isn't a local var declarator or when its inferred type
+/// hasn't settled.
+fn local_var_decl_hover(
+    hir: &Hir,
+    project: &ProjectAnalysis,
+    analysis: &AnalysisResult,
+    ident_idx: Idx<Ident>,
+) -> Option<String> {
+    let name = local_var_name_for(hir, ident_idx)?;
+    let ty = analysis.def_types.get(&name).copied()?;
+    let name_str = &project.symbols()[hir.idents[name].symbol];
+    Some(wrap_code(&format!(
+        "var {}: {}",
+        name_str,
+        project.display_type(ty),
+    )))
+}
+
+fn local_var_decl_hover_inmodule(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    arena: &TypeArena,
+    decl_registry: &DeclRegistry,
+    analysis: &AnalysisResult,
+    ident_idx: Idx<Ident>,
+) -> Option<String> {
+    let name = local_var_name_for(hir, ident_idx)?;
+    let ty = analysis.def_types.get(&name).copied()?;
+    let name_str = &symbols[hir.idents[name].symbol];
+    Some(wrap_code(&format!(
+        "var {}: {}",
+        name_str,
+        greycat_analyzer_analysis::project::display_type(arena, decl_registry, symbols, ty),
+    )))
+}
+
+/// Returns `Some(name_ident)` when `ident_idx` is the declaring ident
+/// of a `Stmt::Var` somewhere in `hir.stmts`.
+fn local_var_name_for(hir: &Hir, ident_idx: Idx<Ident>) -> Option<Idx<Ident>> {
+    hir.stmts.iter().find_map(|(_, stmt)| match stmt {
+        Stmt::Var(lv) if lv.name == ident_idx => Some(lv.name),
+        _ => None,
+    })
 }
 
 fn push_doc_section(out: &mut String, doc: Option<&str>) {
