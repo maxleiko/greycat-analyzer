@@ -1710,7 +1710,16 @@ fn check_fn_inferred_return(
         return;
     };
     let kind = &arena.get(ret_ty).kind;
+    // Skip uninformative top-types and shapes the user can't write:
+    // - `any` / `never` carry no actionable suggestion.
+    // - A union / lambda / unresolved would render as something that
+    //   isn't valid `type_ident` syntax. GCL has no `T | U` form, so a
+    //   genuine multi-branch return type can only be expressed as
+    //   `any`, which is already filtered out above.
     if matches!(kind, TypeKind::Any | TypeKind::Never) {
+        return;
+    }
+    if !is_expressible_type_ident(arena, ret_ty) {
         return;
     }
     let display = crate::project::display_type(arena, decl_registry, symbols, ret_ty);
@@ -1729,25 +1738,147 @@ fn check_fn_inferred_return(
     );
 }
 
-/// Walk a fn body's terminal block looking for the last `return e;`
-/// whose value type was recorded in `expr_types`. Mirrors the inlay-
-/// hint helper in `capabilities`. Misses fns whose every return is
-/// in a nested branch (acceptable — we only suggest when the inference
-/// is unambiguous from the surface).
+/// Walk the fn body recursively, collect the settled type of every
+/// `return e;`, and return the single common type — or `None` when the
+/// branches disagree.
+///
+/// Agreement is by exact `TypeId` (the arena interns by value, so two
+/// shapes that look alike share an id). Mixed-branch returns like
+/// `if (...) { return x.b; } return false;` produce two distinct ids
+/// (`float?` vs `bool`), the honest join is a union, and GCL has no
+/// way to write that — so we return `None` rather than emit a wrong
+/// or uninformative hint. The caller's `is_expressible_type_ident`
+/// gate is a second line of defense against the same shape leaking
+/// through (e.g. via a `Lambda` / `TypeOf` return) when the branches
+/// happen to share an id.
 fn inferred_return_from_body(
     hir: &Hir,
     analysis: &AnalysisResult,
     body: Idx<Stmt>,
 ) -> Option<TypeId> {
-    let Stmt::Block(block) = &hir.stmts[body] else {
+    let mut seen: Option<TypeId> = None;
+    if collect_return_types(hir, analysis, body, &mut seen).is_err() {
         return None;
-    };
-    for s in block.stmts.iter().rev() {
-        if let Stmt::Return(Some(e)) = &hir.stmts[*s] {
-            return analysis.expr_types.get(e).copied();
+    }
+    seen
+}
+
+/// Recursive helper for [`inferred_return_from_body`]. Visits every
+/// statement reachable from `stmt_id` and folds each `Stmt::Return`'s
+/// value type into `seen`. Returns `Err(())` the first time it sees a
+/// return whose type differs from `seen` — the caller treats that as
+/// "branches disagree, no expressible single type, skip the hint".
+///
+/// Visits the bodies of `Block` / `If` / `While` / `DoWhile` / `For` /
+/// `ForIn` / `Try` / `At` so a return buried inside an if-then or
+/// loop counts the same as one in the outer block. `Stmt::Return(None)`
+/// has no value type — leaves `seen` untouched (a bare `return;` in a
+/// branch alongside `return 42;` shouldn't change the inference; if
+/// the user wanted a hint they'd write the explicit return).
+///
+/// Dead branches are skipped: at each block we stop iterating after
+/// the first statement that `stmt_diverges_with_analysis` proves
+/// terminates control flow. That mirrors the `unreachable` lint's
+/// reasoning so a return in a provably-dead branch (e.g. after an
+/// earlier `return` / `throw` in the same block) doesn't pollute the
+/// inferred type. Narrow-dead branches (a then-arm whose condition
+/// the analyzer proves is statically false) aren't covered — the
+/// reachability primitive doesn't track condition-falseness today;
+/// when it does, this walker picks the new signal up for free.
+fn collect_return_types(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    stmt_id: Idx<Stmt>,
+    seen: &mut Option<TypeId>,
+) -> Result<(), ()> {
+    match &hir.stmts[stmt_id] {
+        Stmt::Return(Some(e)) => {
+            if let Some(ty) = analysis.expr_types.get(e).copied() {
+                match *seen {
+                    None => *seen = Some(ty),
+                    Some(prev) if prev == ty => {}
+                    Some(_) => return Err(()),
+                }
+            }
+            Ok(())
+        }
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Breakpoint => Ok(()),
+        Stmt::Block(b) => collect_returns_in_block(hir, analysis, &b.stmts, seen),
+        Stmt::If(i) => {
+            collect_returns_in_block(hir, analysis, &i.then_branch.stmts, seen)?;
+            if let Some(eb) = i.else_branch {
+                collect_return_types(hir, analysis, eb, seen)?;
+            }
+            Ok(())
+        }
+        Stmt::While(w) => collect_returns_in_block(hir, analysis, &w.body.stmts, seen),
+        Stmt::DoWhile(w) => collect_returns_in_block(hir, analysis, &w.body.stmts, seen),
+        Stmt::For(f) => collect_returns_in_block(hir, analysis, &f.body.stmts, seen),
+        Stmt::ForIn(f) => collect_returns_in_block(hir, analysis, &f.body.stmts, seen),
+        Stmt::Try(t) => {
+            collect_returns_in_block(hir, analysis, &t.try_block.stmts, seen)?;
+            collect_returns_in_block(hir, analysis, &t.catch_block.stmts, seen)?;
+            Ok(())
+        }
+        Stmt::At(a) => collect_returns_in_block(hir, analysis, &a.block.stmts, seen),
+        Stmt::Expr(_) | Stmt::Var(_) | Stmt::Assign(_) | Stmt::Throw(_) => Ok(()),
+    }
+}
+
+/// Walk a block's statements in source order, descending into each
+/// for its returns. Stops the iteration after the first statement that
+/// terminates control flow — anything after it is dead code that
+/// shouldn't contribute to the inferred return type.
+///
+/// The divergent statement itself IS visited (it might be a `return`
+/// whose value we care about, or a containing `if` whose then-branch
+/// returns). The cutoff is "siblings AFTER a divergent one".
+fn collect_returns_in_block(
+    hir: &Hir,
+    analysis: &AnalysisResult,
+    stmts: &[Idx<Stmt>],
+    seen: &mut Option<TypeId>,
+) -> Result<(), ()> {
+    for s in stmts {
+        collect_return_types(hir, analysis, *s, seen)?;
+        if crate::reachability::stmt_diverges_with_analysis(hir, analysis, *s) {
+            break;
         }
     }
-    None
+    Ok(())
+}
+
+/// `true` when `ty` is something the user can write in a `type_ident`
+/// slot. The GCL grammar accepts `[typeof] [Mod::]Name[<...>][?]`; any
+/// shape that doesn't fit that template can't be the right-hand side
+/// of an `infer-return-type` hint because the user can't act on it.
+///
+/// Expressible: primitives, named types (`Type(item)`), `Enum`,
+/// `Generic<...>` with expressible args, `TypeOf(inner)` with an
+/// expressible inner, `GenericParam` (the user has the param name in
+/// scope), `Null` (`null` is a valid type keyword), and `Any` (`any`
+/// is too — but the caller already filters that one as uninformative).
+///
+/// Not expressible: `Never`, `Unresolved`, `Lambda` (no GCL literal
+/// for function types beyond the `function` primitive — which the
+/// analyzer never picks here because closures type as `Lambda`), and
+/// `Union` (no `T | U` syntax).
+fn is_expressible_type_ident(arena: &TypeArena, ty: TypeId) -> bool {
+    let t = arena.get(ty);
+    match &t.kind {
+        TypeKind::Null
+        | TypeKind::Any
+        | TypeKind::Primitive(_)
+        | TypeKind::Type(_)
+        | TypeKind::Enum { .. }
+        | TypeKind::GenericParam { .. } => true,
+        TypeKind::Generic { args, .. } => args.iter().all(|a| is_expressible_type_ident(arena, *a)),
+        TypeKind::TypeOf(inner) => is_expressible_type_ident(arena, *inner),
+        TypeKind::Never
+        | TypeKind::Unresolved { .. }
+        | TypeKind::Lambda { .. }
+        | TypeKind::Union { .. } => false,
+    }
 }
 
 /// True when `expr_id` is downstream of a `?.` / `?->` / `?[` somewhere
