@@ -1773,9 +1773,17 @@ impl<'a> Cx<'a> {
     /// Build a string path key for an expression that's a
     /// chain of `Expr::Member` rooted at an `Expr::Ident` (the binding
     /// name) or `Expr::Literal(This)` (yielding `"this"` as the root).
-    /// Returns `None` for any other shape (offsets, calls, parens, etc.)
-    /// so we don't accidentally narrow paths whose receiver is a fresh
-    /// computed value rather than a stable reference.
+    /// Returns `None` for any other shape (calls, parens of calls, an
+    /// offset with a non-stable index, etc.) so we don't accidentally
+    /// narrow paths whose receiver is a fresh computed value rather
+    /// than a stable reference.
+    ///
+    /// `arr[N]` with a literal integer index participates as a stable
+    /// path segment: `e.attrs[0]` keys distinctly from `e.attrs[1]`
+    /// while sharing the receiver root. Non-literal indices (`arr[i]`,
+    /// `arr[f()]`, slices `arr[0..3]`) return `None`. Offset's own
+    /// `pre_optional` / `post_optional` markers don't enter the key —
+    /// they affect nullability, not element identity.
     fn member_path(&self, expr_id: Idx<Expr>) -> Option<String> {
         match &self.hir.exprs[expr_id] {
             Expr::Ident { name: name_idx, .. } => Some(self.ident_text(*name_idx).to_string()),
@@ -1798,6 +1806,21 @@ impl<'a> Cx<'a> {
                 let prop = self.ident_text(property.ident());
                 Some(format!("{recv_path}->{prop}"))
             }
+            Expr::Offset(OffsetExpr {
+                receiver, index, ..
+            }) => {
+                let recv_path = self.member_path(*receiver)?;
+                if let Expr::Literal(LiteralExpr {
+                    kind: LiteralKind::Int(n),
+                    ..
+                }) = &self.hir.exprs[*index]
+                {
+                    Some(format!("{recv_path}[{n}]"))
+                } else {
+                    None
+                }
+            }
+            Expr::Paren(inner, _) => self.member_path(*inner),
             _ => None,
         }
     }
@@ -1906,10 +1929,10 @@ impl<'a> Cx<'a> {
     /// the rest of the enclosing block. The `Stmt::If` post-pass
     /// then lifts narrows that hold along every path through the if.
     /// When the LHS is a member-access path (e.g.
-    /// `this.matchingNormalisation = ...`), record / clear the
-    /// member-narrow for that path based on the RHS's nullability.
-    /// Other LHS shapes (offsets, calls, etc.) don't have a stable
-    /// identity and silently no-op.
+    /// `this.matchingNormalisation = ...` or `arr[0]` with a literal
+    /// index), record / clear the member-narrow for that path based on
+    /// the RHS's nullability. Other LHS shapes (calls, dynamic-index
+    /// offsets, etc.) don't have a stable identity and silently no-op.
     fn record_assign_narrow(&mut self, target: Idx<Expr>, value_ty: TypeId) {
         if let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[target] {
             if let Some(Definition::Param(def) | Definition::Local(def)) =
@@ -1919,8 +1942,10 @@ impl<'a> Cx<'a> {
             }
             return;
         }
-        if matches!(self.hir.exprs[target], Expr::Member(_) | Expr::Arrow(_))
-            && let Some(path) = self.member_path(target)
+        if matches!(
+            self.hir.exprs[target],
+            Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
+        ) && let Some(path) = self.member_path(target)
         {
             // Re-assigning the path invalidates any prior `is`-narrowed type;
             // the new value's static type may be the supertype again.
@@ -1978,8 +2003,10 @@ impl<'a> Cx<'a> {
             }
             return;
         }
-        if matches!(self.hir.exprs[target], Expr::Member(_) | Expr::Arrow(_))
-            && let Some(path) = self.member_path(target)
+        if matches!(
+            self.hir.exprs[target],
+            Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
+        ) && let Some(path) = self.member_path(target)
         {
             self.write_member_non_null(path);
         }
@@ -4652,16 +4679,19 @@ impl<'a> Cx<'a> {
                 _ => {}
             },
             // P6.5: `x is T` narrows x to T in the then-branch.
-            // Also: `foo.bar is T` / `foo->bar is T` narrows the member
-            // path the same way (record by path string).
+            // Also: `foo.bar is T` / `foo->bar is T` / `arr[0] is T` (with
+            // a literal index) narrows the member path the same way
+            // (record by path string).
             Expr::Is { value, ty, .. } => {
                 if let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[*value]
                     && let Some(Definition::Param(def) | Definition::Local(def)) =
                         self.res.lookup(*name_idx)
                 {
                     out.then_typed.push((def, *ty));
-                } else if matches!(self.hir.exprs[*value], Expr::Member(_) | Expr::Arrow(_))
-                    && let Some(path) = self.member_path(*value)
+                } else if matches!(
+                    self.hir.exprs[*value],
+                    Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
+                ) && let Some(path) = self.member_path(*value)
                 {
                     out.then_member_typed.push((path, *ty));
                 }
@@ -4875,20 +4905,25 @@ impl<'a> Cx<'a> {
 
     // P19.16 + P19.21
     /// `foo.bar != null` / `null != foo.bar`
-    /// (and `==`, plus the `->` arrow form `foo->bar`) shape detection.
-    /// Returns the member-access path string when one side is an
-    /// `Expr::Member` / `Expr::Arrow` rooted at an Ident / `this` and
+    /// (and `==`, plus the `->` arrow form `foo->bar` and `arr[N]`
+    /// with a literal int index) shape detection. Returns the
+    /// member-access path string when one side is an `Expr::Member` /
+    /// `Expr::Arrow` / `Expr::Offset` rooted at an Ident / `this` and
     /// the other side is the null literal. Returns `None` for any
     /// other shape (so e.g. `foo.bar == baz.qux` or `f().x != null`
     /// don't participate).
     fn member_compared_to_null(&self, l: Idx<Expr>, r: Idx<Expr>) -> Option<String> {
         let is_null_lit = |id: Idx<Expr>| matches!(&self.hir.exprs[id], Expr::Null { .. });
-        let is_member_or_arrow =
-            |id: Idx<Expr>| matches!(self.hir.exprs[id], Expr::Member(_) | Expr::Arrow(_));
-        if is_member_or_arrow(l) && is_null_lit(r) {
+        let is_pathy = |id: Idx<Expr>| {
+            matches!(
+                self.hir.exprs[id],
+                Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
+            )
+        };
+        if is_pathy(l) && is_null_lit(r) {
             return self.member_path(l);
         }
-        if is_member_or_arrow(r) && is_null_lit(l) {
+        if is_pathy(r) && is_null_lit(l) {
             return self.member_path(r);
         }
         None
@@ -5399,10 +5434,30 @@ impl<'a> Cx<'a> {
                     }
                 };
                 let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
-                if lift_pre || post_optional {
+                let result_ty = if lift_pre || post_optional {
                     self.arena.nullable(base)
                 } else {
                     base
+                };
+                // Mirror `Expr::Member`'s narrow consult — when the
+                // offset path is keyable (literal index) and an `is T`
+                // guard or `!= null` guard recorded a narrow for it,
+                // override the element type. `arr[0] is IfcFloatAttr`
+                // followed by `arr[0].value` should see the narrowed
+                // type on `arr[0]`, same as `obj.foo is T` does for
+                // `obj.foo`.
+                let path = self.member_path(expr_id);
+                if let Some(p) = path.as_deref()
+                    && let Some(narrowed) = self.lookup_member_typed(p)
+                {
+                    narrowed
+                } else if self.arena.get(result_ty).nullable
+                    && let Some(p) = path.as_deref()
+                    && self.member_path_is_non_null(p)
+                {
+                    self.strip_nullable(result_ty)
+                } else {
+                    result_ty
                 }
             }
             Expr::Call(CallExpr { callee, args, .. }) => {
@@ -5585,8 +5640,10 @@ impl<'a> Cx<'a> {
                         {
                             self.write_narrow(def, result);
                         }
-                        if matches!(self.hir.exprs[operand], Expr::Member(_) | Expr::Arrow(_))
-                            && let Some(path) = self.member_path(operand)
+                        if matches!(
+                            self.hir.exprs[operand],
+                            Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
+                        ) && let Some(path) = self.member_path(operand)
                         {
                             self.write_member_non_null(path);
                         }
