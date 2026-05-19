@@ -2035,6 +2035,57 @@ fn hover_local_var_decl_ident() {
     );
 }
 
+/// Hover on the C-style for-loop init binder (`Stmt::For.init_name`)
+/// — declared with `var` in the source, so the rendered form keeps
+/// the `var` keyword. Type comes from the inferred init value.
+#[test]
+fn hover_for_init_var_ident() {
+    let src = "fn main() { for (var i = 0; i < 10; i = i + 1) {} }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(0, 21))
+        .expect("hover present on `i` declarator in for-init");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("var i: int"),
+        "hover should render `var i: int`, got: {value}"
+    );
+}
+
+/// Hover on a for-in iterator param (`Stmt::ForIn.params[i].name`)
+/// — no `var` keyword in the source, so the rendered form omits it
+/// and shows just `name: <type>`. Uses explicit param type
+/// annotations so the test is independent of stdlib's `@iterable`
+/// element-type inference (the `TestProject` fixture doesn't load
+/// stdlib).
+#[test]
+fn hover_for_in_param_ident() {
+    let src = "fn main() { var arr = [1, 2, 3]; for (k: int, v: String in arr) {} }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h_k = project
+        .hover(pos(0, 38))
+        .expect("hover present on `k` declarator in for-in");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h_k.contents else {
+        panic!("expected markup hover on k");
+    };
+    assert!(
+        value.contains("k: int") && !value.contains("var k:"),
+        "for-in key should render `k: int` (no `var`), got: {value}"
+    );
+    let h_v = project
+        .hover(pos(0, 46))
+        .expect("hover present on `v` declarator in for-in");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h_v.contents else {
+        panic!("expected markup hover on v");
+    };
+    assert!(
+        value.contains("v: String") && !value.contains("var v:"),
+        "for-in value should render `v: String` (no `var`), got: {value}"
+    );
+}
+
 /// Hover on a fn declared with a `typeof T` param renders the
 /// signature with the `typeof` keyword preserved. Regression guard
 /// for the [`crate::ide::render::render_type_ref_with_subst`] path
