@@ -1,0 +1,57 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn f(obj: node<node<IdentityFlags>>) {\n    var result = obj\n        .resolve()\n        .resolve()\n        .identity_id\n        .startsWith(\"some string that is a bit too long to display inline!\");\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'obj')
+        type: (type_ident
+          name: (ident 'node')
+          params: (type_ident
+            name: (ident 'node')
+            params: (type_ident
+              name: (ident 'IdentityFlags')
+            )
+          )
+        )
+      )
+    )
+    body: (block
+      (var_decl
+        name: (ident 'result')
+        (initializer
+          expr: (call_expr
+            fn: (member_expr
+              (member_expr
+                (call_expr
+                  fn: (member_expr
+                    (call_expr
+                      fn: (member_expr
+                        (ident 'obj')
+                        property: (ident 'resolve')
+                      )
+                      (args '()')
+                    )
+                    property: (ident 'resolve')
+                  )
+                  (args '()')
+                )
+                property: (ident 'identity_id')
+              )
+              property: (ident 'startsWith')
+            )
+            (args
+              (string
+                (string_fragment 'some string that is a bit too long to display inline!')
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

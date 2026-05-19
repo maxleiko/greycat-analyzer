@@ -1,0 +1,3 @@
+fn f(obj: node<node<IdentityFlags>>) {
+    var result = obj.resolve().resolve().identity_id.startsWith("some string that is a bit too long to display inline!");
+}
