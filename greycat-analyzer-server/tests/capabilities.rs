@@ -285,6 +285,90 @@ fn main(): int { return counter; }
 }
 
 #[test]
+fn completion_after_dot_on_blank_line_in_chain() {
+    // Typing `.` on a blank line inside a multi-line member chain
+    // should fire completion against the receiver expression above
+    // (here `t.other().other()`), not give up because the new `.`
+    // sits past trailing whitespace from the previous line.
+    let src = "\
+type T {
+    name: String;
+    fn other(): T;
+}
+
+fn f(t: T) {
+    var result = t
+        .other()
+        .other()
+        .
+        .name
+        .startsWith(\"xx\");
+}
+";
+    let needle = "        .\n        .name";
+    let off = src.find(needle).unwrap() + 9; // after "        ."
+    let line = src[..off].matches('\n').count() as u32;
+    let col = (off - src[..off].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let cursor = Position {
+        line,
+        character: col,
+    };
+    let test_project = TestProject::single_file(src);
+    let list = test_project
+        .completion(cursor)
+        .expect("completion list at chain `.<blank>`");
+    let labels: Vec<&str> = list.items.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"name") && labels.contains(&"other"),
+        "expected `name` and `other` on chain `.` completion, got {labels:?}"
+    );
+}
+
+#[test]
+fn completion_after_arrow_on_blank_line_in_chain() {
+    // `->` mirror of `completion_after_dot_on_blank_line_in_chain` —
+    // typing `->` on a new line after a multi-line chain that lands
+    // on a `@deref`-annotated type should list the deref target's
+    // members.
+    let src = "\
+type Inner {
+    name: String;
+}
+
+@deref(\"get\")
+type Wrapper {
+    fn get(): Inner { return Inner { name: \"\" }; }
+    fn next(): Wrapper { return this; }
+}
+
+fn f(w: Wrapper) {
+    var result = w
+        .next()
+
+        ->
+        ;
+}
+";
+    let needle = "        ->\n";
+    let off = src.find(needle).unwrap() + 10; // after "        ->"
+    let line = src[..off].matches('\n').count() as u32;
+    let col = (off - src[..off].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let cursor = Position {
+        line,
+        character: col,
+    };
+    let test_project = TestProject::single_file(src);
+    let list = test_project
+        .completion(cursor)
+        .expect("completion list at chain `->`");
+    let labels: Vec<&str> = list.items.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        labels.contains(&"name"),
+        "expected `name` (Inner attribute) on chain `->` completion, got {labels:?}"
+    );
+}
+
+#[test]
 fn completion_method_label_details_is_compact_signature() {
     // Methods should show as `fnName(args): Ret` in the popup row —
     // not buried under `static private @expose("...") fn name(...)`.

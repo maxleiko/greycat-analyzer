@@ -1962,11 +1962,22 @@ fn receiver_type_at(
     symbols: &SymbolTable,
     recv_end: usize,
 ) -> Option<TypeId> {
+    // The user may type the `.` / `->` on a new line, with whitespace
+    // (newline + indent) between the receiver expression's end and the
+    // cursor's separator. Skip whitespace backward so the HIR fast path
+    // finds the expression that ends at the *visible* receiver
+    // position, not at the run of trivia that precedes the separator.
+    // The bare-`.` parse here is `(member_expr <recv>)` with the
+    // receiver salvaged into the block as a `Stmt::Expr`, so the
+    // receiver's `byte_range().end` is the actual end of the receiver
+    // (e.g. the `)` of the trailing call), not the dot itself.
+    let bytes = text.as_bytes();
+    let effective_end = trim_trailing_trivia(bytes, recv_end);
     if let Some((id, _)) = module
         .hir
         .exprs
         .iter()
-        .filter(|(_, e)| e.byte_range().end == recv_end)
+        .filter(|(_, e)| e.byte_range().end == effective_end)
         .max_by_key(|(_, e)| e.byte_range().end - e.byte_range().start)
         && let Some(ty) = module.analysis.expr_types.get(&id).copied()
     {
@@ -2020,6 +2031,18 @@ fn receiver_type_at(
     // resolve by name lookup.
     let recv_text = text.get(r)?.to_string();
     lookup_name_type_at(&module.hir, symbols, &module.analysis, recv_end, &recv_text)
+}
+
+/// Skip ASCII whitespace bytes immediately before `end`, returning the
+/// position just after the last non-whitespace byte. Used by
+/// [`receiver_type_at`] so a `.` / `->` typed on a new line still
+/// resolves to the chain on the previous line.
+fn trim_trailing_trivia(bytes: &[u8], end: usize) -> usize {
+    let mut e = end.min(bytes.len());
+    while e > 0 && bytes[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    e
 }
 
 /// Walk the HIR for a Param / Local binding whose name matches `name`
