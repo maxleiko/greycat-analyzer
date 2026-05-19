@@ -66,8 +66,63 @@ pub fn edit_for_diagnostic(
         "unused-catch-param" => unused_catch_param_fix(root, text, start),
         "redundant-semicolon" => redundant_semicolon_fix(start, end),
         "no-breakpoint" => no_breakpoint_fix(text, start, end),
+        "infer-return-type" => infer_return_type_fix(root, start, message),
         _ => Vec::new(),
     }
+}
+
+/// Insert `: T` between the parameter list's closing `)` and the body's
+/// opening `{` of the fn whose name span the diagnostic points at.
+/// The target type comes from the diagnostic message — the lint
+/// embeds it between backticks (`return type can be inferred as
+/// `T``). Pulling it from the message keeps the fix decoupled from
+/// the type system: no second walk of HIR / arena / decl registry, and
+/// every type the lint chose to surface is by construction a string
+/// the user can paste into source.
+///
+/// No-op when:
+/// - The enclosing fn / method node can't be located (defensive).
+/// - The fn already has a `return_type` field (the lint shouldn't fire
+///   on those, but a stale diagnostic from before an edit might).
+/// - The message doesn't carry a backtick-quoted type name.
+fn infer_return_type_fix(root: Node<'_>, ident_start: usize, message: &str) -> Vec<TextEdit> {
+    let Some(ty) = extract_backtick_quoted(message) else {
+        return Vec::new();
+    };
+    let mut node = match root.descendant_for_byte_range(ident_start, ident_start) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let fn_node = loop {
+        if matches!(node.kind(), "fn_decl" | "type_method") {
+            break node;
+        }
+        node = match node.parent() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+    };
+    if fn_node.child_by_field_name("return_type").is_some() {
+        return Vec::new();
+    }
+    let Some(params) = fn_node.child_by_field_name("params") else {
+        return Vec::new();
+    };
+    let insert_at = params.end_byte();
+    vec![TextEdit {
+        byte_range: insert_at..insert_at,
+        new_text: format!(": {ty}"),
+    }]
+}
+
+/// Extract the substring between the first matching pair of backticks
+/// in `s`, or `None` when no such pair exists. Used by the
+/// `infer-return-type` fix to recover the suggested type from the
+/// diagnostic message without re-running the inference.
+fn extract_backtick_quoted(s: &str) -> Option<&str> {
+    let start = s.find('`')? + 1;
+    let end_offset = s[start..].find('`')?;
+    Some(&s[start..start + end_offset])
 }
 
 // P37.7
@@ -916,6 +971,101 @@ mod tests {
 
     fn fix(code: &str, text: &str, range: Range<usize>) -> Vec<TextEdit> {
         fix_with_msg(code, text, range, "")
+    }
+
+    #[test]
+    fn infer_return_type_inserts_annotation_after_params() {
+        // The lint's byte range covers the fn name. The fix should
+        // synthesize an annotation `: float?` and place it between
+        // the closing `)` of the params and the opening `{` of the
+        // body, leaving everything else untouched.
+        let src = "type Foo { b: float?; }\nfn foo(x: Foo) {\n    return x.b;\n}\n";
+        let name_start = src.find("fn foo").unwrap() + 3;
+        let edits = fix_with_msg(
+            "infer-return-type",
+            src,
+            name_start..(name_start + 3),
+            "return type can be inferred as `float?`",
+        );
+        assert_eq!(edits.len(), 1);
+        let params_end = src.find(") {").unwrap() + 1;
+        assert_eq!(edits[0].byte_range, params_end..params_end);
+        assert_eq!(edits[0].new_text, ": float?");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            after.contains("fn foo(x: Foo): float? {"),
+            "edit didn't produce the expected shape:\n{after}"
+        );
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    #[test]
+    fn infer_return_type_works_on_type_method() {
+        // Same shape on a method inside a type body. The fix must walk
+        // up to the `type_method` node, not stop at a `fn_decl` it
+        // never finds.
+        let src =
+            "type Box {\n    count: int;\n    fn get() {\n        return this.count;\n    }\n}\n";
+        let name_start = src.find("fn get").unwrap() + 3;
+        let edits = fix_with_msg(
+            "infer-return-type",
+            src,
+            name_start..(name_start + 3),
+            "return type can be inferred as `int`",
+        );
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ": int");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            after.contains("fn get(): int {"),
+            "edit didn't produce the expected shape:\n{after}"
+        );
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    #[test]
+    fn infer_return_type_skips_when_fn_already_has_return_type() {
+        // Defensive: a stale diagnostic from a buffer that the user
+        // already annotated must not double-annotate. The fix queries
+        // the CST for an existing `return_type` field and bails.
+        let src = "fn foo(x: int): int {\n    return x;\n}\n";
+        let name_start = src.find("fn foo").unwrap() + 3;
+        let edits = fix_with_msg(
+            "infer-return-type",
+            src,
+            name_start..(name_start + 3),
+            "return type can be inferred as `int`",
+        );
+        assert!(
+            edits.is_empty(),
+            "fix on an already-annotated fn must no-op, got: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn infer_return_type_skips_when_message_carries_no_type() {
+        // If the lint message somehow loses its backticked type
+        // (synthetic test, shouldn't happen at runtime), the fix bails
+        // rather than synthesize a malformed `: ` annotation.
+        let src = "fn foo() {\n    return 42;\n}\n";
+        let name_start = src.find("fn foo").unwrap() + 3;
+        let edits = fix_with_msg(
+            "infer-return-type",
+            src,
+            name_start..(name_start + 3),
+            "return type can be inferred (no backticks here)",
+        );
+        assert!(edits.is_empty(), "fix without backticks should bail");
     }
 
     #[test]
