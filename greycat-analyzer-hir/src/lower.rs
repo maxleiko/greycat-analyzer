@@ -1505,14 +1505,15 @@ fn magnitude_to_i64_negated(m: u64, mut issue: Option<ParseIssue>) -> (i64, Opti
 /// Eisel-Lemire path is correctly rounded by construction so the
 /// boundary cases agree with the runtime.
 ///
-/// Flags:
-/// - [`ParseIssue::Overflow`] when the parsed value is `±∞` (the
-///   literal's magnitude exceeded `f64::MAX`).
-/// - [`ParseIssue::PrecisionLoss`] when the source mantissa carries
-///   more decimal digits than f64 can represent exactly — preserved
-///   from the prior implementation's u64-overflow heuristic. Threshold
-///   is 19 digits (one more than `u64::MAX`'s digit count) so
-///   round-trippable 16–17 digit values like `f64::MAX` stay silent.
+/// Only [`ParseIssue::Overflow`] surfaces here, and only when the
+/// parsed value is `±∞`. The [`ParseIssue::PrecisionLoss`] variant
+/// stays defined for forward compatibility but is intentionally not
+/// emitted: f64 caps precision at ~16 decimal digits regardless of
+/// what the user writes, the parser's result equals what the runtime
+/// computes via `strtod`, and the canonical 20-digit math constants
+/// from `<math.h>` (`M_E`, `M_PI`, …) are idiomatic literals not user
+/// errors. Other mainstream parsers (`gcc`, `clang`, `rustc`, `tsc`)
+/// don't warn here either.
 fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
     // GreyCat allows `_` as a digit-grouping marker (`1_000.5_e+1_0`);
     // Rust's parser rejects them. Strip only when present so the
@@ -1531,27 +1532,7 @@ fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
     if value.is_infinite() {
         return (value, Some(ParseIssue::Overflow));
     }
-    let issue = if mantissa_digit_count(&cleaned) > 19 {
-        Some(ParseIssue::PrecisionLoss)
-    } else {
-        None
-    };
-    (value, issue)
-}
-
-/// Count the decimal digits in the mantissa portion of a float
-/// literal (everything before `e` / `E`). Leading sign, decimal point,
-/// and underscores skip; all other digits — including leading and
-/// trailing zeros — count. Matches the original "u64 mantissa
-/// overflow" heuristic the previous custom parser relied on for
-/// [`ParseIssue::PrecisionLoss`] detection.
-fn mantissa_digit_count(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let end = bytes
-        .iter()
-        .position(|b| *b == b'e' || *b == b'E')
-        .unwrap_or(bytes.len());
-    bytes[..end].iter().filter(|b| b.is_ascii_digit()).count()
+    (value, None)
 }
 
 fn parse_char(raw: &str) -> (LiteralKind, Option<ParseIssue>) {

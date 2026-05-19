@@ -72,10 +72,19 @@ fn f() {
 }
 
 #[test]
-fn float_precision_loss_surfaces_as_lint() {
-    // 25 significant digits — overflows the u64 mantissa the lowering
-    // accumulates, which is the trigger for PrecisionLoss.
-    let src = "fn f() { var x = 1.234567890123456789012345; }\n";
+fn float_with_many_digits_does_not_flag_precision_loss() {
+    // High-precision literals (well past f64's ~16 digit limit) are
+    // idiomatic in scientific code — `<math.h>` ships `M_E`, `M_PI`,
+    // etc. as 20-digit constants for `long double` compatibility, and
+    // users routinely paste them into `.gcl`. The lowering used to
+    // flag these as precision-lost; the heuristic was implementation-
+    // detail noise (tied to the prior in-house parser's u64 overflow
+    // point) and didn't match what the runtime / mainstream compilers
+    // do. The parsed value is the correctly-rounded f64 the runtime
+    // produces, so there's nothing actionable about the extra digits.
+    let src = "fn f() {\n    var x = 2.7182818284590452354_f;\n    \
+               var y = 3.14159265358979323846_f;\n    \
+               var z = 1.234567890123456789012345_f;\n}\n";
     let (uri, pa) = analyze(src);
     let m = pa.module(&uri).unwrap();
     let hits: Vec<_> = m
@@ -83,13 +92,10 @@ fn float_precision_loss_surfaces_as_lint() {
         .iter()
         .filter(|l| l.rule == "literal-overflow")
         .collect();
-    assert_eq!(
-        hits.len(),
-        1,
-        "expected one literal-overflow lint for the float, got {:?}",
-        m.lints
+    assert!(
+        hits.is_empty(),
+        "high-digit float literals must not flag literal-overflow; got: {hits:?}"
     );
-    assert!(hits[0].message.contains("float literal"));
 }
 
 #[test]
