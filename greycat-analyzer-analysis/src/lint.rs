@@ -1706,7 +1706,7 @@ fn check_fn_inferred_return(
     let Some(body) = fnd.body else {
         return;
     };
-    let Some(ret_ty) = inferred_return_from_body(hir, analysis, body) else {
+    let Some(ret_ty) = inferred_return_from_body(hir, analysis, arena, body) else {
         return;
     };
     let kind = &arena.get(ret_ty).kind;
@@ -1739,28 +1739,73 @@ fn check_fn_inferred_return(
 }
 
 /// Walk the fn body recursively, collect the settled type of every
-/// `return e;`, and return the single common type — or `None` when the
-/// branches disagree.
+/// `return e;`, and return the joined single type — or `None` when
+/// the branches form a union the GCL surface can't write.
 ///
-/// Agreement is by exact `TypeId` (the arena interns by value, so two
-/// shapes that look alike share an id). Mixed-branch returns like
-/// `if (...) { return x.b; } return false;` produce two distinct ids
-/// (`float?` vs `bool`), the honest join is a union, and GCL has no
-/// way to write that — so we return `None` rather than emit a wrong
-/// or uninformative hint. The caller's `is_expressible_type_ident`
-/// gate is a second line of defense against the same shape leaking
-/// through (e.g. via a `Lambda` / `TypeOf` return) when the branches
-/// happen to share an id.
+/// Agreement is by exact `TypeId` when the analyzer happens to record
+/// the same id for both branches. The interesting case is when ids
+/// differ but a single expressible type still covers both:
+///
+/// - `null + T?` (or `T? + null`) collapses to `T?`. The right-hand
+///   branch's type already carries the nullable bit, so the join is
+///   the non-null-kind branch's id. No arena allocation needed.
+/// - `T + null` (where `T` is non-nullable) collapses to `T?`. The
+///   nullable wrap is found via the arena's intern table — read-only,
+///   no allocation. If the wrap doesn't already exist in the arena
+///   (no other code in the project used `T?`) we conservatively bail.
+/// - `T + T?` (same kind, one nullable) collapses to `T?` via the
+///   same intern lookup.
+///
+/// Other mixed shapes (`float? + bool`, `int + String`, ...) form a
+/// union with no GCL syntax and bail. The caller's
+/// `is_expressible_type_ident` gate is a second line of defense
+/// against the same shape leaking through (e.g. via a `Lambda` /
+/// `TypeOf` return) when the branches happen to share an id.
 fn inferred_return_from_body(
     hir: &Hir,
     analysis: &AnalysisResult,
+    arena: &TypeArena,
     body: Idx<Stmt>,
 ) -> Option<TypeId> {
     let mut seen: Option<TypeId> = None;
-    if collect_return_types(hir, analysis, body, &mut seen).is_err() {
+    if collect_return_types(hir, analysis, arena, body, &mut seen).is_err() {
         return None;
     }
     seen
+}
+
+/// Combine `a` and `b` into the single GCL-expressible type that
+/// covers both, or `None` when no such type exists in the arena. See
+/// [`inferred_return_from_body`] for the rule set.
+fn join_return_types(arena: &TypeArena, a: TypeId, b: TypeId) -> Option<TypeId> {
+    if a == b {
+        return Some(a);
+    }
+    let ta = arena.get(a);
+    let tb = arena.get(b);
+    let nullable_companion = |id: TypeId| -> Option<TypeId> {
+        let t = arena.get(id);
+        if t.nullable {
+            return Some(id);
+        }
+        let mut probe = t.clone();
+        probe.nullable = true;
+        arena.intern.get(&probe).copied()
+    };
+    // `null + T` (either order) → the nullable form of T. Includes the
+    // `T?` case (the companion of an already-nullable type is itself).
+    if matches!(ta.kind, TypeKind::Null) {
+        return nullable_companion(b);
+    }
+    if matches!(tb.kind, TypeKind::Null) {
+        return nullable_companion(a);
+    }
+    // Same kind, differ only in `nullable` → `T?`. Looks the nullable
+    // wrap up read-only.
+    if ta.kind == tb.kind && ta.nullable != tb.nullable {
+        return nullable_companion(if ta.nullable { a } else { b });
+    }
+    None
 }
 
 /// Recursive helper for [`inferred_return_from_body`]. Visits every
@@ -1788,6 +1833,7 @@ fn inferred_return_from_body(
 fn collect_return_types(
     hir: &Hir,
     analysis: &AnalysisResult,
+    arena: &TypeArena,
     stmt_id: Idx<Stmt>,
     seen: &mut Option<TypeId>,
 ) -> Result<(), ()> {
@@ -1796,31 +1842,33 @@ fn collect_return_types(
             if let Some(ty) = analysis.expr_types.get(e).copied() {
                 match *seen {
                     None => *seen = Some(ty),
-                    Some(prev) if prev == ty => {}
-                    Some(_) => return Err(()),
+                    Some(prev) => match join_return_types(arena, prev, ty) {
+                        Some(joined) => *seen = Some(joined),
+                        None => return Err(()),
+                    },
                 }
             }
             Ok(())
         }
         Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Breakpoint => Ok(()),
-        Stmt::Block(b) => collect_returns_in_block(hir, analysis, &b.stmts, seen),
+        Stmt::Block(b) => collect_returns_in_block(hir, analysis, arena, &b.stmts, seen),
         Stmt::If(i) => {
-            collect_returns_in_block(hir, analysis, &i.then_branch.stmts, seen)?;
+            collect_returns_in_block(hir, analysis, arena, &i.then_branch.stmts, seen)?;
             if let Some(eb) = i.else_branch {
-                collect_return_types(hir, analysis, eb, seen)?;
+                collect_return_types(hir, analysis, arena, eb, seen)?;
             }
             Ok(())
         }
-        Stmt::While(w) => collect_returns_in_block(hir, analysis, &w.body.stmts, seen),
-        Stmt::DoWhile(w) => collect_returns_in_block(hir, analysis, &w.body.stmts, seen),
-        Stmt::For(f) => collect_returns_in_block(hir, analysis, &f.body.stmts, seen),
-        Stmt::ForIn(f) => collect_returns_in_block(hir, analysis, &f.body.stmts, seen),
+        Stmt::While(w) => collect_returns_in_block(hir, analysis, arena, &w.body.stmts, seen),
+        Stmt::DoWhile(w) => collect_returns_in_block(hir, analysis, arena, &w.body.stmts, seen),
+        Stmt::For(f) => collect_returns_in_block(hir, analysis, arena, &f.body.stmts, seen),
+        Stmt::ForIn(f) => collect_returns_in_block(hir, analysis, arena, &f.body.stmts, seen),
         Stmt::Try(t) => {
-            collect_returns_in_block(hir, analysis, &t.try_block.stmts, seen)?;
-            collect_returns_in_block(hir, analysis, &t.catch_block.stmts, seen)?;
+            collect_returns_in_block(hir, analysis, arena, &t.try_block.stmts, seen)?;
+            collect_returns_in_block(hir, analysis, arena, &t.catch_block.stmts, seen)?;
             Ok(())
         }
-        Stmt::At(a) => collect_returns_in_block(hir, analysis, &a.block.stmts, seen),
+        Stmt::At(a) => collect_returns_in_block(hir, analysis, arena, &a.block.stmts, seen),
         Stmt::Expr(_) | Stmt::Var(_) | Stmt::Assign(_) | Stmt::Throw(_) => Ok(()),
     }
 }
@@ -1836,11 +1884,12 @@ fn collect_return_types(
 fn collect_returns_in_block(
     hir: &Hir,
     analysis: &AnalysisResult,
+    arena: &TypeArena,
     stmts: &[Idx<Stmt>],
     seen: &mut Option<TypeId>,
 ) -> Result<(), ()> {
     for s in stmts {
-        collect_return_types(hir, analysis, *s, seen)?;
+        collect_return_types(hir, analysis, arena, *s, seen)?;
         if crate::reachability::stmt_diverges_with_analysis(hir, analysis, *s) {
             break;
         }

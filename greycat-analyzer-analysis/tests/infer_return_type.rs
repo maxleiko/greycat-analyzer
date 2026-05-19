@@ -69,12 +69,64 @@ fn nested_return_inside_if_is_seen() {
 }
 
 #[test]
+fn null_and_nullable_branch_join_to_nullable() {
+    // `return x.b` (type `float?`) on one branch, `return null` on the
+    // other. The honest join is `float? | null = float?`, which is
+    // expressible. The lint must propose `float?`, not skip.
+    let src = "\
+type Foo {
+    a: int;
+    b: float?;
+}
+fn foo(x: Foo) {
+    if (x.a == 0) {
+        return x.b;
+    }
+    return null;
+}
+";
+    let (uri, pa) = analyze(src);
+    let hints = infer_return_hints(&pa, &uri);
+    assert_eq!(hints.len(), 1, "got: {hints:?}");
+    assert!(
+        hints[0].contains("`float?`"),
+        "expected `float?` hint, got: {hints:?}"
+    );
+}
+
+#[test]
+fn nullable_and_nonnull_branches_join_when_wrap_exists() {
+    // One branch returns `x.b: float?`, the other returns a non-null
+    // `float`. The join is `float?`. The nullable wrap is already in
+    // the arena (from `x.b`'s declared type), so the read-only intern
+    // lookup finds it and the lint emits the hint.
+    let src = "\
+type Foo {
+    a: int;
+    b: float?;
+}
+fn foo(x: Foo) {
+    if (x.a == 0) {
+        return x.b;
+    }
+    return 3.14;
+}
+";
+    let (uri, pa) = analyze(src);
+    let hints = infer_return_hints(&pa, &uri);
+    assert_eq!(hints.len(), 1, "got: {hints:?}");
+    assert!(
+        hints[0].contains("`float?`"),
+        "expected `float?` hint, got: {hints:?}"
+    );
+}
+
+#[test]
 fn mixed_branch_returns_skip_when_join_is_not_expressible() {
-    // The user's reproduction shape: one branch returns `float?`, the
-    // other returns `bool`. The honest unified type is `float? | bool`
-    // which has no GCL syntax. The old lint silently picked the
-    // outer-block return (`bool`) and emitted a wrong hint; the fix
-    // detects the disagreement and skips.
+    // True disagreement: one branch returns `float?`, the other
+    // returns `bool`. The honest unified type is `float? | bool`
+    // which has no GCL syntax. The fix detects the disagreement and
+    // skips.
     let src = "\
 type Foo {
     a: int;
