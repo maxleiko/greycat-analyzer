@@ -17,3 +17,6 @@
 # covers node_modules + dist; this catches any global slipups).
 /playground/node_modules
 /playground/dist
+
+# Claude
+/.claude/worktrees/
