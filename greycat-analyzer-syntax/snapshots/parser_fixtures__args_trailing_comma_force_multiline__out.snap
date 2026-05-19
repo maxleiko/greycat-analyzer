@@ -1,0 +1,23 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn f() {\n    foo(\n        a,\n        b,\n        c,\n    );\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (expr_stmt
+        (call_expr
+          fn: (ident 'foo')
+          (args
+            (ident 'a')
+            (ident 'b')
+            (ident 'c')
+          )
+        )
+      )
+    )
+  )
+)

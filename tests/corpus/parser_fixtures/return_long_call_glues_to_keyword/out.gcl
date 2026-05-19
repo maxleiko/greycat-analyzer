@@ -1,0 +1,13 @@
+fn return_stmt() {
+    return buildPlaceHit(
+        PlaceKind::governorate,
+        gov->name,
+        gov->name_original,
+        null,
+        "",
+        gov->location,
+        gov->bbox,
+        gov->total_buildings,
+        gov->total_building_area_m2
+    );
+}

@@ -770,14 +770,25 @@ fn lower_args_call<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if args.is_empty() {
         return Doc::text("()");
     }
+    // Trailing-comma opt-in: a source-level `,` after the last arg
+    // forces the args group into multi-line mode and preserves the
+    // hint on output, mirroring the same idiom on object_fields.
+    let trailing = has_trailing_comma(node);
     let mut inner = Vec::new();
-    inner.push(Doc::softline());
+    inner.push(if trailing {
+        Doc::hardline()
+    } else {
+        Doc::softline()
+    });
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
             inner.push(Doc::text(","));
             inner.push(Doc::line());
         }
         inner.push(lower_node(cx, *a));
+    }
+    if trailing {
+        inner.push(Doc::text(","));
     }
     Doc::group(Doc::concat(vec![
         Doc::text("("),
@@ -843,12 +854,21 @@ fn lower_keyword_expr_stmt<'a>(cx: &Cx<'a>, node: Node<'a>, kw: &'static str) ->
 }
 
 /// Lower an expression that follows a statement keyword (`return`,
-/// `throw`, …) with a fallback line-break before the expression when
-/// the keyword + expression would overflow. Expressions whose own
-/// lowering already breaks (chains) are emitted as-is, since adding an
-/// outer Group on top would just produce nested wrapping.
+/// `throw`, …). Any expression whose own lowering can break — chain
+/// binops, brace-led constructors, postfix chains (`call_expr` /
+/// `member_expr` / `arrow_expr` / `array_expr`) — is emitted verbatim so
+/// the keyword stays glued to its argument and the inner break point
+/// (args group, fields group, chain dot) handles overflow. Wrapping
+/// these in an outer Group with a leading softline would detach the
+/// keyword from the call (`return\n    foo(args)`), which is never the
+/// shape anyone wants.
+///
+/// Only "leaf" expressions (idents, simple binary ops, paren-wrapped
+/// subexprs, …) get the outer softline fallback — for those there's no
+/// internal break point, so an outer one is the only way to fit a wide
+/// expression.
 fn wrap_keyword_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    if is_self_wrapping_expr(cx, node) {
+    if is_self_wrapping_expr(cx, node) || is_postfix_chain_expr(node) {
         lower_node(cx, node)
     } else {
         Doc::group(Doc::indent(Doc::concat(vec![
@@ -856,6 +876,20 @@ fn wrap_keyword_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
             lower_node(cx, node),
         ])))
     }
+}
+
+/// Postfix-chain expression shapes — call / member access / arrow access
+/// / array indexing. Each one's lowering produces a `Doc::Group` (call
+/// args group, member-chain spine) that can break independently, so
+/// callers managing keyword + expr layout treat them like
+/// [`is_self_wrapping_expr`] and skip the outer wrapping. Distinct from
+/// `is_self_wrapping_expr` because the paren-condition wrapper still
+/// wants the symmetric "softline before+after" treatment for these.
+fn is_postfix_chain_expr(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "call_expr" | "member_expr" | "arrow_expr" | "array_expr"
+    )
 }
 
 /// True when the expression's lowering already produces a `Doc::Group`

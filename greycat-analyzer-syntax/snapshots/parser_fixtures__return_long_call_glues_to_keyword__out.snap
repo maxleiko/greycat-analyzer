@@ -1,0 +1,52 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn return_stmt() {\n    return buildPlaceHit(\n        PlaceKind::governorate,\n        gov->name,\n        gov->name_original,\n        null,\n        \"\",\n        gov->location,\n        gov->bbox,\n        gov->total_buildings,\n        gov->total_building_area_m2\n    );\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'return_stmt')
+    params: (fn_params '()')
+    body: (block
+      (return_stmt
+        (call_expr
+          fn: (ident 'buildPlaceHit')
+          (args
+            (static_expr
+              (type_ident
+                name: (ident 'PlaceKind')
+              )
+              property: (ident 'governorate')
+            )
+            (arrow_expr
+              (ident 'gov')
+              property: (ident 'name')
+            )
+            (arrow_expr
+              (ident 'gov')
+              property: (ident 'name_original')
+            )
+            (null 'null')
+            (string '""')
+            (arrow_expr
+              (ident 'gov')
+              property: (ident 'location')
+            )
+            (arrow_expr
+              (ident 'gov')
+              property: (ident 'bbox')
+            )
+            (arrow_expr
+              (ident 'gov')
+              property: (ident 'total_buildings')
+            )
+            (arrow_expr
+              (ident 'gov')
+              property: (ident 'total_building_area_m2')
+            )
+          )
+        )
+      )
+    )
+  )
+)
