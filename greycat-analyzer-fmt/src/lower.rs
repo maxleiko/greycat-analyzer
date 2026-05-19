@@ -1665,12 +1665,42 @@ fn lower_chain_root<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         return head_doc;
     }
 
-    // Split the link content into a head-glued prefix (pre-softline)
-    // and a chain-indented tail (post-softline). The tail goes inside
-    // an IndentIfBroken so the chain's indent step only fires when the
-    // chain itself breaks — leaving inner expandable groups (args /
-    // object inits / arrays) to drive their own indent on their own
-    // break decision when the chain stays flat.
+    // Count dot-break boundaries — links that contribute an
+    // `after_break` (`.prop`, `->prop`). A receiver with at most one
+    // such boundary is a "method-call" shape (`receiver.method(args)`,
+    // `receiver->method(args)`, plain `foo(args)`, `foo[i]`, …) where
+    // the natural break point is the args / index group, not the dot.
+    // Splitting `receiver.method(\n    .method(args))` onto its own
+    // indented line for a one-method call is the symptom the user
+    // (rightly) flagged — `Type::method(args)` doesn't do that
+    // (static_expr is the head, no member link in the chain), and
+    // semantically equivalent `obj.method(args)` / `obj->method(args)`
+    // should match.
+    //
+    // Two or more member-style links is a real multi-segment chain
+    // (`obj.a.b.c()`, `obj.foo().bar()`) — keep the
+    // softline-before-each-dot layout so the renderer can split at
+    // every step when the line overflows.
+    let member_link_count = links.iter().filter(|l| l.after_break.is_some()).count();
+    if member_link_count <= 1 {
+        let mut result: Vec<Doc> = vec![head_doc];
+        for link in links {
+            if !is_doc_nil(&link.leading) {
+                result.push(link.leading);
+            }
+            if let Some(trail) = link.after_break {
+                result.push(trail);
+            }
+        }
+        return Doc::concat(result);
+    }
+
+    // Multi-segment chain. Split the link content into a head-glued
+    // prefix (pre-softline) and a chain-indented tail (post-softline).
+    // The tail goes inside an IndentIfBroken so the chain's indent step
+    // only fires when the chain itself breaks — leaving inner expandable
+    // groups (args / object inits / arrays) to drive their own indent
+    // on their own break decision when the chain stays flat.
     let mut prefix: Vec<Doc> = Vec::new();
     let mut tail: Vec<Doc> = Vec::new();
     let mut crossed_softline = false;

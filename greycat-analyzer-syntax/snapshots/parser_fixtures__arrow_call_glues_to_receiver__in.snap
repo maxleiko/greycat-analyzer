@@ -1,0 +1,33 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn f(profile: Profile) {\n    profile->updateAll(some_very_long_argument_aaaaaaaa, another_long_argument_bbbbbbbbb, third_long_argument_cccccccccc);\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'profile')
+        type: (type_ident
+          name: (ident 'Profile')
+        )
+      )
+    )
+    body: (block
+      (expr_stmt
+        (call_expr
+          fn: (arrow_expr
+            (ident 'profile')
+            property: (ident 'updateAll')
+          )
+          (args
+            (ident 'some_very_long_argument_aaaaaaaa')
+            (ident 'another_long_argument_bbbbbbbbb')
+            (ident 'third_long_argument_cccccccccc')
+          )
+        )
+      )
+    )
+  )
+)

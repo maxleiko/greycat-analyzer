@@ -1,0 +1,17 @@
+type Foo {
+    static fn whatever() {
+        place_meta_by_key.set(
+            key,
+            placesServiceUpsertMetaNode(
+                place_meta_by_key,
+                key,
+                indexed,
+                PlaceKind::governorate,
+                gov->name,
+                gov->name_original,
+                gov->location,
+                gov->bbox
+            ),
+        );
+    }
+}

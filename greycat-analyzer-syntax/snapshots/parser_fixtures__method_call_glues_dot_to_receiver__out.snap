@@ -1,0 +1,60 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "type Foo {\n    static fn whatever() {\n        place_meta_by_key.set(\n            key,\n            placesServiceUpsertMetaNode(\n                place_meta_by_key,\n                key,\n                indexed,\n                PlaceKind::governorate,\n                gov->name,\n                gov->name_original,\n                gov->location,\n                gov->bbox\n            ),\n        );\n    }\n}\n"
+---
+(module
+  (type_decl
+    name: (ident 'Foo')
+    body: (type_body
+      (type_method
+        modifiers: (modifiers 'static')
+        name: (ident 'whatever')
+        params: (fn_params '()')
+        body: (block
+          (expr_stmt
+            (call_expr
+              fn: (member_expr
+                (ident 'place_meta_by_key')
+                property: (ident 'set')
+              )
+              (args
+                (ident 'key')
+                (call_expr
+                  fn: (ident 'placesServiceUpsertMetaNode')
+                  (args
+                    (ident 'place_meta_by_key')
+                    (ident 'key')
+                    (ident 'indexed')
+                    (static_expr
+                      (type_ident
+                        name: (ident 'PlaceKind')
+                      )
+                      property: (ident 'governorate')
+                    )
+                    (arrow_expr
+                      (ident 'gov')
+                      property: (ident 'name')
+                    )
+                    (arrow_expr
+                      (ident 'gov')
+                      property: (ident 'name_original')
+                    )
+                    (arrow_expr
+                      (ident 'gov')
+                      property: (ident 'location')
+                    )
+                    (arrow_expr
+                      (ident 'gov')
+                      property: (ident 'bbox')
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

@@ -1,0 +1,7 @@
+fn f(profile: Profile) {
+    profile->updateAll(
+        some_very_long_argument_aaaaaaaa,
+        another_long_argument_bbbbbbbbb,
+        third_long_argument_cccccccccc
+    );
+}
