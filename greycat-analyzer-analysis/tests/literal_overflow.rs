@@ -93,6 +93,50 @@ fn float_precision_loss_surfaces_as_lint() {
 }
 
 #[test]
+fn f64_max_canonical_decimal_does_not_overflow() {
+    // `f64::MAX` round-trips through Rust's `{:e}` as
+    // `1.7976931348623157e308`; the literal MUST parse to exactly
+    // `f64::MAX` rather than `+∞`. The prior in-house parser
+    // accumulated rounding error in `(mantissa as f64) * 10.powi(exp)`
+    // and overshot `f64::MAX`, producing a spurious literal-overflow
+    // lint at both bounds.
+    let src = "fn f() {\n    -1.7976931348623157e+308_f;\n    1.7976931348623157e+308_f;\n}\n";
+    let (uri, pa) = analyze(src);
+    let m = pa.module(&uri).unwrap();
+    let hits: Vec<_> = m
+        .lints
+        .iter()
+        .filter(|l| l.rule == "literal-overflow")
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "f64::MAX's canonical decimal must not flag literal-overflow; got: {hits:?}"
+    );
+}
+
+#[test]
+fn float_just_past_f64_max_still_overflows() {
+    // One step past `f64::MAX`'s exponent — must still flag as
+    // overflow so the rounding-bound fix doesn't accidentally widen
+    // the accepted range.
+    let src = "fn f() { var x = 1.0e+309_f; }\n";
+    let (uri, pa) = analyze(src);
+    let m = pa.module(&uri).unwrap();
+    let hits: Vec<_> = m
+        .lints
+        .iter()
+        .filter(|l| l.rule == "literal-overflow")
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "literal beyond f64::MAX must still flag overflow, got: {:?}",
+        m.lints
+    );
+    assert!(hits[0].message.contains("rounded to infinity"));
+}
+
+#[test]
 fn malformed_iso8601_stays_a_semantic_error() {
     // Malformed-shape parse failures are hard errors — they must not
     // be routed through the lint surface (where users could

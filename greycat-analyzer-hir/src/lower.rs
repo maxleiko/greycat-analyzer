@@ -1496,109 +1496,62 @@ fn magnitude_to_i64_negated(m: u64, mut issue: Option<ParseIssue>) -> (i64, Opti
     }
 }
 
-/// f64 parse — byte-walker, zero allocation. Accumulates digits into
-/// a u64 mantissa with an `i32` exponent adjustment for the fractional
-/// position, then folds in any `e`/`E` exponent. The final value is
-/// `mantissa * 10^total_exp`.
+/// f64 parse. Strips GreyCat's underscore digit separators then
+/// delegates to Rust's correctly-rounded `str::parse::<f64>`. The
+/// in-house mantissa-times-pow10 accumulator we used previously
+/// accumulated rounding error fast enough that `f64::MAX`'s canonical
+/// decimal (`1.7976931348623157e+308`) parsed to `+∞`, which the
+/// `literal-overflow` lint then flagged as overflow. `from_str`'s
+/// Eisel-Lemire path is correctly rounded by construction so the
+/// boundary cases agree with the runtime.
 ///
 /// Flags:
-/// - [`ParseIssue::Overflow`] when the final value is `±∞` (the
-///   exponent pushed past f64::MAX).
-/// - [`ParseIssue::PrecisionLoss`] when the digit stream overflowed
-///   the u64 mantissa — anything past ~19 significant digits silently
-///   drops below the floor of f64's representable precision.
+/// - [`ParseIssue::Overflow`] when the parsed value is `±∞` (the
+///   literal's magnitude exceeded `f64::MAX`).
+/// - [`ParseIssue::PrecisionLoss`] when the source mantissa carries
+///   more decimal digits than f64 can represent exactly — preserved
+///   from the prior implementation's u64-overflow heuristic. Threshold
+///   is 19 digits (one more than `u64::MAX`'s digit count) so
+///   round-trippable 16–17 digit values like `f64::MAX` stay silent.
 fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut mantissa: u64 = 0;
-    let mut mantissa_overflowed = false;
-    // -1 per fractional digit accumulated; +1 per integer digit
-    // dropped after overflow. Combined with the explicit exponent
-    // below, this is what scales `mantissa` back to the source value.
-    let mut frac_exp: i32 = 0;
-    let mut seen_dot = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            b'_' => {}
-            b'.' => seen_dot = true,
-            b'e' | b'E' => break,
-            b'0'..=b'9' => {
-                let d = (b - b'0') as u64;
-                if !mantissa_overflowed {
-                    match mantissa.checked_mul(10).and_then(|v| v.checked_add(d)) {
-                        Some(v) => {
-                            mantissa = v;
-                            if seen_dot {
-                                frac_exp -= 1;
-                            }
-                        }
-                        None => {
-                            mantissa_overflowed = true;
-                            // Lost an integer-part digit — bump exp
-                            // so magnitude is preserved.
-                            if !seen_dot {
-                                frac_exp += 1;
-                            }
-                        }
-                    }
-                } else if !seen_dot {
-                    // Still in integer part after overflow: each
-                    // dropped digit also bumps the exponent.
-                    frac_exp += 1;
-                }
-                // Overflowed + seen_dot: digit silently dropped
-                // (it's well past f64 precision).
-            }
-            _ => break,
-        }
-        i += 1;
+    // GreyCat allows `_` as a digit-grouping marker (`1_000.5_e+1_0`);
+    // Rust's parser rejects them. Strip only when present so the
+    // common no-underscore case skips the allocation.
+    let cleaned: std::borrow::Cow<'_, str> = if s.contains('_') {
+        std::borrow::Cow::Owned(s.chars().filter(|c| *c != '_').collect())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    };
+    let value = match cleaned.parse::<f64>() {
+        Ok(v) => v,
+        // The lexer / grammar already validated the literal's shape,
+        // so `from_str` shouldn't fail in practice. Defensive return.
+        Err(_) => return (0.0, Some(ParseIssue::Overflow)),
+    };
+    if value.is_infinite() {
+        return (value, Some(ParseIssue::Overflow));
     }
-
-    // Optional exponent.
-    let mut exp: i32 = 0;
-    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        i += 1;
-        let mut neg = false;
-        if let Some(&sign) = bytes.get(i) {
-            match sign {
-                b'-' => {
-                    neg = true;
-                    i += 1;
-                }
-                b'+' => i += 1,
-                _ => {}
-            }
-        }
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'_' {
-                i += 1;
-                continue;
-            }
-            if !b.is_ascii_digit() {
-                break;
-            }
-            exp = exp.saturating_mul(10).saturating_add((b - b'0') as i32);
-            i += 1;
-        }
-        if neg {
-            exp = -exp;
-        }
-    }
-
-    let total_exp = exp.saturating_add(frac_exp);
-    let value = (mantissa as f64) * 10f64.powi(total_exp);
-
-    let issue = if value.is_infinite() {
-        Some(ParseIssue::Overflow)
-    } else if mantissa_overflowed {
+    let issue = if mantissa_digit_count(&cleaned) > 19 {
         Some(ParseIssue::PrecisionLoss)
     } else {
         None
     };
     (value, issue)
+}
+
+/// Count the decimal digits in the mantissa portion of a float
+/// literal (everything before `e` / `E`). Leading sign, decimal point,
+/// and underscores skip; all other digits — including leading and
+/// trailing zeros — count. Matches the original "u64 mantissa
+/// overflow" heuristic the previous custom parser relied on for
+/// [`ParseIssue::PrecisionLoss`] detection.
+fn mantissa_digit_count(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let end = bytes
+        .iter()
+        .position(|b| *b == b'e' || *b == b'E')
+        .unwrap_or(bytes.len());
+    bytes[..end].iter().filter(|b| b.is_ascii_digit()).count()
 }
 
 fn parse_char(raw: &str) -> (LiteralKind, Option<ParseIssue>) {
