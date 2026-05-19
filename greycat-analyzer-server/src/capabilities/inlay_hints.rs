@@ -317,6 +317,21 @@ fn emit_call_arg_hints_expr(
 
 /// Walk a `BlockStmt` recursively for var-hint emission. Body-bearing
 /// statements hold the block inline post-refactor so we can't go via
+/// Push a `: T` type hint anchored at `name_end`. Caller is responsible
+/// for the want-range overlap check and rendering the type to a string.
+fn push_type_hint(text: &str, name_end: usize, rendered_ty: String, out: &mut Vec<InlayHint>) {
+    out.push(InlayHint {
+        position: byte_to_position(text, name_end),
+        label: InlayHintLabel::String(format!(": {rendered_ty}")),
+        kind: Some(InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: None,
+        padding_right: None,
+        data: None,
+    });
+}
+
 /// `Idx<Stmt>` for them.
 fn emit_var_hints_block(
     hir: &Hir,
@@ -377,8 +392,42 @@ fn emit_var_hints(
         Stmt::DoWhile(w) => {
             emit_var_hints_block(hir, analysis, render_ty, &w.body, want, text, out)
         }
-        Stmt::For(f) => emit_var_hints_block(hir, analysis, render_ty, &f.body, want, text, out),
-        Stmt::ForIn(f) => emit_var_hints_block(hir, analysis, render_ty, &f.body, want, text, out),
+        Stmt::For(f) => {
+            // C-style for: `for (var i = 0; …)`. Emit `: T` after the
+            // init name when there's no declared annotation and the
+            // analyzer settled a type on it (`def_types[init_name]`,
+            // bound in P19.14).
+            if f.init_ty.is_none()
+                && let Some(name) = f.init_name
+                && let Some(ty) = analysis.def_types.get(&name).copied()
+            {
+                let name_range = &hir.idents[name].byte_range;
+                if name_range.end >= want.0 && name_range.start <= want.1 {
+                    push_type_hint(text, name_range.end, render_ty(ty), out);
+                }
+            }
+            emit_var_hints_block(hir, analysis, render_ty, &f.body, want, text, out);
+        }
+        Stmt::ForIn(f) => {
+            // `for (k, v in arr)`. Emit `: T` after each un-annotated
+            // param name using `def_types[p.name]` — bound by the
+            // analyzer's @iterable element-type machinery (P18.x) or
+            // the declared annotation when present.
+            for p in f.params.iter() {
+                if p.ty.is_some() {
+                    continue;
+                }
+                let Some(ty) = analysis.def_types.get(&p.name).copied() else {
+                    continue;
+                };
+                let name_range = &hir.idents[p.name].byte_range;
+                if name_range.end < want.0 || name_range.start > want.1 {
+                    continue;
+                }
+                push_type_hint(text, name_range.end, render_ty(ty), out);
+            }
+            emit_var_hints_block(hir, analysis, render_ty, &f.body, want, text, out);
+        }
         Stmt::Try(t) => {
             emit_var_hints_block(hir, analysis, render_ty, &t.try_block, want, text, out);
             emit_var_hints_block(hir, analysis, render_ty, &t.catch_block, want, text, out);
