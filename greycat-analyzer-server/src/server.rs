@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use crossbeam_channel::{RecvError, select};
 use greycat_analyzer_core::SourceEncoding;
 use log::{debug, info};
 use lsp_server::*;
@@ -140,45 +142,65 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
             }
             _ => SourceEncoding::UTF16,
         },
+        last_analyzer_publish: Default::default(),
+        pending_trailing: Default::default(),
+        last_analyzer_diags: Default::default(),
+        diagnostics_debounce: crate::backend::DIAGNOSTICS_DEBOUNCE_DEFAULT,
     };
 
     server.initialized(&init)?;
 
-    for msg in &conn.receiver {
-        match msg {
-            Message::Request(req) => {
-                if conn.handle_shutdown(&req)? {
-                    return Ok(());
+    // `default(timeout)` arm in the select! below wakes the loop when
+    // `Backend::pending_trailing` has a deadline due. With no pending
+    // trailing fire, fall back to a long idle wake so the loop still
+    // periodically yields control (cheap; just re-arms the select).
+    const IDLE_WAKE: Duration = Duration::from_secs(60 * 60);
+
+    loop {
+        let timeout = server
+            .next_trailing_deadline()
+            .and_then(|t| t.checked_duration_since(Instant::now()))
+            .unwrap_or(IDLE_WAKE);
+        select! {
+            recv(conn.receiver) -> msg => match msg {
+                Ok(Message::Request(req)) => {
+                    if conn.handle_shutdown(&req)? {
+                        return Ok(());
+                    }
+                    debug!("got request: {req:?}");
+                    if let Some(response) = handle_request(&server, req) {
+                        conn.sender.send(Message::Response(response))?;
+                    }
                 }
-                debug!("got request: {req:?}");
-                if let Some(response) = handle_request(&server, req) {
-                    conn.sender.send(Message::Response(response))?;
-                }
-            }
-            Message::Response(resp) => debug!("got response: {resp:?}"),
-            Message::Notification(notif) => match notif.method.as_str() {
-                DidOpenTextDocument::METHOD => {
-                    server.did_open(notif.extract(DidOpenTextDocument::METHOD)?)?
-                }
-                DidChangeTextDocument::METHOD => {
-                    server.did_change(notif.extract(DidChangeTextDocument::METHOD)?)?
-                }
-                DidSaveTextDocument::METHOD => {
-                    server.did_save(notif.extract(DidSaveTextDocument::METHOD)?)?
-                }
-                DidCloseTextDocument::METHOD => {
-                    server.did_close(notif.extract(DidCloseTextDocument::METHOD)?)?
-                }
-                DidChangeWatchedFiles::METHOD => server
-                    .did_change_watched_files(notif.extract(DidChangeWatchedFiles::METHOD)?)?,
-                DidChangeWorkspaceFolders::METHOD => server.did_change_workspace_folders(
-                    notif.extract(DidChangeWorkspaceFolders::METHOD)?,
-                )?,
-                _ => debug!("got notification: {notif:#?}"),
+                Ok(Message::Response(resp)) => debug!("got response: {resp:?}"),
+                Ok(Message::Notification(notif)) => match notif.method.as_str() {
+                    DidOpenTextDocument::METHOD => {
+                        server.did_open(notif.extract(DidOpenTextDocument::METHOD)?)?
+                    }
+                    DidChangeTextDocument::METHOD => {
+                        server.did_change(notif.extract(DidChangeTextDocument::METHOD)?)?
+                    }
+                    DidSaveTextDocument::METHOD => {
+                        server.did_save(notif.extract(DidSaveTextDocument::METHOD)?)?
+                    }
+                    DidCloseTextDocument::METHOD => {
+                        server.did_close(notif.extract(DidCloseTextDocument::METHOD)?)?
+                    }
+                    DidChangeWatchedFiles::METHOD => server.did_change_watched_files(
+                        notif.extract(DidChangeWatchedFiles::METHOD)?,
+                    )?,
+                    DidChangeWorkspaceFolders::METHOD => server.did_change_workspace_folders(
+                        notif.extract(DidChangeWorkspaceFolders::METHOD)?,
+                    )?,
+                    _ => debug!("got notification: {notif:#?}"),
+                },
+                Err(RecvError) => return Ok(()),
             },
+            default(timeout) => {
+                server.flush_trailing();
+            }
         }
     }
-    Ok(())
 }
 
 fn handle_request(server: &Backend, req: Request) -> Option<Response> {

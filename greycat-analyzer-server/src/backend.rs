@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -39,6 +39,17 @@ use crate::capabilities::diagnostics_from_module;
 /// edits. Tuned by hand — typical stdlib rebuilds land at ~30-100ms,
 /// so 500ms catches genuine outliers.
 const SLOW_REBUILD_MS: u128 = 500;
+
+/// Default leading-edge + trailing debounce window for analyzer-side
+/// diagnostic publishes. Within this window after the last analyzer
+/// publish, `did_change` only emits a fast (parse + overlays + cached
+/// analyzer) publish and schedules a trailing analyzer fire instead of
+/// re-running the analyzer on every keystroke. Sized to sit below the
+/// "feels delayed" threshold (~200ms) and above typical inter-keystroke
+/// times at fast typing (~80-100ms) so bursts coalesce reliably.
+///
+/// Override per-client via `initializationOptions.diagnosticsDebounceMs`.
+pub const DIAGNOSTICS_DEBOUNCE_DEFAULT: Duration = Duration::from_millis(150);
 
 // P32.9
 /// Static log tag for orphan-file handling. Appears as `[orphan]`
@@ -190,6 +201,30 @@ pub struct Backend {
     pub registry: Option<Arc<dyn RegistryFetcher>>,
     /// Negociated encoding between the client and the server
     pub encoding: SourceEncoding,
+    /// Per-URI timestamp of the last analyzer-side diagnostic publish.
+    /// Drives the leading-edge gate in [`Self::did_change`]: a
+    /// `did_change` whose timestamp is `>= DIAGNOSTICS_DEBOUNCE` past
+    /// this entry fires the analyzer immediately; one within the
+    /// window emits only a fast publish and schedules a trailing fire.
+    pub last_analyzer_publish: FxHashMap<Uri, Instant>,
+    /// Per-URI deadline at which a trailing analyzer publish should
+    /// fire. Set inside the cool-down window on `did_change`; cleared
+    /// by [`Self::flush_trailing`] after the publish.
+    pub pending_trailing: FxHashMap<Uri, Instant>,
+    /// Per-URI cache of the most recent analyzer-derived diagnostic set
+    /// (i.e. just the [`diagnostics_from_module`] output, *without* the
+    /// parse / pragma / overlay diagnostics). Re-merged with fresh
+    /// fast-side diagnostics on every cool-down-window `did_change` so
+    /// the editor keeps showing semantic squiggles stably while the
+    /// user types instead of flickering.
+    pub last_analyzer_diags: FxHashMap<Uri, Vec<Diagnostic>>,
+    /// Leading-edge + trailing debounce window for analyzer publishes.
+    /// Defaults to [`DIAGNOSTICS_DEBOUNCE_DEFAULT`]; client-overridable
+    /// via `initializationOptions.diagnosticsDebounceMs` (parsed in
+    /// [`Self::initialized`]). A value of `0` effectively disables the
+    /// debounce — every keystroke fires the analyzer immediately
+    /// (matches pre-debounce behavior).
+    pub diagnostics_debounce: Duration,
 }
 
 impl Backend {
@@ -256,73 +291,168 @@ impl Backend {
         publish_diagnostics(&self.client, uri, diagnostics, version)
     }
 
+    /// Assemble the cheap "fast" diagnostic set + the heavier analyzer
+    /// set + the doc's version, all from cached state. Splits the old
+    /// monolithic `publish_for` body so a `did_change` mid-burst can
+    /// emit only the fast half (parse + overlays + cached analyzer
+    /// from a previous publish) without re-running the analyzer.
+    ///
+    /// Fast set: parse + pragma resolution + multi-owner / missing-std
+    /// / duplicate-module overlays. All cheap; the parse tree is in
+    /// hand from `manager.update`.
+    /// Analyzer set: `diagnostics_from_module` output only.
+    fn assemble_split(&self, uri: &Uri) -> (Vec<Diagnostic>, Vec<Diagnostic>, Option<i32>) {
+        let Some(project) = self.project_for(uri) else {
+            return (Vec::new(), Vec::new(), None);
+        };
+        let Some(cell) = project.manager.get(uri) else {
+            return (Vec::new(), Vec::new(), None);
+        };
+        let doc = cell.borrow();
+        let version = Some(doc.version);
+        let mut fast = parse_diagnostics(doc.root_node(), &doc.text);
+        // P15.5 — pragma resolution diagnostics. Recomputed on every
+        // publish so edits to `@include` / `@library` pragmas reflect
+        // immediately. Anchored to the owning project's root. Skipped
+        // for the implicit empty-root project (P32.1 lazy fallback).
+        if !project.root.as_os_str().is_empty() {
+            let desc = parse_module_desc(uri.clone(), &doc.text, doc.root_node());
+            if let Ok(ctx) = FsContext::new() {
+                fast.extend(pragma_diagnostics(&doc.text, &desc, &project.root, &ctx));
+            }
+        }
+        // P32.6 — multi-project-owner advisory.
+        if let Some(owners) = self.uri_owner.get(uri)
+            && owners.len() > 1
+        {
+            fast.push(multi_project_owner_diagnostic(&doc.text, owners));
+        }
+        // P33.1 — `missing-std` overlay on the entrypoint when the
+        // resolver couldn't find std.
+        if project.std_resolution == StdResolution::Missing
+            && project.entrypoint_uri.as_ref() == Some(uri)
+        {
+            fast.push(missing_std_diagnostic(&doc.text));
+        }
+        // `duplicate-module-name` overlay on stem-colliding files.
+        if let Some((name, existing)) = project.analysis.index.duplicate_modules.get(uri) {
+            let module_name = &project.analysis.index.symbols[*name];
+            fast.push(duplicate_module_name_diagnostic(
+                &doc.text,
+                module_name,
+                existing,
+            ));
+        }
+        let analyzer = project
+            .analysis
+            .module(uri)
+            .map(|m| diagnostics_from_module(&doc.text, m, self.lint_libs))
+            .unwrap_or_default();
+        (fast, analyzer, version)
+    }
+
     /// Pull cached parse + semantic + lint diagnostics for `uri` and
     /// push them to the client. The cache is populated by
     /// [`ProjectAnalysis::analyze`] on workspace load and by
     /// [`ProjectAnalysis::invalidate`] on every `did_open` / `did_change`.
-    fn publish_for(&self, uri: &Uri) -> Result<()> {
+    /// Also seeds [`Self::last_analyzer_diags`] and
+    /// [`Self::last_analyzer_publish`] / clears any pending trailing
+    /// fire so the debounce treats this as a fresh leading edge.
+    fn publish_for(&mut self, uri: &Uri) -> Result<()> {
         // P32.5 — orphans take a separate parse-only path with a
-        // file-spanning "no project" advisory diag.
+        // file-spanning "no project" advisory diag. No analyzer state
+        // to cache here, but clearing any stale cache entry keeps the
+        // maps from leaking across project ↔ orphan transitions.
         if let Some(cell) = self.orphans.get(uri) {
             let doc = cell.borrow();
             let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
             diags.push(orphan_module_diagnostic(&doc.text));
             let version = doc.version;
             drop(doc);
+            self.last_analyzer_publish.remove(uri);
+            self.last_analyzer_diags.remove(uri);
+            self.pending_trailing.remove(uri);
             return self.publish_diagnostics(uri.clone(), diags, Some(version));
         }
-        let Some(project) = self.project_for(uri) else {
+        let (fast, analyzer, version) = self.assemble_split(uri);
+        if version.is_none() {
             return Ok(());
-        };
-        let Some(cell) = project.manager.get(uri) else {
-            return Ok(());
-        };
-        let doc = cell.borrow();
-        let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
-        if let Some(module) = project.analysis.module(uri) {
-            diags.extend(diagnostics_from_module(&doc.text, module, self.lint_libs));
         }
-        // P15.5 — pragma resolution diagnostics. Recomputed on every
-        // publish so edits to `@include` / `@library` pragmas reflect
-        // immediately. Anchored to the owning project's root.
-        // Skipped for the implicit empty-root project (P32.1 lazy
-        // fallback) so we don't anchor paths against a meaningless
-        // cwd.
-        if !project.root.as_os_str().is_empty() {
-            let desc = parse_module_desc(uri.clone(), &doc.text, doc.root_node());
-            if let Ok(ctx) = FsContext::new() {
-                diags.extend(pragma_diagnostics(&doc.text, &desc, &project.root, &ctx));
+        let mut combined = fast;
+        combined.extend(analyzer.iter().cloned());
+        self.last_analyzer_diags.insert(uri.clone(), analyzer);
+        self.last_analyzer_publish
+            .insert(uri.clone(), Instant::now());
+        self.pending_trailing.remove(uri);
+        self.publish_diagnostics(uri.clone(), combined, version)
+    }
+
+    /// Cool-down-window publish: emit fresh fast diagnostics merged
+    /// with the cached analyzer set. Cheap — no `invalidate`, no
+    /// fresh `diagnostics_from_module` call. Used by `did_change` for
+    /// the second-through-N edits of a typing burst so semantic
+    /// squiggles stay stable while syntax errors update immediately.
+    fn publish_fast(&self, uri: &Uri) -> Result<()> {
+        let (mut combined, _analyzer, version) = self.assemble_split(uri);
+        if version.is_none() {
+            return Ok(());
+        }
+        if let Some(cached) = self.last_analyzer_diags.get(uri) {
+            combined.extend_from_slice(cached);
+        }
+        self.publish_diagnostics(uri.clone(), combined, version)
+    }
+
+    /// Schedule a trailing analyzer publish for `uri` if one isn't
+    /// already pending. Anchored to the last leading-edge publish +
+    /// `debounce` so the trailing fires at a stable deadline
+    /// regardless of how many keystrokes arrive during the burst —
+    /// without this anchor, every keystroke would push the deadline
+    /// further out and the trailing would never fire on a continuous
+    /// typist.
+    fn schedule_trailing(&mut self, uri: Uri, debounce: Duration) {
+        if self.pending_trailing.contains_key(&uri) {
+            return;
+        }
+        let deadline = self
+            .last_analyzer_publish
+            .get(&uri)
+            .map(|t| *t + debounce)
+            .unwrap_or_else(|| Instant::now() + debounce);
+        self.pending_trailing.insert(uri, deadline);
+    }
+
+    /// Earliest pending trailing deadline across all URIs, used by
+    /// the main loop's `select!` timeout-arm. `None` means no trailing
+    /// is scheduled — the main loop falls back to a long idle timer.
+    pub fn next_trailing_deadline(&self) -> Option<Instant> {
+        self.pending_trailing.values().min().copied()
+    }
+
+    /// Drain every trailing entry whose deadline has passed and run
+    /// the analyzer-side publish for each. Each fire re-uses
+    /// [`Self::invalidate_with_slow_warning`] + [`Self::publish_for`]
+    /// so the trailing path is identical to a leading-edge fire (just
+    /// time-shifted by the debounce window).
+    pub fn flush_trailing(&mut self) {
+        let now = Instant::now();
+        let due: Vec<Uri> = self
+            .pending_trailing
+            .iter()
+            .filter(|(_, t)| **t <= now)
+            .map(|(u, _)| u.clone())
+            .collect();
+        for uri in due {
+            self.pending_trailing.remove(&uri);
+            self.invalidate_with_slow_warning(&uri, "trailing");
+            if let Err(e) = self.publish_for(&uri) {
+                warn!(
+                    "[{tag}][trailing] publish failed for {}: {e}",
+                    uri.as_str(),
+                    tag = self.tag_for(&uri)
+                );
             }
         }
-        // P32.6 — overlay the multi-project-owner advisory on top of
-        // the first owner's analysis when two or more projects reach
-        // this file.
-        if let Some(owners) = self.uri_owner.get(uri)
-            && owners.len() > 1
-        {
-            diags.push(multi_project_owner_diagnostic(&doc.text, owners));
-        }
-        // P33.1 — `missing-std` overlays the entrypoint when the
-        // resolver couldn't find std. Anchored on project.gcl
-        // specifically so users see the cause once, on the file that
-        // declares the project.
-        if project.std_resolution == StdResolution::Missing
-            && project.entrypoint_uri.as_ref() == Some(uri)
-        {
-            diags.push(missing_std_diagnostic(&doc.text));
-        }
-        // `duplicate-module-name` overlays any file whose stem
-        // collides with an already-ingested module's. Hard error so
-        // the user knows the file is excluded from project analysis.
-        if let Some((name, existing)) = project.analysis.index.duplicate_modules.get(uri) {
-            let module_name = &project.analysis.index.symbols[*name];
-            diags.push(duplicate_module_name_diagnostic(
-                &doc.text,
-                module_name,
-                existing,
-            ));
-        }
-        self.publish_diagnostics(uri.clone(), diags, Some(doc.version))
     }
 
     pub fn initialized(&mut self, init: &InitializeParams) -> Result<()> {
@@ -332,11 +462,15 @@ impl Backend {
         // user's preference. Missing / malformed payload silently
         // falls back to the default (`false`) — no need to fail the
         // handshake over an absent option.
-        if let Some(opts) = init.initialization_options.as_ref()
-            && let Some(b) = opts.get("lintLibs").and_then(|v| v.as_bool())
-        {
-            self.lint_libs = b;
-            debug!("[{SERVER_LOG_TAG}][init] lintLibs={b}");
+        if let Some(opts) = init.initialization_options.as_ref() {
+            if let Some(b) = opts.get("lintLibs").and_then(|v| v.as_bool()) {
+                self.lint_libs = b;
+                debug!("[{SERVER_LOG_TAG}][init] lintLibs={b}");
+            }
+            if let Some(ms) = opts.get("diagnosticsDebounceMs").and_then(|v| v.as_u64()) {
+                self.diagnostics_debounce = Duration::from_millis(ms);
+                debug!("[{SERVER_LOG_TAG}][init] diagnosticsDebounceMs={ms}");
+            }
         }
         if let Some(workspaces) = init.workspace_folders.as_ref() {
             debug!("[{SERVER_LOG_TAG}] workspaces:");
@@ -620,15 +754,33 @@ impl Backend {
         // remove `@library` / `@include`, which changes the closure of
         // reachable modules. The text update above only refreshes
         // `project.gcl`'s own bytes; the resolver doesn't notice the
-        // new modules until we re-walk. Detect entrypoint edits and
-        // re-walk before invalidating so the rebuild sees the full
-        // closure.
+        // new modules until we re-walk. Entrypoint edits go through
+        // the synchronous path (no debounce) because closure changes
+        // must land before subsequent analyses run.
         if self.is_project_entrypoint(&uri) {
             self.reload_project_closure(&uri);
-        } else {
-            self.invalidate_with_slow_warning(&uri, "did_change");
+            return self.publish_for(&uri);
         }
-        self.publish_for(&uri)?;
+        // Leading-edge + trailing debounce for non-entrypoint edits.
+        // Within `DIAGNOSTICS_DEBOUNCE` of the last analyzer publish,
+        // only emit a fast (parse + overlays + cached analyzer) publish
+        // and schedule a trailing analyzer fire. Outside the window,
+        // run the full invalidate + analyzer publish synchronously so
+        // solo edits and the first edit of a burst feel instant.
+        let now = Instant::now();
+        let cooldown_expired = self
+            .last_analyzer_publish
+            .get(&uri)
+            .map(|t| now.duration_since(*t) >= self.diagnostics_debounce)
+            .unwrap_or(true);
+        if cooldown_expired {
+            self.invalidate_with_slow_warning(&uri, "did_change");
+            self.publish_for(&uri)?;
+        } else {
+            self.publish_fast(&uri)?;
+            let debounce = self.diagnostics_debounce;
+            self.schedule_trailing(uri, debounce);
+        }
         Ok(())
     }
 
@@ -828,6 +980,12 @@ impl Backend {
         // is purely an editor signal, so dropping the doc with the
         // buffer is correct.
         let _ = self.orphans.remove(&uri);
+        // Drop the debounce caches so a later `did_open` of the same
+        // URI starts from a clean slate (no stale leading-edge clock
+        // or analyzer set).
+        self.last_analyzer_publish.remove(&uri);
+        self.last_analyzer_diags.remove(&uri);
+        self.pending_trailing.remove(&uri);
         // Clear diagnostics on close so the editor's stale list goes away.
         self.publish_diagnostics(uri, Vec::new(), None)?;
         Ok(())
@@ -1180,6 +1338,10 @@ mod tests {
                 lint_libs: false,
                 registry: None,
                 encoding: SourceEncoding::UTF8,
+                last_analyzer_publish: FxHashMap::default(),
+                pending_trailing: FxHashMap::default(),
+                last_analyzer_diags: FxHashMap::default(),
+                diagnostics_debounce: DIAGNOSTICS_DEBOUNCE_DEFAULT,
             },
             rx,
         )

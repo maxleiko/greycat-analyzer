@@ -78,6 +78,13 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Surface lint warnings (`unused-decl`, `unused-local`, `unused-param`, `arrow-on-non-deref`) for vendored library modules under `lib/<name>/`. Off by default — those modules aren't yours and the warnings tend to drown out signal in your own code. Type-relation diagnostics always surface regardless of this setting. Restart the server after changing — the extension will prompt."
+        },
+        "greycat-analyzer.diagnosticsDebounceMs": {
+          "type": "integer",
+          "default": 150,
+          "minimum": 0,
+          "maximum": 5000,
+          "markdownDescription": "Leading-edge + trailing debounce window (ms) for analyzer-side diagnostic publishes. Within this window after the last analyzer publish, edits emit only fast diagnostics (parse / pragma / overlays + cached semantic squiggles) and schedule a trailing fire instead of re-running the analyzer on every keystroke. `0` disables debouncing (every keystroke fires the analyzer immediately). Defaults to `150`. Restart the server after changing — the extension will prompt."
         }
       }
     }

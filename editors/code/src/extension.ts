@@ -21,15 +21,21 @@ export function activate(ctx: ExtensionContext) {
     channel,
     commands.registerCommand('greycat-analyzer.restart', restart),
     workspace.onDidChangeConfiguration(async (e) => {
-      // Both settings require an LSP restart: trace.server changes
-      // RUST_LOG (only read at startup) and lintLibs is sent via
+      // Every server-affecting setting requires an LSP restart:
+      // trace.server changes RUST_LOG (only read at startup),
+      // lintLibs / diagnosticsDebounceMs are sent via
       // initializationOptions (only consumed on `initialize`).
       const traceChanged = e.affectsConfiguration('greycat-analyzer.trace.server');
       const lintLibsChanged = e.affectsConfiguration('greycat-analyzer.lintLibs');
-      if (!traceChanged && !lintLibsChanged) {
+      const debounceChanged = e.affectsConfiguration('greycat-analyzer.diagnosticsDebounceMs');
+      if (!traceChanged && !lintLibsChanged && !debounceChanged) {
         return;
       }
-      const what = traceChanged ? 'log level' : 'lintLibs';
+      const what = traceChanged
+        ? 'log level'
+        : lintLibsChanged
+          ? 'lintLibs'
+          : 'diagnosticsDebounceMs';
       const choice = await window.showInformationMessage(
         `greycat-analyzer ${what} changed. Restart the server now?`,
         'Restart',
@@ -106,6 +112,7 @@ function buildInitializationOptions(): Record<string, unknown> {
   const cfg = workspace.getConfiguration('greycat-analyzer');
   return {
     lintLibs: cfg.get<boolean>('lintLibs', false),
+    diagnosticsDebounceMs: cfg.get<number>('diagnosticsDebounceMs', 150),
   };
 }
 
