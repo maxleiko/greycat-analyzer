@@ -3368,7 +3368,9 @@ fn completion_member_items_carry_detail_and_documentation() {
         .iter()
         .find(|i| i.label == "count")
         .expect("`count` attr should appear");
-    assert_eq!(count.detail.as_deref(), Some("count: int"));
+    // Compact `: T` form; the name lives in `label`, repeating it
+    // in detail (`count: int` next to `count`) just wastes width.
+    assert_eq!(count.detail.as_deref(), Some(": int"));
     let count_doc = match count.documentation.as_ref() {
         Some(Documentation::MarkupContent(c)) => c.value.clone(),
         Some(Documentation::String(s)) => s.clone(),

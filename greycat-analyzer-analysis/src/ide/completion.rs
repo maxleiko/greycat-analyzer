@@ -2280,11 +2280,19 @@ fn collect_type_members(
         let ty =
             a.ty.map(|t| render_type_ref_with_subst(hir, symbols, t, ctx))
                 .unwrap_or_else(|| "any".into());
+        // Compact `: T` form — label already carries the name, so
+        // repeating it in detail (`a a: int`) just wastes width.
+        // Matches the fn/method `(args): Ret` convention.
+        let compact = format!(": {ty}");
         items.push(CompletionItem {
             label: name.clone(),
+            label_details: Some(CompletionItemLabelDetails {
+                detail: Some(compact.clone()),
+                description: None,
+            }),
             kind: Some(CompletionItemKind::FIELD),
             insert_text: Some(name.clone()),
-            detail: Some(format!("{name}: {ty}")),
+            detail: Some(compact),
             documentation: doc_to_markup(a.doc.as_deref()),
             ..Default::default()
         });
@@ -2420,12 +2428,16 @@ fn static_completion(
                             crate::ide::render::render_type_ref(&fmod.hir, project.symbols(), tr,)
                         )
                     });
+                    let label_details = detail.clone().map(|d| CompletionItemLabelDetails {
+                        detail: Some(d),
+                        description: None,
+                    });
                     let documentation = doc_to_markup(attr.doc.as_deref());
                     items.push(static_completion_item(
                         name,
                         CompletionItemKind::CONSTANT,
                         replace_range,
-                        None,
+                        label_details,
                         detail,
                         documentation,
                     ));
@@ -2923,10 +2935,20 @@ fn emit_attrs(
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
+        let ty =
+            a.ty.map(|t| render_type_ref_with_subst(hir, symbols, t, None))
+                .unwrap_or_else(|| "any".into());
+        let compact = format!(": {ty}");
         items.push(CompletionItem {
             label: name.clone(),
+            label_details: Some(CompletionItemLabelDetails {
+                detail: Some(compact.clone()),
+                description: None,
+            }),
             kind: Some(CompletionItemKind::FIELD),
             insert_text: Some(format!("{name}: ")),
+            detail: Some(compact),
+            documentation: doc_to_markup(a.doc.as_deref()),
             ..Default::default()
         });
     }
