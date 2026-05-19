@@ -1246,7 +1246,34 @@ fn lower_binary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         .child_by_field_name("right")
         .map(|n| lower_node(cx, n))
         .unwrap_or(Doc::nil());
-    // Wrap non-chain binops (`==`, `!=`, `<`, `>`, `<=`, `>=`, `=`, `?=`,
+    // Assignment ops (`=`, `?=`) keep the binop Group as a break
+    // opportunity (so long chain-only assignments split at `=` rather
+    // than fragmenting at chain dots), but use `Doc::indent_if_broken`
+    // instead of `Doc::indent` for the continuation. The distinction
+    // matters when the right-side expression is self-wrapping via
+    // `Doc::expand` (object initializers, etc.): the binop Group's
+    // fit-check sees zero width from the expanded child, the Group
+    // stays flat, and `indent_if_broken` contributes no indent step —
+    // so the right-side's own internal break renders at the surrounding
+    // block's indent. The previous `Doc::indent` always added a step,
+    // leaving brace-led RHSs over-indented by one level.
+    //
+    // When the right side is a flat chain or simple expr that doesn't
+    // fit, the binop Group breaks, `indent_if_broken` adds the
+    // continuation-indent step, and the layout matches the original
+    // "break at the operator first" semantics.
+    if op == "=" || op == "?=" {
+        return Doc::group(Doc::concat(vec![
+            left,
+            Doc::indent_if_broken(Doc::concat(vec![
+                Doc::line(),
+                Doc::text(op),
+                Doc::space(),
+                right,
+            ])),
+        ]));
+    }
+    // Wrap remaining non-chain binops (`==`, `!=`, `<`, `>`, `<=`, `>=`,
     // `as`, `is`) in their own Group with a `Line` break-point before
     // the operator. This makes the operator the outer break boundary —
     // when the surrounding expression overflows, the binop breaks at the

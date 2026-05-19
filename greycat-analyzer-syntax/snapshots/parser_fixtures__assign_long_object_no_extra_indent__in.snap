@@ -1,0 +1,43 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn foo() {\n    building_admin_csv_path ?= node<BuildingAdminCsvPath?> {BuildingAdminCsvPath { path: defaultBuildingAdminCsvPath() }};\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'foo')
+    params: (fn_params '()')
+    body: (block
+      (expr_stmt
+        (binary_expr
+          left: (ident 'building_admin_csv_path')
+          right: (object_expr
+            type: (type_ident
+              name: (ident 'node')
+              params: (type_ident
+                name: (ident 'BuildingAdminCsvPath')
+                (optional '?')
+              )
+            )
+            (object_initializers
+              (object_expr
+                type: (type_ident
+                  name: (ident 'BuildingAdminCsvPath')
+                )
+                (object_fields
+                  (object_field
+                    name: (ident 'path')
+                    value: (call_expr
+                      fn: (ident 'defaultBuildingAdminCsvPath')
+                      (args '()')
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

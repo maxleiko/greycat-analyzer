@@ -1,0 +1,3 @@
+fn foo() {
+    building_admin_csv_path ?= node<BuildingAdminCsvPath?> {BuildingAdminCsvPath { path: defaultBuildingAdminCsvPath() }};
+}
