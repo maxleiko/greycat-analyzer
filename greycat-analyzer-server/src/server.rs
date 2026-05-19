@@ -470,6 +470,7 @@ fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<Co
     Some(capabilities::code_actions_with_project(
         module,
         &doc.text,
+        doc.root_node(),
         &params.text_document.uri,
         params.range,
     ))

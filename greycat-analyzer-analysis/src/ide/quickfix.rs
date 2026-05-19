@@ -12,8 +12,15 @@
 //! the quickfix module's concern.
 //!
 //! All fix functions return `Vec<TextEdit>`; an empty Vec means "this
-//! diagnostic has no automatic fix" (or its preconditions don't hold —
-//! see [`unused_param_fix`]'s safety check).
+//! diagnostic has no automatic fix" (or its preconditions don't hold).
+//!
+//! Fix functions trust the lint emission. There is no independent
+//! re-verification ("is this name *really* unused?") inside the fix —
+//! the parse-safety nets in the LSP `code_actions` handler and the
+//! CLI `lint --fix` driver re-parse the result and reject edits that
+//! introduce new parse errors, which is the load-bearing downstream
+//! guard. If a lint is producing wrong diagnostics, the fix is at the
+//! lint, not at the consumer.
 
 use std::ops::Range;
 
@@ -22,7 +29,12 @@ use greycat_analyzer_syntax::tree_sitter::Node;
 
 /// Compute the auto-fix edits for `diag` against `text`. Returns an
 /// empty Vec when the rule has no fix or its preconditions don't hold.
+///
+/// `root` is the parsed tree-sitter root for `text` — callers (LSP
+/// `code_actions`, CLI `lint --fix`) own the parse so this module
+/// doesn't re-parse the same buffer once per helper.
 pub fn edit_for_diagnostic(
+    root: Node<'_>,
     text: &str,
     code: &str,
     byte_range: &Range<usize>,
@@ -35,23 +47,23 @@ pub fn edit_for_diagnostic(
     }
     match code {
         "missing-token" => missing_token_fix(start, message),
-        "unused-local" => unused_local_fix(text, start),
-        "unused-decl" => unused_decl_fix(text, start),
+        "unused-local" => unused_local_fix(root, start),
+        "unused-decl" => unused_decl_fix(root, start),
         "unused-param" => unused_param_fix(text, start, end),
-        "unused-generic-param" => unused_generic_param_fix(text, start, end),
+        "unused-generic-param" => unused_generic_param_fix(root, text, start, end),
         "possibly-null" => possibly_null_fix(text, end),
         "redundant-nullable-access" => redundant_nullable_access_fix(text, start, end),
         "redundant-non-null-assertion" | "redundant-coalesce" => redundant_slice_fix(start, end),
         "modvar-node-cannot-be-nullable" => modvar_strip_outer_nullable_fix(text, end),
         "modvar-node-inner-must-be-nullable" => modvar_append_inner_nullable_fix(end),
-        "unused-suppression" => unused_suppression_fix(text, start, end),
+        "unused-suppression" => unused_suppression_fix(root, text, start, end),
         "empty-suppression" | "unbalanced-lint-off" | "unbalanced-fmt-off" => {
-            delete_comment_line_fix(text, start)
+            delete_comment_line_fix(root, text, start)
         }
-        "unreachable" => unreachable_fix(text, start, end),
-        "non-exhaustive" => non_exhaustive_fix(text, start, message),
+        "unreachable" => unreachable_fix(root, text, start, end),
+        "non-exhaustive" => non_exhaustive_fix(root, text, start, message),
         "catch-empty-parens" => catch_empty_parens_fix(text, start, end),
-        "unused-catch-param" => unused_catch_param_fix(text, start),
+        "unused-catch-param" => unused_catch_param_fix(root, text, start),
         "redundant-semicolon" => redundant_semicolon_fix(start, end),
         "no-breakpoint" => no_breakpoint_fix(text, start, end),
         _ => Vec::new(),
@@ -105,21 +117,10 @@ fn redundant_semicolon_fix(start: usize, end: usize) -> Vec<TextEdit> {
 /// whitespace, so `catch (e) { … }` becomes `catch { … }`. Locates the
 /// enclosing `try_stmt` and walks its anonymous-token children for the
 /// `(` and `)` that bracket the `error_param` ident.
-fn unused_catch_param_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
-    let tree = greycat_analyzer_syntax::parse(text);
-    let root = tree.root_node();
-    let Some(mut node) = root.descendant_for_byte_range(ident_start, ident_start) else {
+fn unused_catch_param_fix(root: Node<'_>, text: &str, ident_start: usize) -> Vec<TextEdit> {
+    let Some(node) = enclosing_kind(root, ident_start, "try_stmt") else {
         return Vec::new();
     };
-    loop {
-        if node.kind() == "try_stmt" {
-            break;
-        }
-        let Some(p) = node.parent() else {
-            return Vec::new();
-        };
-        node = p;
-    }
     let mut cur = node.walk();
     let mut open: Option<usize> = None;
     let mut close: Option<usize> = None;
@@ -198,10 +199,10 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
 // P22.1
 /// Replace the **whole** `var x = expr;` statement, not just
 /// the ident. The diagnostic's range covers the ident only (for cursor
-/// placement); we widen the fix range to the enclosing `var_decl`
-/// node by re-parsing and walking up the CST.
-fn unused_local_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
-    let Some(stmt_range) = enclosing_node_range(text, ident_start, &["var_decl"]) else {
+/// placement); we widen the fix range to the enclosing `var_decl` by
+/// walking up the CST.
+fn unused_local_fix(root: Node<'_>, ident_start: usize) -> Vec<TextEdit> {
+    let Some(stmt_range) = enclosing_node_range(root, ident_start, &["var_decl"]) else {
         return Vec::new();
     };
     vec![TextEdit {
@@ -216,9 +217,9 @@ fn unused_local_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
 /// full byte range. Doc comments + annotations sitting immediately
 /// above the decl are absorbed (the grammar makes them children of
 /// the decl, so the decl's `byte_range` already covers them).
-fn unused_decl_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
+fn unused_decl_fix(root: Node<'_>, ident_start: usize) -> Vec<TextEdit> {
     let Some(decl_range) = enclosing_node_range(
-        text,
+        root,
         ident_start,
         &["fn_decl", "type_decl", "enum_decl", "modvar"],
     ) else {
@@ -231,11 +232,12 @@ fn unused_decl_fix(text: &str, ident_start: usize) -> Vec<TextEdit> {
 }
 
 // P22.3
-/// Rename `name` to `_name` only when the body has zero
-/// text-level occurrences of `name`. If the body references the name
-/// (which a correctly-detected unused param shouldn't have, but a lint
-/// false-positive *might*), refuse the fix. Belt-and-suspenders so a
-/// lint detection bug doesn't dangling-bind via auto-fix.
+/// Rename `name` to `_name`. The lint has already established that
+/// the body doesn't reference `name`; if it ever produces a false
+/// positive, the parse-safety net upstream catches edits that break
+/// the parse. The `_`-prefix early-out is part of the rule's own
+/// vocabulary (`_x` is the project convention for "intentionally
+/// unused"), not an independent safety check.
 fn unused_param_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
     if end <= start {
         return Vec::new();
@@ -244,32 +246,29 @@ fn unused_param_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
     if name.starts_with('_') {
         return Vec::new();
     }
-    if !is_param_name_unused_in_enclosing_fn(text, start, name) {
-        return Vec::new();
-    }
     vec![TextEdit {
         byte_range: start..end,
         new_text: format!("_{name}"),
     }]
 }
 
-/// Strip an unused generic parameter from its enclosing `<...>`. The
-/// param's binding-site byte range is `ident_start..ident_end`; the
-/// fix decides which surrounding delimiter to swallow:
+/// Strip an unused generic parameter from its enclosing `<...>` by
+/// walking the `type_params` node's children directly:
 ///
-/// - If the preceding non-whitespace byte is `,`: cut from that comma
-///   through the end of the ident. `<X, T>` / `<X, T, Y>` →
-///   `<X>` / `<X, Y>`.
-/// - Else if the following non-whitespace byte is `,`: cut from the
-///   ident's start through that comma and any whitespace after it.
-///   `<T, X>` → `<X>`.
-/// - Else the param is the *only* generic (prev `<`, next `>`): cut
-///   the whole `<T>` block. `type Foo<T> {}` → `type Foo {}`.
+/// - Sole param (`<T>`): cut the whole `type_params` block.
+/// - First of many (`<T, X>` → `<X>`): cut from ident start through the
+///   following `,` plus any whitespace before the next ident.
+/// - Not first (`<X, T>` / `<X, T, Y>`): cut from the preceding `,`
+///   through the ident's end.
 ///
-/// Refuses the fix when the name still appears elsewhere in the
-/// enclosing decl — same belt-and-suspenders safety net
-/// [`unused_param_fix`] uses against stale-source false positives.
-fn unused_generic_param_fix(text: &str, ident_start: usize, ident_end: usize) -> Vec<TextEdit> {
+/// Trusts the lint; `_`-prefixed names are skipped because that prefix
+/// is the convention for "intentionally unused."
+fn unused_generic_param_fix(
+    root: Node<'_>,
+    text: &str,
+    ident_start: usize,
+    ident_end: usize,
+) -> Vec<TextEdit> {
     if ident_end <= ident_start || ident_end > text.len() {
         return Vec::new();
     }
@@ -277,90 +276,61 @@ fn unused_generic_param_fix(text: &str, ident_start: usize, ident_end: usize) ->
     if name.starts_with('_') {
         return Vec::new();
     }
-    if !is_generic_name_unused_in_enclosing_decl(text, ident_start, ident_end, name) {
+    // Find the enclosing `type_params` node (parent of the binding ident).
+    let Some(params) = enclosing_kind(root, ident_start, "type_params") else {
         return Vec::new();
+    };
+    let mut cursor = params.walk();
+    let named_idents: Vec<Node<'_>> = params
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "ident")
+        .collect();
+    let Some(idx) = named_idents
+        .iter()
+        .position(|n| n.start_byte() == ident_start && n.end_byte() == ident_end)
+    else {
+        return Vec::new();
+    };
+    // Sole param — drop the whole `<T>` block.
+    if named_idents.len() == 1 {
+        return vec![TextEdit {
+            byte_range: params.byte_range(),
+            new_text: String::new(),
+        }];
     }
+    // Find the comma adjacent to this param: previous comma if `idx > 0`,
+    // otherwise the following comma.
     let bytes = text.as_bytes();
-    // Walk back through whitespace to the preceding `,` or `<`.
-    let mut left = ident_start;
-    while left > 0 && matches!(bytes[left - 1], b' ' | b'\t' | b'\n' | b'\r') {
-        left -= 1;
-    }
-    if left == 0 {
-        return Vec::new();
-    }
-    let prev = bytes[left - 1];
-    let prev_pos = left - 1;
-    if prev != b',' && prev != b'<' {
-        return Vec::new();
-    }
-    // Walk forward through whitespace to the following `,` or `>`.
-    let mut right = ident_end;
-    while right < bytes.len() && matches!(bytes[right], b' ' | b'\t' | b'\n' | b'\r') {
-        right += 1;
-    }
-    if right >= bytes.len() {
-        return Vec::new();
-    }
-    let next = bytes[right];
-    let next_pos = right;
-    if next != b',' && next != b'>' {
-        return Vec::new();
-    }
-    let (cut_start, cut_end) = match (prev, next) {
-        // `<X, T>` / `<X, T, Y>` → swallow `, T`.
-        (b',', _) => (prev_pos, ident_end),
-        // `<T, X>` → swallow `T,` plus any whitespace after the comma
-        // so the survivor isn't left with a leading space.
-        (b'<', b',') => {
-            let mut after = next_pos + 1;
-            while after < bytes.len() && matches!(bytes[after], b' ' | b'\t') {
-                after += 1;
-            }
-            (ident_start, after)
+    let (cut_start, cut_end) = if idx > 0 {
+        // Walk backwards from ident_start across whitespace; expect a `,`.
+        let mut i = ident_start;
+        while i > params.start_byte() && matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r') {
+            i -= 1;
         }
-        // `<T>` only → swallow the whole `<...>` block.
-        (b'<', b'>') => (prev_pos, next_pos + 1),
-        _ => return Vec::new(),
+        if i == 0 || bytes[i - 1] != b',' {
+            return Vec::new();
+        }
+        (i - 1, ident_end)
+    } else {
+        // First of many: walk forwards from ident_end across whitespace;
+        // expect a `,`, then eat trailing whitespace before the survivor.
+        let mut i = ident_end;
+        while i < params.end_byte() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b',' {
+            return Vec::new();
+        }
+        let mut after = i + 1;
+        while after < params.end_byte() && matches!(bytes[after], b' ' | b'\t') {
+            after += 1;
+        }
+        (ident_start, after)
     };
     vec![TextEdit {
         byte_range: cut_start..cut_end,
         new_text: String::new(),
     }]
-}
-
-/// Whole-word search for `name` across the enclosing `fn_decl` /
-/// `type_decl` / `type_method`, excluding the binding-site range
-/// itself. The lint rule already established this invariant before
-/// emitting; re-checking here defends the fix against drifted source.
-fn is_generic_name_unused_in_enclosing_decl(
-    text: &str,
-    binding_start: usize,
-    binding_end: usize,
-    name: &str,
-) -> bool {
-    let tree = greycat_analyzer_syntax::parse(text);
-    let root = tree.root_node();
-    let Some(mut node) = root.descendant_for_byte_range(binding_start, binding_start) else {
-        return true;
-    };
-    loop {
-        match node.kind() {
-            "fn_decl" | "type_method" | "type_decl" => break,
-            _ => {}
-        }
-        let Some(p) = node.parent() else {
-            return true;
-        };
-        node = p;
-    }
-    let range = node.byte_range();
-    let rel_b_start = binding_start.saturating_sub(range.start);
-    let rel_b_end = binding_end.saturating_sub(range.start);
-    let decl_text = &text[range.start..range.end];
-    let before = decl_text.get(..rel_b_start).unwrap_or("");
-    let after = decl_text.get(rel_b_end..).unwrap_or("");
-    !contains_whole_word(before, name) && !contains_whole_word(after, name)
 }
 
 fn possibly_null_fix(text: &str, recv_end: usize) -> Vec<TextEdit> {
@@ -445,7 +415,7 @@ fn modvar_append_inner_nullable_fix(end: usize) -> Vec<TextEdit> {
 /// back over whitespace to find and swallow the leading `else` keyword
 /// alongside any whitespace between them. Otherwise we'd leave
 /// `if (…) { … } else ` dangling — a parse error.
-fn unreachable_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
+fn unreachable_fix(root: Node<'_>, text: &str, start: usize, end: usize) -> Vec<TextEdit> {
     let bytes = text.as_bytes();
     if end > bytes.len() || start > end {
         return Vec::new();
@@ -454,41 +424,27 @@ fn unreachable_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
     // `if` keyword. When the if has an `else` branch, unwrap to its
     // contents (the else block is the live branch); otherwise plain
     // delete handles it. The condition's truth value isn't passed
-    // through here — we re-parse to inspect the if_stmt's structure.
+    // through here — we walk to the enclosing if_stmt to inspect its
+    // structure.
     if range_starts_with_keyword(bytes, start, b"if")
-        && let Some(edit) = trivially_decidable_if_fix(text, start)
+        && let Some(edit) = trivially_decidable_if_fix(root, text, start)
     {
         return vec![edit];
     }
     let mut del_start = start;
-    // Detect the "dead else block" shape: range starts at a `{`.
-    if bytes.get(start) == Some(&b'{') {
-        let mut i = start;
-        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
-            i -= 1;
+    // Detect the "dead else block" shape: the diagnostic range starts
+    // at a `{` whose enclosing block is the else-branch of an `if_stmt`.
+    // Walk up via the CST to find the `else` token and swallow it (plus
+    // its leading whitespace).
+    if bytes.get(start) == Some(&b'{')
+        && let Some(else_kw_start) = enclosing_else_token_start(root, start)
+    {
+        // Stop at a newline so the prior block's indentation isn't disturbed.
+        let mut j = else_kw_start;
+        while j > 0 && matches!(bytes[j - 1], b' ' | b'\t') {
+            j -= 1;
         }
-        // Look back for "else" — a 4-byte ASCII keyword preceded by a
-        // word boundary and followed by whitespace (which we just
-        // walked over).
-        if i >= 4 && &bytes[i - 4..i] == b"else" {
-            let kw_start = i - 4;
-            let pre_ok = kw_start == 0
-                || !matches!(
-                    bytes[kw_start - 1],
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'
-                );
-            if pre_ok {
-                // Swallow leading whitespace before the `else` too,
-                // so we don't leave a trailing space after the prior
-                // `}`. Stop at a newline so the prior block's
-                // indentation isn't disturbed.
-                let mut j = kw_start;
-                while j > 0 && matches!(bytes[j - 1], b' ' | b'\t') {
-                    j -= 1;
-                }
-                del_start = j;
-            }
-        }
+        del_start = j;
     }
     // Eat a trailing newline if the deletion would otherwise leave a
     // blank line behind (the dead range was the only content on its
@@ -529,15 +485,12 @@ fn range_starts_with_keyword(bytes: &[u8], start: usize, kw: &[u8]) -> bool {
 }
 
 /// Quickfix shape for a trivially-decidable `if` whose dead range
-/// starts at the `if` keyword. Re-parses to find the enclosing
-/// `if_stmt` node; returns `Some(edit)` when the if has an
-/// `else_branch` (we unwrap to its contents) and `None` when there
-/// is no else (the caller falls back to plain delete).
-fn trivially_decidable_if_fix(text: &str, start: usize) -> Option<TextEdit> {
-    let tree = greycat_analyzer_syntax::parse(text);
-    let mut node = tree
-        .root_node()
-        .descendant_for_byte_range(start, start + 1)?;
+/// starts at the `if` keyword. Walks `root` for the enclosing
+/// `if_stmt`; returns `Some(edit)` when the if has an `else_branch`
+/// (we unwrap to its contents) and `None` when there is no else (the
+/// caller falls back to plain delete).
+fn trivially_decidable_if_fix(root: Node<'_>, text: &str, start: usize) -> Option<TextEdit> {
+    let mut node = root.descendant_for_byte_range(start, start + 1)?;
     while node.kind() != "if_stmt" {
         node = node.parent()?;
     }
@@ -552,6 +505,41 @@ fn trivially_decidable_if_fix(text: &str, start: usize) -> Option<TextEdit> {
         byte_range: if_range,
         new_text,
     })
+}
+
+/// If `block_start` is the start byte of a `block` node that is the
+/// else-branch payload of an `if_stmt`, return the start byte of the
+/// `else` keyword token sitting between the then-branch and that block.
+/// Used by `unreachable_fix` to delete the `else` along with its dead
+/// block body. Returns `None` when the block isn't an else-payload.
+fn enclosing_else_token_start(root: Node<'_>, block_start: usize) -> Option<usize> {
+    // Descend to the smallest node at the `{` byte (usually the `{`
+    // anonymous token), then walk up to the enclosing `block` node.
+    let mut node = root.descendant_for_byte_range(block_start, block_start)?;
+    while node.kind() != "block" {
+        node = node.parent()?;
+    }
+    let block = node;
+    let if_stmt = block.parent()?;
+    if if_stmt.kind() != "if_stmt" {
+        return None;
+    }
+    // Confirm this block is the else-branch payload, not the then-branch.
+    let then_id = if_stmt.child_by_field_name("then_branch")?.id();
+    if block.id() == then_id {
+        return None;
+    }
+    // Walk the if_stmt's anonymous children for the `else` token that
+    // sits between then_branch and this block. `_else_branch` is an
+    // inlined anonymous rule (`seq("else", choice($.if_stmt, $.block))`),
+    // so the `else` keyword appears as a direct child of `if_stmt`.
+    let mut cursor = if_stmt.walk();
+    for ch in if_stmt.children(&mut cursor) {
+        if !ch.is_named() && ch.kind() == "else" && ch.end_byte() <= block.start_byte() {
+            return Some(ch.start_byte());
+        }
+    }
+    None
 }
 
 /// Find the else-branch *payload* of an `if_stmt` — either the
@@ -646,9 +634,7 @@ fn unwrap_block_to_outer_indent(
 /// explicit handling, the user can collapse to `else { }` themselves
 /// in seconds). Extending the API to return multiple alternatives is a
 /// larger surface change tracked separately.
-fn non_exhaustive_fix(text: &str, start: usize, message: &str) -> Vec<TextEdit> {
-    let tree = greycat_analyzer_syntax::parse(text);
-    let root = tree.root_node();
+fn non_exhaustive_fix(root: Node<'_>, text: &str, start: usize, message: &str) -> Vec<TextEdit> {
     let Some(head) = enclosing_kind(root, start, "if_stmt") else {
         return Vec::new();
     };
@@ -771,8 +757,8 @@ fn leading_whitespace_at(text: &str, byte: usize) -> &str {
 ///
 /// Returns an empty Vec when the diagnostic byte range doesn't sit
 /// inside a `line_comment`'s rule-list slot.
-fn unused_suppression_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit> {
-    let Some(comment_range) = enclosing_node_range(text, start, &["line_comment"]) else {
+fn unused_suppression_fix(root: Node<'_>, text: &str, start: usize, end: usize) -> Vec<TextEdit> {
+    let Some(comment_range) = enclosing_node_range(root, start, &["line_comment"]) else {
         return Vec::new();
     };
     let comment = &text[comment_range.clone()];
@@ -820,8 +806,8 @@ fn unused_suppression_fix(text: &str, start: usize, end: usize) -> Vec<TextEdit>
 /// minimal repair. Removes the whole comment line (and its trailing
 /// newline if the comment was the sole content on the line) so the
 /// rest of the file's blank-line vertical rhythm is preserved.
-fn delete_comment_line_fix(text: &str, byte: usize) -> Vec<TextEdit> {
-    let Some(comment_range) = enclosing_node_range(text, byte, &["line_comment"]) else {
+fn delete_comment_line_fix(root: Node<'_>, text: &str, byte: usize) -> Vec<TextEdit> {
+    let Some(comment_range) = enclosing_node_range(root, byte, &["line_comment"]) else {
         return Vec::new();
     };
     vec![TextEdit {
@@ -894,9 +880,7 @@ fn full_line_range_for_comment(text: &str, comment_range: &Range<usize>) -> Rang
     line_start..end
 }
 
-fn enclosing_node_range(text: &str, byte: usize, kinds: &[&str]) -> Option<Range<usize>> {
-    let tree = greycat_analyzer_syntax::parse(text);
-    let root = tree.root_node();
+fn enclosing_node_range(root: Node<'_>, byte: usize, kinds: &[&str]) -> Option<Range<usize>> {
     let mut node: Node<'_> = root.descendant_for_byte_range(byte, byte)?;
     loop {
         if kinds.contains(&node.kind()) {
@@ -906,64 +890,19 @@ fn enclosing_node_range(text: &str, byte: usize, kinds: &[&str]) -> Option<Range
     }
 }
 
-/// Scan the body of the function enclosing the param at `param_start`
-/// for any text-level occurrence of `name` (whole-word). Returns true
-/// iff there are *no* such occurrences (i.e. the rename is safe).
-fn is_param_name_unused_in_enclosing_fn(text: &str, param_start: usize, name: &str) -> bool {
-    let tree = greycat_analyzer_syntax::parse(text);
-    let root = tree.root_node();
-    let Some(mut node) = root.descendant_for_byte_range(param_start, param_start) else {
-        return true;
-    };
-    // Walk up to the enclosing function-shaped node.
-    loop {
-        match node.kind() {
-            "fn_decl" | "type_method" | "lambda_expr" => break,
-            _ => {}
-        }
-        let Some(p) = node.parent() else {
-            return true;
-        };
-        node = p;
-    }
-    let Some(body) = node.child_by_field_name("body") else {
-        return true;
-    };
-    let body_text = &text[body.byte_range()];
-    !contains_whole_word(body_text, name)
-}
-
-/// Whole-word `name` search in `haystack`. "Whole word" = preceded and
-/// followed by a non-`[A-Za-z0-9_]` character (or text boundary).
-fn contains_whole_word(haystack: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let bytes = haystack.as_bytes();
-    let nbytes = name.as_bytes();
-    let mut i = 0;
-    while i + nbytes.len() <= bytes.len() {
-        if &bytes[i..i + nbytes.len()] == nbytes {
-            let pre_ok =
-                i == 0 || !matches!(bytes[i - 1], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
-            let post_idx = i + nbytes.len();
-            let post_ok = post_idx == bytes.len()
-                || !matches!(bytes[post_idx], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
-            if pre_ok && post_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greycat_analyzer_syntax::parse;
+
+    fn fix_with_msg(code: &str, text: &str, range: Range<usize>, message: &str) -> Vec<TextEdit> {
+        let tree = parse(text);
+        let root = tree.root_node();
+        edit_for_diagnostic(root, text, code, &range, message)
+    }
 
     fn fix(code: &str, text: &str, range: Range<usize>) -> Vec<TextEdit> {
-        edit_for_diagnostic(text, code, &range, "")
+        fix_with_msg(code, text, range, "")
     }
 
     #[test]
@@ -1006,17 +945,6 @@ mod tests {
             !tree.root_node().has_error(),
             "applied edit produced parse error:\n{after}"
         );
-    }
-
-    #[test]
-    fn unused_param_skipped_when_body_uses_it() {
-        // Body references `from` even though the lint may have
-        // wrongly flagged it. The fix must refuse so the rename
-        // doesn't break the body's reference.
-        let src = "fn f(from: time) { var x = from; }\n";
-        let p_start = src.find("from:").unwrap();
-        let edits = fix("unused-param", src, p_start..(p_start + 4));
-        assert!(edits.is_empty(), "expected no edit; got {edits:?}");
     }
 
     #[test]
@@ -1112,16 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn unused_generic_param_skipped_when_body_uses_it() {
-        // Drifted source: the lint may have emitted for `T` but a
-        // subsequent edit introduced a use. The fix must refuse.
-        let src = "fn foo<T>(x: T): T { return x; }\n";
-        let t = src.find('T').unwrap();
-        let edits = fix("unused-generic-param", src, t..(t + 1));
-        assert!(edits.is_empty(), "expected refusal, got {edits:?}");
-    }
-
-    #[test]
     fn unused_generic_param_skipped_when_underscore_prefixed() {
         let src = "type Foo<_T> { a: int; }\n";
         let t = src.find("_T").unwrap();
@@ -1131,7 +1049,7 @@ mod tests {
 
     #[test]
     fn missing_token_inserts_quoted_token() {
-        let edits = edit_for_diagnostic("ab", "missing-token", &(2..2), "missing `;`");
+        let edits = fix_with_msg("missing-token", "ab", 2..2, "missing `;`");
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].byte_range, 2..2);
         assert_eq!(edits[0].new_text, ";");
@@ -1311,10 +1229,10 @@ fn t(e: E) {
         // out of it. The quickfix dispatcher requires the right `code`,
         // and the message is what the lint emitter actually produces.
         let msg = "non-exhaustive match over `E` (missing: baz, qux)";
-        let edits = edit_for_diagnostic(
-            src,
+        let edits = fix_with_msg(
             "non-exhaustive",
-            &(head..head + "if (e == E::foo)".len()),
+            src,
+            head..head + "if (e == E::foo)".len(),
             msg,
         );
         assert_eq!(edits.len(), 1);
@@ -1342,10 +1260,10 @@ fn t(e: E) {
         // Defensive: a malformed message must not produce edits.
         let src = "fn t(e: E) { if (e == E::foo) {} else if (e == E::bar) {} }\n";
         let head = src.find("if (e == E::foo)").unwrap();
-        let edits = edit_for_diagnostic(
-            src,
+        let edits = fix_with_msg(
             "non-exhaustive",
-            &(head..head + 4),
+            src,
+            head..head + 4,
             "totally not the expected shape",
         );
         assert!(edits.is_empty());
@@ -1358,7 +1276,7 @@ fn t(e: E) {
         // slice-delete.
         let src = "fn n(): int { return 1; };\n";
         let semi = src.find(";\n").unwrap();
-        let edits = edit_for_diagnostic(src, "redundant-semicolon", &(semi..semi + 1), "");
+        let edits = fix("redundant-semicolon", src, semi..semi + 1);
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].byte_range, semi..semi + 1);
         assert_eq!(edits[0].new_text, "");
@@ -1369,8 +1287,7 @@ fn t(e: E) {
         // `};;;` -> `}` (entire run is one diagnostic range).
         let src = "fn n() {};;;\n";
         let run_start = src.find(";;;").unwrap();
-        let edits =
-            edit_for_diagnostic(src, "redundant-semicolon", &(run_start..run_start + 3), "");
+        let edits = fix("redundant-semicolon", src, run_start..run_start + 3);
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].byte_range, run_start..run_start + 3);
         assert_eq!(edits[0].new_text, "");

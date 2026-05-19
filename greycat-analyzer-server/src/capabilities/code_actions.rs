@@ -3,7 +3,8 @@
 //! a `TextEdit`. The parse-safety gate re-parses with the edit applied
 //! and discards anything that would introduce new parse errors.
 
-use greycat_analyzer_analysis::project::ModuleAnalysis;
+use greycat_analyzer_analysis::{ide, project::ModuleAnalysis};
+use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, NumberOrString, TextEdit, Uri,
     WorkspaceEdit,
@@ -21,16 +22,18 @@ use crate::conv::{byte_to_position, position_to_byte, ranges_overlap};
 pub fn code_actions_with_project(
     module: &ModuleAnalysis,
     text: &str,
+    root: tree_sitter::Node<'_>,
     uri: &Uri,
     range: lsp_types::Range,
 ) -> Vec<CodeActionOrCommand> {
     // Code actions don't differentiate lib vs project — the user's
     // already pointing at a specific diagnostic when invoking them.
     let semantic = diagnostics_from_module(text, module, true);
-    code_actions_from_diagnostics(text, uri, range, semantic)
+    code_actions_from_diagnostics(root, text, uri, range, semantic)
 }
 
 fn code_actions_from_diagnostics(
+    root: tree_sitter::Node<'_>,
     text: &str,
     uri: &Uri,
     range: lsp_types::Range,
@@ -40,7 +43,7 @@ fn code_actions_from_diagnostics(
         .into_iter()
         .filter(|d| ranges_overlap(&d.range, &range))
         .map(|d| {
-            let raw_edits = synthesize_fix(text, &d);
+            let raw_edits = synthesize_fix(root, text, &d);
             // **P22.5** — never offer an edit whose application would
             // break the document's parse. Apply the edit in-memory,
             // re-parse, and drop the edit if it adds new parse errors
@@ -117,19 +120,14 @@ fn would_break_parse(text: &str, edits: &[TextEdit]) -> bool {
 /// Map a diagnostic to a concrete `Vec<TextEdit>`. Routes through the
 /// shared [`greycat_analyzer_analysis::ide::quickfix`] module so the LSP and
 /// the cli `lint --fix` path share a single source of truth.
-fn synthesize_fix(text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
+fn synthesize_fix(root: tree_sitter::Node<'_>, text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
     let code = match &diag.code {
         Some(NumberOrString::String(s)) => s.as_str(),
         _ => return Vec::new(),
     };
     let start = position_to_byte(text, diag.range.start);
     let end = position_to_byte(text, diag.range.end);
-    let edits = greycat_analyzer_analysis::ide::quickfix::edit_for_diagnostic(
-        text,
-        code,
-        &(start..end),
-        &diag.message,
-    );
+    let edits = ide::quickfix::edit_for_diagnostic(root, text, code, &(start..end), &diag.message);
     edits
         .into_iter()
         .map(|e| TextEdit {

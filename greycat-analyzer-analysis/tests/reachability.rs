@@ -72,7 +72,14 @@ fn user_example_quickfix_removes_both_dead_islands() {
     diags.sort_by_key(|b| std::cmp::Reverse(b.byte_range.start));
 
     for d in &diags {
-        let edits = quickfix::edit_for_diagnostic(&text, d.rule, &d.byte_range, &d.message);
+        let tree = greycat_analyzer_syntax::parse(&text);
+        let edits = quickfix::edit_for_diagnostic(
+            tree.root_node(),
+            &text,
+            d.rule,
+            &d.byte_range,
+            &d.message,
+        );
         assert_eq!(edits.len(), 1, "unreachable should yield exactly one edit");
         text.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
     }

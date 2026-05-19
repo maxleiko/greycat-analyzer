@@ -136,7 +136,13 @@ impl TestProject {
 
     pub fn code_actions(&self, range: lsp_types::Range) -> Vec<CodeActionOrCommand> {
         let doc = self.doc();
-        capabilities::code_actions_with_project(self.module(), &doc.text, &self.uri, range)
+        capabilities::code_actions_with_project(
+            self.module(),
+            &doc.text,
+            doc.root_node(),
+            &self.uri,
+            range,
+        )
     }
 }
 

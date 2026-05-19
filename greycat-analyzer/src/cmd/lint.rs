@@ -398,10 +398,16 @@ impl Lint {
                     let Ok(original) = std::fs::read_to_string(&entry.path) else {
                         continue;
                     };
+                    // Parse `original` once per file per pass; share the
+                    // tree across diag_to_edit (which walks the CST for
+                    // node-aware fixes) and the post-fix parse-safety
+                    // check below.
+                    let original_tree = greycat_analyzer_syntax::parse(&original);
+                    let original_root = original_tree.root_node();
                     let mut edits: Vec<(std::ops::Range<usize>, String)> = entry
                         .diagnostics
                         .iter()
-                        .filter_map(|d| diag_to_edit(&original, d))
+                        .filter_map(|d| diag_to_edit(original_root, &original, d))
                         .collect();
                     if edits.is_empty() {
                         continue;
@@ -419,9 +425,7 @@ impl Lint {
                     if non_overlap.is_empty() {
                         continue;
                     }
-                    let original_had_errors = greycat_analyzer_syntax::parse(&original)
-                        .root_node()
-                        .has_error();
+                    let original_had_errors = original_root.has_error();
                     let edit_count = non_overlap.len();
                     let mut new_text = original.clone();
                     for (r, t) in non_overlap.into_iter().rev() {
@@ -792,7 +796,11 @@ fn print_pretty_diagnostic(path: &str, source: &str, diag: &Diagnostic) {
 /// Each rule may produce multiple `TextEdit`s in principle; the
 /// current cli `--fix` driver expects a single range+text pair, so we
 /// flatten "one edit" rules and drop multi-edit cases (none today).
-fn diag_to_edit(text: &str, diag: &Diagnostic) -> Option<(std::ops::Range<usize>, String)> {
+fn diag_to_edit(
+    root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
+    text: &str,
+    diag: &Diagnostic,
+) -> Option<(std::ops::Range<usize>, String)> {
     let code = match diag.code.as_ref()? {
         NumberOrString::String(s) => s.as_str(),
         _ => return None,
@@ -800,6 +808,7 @@ fn diag_to_edit(text: &str, diag: &Diagnostic) -> Option<(std::ops::Range<usize>
     let start = lsp_to_byte(text, diag.range.start);
     let end = lsp_to_byte(text, diag.range.end);
     let edits = greycat_analyzer_analysis::ide::quickfix::edit_for_diagnostic(
+        root,
         text,
         code,
         &(start..end),

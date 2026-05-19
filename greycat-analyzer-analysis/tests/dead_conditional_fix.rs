@@ -39,7 +39,14 @@ fn apply_unreachable_fixes(src: &str, pa: &ProjectAnalysis, uri: &Uri) -> String
     diags.sort_by_key(|d| std::cmp::Reverse(d.byte_range.start));
     let mut text = src.to_string();
     for d in &diags {
-        let edits = quickfix::edit_for_diagnostic(&text, d.rule, &d.byte_range, &d.message);
+        let tree = greycat_analyzer_syntax::parse(&text);
+        let edits = quickfix::edit_for_diagnostic(
+            tree.root_node(),
+            &text,
+            d.rule,
+            &d.byte_range,
+            &d.message,
+        );
         for e in edits {
             text.replace_range(e.byte_range.clone(), &e.new_text);
         }
