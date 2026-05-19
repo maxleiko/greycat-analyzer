@@ -854,42 +854,29 @@ fn lower_keyword_expr_stmt<'a>(cx: &Cx<'a>, node: Node<'a>, kw: &'static str) ->
 }
 
 /// Lower an expression that follows a statement keyword (`return`,
-/// `throw`, …). Any expression whose own lowering can break — chain
-/// binops, brace-led constructors, postfix chains (`call_expr` /
-/// `member_expr` / `arrow_expr` / `array_expr`) — is emitted verbatim so
-/// the keyword stays glued to its argument and the inner break point
-/// (args group, fields group, chain dot) handles overflow. Wrapping
-/// these in an outer Group with a leading softline would detach the
-/// keyword from the call (`return\n    foo(args)`), which is never the
-/// shape anyone wants.
+/// `throw`). The expression is emitted verbatim — **never** wrapped in
+/// an outer Group with a leading softline, regardless of width.
 ///
-/// Only "leaf" expressions (idents, simple binary ops, paren-wrapped
-/// subexprs, …) get the outer softline fallback — for those there's no
-/// internal break point, so an outer one is the only way to fit a wide
-/// expression.
+/// **ASI safety:** GreyCat has automatic semicolon insertion
+/// (`_automatic_semicolon` is an external token in the grammar's
+/// `return_stmt` / `throw_stmt` rules). A newline between `return` and
+/// its expression re-parses as `return;` followed by a separate
+/// statement — silent semantic corruption, the classic JS
+/// "`return\n{ ... }`" bug. Even when the formatter's first pass
+/// happens to render `return\n    expr;` correctly (because the user's
+/// source typed it on one line), the *second* pass would re-tokenize
+/// from the formatted output and produce different code.
+///
+/// Expressions whose own lowering can break (chains, brace-led
+/// constructors, postfix chains, …) handle overflow internally —
+/// `return foo(\n    arg1,\n    arg2\n);` keeps `return` glued to
+/// `foo(` and only the args break. Atomic expressions that can't break
+/// internally (string literals, plain idents, …) stay on one long line
+/// when they overflow; the user can break them manually via string
+/// concat or similar, but the formatter never inserts a break that
+/// could be re-tokenized away.
 fn wrap_keyword_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    if is_self_wrapping_expr(cx, node) || is_postfix_chain_expr(node) {
-        lower_node(cx, node)
-    } else {
-        Doc::group(Doc::indent(Doc::concat(vec![
-            Doc::softline(),
-            lower_node(cx, node),
-        ])))
-    }
-}
-
-/// Postfix-chain expression shapes — call / member access / arrow access
-/// / array indexing. Each one's lowering produces a `Doc::Group` (call
-/// args group, member-chain spine) that can break independently, so
-/// callers managing keyword + expr layout treat them like
-/// [`is_self_wrapping_expr`] and skip the outer wrapping. Distinct from
-/// `is_self_wrapping_expr` because the paren-condition wrapper still
-/// wants the symmetric "softline before+after" treatment for these.
-fn is_postfix_chain_expr(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "call_expr" | "member_expr" | "arrow_expr" | "array_expr"
-    )
+    lower_node(cx, node)
 }
 
 /// True when the expression's lowering already produces a `Doc::Group`

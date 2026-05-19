@@ -1,0 +1,59 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn bar() {\n    return \"${OsmQuery::header(OsmSettings::default_timeout_s)}${area_prefix}(${inside});${OsmQuery::outClause(true, true, false, false)}\";\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'bar')
+    params: (fn_params '()')
+    body: (block
+      (return_stmt
+        (string
+          (string_substitution
+            (call_expr
+              fn: (static_expr
+                (type_ident
+                  name: (ident 'OsmQuery')
+                )
+                property: (ident 'header')
+              )
+              (args
+                (static_expr
+                  (type_ident
+                    name: (ident 'OsmSettings')
+                  )
+                  property: (ident 'default_timeout_s')
+                )
+              )
+            )
+          )
+          (string_substitution
+            (ident 'area_prefix')
+          )
+          (string_fragment '(')
+          (string_substitution
+            (ident 'inside')
+          )
+          (string_fragment ');')
+          (string_substitution
+            (call_expr
+              fn: (static_expr
+                (type_ident
+                  name: (ident 'OsmQuery')
+                )
+                property: (ident 'outClause')
+              )
+              (args
+                (true 'true')
+                (true 'true')
+                (false 'false')
+                (false 'false')
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

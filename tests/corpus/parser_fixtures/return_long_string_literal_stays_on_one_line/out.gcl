@@ -1,0 +1,3 @@
+fn bar() {
+    return "${OsmQuery::header(OsmSettings::default_timeout_s)}${area_prefix}(${inside});${OsmQuery::outClause(true, true, false, false)}";
+}
