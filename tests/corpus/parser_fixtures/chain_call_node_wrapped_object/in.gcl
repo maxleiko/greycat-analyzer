@@ -1,0 +1,3 @@
+fn f(out: Out, profile: P) {
+    out.add(node<IdentityFlags> { IdentityFlags { identity_id: profile->identity_id, email_verified: false, created_at: time::now() } });
+}

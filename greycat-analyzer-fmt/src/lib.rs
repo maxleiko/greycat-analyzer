@@ -29,7 +29,7 @@ pub struct FmtOptions {
     pub line_width: usize,
     /// Spaces per indent step. Default: `4`.
     pub indent: usize,
-    /// Append a trailing newline at end of file. Default: `false`.
+    /// Append a trailing newline at end of file. Default: `true`.
     pub eol_last: bool,
 }
 
@@ -38,7 +38,7 @@ impl Default for FmtOptions {
         FmtOptions {
             line_width: 120,
             indent: 4,
-            eol_last: false,
+            eol_last: true,
         }
     }
 }
@@ -267,11 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_module_is_empty() {
-        // P14.3 changed format() to mirror the input's trailing-newline
-        // policy. Empty input → empty output (no synthetic newline).
+    fn empty_module_gets_trailing_newline() {
+        // Default `eol_last: true` appends a single trailing newline,
+        // including for empty input — POSIX-style "every text file ends
+        // with `\n`." Callers that want strict empty-in / empty-out can
+        // override via `FmtOptions { eol_last: false, .. }`.
         let out = format("");
-        assert_eq!(out, "");
+        assert_eq!(out, "\n");
     }
 
     #[test]

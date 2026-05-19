@@ -1370,14 +1370,53 @@ fn lower_object_initializers<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
             inner.push(Doc::text(","));
             inner.push(Doc::line());
         }
-        inner.push(lower_node(cx, *e));
+        // When the initializer is itself an `object_expr` (the
+        // `node<T> { Foo {...} }` shape), lower it with the inner
+        // `object_fields` *not* wrapped in `Doc::expand`, so the OUTER
+        // `object_initializers` group's fit-check counts the inner's
+        // full width and breaks at the outer `{` first. Other init
+        // expression shapes go through the standard dispatch.
+        if e.kind() == "object_expr" {
+            inner.push(lower_object_expr_compact_fields(cx, *e));
+        } else {
+            inner.push(lower_node(cx, *e));
+        }
     }
+    // Outer wrapper keeps `Doc::expand` so that ANY enclosing Group
+    // (call args, method chain, etc.) treats the entire `node<T> { … }`
+    // shape as zero-width during its own fit-check. The break decision
+    // is the outer Group's alone.
     Doc::expand(Doc::group(Doc::concat(vec![
         Doc::text("{"),
         Doc::indent_if_broken(Doc::concat(inner)),
         Doc::line(),
         Doc::text("}"),
     ])))
+}
+
+/// `object_expr` variant used only from inside [`lower_object_initializers`].
+/// Mirrors [`lower_object_expr`] but routes a nested `object_fields` body
+/// through [`lower_object_fields_no_expand`] so the inner block's flat
+/// width is visible to the enclosing `object_initializers` group. The
+/// standalone path (`foo(Foo { … })`, `var x = Foo { … }`) still uses
+/// the Expand-wrapped `lower_object_fields` to preserve the "outer chain
+/// / call-args group stays flat while only the inner block breaks"
+/// behavior.
+fn lower_object_expr_compact_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut parts = Vec::new();
+    if let Some(t) = node.child_by_field_name("type") {
+        parts.push(lower_node(cx, t));
+        parts.push(Doc::space());
+    }
+    let mut walker = node.walk();
+    for c in node.named_children(&mut walker) {
+        match c.kind() {
+            "object_initializers" => parts.push(lower_node(cx, c)),
+            "object_fields" => parts.push(lower_object_fields_no_expand(cx, c)),
+            _ => {}
+        }
+    }
+    Doc::concat(parts)
 }
 
 fn lower_object_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
@@ -1404,6 +1443,36 @@ fn lower_object_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         Doc::line(),
         Doc::text("}"),
     ])))
+}
+
+/// `object_fields` variant without the outer `Doc::expand` wrap. Used
+/// only from [`lower_object_expr_compact_fields`] — i.e. when the fields
+/// block sits directly inside an `object_initializers` and the outer
+/// wrapper is the single break point for the combined shape.
+fn lower_object_fields_no_expand<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    let mut walker = node.walk();
+    let fields: Vec<Node<'_>> = node
+        .named_children(&mut walker)
+        .filter(|c| !matches!(c.kind(), "block_comment" | "line_comment"))
+        .collect();
+    if fields.is_empty() {
+        return Doc::text("{}");
+    }
+    let mut inner = Vec::new();
+    inner.push(Doc::line());
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            inner.push(Doc::text(","));
+            inner.push(Doc::line());
+        }
+        inner.push(lower_node(cx, *f));
+    }
+    Doc::group(Doc::concat(vec![
+        Doc::text("{"),
+        Doc::indent_if_broken(Doc::concat(inner)),
+        Doc::line(),
+        Doc::text("}"),
+    ]))
 }
 
 fn lower_object_field<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {

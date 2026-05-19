@@ -1,0 +1,74 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn f(profile: P) {\n    Builder::make(Foo {\n        identity_id: profile->identity_id,\n        email_verified: false,\n        created_at: time::now(),\n        updated_at: time::now()\n    });\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'profile')
+        type: (type_ident
+          name: (ident 'P')
+        )
+      )
+    )
+    body: (block
+      (expr_stmt
+        (call_expr
+          fn: (static_expr
+            (type_ident
+              name: (ident 'Builder')
+            )
+            property: (ident 'make')
+          )
+          (args
+            (object_expr
+              type: (type_ident
+                name: (ident 'Foo')
+              )
+              (object_fields
+                (object_field
+                  name: (ident 'identity_id')
+                  value: (arrow_expr
+                    (ident 'profile')
+                    property: (ident 'identity_id')
+                  )
+                )
+                (object_field
+                  name: (ident 'email_verified')
+                  value: (false 'false')
+                )
+                (object_field
+                  name: (ident 'created_at')
+                  value: (call_expr
+                    fn: (static_expr
+                      (type_ident
+                        name: (ident 'time')
+                      )
+                      property: (ident 'now')
+                    )
+                    (args '()')
+                  )
+                )
+                (object_field
+                  name: (ident 'updated_at')
+                  value: (call_expr
+                    fn: (static_expr
+                      (type_ident
+                        name: (ident 'time')
+                      )
+                      property: (ident 'now')
+                    )
+                    (args '()')
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

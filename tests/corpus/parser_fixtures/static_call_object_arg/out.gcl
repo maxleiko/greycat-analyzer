@@ -1,0 +1,8 @@
+fn f(profile: P) {
+    Builder::make(Foo {
+        identity_id: profile->identity_id,
+        email_verified: false,
+        created_at: time::now(),
+        updated_at: time::now()
+    });
+}

@@ -1,0 +1,3 @@
+fn f(h: Holder, profile: P) {
+    h->items.add(Foo { identity_id: profile->identity_id, email_verified: false, created_at: time::now(), updated_at: time::now() });
+}

@@ -246,6 +246,21 @@ Verification before commit: `cargo test --workspace` (the `TestProject`-based in
 
 Removal-side: walk the same touchpoints in reverse. **Watch out for the LSP↔analysis boundary** — if the capability had an analysis-side service, delete the analysis module too (otherwise the API stays exposed for no caller). `git grep` the analysis fn names to confirm no other capability borrowed them mid-flight.
 
+## Formatter — every observable behavior gets an in/out fixture
+
+**Hard rule:** when you add, change, or fix any observable formatter behavior — a new break point, a different indentation rule, a softline / hardline decision, a trailing-newline policy, anything a user could see by running `greycat-lang fmt` — you also add a [tests/corpus/parser_fixtures/](../tests/corpus/parser_fixtures/) `<name>/{in.gcl, out.gcl}` pair that captures the new contract. No exceptions for "small tweaks" or "obviously correct" changes.
+
+**Why:** the formatter has a lot of independent tunables (Group / Expand / IndentIfBroken / softline / IfBroken / hardline) whose interactions are non-obvious. Without a fixture, a change you made for one shape silently regresses next month when someone adjusts a neighboring rule — and the only way you'd know is by re-deriving the reasoning from memory. The fixture turns "I think this should produce X" into a byte-for-byte assertion the gauntlet (`tests/parity_gauntlet.rs`) enforces on every CI run.
+
+**How to apply:**
+- Pick a descriptive snake_case name (`object_init_break_outer`, `if_long_or_chain`, `for_in_range`). One fixture per *behavior*, not per *commit*.
+- `in.gcl` carries the minimal source that exercises the rule — typically a snippet that overflows the default `line_width` (120) so the formatter has to make the decision you're encoding.
+- `out.gcl` is the expected formatted output, byte-for-byte. It MUST end with a trailing newline (the formatter's `eol_last: true` default).
+- The new fixture path triggers two gauntlets automatically: the formatter parity at [greycat-analyzer-fmt/tests/parity_gauntlet.rs](../greycat-analyzer-fmt/tests/parity_gauntlet.rs) and the CST shape snapshot at [greycat-analyzer-syntax/tests/snapshot.rs](../greycat-analyzer-syntax/tests/snapshot.rs). The first run after adding the fixture will create the snapshot `.snap.new`; accept it (`cargo insta accept` or rename the file) once you've eyeballed the CST is what you expected.
+- If a fixture's `out.gcl` later changes shape because the formatter's behavior changed, that's a *deliberate* contract update — review the diff against what the TS reference produces (the parity oracle) and update fixture + commit message together. Never silently rewrite a fixture's `out.gcl` to make a failing test pass; that erases the previous contract.
+
+The inline `tests/` in [greycat-analyzer-fmt/src/lib.rs](../greycat-analyzer-fmt/src/lib.rs) and the integration tests under [greycat-analyzer-fmt/tests/](../greycat-analyzer-fmt/tests/) cover *unit*-shaped invariants (round-trip stability, pragma overrides, trivia preservation, idempotency). The corpus fixtures cover *layout*-shaped invariants — every break-decision rule lives there. When in doubt, prefer adding a corpus fixture; the inline tests should be the exception, reserved for cases where the input isn't a self-contained `.gcl` snippet.
+
 ## Conventions
 
 - **`lsp_types` is re-exported from `greycat-analyzer-core`** — depend on `greycat_analyzer_core::lsp_types` from downstream crates so versions stay in lockstep.

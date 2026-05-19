@@ -1,0 +1,5 @@
+fn main() {
+    var flags = node<IdentityFlags> {
+        IdentityFlags { identity_id: id.id, email_verified: false, created_at: time::now() }
+    };
+}
