@@ -1,0 +1,35 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn loop_until() {\n    do {\n        i = i + 1;\n    } while (some_long_condition_aaaaaaaa\n        && some_long_condition_bbbbbbbb\n        && some_long_condition_cccccccc_does_overflow\n    );\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'loop_until')
+    params: (fn_params '()')
+    body: (block
+      (do_while_stmt
+        block: (block
+          (expr_stmt
+            (binary_expr
+              left: (ident 'i')
+              right: (binary_expr
+                left: (ident 'i')
+                right: (number
+                  (number_int '1')
+                )
+              )
+            )
+          )
+        )
+        condition: (binary_expr
+          left: (binary_expr
+            left: (ident 'some_long_condition_aaaaaaaa')
+            right: (ident 'some_long_condition_bbbbbbbb')
+          )
+          right: (ident 'some_long_condition_cccccccc_does_overflow')
+        )
+      )
+    )
+  )
+)

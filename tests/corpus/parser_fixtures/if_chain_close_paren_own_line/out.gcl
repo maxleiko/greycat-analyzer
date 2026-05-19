@@ -1,0 +1,8 @@
+fn another() {
+    if (skip_weather_archive_for_tests.resolve() != true
+        && (System::getEnv("SKIP_WEATHER_ARCHIVE_IMPORT") ?? "") != "true"
+        && (System::getEnv("SKIP_WEATHER_ARCHIVE_IMPORT") ?? "") != "true"
+    ) {
+        // body
+    }
+}

@@ -946,14 +946,26 @@ fn lower_do_while_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 /// Wrap a condition expression (the body of `if (…)`, `while (…)`,
-/// `at (…)`, `do { } while (…)`) so the parens flow onto their own
-/// lines when the condition would overflow. Chain-style conditions
-/// already break internally and are emitted as-is — the leading
-/// operator stays on the `if (` line rather than the more-verbose
-/// "parens on bare lines" shape.
+/// `at (…)`, `do { } while (…)`) so the closing `)` lands on its own
+/// line at the statement's indent when the condition would overflow.
+///
+/// Two shapes:
+/// - Chain-style conditions (`a && b && c`) glue the first operand to
+///   the opening `(`, indent the continuation through the chain's own
+///   `Doc::indent`, and emit `Doc::if_broken(Doc::line())` to push `)`
+///   onto a fresh line at the outer indent only when the chain breaks.
+///   Without this trailing break, `) {` would glue to the last operand
+///   — and hitting Enter inside the if's `{` body in an editor would
+///   add one indent too many.
+/// - Non-chain conditions follow the symmetric "softline before and
+///   after" shape so the whole condition floats onto its own indented
+///   line when wrapped.
 fn wrap_paren_condition<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if is_self_wrapping_expr(cx, node) {
-        lower_node(cx, node)
+        Doc::group(Doc::concat(vec![
+            lower_node(cx, node),
+            Doc::if_broken(Doc::line()),
+        ]))
     } else {
         Doc::group(Doc::concat(vec![
             Doc::indent(Doc::concat(vec![Doc::softline(), lower_node(cx, node)])),

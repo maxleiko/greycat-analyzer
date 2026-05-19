@@ -2,7 +2,8 @@ fn example(aaa: int, bbb: int, ccc: int, ddd: int, eee: int, fff: int, ggg: int,
     if (aaa == 1111 && bbb == 2222
         || ccc == 3333 && ddd == 4444
         || eee == 5555 && fff == 6666
-        || ggg == 7777 && hhh == 8888) {
+        || ggg == 7777 && hhh == 8888
+    ) {
         // mixed
     }
 }

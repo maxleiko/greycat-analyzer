@@ -9,7 +9,8 @@ fn example(e: Example) {
     if (e == Example::first_field
         || e == Example::second_field
         || e == Example::third_field
-        || e == Example::fourth_field) {
+        || e == Example::fourth_field
+    ) {
         // do something
     }
 }

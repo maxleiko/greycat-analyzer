@@ -1,0 +1,5 @@
+fn loop_until() {
+    do {
+        i = i + 1;
+    } while (some_long_condition_aaaaaaaa && some_long_condition_bbbbbbbb && some_long_condition_cccccccc_does_overflow);
+}

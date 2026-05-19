@@ -1,0 +1,78 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn another() {\n    if (skip_weather_archive_for_tests.resolve() != true\n        && (System::getEnv(\"SKIP_WEATHER_ARCHIVE_IMPORT\") ?? \"\") != \"true\"\n        && (System::getEnv(\"SKIP_WEATHER_ARCHIVE_IMPORT\") ?? \"\") != \"true\"\n    ) {\n        // body\n    }\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'another')
+    params: (fn_params '()')
+    body: (block
+      (if_stmt
+        condition: (binary_expr
+          left: (binary_expr
+            left: (binary_expr
+              left: (call_expr
+                fn: (member_expr
+                  (ident 'skip_weather_archive_for_tests')
+                  property: (ident 'resolve')
+                )
+                (args '()')
+              )
+              right: (true 'true')
+            )
+            right: (binary_expr
+              left: (paren_expr
+                expr: (binary_expr
+                  left: (call_expr
+                    fn: (static_expr
+                      (type_ident
+                        name: (ident 'System')
+                      )
+                      property: (ident 'getEnv')
+                    )
+                    (args
+                      (string
+                        (string_fragment 'SKIP_WEATHER_ARCHIVE_IMPORT')
+                      )
+                    )
+                  )
+                  right: (string '""')
+                )
+              )
+              right: (string
+                (string_fragment 'true')
+              )
+            )
+          )
+          right: (binary_expr
+            left: (paren_expr
+              expr: (binary_expr
+                left: (call_expr
+                  fn: (static_expr
+                    (type_ident
+                      name: (ident 'System')
+                    )
+                    property: (ident 'getEnv')
+                  )
+                  (args
+                    (string
+                      (string_fragment 'SKIP_WEATHER_ARCHIVE_IMPORT')
+                    )
+                  )
+                )
+                right: (string '""')
+              )
+            )
+            right: (string
+              (string_fragment 'true')
+            )
+          )
+        )
+        then_branch: (block
+          (line_comment '// body')
+        )
+      )
+    )
+  )
+)
