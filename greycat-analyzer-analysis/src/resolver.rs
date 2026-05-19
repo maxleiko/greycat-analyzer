@@ -69,7 +69,17 @@ impl Position {
             // bare ident, and the runtime's apparent behavior
             // (verified via `greycat build` on cross-module `fn`/`var`
             // mixes).
-            Position::Value => &[Namespace::Fn, Namespace::Var],
+            //
+            // Type is a last-resort fallback so a bare type / enum
+            // ident in value position (passed as a runtime *type
+            // literal*, e.g. `type::enum_by_name(DurationUnit, "ms")`
+            // or `node::create(MyType)`) binds to its declaring decl
+            // rather than falling out as an unresolved name. The
+            // analyzer then types it as `TypeOf(<that decl>)` so the
+            // typeof-aware generic inference rule can witness
+            // `T := <that decl>`. Putting Type last preserves the
+            // Fn-then-Var precedence when names overlap.
+            Position::Value => &[Namespace::Fn, Namespace::Var, Namespace::Type],
         }
     }
 }

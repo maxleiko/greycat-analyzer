@@ -2670,7 +2670,20 @@ impl<'a> Cx<'a> {
                     // treats `module::fn_name` as a function ref, so
                     // type it as `function` (not `type`).
                     Some(self.function_ty())
-                } else if self.index.type_members.contains_key(&item) || self.index.has_name(sym) {
+                } else if let Some(enum_id) = self.index.enum_types.get(&item).copied() {
+                    // P-typeof — `module::EnumName` in value position
+                    // is a type-literal value. Refine to `TypeOf(...)`
+                    // so call-site inference can witness `T := EnumName`
+                    // for `typeof T` parameters (e.g. `type::enum_by_name`).
+                    Some(self.arena.type_of(enum_id))
+                } else if self.index.type_members.contains_key(&item) {
+                    // P-typeof — same rule for `module::TypeName`.
+                    let inner = self.arena.alloc_type(item);
+                    Some(self.arena.type_of(inner))
+                } else if self.index.has_name(sym) {
+                    // Runtime-internal type the user can't author —
+                    // keep the unrefined `type` shape so existing
+                    // behavior for these stays put.
                     Some(self.type_ty())
                 } else {
                     None
@@ -2944,6 +2957,17 @@ impl<'a> Cx<'a> {
                 }
             }
         };
+        if tr.typeof_marker {
+            // P-typeof — `typeof T` in source position. Wrap the lowered
+            // inner shape (which may itself be a `GenericParam`, a
+            // concrete `Type`, an enum, etc.) in `TypeOf(...)` so
+            // generic inference's witness collection can pair it with
+            // a `TypeOf(X)` argument and bind `T := X`. The `?` suffix
+            // (if any) applies on top of the wrapper — `typeof T?` is
+            // a nullable type-literal value, not a typeof of a
+            // nullable inner.
+            base = self.arena.type_of(base);
+        }
         if tr.optional {
             base = self.arena.nullable(base);
         }
@@ -3130,6 +3154,9 @@ impl<'a> Cx<'a> {
             // already flagged it as unresolved. Surface the leaf as
             // an Unresolved type so downstream typing doesn't cascade.
             let mut base = self.arena.unresolved(leaf_sym, byte_span);
+            if tr.typeof_marker {
+                base = self.arena.type_of(base);
+            }
             if tr.optional {
                 base = self.arena.nullable(base);
             }
@@ -3150,6 +3177,9 @@ impl<'a> Cx<'a> {
                 Some(item) => self.arena.generic(item, args),
                 None => self.arena.unresolved(leaf_sym, byte_span),
             };
+            if tr.typeof_marker {
+                base = self.arena.type_of(base);
+            }
             if tr.optional {
                 base = self.arena.nullable(base);
             }
@@ -3167,6 +3197,9 @@ impl<'a> Cx<'a> {
             Some(item) => self.arena.alloc_type(item),
             None => self.arena.unresolved(leaf_sym, byte_span),
         };
+        if tr.typeof_marker {
+            base = self.arena.type_of(base);
+        }
         if tr.optional {
             base = self.arena.nullable(base);
         }
@@ -3187,6 +3220,42 @@ impl<'a> Cx<'a> {
         arg_tys: &[TypeId],
         call_range: Range<usize>,
     ) -> Option<TypeId> {
+        // P-typeof-inference — Static / QualifiedStatic / Member /
+        // Arrow callees route through the pre-lowered
+        // `TypeMembers::method_signatures` storage. The witness +
+        // substitute loop is the same as the bare-Ident path, only
+        // the way we *find* the method signature differs.
+        match &self.hir.exprs[callee] {
+            Expr::Static(s) => {
+                let recv_ty = self.lower_type_ref(s.ty);
+                let property = s.property.ident();
+                return self.run_method_generic_inference(recv_ty, property, arg_tys, &call_range);
+            }
+            Expr::Member(m) => {
+                let property = m.property.ident();
+                let recv_ty = self.out.expr_types.get(&m.receiver).copied()?;
+                return self.run_method_generic_inference(recv_ty, property, arg_tys, &call_range);
+            }
+            Expr::Arrow(m) => {
+                let property = m.property.ident();
+                let recv_ty = self.out.expr_types.get(&m.receiver).copied()?;
+                let recv_ty = self.arrow_deref_receiver(recv_ty).unwrap_or(recv_ty);
+                return self.run_method_generic_inference(recv_ty, property, arg_tys, &call_range);
+            }
+            Expr::QualifiedStatic { chain, .. } if chain.len() == 3 => {
+                let module_sym = self.hir.idents[chain[0]].symbol;
+                let type_sym = self.hir.idents[chain[1]].symbol;
+                let property = chain[2];
+                let type_id_item = ItemId::new(module_sym, type_sym);
+                let recv_ty = self.arena.alloc_type(type_id_item);
+                return self.run_method_generic_inference(recv_ty, property, arg_tys, &call_range);
+            }
+            // 2-segment QualifiedStatic shapes (`module::fn`) fall
+            // through to the Definition-based lookup below; the
+            // resolver binds them to `Definition::ProjectDecl` via the
+            // leaf, and the existing arm picks up the FnSignature.
+            _ => {}
+        }
         // P19.8: peek without cloning the whole `Expr` — `name_idx`
         // is a `Copy` `Idx<Ident>`, no allocation.
         let name_idx = match &self.hir.exprs[callee] {
@@ -3266,6 +3335,73 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Shared body of the Static / Member / Arrow / QualifiedStatic
+    /// branches of [`Self::try_generic_call_inference`]. Looks up
+    /// the method's pre-lowered signature in
+    /// [`crate::stdlib::TypeMembers::method_signatures`], composes
+    /// the receiver-side instantiation substitution with the call-
+    /// site witness collection, and substitutes the result through
+    /// the declared return type.
+    ///
+    /// Returns `None` when:
+    /// - the receiver type doesn't resolve to a known type decl
+    ///   (primitive without member storage, unresolved name, etc.);
+    /// - the method isn't in `method_signatures` (no generic
+    ///   params — the non-generic `method_returns` path handles
+    ///   that case in [`Self::try_member_call_typing`]).
+    fn run_method_generic_inference(
+        &mut self,
+        recv_ty: TypeId,
+        property: Idx<Ident>,
+        arg_tys: &[TypeId],
+        call_range: &Range<usize>,
+    ) -> Option<TypeId> {
+        let recv = self.arena.get(recv_ty).clone();
+        let (type_id, instantiation): (ItemId, Vec<TypeId>) = match recv.kind {
+            TypeKind::Primitive(p) => {
+                let core_mod = self.index.symbols.intern("core");
+                let name_sym = self.index.symbols.intern(p.name());
+                (ItemId::new(core_mod, name_sym), Vec::new())
+            }
+            TypeKind::Type(decl) => (decl, Vec::new()),
+            TypeKind::Generic { decl, args } => (decl, args.into_vec()),
+            _ => return None,
+        };
+        let method_sym = self.hir.idents[property].symbol;
+        let members = self.index.type_members.get(&type_id)?;
+        let sig = members.method_signatures.get(&method_sym)?.clone();
+        // Receiver-side substitution. Maps the type decl's own generic
+        // params (`Array<T>.push(x: T)`) to the receiver's concrete
+        // args (`Array<int>` → `T := int`) so the method's params /
+        // return show through with the right type *before* call-site
+        // witness collection runs against `arg_tys`.
+        let recv_subst: FxHashMap<Symbol, TypeId> = members
+            .generics
+            .iter()
+            .copied()
+            .zip(instantiation.iter().copied())
+            .collect();
+        let declared_params: Vec<TypeId> = if recv_subst.is_empty() {
+            sig.params.clone()
+        } else {
+            sig.params
+                .iter()
+                .map(|p| self.arena.substitute(*p, &recv_subst))
+                .collect()
+        };
+        let declared_return = if recv_subst.is_empty() {
+            sig.return_ty
+        } else {
+            self.arena.substitute(sig.return_ty, &recv_subst)
+        };
+        let mut tbl = InferenceTable::new();
+        let pair_count = declared_params.len().min(arg_tys.len());
+        for i in 0..pair_count {
+            self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, call_range);
+        }
+        Some(tbl.substitute(self.arena, declared_return))
+    }
+
     /// Walk `param_ty` (declared) against `arg_ty` (witness). When
     /// `param_ty` is a [`TypeKind::GenericParam`], record `arg_ty` as
     /// the witness; if a different witness was already recorded for
@@ -3281,6 +3417,21 @@ impl<'a> Cx<'a> {
         call_range: &Range<usize>,
     ) {
         let pk = self.arena.get(param_ty).clone();
+        // P-typeof — `typeof T` parameter form. The declared shape is
+        // `TypeOf(p_inner)`; the argument must itself be a type-
+        // literal value (`TypeOf(a_inner)`) for the binding to make
+        // sense. Recurse on the inners so `TypeOf(GenericParam(T))`
+        // ↔ `TypeOf(<some decl>)` lands the `T := <some decl>`
+        // witness. A non-`TypeOf` argument is a type error — the
+        // assignability check at the call site will surface it; we
+        // just skip witness recording so substitution doesn't bind
+        // `T` to a non-type value.
+        if let TypeKind::TypeOf(p_inner) = pk.kind
+            && let TypeKind::TypeOf(a_inner) = self.arena.get(arg_ty).kind
+        {
+            self.collect_witnesses(p_inner, a_inner, tbl, call_range);
+            return;
+        }
         if let TypeKind::GenericParam { name, .. } = &pk.kind {
             // If the param is `T?`, the witness is whatever the arg
             // strips down to without nullable.
@@ -4870,11 +5021,33 @@ impl<'a> Cx<'a> {
                         .ty
                         .map(|ty_ref| self.lower_type_ref(ty_ref))
                         .unwrap_or_else(|| self.any_nullable()),
-                    // P23 — bare type / enum / fn references used as
-                    // values were typed by pass 3.5 before. Now type
-                    // them inline against the runtime "type" /
-                    // "function" named shapes.
-                    Decl::Type(_) | Decl::Enum(_) => self.type_ty(),
+                    // P23 — bare type / enum references used in value
+                    // position carry the named decl's identity, not
+                    // the generic `type` shape. Refine to
+                    // `TypeOf(<that decl>)` so generic inference's
+                    // typeof rule can witness `T := X` when the value
+                    // flows into a `typeof T` slot. Stays assignable
+                    // to plain `type` (see `is_assignable_to_with_index`'s
+                    // `TypeOf → Type(core::type)` rule) so existing
+                    // `fn foo(t: type)` consumers still accept these.
+                    Decl::Type(td) => {
+                        let name_sym = self.hir.idents[td.name].symbol;
+                        let inner = self
+                            .arena
+                            .alloc_type(ItemId::new(self.module_sym, name_sym));
+                        self.arena.type_of(inner)
+                    }
+                    Decl::Enum(ed) => {
+                        let name_sym = self.hir.idents[ed.name].symbol;
+                        let item = ItemId::new(self.module_sym, name_sym);
+                        let inner = self
+                            .index
+                            .enum_types
+                            .get(&item)
+                            .copied()
+                            .unwrap_or_else(|| self.arena.alloc_type(item));
+                        self.arena.type_of(inner)
+                    }
                     Decl::Fn(_) => self.function_ty(),
                     _ => self.any_nullable(),
                 },
@@ -4905,12 +5078,27 @@ impl<'a> Cx<'a> {
                         // bare; only the `type_ty()` fallback below
                         // remains for genuine type / enum names.
                         self.function_ty()
-                    } else if self
-                        .index
-                        .item_id_for(dec_uri, sym)
-                        .is_some_and(|item| self.index.type_members.contains_key(&item))
-                        || self.index.has_name(sym)
+                    } else if let Some(enum_id) =
+                        item.and_then(|id| self.index.enum_types.get(&id).copied())
                     {
+                        // P-typeof — cross-module bare ident referring
+                        // to an enum decl. Refine to
+                        // `TypeOf(<enum's interned TypeId>)` so the
+                        // typeof witness rule fires at call sites like
+                        // `type::enum_by_name(DurationUnit, "...")`.
+                        self.arena.type_of(enum_id)
+                    } else if let Some(item) =
+                        item.filter(|id| self.index.type_members.contains_key(id))
+                    {
+                        // P-typeof — cross-module bare ident referring
+                        // to a type decl. Refine to `TypeOf(Type(item))`.
+                        let inner = self.arena.alloc_type(item);
+                        self.arena.type_of(inner)
+                    } else if self.index.has_name(sym) {
+                        // Recognised name without a decl handle yet
+                        // (runtime-internal type the user doesn't
+                        // author). Keep the unrefined `type` shape so
+                        // existing behavior for these stays put.
                         self.type_ty()
                     } else {
                         self.any_nullable()

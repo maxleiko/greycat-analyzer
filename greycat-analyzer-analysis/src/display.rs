@@ -100,6 +100,12 @@ pub fn display_fqn(
             }
             parts.join(" | ")
         }
+        // P-typeof — render the source form `typeof Inner`, mirroring the
+        // grammar's `optional("typeof")` prefix on `type_ident`.
+        TypeKind::TypeOf(inner) => format!(
+            "typeof {}",
+            display_fqn(arena, _decl_registry, symbols, *inner, home_lib)
+        ),
     };
     if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
         s.push('?');

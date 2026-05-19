@@ -188,6 +188,12 @@ struct ModuleSigCache {
     // P19.9
     /// `(type_id, method_sym, ty)`.
     methods: Vec<(ItemId, Symbol, TypeId)>,
+    /// `(type_id, method_sym, FnSignature)` — full signature for
+    /// methods that declare their own generic params (`<T, …>`).
+    /// Lets cross-module / static / instance / arrow method calls
+    /// run the same witness-based generic inference the bare-Ident
+    /// path uses today (see [`crate::analyzer::Cx::try_generic_call_inference`]).
+    method_sigs: Vec<(ItemId, Symbol, FnSignature)>,
     // P19.9
     /// `(fn_id, signature)`.
     fns: Vec<(ItemId, FnSignature)>,
@@ -712,6 +718,10 @@ fn write_type_qualified(
                 f.write_str(" | null")?;
             }
         }
+        TypeKind::TypeOf(inner) => {
+            f.write_str("typeof ")?;
+            write_type_qualified(f, project, *inner)?;
+        }
     }
     if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
         f.write_str("?")?;
@@ -824,6 +834,10 @@ fn write_type_with_decls(
             {
                 f.write_str(" | null")?;
             }
+        }
+        TypeKind::TypeOf(inner) => {
+            f.write_str("typeof ")?;
+            write_type_with_decls(f, arena, _decl_registry, symbols, *inner)?;
         }
     }
     if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
@@ -1383,9 +1397,6 @@ fn lower_module_signatures(
                         continue;
                     };
                     let method_sym = hir.idents[fnd.name].symbol;
-                    let Some(ret) = fnd.return_type else {
-                        continue;
-                    };
                     // P19.8: push the method's generics onto the
                     // type-level scope, lower, then pop. Avoids
                     // cloning `generics_in_scope` (a HashMap with
@@ -1400,14 +1411,67 @@ fn lower_module_signatures(
                         let prev = generics_in_scope.insert(g_sym, method_owner);
                         saved.push((g_sym, prev));
                     }
-                    let ty = lower_type_ref_project(
-                        hir,
-                        ret,
-                        arena_mut,
-                        &*index,
-                        decl_registry,
-                        &generics_in_scope,
-                    );
+                    if let Some(ret) = fnd.return_type {
+                        let ty = lower_type_ref_project(
+                            hir,
+                            ret,
+                            arena_mut,
+                            &*index,
+                            decl_registry,
+                            &generics_in_scope,
+                        );
+                        entry.methods.push((type_id, method_sym, ty));
+                    }
+                    // P-typeof-inference — pre-lower the full signature
+                    // for methods that carry their own generic params
+                    // so call-site inference can witness `T` from arg
+                    // types. The non-generic case skips this (the
+                    // simpler `method_returns` lookup is enough) to
+                    // avoid duplicating per-call signature work.
+                    if !fnd.generics.is_empty() {
+                        let method_generics: Vec<Symbol> =
+                            fnd.generics.iter().map(|g| hir.idents[*g].symbol).collect();
+                        let mut method_params: Vec<TypeId> = Vec::with_capacity(fnd.params.len());
+                        for p_id in &fnd.params {
+                            let p = &hir.fn_params[*p_id];
+                            let pt = if let Some(tr) = p.ty {
+                                lower_type_ref_project(
+                                    hir,
+                                    tr,
+                                    arena_mut,
+                                    &*index,
+                                    decl_registry,
+                                    &generics_in_scope,
+                                )
+                            } else {
+                                arena_mut.any_nullable()
+                            };
+                            method_params.push(pt);
+                        }
+                        let method_ret_ty = fnd
+                            .return_type
+                            .map(|ret| {
+                                lower_type_ref_project(
+                                    hir,
+                                    ret,
+                                    arena_mut,
+                                    &*index,
+                                    decl_registry,
+                                    &generics_in_scope,
+                                )
+                            })
+                            .unwrap_or_else(|| arena_mut.any_nullable());
+                        entry.method_sigs.push((
+                            type_id,
+                            method_sym,
+                            FnSignature {
+                                home_uri: uri.clone(),
+                                return_ty: method_ret_ty,
+                                generics: method_generics,
+                                params: method_params,
+                            },
+                        ));
+                    }
                     // Restore: undo every push (in reverse so a method
                     // that re-shadows an outer name plays back correctly).
                     for (k, prev) in saved.into_iter().rev() {
@@ -1420,7 +1484,6 @@ fn lower_module_signatures(
                             }
                         }
                     }
-                    entry.methods.push((type_id, method_sym, ty));
                 }
             }
             Decl::Enum(_) => {
@@ -1574,6 +1637,27 @@ pub(crate) fn is_assignable_to_with_index(
             is_assignable_to_with_index(index, well_known, _decl_registry, arena, alt, to)
         }),
 
+        // P-typeof — type-literal source. Accepts `Type(core::type)`
+        // as a widening target so stdlib functions typed `(t: type)`
+        // continue to accept arguments now typed as `TypeOf(X)`.
+        // Identity TypeOf → TypeOf is handled by the core fast path.
+        TypeKind::TypeOf(_) => match b_kind {
+            TypeKind::Type(d) => well_known.type_decl == Some(d),
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
+        },
+
         // Handle-keyed subtype chain — the inheritance layer this
         // wrapper exists to add. `Type(sub) → Type(sup)` when `sub`
         // is a transitive descendant of `sup` in `index.type_members`.
@@ -1605,7 +1689,8 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Primitive(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // Node-tag bivariance + node<T> covariance + cross-decl
@@ -1653,7 +1738,8 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Type(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // Primitive / Lambda / Enum / GenericParam: the wrapper adds
@@ -1677,7 +1763,8 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
     }
 }
@@ -1791,6 +1878,27 @@ pub(crate) fn is_castable_with_index(
             .into_iter()
             .any(|alt| is_castable_with_index(index, well_known, _decl_registry, arena, alt, to)),
 
+        // P-typeof — `as` is dropped at runtime; the analyzer mirrors
+        // assignability for cast strictness, so accept the widening
+        // `TypeOf(X) → Type(core::type)` for the same reason. Other
+        // targets reject (identity goes through the early-return).
+        TypeKind::TypeOf(_) => match to_kind {
+            TypeKind::Type(d) => well_known.type_decl == Some(d),
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Primitive(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
+        },
+
         // Source Type: bidirectional inheritance with Type / Generic
         // targets; target-Union retry. No node-tag-int rule applies
         // (Type is non-generic, can't be a node tag). Non-generic
@@ -1840,7 +1948,8 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::Primitive(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // Source Generic: same-decl trusts core (which has already
@@ -1910,7 +2019,8 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::Primitive(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // Source Primitive(Int): inverse `int as <node-tag>` rule.
@@ -1931,7 +2041,8 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // Other source kinds: wrapper adds no rules beyond core; only
@@ -1953,7 +2064,8 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
     }
 }
@@ -1973,6 +2085,13 @@ fn apply_module_contributions(index: &mut ProjectIndex, c: &ModuleSigCache) {
     for (type_id, method_sym, ty) in &c.methods {
         if let Some(tm) = index.type_members.get_mut(type_id) {
             tm.method_returns.insert(*method_sym, *ty);
+        }
+    }
+    for (type_id, method_sym, sig) in &c.method_sigs {
+        if let Some(tm) = index.type_members.get_mut(type_id) {
+            tm.method_signatures
+                .entry(*method_sym)
+                .or_insert_with(|| sig.clone());
         }
     }
     for (fn_id, sig) in &c.fns {
@@ -4094,6 +4213,14 @@ fn lower_type_ref_project(
             }
         }
     };
+    if tr.typeof_marker {
+        // P-typeof — same wrapping rule as the in-module
+        // `Cx::lower_type_ref`. Lifts the lowered inner into a
+        // `TypeOf(...)` so cross-module `FnSignature.params` end up
+        // with the typeof-aware shape and generic inference can match
+        // them against type-literal arguments.
+        base = arena.type_of(base);
+    }
     if tr.optional {
         base = arena.nullable(base);
     }
@@ -4181,6 +4308,9 @@ fn lower_qualified_type_ref_project(
 
     let Some(module_uri) = index.module_names.get(&module_name) else {
         let mut base = arena.unresolved(leaf_name, byte_span);
+        if tr.typeof_marker {
+            base = arena.type_of(base);
+        }
         if tr.optional {
             base = arena.nullable(base);
         }
@@ -4202,6 +4332,9 @@ fn lower_qualified_type_ref_project(
             Some(item) => arena.generic(item, args),
             None => arena.unresolved(leaf_name, byte_span),
         };
+        if tr.typeof_marker {
+            base = arena.type_of(base);
+        }
         if tr.optional {
             base = arena.nullable(base);
         }
@@ -4215,6 +4348,9 @@ fn lower_qualified_type_ref_project(
         Some(item) => arena.alloc_type(item),
         None => arena.unresolved(leaf_name, byte_span),
     };
+    if tr.typeof_marker {
+        base = arena.type_of(base);
+    }
     if tr.optional {
         base = arena.nullable(base);
     }
@@ -4318,6 +4454,10 @@ fn lower_type_ref_id(
             }
         }
     };
+    let mut base = base;
+    if tr.typeof_marker {
+        base = arena.type_of(base);
+    }
     Some(if tr.optional {
         arena.nullable(base)
     } else {

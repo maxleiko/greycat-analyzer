@@ -711,6 +711,13 @@ pub struct TypeRef {
     /// Generic args (`Map<K, V>` → `[K, V]`). Empty for non-generic.
     pub params: Box<[Idx<TypeRef>]>,
     pub optional: bool,
+    /// `true` when the source carried a leading `typeof` keyword,
+    /// declaring the reference as a *type literal* (the runtime value
+    /// IS a type, not an instance of one). The grammar admits the
+    /// keyword in two positions — inside `type_ident` itself and on
+    /// the param-slot side of `fn_param` — so the lowering checks
+    /// both and collapses them onto this single flag.
+    pub typeof_marker: bool,
     pub byte_range: Span,
 }
 

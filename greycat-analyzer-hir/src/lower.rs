@@ -2113,11 +2113,21 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
     let optional = inner
         .named_children(&mut inner.walk())
         .any(|c| c.kind() == "optional");
+    // Anonymous `typeof` keyword child: the grammar admits it at the
+    // head of `type_ident` (grammar.js:483, the parser always prefers
+    // this path even when the surrounding `fn_param` also offers an
+    // optional `typeof` slot). Detect it via the unnamed-children walk
+    // so the marker carries through to type lowering, where it lifts
+    // the lowered shape into `TypeKind::TypeOf(inner)`.
+    let typeof_marker = inner
+        .children(&mut inner.walk())
+        .any(|c| c.kind() == "typeof");
     Some(cx.hir.type_refs.alloc(TypeRef {
         qualifier: qualifier.into_boxed_slice(),
         name,
         params: params.into_boxed_slice(),
         optional,
+        typeof_marker,
         // P18.1 — store the `type_ident`'s own byte range, not the
         // wrapper's (`attr_type` / `type_decorator` include the leading
         // `:` / annotation tokens). The TS reference's `dump-types`

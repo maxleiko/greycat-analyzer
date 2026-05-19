@@ -145,6 +145,17 @@ pub enum TypeKind {
     /// Union of two-or-more alternatives. Construction normalizes:
     /// `T | T = T`, `T | null = nullable(T)`.
     Union { alts: Vec<TypeId> },
+    /// A *type-literal value* — the runtime value is the type `inner`
+    /// itself (not an instance of it). Mints from
+    /// `typeof T` in source position and from bare type-ident
+    /// expressions like `DurationUnit` used in value position. Pairs
+    /// with the `typeof T` parameter form so generic inference can
+    /// witness `T := inner` when a `typeof T` param meets a
+    /// `TypeOf(X)` argument.
+    ///
+    /// Equality is by inner-`TypeId` only; nullability lives on the
+    /// outer [`Type`] wrapper as for every other kind.
+    TypeOf(TypeId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -346,6 +357,18 @@ impl TypeArena {
         })
     }
 
+    /// Allocate a [`TypeKind::TypeOf`] wrapping `inner`. Idempotent
+    /// (interns through `alloc`). Idiomatic for both the lowering of a
+    /// `typeof T` source-form annotation and the expression-typing of a
+    /// bare type-ident in value position (e.g. `DurationUnit` passed as
+    /// an argument).
+    pub fn type_of(&mut self, inner: TypeId) -> TypeId {
+        self.alloc(Type {
+            kind: TypeKind::TypeOf(inner),
+            nullable: false,
+        })
+    }
+
     /// `(x, y)` tuple-literal type, modelled as `Tuple<X, Y>` per
     /// the compiler's desugaring rule (mirrors `[42]` ≡
     /// `Array<int>{42}`). Strictly 2-element — the grammar's
@@ -428,6 +451,18 @@ impl TypeArena {
                         kind: TypeKind::Union { alts: new_alts },
                         nullable: false,
                     });
+                    if t.nullable {
+                        new_t = self.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
+            TypeKind::TypeOf(inner) => {
+                let new_inner = self.substitute(*inner, subst);
+                if new_inner == *inner {
+                    ty
+                } else {
+                    let mut new_t = self.type_of(new_inner);
                     if t.nullable {
                         new_t = self.nullable(new_t);
                     }
@@ -579,7 +614,8 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // P35.2 — decl identity via `ItemId`. Cross-module references
@@ -598,7 +634,8 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // P12.2 / P19.10 / P19.14 — generic args are invariant
@@ -638,7 +675,8 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::Type(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // Lambda: contravariant in params, covariant in return.
@@ -667,7 +705,8 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::Type(_)
             | TypeKind::Generic { .. }
             | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         TypeKind::Enum { name: na, .. } => match &b.kind {
@@ -682,7 +721,8 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::Type(_)
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
-            | TypeKind::GenericParam { .. } => false,
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
         },
 
         // P25.4 — a generic param `T` (inside a `fn<T>(...)` body) is
@@ -695,6 +735,30 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             TypeKind::Any | TypeKind::Unresolved { .. } => {
                 unreachable!("filtered by top-level guards")
             }
+            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
+            TypeKind::Null
+            | TypeKind::Never
+            | TypeKind::Primitive(_)
+            | TypeKind::Type(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
+        },
+
+        // P-typeof — `TypeOf(X)` is a *type-literal value*, modelled
+        // as a distinct kind from its inner. Identity is by inner-
+        // TypeId; equality short-circuits via the `from == to`
+        // top-of-function check. Cross-kind targets reject. The
+        // analyzer-side `is_assignable_to_with_index` adds the
+        // `TypeOf(X) → Type(core::type)` widening so stdlib functions
+        // typed `(t: type)` still accept type-literal arguments.
+        TypeKind::TypeOf(_) => match &b.kind {
+            TypeKind::Any | TypeKind::Unresolved { .. } => {
+                unreachable!("filtered by top-level guards")
+            }
+            TypeKind::TypeOf(_) => false, // identity is the `from == to` early-return above
             TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
             TypeKind::Null
             | TypeKind::Never
@@ -793,6 +857,18 @@ impl InferenceTable {
                     new_t
                 }
             }
+            TypeKind::TypeOf(inner) => {
+                let new_inner = self.substitute(arena, *inner);
+                if new_inner == *inner {
+                    ty
+                } else {
+                    let mut new_t = arena.type_of(new_inner);
+                    if t.nullable {
+                        new_t = arena.nullable(new_t);
+                    }
+                    new_t
+                }
+            }
             _ => ty,
         }
     }
@@ -856,6 +932,13 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // is allowed: the runtime decides at instantiation time.
         TypeKind::GenericParam { .. } => true,
 
+        // P-typeof — type-literal value. The runtime treats `as` as
+        // dropped (per the `runtime drops as casts entirely` rule),
+        // so cast strictness mirrors assignability: identity through
+        // the `from == to` short-circuit at the top of
+        // `is_assignable_to`, plus the assignability fall-back below.
+        TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
+
         // Union source: cast iff ANY alt is castable to target.
         // `as` is a runtime-checked downcast — `(A | B) as A` is
         // accepted because the value MIGHT be `A`; if it turns out to
@@ -892,7 +975,8 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
                 | TypeKind::Enum { .. }
-                | TypeKind::Union { .. } => is_assignable_to_strip_source_nullable(arena, from, to),
+                | TypeKind::Union { .. }
+                | TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
             },
             Primitive::Float => match &to_t.kind {
                 TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
@@ -906,7 +990,8 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
                 | TypeKind::Enum { .. }
-                | TypeKind::Union { .. } => is_assignable_to_strip_source_nullable(arena, from, to),
+                | TypeKind::Union { .. }
+                | TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
             },
             Primitive::Char => match &to_t.kind {
                 TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
@@ -920,7 +1005,8 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
                 | TypeKind::Enum { .. }
-                | TypeKind::Union { .. } => is_assignable_to_strip_source_nullable(arena, from, to),
+                | TypeKind::Union { .. }
+                | TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
             },
             Primitive::Bool
             | Primitive::String
@@ -932,7 +1018,8 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // Everything else (Null source, Never source, Type, Generic,
         // Lambda) defers to the assignability fall-back. Node-tag
         // bivariance / `<node-tag> as int` rules live in
-        // `is_castable_with_index`.
+        // `is_castable_with_index`. `TypeOf` is handled by its own
+        // arm above.
         TypeKind::Null
         | TypeKind::Never
         | TypeKind::Type(_)
@@ -999,7 +1086,8 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
             | TypeKind::GenericParam { .. }
-            | TypeKind::Union { .. } => false,
+            | TypeKind::Union { .. }
+            | TypeKind::TypeOf(_) => false,
         },
         TypeKind::Enum { name: na, .. } => match &to_t.kind {
             TypeKind::Any | TypeKind::Unresolved { .. } => unreachable!("filtered by guards above"),
@@ -1011,7 +1099,8 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::GenericParam { .. }
-            | TypeKind::Union { .. } => false,
+            | TypeKind::Union { .. }
+            | TypeKind::TypeOf(_) => false,
         },
         TypeKind::Primitive(pa) => match &to_t.kind {
             TypeKind::Any | TypeKind::Unresolved { .. } => unreachable!("filtered by guards above"),
@@ -1023,8 +1112,12 @@ fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: T
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
             | TypeKind::GenericParam { .. }
-            | TypeKind::Union { .. } => false,
+            | TypeKind::Union { .. }
+            | TypeKind::TypeOf(_) => false,
         },
+        // P-typeof — source nullability stripped. `TypeOf(X) → TypeOf(Y)`
+        // is identity through `from == to`; nothing else accepts.
+        TypeKind::TypeOf(_) => false,
         TypeKind::Generic { .. }
         | TypeKind::Lambda { .. }
         | TypeKind::GenericParam { .. }

@@ -1970,11 +1970,14 @@ fn qualified_static_method_ref_infers_function() {
     );
 }
 
-/// P15.x — `var w = runtime::Identity;` (module-prefixed type
-/// reference) infers as `type` (the runtime native — type decls
-/// become `type` values when referenced via `module::Type`).
+/// `var w = runtime::Identity;` (module-prefixed type reference)
+/// infers as `typeof Identity` — a refinement of the `type` runtime
+/// native that carries which decl was named. The refinement enables
+/// generic inference for `typeof T` parameters; non-typeof slots that
+/// expect plain `type` still accept it via the assignability rule
+/// `TypeOf(X) → Type(core::type)`.
 #[test]
-fn module_prefixed_type_ref_infers_type() {
+fn module_prefixed_type_ref_infers_typeof() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
     use greycat_analyzer_core::SourceManager;
     let stdlib_uri = Uri::from_str("file:///lib/std/core.gcl").unwrap();
@@ -2005,7 +2008,10 @@ fn module_prefixed_type_ref_infers_type() {
         .copied()
         .expect("def_type for w");
     let display = pa.display_type(ty).to_string();
-    assert_eq!(display, "type", "w should infer as `type`, got `{display}`");
+    assert_eq!(
+        display, "typeof Identity",
+        "w should infer as `typeof Identity`, got `{display}`"
+    );
 }
 
 /// P15.7 — `var y = Identity::create;` (method reference, no call)

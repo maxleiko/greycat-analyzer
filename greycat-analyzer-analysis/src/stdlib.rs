@@ -381,6 +381,14 @@ pub struct TypeMembers {
     /// explicit return type are absent (the analyzer's call-typing
     /// falls through to the existing inference path).
     pub method_returns: FxHashMap<Symbol, TypeId>,
+    /// Pre-lowered full signatures for *generic* methods — keyed by
+    /// method-name symbol, populated only when the method declares
+    /// its own `<T, …>` generic params. Lets call-site inference
+    /// run on static / instance / arrow method calls (e.g.
+    /// `type::enum_by_name<T>(...)`) without crossing the foreign
+    /// HIR boundary at body-walk time. Non-generic methods are
+    /// absent and route through the simpler `method_returns` path.
+    pub method_signatures: FxHashMap<Symbol, FnSignature>,
     // P19.13
     /// Names of attrs declared with the `static`
     /// modifier (`type Foo { static path: String = "..." }`).
@@ -886,6 +894,7 @@ impl ProjectIndex {
                             // after every module is loaded.
                             attr_types: FxHashMap::default(),
                             method_returns: FxHashMap::default(),
+                            method_signatures: FxHashMap::default(),
                             static_attrs: FxHashSet::default(),
                             private_attrs: FxHashSet::default(),
                             static_methods: FxHashSet::default(),
