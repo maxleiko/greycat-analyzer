@@ -35,6 +35,9 @@ enum Command {
     /// Dump per-ident-use byte ranges and decl pointers as JSONL.
     #[clap(name = "dump-resolutions")]
     DumpResolutions(DumpResolutions),
+    /// Print the full HIR view of a project (debug). Use `--json` for
+    /// machine-readable output; default is Rust Debug pretty-print.
+    Hir(HirCmd),
 }
 
 fn main() -> Result<ExitCode, AnyError> {
@@ -58,5 +61,6 @@ fn main() -> Result<ExitCode, AnyError> {
         Command::Cst(cmd) => cmd.run().map(|_| ExitCode::SUCCESS),
         Command::DumpTypes(cmd) => cmd.run(),
         Command::DumpResolutions(cmd) => cmd.run(),
+        Command::Hir(cmd) => cmd.run(),
     }
 }
