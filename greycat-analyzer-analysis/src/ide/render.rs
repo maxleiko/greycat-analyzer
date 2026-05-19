@@ -296,6 +296,7 @@ pub fn render_type_ref_with_subst(
     ctx: Option<&RenderCtx<'_>>,
 ) -> String {
     let tr = &hir.type_refs[type_ref];
+    let typeof_prefix = if tr.typeof_marker { "typeof " } else { "" };
     if let Some(ctx) = ctx
         && tr.qualifier.is_empty()
         && tr.params.is_empty()
@@ -306,14 +307,15 @@ pub fn render_type_ref_with_subst(
             let arena_ty = ctx.project.arena().get(subst_ty);
             if !arena_ty.nullable {
                 return match &arena_ty.kind {
-                    TypeKind::Union { .. } => format!("{rendered} | null"),
-                    _ => format!("{rendered}?"),
+                    TypeKind::Union { .. } => format!("{typeof_prefix}{rendered} | null"),
+                    _ => format!("{typeof_prefix}{rendered}?"),
                 };
             }
         }
-        return rendered;
+        return format!("{typeof_prefix}{rendered}");
     }
     let mut out = String::new();
+    out.push_str(typeof_prefix);
     for q in tr.qualifier.iter() {
         out.push_str(&symbols[hir.idents[*q].symbol]);
         out.push_str("::");

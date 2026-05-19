@@ -2014,6 +2014,28 @@ fn module_prefixed_type_ref_infers_typeof() {
     );
 }
 
+/// Hover on a fn declared with a `typeof T` param renders the
+/// signature with the `typeof` keyword preserved. Regression guard
+/// for the [`crate::ide::render::render_type_ref_with_subst`] path
+/// that previously dropped `tr.typeof_marker` and emitted a bare
+/// `T` instead.
+#[test]
+fn hover_renders_typeof_t_param_keyword() {
+    let src = "fn enum_by_name<T>(et: typeof T, name: String): T? { return null; }\n\
+        fn main() { enum_by_name(int, \"x\"); }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let h = project
+        .hover(pos(1, 14))
+        .expect("hover present on call-site `enum_by_name`");
+    let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        value.contains("typeof T"),
+        "hover should render `typeof T` in the param list, got: {value}"
+    );
+}
+
 /// P15.7 — `var y = Identity::create;` (method reference, no call)
 /// infers as `function` (a runtime native type).
 #[test]
