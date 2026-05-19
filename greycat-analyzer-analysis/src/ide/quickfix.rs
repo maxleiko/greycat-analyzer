@@ -47,7 +47,7 @@ pub fn edit_for_diagnostic(
     }
     match code {
         "missing-token" => missing_token_fix(start, message),
-        "unused-local" => unused_local_fix(root, start),
+        "unused-local" => unused_local_fix(root, text, start, end),
         "unused-decl" => unused_decl_fix(root, start),
         "unused-param" => unused_param_fix(text, start, end),
         "unused-generic-param" => unused_generic_param_fix(root, text, start, end),
@@ -201,14 +201,27 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
 /// the ident. The diagnostic's range covers the ident only (for cursor
 /// placement); we widen the fix range to the enclosing `var_decl` by
 /// walking up the CST.
-fn unused_local_fix(root: Node<'_>, ident_start: usize) -> Vec<TextEdit> {
-    let Some(stmt_range) = enclosing_node_range(root, ident_start, &["var_decl"]) else {
-        return Vec::new();
-    };
-    vec![TextEdit {
-        byte_range: stmt_range,
-        new_text: String::new(),
-    }]
+///
+/// For for-init (`for (var i = …; …)`) and for-in (`for (k, v in …)`)
+/// binders, the ident sits in a structural slot — the whole binding
+/// can't be removed without breaking the loop — so the fix renames to
+/// `_name` instead, matching `unused-param`'s shape.
+fn unused_local_fix(
+    root: Node<'_>,
+    text: &str,
+    ident_start: usize,
+    ident_end: usize,
+) -> Vec<TextEdit> {
+    if let Some(stmt_range) = enclosing_node_range(root, ident_start, &["var_decl"]) {
+        return vec![TextEdit {
+            byte_range: stmt_range,
+            new_text: String::new(),
+        }];
+    }
+    if enclosing_node_range(root, ident_start, &["for_stmt", "for_in_stmt"]).is_some() {
+        return unused_param_fix(text, ident_start, ident_end);
+    }
+    Vec::new()
 }
 
 // P22.2
@@ -903,6 +916,40 @@ mod tests {
 
     fn fix(code: &str, text: &str, range: Range<usize>) -> Vec<TextEdit> {
         fix_with_msg(code, text, range, "")
+    }
+
+    #[test]
+    fn unused_local_renames_for_in_binder() {
+        let src = "fn f(vars: Array<String>) {\n    for (k, v in vars) {}\n}\n";
+        let k_start = src.find("(k").unwrap() + 1;
+        let edits = fix("unused-local", src, k_start..(k_start + 1));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].byte_range, k_start..(k_start + 1));
+        assert_eq!(edits[0].new_text, "_k");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    #[test]
+    fn unused_local_renames_for_init_var() {
+        let src = "fn f() {\n    for (var i = 0; false; 0) {}\n}\n";
+        let i_start = src.find("var i").unwrap() + 4;
+        let edits = fix("unused-local", src, i_start..(i_start + 1));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].byte_range, i_start..(i_start + 1));
+        assert_eq!(edits[0].new_text, "_i");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
     }
 
     #[test]

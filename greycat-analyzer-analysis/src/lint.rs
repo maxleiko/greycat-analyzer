@@ -760,6 +760,34 @@ fn visit_block_for_locals(
     }
 }
 
+fn check_unused_local_ident(
+    hir: &Hir,
+    res: &Resolutions,
+    symbols: &SymbolTable,
+    name_idx: Idx<Ident>,
+    out: &mut Vec<LintDiagnostic>,
+    rule: &'static str,
+) {
+    let ident = &hir.idents[name_idx];
+    let name = &symbols[ident.symbol];
+    if name.starts_with('_') {
+        return;
+    }
+    let used = res.uses.values().any(|d| match d {
+        Definition::Local(n) => *n == name_idx,
+        _ => false,
+    });
+    if !used {
+        out.push(LintDiagnostic {
+            rule,
+            severity: LintSeverity::Warning,
+            message: format!("unused local `{name}`"),
+            byte_range: ident.byte_range.clone(),
+            tag: None,
+        });
+    }
+}
+
 fn visit_for_locals(
     hir: &Hir,
     res: &Resolutions,
@@ -771,26 +799,7 @@ fn visit_for_locals(
     let stmt = &hir.stmts[stmt_id];
     match stmt {
         Stmt::Block(b) => visit_block_for_locals(hir, res, symbols, b, out, rule),
-        Stmt::Var(v) => {
-            let ident = &hir.idents[v.name];
-            let name = &symbols[ident.symbol];
-            if name.starts_with('_') {
-                return;
-            }
-            let used = res.uses.values().any(|d| match d {
-                Definition::Local(name) => *name == v.name,
-                _ => false,
-            });
-            if !used {
-                out.push(LintDiagnostic {
-                    rule,
-                    severity: LintSeverity::Warning,
-                    message: format!("unused local `{name}`"),
-                    byte_range: ident.byte_range.clone(),
-                    tag: None,
-                });
-            }
-        }
+        Stmt::Var(v) => check_unused_local_ident(hir, res, symbols, v.name, out, rule),
         Stmt::If(i) => {
             visit_block_for_locals(hir, res, symbols, &i.then_branch, out, rule);
             if let Some(eb) = i.else_branch {
@@ -799,8 +808,18 @@ fn visit_for_locals(
         }
         Stmt::While(w) => visit_block_for_locals(hir, res, symbols, &w.body, out, rule),
         Stmt::DoWhile(w) => visit_block_for_locals(hir, res, symbols, &w.body, out, rule),
-        Stmt::For(f) => visit_block_for_locals(hir, res, symbols, &f.body, out, rule),
-        Stmt::ForIn(f) => visit_block_for_locals(hir, res, symbols, &f.body, out, rule),
+        Stmt::For(f) => {
+            if let Some(name_idx) = f.init_name {
+                check_unused_local_ident(hir, res, symbols, name_idx, out, rule);
+            }
+            visit_block_for_locals(hir, res, symbols, &f.body, out, rule);
+        }
+        Stmt::ForIn(f) => {
+            for p in &f.params {
+                check_unused_local_ident(hir, res, symbols, p.name, out, rule);
+            }
+            visit_block_for_locals(hir, res, symbols, &f.body, out, rule);
+        }
         Stmt::Try(t) => {
             visit_block_for_locals(hir, res, symbols, &t.try_block, out, rule);
             visit_block_for_locals(hir, res, symbols, &t.catch_block, out, rule);
@@ -2488,6 +2507,94 @@ fn f(): int {
         assert!(
             !diags.iter().any(|d| d.rule == "unused-local"),
             "underscore-prefixed locals should not warn: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unused_for_in_params_warn() {
+        let diags = lint(
+            r#"
+fn f(vars: Array<String>) {
+    for (k, v in vars) {}
+}
+"#,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "unused-local" && d.message.contains("`k`")),
+            "expected unused-local on for-in binder `k`: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "unused-local" && d.message.contains("`v`")),
+            "expected unused-local on for-in binder `v`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn used_for_in_params_silent() {
+        let diags = lint(
+            r#"
+fn f(vars: Array<String>) {
+    for (k, v in vars) {
+        info(k);
+        info(v);
+    }
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-local"),
+            "for-in binders used in body should not warn: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn underscore_for_in_params_skipped() {
+        let diags = lint(
+            r#"
+fn f(vars: Array<String>) {
+    for (_k, _v in vars) {}
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-local"),
+            "underscore-prefixed for-in binders should not warn: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unused_for_init_var_warns() {
+        let diags = lint(
+            r#"
+fn f() {
+    for (var i = 0; false; 0) {}
+}
+"#,
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == "unused-local" && d.message.contains("`i`")),
+            "expected unused-local on for-init `i`: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn used_for_init_var_silent() {
+        let diags = lint(
+            r#"
+fn f(n: int) {
+    for (var i = 0; i < n; i = i + 1) {}
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "unused-local"),
+            "for-init var used in condition / increment should not warn: {diags:?}"
         );
     }
 
