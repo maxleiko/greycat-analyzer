@@ -130,10 +130,8 @@ impl Fmt {
             FmtMode::Write => {
                 for e in &drift {
                     std::fs::write(&e.path, &e.formatted)?;
-                    // TODO: add formatting duration
-                    // println!("{}: {:.02?}", e.path.display(), e.duration());
-                    println!("{}", e.path.display());
                 }
+                println!("{} file(s) formatted", drift.len());
                 Ok(if any_skipped {
                     ExitCode::FAILURE
                 } else {
