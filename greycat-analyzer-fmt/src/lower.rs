@@ -1363,8 +1363,19 @@ fn lower_object_initializers<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if inits.is_empty() {
         return Doc::text("{}");
     }
+    let trailing = has_trailing_comma(node);
     let mut inner = Vec::new();
-    inner.push(Doc::line());
+    // A `Doc::hardline()` anywhere inside the Group makes its flat
+    // fit-check return false, forcing broken mode unconditionally. We
+    // place it where the first `Doc::line()` would have gone — the
+    // first child after `{` — so the layout matches normal broken
+    // rendering. See [`has_trailing_comma`] for the source-driven
+    // opt-in semantics.
+    inner.push(if trailing {
+        Doc::hardline()
+    } else {
+        Doc::line()
+    });
     for (i, e) in inits.iter().enumerate() {
         if i > 0 {
             inner.push(Doc::text(","));
@@ -1381,6 +1392,12 @@ fn lower_object_initializers<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         } else {
             inner.push(lower_node(cx, *e));
         }
+    }
+    if trailing {
+        // Preserve the source's trailing-comma hint so the formatter
+        // is idempotent: re-formatting the broken output still detects
+        // the trailing comma and keeps the layout.
+        inner.push(Doc::text(","));
     }
     // Outer wrapper keeps `Doc::expand` so that ANY enclosing Group
     // (call args, method chain, etc.) treats the entire `node<T> { … }`
@@ -1428,14 +1445,22 @@ fn lower_object_fields<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if fields.is_empty() {
         return Doc::text("{}");
     }
+    let trailing = has_trailing_comma(node);
     let mut inner = Vec::new();
-    inner.push(Doc::line());
+    inner.push(if trailing {
+        Doc::hardline()
+    } else {
+        Doc::line()
+    });
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             inner.push(Doc::text(","));
             inner.push(Doc::line());
         }
         inner.push(lower_node(cx, *f));
+    }
+    if trailing {
+        inner.push(Doc::text(","));
     }
     Doc::expand(Doc::group(Doc::concat(vec![
         Doc::text("{"),
@@ -1458,8 +1483,13 @@ fn lower_object_fields_no_expand<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if fields.is_empty() {
         return Doc::text("{}");
     }
+    let trailing = has_trailing_comma(node);
     let mut inner = Vec::new();
-    inner.push(Doc::line());
+    inner.push(if trailing {
+        Doc::hardline()
+    } else {
+        Doc::line()
+    });
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             inner.push(Doc::text(","));
@@ -1467,12 +1497,37 @@ fn lower_object_fields_no_expand<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         }
         inner.push(lower_node(cx, *f));
     }
+    if trailing {
+        inner.push(Doc::text(","));
+    }
     Doc::group(Doc::concat(vec![
         Doc::text("{"),
         Doc::indent_if_broken(Doc::concat(inner)),
         Doc::line(),
         Doc::text("}"),
     ]))
+}
+
+/// Detect a source-level trailing comma between the last item and the
+/// closing brace. Walks the node's anonymous children (separators) and
+/// returns `true` iff the *last* non-comment child is preceded by a `,`
+/// before the `}`. Block / line comments between the last item and the
+/// closing brace are ignored — they don't change the trailing-comma
+/// status. Used by [`lower_object_fields`], [`lower_object_fields_no_expand`]
+/// and [`lower_object_initializers`] to support a "trailing comma forces
+/// multi-line" opt-in mirroring rustfmt / Black.
+fn has_trailing_comma(node: Node<'_>) -> bool {
+    let mut walker = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut walker).collect();
+    let Some(last_item_idx) = children
+        .iter()
+        .rposition(|c| c.is_named() && !matches!(c.kind(), "block_comment" | "line_comment"))
+    else {
+        return false;
+    };
+    children[last_item_idx + 1..]
+        .iter()
+        .any(|c| !c.is_named() && c.kind() == ",")
 }
 
 fn lower_object_field<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {

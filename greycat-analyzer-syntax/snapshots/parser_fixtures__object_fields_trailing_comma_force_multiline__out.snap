@@ -1,0 +1,43 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn f() {\n    var x = Foo {\n        a: 1,\n        b: 2,\n        c: 3,\n    };\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 'x')
+        (initializer
+          expr: (object_expr
+            type: (type_ident
+              name: (ident 'Foo')
+            )
+            (object_fields
+              (object_field
+                name: (ident 'a')
+                value: (number
+                  (number_int '1')
+                )
+              )
+              (object_field
+                name: (ident 'b')
+                value: (number
+                  (number_int '2')
+                )
+              )
+              (object_field
+                name: (ident 'c')
+                value: (number
+                  (number_int '3')
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

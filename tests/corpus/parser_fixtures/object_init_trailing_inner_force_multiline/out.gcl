@@ -1,0 +1,8 @@
+fn f(profile: P) {
+    var flags = node<IdentityFlags> {
+        IdentityFlags {
+            identity_id: profile->id,
+            email_verified: false,
+        }
+    };
+}
