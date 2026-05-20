@@ -222,6 +222,56 @@ fn rt_tuple_element_mismatch_rejected() {
     assert!(!is_assignable_to(&a, t1, t2));
 }
 
+// Asymmetric wildcard direction. The runtime accepts
+// `Tuple<int, T>` flowing into `Tuple<any?, any?>` (target raw form
+// is the universal sink), but REJECTS the reverse — passing
+// `Tuple<any?, any?>{}` to a parameter typed `Tuple<int, T>` raises
+// `argument of type 'Tuple' is not assignable to parameter of type
+// 'Tuple<int, ...>'`. Probed live with:
+//
+//   abstract type AbstractType {}
+//   fn main() { stats(Tuple<any?, any?> {}); }
+//   fn stats(result: Tuple<int, AbstractType>) {}
+//
+// `greycat run` rejects the call. The bidirectional invariance check
+// historically here let P20.1's `Any` source guard masquerade as
+// structural equality on each arg, falsely accepting the wrong
+// direction.
+#[test]
+fn rt_tuple_concrete_to_all_any_target_allowed() {
+    let mut a = arena();
+    let i = a.primitive(Primitive::Int);
+    let foo = a.alloc_type(synth_decl("Foo"));
+    let any_q = a.any_nullable();
+    let concrete = a.tuple(synth_decl("Tuple"), i, foo);
+    let raw = a.tuple(synth_decl("Tuple"), any_q, any_q);
+    assert!(is_assignable_to(&a, concrete, raw));
+}
+
+#[test]
+fn rt_tuple_all_any_source_to_concrete_rejected() {
+    let mut a = arena();
+    let i = a.primitive(Primitive::Int);
+    let foo = a.alloc_type(synth_decl("Foo"));
+    let any_q = a.any_nullable();
+    let concrete = a.tuple(synth_decl("Tuple"), i, foo);
+    let raw = a.tuple(synth_decl("Tuple"), any_q, any_q);
+    assert!(!is_assignable_to(&a, raw, concrete));
+}
+
+#[test]
+fn rt_array_all_any_source_to_concrete_rejected() {
+    // Same rule on a single-arg generic — `Array<any?>` does not
+    // flow into `Array<int>`. Runtime mirror of the Tuple probe.
+    let mut a = arena();
+    let i = a.primitive(Primitive::Int);
+    let any_q = a.any_nullable();
+    let arr_concrete = a.generic(synth_decl("Array"), vec![i]);
+    let arr_raw = a.generic(synth_decl("Array"), vec![any_q]);
+    assert!(is_assignable_to(&a, arr_concrete, arr_raw));
+    assert!(!is_assignable_to(&a, arr_raw, arr_concrete));
+}
+
 // =============================================================================
 // Cast rules (P12.3) — asymmetric promotions
 // =============================================================================

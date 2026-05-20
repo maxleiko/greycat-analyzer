@@ -639,12 +639,23 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         },
 
         // P12.2 / P19.10 / P19.14 — generic args are invariant
-        // (matches the runtime, not the TS checker), checked by
-        // bidirectional `is_assignable_to` so cross-arena lowering
-        // variations still match. An "all-any wildcard" target
-        // (`Foo<any, any>`) accepts any same-decl instantiation —
-        // mirrors the runtime's raw-form acceptance. Node-tag
-        // bivariance lives in `is_assignable_to_with_index`.
+        // (matches the runtime, not the TS checker). The "all-any
+        // wildcard" rule is *target-only* and asymmetric: `Foo<any?,
+        // any?>` as a TARGET accepts any same-decl instantiation
+        // (raw-form acceptance), but as a SOURCE does NOT flow into a
+        // concrete `Foo<int, T>` — the runtime rejects with
+        // `argument of type 'Foo' is not assignable to parameter of
+        // type 'Foo<int, T>'`. Node-tag bivariance lives in
+        // `is_assignable_to_with_index`.
+        //
+        // Invariance compares args by TypeId — arena interning
+        // collapses structural equality to identity, so two
+        // structurally-equal generic args mint the same `TypeId`.
+        // A bidirectional `is_assignable_to(x, y) && is_assignable_to(y, x)`
+        // fallback would leak P20.1's any-as-bottom rule into the arg
+        // position: `is_assignable_to(any?, int)` returns true via the
+        // top-level `Any` source guard, so `Tuple<any?, any?>` would
+        // falsely flow into `Tuple<int, AbstractType>`.
         TypeKind::Generic { decl: da, args: aa } => match &b.kind {
             TypeKind::Any | TypeKind::Unresolved { .. } => {
                 unreachable!("filtered by top-level guards")
@@ -659,14 +670,7 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                 {
                     return true;
                 }
-                da == db
-                    && aa.len() == ab.len()
-                    && aa.iter().zip(ab).all(|(x, y)| {
-                        if *x == *y {
-                            return true;
-                        }
-                        is_assignable_to(arena, *x, *y) && is_assignable_to(arena, *y, *x)
-                    })
+                da == db && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| *x == *y)
             }
             TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
             TypeKind::Null
