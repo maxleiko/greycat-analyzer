@@ -474,7 +474,7 @@ fn build_module_view<'a>(
                         AttrView {
                             name: aname,
                             id: aix.into_raw(),
-                            modifiers: build_modifiers(&a.modifiers),
+                            modifiers: build_modifiers(symbols, &a.modifiers),
                             ty: fqn,
                             has_init: a.init.is_some(),
                             doc: a.doc.as_deref(),
@@ -494,7 +494,7 @@ fn build_module_view<'a>(
                     name,
                     id: decl_raw,
                     type_id: item.and_then(|i| find_type_id_for_item(arena, i)),
-                    modifiers: build_modifiers(&td.modifiers),
+                    modifiers: build_modifiers(symbols, &td.modifiers),
                     generics,
                     extends_chain,
                     attrs,
@@ -521,7 +521,7 @@ fn build_module_view<'a>(
                 enums.push(EnumView {
                     name,
                     id: decl_raw,
-                    modifiers: build_modifiers(&ed.modifiers),
+                    modifiers: build_modifiers(symbols, &ed.modifiers),
                     fields,
                     doc: ed.doc.as_deref(),
                 });
@@ -539,7 +539,7 @@ fn build_module_view<'a>(
                 vars.push(VarView {
                     name,
                     id: decl_raw,
-                    modifiers: build_modifiers(&vd.modifiers),
+                    modifiers: build_modifiers(symbols, &vd.modifiers),
                     ty,
                     initializer: init_slice,
                 });
@@ -718,7 +718,7 @@ fn build_fn_view<'a>(
     FnView {
         name,
         id: fn_decl_raw,
-        modifiers: build_modifiers(&fnd.modifiers),
+        modifiers: build_modifiers(symbols, &fnd.modifiers),
         generics,
         params,
         return_ty,
@@ -746,7 +746,10 @@ fn placeholder_fn<'a>(decl_idx: Idx<Decl>) -> FnView<'a> {
     }
 }
 
-fn build_modifiers(m: &greycat_analyzer_hir::types::Modifiers) -> ModifiersView<'_> {
+fn build_modifiers<'a>(
+    symbols: &'a SymbolTable,
+    m: &'a greycat_analyzer_hir::types::Modifiers,
+) -> ModifiersView<'a> {
     ModifiersView {
         private: m.private,
         static_: m.static_,
@@ -756,10 +759,30 @@ fn build_modifiers(m: &greycat_analyzer_hir::types::Modifiers) -> ModifiersView<
             .annotations
             .iter()
             .map(|a| AnnotationView {
-                name: a.name.as_str(),
-                args: a.args.iter().map(|s| s.as_str()).collect(),
+                name: &symbols[a.name],
+                args: a.args.iter().map(|arg| render_arg(symbols, arg)).collect(),
             })
             .collect(),
+    }
+}
+
+fn render_arg(symbols: &SymbolTable, arg: &greycat_analyzer_hir::types::AnnotationArg) -> String {
+    use greycat_analyzer_hir::types::AnnotationArg as A;
+    match arg {
+        A::Int(v) => v.to_string(),
+        A::Float(v) => v.to_string(),
+        A::Bool(b) => b.to_string(),
+        A::Char(c) => format!("'{c}'"),
+        A::String(s) => format!("\"{}\"", &symbols[*s]),
+        A::Duration(v) => format!("{v}us"),
+        A::Time(v) | A::Iso8601(v) => format!("{v}time"),
+        A::Null => "null".to_string(),
+        A::Path { chain, .. } => chain
+            .iter()
+            .map(|s| symbols[*s].to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+        A::Invalid { .. } => "<invalid>".to_string(),
     }
 }
 

@@ -154,7 +154,13 @@ pub struct ModifiersView<'a> {
 #[derive(Debug, Serialize)]
 pub struct AnnotationView<'a> {
     pub name: &'a str,
-    pub args: Vec<&'a str>,
+    /// Pre-rendered argument values, one entry per source arg. The
+    /// HIR carries typed values (`AnnotationArg::Int(42)`,
+    /// `AnnotationArg::String(sym)`, `AnnotationArg::Path { chain
+    /// }`, …); the dump renders each variant in a stable
+    /// human-readable form (`"foo"`, `42`, `null`,
+    /// `DurationUnit::milliseconds`, …).
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

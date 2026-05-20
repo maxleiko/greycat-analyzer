@@ -43,6 +43,7 @@
 //!    CLI both consume them.
 
 pub mod analyzer;
+pub mod annotation_validate;
 pub mod conv;
 pub mod directives;
 pub mod display;

@@ -348,6 +348,14 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
     ),
 ];
 
+// Note: `invalid-pragma-arg` is NOT a lint — it's a hard
+// structural error surfaced through `module.analysis.diagnostics`
+// (severity `Error`) by the per-module annotation validator. Lints
+// can be silenced via `// gcl-lint-off …` / `@lint_off(...)`;
+// pragmas with non-literal args must not be silenceable because the
+// .gcp packager refuses to emit anything for a decl whose pragma
+// list is unparseable.
+
 /// Run every registered HIR-only rule in order and return the merged
 /// findings. Suppressions are honored when `directives` is `Some(_)`.
 pub fn run_lints(hir: &Hir, res: &Resolutions, symbols: &SymbolTable) -> Vec<LintDiagnostic> {
@@ -1219,7 +1227,7 @@ fn check_unused_decl(
         if !modifiers.private {
             continue;
         }
-        if is_exposed(modifiers) {
+        if is_exposed(symbols, modifiers) {
             continue;
         }
         let ident = &hir.idents[name_idx];
@@ -1292,11 +1300,14 @@ impl LintRule for DuplicateDecl {
     }
 }
 
-fn is_exposed(modifiers: &greycat_analyzer_hir::types::Modifiers) -> bool {
+fn is_exposed(
+    symbols: &greycat_analyzer_core::SymbolTable,
+    modifiers: &greycat_analyzer_hir::types::Modifiers,
+) -> bool {
     modifiers
         .annotations
         .iter()
-        .any(|a| matches!(a.name.as_str(), "expose"))
+        .any(|a| &symbols[a.name] == "expose")
 }
 
 // =============================================================================

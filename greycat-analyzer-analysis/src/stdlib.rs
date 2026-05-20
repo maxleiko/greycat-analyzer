@@ -481,15 +481,18 @@ pub struct TypeFlags {
 /// A single `@expose`-annotated decl, recorded for the
 /// runtime-API surface. `local_name` is the source-level name in the
 /// declaring module; `rename` is what `@expose("renamed")` gave it
-/// (or `None` when `@expose` was used bare).
+/// (or `None` when `@expose` was used bare). Both are interned
+/// through the project's [`SymbolTable`] — names are dedup'd, and
+/// repeated `@expose("api_v1")` annotations across decls share one
+/// `Symbol`.
 #[derive(Debug, Clone)]
 pub struct ExposureSite {
     pub uri: Uri,
     pub decl: Idx<Decl>,
     // P25.6
-    pub local_name: SmolStr,
+    pub local_name: Symbol,
     // P25.6
-    pub rename: Option<SmolStr>,
+    pub rename: Option<Symbol>,
 }
 
 impl ProjectIndex {
@@ -828,7 +831,7 @@ impl ProjectIndex {
                     }
                     // P13.5: capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
-                    let flags = derive_type_flags(&td.modifiers.annotations);
+                    let flags = derive_type_flags(&self.symbols, &td.modifiers.annotations);
                     if flags.iterable || flags.deref.is_some() || flags.primitive {
                         self.type_flags.entry(item).or_insert(flags);
                     }
@@ -1052,17 +1055,18 @@ impl ProjectIndex {
                 if modifiers.private {
                     self.private_locations.insert((uri.clone(), *decl_id));
                 }
-                let local_name: SmolStr = hir.decls[*decl_id]
+                let local_name = hir.decls[*decl_id]
                     .name()
-                    .map(|n| SmolStr::from(&self.symbols[hir.idents[n].symbol]))
-                    .unwrap_or_default();
+                    .map(|n| hir.idents[n].symbol)
+                    .unwrap_or_else(|| self.symbols.intern(""));
                 for ann in &modifiers.annotations {
-                    if ann.name != "expose" {
+                    if &self.symbols[ann.name] != "expose" {
                         continue;
                     }
-                    let rename = ann.args.first().cloned();
-                    let key_str = rename.as_deref().unwrap_or(local_name.as_str());
-                    let key_sym = self.symbols.intern(key_str);
+                    let rename = ann.first_string_arg();
+                    // Map key: public name. `@expose("renamed")` →
+                    // `renamed`; bare `@expose` → the local name.
+                    let key_sym = rename.unwrap_or(local_name);
                     let entries = self.exposed.entry(key_sym).or_default();
                     let already = entries
                         .iter()
@@ -1071,7 +1075,7 @@ impl ProjectIndex {
                         entries.push(ExposureSite {
                             uri: uri.clone(),
                             decl: *decl_id,
-                            local_name: local_name.clone(),
+                            local_name,
                             rename,
                         });
                     }
@@ -1185,13 +1189,18 @@ pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
 // P13.5
 /// Read `@iterable` / `@deref` / `@primitive` annotations on a
 /// type decl into a [`TypeFlags`] record.
-fn derive_type_flags(annotations: &[Annotation]) -> TypeFlags {
+fn derive_type_flags(symbols: &SymbolTable, annotations: &[Annotation]) -> TypeFlags {
     let mut flags = TypeFlags::default();
     for ann in annotations {
-        match ann.name.as_str() {
+        match &symbols[ann.name] {
             "iterable" => flags.iterable = true,
             "primitive" => flags.primitive = true,
-            "deref" => flags.deref = ann.args.first().cloned().or(Some(SmolStr::default())),
+            "deref" => {
+                flags.deref = ann
+                    .first_string_arg()
+                    .map(|s| SmolStr::from(&symbols[s]))
+                    .or(Some(SmolStr::default()))
+            }
             _ => {}
         }
     }
@@ -1621,8 +1630,11 @@ fn ignored() {}
         let alpha_sym = idx.symbol("public_alpha").expect("public_alpha interned");
         let alpha_hits = idx.exposed.get(&alpha_sym).expect("public_alpha");
         assert_eq!(alpha_hits.len(), 1);
-        assert_eq!(alpha_hits[0].rename.as_deref(), Some("public_alpha"));
-        assert_eq!(alpha_hits[0].local_name, "alpha");
+        assert_eq!(
+            alpha_hits[0].rename.map(|s| &idx.symbols[s]),
+            Some("public_alpha")
+        );
+        assert_eq!(&idx.symbols[alpha_hits[0].local_name], "alpha");
 
         let beta_sym = idx.symbol("beta").expect("beta interned");
         let beta_hits = idx.exposed.get(&beta_sym).expect("beta");

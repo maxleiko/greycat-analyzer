@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use greycat_analyzer_core::SymbolTable;
+use greycat_analyzer_core::{Symbol, SymbolTable};
 use greycat_analyzer_syntax::tree_sitter;
 
 use crate::Hir;
@@ -201,11 +201,13 @@ fn lower_modifiers(cx: &LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Modifi
     m
 }
 
-/// Collect annotations (`@expose("renamed")`, `@permission`, …) from
-/// the `annotations` named child of a decl-level node. returns
-/// `Annotation { name, args }` where `args` carries every
-/// string-literal argument the source provided (other arg shapes are
-/// dropped — call-site consumers we have today only read string args).
+/// Collect annotations (`@expose("renamed")`, `@tag("mcp")`,
+/// `@max_count(100)`, `@timeout(5s)`, …) from the `annotations`
+/// named child of a decl-level node. Returns one [`Annotation`] per
+/// `annotation` CST child, with `name` interned through the project
+/// symbol table and `args` carrying every primitive-literal arg in
+/// source order. Non-literal args (idents, exprs) are dropped —
+/// pragmas accept only literal payloads in GreyCat practice.
 // P25.7
 fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[Annotation]> {
     let mut cursor = decl_node.walk();
@@ -225,17 +227,13 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[An
         let Some(ident) = ann.named_children(&mut c3).find(|n| n.kind() == "ident") else {
             continue;
         };
-        let name: smol_str::SmolStr = cx.text(ident).into();
-        let mut args: Vec<smol_str::SmolStr> = Vec::new();
+        let name = cx.symbols.intern(cx.text(ident));
+        let mut args: Vec<AnnotationArg> = Vec::new();
         let mut c4 = ann.walk();
         if let Some(args_node) = ann.named_children(&mut c4).find(|n| n.kind() == "args") {
             let mut c5 = args_node.walk();
             for a in args_node.named_children(&mut c5) {
-                if a.kind() == "string"
-                    && let Some(value) = string_literal_value(cx, a)
-                {
-                    args.push(value.into());
-                }
+                args.push(lower_annotation_arg(cx, a));
             }
         }
         out.push(Annotation {
@@ -244,6 +242,130 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[An
         });
     }
     out.into_boxed_slice()
+}
+
+/// Lower a single annotation arg node into an [`AnnotationArg`].
+///
+/// String args are interned through `cx.symbols` so identical
+/// values share a `Symbol` — `@tag("mcp")` repeated across fifty
+/// fns is one symbol entry, not fifty.
+///
+/// Non-literal arg nodes (idents, calls, member access, anything
+/// not in the primitive literal set) become
+/// [`AnnotationArg::Invalid`] carrying the source byte-range so
+/// the analyzer's `invalid-pragma-arg` lint can point at the
+/// offending span. Pragmas accept only literals; non-literal args
+/// are a hard error.
+fn lower_annotation_arg(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> AnnotationArg {
+    match node.kind() {
+        "string" => match string_literal_value(cx, node) {
+            Some(value) => AnnotationArg::String(cx.symbols.intern(&value)),
+            None => invalid_arg(node),
+        },
+        "true" => AnnotationArg::Bool(true),
+        "false" => AnnotationArg::Bool(false),
+        "null" => AnnotationArg::Null,
+        "number" => {
+            let raw = cx.text(node);
+            let (kind, _issue) = classify_and_parse_number(cx, node, raw, false);
+            lit_to_annotation_arg(kind)
+        }
+        "char" => {
+            // The grammar nests `iso8601` inside `'...'` quotes.
+            let iso_child = node
+                .named_children(&mut node.walk())
+                .find(|c| c.kind() == "iso8601");
+            let (kind, _issue) = match iso_child {
+                Some(iso) => parse_iso8601(cx.text(iso)),
+                None => parse_char(cx.text(node)),
+            };
+            lit_to_annotation_arg(kind)
+        }
+        // Path-shaped args — type pointers / enum-variant
+        // references / bare names. The validator resolves them
+        // against the project's name tables and rejects ones that
+        // don't point at a type / enum / variant.
+        "ident" | "type_ident" => {
+            let r = node.byte_range();
+            let chain = vec![cx.symbols.intern(cx.text(node))].into_boxed_slice();
+            AnnotationArg::Path {
+                chain,
+                start: r.start as u32,
+                end: r.end as u32,
+            }
+        }
+        "static_expr" => match collect_path_chain(cx, node) {
+            Some(chain) => {
+                let r = node.byte_range();
+                AnnotationArg::Path {
+                    chain,
+                    start: r.start as u32,
+                    end: r.end as u32,
+                }
+            }
+            None => invalid_arg(node),
+        },
+        _ => invalid_arg(node),
+    }
+}
+
+/// Walk a `static_expr` CST node left-to-right and collect its
+/// path segments as interned [`Symbol`]s. `static_expr` is
+/// left-recursive in the grammar (`(static_expr | type_ident) ::
+/// property`), so we recurse into the head and append the property
+/// last. Returns `None` if any segment isn't a name-shaped node
+/// (the validator catches the rest).
+fn collect_path_chain(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Option<Box<[Symbol]>> {
+    let mut chain: Vec<Symbol> = Vec::new();
+    fn walk(cx: &LowerCtx, node: tree_sitter::Node<'_>, out: &mut Vec<Symbol>) -> Option<()> {
+        let kind = node.kind();
+        if kind == "ident" || kind == "type_ident" {
+            out.push(cx.symbols.intern(cx.text(node)));
+            return Some(());
+        }
+        if kind == "static_expr" {
+            // First named child is the head (static_expr or
+            // type_ident), then optionally a `property` field.
+            let mut cursor = node.walk();
+            let head = node.named_children(&mut cursor).next()?;
+            walk(cx, head, out)?;
+            if let Some(prop) = node.child_by_field_name("property")
+                && (prop.kind() == "ident" || prop.kind() == "string")
+            {
+                let text = if prop.kind() == "string" {
+                    // `Foo::"variant"` — strip quotes.
+                    string_literal_value(cx, prop)?
+                } else {
+                    cx.text(prop).to_string()
+                };
+                out.push(cx.symbols.intern(&text));
+            }
+            return Some(());
+        }
+        None
+    }
+    walk(cx, node, &mut chain)?;
+    Some(chain.into_boxed_slice())
+}
+
+fn invalid_arg(node: tree_sitter::Node<'_>) -> AnnotationArg {
+    let r = node.byte_range();
+    AnnotationArg::Invalid {
+        start: r.start as u32,
+        end: r.end as u32,
+    }
+}
+
+fn lit_to_annotation_arg(kind: LiteralKind) -> AnnotationArg {
+    match kind {
+        LiteralKind::Int(v) => AnnotationArg::Int(v),
+        LiteralKind::Float(v) => AnnotationArg::Float(v),
+        LiteralKind::Char(c) => AnnotationArg::Char(c),
+        LiteralKind::Bool(b) => AnnotationArg::Bool(b),
+        LiteralKind::Duration(v) => AnnotationArg::Duration(v),
+        LiteralKind::Time(v) => AnnotationArg::Time(v),
+        LiteralKind::Iso8601(v) => AnnotationArg::Iso8601(v),
+    }
 }
 
 fn string_literal_value(cx: &LowerCtx, string_node: tree_sitter::Node<'_>) -> Option<String> {

@@ -2216,7 +2216,7 @@ impl ProjectAnalysis {
                 ..ModuleTimings::default()
             };
             let t1 = Instant::now();
-            let analysis = analyze_with_index_into(
+            let mut analysis = analyze_with_index_into(
                 &p.hir,
                 &p.resolutions,
                 &self.index,
@@ -2224,6 +2224,15 @@ impl ProjectAnalysis {
                 &self.decl_registry,
                 &p.uri,
                 &mut self.arena,
+            );
+            // Hard error pass: every `AnnotationArg::Invalid` left
+            // by HIR lowering becomes a `Severity::Error`
+            // structural diagnostic the package gate refuses on.
+            // See `crate::annotation_validate` for the rationale.
+            crate::annotation_validate::validate_annotation_args(
+                &p.hir,
+                &self.index,
+                &mut analysis.diagnostics,
             );
             timings.analyze = t1.elapsed();
             self.modules.insert(

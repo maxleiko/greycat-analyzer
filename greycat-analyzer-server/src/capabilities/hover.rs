@@ -587,7 +587,7 @@ fn render_decl_hover_markdown(
     // intentionally don't emit them (completion `detail` strings
     // get flattened to a single line and would be buried).
     let mut signature = String::new();
-    push_annotations(&mut signature, decl_modifier_annotations(decl));
+    push_annotations(&mut signature, symbols, decl_modifier_annotations(decl));
     let body = match decl {
         Decl::Type(td) => render_type_decl_with_body(hir, symbols, td),
         _ => render_decl_signature(hir, symbols, decl, ctx),

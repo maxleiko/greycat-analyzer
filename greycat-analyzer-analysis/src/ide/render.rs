@@ -36,19 +36,69 @@ pub struct RenderCtx<'a> {
 /// source form; the signature renderers themselves stay annotation-
 /// free so completion `detail` strings (which clients flatten to a
 /// single line) don't get buried under pragma noise.
-pub fn push_annotations(out: &mut String, annotations: &[Annotation]) {
+pub fn push_annotations(
+    out: &mut String,
+    symbols: &greycat_analyzer_core::SymbolTable,
+    annotations: &[Annotation],
+) {
+    use std::fmt::Write;
     for ann in annotations {
         out.push('@');
-        out.push_str(&ann.name);
+        out.push_str(&symbols[ann.name]);
         if !ann.args.is_empty() {
             out.push('(');
             for (i, arg) in ann.args.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                out.push('"');
-                out.push_str(arg);
-                out.push('"');
+                match arg {
+                    greycat_analyzer_hir::types::AnnotationArg::String(s) => {
+                        out.push('"');
+                        out.push_str(&symbols[*s]);
+                        out.push('"');
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Int(v) => {
+                        let _ = write!(out, "{v}");
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Float(v) => {
+                        let _ = write!(out, "{v}");
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Bool(b) => {
+                        out.push_str(if *b { "true" } else { "false" });
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Char(c) => {
+                        let _ = write!(out, "'{c}'");
+                    }
+                    // Render typed-suffix literals back in their
+                    // canonical microsecond form — hover is read-
+                    // only, so this is fine even if the source
+                    // wrote `5s` rather than `5_000_000us`.
+                    greycat_analyzer_hir::types::AnnotationArg::Duration(v) => {
+                        let _ = write!(out, "{v}us");
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Time(v)
+                    | greycat_analyzer_hir::types::AnnotationArg::Iso8601(v) => {
+                        let _ = write!(out, "{v}time");
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Null => {
+                        out.push_str("null");
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Path { chain, .. } => {
+                        for (j, seg) in chain.iter().enumerate() {
+                            if j > 0 {
+                                out.push_str("::");
+                            }
+                            out.push_str(&symbols[*seg]);
+                        }
+                    }
+                    greycat_analyzer_hir::types::AnnotationArg::Invalid { .. } => {
+                        // Hard errors are surfaced separately as
+                        // `invalid-pragma-arg`; in hover output we
+                        // render a placeholder so the rest of the
+                        // annotation stays legible.
+                        out.push_str("<invalid>");
+                    }
+                }
             }
             out.push(')');
         }

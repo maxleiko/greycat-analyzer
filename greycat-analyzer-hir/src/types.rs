@@ -6,7 +6,6 @@
 use std::ops::Range;
 
 use greycat_analyzer_core::Symbol;
-use smol_str::SmolStr;
 
 use crate::arena::Idx;
 
@@ -28,7 +27,7 @@ pub struct Ident {
     pub byte_range: Span,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Modifiers {
     pub private: bool,
     pub static_: bool,
@@ -36,19 +35,132 @@ pub struct Modifiers {
     pub native: bool,
     // P13.4
     /// Annotations declared on this decl, drawn from grammar
-    /// `annotations`. Each entry carries the annotation name
-    /// plus any string-literal arguments (e.g.
-    /// `@expose("renamed")` → `Annotation { name: "expose",
-    /// args: ["renamed"] }`). Non-string arguments are dropped —
-    /// the consumers we have today (`@expose` rename capture, the
-    /// `unused-decl` exposure check) only need string args.
+    /// `annotations`. Each entry carries the annotation name plus
+    /// any primitive-literal arguments — `@expose("renamed")`,
+    /// `@tag("mcp")`, `@max_count(100)`, `@enabled(true)`,
+    /// `@timeout(5s)`, etc. See [`AnnotationArg`] for the per-arg
+    /// shape.
     pub annotations: Box<[Annotation]>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Decl annotation — `@<name>(<args>...)`.
+///
+/// Both the annotation name and any string-literal args are
+/// interned through the project's [`SymbolTable`](crate::Symbol)
+/// (no `SmolStr`/`String`). Annotation strings are literal — there
+/// is no interpolation, no `${...}` — and they repeat heavily
+/// across decls (`@expose`, `@tag("mcp")`, `@permission("admin")`
+/// on dozens of fns), so interning them is a straight win.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Annotation {
-    pub name: SmolStr,
-    pub args: Box<[SmolStr]>,
+    /// Annotation name as an interned symbol (e.g. `expose`,
+    /// `tag`, `permission`).
+    pub name: Symbol,
+    pub args: Box<[AnnotationArg]>,
+}
+
+impl Annotation {
+    /// Iterator over the string-typed arguments only, in source
+    /// order. Convenience for callers (`@expose`, `@deref`,
+    /// `@iterable`) that only care about string args.
+    pub fn arg_strings(&self) -> impl Iterator<Item = Symbol> + '_ {
+        self.args.iter().filter_map(|a| match a {
+            AnnotationArg::String(s) => Some(*s),
+            _ => None,
+        })
+    }
+
+    /// First string-typed arg, if any.
+    pub fn first_string_arg(&self) -> Option<Symbol> {
+        self.arg_strings().next()
+    }
+}
+
+/// Compile-time-constant argument of an [`Annotation`]. GreyCat
+/// pragmas accept only values the analyzer can resolve without
+/// running code: primitive literals, `null`, and path-shaped
+/// references to types or enum variants (`Foo`, `mod::Foo`,
+/// `DurationUnit::milliseconds`).
+///
+/// Anything else — a call, arithmetic, an array literal, an
+/// instance member-access, etc. — is captured as
+/// [`AnnotationArg::Invalid`] so the analyzer can surface it as a
+/// hard `invalid-pragma-arg` error pointing at the offending span.
+/// Non-resolving paths get the same treatment at validation time.
+///
+/// `Float` is bit-equal for `Hash` so identical NaN payloads dedup
+/// (matches the literal interning we already do for `LiteralExpr`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnnotationArg {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Char(char),
+    /// String args are interned through the project's
+    /// `SymbolTable` — `@tag("mcp")` repeated 50 times shares one
+    /// `Symbol`.
+    String(Symbol),
+    /// Microseconds (GreyCat's canonical `duration` unit).
+    Duration(i64),
+    /// Microseconds since the Unix epoch.
+    Time(i64),
+    /// Microseconds since the Unix epoch — variant preserved so
+    /// the consumer can distinguish
+    /// `@since("2024-01-01T00:00:00Z")` from a raw numeric `time`.
+    Iso8601(i64),
+    /// The `null` literal.
+    Null,
+    /// Path expression — `Foo`, `mod::Foo`, `Foo::bar`,
+    /// `mod::Foo::bar`. The `chain` segments are the parsed
+    /// identifiers in source order; the analyzer's validator
+    /// resolves the path to either a type decl or an enum variant
+    /// at validation time. Unresolved paths surface as a hard
+    /// `invalid-pragma-arg` error pointing at `start..end`.
+    Path {
+        chain: Box<[Symbol]>,
+        start: u32,
+        end: u32,
+    },
+    /// Structurally-non-constant argument — a call, arithmetic, an
+    /// array / object literal, an instance member-access, etc.
+    /// Hard error at validation time pointing at `start..end`.
+    Invalid {
+        start: u32,
+        end: u32,
+    },
+}
+
+impl Eq for AnnotationArg {}
+
+impl std::hash::Hash for AnnotationArg {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        // Discriminant + payload bits. Float hashes via bit pattern
+        // so two `Float(f)` with the same bits dedup; NaN payloads
+        // compare unequal under `PartialEq` but the hasher still
+        // distributes them consistently — fine for dedup tables.
+        std::mem::discriminant(self).hash(h);
+        match self {
+            AnnotationArg::Int(v)
+            | AnnotationArg::Duration(v)
+            | AnnotationArg::Time(v)
+            | AnnotationArg::Iso8601(v) => v.hash(h),
+            AnnotationArg::Float(f) => f.to_bits().hash(h),
+            AnnotationArg::Bool(b) => b.hash(h),
+            AnnotationArg::Char(c) => c.hash(h),
+            AnnotationArg::String(s) => s.hash(h),
+            AnnotationArg::Null => {}
+            AnnotationArg::Path { chain, .. } => {
+                // start/end deliberately excluded from the hash —
+                // two paths with the same chain but different source
+                // spans dedup to the same value.
+                chain.hash(h);
+            }
+            AnnotationArg::Invalid { start, end } => {
+                start.hash(h);
+                end.hash(h);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
