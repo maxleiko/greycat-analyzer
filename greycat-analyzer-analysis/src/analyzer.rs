@@ -5199,13 +5199,32 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Array(items, _) => {
-                for i in items.iter() {
-                    let _ = self.visit_expr(*i);
-                }
-                let any = self.any_nullable();
+                // Visit every element unconditionally so each gets its
+                // `expr_types` entry (and any nested diagnostics still
+                // fire), regardless of whether the array as a whole
+                // qualifies for element-type inference.
+                let elem_types: Vec<TypeId> = items.iter().map(|i| self.visit_expr(*i)).collect();
+
+                // Mimic the GreyCat runtime's "constant-evaluable" trigger
+                // for array-literal element inference: the literal types
+                // as `Array<T>` only when every element has a constant-
+                // evaluable shape (literal, string, null, paren/unary/
+                // binary recursing into the above, nested array, or an
+                // object_expr with a declared type). Idents / calls /
+                // member access / etc. bail to bare `Array`. We *could*
+                // do better ourselves (we have full type inference) but
+                // mimicking the runtime keeps user expectations predictable.
+                // EXCEPT for `[42time - 10s]` and similar binary-over-
+                // typed-literal cases where the runtime has a known
+                // mis-inference (`Array<duration>`); the element type
+                // here comes from `infer_binary`, which correctly returns
+                // `time`, so the analyzer outputs `Array<time>`.
+                let inferred_elem = self.infer_array_element_type(&items, &elem_types);
+
                 let span = self.hir.exprs[expr_id].byte_range();
+                let elem = inferred_elem.unwrap_or_else(|| self.any_nullable());
                 match self.well_known.array_decl {
-                    Some(decl) => self.arena.generic(decl, vec![any]),
+                    Some(decl) => self.arena.generic(decl, vec![elem]),
                     None => {
                         let name = self.index.symbols.intern("Array");
                         self.arena.unresolved(name, (span.start, span.end))
@@ -5837,6 +5856,80 @@ impl<'a> Cx<'a> {
                 }
             }
             BinOp::Other(_) => self.any_nullable(),
+        }
+    }
+
+    /// Element-type inference for an `Expr::Array` literal. Returns
+    /// `Some(T)` when every element is constant-evaluable in shape and
+    /// shares the same TypeId; otherwise `None` (caller falls back to
+    /// `any?` so the array types as bare `Array`).
+    ///
+    /// Mimics the runtime's syntactic trigger rules so user expectations
+    /// stay aligned with `greycat run`. See [`Self::is_constant_array_element_shape`]
+    /// for the per-element rules. The resulting *element type* is the
+    /// analyzer's own inference, so binary expressions over typed
+    /// literals (e.g. `42time - 10s`) get the correct `time` here even
+    /// though the runtime currently mis-infers them as `duration` — a
+    /// deliberate deviation from the buggy runtime behavior.
+    fn infer_array_element_type(
+        &self,
+        items: &[Idx<Expr>],
+        elem_types: &[TypeId],
+    ) -> Option<TypeId> {
+        if items.is_empty() {
+            return None;
+        }
+        for &i in items {
+            if !self.is_constant_array_element_shape(i) {
+                return None;
+            }
+        }
+        // No widening: runtime returns bare `Array` when any element
+        // types as `null` (including the all-`null` case) or when
+        // element types diverge.
+        let first = elem_types[0];
+        if matches!(self.arena.get(first).kind, TypeKind::Null) {
+            return None;
+        }
+        if elem_types.iter().any(|t| *t != first) {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// Per-element "constant-evaluable" shape check used by the
+    /// array-literal element-type inference. Mirrors the runtime's
+    /// (purely syntactic) algorithm — verified empirically against
+    /// `greycat run`:
+    ///
+    /// - Literals (int / float / bool / time / duration / iso8601) and
+    ///   string literals qualify. `null` qualifies *shape-wise* but
+    ///   its type causes the array to bail in the caller.
+    /// - **`char` literals do NOT qualify** (runtime quirk — the
+    ///   compiler skips them even though they have a type).
+    /// - `paren` / `unary` / `binary` recurse into their operands.
+    /// - Nested `array` literals recurse into their elements (so
+    ///   `[[1, 2]]` infers as `Array<Array<int>>`).
+    /// - `object_expr` qualifies when it carries a type-ident — the
+    ///   runtime does NOT recurse into the object's slots, so
+    ///   `[Foo { x: <ident> }]` still infers `Array<Foo>`.
+    /// - Everything else (ident, call, member / arrow / static access,
+    ///   offset, range, cast, lambda, `this`, tuple, …) disqualifies.
+    fn is_constant_array_element_shape(&self, expr_id: Idx<Expr>) -> bool {
+        match &self.hir.exprs[expr_id] {
+            Expr::Literal(l) => !matches!(l.kind, LiteralKind::Char(_)),
+            Expr::String(_) | Expr::Null { .. } => true,
+            Expr::Array(items, _) => items
+                .iter()
+                .all(|i| self.is_constant_array_element_shape(*i)),
+            Expr::Paren(inner, _) => self.is_constant_array_element_shape(*inner),
+            Expr::Unary(u) => self.is_constant_array_element_shape(u.operand),
+            Expr::Binary(b) => {
+                self.is_constant_array_element_shape(b.left)
+                    && self.is_constant_array_element_shape(b.right)
+            }
+            Expr::Object(obj) => obj.ty.is_some(),
+            _ => false,
         }
     }
 }
