@@ -33,7 +33,9 @@ pub const DIAGNOSTIC_SOURCE: &str = "greycat-analyzer";
 /// semantic grounds (`Foo::` / `s.` / `s->` with no property,
 /// non-native/non-abstract functions without a body, `var` with no
 /// name, `var` terminated by auto-semi rather than an explicit `;`,
-/// …). Every call site (CLI lint, LSP backend, WASM bridge) goes
+/// reserved keywords used as identifiers in positions the runtime
+/// rejects or where the declaration would be unreachable, …).
+/// Every call site (CLI lint, LSP backend, WASM bridge) goes
 /// through this single entry point so a new shape check is one edit
 /// here, not five.
 pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagnostic> {
@@ -67,6 +69,7 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
         | "breakpoint_stmt" | "do_while_stmt" | "modvar" => {
             check_explicit_semi(node, source, out);
         }
+        "ident" => check_ident_keyword(node, source, out),
         _ => {}
     }
     let mut cursor = node.walk();
@@ -216,6 +219,106 @@ fn check_explicit_semi(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
         code: Some(NumberOrString::String("missing-semicolon".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
         message: "expected `;` at end of statement".into(),
+        ..Default::default()
+    });
+}
+
+/// Reserved keywords the runtime rejects in identifier-binding /
+/// identifier-reference positions. Derived empirically against
+/// `greycat run`: every word here is rejected as a `fn_param.name`;
+/// words used contextually in grammar.js but accepted by the runtime
+/// as binding names (`type`, `null`, `this`, `sampling`, `limit`,
+/// `skip`, `from`, `to`) are intentionally absent.
+const RESERVED_KEYWORDS: &[&str] = &[
+    "abstract",
+    "as",
+    "at",
+    "break",
+    "breakpoint",
+    "catch",
+    "continue",
+    "do",
+    "else",
+    "enum",
+    "extends",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "in",
+    "is",
+    "native",
+    "private",
+    "return",
+    "static",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "while",
+];
+
+/// `true` iff `text` matches one of `RESERVED_KEYWORDS`.
+fn is_reserved_keyword(text: &str) -> bool {
+    RESERVED_KEYWORDS.binary_search(&text).is_ok()
+}
+
+/// Tree-sitter's `word: $.ident` rule lets keyword text parse as a
+/// plain `ident` whenever the current grammar state has no competing
+/// keyword token reachable — e.g. `fn ex(return: int)` parses with
+/// `return` as a `fn_param.name` ident. The runtime then rejects most
+/// such positions as parse errors. We diagnose them here so the error
+/// surfaces in `parse_diagnostics` instead of as a confusing downstream
+/// resolution failure (or, for the four "declaration-only unreachable"
+/// positions, before the imminent runtime fix lands).
+///
+/// The allow-list below matches the positions the runtime genuinely
+/// supports (`type T { return: int; }`, `enum E { return }`,
+/// `t.return`, `n->return`, `E::return`, …).
+fn check_ident_keyword(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let Some(text) = source.get(node.byte_range()) else {
+        return;
+    };
+    if !is_reserved_keyword(text) {
+        return;
+    }
+    let Some(parent) = node.parent() else {
+        return;
+    };
+    let parent_kind = parent.kind();
+    let mut field: Option<&str> = None;
+    let mut cursor = parent.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if cursor.node().id() == node.id() {
+                field = cursor.field_name();
+                break;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    if matches!(
+        (parent_kind, field),
+        ("type_attr", Some("name"))
+            | ("type_method", Some("name"))
+            | ("enum_field", _)
+            | ("object_field", Some("name"))
+            | ("member_expr", Some("property"))
+            | ("arrow_expr", Some("property"))
+            | ("static_expr", Some("property"))
+            | ("annotation", _)
+    ) {
+        return;
+    }
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &node.byte_range()),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("keyword-as-ident".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: format!("`{text}` is a reserved keyword and cannot be used as an identifier here"),
         ..Default::default()
     });
 }
@@ -1021,6 +1124,151 @@ mod tests {
         let src = "fn f(): int {\n    bar();\n    throw 0;\n    return 1;\n}\n";
         let ds = diags(src);
         assert!(!codes(&ds).contains(&"missing-semicolon"), "got: {ds:?}");
+    }
+
+    /// Reserved keyword used as a `fn_param.name` — the runtime parse-rejects
+    /// `fn ex(return: int) {}`, so we flag it here.
+    #[test]
+    fn keyword_as_fn_param_name_surfaces() {
+        let ds = diags("fn ex(return: int) { println(1); }\n");
+        let hits: Vec<_> = ds
+            .iter()
+            .filter(
+                |d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "keyword-as-ident"),
+            )
+            .collect();
+        assert_eq!(hits.len(), 1, "expected exactly one diag, got: {ds:?}");
+        assert!(
+            hits[0].message.contains("`return`"),
+            "got: {}",
+            hits[0].message
+        );
+        assert_eq!(hits[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    /// Reserved keyword used as a `var_decl.name` — also runtime parse-reject.
+    #[test]
+    fn keyword_as_var_decl_name_surfaces() {
+        let ds = diags("fn f() {\n    var return = 1;\n}\n");
+        assert!(codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    /// Reserved keyword in plain-expression value position
+    /// (`1 + return`) — parse-rejected by the runtime.
+    #[test]
+    fn keyword_as_plain_expr_ident_surfaces() {
+        let ds = diags("fn f() {\n    var x = 1 + return;\n}\n");
+        assert!(codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    /// Reserved keyword as a `type_ident` reference (`x: return`) —
+    /// parse-rejected by the runtime.
+    #[test]
+    fn keyword_as_type_ident_reference_surfaces() {
+        let ds = diags("fn f() {\n    var x: return;\n}\n");
+        assert!(codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    /// Declaration-only positions the runtime currently *accepts* but
+    /// renders unreachable (the call site `return()` parse-rejects).
+    /// Flagged pre-emptively — the runtime fix is imminent.
+    #[test]
+    fn keyword_as_fn_decl_name_surfaces() {
+        let ds = diags("fn return() {}\n");
+        assert!(codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_type_decl_name_surfaces() {
+        let ds = diags("type return { x: int; }\n");
+        assert!(codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_enum_decl_name_surfaces() {
+        let ds = diags("enum return { A }\n");
+        assert!(codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_type_params_entry_surfaces() {
+        let ds = diags("type T<return> {}\n");
+        assert!(codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    /// Positions the runtime supports — must stay silent.
+    #[test]
+    fn keyword_as_type_attr_name_no_diag() {
+        let ds = diags("type T { return: int; }\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_type_method_name_no_diag() {
+        let ds = diags("type T {\n    fn return(): int { return 1; }\n}\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_enum_field_name_no_diag() {
+        let ds = diags("enum E { return }\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_object_slot_key_no_diag() {
+        let ds = diags("fn f() {\n    var t = T { return: 1 };\n}\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_member_property_no_diag() {
+        let ds = diags("fn f(t: T) {\n    println(t.return);\n}\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_arrow_property_no_diag() {
+        let ds = diags("fn f(n: node<T>) {\n    println(n->return);\n}\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    #[test]
+    fn keyword_as_static_property_no_diag() {
+        let ds = diags("fn f() {\n    println(E::return);\n}\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    /// Annotations: `@private` is a real annotation name even though
+    /// `private` is also a keyword — don't false-positive.
+    #[test]
+    fn keyword_as_annotation_name_no_diag() {
+        let ds = diags("@private\nfn f() {}\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    /// Non-keyword identifiers never trip the check.
+    #[test]
+    fn non_keyword_ident_no_diag() {
+        let ds = diags("fn ex(answer: int) {\n    var x = answer + 1;\n    println(x);\n}\n");
+        assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
+    }
+
+    /// Contextual-only keywords (`sampling`, `limit`, `skip`, `from`,
+    /// `to`, plus `type` / `null` / `this`) are accepted as binding
+    /// names by the runtime — don't false-positive.
+    #[test]
+    fn contextual_keywords_as_param_names_no_diag() {
+        for kw in [
+            "type", "null", "this", "sampling", "limit", "skip", "from", "to",
+        ] {
+            let src = format!("fn ex({kw}: int) {{ println(1); }}\n");
+            let ds = diags(&src);
+            assert!(
+                !codes(&ds).contains(&"keyword-as-ident"),
+                "`{kw}` should be allowed as a param name; got: {ds:?}"
+            );
+        }
     }
 
     // P15.5
