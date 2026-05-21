@@ -2562,6 +2562,28 @@ fn semantic_tokens_emit_for_idents() {
     );
 }
 
+/// `this` should paint as KEYWORD (same bucket as `null` / `true` / `false`)
+/// — without this, the implicit receiver inside type methods rendered as a
+/// plain ident.
+#[test]
+fn semantic_tokens_paint_this_as_keyword() {
+    let src = "type T {\n    fn f(): T { return this; }\n}\n";
+    let tree = parse(src);
+    let tokens = capabilities::semantic_tokens(src, "project", tree.root_node());
+    let keyword_idx = capabilities::SEMANTIC_TOKEN_TYPES
+        .iter()
+        .position(|t| *t == SemanticTokenType::KEYWORD)
+        .expect("KEYWORD must be in the token-type table") as u32;
+    assert!(
+        tokens
+            .data
+            .iter()
+            .any(|t| t.token_type == keyword_idx && t.length == 4),
+        "expected a KEYWORD token of length 4 for `this`, got: {:?}",
+        tokens.data
+    );
+}
+
 #[test]
 fn code_actions_for_unused_local_emits_remove_edit() {
     let src = "fn body() {\n    var unused = 1;\n}\n";

@@ -76,7 +76,11 @@ pub fn semantic_tokens(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Se
             "line_comment" | "doc_comment" => push(&mut events, TOK_COMMENT),
             // Language constants: paint as KEYWORD so themes render them
             // the same way they render `true` / `false` / language literals.
-            "null" | "true" | "false" => push(&mut events, TOK_KEYWORD),
+            // `this` rides along — without it the implicit-receiver inside
+            // type methods reads as a plain ident (no LSP semantic token
+            // fires, editors fall back to textmate which doesn't know it's
+            // anything special).
+            "null" | "true" | "false" | "this" => push(&mut events, TOK_KEYWORD),
             "ident" => {
                 // Runtime value-position globals (`Infinity`, `NaN`) have no
                 // `.gcl` decl — they resolve through `Definition::Project`,
