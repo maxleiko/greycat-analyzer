@@ -187,9 +187,6 @@ playground/scripts/build-wasm.sh                      # wraps wasm-pack with the
 
 # playground (committed, separate npm project)
 cd playground && pnpm install && pnpm dev
-
-# parity oracle (P10.3 harness)
-scripts/parity-oracle.sh <ts-lang-checkout> <corpus-dir>
 ```
 
 ## Adding / removing a lint rule
@@ -259,7 +256,7 @@ Removal-side: walk the same touchpoints in reverse. **Watch out for the LSP↔an
 - `in.gcl` carries the minimal source that exercises the rule — typically a snippet that overflows the default `line_width` (120) so the formatter has to make the decision you're encoding.
 - `out.gcl` is the expected formatted output, byte-for-byte. It MUST end with a trailing newline (the formatter's `eol_last: true` default).
 - The new fixture path triggers two gauntlets automatically: the formatter parity at [greycat-analyzer-fmt/tests/parity_gauntlet.rs](../greycat-analyzer-fmt/tests/parity_gauntlet.rs) and the CST shape snapshot at [greycat-analyzer-syntax/tests/snapshot.rs](../greycat-analyzer-syntax/tests/snapshot.rs). The first run after adding the fixture will create the snapshot `.snap.new`; accept it (`cargo insta accept` or rename the file) once you've eyeballed the CST is what you expected.
-- If a fixture's `out.gcl` later changes shape because the formatter's behavior changed, that's a *deliberate* contract update — review the diff against what the TS reference produces (the parity oracle) and update fixture + commit message together. Never silently rewrite a fixture's `out.gcl` to make a failing test pass; that erases the previous contract.
+- If a fixture's `out.gcl` later changes shape because the formatter's behavior changed, that's a *deliberate* contract update — review the diff against what the TS reference produces and update fixture + commit message together. Never silently rewrite a fixture's `out.gcl` to make a failing test pass; that erases the previous contract.
 
 The inline `tests/` in [greycat-analyzer-fmt/src/lib.rs](../greycat-analyzer-fmt/src/lib.rs) and the integration tests under [greycat-analyzer-fmt/tests/](../greycat-analyzer-fmt/tests/) cover *unit*-shaped invariants (round-trip stability, pragma overrides, trivia preservation, idempotency). The corpus fixtures cover *layout*-shaped invariants — every break-decision rule lives there. When in doubt, prefer adding a corpus fixture; the inline tests should be the exception, reserved for cases where the input isn't a self-contained `.gcl` snippet.
 

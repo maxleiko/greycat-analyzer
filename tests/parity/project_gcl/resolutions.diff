@@ -1,4 +1,0 @@
-[parity-resolutions] running TS reference: /home/leiko/.greycat/bin/greycat-lang dump-resolutions project.gcl
-[parity-resolutions] running Rust port: cargo run --manifest-path /home/leiko/dev/leiko/rust/greycat-analyzer/Cargo.toml -q -p greycat-analyzer -- dump-resolutions project.gcl
-[parity-resolutions] diff (TS → Rust), with allow-list applied:
-[parity-resolutions] OK — no diff
