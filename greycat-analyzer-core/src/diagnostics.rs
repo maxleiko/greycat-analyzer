@@ -68,11 +68,25 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
             check_modvar_initializer(node, source, out);
             check_explicit_semi(node, source, out);
         }
+        // Grammar accepts a freestanding `expr_stmt` at module scope
+        // so doc snippets (triple-backtick `gcl` blocks containing
+        // only an expression) pretty-print under the same syntax
+        // highlighter as real modules. A real project module cannot
+        // contain a freestanding expression; the `if !…` guard runs
+        // `check_top_level_expr` first — it emits `top-level-expr` AND
+        // returns `true` when the stmt is at module scope, suppressing
+        // the trailing `missing-semicolon` (which would be noise on
+        // top of an already-invalid stmt). Inner shape checks
+        // (`Foo::` / `s.` / `s->` / keyword-ident) still recurse below
+        // the match.
+        "expr_stmt" if !check_top_level_expr(node, source, out) => {
+            check_explicit_semi(node, source, out);
+        }
         // Every stmt kind whose terminator is `choice(_semi, _automatic_semicolon)`
         // in grammar.js — the ASI is a parser convenience for mid-edit
         // recovery, never semantically valid GreyCat.
-        "expr_stmt" | "return_stmt" | "throw_stmt" | "break_stmt" | "continue_stmt"
-        | "breakpoint_stmt" | "do_while_stmt" => {
+        "return_stmt" | "throw_stmt" | "break_stmt" | "continue_stmt" | "breakpoint_stmt"
+        | "do_while_stmt" => {
             check_explicit_semi(node, source, out);
         }
         "ident" => check_ident_keyword(node, source, out),
@@ -172,6 +186,40 @@ fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut
         ),
         ..Default::default()
     });
+}
+
+/// Grammar accepts a freestanding `expr_stmt` at module scope so doc
+/// snippets parse under the same highlighter as real modules (see
+/// `module` rule in grammar.js). A real project module cannot contain
+/// a top-level expression — emit a hard error covering the whole
+/// stmt. Returns `true` if the diagnostic was emitted (caller uses
+/// this to suppress the trailing `missing-semicolon` check).
+fn check_top_level_expr(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    out: &mut Vec<Diagnostic>,
+) -> bool {
+    if node.parent().map(|p| p.kind()) != Some("module") {
+        return false;
+    }
+    // Range covers the whole stmt so the editor's red underline marks
+    // the entire offending snippet — useful when the expression spans
+    // multiple lines.
+    let mut range = node.byte_range();
+    // Trim a trailing explicit `;` from the range so the squiggle
+    // doesn't extend past the visible expression text.
+    if source.get(range.clone()).is_some_and(|s| s.ends_with(';')) {
+        range.end -= 1;
+    }
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("top-level-expr".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: "expressions cannot appear at module scope — wrap in a `fn` body".into(),
+        ..Default::default()
+    });
+    true
 }
 
 /// Grammar accepts a `modvar` without a `type_decorator` so mid-edit
@@ -1173,6 +1221,68 @@ mod tests {
         let cs = codes(&ds);
         assert!(cs.contains(&"missing-modvar-type"), "got: {ds:?}");
         assert!(cs.contains(&"modvar-initializer"), "got: {ds:?}");
+    }
+
+    /// Grammar accepts `foo();` at module scope so doc snippets work
+    /// for syntax highlighting. As a project module, that's invalid —
+    /// `top-level-expr` fires covering the whole stmt.
+    #[test]
+    fn top_level_expr_surfaces() {
+        let src = "foo();\n";
+        let ds = diags(src);
+        let hits: Vec<_> = ds
+            .iter()
+            .filter(|d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "top-level-expr"))
+            .collect();
+        assert_eq!(hits.len(), 1, "expected one diag, got: {ds:?}");
+        assert_eq!(hits[0].severity, Some(DiagnosticSeverity::ERROR));
+        // Range covers `foo()` (the `;` is trimmed).
+        let start_byte: usize = src
+            .lines()
+            .take(hits[0].range.start.line as usize)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            + hits[0].range.start.character as usize;
+        let end_byte: usize = src
+            .lines()
+            .take(hits[0].range.end.line as usize)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            + hits[0].range.end.character as usize;
+        assert_eq!(src.get(start_byte..end_byte), Some("foo()"));
+    }
+
+    /// `foo()` without trailing `;` at top level — `top-level-expr`
+    /// fires but `missing-semicolon` does NOT (the whole stmt is
+    /// invalid; piling a semi diag on top is noise).
+    #[test]
+    fn top_level_expr_suppresses_missing_semicolon() {
+        let ds = diags("foo()\n");
+        let cs = codes(&ds);
+        assert!(cs.contains(&"top-level-expr"), "got: {ds:?}");
+        assert!(
+            !cs.contains(&"missing-semicolon"),
+            "missing-semicolon should be suppressed on a top-level expr, got: {ds:?}"
+        );
+    }
+
+    /// `expr_stmt` inside a `fn` body stays unaffected — no
+    /// `top-level-expr` (only top-level expr_stmts trigger the rule).
+    #[test]
+    fn nested_expr_stmt_unaffected() {
+        let ds = diags("fn f() { foo(); }\n");
+        let cs = codes(&ds);
+        assert!(!cs.contains(&"top-level-expr"), "got: {ds:?}");
+    }
+
+    /// Inner shape checks still recurse: a top-level `Foo::` surfaces
+    /// both `top-level-expr` and `missing-static-property`.
+    #[test]
+    fn top_level_expr_still_recurses_inner_checks() {
+        let ds = diags("Foo::;\n");
+        let cs = codes(&ds);
+        assert!(cs.contains(&"top-level-expr"), "got: {ds:?}");
+        assert!(cs.contains(&"missing-static-property"), "got: {ds:?}");
     }
 
     /// `var;` (no name) → `missing-var-name` fires (same code as
