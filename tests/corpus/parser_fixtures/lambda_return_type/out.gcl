@@ -1,0 +1,14 @@
+fn main() {
+    var add = fn(a: int, b: int): int {
+        return a + b;
+    };
+    var make_arr = fn(): Array<int>? {
+        return null;
+    };
+    var no_ret = fn(x: int) {
+        return x;
+    };
+    println(add(40, 2));
+    println(make_arr());
+    println(no_ret(7));
+}

@@ -403,7 +403,10 @@ fn expr_node(
                     children: pk,
                 });
             }
-            kids.push(expr_node(hir, symbols, l.body));
+            if let Some(t) = l.return_type {
+                kids.push(type_ref_node(hir, symbols, t));
+            }
+            kids.push(block_node(hir, symbols, &l.body));
             ("expr:lambda", None, kids)
         }
         Expr::Is { value, ty, .. } => (

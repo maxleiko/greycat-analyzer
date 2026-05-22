@@ -2337,6 +2337,90 @@ impl<'a> Cx<'a> {
         ));
     }
 
+    /// Hard error for direct assignment to a `static` attribute through
+    /// a `Type::name` (or `module::Type::name`) path expression. GreyCat's
+    /// runtime forbids `Counter::count = 42` / `Counter::count ?= 42`
+    /// regardless of where the assignment lives. Reads of static attrs
+    /// (`let x = Counter::count;`) are unaffected — `static_value_type`
+    /// already types those at the attr's declared type.
+    ///
+    /// Counterpart to `check_private_attr_write`: that one covers
+    /// instance-shape LHS (`Expr::Member` / `Expr::Arrow`); this one
+    /// covers static-shape LHS (`Expr::Static` / `Expr::QualifiedStatic`).
+    fn check_static_attr_write(&mut self, lhs: Idx<Expr>) {
+        // Extract the property ident and (for the foreign-attr path)
+        // enough info to recover the owner `ItemId`. `Expr::Static`
+        // carries a `TypeRef` we have to lower; `Expr::QualifiedStatic`
+        // with a 3-segment chain carries the owner directly as
+        // `module::Type` in the first two segments.
+        let (property, owner_via_typeref) = match &self.hir.exprs[lhs] {
+            Expr::Static(s) => (s.property.ident(), Some(s.ty)),
+            Expr::QualifiedStatic { chain, .. } if chain.len() == 3 => {
+                (*chain.last().expect("len==3"), None)
+            }
+            _ => return,
+        };
+        // In-module attr — `member_uses` carries the resolved `AttrId`
+        // when the type lives in this module. Read `static_` straight
+        // off the HIR.
+        let is_static_local = self
+            .out
+            .member_uses
+            .get(&property)
+            .and_then(|m| match m {
+                MemberDef::Attr(attr_id) => Some(*attr_id),
+                _ => None,
+            })
+            .is_some_and(|attr_id| self.hir.type_attrs[attr_id].modifiers.static_);
+        // Cross-module attr — consult the project index's `static_attrs`
+        // set for the receiver's `ItemId`. Two shapes feed the lookup:
+        //  - `Expr::Static`: lower the receiver `TypeRef` to a `TypeId`,
+        //    then map to `ItemId` the same way `static_value_type` does.
+        //  - `Expr::QualifiedStatic` (chain==3): the first two segments
+        //    are `module::Type` — build the `ItemId` directly.
+        let is_static_foreign = (|| {
+            let foreign = self.out.foreign_member_uses.get(&property)?;
+            if !matches!(foreign.member, MemberDef::Attr(_)) {
+                return None;
+            }
+            let prop_sym = self.hir.idents[property].symbol;
+            let owner_id: ItemId = if let Some(ty_ref) = owner_via_typeref {
+                let recv_ty = self.lower_type_ref(ty_ref);
+                match &self.arena.get(recv_ty).kind {
+                    TypeKind::Type(d) => *d,
+                    TypeKind::Generic { decl, .. } => *decl,
+                    TypeKind::Primitive(p) => {
+                        let core_mod = self.index.symbols.intern("core");
+                        let name_sym = self.index.symbols.intern(p.name());
+                        ItemId::new(core_mod, name_sym)
+                    }
+                    _ => return None,
+                }
+            } else {
+                let Expr::QualifiedStatic { chain, .. } = &self.hir.exprs[lhs] else {
+                    return None;
+                };
+                let module_sym = self.hir.idents[chain[0]].symbol;
+                let type_sym = self.hir.idents[chain[1]].symbol;
+                ItemId::new(module_sym, type_sym)
+            };
+            let members = self.index.type_members.get(&owner_id)?;
+            members.static_attrs.contains(&prop_sym).then_some(())
+        })()
+        .is_some();
+        if !is_static_local && !is_static_foreign {
+            return;
+        }
+        let prop_text = self.ident_text(property);
+        let span = self.hir.idents[property].byte_range.clone();
+        self.out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            "static-attr-assign",
+            format!("attribute `{prop_text}` is `static`; static attributes cannot be assigned"),
+            span,
+        ));
+    }
+
     // P23
     /// Inline call-return typing for Member / Arrow /
     /// Static callees. Looks up the method's pre-lowered return
@@ -5612,9 +5696,11 @@ impl<'a> Cx<'a> {
                 // hold along every path.
                 if matches!(op, BinOp::Other("=")) {
                     self.check_private_attr_write(left);
+                    self.check_static_attr_write(left);
                     self.record_assign_narrow(left, rt);
                 } else if matches!(op, BinOp::Other("?=")) {
                     self.check_private_attr_write(left);
+                    self.check_static_attr_write(left);
                     self.record_coalesce_assign_narrow(left, rt);
                 }
                 self.infer_binary(op, lt, rt)
@@ -5671,7 +5757,12 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Paren(inner, _) => self.visit_expr(inner),
-            Expr::Lambda(LambdaExpr { params, body, .. }) => {
+            Expr::Lambda(LambdaExpr {
+                params,
+                return_type,
+                body,
+                ..
+            }) => {
                 let mut param_tys = Vec::with_capacity(params.len());
                 for p in &params {
                     let p = self.hir.fn_params[*p].clone();
@@ -5680,8 +5771,10 @@ impl<'a> Cx<'a> {
                             .unwrap_or_else(|| self.any_nullable());
                     param_tys.push(pt);
                 }
-                let body_ty = self.visit_expr(body);
-                self.arena.lambda(param_tys, body_ty)
+                let declared_ret = return_type.map(|t| self.lower_type_ref(t));
+                self.visit_block(&body, declared_ret);
+                let ret_ty = declared_ret.unwrap_or_else(|| self.any_nullable());
+                self.arena.lambda(param_tys, ret_ty)
             }
             Expr::Is { value, .. } => {
                 let _ = self.visit_expr(value);

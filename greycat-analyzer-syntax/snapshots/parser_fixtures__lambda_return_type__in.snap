@@ -1,0 +1,129 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn main() {\n    var add = fn (a: int, b: int): int { return a + b; };\n    var make_arr = fn (): Array<int>? { return null; };\n    var no_ret = fn (x: int) { return x; };\n    println(add(40, 2));\n    println(make_arr());\n    println(no_ret(7));\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'main')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 'add')
+        (initializer
+          expr: (lambda_expr
+            params: (fn_params
+              param: (fn_param
+                name: (ident 'a')
+                type: (type_ident
+                  name: (ident 'int')
+                )
+              )
+              param: (fn_param
+                name: (ident 'b')
+                type: (type_ident
+                  name: (ident 'int')
+                )
+              )
+            )
+            return_type: (type_ident
+              name: (ident 'int')
+            )
+            body: (block
+              (return_stmt
+                (binary_expr
+                  left: (ident 'a')
+                  right: (ident 'b')
+                )
+              )
+            )
+          )
+        )
+      )
+      (var_decl
+        name: (ident 'make_arr')
+        (initializer
+          expr: (lambda_expr
+            params: (fn_params '()')
+            return_type: (type_ident
+              name: (ident 'Array')
+              params: (type_ident
+                name: (ident 'int')
+              )
+              (optional '?')
+            )
+            body: (block
+              (return_stmt
+                (null 'null')
+              )
+            )
+          )
+        )
+      )
+      (var_decl
+        name: (ident 'no_ret')
+        (initializer
+          expr: (lambda_expr
+            params: (fn_params
+              param: (fn_param
+                name: (ident 'x')
+                type: (type_ident
+                  name: (ident 'int')
+                )
+              )
+            )
+            body: (block
+              (return_stmt
+                (ident 'x')
+              )
+            )
+          )
+        )
+      )
+      (expr_stmt
+        (call_expr
+          fn: (ident 'println')
+          (args
+            (call_expr
+              fn: (ident 'add')
+              (args
+                (number
+                  (number_int '40')
+                )
+                (number
+                  (number_int '2')
+                )
+              )
+            )
+          )
+        )
+      )
+      (expr_stmt
+        (call_expr
+          fn: (ident 'println')
+          (args
+            (call_expr
+              fn: (ident 'make_arr')
+              (args '()')
+            )
+          )
+        )
+      )
+      (expr_stmt
+        (call_expr
+          fn: (ident 'println')
+          (args
+            (call_expr
+              fn: (ident 'no_ret')
+              (args
+                (number
+                  (number_int '7')
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

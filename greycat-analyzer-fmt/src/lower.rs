@@ -1929,6 +1929,10 @@ fn lower_lambda_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if let Some(p) = node.child_by_field_name("params") {
         parts.push(lower_node(cx, p));
     }
+    if let Some(r) = node.child_by_field_name("return_type") {
+        parts.push(Doc::text(": "));
+        parts.push(lower_node(cx, r));
+    }
     parts.push(Doc::space());
     if let Some(b) = node.child_by_field_name("body") {
         parts.push(lower_node(cx, b));

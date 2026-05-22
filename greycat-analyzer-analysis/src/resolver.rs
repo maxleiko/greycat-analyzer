@@ -816,7 +816,12 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
         }
         Expr::Unary(UnaryExpr { operand, .. }) => visit_expr(cx, operand),
         Expr::Paren(inner, _) => visit_expr(cx, inner),
-        Expr::Lambda(LambdaExpr { params, body, .. }) => {
+        Expr::Lambda(LambdaExpr {
+            params,
+            return_type,
+            body,
+            ..
+        }) => {
             cx.push_scope();
             for param_id in params {
                 let p = cx.hir.fn_params[param_id].clone();
@@ -826,7 +831,10 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
                     visit_type_ref(cx, t);
                 }
             }
-            visit_expr(cx, body);
+            if let Some(t) = return_type {
+                visit_type_ref(cx, t);
+            }
+            visit_block(cx, &body);
             cx.pop_scope();
         }
         Expr::Is { value, ty, .. } | Expr::Cast { value, ty, .. } => {

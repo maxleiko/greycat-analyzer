@@ -1332,11 +1332,15 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         }
         "lambda_expr" => {
             let params = lower_fn_params(cx, node.child_by_field_name("params"));
+            let return_type = node
+                .child_by_field_name("return_type")
+                .and_then(|n| lower_type_ref(cx, n));
             let body = node
                 .child_by_field_name("body")
-                .and_then(|n| lower_expr(cx, n))?;
+                .and_then(|n| lower_block_inline(cx, n))?;
             Expr::Lambda(LambdaExpr {
                 params,
+                return_type,
                 body,
                 byte_range: node.byte_range(),
             })

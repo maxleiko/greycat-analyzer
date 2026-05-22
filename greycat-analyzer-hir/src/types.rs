@@ -800,7 +800,8 @@ pub enum UnaryOp {
 #[derive(Debug, Clone)]
 pub struct LambdaExpr {
     pub params: Box<[Idx<FnParam>]>,
-    pub body: Idx<Expr>,
+    pub return_type: Option<Idx<TypeRef>>,
+    pub body: BlockStmt,
     pub byte_range: Span,
 }
 

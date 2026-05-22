@@ -306,7 +306,7 @@ fn emit_call_arg_hints_expr(
             }
         }
         Expr::Lambda(l) => {
-            emit_call_arg_hints_expr(hir, symbols, resolutions, l.body, want, text, out)
+            emit_call_arg_hints_block(hir, symbols, resolutions, &l.body, want, text, out);
         }
         Expr::Is { value, .. } | Expr::Cast { value, .. } => {
             emit_call_arg_hints_expr(hir, symbols, resolutions, *value, want, text, out);

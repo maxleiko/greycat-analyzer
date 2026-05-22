@@ -1406,6 +1406,51 @@ fn semantic_tokens_string_interpolation_no_overlap() {
     }
 }
 
+#[test]
+fn semantic_tokens_paints_lambda_return_type_as_type() {
+    // The return-type annotation on a lambda (`fn (...): T { ... }`) is a
+    // `type_ident`; its `name` ident must paint as TYPE (index 1) just
+    // like `fn_decl`'s return type does — not fall through to "no token".
+    let src = "fn main() { var f = fn (a: int): int { return a; }; }\n";
+    let mut t = None;
+    let r = root(src, &mut t);
+    let tokens = capabilities::semantic_tokens(src, "project", r);
+
+    let type_idx = 1u32;
+    let mut line = 0u32;
+    let mut col = 0u32;
+    let mut spans: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for tk in &tokens.data {
+        if tk.delta_line != 0 {
+            line += tk.delta_line;
+            col = tk.delta_start;
+        } else {
+            col += tk.delta_start;
+        }
+        spans.push((line, col, tk.length, tk.token_type));
+    }
+
+    // Two `int` occurrences on line 0: the param type at col 28 and the
+    // lambda return type at col 33. Both must paint as TYPE.
+    let int_type_spans: Vec<_> = spans
+        .iter()
+        .filter(|(_, c, len, ty)| {
+            *ty == type_idx
+                && src
+                    .lines()
+                    .next()
+                    .and_then(|l| l.get(*c as usize..(*c + *len) as usize))
+                    == Some("int")
+        })
+        .collect();
+    assert_eq!(
+        int_type_spans.len(),
+        2,
+        "expected 2 TYPE spans covering `int` (param type + lambda return type); \
+         got spans: {spans:?}",
+    );
+}
+
 // =============================================================================
 // P24.5 — DiagnosticTag::UNNECESSARY plumbing
 // =============================================================================
