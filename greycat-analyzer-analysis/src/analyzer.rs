@@ -554,6 +554,31 @@ pub fn analyze_with_index_into(
         ));
     }
 
+    // Lambda captures — runtime rejects refs to locals/params from
+    // enclosing scope with `unresolved identifier`, and segfaults on
+    // `this`. Both surface here as `lambda-capture`.
+    let captured = res.captured.clone();
+    for ident_idx in captured {
+        let ident = &hir.idents[ident_idx];
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            "lambda-capture",
+            format!(
+                "lambda cannot capture `{}` from enclosing scope",
+                &index.symbols[ident.symbol]
+            ),
+            ident.byte_range.clone(),
+        ));
+    }
+    for span in &res.this_in_lambda {
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            "lambda-capture",
+            "lambda cannot capture `this` from enclosing type method".to_string(),
+            span.clone(),
+        ));
+    }
+
     // P38.4 — `ambiguous-symbol` Severity::Error: the bare name is
     // exported publicly by ≥2 distinct modules, with no local hit to
     // resolve it. Matches the GreyCat runtime's "unresolved function"

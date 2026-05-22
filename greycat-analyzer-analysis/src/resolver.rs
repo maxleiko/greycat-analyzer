@@ -32,7 +32,7 @@
 use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{SymbolTable, TypeArena};
+use greycat_analyzer_core::{Symbol, SymbolTable, TypeArena};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -144,6 +144,15 @@ pub struct Resolutions {
     /// diagnostic naming each candidate, with quick-fixes that
     /// rewrite the bare ident to one of `<module>::<name>`.
     pub ambiguous: FxHashMap<Idx<Ident>, Vec<(Uri, Idx<Decl>)>>,
+    /// Idents inside a lambda body that resolved to a Local/Param bound
+    /// in an enclosing scope. GreyCat lambdas don't capture — the
+    /// runtime rejects these as `unresolved identifier`. The resolver
+    /// still records a binding (so goto-def / hover work on the actual
+    /// declaration) but the analyzer surfaces a `lambda-capture` error.
+    pub captured: Vec<Idx<Ident>>,
+    /// `this` byte ranges inside lambda bodies. The runtime segfaults
+    /// on this shape today; we forbid it at analyze time.
+    pub this_in_lambda: Vec<greycat_analyzer_hir::types::Span>,
 }
 
 impl Resolutions {
@@ -152,14 +161,28 @@ impl Resolutions {
     }
 }
 
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum ScopeKind {
+    #[default]
+    Default,
+    /// The scope that holds a lambda's params + body locals. Treated as
+    /// a hard capture boundary: lookups crossing it from inside that
+    /// scope toward an outer one signal an illegal capture (GreyCat
+    /// lambdas have a closed scope — only own params/locals + module-
+    /// scope decls are reachable).
+    LambdaBody,
+}
+
 #[derive(Default)]
 struct Scope {
-    /// Lexical name → resolution.
-    names: FxHashMap<String, Definition>,
+    /// Lexical name → resolution. Keyed by [`Symbol`] (interned) so the
+    /// hot insert / lookup path doesn't allocate per ident.
+    names: FxHashMap<Symbol, Definition>,
+    kind: ScopeKind,
 }
 
 impl Scope {
-    fn insert(&mut self, name: String, def: Definition) {
+    fn insert(&mut self, name: Symbol, def: Definition) {
         self.names.insert(name, def);
     }
 }
@@ -177,17 +200,17 @@ struct Cx<'a> {
     // fn, var) — validated against `greycat build` 8.0.301-dev: every
     // cross-namespace pair coexists, every in-namespace pair errors.
     /// Module-level `type` / `enum` decls without `private`.
-    module_public_type: FxHashMap<String, Definition>,
+    module_public_type: FxHashMap<Symbol, Definition>,
     /// Module-level `fn` decls without `private`.
-    module_public_fn: FxHashMap<String, Definition>,
+    module_public_fn: FxHashMap<Symbol, Definition>,
     /// Module-level `var` decls without `private`.
-    module_public_var: FxHashMap<String, Definition>,
+    module_public_var: FxHashMap<Symbol, Definition>,
     /// Module-level `type` / `enum` decls with `private`.
-    module_private_type: FxHashMap<String, Definition>,
+    module_private_type: FxHashMap<Symbol, Definition>,
     /// Module-level `fn` decls with `private`.
-    module_private_fn: FxHashMap<String, Definition>,
+    module_private_fn: FxHashMap<Symbol, Definition>,
     /// Module-level `var` decls with `private`.
-    module_private_var: FxHashMap<String, Definition>,
+    module_private_var: FxHashMap<Symbol, Definition>,
     /// Nested lexical scopes (fn / type / block / loop / try / catch).
     /// The module-level scope is *not* held here — see
     /// `module_public_*` / `module_private_*` above.
@@ -225,7 +248,7 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn module_public(&self, ns: Namespace) -> &FxHashMap<String, Definition> {
+    fn module_public(&self, ns: Namespace) -> &FxHashMap<Symbol, Definition> {
         match ns {
             Namespace::Type => &self.module_public_type,
             Namespace::Fn => &self.module_public_fn,
@@ -233,7 +256,7 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn module_public_mut(&mut self, ns: Namespace) -> &mut FxHashMap<String, Definition> {
+    fn module_public_mut(&mut self, ns: Namespace) -> &mut FxHashMap<Symbol, Definition> {
         match ns {
             Namespace::Type => &mut self.module_public_type,
             Namespace::Fn => &mut self.module_public_fn,
@@ -241,7 +264,7 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn module_private(&self, ns: Namespace) -> &FxHashMap<String, Definition> {
+    fn module_private(&self, ns: Namespace) -> &FxHashMap<Symbol, Definition> {
         match ns {
             Namespace::Type => &self.module_private_type,
             Namespace::Fn => &self.module_private_fn,
@@ -249,7 +272,7 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn module_private_mut(&mut self, ns: Namespace) -> &mut FxHashMap<String, Definition> {
+    fn module_private_mut(&mut self, ns: Namespace) -> &mut FxHashMap<Symbol, Definition> {
         match ns {
             Namespace::Type => &mut self.module_private_type,
             Namespace::Fn => &mut self.module_private_fn,
@@ -259,6 +282,12 @@ impl<'a> Cx<'a> {
 
     fn push_scope(&mut self) {
         self.scopes.push(Scope::default());
+    }
+    fn push_lambda_scope(&mut self) {
+        self.scopes.push(Scope {
+            names: FxHashMap::default(),
+            kind: ScopeKind::LambdaBody,
+        });
     }
     fn pop_scope(&mut self) {
         self.scopes.pop();
@@ -275,21 +304,26 @@ impl<'a> Cx<'a> {
     /// namespace — the grammar disallows re-using a single scope's
     /// name across kinds. Module-level tables are *not* consulted
     /// here; `record_use` handles them per-namespace.
-    fn lookup_scope(&self, name: &str) -> Option<Definition> {
+    ///
+    /// Returns `(definition, captured_from_outside_lambda)`. The boolean
+    /// is true when the match was found in a scope *above* a
+    /// [`ScopeKind::LambdaBody`] boundary — i.e. the use site is inside
+    /// a lambda body and the binding lives in an enclosing function's
+    /// scope. Callers surface that case as a `lambda-capture` error.
+    fn lookup_scope(&self, name: Symbol) -> Option<(Definition, bool)> {
+        let mut crossed_lambda = false;
         for scope in self.scopes.iter().rev() {
-            if let Some(d) = scope.names.get(name) {
-                return Some(d.clone());
+            if let Some(d) = scope.names.get(&name) {
+                return Some((d.clone(), crossed_lambda));
+            }
+            if scope.kind == ScopeKind::LambdaBody {
+                crossed_lambda = true;
             }
         }
         None
     }
 
-    fn ident_text(&self, idx: Idx<Ident>) -> &str {
-        &self.index.symbols[self.hir.idents[idx].symbol]
-    }
-
     fn record_use(&mut self, idx: Idx<Ident>, pos: Position) {
-        let name = self.ident_text(idx);
         let name_sym = self.hir.idents[idx].symbol;
         // Bare-name resolution order, applied per namespace in the
         // priority list for `pos`:
@@ -322,9 +356,17 @@ impl<'a> Cx<'a> {
         // namespace short-circuits the whole walk.
 
         // 1. Nested scopes are namespace-agnostic.
-        if let Some(def) = self.lookup_scope(name) {
+        if let Some((def, captured)) = self.lookup_scope(name_sym) {
             if let Definition::Decl(decl_id) = &def {
                 *self.res.references_to.entry(*decl_id).or_insert(0) += 1;
+            }
+            // Locals / params bound outside the enclosing lambda are
+            // captures — GreyCat doesn't allow them. Record the use
+            // anyway so goto-def / hover still point at the real
+            // declaration; the analyzer surfaces a `lambda-capture`
+            // error from the `captured` list.
+            if captured && matches!(&def, Definition::Local(_) | Definition::Param(_)) {
+                self.res.captured.push(idx);
             }
             self.res.uses.insert(idx, def);
             return;
@@ -336,8 +378,8 @@ impl<'a> Cx<'a> {
             // namespace. Module-local always shadows cross-module.
             if let Some(def) = self
                 .module_public(ns)
-                .get(name)
-                .or_else(|| self.module_private(ns).get(name))
+                .get(&name_sym)
+                .or_else(|| self.module_private(ns).get(&name_sym))
                 .cloned()
             {
                 if let Definition::Decl(decl_id) = &def {
@@ -497,7 +539,7 @@ fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
     let Some(ns) = Namespace::of_decl(decl) else {
         return;
     };
-    let name = cx.ident_text(name_id).to_string();
+    let name_sym = cx.hir.idents[name_id].symbol;
     // P38.3 — route on visibility, then on namespace. Public decls
     // join the first-tier lookup namespace alongside nested scopes;
     // private decls go to the last-resort fallback table. See the
@@ -509,7 +551,7 @@ fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
     } else {
         cx.module_public_mut(ns)
     };
-    table.insert(name, Definition::Decl(decl_id));
+    table.insert(name_sym, Definition::Decl(decl_id));
 }
 
 // P38.3
@@ -547,14 +589,14 @@ fn visit_fn_decl(cx: &mut Cx, d: &FnDecl) {
     // Generic params first so type-refs in param / return position can
     // see them.
     for g in &d.generics {
-        let name = cx.ident_text(*g).to_string();
-        cx.current_mut().insert(name, Definition::Generic(*g));
+        let sym = cx.hir.idents[*g].symbol;
+        cx.current_mut().insert(sym, Definition::Generic(*g));
     }
     // Parameters become Param bindings in the function scope.
     for param_id in &d.params {
         let p = cx.hir.fn_params[*param_id].clone();
-        let name = cx.ident_text(p.name).to_string();
-        cx.current_mut().insert(name, Definition::Param(p.name));
+        let sym = cx.hir.idents[p.name].symbol;
+        cx.current_mut().insert(sym, Definition::Param(p.name));
         if let Some(ty) = p.ty {
             visit_type_ref(cx, ty);
         }
@@ -572,8 +614,8 @@ fn visit_type_decl(cx: &mut Cx, d: &TypeDecl) {
     cx.push_scope();
     // Generic params visible inside attribute types and method bodies.
     for g in &d.generics {
-        let name = cx.ident_text(*g).to_string();
-        cx.current_mut().insert(name, Definition::Generic(*g));
+        let sym = cx.hir.idents[*g].symbol;
+        cx.current_mut().insert(sym, Definition::Generic(*g));
     }
     if let Some(sup) = d.supertype {
         visit_type_ref(cx, sup);
@@ -641,8 +683,8 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             if let Some(init) = init {
                 visit_expr(cx, init);
             }
-            let n = cx.ident_text(name).to_string();
-            cx.current_mut().insert(n, Definition::Local(name));
+            let sym = cx.hir.idents[name].symbol;
+            cx.current_mut().insert(sym, Definition::Local(name));
         }
         Stmt::Assign(AssignStmt { target, value, .. }) => {
             visit_expr(cx, target);
@@ -689,8 +731,8 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 visit_expr(cx, v);
             }
             if let Some(name) = init_name {
-                let n = cx.ident_text(name).to_string();
-                cx.current_mut().insert(n, Definition::Local(name));
+                let sym = cx.hir.idents[name].symbol;
+                cx.current_mut().insert(sym, Definition::Local(name));
             }
             if let Some(c) = condition {
                 visit_expr(cx, c);
@@ -713,8 +755,8 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 if let Some(t) = p.ty {
                     visit_type_ref(cx, t);
                 }
-                let n = cx.ident_text(p.name).to_string();
-                cx.current_mut().insert(n, Definition::Local(p.name));
+                let sym = cx.hir.idents[p.name].symbol;
+                cx.current_mut().insert(sym, Definition::Local(p.name));
             }
             visit_block(cx, &body);
             cx.pop_scope();
@@ -735,8 +777,8 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             visit_block(cx, &try_block);
             cx.push_scope();
             if let Some(name) = error_param {
-                let n = cx.ident_text(name).to_string();
-                cx.current_mut().insert(n, Definition::Local(name));
+                let sym = cx.hir.idents[name].symbol;
+                cx.current_mut().insert(sym, Definition::Local(name));
             }
             visit_block(cx, &catch_block);
             cx.pop_scope();
@@ -822,11 +864,11 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             body,
             ..
         }) => {
-            cx.push_scope();
+            cx.push_lambda_scope();
             for param_id in params {
                 let p = cx.hir.fn_params[param_id].clone();
-                let name = cx.ident_text(p.name).to_string();
-                cx.current_mut().insert(name, Definition::Param(p.name));
+                let sym = cx.hir.idents[p.name].symbol;
+                cx.current_mut().insert(sym, Definition::Param(p.name));
                 if let Some(t) = p.ty {
                     visit_type_ref(cx, t);
                 }
@@ -852,8 +894,17 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
         Expr::Unsupported { .. } => {
             // Lowering hasn't expanded this shape yet; nothing to bind.
         }
-        Expr::Null { .. } | Expr::This { .. } => {
-            // Keyword literals with no name to resolve.
+        Expr::Null { .. } => {
+            // Keyword literal with no name to resolve.
+        }
+        Expr::This { byte_range } => {
+            // `this` inside a lambda body is forbidden — the runtime
+            // segfaults on this shape, and lambdas have a closed scope
+            // by design. Detect via the [`ScopeKind::LambdaBody`]
+            // marker on the scope stack rather than a parallel counter.
+            if cx.scopes.iter().any(|s| s.kind == ScopeKind::LambdaBody) {
+                cx.res.this_in_lambda.push(byte_range);
+            }
         }
     }
 }
