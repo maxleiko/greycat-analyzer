@@ -43,6 +43,8 @@ When a commit lands in `tree-sitter-greycat`, the propagation order is:
 
 Steps 3 + 4 are the easy-to-miss part: queries don't propagate automatically and a stale `extension.toml` SHA means Zed users compile against the old grammar.
 
+**Hard rule — never bump the Zed extension `version` without asking.** The `version` field inside `editors/zed/extension.toml` corresponds to a published release in `zed-industries/extensions` and may already be reserved for an in-flight publish the user is preparing. Bumping it on autopilot can collide with that pending release or jump the version number past what's been QA'd. Steps 4 + 5 above are about the `[grammars.greycat] commit` SHA — that is fine to bump for every grammar SHA push. The top-level `version = "..."` field is *not*; treat it as the user's to bump. If a change actually needs a new published version (a behavioral fix users will see), say so and ask before editing the line.
+
 ## Project model
 
 GreyCat projects have a single entrypoint (conventionally `project.gcl`) whose `@library` / `@include` mod-pragmas form the closure of analyzed modules. **Never flat-walk a directory for `.gcl` files** — go through [`SourceManager::load_project(entrypoint)`](../greycat-analyzer-core/src/manager.rs), which:
