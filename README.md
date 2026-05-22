@@ -148,7 +148,7 @@ CI enforces all four on every push.
 
 Dependency direction: `syntax → core → hir → analysis → {fmt, server, cli, wasm}`.
 
-Repo conventions, grammar edit loop, and ROADMAP execution rules live in [.claude/CLAUDE.md](.claude/CLAUDE.md).
+Open work is tracked in [ROADMAP.md](ROADMAP.md). Repo conventions, grammar edit loop, and commit cadence live in [.claude/CLAUDE.md](.claude/CLAUDE.md).
 
 ## License
 

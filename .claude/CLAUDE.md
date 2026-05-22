@@ -1,8 +1,6 @@
 # greycat-analyzer
 
-Rust port of the [GreyCat](https://greycat.io) language frontend: static analyzer, LSP server, formatter, linter. Targets `.gcl` source. Distributed as a CLI binary, an LSP server, a WASM build, and library crates.
-
-The reference implementation is the TypeScript monorepo at `https://hub.datathings.com/greycat/lang`. The Rust port matches its frontend; no runtime/VM is in scope.
+Static analyzer, LSP server, formatter, and linter for [GreyCat](https://greycat.io) (`.gcl`). Distributed as a CLI binary, an LSP server, a WASM build, and library crates. No runtime / VM in scope — execution lives in the separate GreyCat runtime.
 
 Rust edition 2024. Workspace resolver `"3"`. Workspace metadata (`license = "MIT OR Apache-2.0"`, repo, authors) lives in `[workspace.package]` and every crate inherits via `*.workspace = true`.
 
@@ -14,7 +12,7 @@ Rust edition 2024. Workspace resolver `"3"`. Workspace metadata (`license = "MIT
 | [greycat-analyzer-core](../greycat-analyzer-core/) | `Document`, `SourceManager`, `span`, project graph, `@library` / `@include` resolver, parse diagnostics. Re-exports `lsp_types` and `greycat_analyzer_syntax`, `Type` / `TypeKind`, `TypeArena`, subtyping (`is_assignable_to`), `InferenceTable` foundation. |
 | [greycat-analyzer-hir](../greycat-analyzer-hir/) | Arena-backed typed HIR, CST→HIR lowering. |
 | [greycat-analyzer-analysis](../greycat-analyzer-analysis/) | Resolver, analyzer (inference + null-flow + `is`-narrowing + enum exhaustiveness + member resolution), lints, `ProjectAnalysis` driver, `ProjectIndex` cross-module index. Editor-facing services live under [src/ide/](../greycat-analyzer-analysis/src/ide/) (`actions`, `quickfix`, `rename`, and future capability services). |
-| [greycat-analyzer-fmt](../greycat-analyzer-fmt/) | Formatter (foundational; per-construct parity with TS `cst_format.ts` is P9.1). |
+| [greycat-analyzer-fmt](../greycat-analyzer-fmt/) | Formatter. |
 | [greycat-analyzer-server](../greycat-analyzer-server/) | LSP server (`lsp-server` + `crossbeam-channel`). Per-capability handlers under [src/capabilities/](../greycat-analyzer-server/src/capabilities/) (one file per LSP request kind). Shared LSP `Position` / byte-offset helpers in [src/conv.rs](../greycat-analyzer-server/src/conv.rs). |
 | [greycat-analyzer](../greycat-analyzer/) | CLI binary `greycat-lang`. `clap` subcommands in [src/cmd/](../greycat-analyzer/src/cmd/). |
 | [greycat-analyzer-wasm](../greycat-analyzer-wasm/) | `cdylib` + `rlib`, `wasm-bindgen` bridge. Drives the playground. |
@@ -95,7 +93,7 @@ Tree-sitter owns scanning; do not add a separate Rust lexer.
 
 ### Grammar lives in this repo
 
-`tree-sitter-greycat` is a **git submodule** at [tree-sitter-greycat/](../tree-sitter-greycat/) (repo root), pulled in as a Cargo `path` dep. That means: when the parser disagrees with the TS reference, **edit the grammar locally and re-run `cargo test --workspace`** instead of allowlisting the divergence in the analyzer.
+`tree-sitter-greycat` is a **git submodule** at [tree-sitter-greycat/](../tree-sitter-greycat/) (repo root), pulled in as a Cargo `path` dep. That means: when the parser mis-shapes a valid GreyCat construct, **edit the grammar locally and re-run `cargo test --workspace`** instead of allowlisting the divergence in the analyzer.
 
 Grammar edit loop:
 
@@ -116,7 +114,7 @@ The syntax crate's `build.rs` reads `node-types.json` directly from the submodul
 
 When grammar fixes are ready, commit inside the submodule and push to `maxleiko/tree-sitter-greycat`, then bump the submodule pointer here. The submodule's own [CLAUDE.md](../tree-sitter-greycat/.claude/CLAUDE.md) has the full grammar workflow (scanner.c boundary, query updates, etc.).
 
-**Hard rule:** when the gauntlet flags ERROR/MISSING, when CST shape diverges from TS reference, when typed-node accessors return `None` where the reference produces a value — pause and ask. Default answer is "fix the grammar," not "work around it." `KNOWN_GRAMMAR_GAPS` in `greycat-analyzer-syntax/tests/coverage.rs` is a temporary buffer between *gap discovered* and *grammar fixed*; it should be empty most of the time (currently `&[]`).
+**Hard rule:** when the gauntlet flags ERROR/MISSING, when CST shape mis-parses a known-valid construct, or when typed-node accessors return `None` where a value is expected — pause and ask. Default answer is "fix the grammar," not "work around it." `KNOWN_GRAMMAR_GAPS` in `greycat-analyzer-syntax/tests/coverage.rs` is a temporary buffer between *gap discovered* and *grammar fixed*; it should be empty most of the time (currently `&[]`).
 
 **Hard rule — never assume GreyCat syntax (auto-mode included):** before adding, narrowing, or restricting any grammar / lowering / analyzer rule based on a guess about what is "valid GreyCat," verify against an authoritative source. Stopping to verify is mandatory — auto-mode does **not** waive this. The cost of one paused turn is far less than the cost of regressing the corpus or shipping a parser that rejects valid programs.
 
@@ -125,9 +123,8 @@ Verification order:
 1. Inspect `tree-sitter-greycat/grammar.js` for the existing rule shape.
 2. Search the stdlib (`lib/std/*.gcl`) and corpus (`tests/corpus/`) for real examples of the construct.
 3. Invoke the `/greycat:greycat` skill — it has the canonical syntax/semantics reference.
-4. Read the TS reference at `https://hub.datathings.com/greycat/lang` if you have a checkout / can git clone with ssh (`git clone git@hub.datathings.com:greycat/lang.git`).
-5. **Run against `greycat run`** — the GreyCat compiler is the *true oracle* for what is and isn't valid. Write a minimal `project.gcl`, run `greycat run`, and read the diagnostic. Caveat: the runtime compiler doesn't do control-flow analysis (narrowing, exhaustiveness, etc.), so behaviors that depend on those still need to be validated through the TS reference / corpus / runtime *assignment* (e.g. provoke the error by actually running the call). When the TS reference and the runtime disagree (it has happened — see P12.2 generic variance), trust the runtime.
-6. If still unresolved after (1)–(5): **STOP and ask the user.** Even in auto-mode.
+4. **Run against `greycat run`** — the GreyCat runtime is the *true oracle* for what is and isn't valid. Write a minimal `project.gcl`, run `greycat run`, and read the diagnostic. Caveat: the runtime compiler doesn't do control-flow analysis (narrowing, exhaustiveness, etc.), so behaviors that depend on those need to be validated by provoking the error through actual execution (e.g. forcing the call at runtime).
+5. If still unresolved after (1)–(4): **STOP and ask the user.** Even in auto-mode.
 
 If for any reason you cannot stop (truly unattended run), leave a `// FIXME(syntax-assumption): <what you assumed and why>` comment beside the change AND append a one-line entry to [`docs/syntax-assumptions.log`](../docs/syntax-assumptions.log) so the user can find every assumption on return. Never ship a grammar / lowering change that bakes in a syntactic assumption silently.
 
@@ -149,11 +146,11 @@ The temptation, especially under time pressure, is to add a "fix-up" pass that w
 - a `if expr_id in suppressed_set` early-return whose membership is decided by reading the AST again.
 - an `is_assignable_to` rule that asymmetrically allows X→Y because some downstream call expected it; if the runtime rejects the same shape, it's the wrong fix.
 
-When you see a wrong diagnostic, **first** ask: "which stage was supposed to know this, and why didn't it?" Then fix that stage. Examples of correct fixes from the recent ROADMAP work:
+When you see a wrong diagnostic, **first** ask: "which stage was supposed to know this, and why didn't it?" Then fix that stage. Worked examples:
 
-- `for-in` element typing wasn't reaching the body — bind the iterator params' `def_types` in the `Stmt::ForIn` arm of the body walker (P18.x), not by special-casing the diagnostic in `validate_type_relations`.
-- C-style `for (var i = 0; …)` loop var was untyped inside the condition / body — bind `init_name` to declared-or-inferred type at the top of `Stmt::For` (P19.14), don't post-fix.
-- `var x = nodeFn(); if (x == null) { x = bar(); } use(x);` — `x` should be non-null after the if. The fix lives in the if-handler's narrow-frame join (P19.16) — *that* is the analysis stage responsible for narrows. A `validate_type_relations`-side suppression list would be monkey-patching.
+- `for-in` element typing wasn't reaching the body — bind the iterator params' `def_types` in the `Stmt::ForIn` arm of the body walker, not by special-casing the diagnostic in `validate_type_relations`.
+- C-style `for (var i = 0; …)` loop var was untyped inside the condition / body — bind `init_name` to declared-or-inferred type at the top of `Stmt::For`, don't post-fix.
+- `var x = nodeFn(); if (x == null) { x = bar(); } use(x);` — `x` should be non-null after the if. The fix lives in the if-handler's narrow-frame join — *that* is the analysis stage responsible for narrows. A `validate_type_relations`-side suppression list would be monkey-patching.
 - post-S12 cross-module passes (`stage_cross_module_post_passes`) ARE legitimate when they fold in *foreign* information that S12 cannot know module-locally (e.g. resolving a Project-fallback ident's foreign decl). They are not legitimate when they re-walk the same module to second-guess what S12 already typed.
 
 If you genuinely cannot find the right stage and need a temporary monkey-patch, leave a `// FIXME(monkey-patch): <stage that should own this>` comment AND open a ROADMAP entry for the proper fix. Do not let "temporary" survive a release.
@@ -256,7 +253,7 @@ Removal-side: walk the same touchpoints in reverse. **Watch out for the LSP↔an
 - `in.gcl` carries the minimal source that exercises the rule — typically a snippet that overflows the default `line_width` (120) so the formatter has to make the decision you're encoding.
 - `out.gcl` is the expected formatted output, byte-for-byte. It MUST end with a trailing newline (the formatter's `eol_last: true` default).
 - The new fixture path triggers two gauntlets automatically: the formatter parity at [greycat-analyzer-fmt/tests/parity_gauntlet.rs](../greycat-analyzer-fmt/tests/parity_gauntlet.rs) and the CST shape snapshot at [greycat-analyzer-syntax/tests/snapshot.rs](../greycat-analyzer-syntax/tests/snapshot.rs). The first run after adding the fixture will create the snapshot `.snap.new`; accept it (`cargo insta accept` or rename the file) once you've eyeballed the CST is what you expected.
-- If a fixture's `out.gcl` later changes shape because the formatter's behavior changed, that's a *deliberate* contract update — review the diff against what the TS reference produces and update fixture + commit message together. Never silently rewrite a fixture's `out.gcl` to make a failing test pass; that erases the previous contract.
+- If a fixture's `out.gcl` later changes shape because the formatter's behavior changed, that's a *deliberate* contract update — eyeball the new output, confirm it's what the rule intends, then update fixture + commit message together. Never silently rewrite a fixture's `out.gcl` to make a failing test pass; that erases the previous contract.
 
 The inline `tests/` in [greycat-analyzer-fmt/src/lib.rs](../greycat-analyzer-fmt/src/lib.rs) and the integration tests under [greycat-analyzer-fmt/tests/](../greycat-analyzer-fmt/tests/) cover *unit*-shaped invariants (round-trip stability, pragma overrides, trivia preservation, idempotency). The corpus fixtures cover *layout*-shaped invariants — every break-decision rule lives there. When in doubt, prefer adding a corpus fixture; the inline tests should be the exception, reserved for cases where the input isn't a self-contained `.gcl` snippet.
 
@@ -268,9 +265,9 @@ The inline `tests/` in [greycat-analyzer-fmt/src/lib.rs](../greycat-analyzer-fmt
 - **Position / byte-range math lives in [`src/conv.rs`](../greycat-analyzer-server/src/conv.rs).** Don't reimplement `position_to_byte` / `byte_to_position` / `byte_range_to_lsp` inline — every capability uses the same conversion.
 - **Analysis work belongs under [`greycat-analyzer-analysis/src/ide/`](../greycat-analyzer-analysis/src/ide/).** If a capability handler is walking scope, enumerating type members, resolving cross-module names, doing flow inference, or synthesising edits, it's analysis work — add an `ide/<capability>.rs` module (decoupled from `lsp_types`) and keep the LSP / CLI layer doing only shape conversion. The [`analysis::ide::rename`](../greycat-analyzer-analysis/src/ide/rename.rs) ↔ [`capabilities::references_rename`](../greycat-analyzer-server/src/capabilities/references_rename.rs) split is the reference pattern.
 - **Gitignored at repo root:** `/target`, `/gcdata`, `/files`, `/lib`, `/webroot`, `/bin`, `/greycat-analyzer-wasm/pkg`, `/playground/{node_modules,dist}`. The root [project.gcl](../project.gcl) IS committed — it pins the stdlib version via `@library("std", "...")` and drives `greycat install`.
-- **Conformance corpus:** vendored TS reference parser/project fixtures live at [tests/corpus/](../tests/corpus/). Stdlib (`lib/std/*.gcl`) is *not* vendored — populate via `greycat install`. The coverage gauntlet handles both.
+- **Corpus fixtures:** `.gcl` snippets used by the coverage and snapshot gauntlets live at [tests/corpus/](../tests/corpus/). Stdlib (`lib/std/*.gcl`) is *not* vendored — populate via `greycat install`. The coverage gauntlet handles both.
 - **`Expr::Unsupported` is a regression marker.** [greycat-analyzer-hir/tests/unsupported_audit.rs](../greycat-analyzer-hir/tests/unsupported_audit.rs) asserts the histogram is empty over stdlib + corpus. If a lowering change re-introduces an Unsupported kind, that test will fail.
-- **`Definition::Project` is the cross-module fallback.** Capabilities that need scope-aware behavior (rename, references, goto-def) consult the resolver first; only use text-equality across modules for `Project` until P8.x cross-module decl pointers land.
+- **`Definition::Project` is the cross-module fallback.** Capabilities that need scope-aware behavior (rename, references, goto-def) consult the resolver first; cross-module identity falls back to text-equality.
 - **Keep ROADMAP phase markers OUT of doc comments.** `///` and `//!` are public API documentation — they end up in `cargo doc` and ship to consumers who don't care about our internal phase numbering. Phase markers (`P19.6`, `**P22.1** —`, `(P15.7 + P16.4)`, etc.) belong in a regular `// PNN.N` line *adjacent* to the doc comment, never inside the `///` / `//!` text. Same applies to README.md and any other consumer-facing prose. Pattern: `// P19.6` on its own line, then the `/// ...` block immediately below it.
 - **LICENSE:** dual MIT / Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE` at workspace root).
 
