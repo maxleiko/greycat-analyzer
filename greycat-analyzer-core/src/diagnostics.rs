@@ -63,6 +63,8 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
             check_explicit_semi(node, source, out);
         }
         "modvar" => {
+            check_var_name(node, source, out);
+            check_modvar_type(node, source, out);
             check_modvar_initializer(node, source, out);
             check_explicit_semi(node, source, out);
         }
@@ -168,6 +170,37 @@ fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut
         message: format!(
             "attribute `{name_text}` cannot have an initializer — only `static` attributes may"
         ),
+        ..Default::default()
+    });
+}
+
+/// Grammar accepts a `modvar` without a `type_decorator` so mid-edit
+/// `var x;` parses cleanly. Real module variables must declare their
+/// type explicitly (the `modvar-shape` lint family further constrains
+/// it to a node-tag head). Caret just after the binding name (or after
+/// `var` if the name itself is missing — `missing-var-name` already
+/// flags that case).
+fn check_modvar_type(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let has_type = node
+        .named_children(&mut node.walk())
+        .any(|c| c.kind() == "type_decorator");
+    if has_type {
+        return;
+    }
+    // No type AND no name → `missing-var-name` already fires; skip
+    // here to avoid a redundant diagnostic on the same `var ;` shape.
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let after_name = name.end_byte();
+    let range = after_name..after_name;
+    let name_text = source.get(name.byte_range()).unwrap_or("?");
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("missing-modvar-type".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: format!("module-level `var {name_text}` must declare a type (e.g. `: node<T?>`)"),
         ..Default::default()
     });
 }
@@ -1108,6 +1141,51 @@ mod tests {
         assert!(
             !codes(&ds).contains(&"modvar-initializer"),
             "expected no modvar-initializer, got: {ds:?}"
+        );
+    }
+
+    /// Grammar accepts `var x;` (no `: T`) at module scope so mid-edit
+    /// source doesn't ERROR-recover. Semantic rule: modvars must
+    /// declare a type. Caret just after the binding name.
+    #[test]
+    fn modvar_missing_type_surfaces() {
+        let src = "var x;\n";
+        let ds = diags(src);
+        let hits: Vec<_> = ds
+            .iter()
+            .filter(|d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "missing-modvar-type"))
+            .collect();
+        assert_eq!(hits.len(), 1, "expected one diag, got: {ds:?}");
+        assert_eq!(hits[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            hits[0].message.contains("var x"),
+            "should name `var x`, got: {}",
+            hits[0].message
+        );
+    }
+
+    /// `var x = 1;` (no type but with initializer) — both
+    /// `missing-modvar-type` AND `modvar-initializer` fire; the user
+    /// has two distinct issues, surface both.
+    #[test]
+    fn modvar_no_type_with_initializer_surfaces_both() {
+        let ds = diags("var x = 1;\n");
+        let cs = codes(&ds);
+        assert!(cs.contains(&"missing-modvar-type"), "got: {ds:?}");
+        assert!(cs.contains(&"modvar-initializer"), "got: {ds:?}");
+    }
+
+    /// `var;` (no name) → `missing-var-name` fires (same code as
+    /// var_decl). `missing-modvar-type` is suppressed because the
+    /// name diagnostic already covers the user's editing state.
+    #[test]
+    fn modvar_missing_name_surfaces_missing_var_name() {
+        let ds = diags("var;\n");
+        let cs = codes(&ds);
+        assert!(cs.contains(&"missing-var-name"), "got: {ds:?}");
+        assert!(
+            !cs.contains(&"missing-modvar-type"),
+            "missing-modvar-type should be suppressed when name is also missing, got: {ds:?}"
         );
     }
 
