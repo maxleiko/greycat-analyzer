@@ -62,11 +62,15 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
             check_var_name(node, source, out);
             check_explicit_semi(node, source, out);
         }
+        "modvar" => {
+            check_modvar_initializer(node, source, out);
+            check_explicit_semi(node, source, out);
+        }
         // Every stmt kind whose terminator is `choice(_semi, _automatic_semicolon)`
         // in grammar.js — the ASI is a parser convenience for mid-edit
         // recovery, never semantically valid GreyCat.
         "expr_stmt" | "return_stmt" | "throw_stmt" | "break_stmt" | "continue_stmt"
-        | "breakpoint_stmt" | "do_while_stmt" | "modvar" => {
+        | "breakpoint_stmt" | "do_while_stmt" => {
             check_explicit_semi(node, source, out);
         }
         "ident" => check_ident_keyword(node, source, out),
@@ -163,6 +167,35 @@ fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut
         source: Some(DIAGNOSTIC_SOURCE.into()),
         message: format!(
             "attribute `{name_text}` cannot have an initializer — only `static` attributes may"
+        ),
+        ..Default::default()
+    });
+}
+
+/// Grammar accepts `var x: int = expr;` at module scope so mid-edit
+/// source — and the common copy-paste from JS / a local `var` — parses
+/// cleanly instead of opening an `(ERROR)` recovery span. The runtime
+/// rejects an initializer on a module-level `var` (module vars are
+/// assigned only via runtime mechanisms / explicit functions), so emit
+/// a hard error here pointing at the offending `= expr`.
+fn check_modvar_initializer(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+    let Some(init) = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "initializer")
+    else {
+        return;
+    };
+    let name_text = node
+        .child_by_field_name("name")
+        .and_then(|n| source.get(n.byte_range()))
+        .unwrap_or("?");
+    out.push(Diagnostic {
+        range: byte_range_to_lsp(source, &init.byte_range()),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("modvar-initializer".into())),
+        source: Some(DIAGNOSTIC_SOURCE.into()),
+        message: format!(
+            "module-level `var {name_text}` cannot have an initializer — only local `var` declarations can"
         ),
         ..Default::default()
     });
@@ -1028,6 +1061,53 @@ mod tests {
             hits[0].message.contains("`a`"),
             "should name `a`, got: {}",
             hits[0].message
+        );
+    }
+
+    /// Grammar accepts `var x: int = expr;` at module scope (so
+    /// mid-edit / JS-habit copy-paste doesn't cascade-recover), but the
+    /// runtime rejects an initializer on a module-level `var`. Flag the
+    /// `= expr` span.
+    #[test]
+    fn modvar_initializer_surfaces() {
+        let src = "var x: int = 42;\n";
+        let ds = diags(src);
+        let hits: Vec<_> = ds
+            .iter()
+            .filter(
+                |d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "modvar-initializer"),
+            )
+            .collect();
+        assert_eq!(hits.len(), 1, "expected one diag, got: {ds:?}");
+        assert_eq!(hits[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            hits[0].message.contains("var x"),
+            "should name `var x`, got: {}",
+            hits[0].message
+        );
+        // Range covers the `= 42` slice.
+        let start_byte: usize = src
+            .lines()
+            .take(hits[0].range.start.line as usize)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            + hits[0].range.start.character as usize;
+        let end_byte: usize = src
+            .lines()
+            .take(hits[0].range.end.line as usize)
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            + hits[0].range.end.character as usize;
+        assert_eq!(src.get(start_byte..end_byte), Some("= 42"));
+    }
+
+    /// Canonical module-var (no initializer) stays silent.
+    #[test]
+    fn modvar_without_initializer_no_diag() {
+        let ds = diags("var x: int;\n");
+        assert!(
+            !codes(&ds).contains(&"modvar-initializer"),
+            "expected no modvar-initializer, got: {ds:?}"
         );
     }
 

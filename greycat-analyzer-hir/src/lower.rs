@@ -590,10 +590,19 @@ fn lower_top_var(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<VarDe
     let name = cx.alloc_ident(name_node);
     let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
     modifiers.annotations = lower_annotations(cx, node);
+    // The grammar wraps the type in a `type_decorator` child rather
+    // than exposing it as a top-level `type` field (mirrors `var_decl`
+    // — see `lower_var_decl`). `lower_type_ref` unwraps the decorator
+    // back to the inner `type_ident`.
     let ty = node
-        .child_by_field_name("type")
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "type_decorator")
         .and_then(|n| lower_type_ref(cx, n));
-    // var_decl has no field for init; modvar has an `initializer` child.
+    // The initializer (`= expr`) parses but is semantically invalid on
+    // a module-level `var`; `parse_diagnostics` emits a hard error for
+    // it. We still lower the expression so downstream type / resolve
+    // diagnostics fire on it (otherwise a single grammar-permissive
+    // shape would hide every nested issue).
     let init = node
         .named_children(&mut node.walk())
         .find(|c| c.kind() == "initializer")

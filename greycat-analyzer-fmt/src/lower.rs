@@ -346,9 +346,21 @@ fn lower_modvar<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if let Some(name) = node.child_by_field_name("name") {
         parts.push(Doc::text(cx.text(name)));
     }
-    parts.push(Doc::text(": "));
-    if let Some(ty) = node.child_by_field_name("type") {
-        parts.push(lower_node(cx, ty));
+    // `type_decorator` carries its own leading `: ` (see
+    // `lower_type_decorator`); the optional `initializer` is
+    // semantically invalid here but the grammar accepts it, so format
+    // round-trips the source as written and `parse_diagnostics` emits
+    // a `modvar-initializer` error pointing at the `= expr`.
+    let mut walker = node.walk();
+    for c in node.named_children(&mut walker) {
+        match c.kind() {
+            "type_decorator" => parts.push(lower_node(cx, c)),
+            "initializer" => {
+                parts.push(Doc::space());
+                parts.push(lower_node(cx, c));
+            }
+            _ => {}
+        }
     }
     parts.push(Doc::text(";"));
     Doc::concat(parts)

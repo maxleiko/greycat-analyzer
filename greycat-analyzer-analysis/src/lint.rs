@@ -323,7 +323,7 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
     ),
     rule(
         "redundant-semicolon",
-        "error on a stray `;` after a fn or method body (`fn f() {};`) — the runtime rejects it; auto-fix removes the `;`",
+        "error on a stray `;` after a top-level decl body (`fn f() {};`, `type T {};`, `enum E {};`, method) — the runtime rejects it; auto-fix removes the `;`",
     ),
     rule(
         "conflicting-lint-pragma",
@@ -512,13 +512,14 @@ pub fn lint_catch_empty_parens(
     }
 }
 
-/// Flag every `block_trailing_semi` node — a stray `;` after a fn or
-/// method body's closing `}`. The grammar permissively accepts the
-/// shape so a `};` doesn't open a recovery span that swallows the
-/// rest of the surrounding type / module, but the runtime rejects
-/// it; this lint is the analyzer-side strict check that pulls the
-/// scope back to a single-token diagnostic with a quickfix removing
-/// the offending range.
+/// Flag every `block_trailing_semi` node — a stray `;` after the
+/// closing `}` of a top-level decl body (`fn_decl`, `type_decl`,
+/// `enum_decl`, or `type_method`). The grammar permissively accepts
+/// the shape so a `};` doesn't open a recovery span that swallows the
+/// rest of the surrounding type / module, but the runtime rejects it;
+/// this lint is the analyzer-side strict check that pulls the scope
+/// back to a single-token diagnostic with a quickfix removing the
+/// offending range.
 pub fn lint_redundant_semicolon(
     text: &str,
     root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
@@ -548,9 +549,9 @@ pub fn lint_redundant_semicolon(
             .get(byte_range.clone())
             .is_some_and(|s| s.contains(";;"))
         {
-            "redundant `;` after fn / method body — drop them".to_string()
+            "redundant `;` after declaration body — drop them".to_string()
         } else {
-            "redundant `;` after fn / method body — drop it".to_string()
+            "redundant `;` after declaration body — drop it".to_string()
         };
         out.push(LintDiagnostic {
             rule: "redundant-semicolon",

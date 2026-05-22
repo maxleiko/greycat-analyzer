@@ -21,11 +21,13 @@ expression: "fn helper(): int { return 1; } // after fn decl\nvar top: node<int?
   (line_comment '// after fn decl')
   (modvar
     name: (ident 'top')
-    type: (type_ident
-      name: (ident 'node')
-      params: (type_ident
-        name: (ident 'int')
-        (optional '?')
+    (type_decorator
+      type: (type_ident
+        name: (ident 'node')
+        params: (type_ident
+          name: (ident 'int')
+          (optional '?')
+        )
       )
     )
   )
