@@ -68,25 +68,24 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
             check_modvar_initializer(node, source, out);
             check_explicit_semi(node, source, out);
         }
-        // Grammar accepts a freestanding `expr_stmt` at module scope
-        // so doc snippets (triple-backtick `gcl` blocks containing
-        // only an expression) pretty-print under the same syntax
-        // highlighter as real modules. A real project module cannot
-        // contain a freestanding expression; the `if !…` guard runs
-        // `check_top_level_expr` first — it emits `top-level-expr` AND
-        // returns `true` when the stmt is at module scope, suppressing
-        // the trailing `missing-semicolon` (which would be noise on
-        // top of an already-invalid stmt). Inner shape checks
-        // (`Foo::` / `s.` / `s->` / keyword-ident) still recurse below
-        // the match.
-        "expr_stmt" if !check_top_level_expr(node, source, out) => {
-            check_explicit_semi(node, source, out);
+        // Grammar accepts most block-style statements at module scope
+        // (wrapped in `mod_stmt`) so doc snippets pretty-print under
+        // the same tree-sitter highlighter as real modules. A real
+        // project module cannot contain a freestanding stmt; flag the
+        // whole wrapper with `top-level-stmt`. Inner shape checks
+        // (`Foo::` / `s.` / `s->` / keyword-ident / missing-`;` on
+        // the inner expr_stmt) are intentionally NOT recursed: the
+        // stmt is invalid as a whole, piling per-fragment diags on
+        // top is noise.
+        "mod_stmt" => {
+            check_top_level_stmt(node, source, out);
+            return;
         }
         // Every stmt kind whose terminator is `choice(_semi, _automatic_semicolon)`
         // in grammar.js — the ASI is a parser convenience for mid-edit
         // recovery, never semantically valid GreyCat.
-        "return_stmt" | "throw_stmt" | "break_stmt" | "continue_stmt" | "breakpoint_stmt"
-        | "do_while_stmt" => {
+        "expr_stmt" | "return_stmt" | "throw_stmt" | "break_stmt" | "continue_stmt"
+        | "breakpoint_stmt" | "do_while_stmt" => {
             check_explicit_semi(node, source, out);
         }
         "ident" => check_ident_keyword(node, source, out),
@@ -188,38 +187,29 @@ fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut
     });
 }
 
-/// Grammar accepts a freestanding `expr_stmt` at module scope so doc
-/// snippets parse under the same highlighter as real modules (see
-/// `module` rule in grammar.js). A real project module cannot contain
-/// a top-level expression — emit a hard error covering the whole
-/// stmt. Returns `true` if the diagnostic was emitted (caller uses
-/// this to suppress the trailing `missing-semicolon` check).
-fn check_top_level_expr(
-    node: tree_sitter::Node<'_>,
-    source: &str,
-    out: &mut Vec<Diagnostic>,
-) -> bool {
-    if node.parent().map(|p| p.kind()) != Some("module") {
-        return false;
-    }
+/// Grammar accepts most block-style statements at module scope
+/// (wrapped in `mod_stmt`) so doc snippets parse under the same
+/// highlighter as real modules (see `module` / `mod_stmt` rules in
+/// grammar.js). A real project module cannot contain a freestanding
+/// stmt — emit a hard error covering the whole wrapper.
+fn check_top_level_stmt(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
     // Range covers the whole stmt so the editor's red underline marks
-    // the entire offending snippet — useful when the expression spans
-    // multiple lines.
+    // the entire offending snippet — useful when the stmt spans
+    // multiple lines (`if (cond) { ... }`).
     let mut range = node.byte_range();
     // Trim a trailing explicit `;` from the range so the squiggle
-    // doesn't extend past the visible expression text.
+    // doesn't extend past the visible stmt text.
     if source.get(range.clone()).is_some_and(|s| s.ends_with(';')) {
         range.end -= 1;
     }
     out.push(Diagnostic {
         range: byte_range_to_lsp(source, &range),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: Some(NumberOrString::String("top-level-expr".into())),
+        code: Some(NumberOrString::String("top-level-stmt".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
-        message: "expressions cannot appear at module scope — wrap in a `fn` body".into(),
+        message: "statements cannot appear at module scope — wrap in a `fn` body".into(),
         ..Default::default()
     });
-    true
 }
 
 /// Grammar accepts a `modvar` without a `type_decorator` so mid-edit
@@ -1223,20 +1213,21 @@ mod tests {
         assert!(cs.contains(&"modvar-initializer"), "got: {ds:?}");
     }
 
-    /// Grammar accepts `foo();` at module scope so doc snippets work
-    /// for syntax highlighting. As a project module, that's invalid —
-    /// `top-level-expr` fires covering the whole stmt.
+    /// Grammar accepts `foo();` at module scope (wrapped in
+    /// `mod_stmt`) so doc snippets work for syntax highlighting. As a
+    /// project module, that's invalid — `top-level-stmt` fires
+    /// covering the whole wrapper.
     #[test]
-    fn top_level_expr_surfaces() {
+    fn top_level_stmt_surfaces_on_expr() {
         let src = "foo();\n";
         let ds = diags(src);
         let hits: Vec<_> = ds
             .iter()
-            .filter(|d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "top-level-expr"))
+            .filter(|d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "top-level-stmt"))
             .collect();
         assert_eq!(hits.len(), 1, "expected one diag, got: {ds:?}");
         assert_eq!(hits[0].severity, Some(DiagnosticSeverity::ERROR));
-        // Range covers `foo()` (the `;` is trimmed).
+        // Range covers `foo()` (the trailing `;` is trimmed).
         let start_byte: usize = src
             .lines()
             .take(hits[0].range.start.line as usize)
@@ -1252,37 +1243,52 @@ mod tests {
         assert_eq!(src.get(start_byte..end_byte), Some("foo()"));
     }
 
-    /// `foo()` without trailing `;` at top level — `top-level-expr`
-    /// fires but `missing-semicolon` does NOT (the whole stmt is
-    /// invalid; piling a semi diag on top is noise).
+    /// `top-level-stmt` covers other stmt kinds too — `if`, `while`,
+    /// `return`, etc. all wrap in `mod_stmt` at module scope.
     #[test]
-    fn top_level_expr_suppresses_missing_semicolon() {
+    fn top_level_stmt_surfaces_on_if() {
+        let ds = diags("if (cond) { foo(); }\n");
+        let cs = codes(&ds);
+        assert!(cs.contains(&"top-level-stmt"), "got: {ds:?}");
+    }
+
+    /// `foo()` without trailing `;` at top level — `top-level-stmt`
+    /// fires but `missing-semicolon` does NOT (the wrapper short-
+    /// circuits recursion into the inner expr_stmt, where the semi
+    /// check lives — that suppression is the point).
+    #[test]
+    fn top_level_stmt_suppresses_inner_diagnostics() {
         let ds = diags("foo()\n");
         let cs = codes(&ds);
-        assert!(cs.contains(&"top-level-expr"), "got: {ds:?}");
+        assert!(cs.contains(&"top-level-stmt"), "got: {ds:?}");
         assert!(
             !cs.contains(&"missing-semicolon"),
-            "missing-semicolon should be suppressed on a top-level expr, got: {ds:?}"
+            "missing-semicolon should be suppressed on a top-level stmt, got: {ds:?}"
         );
     }
 
-    /// `expr_stmt` inside a `fn` body stays unaffected — no
-    /// `top-level-expr` (only top-level expr_stmts trigger the rule).
+    /// `expr_stmt` inside a `fn` body stays unaffected — `mod_stmt`
+    /// only fires at module scope (it's a direct child of `module`).
     #[test]
     fn nested_expr_stmt_unaffected() {
         let ds = diags("fn f() { foo(); }\n");
         let cs = codes(&ds);
-        assert!(!cs.contains(&"top-level-expr"), "got: {ds:?}");
+        assert!(!cs.contains(&"top-level-stmt"), "got: {ds:?}");
     }
 
-    /// Inner shape checks still recurse: a top-level `Foo::` surfaces
-    /// both `top-level-expr` and `missing-static-property`.
+    /// A top-level `Foo::;` produces ONE clean `top-level-stmt`
+    /// diagnostic — the `missing-static-property` recursion is
+    /// suppressed so the user sees the headline error without
+    /// per-fragment noise on top.
     #[test]
-    fn top_level_expr_still_recurses_inner_checks() {
+    fn top_level_stmt_suppresses_inner_shape_checks() {
         let ds = diags("Foo::;\n");
         let cs = codes(&ds);
-        assert!(cs.contains(&"top-level-expr"), "got: {ds:?}");
-        assert!(cs.contains(&"missing-static-property"), "got: {ds:?}");
+        assert!(cs.contains(&"top-level-stmt"), "got: {ds:?}");
+        assert!(
+            !cs.contains(&"missing-static-property"),
+            "inner shape checks should be suppressed under mod_stmt, got: {ds:?}"
+        );
     }
 
     /// `var;` (no name) → `missing-var-name` fires (same code as

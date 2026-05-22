@@ -122,6 +122,18 @@ fn lower_node<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         "type_decl" => lower_type_decl(cx, node),
         "enum_decl" => lower_enum_decl(cx, node),
         "modvar" => lower_modvar(cx, node),
+        // `mod_stmt` is a transparent wrapper around the block-stmt
+        // grammar nodes that are permissively accepted at module scope
+        // (for doc-snippet highlighting); the formatter recurses into
+        // the inner stmt and renders it as-is. The analyzer flags the
+        // wrapper with `top-level-stmt`, but fmt isn't a semantic
+        // gate — it round-trips the source faithfully.
+        "mod_stmt" => {
+            let inner = node
+                .named_children(&mut node.walk())
+                .find(|c| !matches!(c.kind(), "line_comment" | "block_comment"));
+            inner.map(|c| lower_node(cx, c)).unwrap_or(Doc::nil())
+        }
         // Bodies
         "type_body" => lower_type_body(cx, node),
         "enum_body" => lower_enum_body(cx, node),
