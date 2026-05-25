@@ -1750,15 +1750,16 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::TypeOf(_) => false,
         },
 
-        // Primitive / Lambda / Enum / GenericParam: the wrapper adds
-        // no inheritance-aware rules beyond what core already covers.
-        // Only the target-Union retry is meaningful (a single alt
-        // might match via the wrapper's extensions even when core
-        // rejected the whole union).
-        TypeKind::Primitive(_)
-        | TypeKind::Lambda { .. }
-        | TypeKind::Enum { .. }
-        | TypeKind::GenericParam { .. } => match b_kind {
+        // Lambda source: structural→nominal `fn(...) -> Type(function)`.
+        // Any lambda flows into the opaque GCL `function` slot — the
+        // dual of "lambdas and `function` are two concepts unified at
+        // the type-checker." Target-Union retry as for the sibling
+        // kinds below. The reverse direction (function → specific
+        // Lambda{...}) is intentionally NOT added: the opaque side
+        // carries no signature, so admitting it into a typed slot
+        // would be unsound.
+        TypeKind::Lambda { .. } => match b_kind {
+            TypeKind::Type(d) if Some(d) == well_known.function_decl => true,
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
                 is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
@@ -1774,6 +1775,30 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::GenericParam { .. }
             | TypeKind::TypeOf(_) => false,
         },
+
+        // Primitive / Enum / GenericParam: the wrapper adds no
+        // inheritance-aware rules beyond what core already covers.
+        // Only the target-Union retry is meaningful (a single alt
+        // might match via the wrapper's extensions even when core
+        // rejected the whole union).
+        TypeKind::Primitive(_) | TypeKind::Enum { .. } | TypeKind::GenericParam { .. } => {
+            match b_kind {
+                TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                    is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
+                }),
+                TypeKind::Null
+                | TypeKind::Any
+                | TypeKind::Never
+                | TypeKind::Unresolved { .. }
+                | TypeKind::Primitive(_)
+                | TypeKind::Type(_)
+                | TypeKind::Generic { .. }
+                | TypeKind::Lambda { .. }
+                | TypeKind::Enum { .. }
+                | TypeKind::GenericParam { .. }
+                | TypeKind::TypeOf(_) => false,
+            }
+        }
     }
 }
 
