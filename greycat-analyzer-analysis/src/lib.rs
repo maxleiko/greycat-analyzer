@@ -55,6 +55,11 @@ pub mod pragmas;
 pub mod project;
 pub mod reachability;
 pub mod resolver;
+/// Shared return-type inference helpers consumed by both the
+/// `infer-return-type` lint and the lambda body-typing arm. The
+/// "lambda is a top-level fn in a scope" mental model demands one
+/// implementation for both — see `return_inference::inferred_return_from_body`.
+pub mod return_inference;
 pub mod stdlib;
 // P35.1
 pub mod well_known;

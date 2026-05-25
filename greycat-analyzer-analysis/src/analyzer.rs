@@ -5883,11 +5883,19 @@ impl<'a> Cx<'a> {
                 }
                 let declared_ret = return_type.map(|t| self.lower_type_ref(t));
                 self.visit_block(&body, declared_ret);
-                // Body-inference for `ret = None` lambdas lands in
-                // step 5 of the lambda-unify plan; today we just store
-                // the declared return when present and leave `None`
-                // for unannotated lambdas (display: `fn(...)`).
-                self.arena.lambda(param_tys, declared_ret)
+                // Lambda body inference mirrors the fn-level
+                // infer-return-type lint — same `return_inference`
+                // helper. When the user didn't annotate, walk the body
+                // returns and join them; only accept a single GCL-
+                // expressible type (`T` or `T?`), otherwise stay
+                // `None` (rendered `fn(...)`).
+                let inferred_ret = declared_ret.or_else(|| {
+                    let ty = crate::return_inference::inferred_return_from_block(
+                        self.hir, self.out, self.arena, &body,
+                    )?;
+                    crate::return_inference::is_expressible_type_ident(self.arena, ty).then_some(ty)
+                });
+                self.arena.lambda(param_tys, inferred_ret)
             }
             Expr::Is { value, .. } => {
                 let _ = self.visit_expr(value);
