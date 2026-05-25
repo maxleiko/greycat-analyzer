@@ -9,7 +9,7 @@
 
 use greycat_analyzer_analysis::ide::rename;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
-use greycat_analyzer_core::SourceManager;
+use greycat_analyzer_core::{SourceEncoding, SourceManager};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
@@ -37,15 +37,16 @@ pub fn prepare_rename(
     text: &str,
     root: tree_sitter::Node<'_>,
     pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<PrepareRenameResponse> {
-    let byte = position_to_byte(text, pos);
+    let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
     if node.kind() != "ident" {
         return None;
     }
     let placeholder = text.get(node.byte_range())?.to_string();
     Some(PrepareRenameResponse::RangeWithPlaceholder {
-        range: byte_range_to_lsp(text, &node.byte_range()),
+        range: byte_range_to_lsp(text, &node.byte_range(), encoding),
         placeholder,
     })
 }
@@ -68,8 +69,9 @@ pub fn references_across_project(
     manager: &SourceManager,
     cursor_uri: &Uri,
     cursor_pos: Position,
+    encoding: SourceEncoding,
 ) -> Vec<Location> {
-    let Some(target) = cursor_target(project, manager, cursor_uri, cursor_pos) else {
+    let Some(target) = cursor_target(project, manager, cursor_uri, cursor_pos, encoding) else {
         return Vec::new();
     };
     rename::target_sites(project, &target)
@@ -78,7 +80,7 @@ pub fn references_across_project(
             let cell = manager.get(&site.uri)?;
             let doc = cell.borrow();
             Some(Location {
-                range: byte_range_to_lsp(&doc.text, &site.byte_range),
+                range: byte_range_to_lsp(&doc.text, &site.byte_range, encoding),
                 uri: site.uri,
             })
         })
@@ -94,8 +96,9 @@ pub fn rename_across_project(
     cursor_uri: &Uri,
     cursor_pos: Position,
     new_name: &str,
+    encoding: SourceEncoding,
 ) -> Option<WorkspaceEdit> {
-    let target = cursor_target(project, manager, cursor_uri, cursor_pos)?;
+    let target = cursor_target(project, manager, cursor_uri, cursor_pos, encoding)?;
     #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
     let mut changes: std::collections::HashMap<Uri, Vec<TextEdit>> =
         std::collections::HashMap::new();
@@ -104,7 +107,7 @@ pub fn rename_across_project(
             continue;
         };
         let doc = cell.borrow();
-        let range = byte_range_to_lsp(&doc.text, &site.byte_range);
+        let range = byte_range_to_lsp(&doc.text, &site.byte_range, encoding);
         changes.entry(site.uri).or_default().push(TextEdit {
             range,
             new_text: new_name.to_string(),
@@ -125,11 +128,18 @@ fn cursor_target(
     manager: &SourceManager,
     cursor_uri: &Uri,
     cursor_pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<RenameTarget> {
     let cell = manager.get(cursor_uri)?;
     let doc = cell.borrow();
     let module = project.module(cursor_uri)?;
-    let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
+    let cursor_idx = cursor_ident_idx(
+        &doc.text,
+        doc.root_node(),
+        cursor_pos,
+        &module.hir,
+        encoding,
+    )?;
     drop(doc);
     rename::resolve_target(project, cursor_uri, cursor_idx)
 }

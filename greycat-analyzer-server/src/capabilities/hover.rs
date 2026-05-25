@@ -15,7 +15,7 @@ use greycat_analyzer_analysis::ide::render::{
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, Resolutions, resolve};
 use greycat_analyzer_analysis::well_known::DeclRegistry;
-use greycat_analyzer_core::{SourceManager, SymbolTable, TypeArena, TypeId};
+use greycat_analyzer_core::{SourceEncoding, SourceManager, SymbolTable, TypeArena, TypeId};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
@@ -36,6 +36,7 @@ use crate::conv::{byte_range_to_lsp, position_to_byte};
 /// Consumes the cached `ModuleAnalysis` for `uri` directly (so cross-
 /// module name resolution flows through the project index). Falls back
 /// to the in-module-only [`hover`] when the cache is empty.
+#[allow(clippy::too_many_arguments)]
 pub fn hover_with_project(
     text: &str,
     lib: &str,
@@ -44,9 +45,10 @@ pub fn hover_with_project(
     uri: &Uri,
     project: &ProjectAnalysis,
     manager: &SourceManager,
+    encoding: SourceEncoding,
 ) -> Option<Hover> {
     if let Some(module) = project.module(uri) {
-        let byte = position_to_byte(text, pos);
+        let byte = position_to_byte(text, pos, encoding);
         let node = node_at_offset(root, byte)?;
         if !node.is_named() {
             return None;
@@ -74,6 +76,7 @@ pub fn hover_with_project(
                     markdown,
                     ident.byte_range.clone(),
                     text,
+                    encoding,
                 ));
             }
             // Decl-defining ident.
@@ -94,6 +97,7 @@ pub fn hover_with_project(
                             markdown,
                             module.hir.idents[name_id].byte_range.clone(),
                             text,
+                            encoding,
                         ));
                     }
                 }
@@ -111,6 +115,7 @@ pub fn hover_with_project(
                     markdown,
                     ident.byte_range.clone(),
                     text,
+                    encoding,
                 ));
             }
             // TypeAttr-defining ident (cursor on the `path` in
@@ -146,6 +151,7 @@ pub fn hover_with_project(
                     markdown,
                     module.hir.idents[attr.name].byte_range.clone(),
                     text,
+                    encoding,
                 ));
             }
         }
@@ -172,13 +178,13 @@ pub fn hover_with_project(
                     short_expr_label(&module.hir, project.symbols(), expr),
                     project.display_type(*ty),
                 );
-                return Some(hover_from_markdown(wrap_code(&label), r, text));
+                return Some(hover_from_markdown(wrap_code(&label), r, text, encoding));
             }
         }
         return None;
     }
     // Cache miss — fall back to in-module-only hover.
-    hover_inner(text, lib, root, pos)
+    hover_inner(text, lib, root, pos, encoding)
 }
 
 #[derive(Copy, Clone)]
@@ -188,8 +194,14 @@ struct HoverProjectCtx<'a> {
     manager: &'a SourceManager,
 }
 
-fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position) -> Option<Hover> {
-    let byte = position_to_byte(text, pos);
+fn hover_inner(
+    text: &str,
+    lib: &str,
+    root: tree_sitter::Node<'_>,
+    pos: Position,
+    encoding: SourceEncoding,
+) -> Option<Hover> {
+    let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
     if !node.is_named() {
         return None;
@@ -223,6 +235,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
                 markdown,
                 ident.byte_range.clone(),
                 text,
+                encoding,
             ));
         }
         // Decl-defining ident (e.g. cursor on the `helper` in `fn helper()`).
@@ -237,6 +250,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
                         markdown,
                         hir.idents[name_id].byte_range.clone(),
                         text,
+                        encoding,
                     ));
                 }
             }
@@ -254,6 +268,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
                 markdown,
                 ident.byte_range.clone(),
                 text,
+                encoding,
             ));
         }
     }
@@ -285,7 +300,7 @@ fn hover_inner(text: &str, lib: &str, root: tree_sitter::Node<'_>, pos: Position
                     *ty,
                 ),
             );
-            return Some(hover_from_markdown(wrap_code(&label), r, text));
+            return Some(hover_from_markdown(wrap_code(&label), r, text, encoding));
         }
     }
 
@@ -696,13 +711,18 @@ fn wrap_code(label: &str) -> String {
     format!("```greycat\n{label}\n```")
 }
 
-fn hover_from_markdown(markdown: String, range: Range<usize>, text: &str) -> Hover {
+fn hover_from_markdown(
+    markdown: String,
+    range: Range<usize>,
+    text: &str,
+    encoding: SourceEncoding,
+) -> Hover {
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value: markdown,
         }),
-        range: Some(byte_range_to_lsp(text, &range)),
+        range: Some(byte_range_to_lsp(text, &range, encoding)),
     }
 }
 

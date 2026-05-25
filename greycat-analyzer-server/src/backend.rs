@@ -310,7 +310,7 @@ impl Backend {
         };
         let doc = cell.borrow();
         let version = Some(doc.version);
-        let mut fast = parse_diagnostics(doc.root_node(), &doc.text);
+        let mut fast = parse_diagnostics(doc.root_node(), &doc.text, self.encoding);
         // P15.5 — pragma resolution diagnostics. Recomputed on every
         // publish so edits to `@include` / `@library` pragmas reflect
         // immediately. Anchored to the owning project's root. Skipped
@@ -318,21 +318,31 @@ impl Backend {
         if !project.root.as_os_str().is_empty() {
             let desc = parse_module_desc(uri.clone(), &doc.text, doc.root_node());
             if let Ok(ctx) = FsContext::new() {
-                fast.extend(pragma_diagnostics(&doc.text, &desc, &project.root, &ctx));
+                fast.extend(pragma_diagnostics(
+                    &doc.text,
+                    &desc,
+                    &project.root,
+                    &ctx,
+                    self.encoding,
+                ));
             }
         }
         // P32.6 — multi-project-owner advisory.
         if let Some(owners) = self.uri_owner.get(uri)
             && owners.len() > 1
         {
-            fast.push(multi_project_owner_diagnostic(&doc.text, owners));
+            fast.push(multi_project_owner_diagnostic(
+                &doc.text,
+                owners,
+                self.encoding,
+            ));
         }
         // P33.1 — `missing-std` overlay on the entrypoint when the
         // resolver couldn't find std.
         if project.std_resolution == StdResolution::Missing
             && project.entrypoint_uri.as_ref() == Some(uri)
         {
-            fast.push(missing_std_diagnostic(&doc.text));
+            fast.push(missing_std_diagnostic(&doc.text, self.encoding));
         }
         // `duplicate-module-name` overlay on stem-colliding files.
         if let Some((name, existing)) = project.analysis.index.duplicate_modules.get(uri) {
@@ -341,12 +351,13 @@ impl Backend {
                 &doc.text,
                 module_name,
                 existing,
+                self.encoding,
             ));
         }
         let analyzer = project
             .analysis
             .module(uri)
-            .map(|m| diagnostics_from_module(&doc.text, m, self.lint_libs))
+            .map(|m| diagnostics_from_module(&doc.text, m, self.lint_libs, self.encoding))
             .unwrap_or_default();
         (fast, analyzer, version)
     }
@@ -365,8 +376,8 @@ impl Backend {
         // maps from leaking across project ↔ orphan transitions.
         if let Some(cell) = self.orphans.get(uri) {
             let doc = cell.borrow();
-            let mut diags = parse_diagnostics(doc.root_node(), &doc.text);
-            diags.push(orphan_module_diagnostic(&doc.text));
+            let mut diags = parse_diagnostics(doc.root_node(), &doc.text, self.encoding);
+            diags.push(orphan_module_diagnostic(&doc.text, self.encoding));
             let version = doc.version;
             drop(doc);
             self.last_analyzer_publish.remove(uri);

@@ -37,12 +37,25 @@ pub fn start_server() -> Result<()> {
     let (id, params) = conn.initialize_start_while(|| running.load(Ordering::SeqCst))?;
     let init_params: InitializeParams = serde_json::from_value(params).unwrap();
 
+    // Honest LSP encoding negotiation. Clients that advertise UTF-8 in
+    // `general.positionEncodings` get UTF-8 back (cheaper — tree-sitter
+    // already returns byte columns); everyone else gets UTF-16, the LSP
+    // default. The chosen encoding flows into `Backend::encoding` so
+    // capability handlers convert columns / lengths to the right code-
+    // unit count, and the response field is kept in lockstep so the
+    // client doesn't have to guess.
+    let encoding = negotiated_encoding(&init_params);
+    let position_encoding_label = match encoding {
+        SourceEncoding::UTF8 => "utf-8",
+        SourceEncoding::UTF16 => "utf-16",
+    };
+
     let initialize_data = serde_json::json!({
         "serverInfo": {
             "name": "greycat-analyzer",
             "version": VERSION
         },
-        "positionEncoding": "utf-8", // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#positionEncodingKind
+        "positionEncoding": position_encoding_label,
         "capabilities": ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Options(
                 TextDocumentSyncOptions {
@@ -110,14 +123,35 @@ pub fn start_server() -> Result<()> {
     });
 
     conn.initialize_finish_while(id, initialize_data, || running.load(Ordering::SeqCst))?;
-    main_loop(conn, init_params)?;
+    main_loop(conn, init_params, encoding)?;
     io_threads.join()?;
 
     info!("shutting down greycat-analyzer");
     Ok(())
 }
 
-fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
+/// Pick the position encoding to negotiate based on the client's
+/// `general.positionEncodings` advertisement. UTF-8 if the client
+/// explicitly supports it (lets us pass tree-sitter byte columns
+/// straight through); otherwise UTF-16, which is the LSP default. The
+/// chosen encoding must be reported back to the client via the
+/// `positionEncoding` field of the initialize response so both ends
+/// agree — a stale "always utf-8" claim with a UTF-16-only client
+/// yields silent overruns (e.g. doc-comment tokens past a multibyte
+/// char bleed onto the next line).
+fn negotiated_encoding(init: &InitializeParams) -> SourceEncoding {
+    match init
+        .capabilities
+        .general
+        .as_ref()
+        .and_then(|g| g.position_encodings.as_deref())
+    {
+        Some(encodings) if encodings.contains(&PositionEncodingKind::UTF8) => SourceEncoding::UTF8,
+        _ => SourceEncoding::UTF16,
+    }
+}
+
+fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding) -> Result<()> {
     info!("greycat-analyzer {VERSION} started");
 
     let mut server = Backend {
@@ -131,17 +165,7 @@ fn main_loop(conn: Connection, init: InitializeParams) -> Result<()> {
         // builds always have it; WASM uses a different bridge that
         // doesn't go through this entry point.
         registry: Some(crate::registry::shared()),
-        encoding: match init
-            .capabilities
-            .general
-            .as_ref()
-            .and_then(|g| g.position_encodings.as_deref())
-        {
-            Some(encodings) if encodings.contains(&PositionEncodingKind::UTF8) => {
-                SourceEncoding::UTF8
-            }
-            _ => SourceEncoding::UTF16,
-        },
+        encoding,
         last_analyzer_publish: Default::default(),
         pending_trailing: Default::default(),
         last_analyzer_diags: Default::default(),
@@ -344,6 +368,7 @@ fn hover_handler(server: &Backend, params: HoverParams) -> Option<Hover> {
         &uri,
         &project.analysis,
         &project.manager,
+        server.encoding,
     )
 }
 
@@ -353,7 +378,7 @@ fn signature_help_handler(server: &Backend, params: SignatureHelpParams) -> Opti
     let project = server.project_for(&uri)?;
     let cell = project.manager.get(&uri)?;
     let doc = cell.borrow();
-    capabilities::signature_help(&doc.text, &doc.lib, doc.root_node(), pos)
+    capabilities::signature_help(&doc.text, &doc.lib, doc.root_node(), pos, server.encoding)
 }
 
 fn goto_definition_handler(
@@ -363,7 +388,13 @@ fn goto_definition_handler(
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let project = server.project_for(&uri)?;
-    capabilities::goto_definition_across_project(&project.analysis, &project.manager, &uri, pos)
+    capabilities::goto_definition_across_project(
+        &project.analysis,
+        &project.manager,
+        &uri,
+        pos,
+        server.encoding,
+    )
 }
 
 fn goto_declaration_handler(
@@ -373,7 +404,13 @@ fn goto_declaration_handler(
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let project = server.project_for(&uri)?;
-    capabilities::goto_declaration_across_project(&project.analysis, &project.manager, &uri, pos)
+    capabilities::goto_declaration_across_project(
+        &project.analysis,
+        &project.manager,
+        &uri,
+        pos,
+        server.encoding,
+    )
 }
 
 fn goto_implementation_handler(
@@ -386,7 +423,13 @@ fn goto_implementation_handler(
     let uri = params.text_document_position_params.text_document.uri;
     let pos = params.text_document_position_params.position;
     let project = server.project_for(&uri)?;
-    capabilities::goto_implementation_across_project(&project.analysis, &project.manager, &uri, pos)
+    capabilities::goto_implementation_across_project(
+        &project.analysis,
+        &project.manager,
+        &uri,
+        pos,
+        server.encoding,
+    )
 }
 
 fn document_symbols_handler(
@@ -396,7 +439,8 @@ fn document_symbols_handler(
     let project = server.project_for(&params.text_document.uri)?;
     let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
-    let syms = capabilities::document_symbols(&doc.text, &doc.lib, doc.root_node());
+    let syms =
+        capabilities::document_symbols(&doc.text, &doc.lib, doc.root_node(), server.encoding);
     Some(DocumentSymbolResponse::Nested(syms))
 }
 
@@ -413,6 +457,7 @@ fn references_handler(server: &Backend, params: ReferenceParams) -> Option<Vec<L
         &project.manager,
         &uri,
         pos,
+        server.encoding,
     ))
 }
 
@@ -423,7 +468,7 @@ fn prepare_rename_handler(
     let project = server.project_for(&params.text_document.uri)?;
     let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
-    capabilities::prepare_rename(&doc.text, doc.root_node(), params.position)
+    capabilities::prepare_rename(&doc.text, doc.root_node(), params.position, server.encoding)
 }
 
 fn rename_handler(server: &Backend, params: RenameParams) -> Option<WorkspaceEdit> {
@@ -437,6 +482,7 @@ fn rename_handler(server: &Backend, params: RenameParams) -> Option<WorkspaceEdi
         &uri,
         pos,
         &params.new_name,
+        server.encoding,
     )
 }
 
@@ -453,6 +499,7 @@ fn document_highlight_handler(
         &doc.text,
         doc.root_node(),
         pos,
+        server.encoding,
     ))
 }
 
@@ -467,6 +514,7 @@ fn selection_ranges_handler(
         &doc.text,
         doc.root_node(),
         &params.positions,
+        server.encoding,
     ))
 }
 
@@ -477,7 +525,11 @@ fn folding_ranges_handler(
     let project = server.project_for(&params.text_document.uri)?;
     let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
-    Some(capabilities::folding_ranges(&doc.text, doc.root_node()))
+    Some(capabilities::folding_ranges(
+        &doc.text,
+        doc.root_node(),
+        server.encoding,
+    ))
 }
 
 fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<CodeActionResponse> {
@@ -495,6 +547,7 @@ fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<Co
         doc.root_node(),
         &params.text_document.uri,
         params.range,
+        server.encoding,
     ))
 }
 
@@ -511,6 +564,7 @@ fn completion_handler(server: &Backend, params: CompletionParams) -> Option<Comp
         &uri,
         &project.analysis,
         Some(project.root.as_path()),
+        server.encoding,
     )?;
     // P15.3 — swap the lazy `@library` version placeholder with
     // concrete items. Skipped when no fetcher is configured (WASM
@@ -540,6 +594,7 @@ fn inlay_hints_handler(server: &Backend, params: InlayHintParams) -> Option<Vec<
         &project.analysis,
         &doc.text,
         &params.range,
+        server.encoding,
     ))
 }
 
@@ -547,7 +602,7 @@ fn formatting_handler(server: &Backend, params: DocumentFormattingParams) -> Opt
     let project = server.project_for(&params.text_document.uri)?;
     let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
-    capabilities::formatting(&doc.text, doc.root_node())
+    capabilities::formatting(&doc.text, doc.root_node(), server.encoding)
 }
 
 fn range_formatting_handler(
@@ -557,7 +612,7 @@ fn range_formatting_handler(
     let project = server.project_for(&params.text_document.uri)?;
     let cell = project.manager.get(&params.text_document.uri)?;
     let doc = cell.borrow();
-    capabilities::range_formatting(&doc.text, doc.root_node(), params.range)
+    capabilities::range_formatting(&doc.text, doc.root_node(), params.range, server.encoding)
 }
 
 fn workspace_symbols_handler(
@@ -577,7 +632,11 @@ fn workspace_symbols_handler(
             })
         })
         .collect();
-    Some(capabilities::workspace_symbols(docs, &params.query))
+    Some(capabilities::workspace_symbols(
+        docs,
+        &params.query,
+        server.encoding,
+    ))
 }
 
 fn semantic_tokens_handler(
@@ -591,5 +650,6 @@ fn semantic_tokens_handler(
         &doc.text,
         &doc.lib,
         doc.root_node(),
+        server.encoding,
     )))
 }

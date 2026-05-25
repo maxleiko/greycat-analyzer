@@ -19,13 +19,22 @@ use std::str::FromStr;
 
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_core::Document;
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_server::capabilities;
 use lsp_types::{
     CodeActionOrCommand, CompletionList, GotoDefinitionResponse, Hover, InlayHint, Location,
-    Position, WorkspaceEdit,
+    Position, SemanticTokens, WorkspaceEdit,
 };
+
+/// Tests run under UTF-8 encoding by default — matches the CLI path and
+/// keeps tree-sitter byte columns directly comparable with LSP positions
+/// for the ASCII-only fixtures that make up most of the test corpus.
+/// Encoding-specific tests (e.g. semantic-tokens regression on em-dash)
+/// can build the underlying capability calls directly with
+/// [`SourceEncoding::UTF16`].
+pub const TEST_ENCODING: SourceEncoding = SourceEncoding::UTF8;
 
 /// One-file project fixture — wraps a `SourceManager` populated with a
 /// single `project` module plus its `ProjectAnalysis`, mirroring the
@@ -94,19 +103,39 @@ impl TestProject {
             &self.uri,
             &self.analysis,
             &self.manager,
+            TEST_ENCODING,
         )
     }
 
     pub fn goto_definition(&self, pos: Position) -> Option<GotoDefinitionResponse> {
-        capabilities::goto_definition_across_project(&self.analysis, &self.manager, &self.uri, pos)
+        capabilities::goto_definition_across_project(
+            &self.analysis,
+            &self.manager,
+            &self.uri,
+            pos,
+            TEST_ENCODING,
+        )
     }
 
     pub fn references(&self, pos: Position) -> Vec<Location> {
-        capabilities::references_across_project(&self.analysis, &self.manager, &self.uri, pos)
+        capabilities::references_across_project(
+            &self.analysis,
+            &self.manager,
+            &self.uri,
+            pos,
+            TEST_ENCODING,
+        )
     }
 
     pub fn rename(&self, pos: Position, new_name: &str) -> Option<WorkspaceEdit> {
-        capabilities::rename_across_project(&self.analysis, &self.manager, &self.uri, pos, new_name)
+        capabilities::rename_across_project(
+            &self.analysis,
+            &self.manager,
+            &self.uri,
+            pos,
+            new_name,
+            TEST_ENCODING,
+        )
     }
 
     pub fn completion(&self, pos: Position) -> Option<CompletionList> {
@@ -126,12 +155,19 @@ impl TestProject {
             &self.uri,
             &self.analysis,
             project_root,
+            TEST_ENCODING,
         )
     }
 
     pub fn inlay_hints(&self, range: &lsp_types::Range) -> Vec<InlayHint> {
         let doc = self.doc();
-        capabilities::inlay_hints_with_project(self.module(), &self.analysis, &doc.text, range)
+        capabilities::inlay_hints_with_project(
+            self.module(),
+            &self.analysis,
+            &doc.text,
+            range,
+            TEST_ENCODING,
+        )
     }
 
     pub fn code_actions(&self, range: lsp_types::Range) -> Vec<CodeActionOrCommand> {
@@ -142,7 +178,17 @@ impl TestProject {
             doc.root_node(),
             &self.uri,
             range,
+            TEST_ENCODING,
         )
+    }
+
+    pub fn semantic_tokens(&self) -> SemanticTokens {
+        self.semantic_tokens_with(TEST_ENCODING)
+    }
+
+    pub fn semantic_tokens_with(&self, encoding: SourceEncoding) -> SemanticTokens {
+        let doc = self.doc();
+        capabilities::semantic_tokens(&doc.text, &doc.lib, doc.root_node(), encoding)
     }
 }
 

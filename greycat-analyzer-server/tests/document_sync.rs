@@ -61,13 +61,13 @@ fn full_text(m: &SourceManager) -> String {
 fn parse_error_count(m: &SourceManager) -> usize {
     let cell = m.get(&uri()).unwrap();
     let d = cell.borrow();
-    parse_diagnostics(d.root_node(), &d.text).len()
+    parse_diagnostics(d.root_node(), &d.text, SourceEncoding::UTF8).len()
 }
 
 fn parse_error_summary(m: &SourceManager) -> String {
     let cell = m.get(&uri()).unwrap();
     let d = cell.borrow();
-    let diags = parse_diagnostics(d.root_node(), &d.text);
+    let diags = parse_diagnostics(d.root_node(), &d.text, SourceEncoding::UTF8);
     diags
         .iter()
         .map(|x| format!("[{:?}] {}", x.range, x.message))
@@ -664,12 +664,12 @@ fn incremental_and_fresh_parse_diagnostics_match_after_edit_cycle() {
     let inc_diags = {
         let cell = m_inc.get(&uri()).unwrap();
         let d = cell.borrow();
-        parse_diagnostics(d.root_node(), &d.text)
+        parse_diagnostics(d.root_node(), &d.text, SourceEncoding::UTF8)
     };
     let fresh_diags = {
         let cell = m_fresh.get(&uri()).unwrap();
         let d = cell.borrow();
-        parse_diagnostics(d.root_node(), &d.text)
+        parse_diagnostics(d.root_node(), &d.text, SourceEncoding::UTF8)
     };
     assert_eq!(
         inc_diags.len(),

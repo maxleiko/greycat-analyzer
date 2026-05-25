@@ -3,6 +3,7 @@
 //! `textDocument/implementation`.
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_server::capabilities;
@@ -57,8 +58,14 @@ fn main() {}
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "process(): int { return 1");
-    let resp = capabilities::goto_declaration_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-decl returned a response");
+    let resp = capabilities::goto_declaration_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-decl returned a response");
     let loc = first_loc(resp);
     assert_eq!(loc.uri, uri);
     // `abstract fn process(): int;` is on line 1.
@@ -85,8 +92,14 @@ type Child extends Base {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(child_src, "run() {}");
-    let resp = capabilities::goto_declaration_across_project(&pa, &mgr, &child_uri, cursor_pos)
-        .expect("goto-decl returned a response");
+    let resp = capabilities::goto_declaration_across_project(
+        &pa,
+        &mgr,
+        &child_uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-decl returned a response");
     let loc = first_loc(resp);
     assert_eq!(loc.uri, base_uri);
     assert_eq!(loc.range.start.line, 1);
@@ -113,8 +126,14 @@ fn main() {}
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "tick() {}");
-    let resp = capabilities::goto_declaration_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-decl returned a response");
+    let resp = capabilities::goto_declaration_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-decl returned a response");
     let loc = first_loc(resp);
     // `abstract fn tick();` is on line 1.
     assert_eq!(loc.range.start.line, 1);
@@ -138,7 +157,14 @@ fn main() {}
 
     let cursor_pos = position_of(src, "run() {}");
     assert!(
-        capabilities::goto_declaration_across_project(&pa, &mgr, &uri, cursor_pos).is_none(),
+        capabilities::goto_declaration_across_project(
+            &pa,
+            &mgr,
+            &uri,
+            cursor_pos,
+            SourceEncoding::UTF8
+        )
+        .is_none(),
         "expected None when cursor is on the decl with no abstract ancestor"
     );
 }
@@ -160,8 +186,14 @@ fn caller(s: Solo) {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "run();");
-    let resp = capabilities::goto_declaration_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-decl returned a response");
+    let resp = capabilities::goto_declaration_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-decl returned a response");
     let loc = first_loc(resp);
     assert_eq!(loc.uri, uri);
     // `fn run() {}` is on line 1.
@@ -189,8 +221,14 @@ fn use_child(c: Child): int {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "process();");
-    let resp = capabilities::goto_declaration_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-decl returned a response");
+    let resp = capabilities::goto_declaration_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-decl returned a response");
     let loc = first_loc(resp);
     // Abstract decl on line 1.
     assert_eq!(loc.range.start.line, 1);

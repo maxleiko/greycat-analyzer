@@ -19,6 +19,8 @@ use rustc_hash::FxHashSet;
 
 use greycat_analyzer_syntax::tree_sitter;
 
+use crate::SourceEncoding;
+use crate::conv::byte_to_position;
 use crate::module_desc::ModuleDesc;
 use crate::resolver::{Context, global_std_dir, library_dir};
 
@@ -38,12 +40,16 @@ pub const DIAGNOSTIC_SOURCE: &str = "greycat-analyzer";
 /// Every call site (CLI lint, LSP backend, WASM bridge) goes
 /// through this single entry point so a new shape check is one edit
 /// here, not five.
-pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagnostic> {
+pub fn parse_diagnostics(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     if root.has_error() || root.is_missing() {
-        walk(root, source, &mut out);
+        walk(root, source, encoding, &mut out);
     }
-    walk_shape_checks(root, source, &mut out);
+    walk_shape_checks(root, source, encoding, &mut out);
     out
 }
 
@@ -51,22 +57,27 @@ pub fn parse_diagnostics(root: tree_sitter::Node<'_>, source: &str) -> Vec<Diagn
 /// together so we only traverse the tree once and adding a new
 /// check is a single match arm rather than another standalone
 /// walker wired at every call site.
-fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn walk_shape_checks(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     match node.kind() {
-        "static_expr" => check_property_after(node, source, out, "::"),
-        "member_expr" => check_property_after(node, source, out, "."),
-        "arrow_expr" => check_property_after(node, source, out, "->"),
-        "fn_decl" | "type_method" => check_function_body(node, source, out),
-        "type_attr" => check_attr_init_modifier(node, source, out),
+        "static_expr" => check_property_after(node, source, encoding, out, "::"),
+        "member_expr" => check_property_after(node, source, encoding, out, "."),
+        "arrow_expr" => check_property_after(node, source, encoding, out, "->"),
+        "fn_decl" | "type_method" => check_function_body(node, source, encoding, out),
+        "type_attr" => check_attr_init_modifier(node, source, encoding, out),
         "var_decl" => {
-            check_var_name(node, source, out);
-            check_explicit_semi(node, source, out);
+            check_var_name(node, source, encoding, out);
+            check_explicit_semi(node, source, encoding, out);
         }
         "modvar" => {
-            check_var_name(node, source, out);
-            check_modvar_type(node, source, out);
-            check_modvar_initializer(node, source, out);
-            check_explicit_semi(node, source, out);
+            check_var_name(node, source, encoding, out);
+            check_modvar_type(node, source, encoding, out);
+            check_modvar_initializer(node, source, encoding, out);
+            check_explicit_semi(node, source, encoding, out);
         }
         // Grammar accepts most block-style statements at module scope
         // (wrapped in `mod_stmt`) so doc snippets pretty-print under
@@ -78,7 +89,7 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
         // stmt is invalid as a whole, piling per-fragment diags on
         // top is noise.
         "mod_stmt" => {
-            check_top_level_stmt(node, source, out);
+            check_top_level_stmt(node, source, encoding, out);
             return;
         }
         // Every stmt kind whose terminator is `choice(_semi, _automatic_semicolon)`
@@ -86,14 +97,14 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
         // recovery, never semantically valid GreyCat.
         "expr_stmt" | "return_stmt" | "throw_stmt" | "break_stmt" | "continue_stmt"
         | "breakpoint_stmt" | "do_while_stmt" => {
-            check_explicit_semi(node, source, out);
+            check_explicit_semi(node, source, encoding, out);
         }
-        "ident" => check_ident_keyword(node, source, out),
+        "ident" => check_ident_keyword(node, source, encoding, out),
         _ => {}
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_shape_checks(child, source, out);
+        walk_shape_checks(child, source, encoding, out);
     }
 }
 
@@ -106,6 +117,7 @@ fn walk_shape_checks(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
 fn check_property_after(
     node: tree_sitter::Node<'_>,
     source: &str,
+    encoding: SourceEncoding,
     out: &mut Vec<Diagnostic>,
     sep: &str,
 ) {
@@ -120,7 +132,7 @@ fn check_property_after(
         _ => "missing-property",
     };
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &sep_range),
+        range: byte_range_to_lsp(source, &sep_range, encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String(code.into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -133,7 +145,12 @@ fn check_property_after(
 /// (`native` ≈ FFI-bound, `abstract` ≈ subclass-fills-it); every
 /// other function must define a body. Diagnostic range points at
 /// the function name.
-fn check_function_body(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_function_body(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     if node.child_by_field_name("body").is_some() {
         return;
     }
@@ -146,7 +163,7 @@ fn check_function_body(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
     };
     let name_text = source.get(name.byte_range()).unwrap_or("?");
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &name.byte_range()),
+        range: byte_range_to_lsp(source, &name.byte_range(), encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("missing-function-body".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -163,7 +180,12 @@ fn check_function_body(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
 /// initializer on a non-static attribute, so emit a diagnostic at
 /// parse-shape time before lowering walks the same construct. Range
 /// covers the `init` field so the offending `= expr` is highlighted.
-fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_attr_init_modifier(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     let Some(init) = node.child_by_field_name("init") else {
         return;
     };
@@ -176,7 +198,7 @@ fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut
         .and_then(|n| source.get(n.byte_range()))
         .unwrap_or("?");
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &init.byte_range()),
+        range: byte_range_to_lsp(source, &init.byte_range(), encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("non-static-attr-initializer".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -192,7 +214,12 @@ fn check_attr_init_modifier(node: tree_sitter::Node<'_>, source: &str, out: &mut
 /// highlighter as real modules (see `module` / `mod_stmt` rules in
 /// grammar.js). A real project module cannot contain a freestanding
 /// stmt — emit a hard error covering the whole wrapper.
-fn check_top_level_stmt(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_top_level_stmt(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     // Range covers the whole stmt so the editor's red underline marks
     // the entire offending snippet — useful when the stmt spans
     // multiple lines (`if (cond) { ... }`).
@@ -203,7 +230,7 @@ fn check_top_level_stmt(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec
         range.end -= 1;
     }
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &range),
+        range: byte_range_to_lsp(source, &range, encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("top-level-stmt".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -218,7 +245,12 @@ fn check_top_level_stmt(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec
 /// it to a node-tag head). Caret just after the binding name (or after
 /// `var` if the name itself is missing — `missing-var-name` already
 /// flags that case).
-fn check_modvar_type(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_modvar_type(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     let has_type = node
         .named_children(&mut node.walk())
         .any(|c| c.kind() == "type_decorator");
@@ -234,7 +266,7 @@ fn check_modvar_type(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
     let range = after_name..after_name;
     let name_text = source.get(name.byte_range()).unwrap_or("?");
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &range),
+        range: byte_range_to_lsp(source, &range, encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("missing-modvar-type".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -249,7 +281,12 @@ fn check_modvar_type(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Di
 /// rejects an initializer on a module-level `var` (module vars are
 /// assigned only via runtime mechanisms / explicit functions), so emit
 /// a hard error here pointing at the offending `= expr`.
-fn check_modvar_initializer(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_modvar_initializer(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     let Some(init) = node
         .named_children(&mut node.walk())
         .find(|c| c.kind() == "initializer")
@@ -261,7 +298,7 @@ fn check_modvar_initializer(node: tree_sitter::Node<'_>, source: &str, out: &mut
         .and_then(|n| source.get(n.byte_range()))
         .unwrap_or("?");
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &init.byte_range()),
+        range: byte_range_to_lsp(source, &init.byte_range(), encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("modvar-initializer".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -275,14 +312,19 @@ fn check_modvar_initializer(node: tree_sitter::Node<'_>, source: &str, out: &mut
 /// `var` parses with optional `name` so mid-edit `var ` doesn't
 /// ERROR-recover the next line. Real GreyCat requires a name. Caret
 /// just after the `var` keyword.
-fn check_var_name(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_var_name(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     if node.child_by_field_name("name").is_some() {
         return;
     }
     let after_var = keyword_end(node, source, "var").unwrap_or(node.end_byte());
     let range = after_var..after_var;
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &range),
+        range: byte_range_to_lsp(source, &range, encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("missing-var-name".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -299,7 +341,12 @@ fn check_var_name(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagn
 /// one-byte token whose source text is `";"`; auto-semi is zero-width
 /// and has no source text. Caret points at the end of the last real
 /// token (where the `;` should have been written).
-fn check_explicit_semi(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_explicit_semi(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     let mut explicit_semi = false;
     let mut last_real_end = node.start_byte();
     let mut cursor = node.walk();
@@ -318,7 +365,7 @@ fn check_explicit_semi(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
     }
     let range = last_real_end..last_real_end;
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &range),
+        range: byte_range_to_lsp(source, &range, encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("missing-semicolon".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -380,7 +427,12 @@ fn is_reserved_keyword(text: &str) -> bool {
 /// The allow-list below matches the positions the runtime genuinely
 /// supports (`type T { return: int; }`, `enum E { return }`,
 /// `t.return`, `n->return`, `E::return`, …).
-fn check_ident_keyword(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn check_ident_keyword(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     let Some(text) = source.get(node.byte_range()) else {
         return;
     };
@@ -418,7 +470,7 @@ fn check_ident_keyword(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<
         return;
     }
     out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &node.byte_range()),
+        range: byte_range_to_lsp(source, &node.byte_range(), encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("keyword-as-ident".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -475,13 +527,18 @@ fn separator_range(
     None
 }
 
-fn walk(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
+fn walk(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+    out: &mut Vec<Diagnostic>,
+) {
     if node.is_missing() {
-        out.push(missing_diagnostic(node));
+        out.push(missing_diagnostic(node, source, encoding));
         return;
     }
     if node.is_error() {
-        out.push(error_diagnostic(node, source));
+        out.push(error_diagnostic(node, source, encoding));
         return;
     }
     if !node.has_error() {
@@ -489,11 +546,15 @@ fn walk(node: tree_sitter::Node<'_>, source: &str, out: &mut Vec<Diagnostic>) {
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, source, out);
+        walk(child, source, encoding, out);
     }
 }
 
-fn error_diagnostic(node: tree_sitter::Node<'_>, source: &str) -> Diagnostic {
+fn error_diagnostic(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+) -> Diagnostic {
     let snippet = source
         .get(node.byte_range())
         .map(str::trim)
@@ -511,7 +572,7 @@ fn error_diagnostic(node: tree_sitter::Node<'_>, source: &str) -> Diagnostic {
         format!("syntax error near `{snippet}`")
     };
     Diagnostic {
-        range: node_range(node),
+        range: node_range(node, source, encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(lsp_types::NumberOrString::String("parse-error".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -520,7 +581,11 @@ fn error_diagnostic(node: tree_sitter::Node<'_>, source: &str) -> Diagnostic {
     }
 }
 
-fn missing_diagnostic(node: tree_sitter::Node<'_>) -> Diagnostic {
+fn missing_diagnostic(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    encoding: SourceEncoding,
+) -> Diagnostic {
     let kind = node.kind();
     let message = if kind.is_empty() {
         "missing token".to_string()
@@ -528,7 +593,7 @@ fn missing_diagnostic(node: tree_sitter::Node<'_>) -> Diagnostic {
         format!("missing `{kind}`")
     };
     Diagnostic {
-        range: node_range(node),
+        range: node_range(node, source, encoding),
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(lsp_types::NumberOrString::String("missing-token".into())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -537,19 +602,8 @@ fn missing_diagnostic(node: tree_sitter::Node<'_>) -> Diagnostic {
     }
 }
 
-fn node_range(node: tree_sitter::Node<'_>) -> Range {
-    let s = node.start_position();
-    let e = node.end_position();
-    Range {
-        start: Position {
-            line: s.row as u32,
-            character: s.column as u32,
-        },
-        end: Position {
-            line: e.row as u32,
-            character: e.column as u32,
-        },
-    }
+fn node_range(node: tree_sitter::Node<'_>, source: &str, encoding: SourceEncoding) -> Range {
+    byte_range_to_lsp(source, &node.byte_range(), encoding)
 }
 
 // P15.5
@@ -573,6 +627,7 @@ pub fn pragma_diagnostics(
     desc: &ModuleDesc,
     project_dir: &Path,
     ctx: &dyn Context,
+    encoding: SourceEncoding,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let mut seen_includes: FxHashSet<&str> = FxHashSet::default();
@@ -584,6 +639,7 @@ pub fn pragma_diagnostics(
                 "duplicate-include",
                 DiagnosticSeverity::WARNING,
                 format!("duplicate @include('{}')", inc.value),
+                encoding,
             ));
             continue;
         }
@@ -600,6 +656,7 @@ pub fn pragma_diagnostics(
                     "@include('{}'): absolute paths are not supported (use a project-relative path)",
                     inc.value
                 ),
+                encoding,
             ));
             continue;
         }
@@ -611,6 +668,7 @@ pub fn pragma_diagnostics(
                 "unresolved-include",
                 DiagnosticSeverity::WARNING,
                 format!("@include('{}'): directory not found", inc.value),
+                encoding,
             ));
         }
     }
@@ -623,6 +681,7 @@ pub fn pragma_diagnostics(
                 "duplicate-library",
                 DiagnosticSeverity::WARNING,
                 format!("duplicate @library('{}')", lib.name),
+                encoding,
             ));
             continue;
         }
@@ -651,6 +710,7 @@ pub fn pragma_diagnostics(
                 "unresolved-library",
                 DiagnosticSeverity::WARNING,
                 format!("@library('{}'): library not found", lib.name),
+                encoding,
             ));
         }
     }
@@ -677,9 +737,10 @@ fn make_pragma_diag(
     code: &str,
     severity: DiagnosticSeverity,
     message: String,
+    encoding: SourceEncoding,
 ) -> Diagnostic {
     Diagnostic {
-        range: byte_range_to_lsp(text, byte_range),
+        range: byte_range_to_lsp(text, byte_range, encoding),
         severity: Some(severity),
         code: Some(NumberOrString::String(code.to_string())),
         source: Some(DIAGNOSTIC_SOURCE.into()),
@@ -688,29 +749,12 @@ fn make_pragma_diag(
     }
 }
 
-fn byte_range_to_lsp(text: &str, range: &std::ops::Range<usize>) -> Range {
-    Range {
-        start: position_at(text, range.start),
-        end: position_at(text, range.end),
-    }
-}
-
-fn position_at(text: &str, byte: usize) -> Position {
-    let mut line = 0u32;
-    let mut col = 0u32;
-    let prefix = &text[..byte.min(text.len())];
-    for c in prefix.chars() {
-        if c == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += c.len_utf8() as u32;
-        }
-    }
-    Position {
-        line,
-        character: col,
-    }
+fn byte_range_to_lsp(
+    text: &str,
+    range: &std::ops::Range<usize>,
+    encoding: SourceEncoding,
+) -> Range {
+    crate::conv::byte_range_to_lsp(text, range, encoding)
 }
 
 // P32.5
@@ -723,14 +767,14 @@ fn position_at(text: &str, byte: usize) -> Position {
 /// Tagged `UNNECESSARY` so VSCode / other editors render the file
 /// greyed out. Severity is `Information` — this is guidance, not
 /// an error.
-pub fn orphan_module_diagnostic(text: &str) -> Diagnostic {
+pub fn orphan_module_diagnostic(text: &str, encoding: SourceEncoding) -> Diagnostic {
     Diagnostic {
         range: Range {
             start: Position {
                 line: 0,
                 character: 0,
             },
-            end: position_at(text, text.len()),
+            end: byte_to_position(text, text.len(), encoding),
         },
         severity: Some(DiagnosticSeverity::INFORMATION),
         code: Some(NumberOrString::String("orphan-module".into())),
@@ -751,14 +795,14 @@ pub fn orphan_module_diagnostic(text: &str) -> Diagnostic {
 /// Severity is `Error` (this is a hard blocker for any meaningful
 /// analysis) and the diag is also tagged `UNNECESSARY` so editors
 /// dim the whole file as a visual cue.
-pub fn missing_std_diagnostic(text: &str) -> Diagnostic {
+pub fn missing_std_diagnostic(text: &str, encoding: SourceEncoding) -> Diagnostic {
     Diagnostic {
         range: Range {
             start: Position {
                 line: 0,
                 character: 0,
             },
-            end: position_at(text, text.len()),
+            end: byte_to_position(text, text.len(), encoding),
         },
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("missing-std".into())),
@@ -783,6 +827,7 @@ pub fn duplicate_module_name_diagnostic(
     text: &str,
     module_name: &str,
     existing_uri: &Uri,
+    encoding: SourceEncoding,
 ) -> Diagnostic {
     Diagnostic {
         range: Range {
@@ -790,7 +835,7 @@ pub fn duplicate_module_name_diagnostic(
                 line: 0,
                 character: 0,
             },
-            end: position_at(text, text.len()),
+            end: byte_to_position(text, text.len(), encoding),
         },
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String("duplicate-module-name".into())),
@@ -811,7 +856,11 @@ pub fn duplicate_module_name_diagnostic(
 /// unintended.
 ///
 /// Tagged `UNNECESSARY` (dim) and `Information` severity.
-pub fn multi_project_owner_diagnostic(text: &str, roots: &[std::path::PathBuf]) -> Diagnostic {
+pub fn multi_project_owner_diagnostic(
+    text: &str,
+    roots: &[std::path::PathBuf],
+    encoding: SourceEncoding,
+) -> Diagnostic {
     let mut roots_msg = String::new();
     for (i, r) in roots.iter().enumerate() {
         if i > 0 {
@@ -828,7 +877,7 @@ pub fn multi_project_owner_diagnostic(text: &str, roots: &[std::path::PathBuf]) 
                 line: 0,
                 character: 0,
             },
-            end: position_at(text, text.len()),
+            end: byte_to_position(text, text.len(), encoding),
         },
         severity: Some(DiagnosticSeverity::INFORMATION),
         code: Some(NumberOrString::String("multi-project-owner".into())),
@@ -907,7 +956,7 @@ mod tests {
 
     fn diags(source: &str) -> Vec<Diagnostic> {
         let tree = greycat_analyzer_syntax::parse(source);
-        parse_diagnostics(tree.root_node(), source)
+        parse_diagnostics(tree.root_node(), source, SourceEncoding::UTF8)
     }
 
     // P17.4 added the optional `path → contents` map.
@@ -948,7 +997,7 @@ mod tests {
             greycat_home: PathBuf::from("/gcat"),
         };
         let project_dir = Path::new("/proj");
-        pragma_diagnostics(source, &desc, project_dir, &ctx)
+        pragma_diagnostics(source, &desc, project_dir, &ctx, SourceEncoding::UTF8)
             .into_iter()
             .map(|d| {
                 let code = match &d.code {
@@ -1644,7 +1693,7 @@ mod tests {
             greycat_home: PathBuf::from("/gcat"),
         };
         let project_dir = Path::new("/proj");
-        let out = pragma_diagnostics(src, &desc, project_dir, &ctx);
+        let out = pragma_diagnostics(src, &desc, project_dir, &ctx, SourceEncoding::UTF8);
         assert!(
             !out.iter().any(
                 |d| matches!(&d.code, Some(NumberOrString::String(s)) if s == "unresolved-library")

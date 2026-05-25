@@ -1,6 +1,6 @@
 //! Document symbol handler — hierarchy of top-level decls + type members.
 
-use greycat_analyzer_core::SymbolTable;
+use greycat_analyzer_core::{SourceEncoding, SymbolTable};
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::tree_sitter;
@@ -8,7 +8,12 @@ use lsp_types::{DocumentSymbol, SymbolKind};
 
 use crate::conv::byte_range_to_lsp;
 
-pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> Vec<DocumentSymbol> {
+pub fn document_symbols(
+    text: &str,
+    lib: &str,
+    root: tree_sitter::Node<'_>,
+    encoding: SourceEncoding,
+) -> Vec<DocumentSymbol> {
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
     let module = match hir.module.as_ref() {
@@ -42,8 +47,8 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
             Decl::Var(_) => SymbolKind::VARIABLE,
             Decl::Pragma(_) => SymbolKind::KEY,
         };
-        let full_range = byte_range_to_lsp(text, decl.byte_range());
-        let selection_range = byte_range_to_lsp(text, &ident.byte_range);
+        let full_range = byte_range_to_lsp(text, decl.byte_range(), encoding);
+        let selection_range = byte_range_to_lsp(text, &ident.byte_range, encoding);
         let mut children: Vec<DocumentSymbol> = Vec::new();
         if let Decl::Type(td) = decl {
             for attr_id in &td.attrs {
@@ -60,8 +65,8 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
                     tags: None,
                     #[allow(deprecated)]
                     deprecated: None,
-                    range: byte_range_to_lsp(text, &a.byte_range),
-                    selection_range: byte_range_to_lsp(text, &aname.byte_range),
+                    range: byte_range_to_lsp(text, &a.byte_range, encoding),
+                    selection_range: byte_range_to_lsp(text, &aname.byte_range, encoding),
                     children: None,
                 });
             }
@@ -79,8 +84,8 @@ pub fn document_symbols(text: &str, lib: &str, root: tree_sitter::Node<'_>) -> V
                         kind: SymbolKind::METHOD,
                         tags: None,
                         deprecated: None,
-                        range: byte_range_to_lsp(text, &fnd.byte_range),
-                        selection_range: byte_range_to_lsp(text, &mname.byte_range),
+                        range: byte_range_to_lsp(text, &fnd.byte_range, encoding),
+                        selection_range: byte_range_to_lsp(text, &mname.byte_range, encoding),
                         children: None,
                     });
                 }

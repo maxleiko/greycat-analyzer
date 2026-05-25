@@ -8,7 +8,7 @@ use std::{
 
 use greycat_analyzer_analysis::{analyzer::Severity, lint::LintSeverity, project::ProjectAnalysis};
 use greycat_analyzer_core::{
-    LoadTimings, SourceManager,
+    LoadTimings, SourceEncoding, SourceManager,
     diagnostics::{parse_diagnostics, print_compact_diagnostic},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
     resolver::FsContext,
@@ -286,7 +286,7 @@ impl Lint {
          -> Entry {
             let load = load_by_uri.get(uri).copied().unwrap_or_default();
             let timings = analysis.module(uri).map(|m| m.timings).unwrap_or_default();
-            let mut diagnostics = parse_diagnostics(root, text);
+            let mut diagnostics = parse_diagnostics(root, text, SourceEncoding::UTF8);
             if let Some(proot) = pragma_root.as_ref() {
                 let desc =
                     greycat_analyzer_core::module_desc::parse_module_desc(uri.clone(), text, root);
@@ -295,11 +295,13 @@ impl Lint {
                     &desc,
                     proot,
                     &pragma_ctx,
+                    SourceEncoding::UTF8,
                 ));
             }
             if std_missing && entrypoint_uri.as_ref() == Some(uri) {
                 diagnostics.push(greycat_analyzer_core::diagnostics::missing_std_diagnostic(
                     text,
+                    SourceEncoding::UTF8,
                 ));
             }
             if let Some((name, existing)) = analysis.index.duplicate_modules.get(uri) {
@@ -309,6 +311,7 @@ impl Lint {
                         text,
                         module_name,
                         existing,
+                        SourceEncoding::UTF8,
                     ),
                 );
             }
@@ -482,7 +485,8 @@ impl Lint {
                         .module(uri)
                         .map(|m| m.timings)
                         .unwrap_or_default();
-                    let mut diagnostics = parse_diagnostics(doc.root_node(), &doc.text);
+                    let mut diagnostics =
+                        parse_diagnostics(doc.root_node(), &doc.text, SourceEncoding::UTF8);
                     if let Some(root) = pragma_root.as_ref() {
                         let desc = greycat_analyzer_core::module_desc::parse_module_desc(
                             uri.clone(),
@@ -494,6 +498,7 @@ impl Lint {
                             &desc,
                             root,
                             &pragma_ctx,
+                            SourceEncoding::UTF8,
                         ));
                     }
                     if let Some(module) = new_analysis.module(uri)

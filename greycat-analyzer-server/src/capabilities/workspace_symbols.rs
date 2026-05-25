@@ -3,6 +3,7 @@
 //! and filters by case-insensitive substring match (matching the TS
 //! reference).
 
+use greycat_analyzer_core::SourceEncoding;
 use lsp_types::{DocumentSymbol, Location, OneOf, Uri, WorkspaceSymbol};
 
 use super::document_symbols::document_symbols;
@@ -10,12 +11,13 @@ use super::document_symbols::document_symbols;
 pub fn workspace_symbols(
     docs: impl IntoIterator<Item = (Uri, String, String)>,
     query: &str,
+    encoding: SourceEncoding,
 ) -> Vec<WorkspaceSymbol> {
     let needle = query.to_lowercase();
     let mut out = Vec::new();
     for (uri, lib, text) in docs {
         let tree = greycat_analyzer_syntax::parse(&text);
-        let symbols = document_symbols(&text, &lib, tree.root_node());
+        let symbols = document_symbols(&text, &lib, tree.root_node(), encoding);
         flatten_workspace(&uri, &symbols, &needle, &mut out);
     }
     out

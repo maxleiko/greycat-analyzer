@@ -35,6 +35,7 @@ use greycat_analyzer_analysis::{
     project::ProjectAnalysis,
     resolver::resolve,
 };
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_core::diagnostics::parse_diagnostics;
@@ -878,7 +879,7 @@ struct WasmDiagnostic {
 #[wasm_bindgen]
 pub fn diagnostics(source: &str) -> Result<JsValue, JsValue> {
     let tree = greycat_analyzer_syntax::parse(source);
-    let parse_diags = parse_diagnostics(tree.root_node(), source);
+    let parse_diags = parse_diagnostics(tree.root_node(), source, SourceEncoding::UTF16);
     let mut out: Vec<WasmDiagnostic> = parse_diags
         .into_iter()
         .map(|d| {

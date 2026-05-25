@@ -14,12 +14,19 @@
 
 use std::str::FromStr;
 
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_server::capabilities;
 use greycat_analyzer_syntax::parse;
 use lsp_types::*;
 
 mod support;
 use support::TestProject;
+
+/// Encoding tests pass to every capability call. Matches the CLI / VS
+/// Code path; encoding-specific regressions belong in the unit-tests
+/// alongside the capability module they cover (e.g.
+/// `semantic_tokens::tests::doc_comment_with_em_dash_under_utf16_uses_code_units_not_bytes`).
+const ENC: SourceEncoding = SourceEncoding::UTF8;
 
 fn pos(line: u32, character: u32) -> Position {
     Position { line, character }
@@ -256,6 +263,7 @@ fn hover_with_project_renders_cross_module_provenance() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover present on cross-module Point");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
@@ -279,7 +287,7 @@ fn hover_with_project_renders_cross_module_provenance() {
 fn document_symbols_lists_top_level_decls() {
     let src = "fn one() {}\ntype Foo {}\nenum E { A, B }\n";
     let tree = parse(src);
-    let syms = capabilities::document_symbols(src, "project", tree.root_node());
+    let syms = capabilities::document_symbols(src, "project", tree.root_node(), ENC);
     let names: Vec<_> = syms.iter().map(|s| s.name.as_str()).collect();
     assert!(
         names.contains(&"one"),
@@ -299,7 +307,7 @@ fn document_symbols_lists_top_level_decls() {
 fn folding_ranges_block_spans_multi_line() {
     let src = "fn body() {\n    var x = 1;\n    var y = 2;\n}\n";
     let tree = parse(src);
-    let folds = capabilities::folding_ranges(src, tree.root_node());
+    let folds = capabilities::folding_ranges(src, tree.root_node(), ENC);
     assert!(!folds.is_empty(), "fn body should fold");
 }
 
@@ -307,7 +315,7 @@ fn folding_ranges_block_spans_multi_line() {
 fn document_highlights_match_same_text() {
     let src = "fn id(x: int): int { return x; }\n";
     let tree = parse(src);
-    let hi = capabilities::document_highlights(src, tree.root_node(), pos(0, 28));
+    let hi = capabilities::document_highlights(src, tree.root_node(), pos(0, 28), ENC);
     assert!(
         hi.len() >= 2,
         "expected at least 2 `x` highlights, got {hi:?}"
@@ -344,7 +352,8 @@ fn references_returns_def_plus_uses() {
 fn goto_definition_param_lands_on_decl() {
     let src = "fn id(x: int): int { return x; }\n";
     let tree = parse(src);
-    let g = capabilities::goto_definition(src, "project", tree.root_node(), &uri(), pos(0, 28));
+    let g =
+        capabilities::goto_definition(src, "project", tree.root_node(), &uri(), pos(0, 28), ENC);
     let GotoDefinitionResponse::Scalar(loc) = g.expect("goto on `x`") else {
         panic!("expected single location");
     };
@@ -368,7 +377,7 @@ fn cross_module_references_aggregates_across_docs() {
     );
     let pa = ProjectAnalysis::analyze(&mgr);
     // Cursor on the `Helper` decl name in home.gcl (col 5).
-    let refs = capabilities::references_across_project(&pa, &mgr, &home_uri, pos(0, 5));
+    let refs = capabilities::references_across_project(&pa, &mgr, &home_uri, pos(0, 5), ENC);
     let user_hits = refs.iter().filter(|l| l.uri == user_uri).count();
     let home_hits = refs.iter().filter(|l| l.uri == home_uri).count();
     assert_eq!(home_hits, 1, "binding site in home.gcl: {refs:?}");
@@ -389,7 +398,7 @@ fn rename_method_renames_binding_and_call_sites() {
     );
     let pa = ProjectAnalysis::analyze(&mgr);
     // Cursor on the method binding `m` inside `fn m(): int`.
-    let edit = capabilities::rename_across_project(&pa, &mgr, &u, pos(0, 12), "n").unwrap();
+    let edit = capabilities::rename_across_project(&pa, &mgr, &u, pos(0, 12), "n", ENC).unwrap();
     #[allow(clippy::mutable_key_type)]
     let changes = edit.changes.unwrap();
     let edits = changes.get(&u).expect("home-module edits");
@@ -417,7 +426,7 @@ fn rename_type_attr_renames_binding_and_member_access() {
     );
     let pa = ProjectAnalysis::analyze(&mgr);
     // Cursor on the attr binding `a` inside `a: int;`.
-    let edit = capabilities::rename_across_project(&pa, &mgr, &u, pos(0, 9), "b").unwrap();
+    let edit = capabilities::rename_across_project(&pa, &mgr, &u, pos(0, 9), "b", ENC).unwrap();
     #[allow(clippy::mutable_key_type)]
     let changes = edit.changes.unwrap();
     let edits = changes.get(&u).expect("home-module edits");
@@ -444,7 +453,7 @@ fn rename_cross_module_method_aggregates_per_uri() {
     mgr.add_simple(user.clone(), "fn caller(t: T) { t.m(); }\n", "p", false);
     let pa = ProjectAnalysis::analyze(&mgr);
     // Cursor on home.gcl's `m` binding (col 12 inside `fn m(): int`).
-    let edit = capabilities::rename_across_project(&pa, &mgr, &home, pos(0, 12), "n").unwrap();
+    let edit = capabilities::rename_across_project(&pa, &mgr, &home, pos(0, 12), "n", ENC).unwrap();
     #[allow(clippy::mutable_key_type)]
     let changes = edit.changes.unwrap();
     assert_eq!(changes.len(), 2, "expected edits in both URIs: {changes:?}");
@@ -462,8 +471,8 @@ fn cross_module_rename_aggregates_text_edits_per_uri() {
     mgr.add_simple(home_uri.clone(), "type Helper {}\n", "p", false);
     mgr.add_simple(user_uri.clone(), "fn use_h(h: Helper) {}\n", "p", false);
     let pa = ProjectAnalysis::analyze(&mgr);
-    let edit =
-        capabilities::rename_across_project(&pa, &mgr, &home_uri, pos(0, 5), "Renamed").unwrap();
+    let edit = capabilities::rename_across_project(&pa, &mgr, &home_uri, pos(0, 5), "Renamed", ENC)
+        .unwrap();
     #[allow(clippy::mutable_key_type)]
     let changes = edit.changes.unwrap();
     assert_eq!(changes.len(), 2, "edits across two URIs: {changes:?}");
@@ -512,6 +521,7 @@ fn hover_works_on_static_expr_segments() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     );
     assert!(
         h_ident.is_some(),
@@ -526,6 +536,7 @@ fn hover_works_on_static_expr_segments() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     );
     assert!(
         h_method.is_some(),
@@ -556,9 +567,14 @@ fn goto_module_segment_jumps_to_named_module_file() {
     let user_cell = mgr.get(&user_uri).expect("user doc");
     let user_doc = user_cell.borrow();
     // Cursor on the leftmost `runtime` ident (line 0, col 14).
-    let loc =
-        capabilities::goto_module_segment(&user_doc.text, user_doc.root_node(), pos(0, 14), &mgr)
-            .expect("goto-def on `runtime` segment");
+    let loc = capabilities::goto_module_segment(
+        &user_doc.text,
+        user_doc.root_node(),
+        pos(0, 14),
+        &mgr,
+        ENC,
+    )
+    .expect("goto-def on `runtime` segment");
     assert_eq!(loc.uri, runtime_uri);
     assert_eq!(loc.range.start.line, 0);
     assert_eq!(loc.range.start.character, 0);
@@ -990,6 +1006,7 @@ fn completion_scope_aware_lists_locals_and_decls() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1024,6 +1041,7 @@ fn completion_scope_excludes_later_locals() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1055,6 +1073,7 @@ fn completion_lists_runtime_types() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1089,6 +1108,7 @@ fn completion_after_dot_lists_attrs_and_methods() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1126,6 +1146,7 @@ fn completion_after_dot_skips_static_attrs() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1173,6 +1194,7 @@ fn completion_on_nullable_receiver_offers_null_safe_rewrite() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let item = list
@@ -1217,6 +1239,7 @@ fn completion_on_non_null_receiver_no_null_safe_rewrite() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let item = list
@@ -1269,6 +1292,7 @@ fn completion_after_upstream_null_safe_no_rewrite() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let z = list
@@ -1317,6 +1341,7 @@ fn completion_after_dot_prefix_filters() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1352,6 +1377,7 @@ fn completion_inside_object_literal_lists_attrs() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1398,7 +1424,7 @@ fn is_narrow_union_complement_lifts_past_early_return() {
     let cell = mgr.get(&user_uri).unwrap();
     let doc = cell.borrow();
     let module = pa.module(&user_uri).expect("module");
-    let diags = capabilities::diagnostics_from_module(&doc.text, module, false);
+    let diags = capabilities::diagnostics_from_module(&doc.text, module, false, ENC);
     assert!(
         !diags.iter().any(|d| {
             let msg = &d.message;
@@ -1483,6 +1509,7 @@ fn completion_at_type_position_lists_types_only() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1526,6 +1553,7 @@ fn completion_after_double_colon_lists_static_methods() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1564,6 +1592,7 @@ fn completion_after_double_colon_lists_static_attrs() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1596,6 +1625,7 @@ fn completion_after_double_colon_lists_module_decls() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1625,6 +1655,7 @@ fn completion_after_dot_cross_module() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -1716,6 +1747,7 @@ fn hover_on_static_method_renders_signature() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover present on `create`");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
@@ -1764,6 +1796,7 @@ fn hover_on_chain_type_segment_renders_foreign_type() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover present on `Identity` chain segment");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
@@ -1812,6 +1845,7 @@ fn hover_on_chain_member_segment_renders_foreign_method() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover present on `create` chain segment");
     let HoverContents::Markup(MarkupContent { value, .. }) = h.contents else {
@@ -2297,8 +2331,8 @@ fn cross_module_goto_implementation_walks_every_module() {
     );
     let pa = ProjectAnalysis::analyze(&mgr);
     // Cursor on `run` in a.gcl line 1 col 8 (0-indexed: "    fn run" → r at col 7).
-    let resp =
-        capabilities::goto_implementation_across_project(&pa, &mgr, &a, pos(1, 8)).expect("hits");
+    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &a, pos(1, 8), ENC)
+        .expect("hits");
     let GotoDefinitionResponse::Array(locs) = resp else {
         panic!("expected array of impls");
     };
@@ -2332,6 +2366,7 @@ fn cross_module_decl_location_points_at_foreign_name() {
         foreign_text,
         &foreign_hir,
         helper_decl,
+        ENC,
     )
     .expect("location for foreign Helper");
     assert_eq!(loc.uri, foreign_uri);
@@ -2350,7 +2385,8 @@ fn caller(): int { return 0; }
 "#;
     let tree = parse(src);
     // Cursor inside `body` ident (line 2, col 7-ish).
-    let g = capabilities::goto_implementation(src, "project", tree.root_node(), &uri(), pos(2, 8));
+    let g =
+        capabilities::goto_implementation(src, "project", tree.root_node(), &uri(), pos(2, 8), ENC);
     assert!(g.is_some(), "goto_implementation should resolve `body`");
 }
 
@@ -2358,7 +2394,7 @@ fn caller(): int { return 0; }
 fn formatting_normalizes_whitespace() {
     let src = "fn x() {var y=1;}\n";
     let tree = parse(src);
-    let edits = capabilities::formatting(src, tree.root_node()).expect("formatting result");
+    let edits = capabilities::formatting(src, tree.root_node(), ENC).expect("formatting result");
     // Either the formatter emits an edit or the input was already
     // canonical; either way we expect the call to return a Vec.
     let _ = edits;
@@ -2378,7 +2414,7 @@ fn workspace_symbols_aggregates_across_docs() {
             "fn beta() {}\n".to_string(),
         ),
     ];
-    let syms = capabilities::workspace_symbols(docs, "");
+    let syms = capabilities::workspace_symbols(docs, "", ENC);
     let names: Vec<_> = syms.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"alpha"));
     assert!(names.contains(&"beta"));
@@ -2396,6 +2432,7 @@ fn workspace_symbols_aggregates_across_docs() {
             ),
         ],
         "alph",
+        ENC,
     );
     let names: Vec<_> = only_alpha.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["alpha"]);
@@ -2406,7 +2443,7 @@ fn signature_help_renders_params() {
     let src = "fn add(a: int, b: int): int { return 0; }\nfn caller(): int { return add(1, 2); }\n";
     let tree = parse(src);
     // Cursor inside the call `add(1, 2)` — anywhere between `(` and `)`.
-    let sh = capabilities::signature_help(src, "project", tree.root_node(), pos(1, 32));
+    let sh = capabilities::signature_help(src, "project", tree.root_node(), pos(1, 32), ENC);
     let _ = sh; // signature_help may return None when the cursor isn't
     // immediately under a `call_expr` ancestor; just exercise the path
     // for now and rely on the existing unit tests in the LS crate for
@@ -2547,7 +2584,7 @@ fn selection_ranges_cover_cursor() {
     let src = "fn x(): int { return 1 + 2; }\n";
     let tree = parse(src);
     let positions = vec![pos(0, 24)]; // cursor on `1`
-    let sr = capabilities::selection_ranges(src, tree.root_node(), &positions);
+    let sr = capabilities::selection_ranges(src, tree.root_node(), &positions, ENC);
     assert!(!sr.is_empty(), "selection ranges should compute");
 }
 
@@ -2555,7 +2592,7 @@ fn selection_ranges_cover_cursor() {
 fn semantic_tokens_emit_for_idents() {
     let src = "fn one(): int { return 1; }\n";
     let tree = parse(src);
-    let tokens = capabilities::semantic_tokens(src, "project", tree.root_node());
+    let tokens = capabilities::semantic_tokens(src, "project", tree.root_node(), ENC);
     assert!(
         !tokens.data.is_empty(),
         "expected at least one semantic token"
@@ -2569,7 +2606,7 @@ fn semantic_tokens_emit_for_idents() {
 fn semantic_tokens_paint_this_as_keyword() {
     let src = "type T {\n    fn f(): T { return this; }\n}\n";
     let tree = parse(src);
-    let tokens = capabilities::semantic_tokens(src, "project", tree.root_node());
+    let tokens = capabilities::semantic_tokens(src, "project", tree.root_node(), ENC);
     let keyword_idx = capabilities::SEMANTIC_TOKEN_TYPES
         .iter()
         .position(|t| *t == SemanticTokenType::KEYWORD)
@@ -2639,6 +2676,7 @@ fn completion_cross_module_decl_carries_signature_and_module_label() {
         &main_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let groups = list
@@ -2694,8 +2732,12 @@ fn diagnostics_skip_non_project_lib_lints() {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let project_module = pa.module(&project_uri).unwrap();
-    let project_diags =
-        capabilities::diagnostics_from_module("private fn unused() {}\n", project_module, false);
+    let project_diags = capabilities::diagnostics_from_module(
+        "private fn unused() {}\n",
+        project_module,
+        false,
+        ENC,
+    );
     assert!(
         project_diags
             .iter()
@@ -2705,7 +2747,7 @@ fn diagnostics_skip_non_project_lib_lints() {
 
     let lib_module = pa.module(&lib_uri).unwrap();
     let lib_diags =
-        capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module, false);
+        capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module, false, ENC);
     assert!(
         !lib_diags
             .iter()
@@ -2716,7 +2758,7 @@ fn diagnostics_skip_non_project_lib_lints() {
     // …but `lint_libs=true` (the `greycat-analyzer.lintLibs` extension
     // setting / `--lint-libs` CLI flag) lifts the suppression.
     let lib_diags_opted_in =
-        capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module, true);
+        capabilities::diagnostics_from_module("private fn unused() {}\n", lib_module, true, ENC);
     assert!(
         lib_diags_opted_in
             .iter()
@@ -2744,7 +2786,7 @@ fn semantic_diagnostics_skip_non_project_lib_by_default() {
     let pa = ProjectAnalysis::analyze(&mgr);
     let lib_module = pa.module(&lib_uri).unwrap();
 
-    let suppressed = capabilities::diagnostics_from_module(lib_src, lib_module, false);
+    let suppressed = capabilities::diagnostics_from_module(lib_src, lib_module, false, ENC);
     assert!(
         !suppressed
             .iter()
@@ -2753,7 +2795,7 @@ fn semantic_diagnostics_skip_non_project_lib_by_default() {
          lint_libs=false; got: {suppressed:?}"
     );
 
-    let opted_in = capabilities::diagnostics_from_module(lib_src, lib_module, true);
+    let opted_in = capabilities::diagnostics_from_module(lib_src, lib_module, true, ENC);
     assert!(
         opted_in
             .iter()
@@ -2797,7 +2839,7 @@ fn sealed_hierarchy_is_narrow_does_not_false_positive() {
     mgr.add_simple(user_uri.clone(), src, "project", false);
     let pa = ProjectAnalysis::analyze(&mgr);
     let module = pa.module(&user_uri).unwrap();
-    let diags = capabilities::diagnostics_from_module(src, module, false);
+    let diags = capabilities::diagnostics_from_module(src, module, false, ENC);
 
     // 1. The `is`-check must not be reported as decidable. Shape can
     //    legitimately be a Rect at runtime — that's the whole point of
@@ -2927,7 +2969,7 @@ fn invalidate_after_did_change_does_not_misalign_symbols() {
     // sealed-hierarchy test above).
     {
         let module = pa.module(&user_uri).unwrap();
-        let diags = capabilities::diagnostics_from_module(initial_src, module, false);
+        let diags = capabilities::diagnostics_from_module(initial_src, module, false, ENC);
         let bad: Vec<_> = diags
             .iter()
             .filter(|d| {
@@ -2988,7 +3030,7 @@ fn invalidate_after_did_change_does_not_misalign_symbols() {
     // Diagnostic-side signal — the same regression surfaces as the
     // decidable + unreachable + not-assignable triplet from the
     // screenshot, with foreign names where the user's types should be.
-    let diags = capabilities::diagnostics_from_module(edited_src, module, false);
+    let diags = capabilities::diagnostics_from_module(edited_src, module, false, ENC);
     let decidable: Vec<_> = diags
         .iter()
         .filter(|d| {
@@ -3031,6 +3073,7 @@ fn completion_dot_on_node_tag_receiver_offers_inner_with_arrow_rewrite() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let name = list
@@ -3082,6 +3125,7 @@ fn completion_arrow_on_node_tag_receiver_lists_inner_directly() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -3132,6 +3176,7 @@ fn hover_arrow_on_node_tag_resolves_inner_member() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover should resolve through the deref");
     let body = match hover.contents {
@@ -3174,6 +3219,7 @@ fn completion_in_empty_for_in_body_surfaces_iterator_params() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -3211,6 +3257,7 @@ fn completion_in_module_local_carries_inferred_type_detail() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let counter = list
@@ -3252,6 +3299,7 @@ fn completion_function_item_appends_call_parens() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let helper = list
@@ -3296,6 +3344,7 @@ fn completion_variable_item_does_not_append_parens() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let counter = list
@@ -3342,6 +3391,7 @@ fn completion_skips_call_parens_when_already_present() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let helper = list
@@ -3383,6 +3433,7 @@ fn completion_member_items_carry_detail_and_documentation() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let count = list
@@ -3451,6 +3502,7 @@ fn completion_static_items_carry_detail_and_documentation() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let make = list
@@ -3509,6 +3561,7 @@ fn completion_mid_identifier_replaces_whole_word() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let ends_with = list
@@ -3563,6 +3616,7 @@ fn completion_pragma_snippet_not_clobbered_by_call_parens() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let lib = list
@@ -3607,6 +3661,7 @@ fn completion_in_module_decl_carries_signature_detail() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list");
     let helper = list
@@ -3689,6 +3744,7 @@ fn completion_after_dot_on_modvar_node_receiver() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("expected a completion list after `n.` on a modvar receiver");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -3729,6 +3785,7 @@ fn completion_after_dot_on_modvar_user_type_receiver_no_error() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("expected a completion list after `p.` on a user-typed modvar");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -3775,6 +3832,7 @@ fn completion_after_dot_on_modvar_node_receiver_no_error() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("expected a completion list after `n.` on a modvar receiver (no-ERROR variant)");
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -3840,6 +3898,7 @@ fn hover_on_generic_method_substitutes_receiver_instantiation() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover should resolve on `add`");
     let body = match hover.contents {
@@ -3891,6 +3950,7 @@ fn hover_on_generic_method_substitutes_multiple_generics() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover should resolve on `set`");
     let body = match hover.contents {
@@ -3938,6 +3998,7 @@ fn hover_on_nullable_generic_return_substitutes() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover should resolve on `last`");
     let body = match hover.contents {
@@ -3984,6 +4045,7 @@ fn completion_after_dot_substitutes_generic_method_signatures() {
         &user_uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list after `arr.`");
     let add = list
@@ -4035,6 +4097,7 @@ fn hover_on_free_function_no_subst_applied() {
         &user_uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover should resolve on `helper`");
     let body = match hover.contents {
@@ -4109,6 +4172,7 @@ fn completion_after_dot_inside_if_error_recovery() {
         &uri,
         &pa,
         None,
+        ENC,
     )
     .expect("completion list at the salvaged `c.sim.` cursor");
     // The receiver `c.sim` has nullable type `node<Simulation>?`, so
@@ -4184,6 +4248,7 @@ fn hover_inside_if_error_recovery_resolves_member_type() {
         &uri,
         &pa,
         &mgr,
+        ENC,
     )
     .expect("hover should resolve on the salvaged `sim` ident");
     let body = match hover.contents {
@@ -4206,7 +4271,7 @@ fn hover_inside_if_error_recovery_resolves_member_type() {
 fn goto_def_inside_if_error_recovery_jumps_to_decl() {
     let (mgr, pa, uri) = p43_user_repro_project();
     // Cursor on the `sim` use at line 3, col 11.
-    let resp = capabilities::goto_definition_across_project(&pa, &mgr, &uri, pos(3, 11))
+    let resp = capabilities::goto_definition_across_project(&pa, &mgr, &uri, pos(3, 11), ENC)
         .expect("goto-def should resolve on the salvaged `sim`");
     let locs: Vec<Location> = match resp {
         GotoDefinitionResponse::Scalar(l) => vec![l],
@@ -4252,7 +4317,7 @@ fn goto_def_inside_if_error_recovery_jumps_to_decl() {
 fn references_include_salvaged_member_use() {
     let (mgr, pa, uri) = p43_user_repro_project();
     // Cursor on the `sim` declaration ident at line 0, col 11.
-    let refs = capabilities::references_across_project(&pa, &mgr, &uri, pos(0, 11));
+    let refs = capabilities::references_across_project(&pa, &mgr, &uri, pos(0, 11), ENC);
     assert!(
         refs.iter()
             .any(|l| l.range.start.line == 3 && l.range.start.character == 10),

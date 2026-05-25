@@ -2,7 +2,7 @@
 //! the callee fn's parameter list with the active parameter
 //! highlighted.
 
-use greycat_analyzer_core::SymbolTable;
+use greycat_analyzer_core::{SourceEncoding, SymbolTable};
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::cst::node_at_offset;
@@ -20,8 +20,9 @@ pub fn signature_help(
     lib: &str,
     root: tree_sitter::Node<'_>,
     pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<SignatureHelp> {
-    let byte = position_to_byte(text, pos);
+    let byte = position_to_byte(text, pos, encoding);
     let mut node = node_at_offset(root, byte)?;
     // Walk up looking for a `call_expr`.
     while node.kind() != "call_expr" {

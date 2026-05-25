@@ -7,6 +7,7 @@
 //! of spinning up the full server. A separate end-to-end protocol smoke
 //! test in [`lsp_smoke.rs`](./lsp_smoke.rs) covers the JSON-RPC half.
 
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_server::capabilities;
 use greycat_analyzer_syntax::parse;
 use lsp_types::*;
@@ -497,8 +498,8 @@ fn main(): int { return add(1, 2); }
     let offset = src.find("add(1").unwrap() + "add(".len();
     let line = src[..offset].matches('\n').count() as u32;
     let col = (offset - src[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
-    let sh =
-        capabilities::signature_help(src, "project", r, pos(line, col)).expect("signature help");
+    let sh = capabilities::signature_help(src, "project", r, pos(line, col), SourceEncoding::UTF8)
+        .expect("signature help");
     assert_eq!(sh.signatures.len(), 1);
     let sig = &sh.signatures[0];
     assert!(sig.label.starts_with("fn add("));
@@ -521,8 +522,15 @@ fn goto_definition_lands_on_decl_name() {
     let line = src[..use_offset].matches('\n').count() as u32;
     let col = (use_offset - src[..use_offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
     let uri = "file:///mod.gcl".parse::<Uri>().unwrap();
-    let resp = capabilities::goto_definition(src, "project", r, &uri, pos(line, col))
-        .expect("goto produced a location");
+    let resp = capabilities::goto_definition(
+        src,
+        "project",
+        r,
+        &uri,
+        pos(line, col),
+        SourceEncoding::UTF8,
+    )
+    .expect("goto produced a location");
     let GotoDefinitionResponse::Scalar(loc) = resp else {
         panic!("expected scalar location")
     };
@@ -548,7 +556,7 @@ fn outside(): int { return 0; }
 "#;
     let mut t = None;
     let r = root(src, &mut t);
-    let syms = capabilities::document_symbols(src, "project", r);
+    let syms = capabilities::document_symbols(src, "project", r, SourceEncoding::UTF8);
     let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"Point"));
     assert!(names.contains(&"outside"));
@@ -578,7 +586,7 @@ fn document_symbols_skips_empty_name_recovered_from_partial_edit() {
     let src = "type Foo {\n    static fn whatever() {};\n\n    static\n}\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let syms = capabilities::document_symbols(src, "project", r);
+    let syms = capabilities::document_symbols(src, "project", r, SourceEncoding::UTF8);
 
     // Walk every level of the symbol tree and assert no name is empty.
     fn walk(symbols: &[DocumentSymbol]) {
@@ -633,7 +641,8 @@ fn prepare_rename_advertises_current_name() {
     let src = "fn helper(): int { return 1; }\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let resp = capabilities::prepare_rename(src, r, pos(0, 5)).expect("renamable");
+    let resp =
+        capabilities::prepare_rename(src, r, pos(0, 5), SourceEncoding::UTF8).expect("renamable");
     if let PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } = resp {
         assert_eq!(placeholder, "helper");
     } else {
@@ -655,7 +664,7 @@ fn long(): int {
 "#;
     let mut t = None;
     let r = root(src, &mut t);
-    let folds = capabilities::folding_ranges(src, r);
+    let folds = capabilities::folding_ranges(src, r, SourceEncoding::UTF8);
     assert!(!folds.is_empty(), "expected at least one fold range");
     assert!(folds.iter().all(|f| f.end_line > f.start_line));
 }
@@ -666,7 +675,7 @@ fn document_highlights_match_same_text_idents() {
     let mut t = None;
     let r = root(src, &mut t);
     // Cursor on the parameter `x`.
-    let hs = capabilities::document_highlights(src, r, pos(0, 5));
+    let hs = capabilities::document_highlights(src, r, pos(0, 5), SourceEncoding::UTF8);
     // Three `x` idents: the param decl + two uses.
     assert_eq!(hs.len(), 3);
 }
@@ -679,7 +688,7 @@ fn selection_ranges_form_an_ancestor_chain() {
     let offset = src.find("1").unwrap();
     let line = src[..offset].matches('\n').count() as u32;
     let col = (offset - src[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
-    let ranges = capabilities::selection_ranges(src, r, &[pos(line, col)]);
+    let ranges = capabilities::selection_ranges(src, r, &[pos(line, col)], SourceEncoding::UTF8);
     assert_eq!(ranges.len(), 1);
     // Walk the .parent chain — should have several levels (number → binary
     // → return → block → fn_decl → module).
@@ -759,7 +768,13 @@ fn inlay_hints_with_project_use_cross_module_call_return_types() {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints_with_project(module, &pa, &user_doc.text, &range);
+    let hints = capabilities::inlay_hints_with_project(
+        module,
+        &pa,
+        &user_doc.text,
+        &range,
+        SourceEncoding::UTF8,
+    );
     assert_eq!(
         hints.len(),
         1,
@@ -808,7 +823,13 @@ fn inlay_hints_qualify_ambiguous_type_names() {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints_with_project(module, &pa, &main_doc.text, &range);
+    let hints = capabilities::inlay_hints_with_project(
+        module,
+        &pa,
+        &main_doc.text,
+        &range,
+        SourceEncoding::UTF8,
+    );
     assert_eq!(
         hints.len(),
         1,
@@ -940,6 +961,7 @@ fn completion_after_enum_double_colon_lists_variants() {
             uri,
             pa,
             None,
+            SourceEncoding::UTF8,
         )
         .unwrap_or_else(|| panic!("no completion at byte {cursor_byte}"));
         list.items
@@ -1162,7 +1184,13 @@ fn inlay_hints_with_project_use_bare_ident_call_return_types() {
         start: pos(0, 0),
         end: pos(99, 0),
     };
-    let hints = capabilities::inlay_hints_with_project(module, &pa, &doc.text, &range);
+    let hints = capabilities::inlay_hints_with_project(
+        module,
+        &pa,
+        &doc.text,
+        &range,
+        SourceEncoding::UTF8,
+    );
     let var_hint = hints
         .iter()
         .find(|h| {
@@ -1191,7 +1219,7 @@ fn formatting_returns_no_edits_on_already_formatted_input() {
     let src = greycat_analyzer_fmt::format("fn main() {}\n");
     let mut t = None;
     let r = root(&src, &mut t);
-    let edits = capabilities::formatting(&src, r).expect("Some(edits)");
+    let edits = capabilities::formatting(&src, r, SourceEncoding::UTF8).expect("Some(edits)");
     assert!(edits.is_empty(), "expected no edits, got {edits:?}");
 }
 
@@ -1200,7 +1228,7 @@ fn formatting_returns_a_single_full_replacement_on_drift() {
     let src = "fn   sloppy   (   ){}\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let edits = capabilities::formatting(src, r).expect("Some(edits)");
+    let edits = capabilities::formatting(src, r, SourceEncoding::UTF8).expect("Some(edits)");
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].range.start, pos(0, 0));
 }
@@ -1214,7 +1242,7 @@ fn semantic_tokens_emits_typed_idents_and_literals() {
     let src = "fn add(a: int, b: int): int { return a + b; }\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let tokens = capabilities::semantic_tokens(src, "project", r);
+    let tokens = capabilities::semantic_tokens(src, "project", r, SourceEncoding::UTF8);
     // Each SemanticToken is a 5-tuple (delta_line, delta_start, length, type, mod);
     // `data` is a flat list.
     assert!(
@@ -1237,7 +1265,7 @@ fn semantic_tokens_emits_enum_member_for_variant_decl_and_ref() {
     let src = "enum Color { Red, Green, Blue }\nfn pick(): Color { return Color::Red; }\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let tokens = capabilities::semantic_tokens(src, "project", r);
+    let tokens = capabilities::semantic_tokens(src, "project", r, SourceEncoding::UTF8);
     let enum_idx = 2u32;
     let enum_member_idx = 3u32;
     // Three decl-site variants + one variant ref = 4 ENUM_MEMBER tokens.
@@ -1273,7 +1301,7 @@ fn semantic_tokens_typed_suffix_distinct_from_digits() {
     let src = "fn main() { 42_time; 3day_2hour42s; 3.14f; }\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let tokens = capabilities::semantic_tokens(src, "project", r);
+    let tokens = capabilities::semantic_tokens(src, "project", r, SourceEncoding::UTF8);
 
     let number_idx = 7u32; // TOK_NUMBER
     let keyword_idx = 9u32; // TOK_KEYWORD
@@ -1365,7 +1393,7 @@ fn semantic_tokens_string_interpolation_no_overlap() {
     let src = "fn main() { var world = 0; var s = \"hello ${world}\"; }\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let tokens = capabilities::semantic_tokens(src, "project", r);
+    let tokens = capabilities::semantic_tokens(src, "project", r, SourceEncoding::UTF8);
 
     // STRING token type is index 6.
     let string_type_idx = 6u32;
@@ -1414,7 +1442,7 @@ fn semantic_tokens_paints_lambda_return_type_as_type() {
     let src = "fn main() { var f = fn (a: int): int { return a; }; }\n";
     let mut t = None;
     let r = root(src, &mut t);
-    let tokens = capabilities::semantic_tokens(src, "project", r);
+    let tokens = capabilities::semantic_tokens(src, "project", r, SourceEncoding::UTF8);
 
     let type_idx = 1u32;
     let mut line = 0u32;
@@ -1472,7 +1500,8 @@ fn dead_code_lint_carries_unnecessary_tag() {
     let module = pa.module(&uri).unwrap();
     let cell = mgr.get(&uri).unwrap();
     let doc = cell.borrow();
-    let diags = capabilities::diagnostics_from_module(&doc.text, module, false);
+    let diags =
+        capabilities::diagnostics_from_module(&doc.text, module, false, SourceEncoding::UTF8);
     let unreachable = diags
         .iter()
         .find(|d| {
@@ -1511,7 +1540,8 @@ fn unused_local_carries_unnecessary_tag() {
     let module = pa.module(&uri).unwrap();
     let cell = mgr.get(&uri).unwrap();
     let doc = cell.borrow();
-    let diags = capabilities::diagnostics_from_module(&doc.text, module, false);
+    let diags =
+        capabilities::diagnostics_from_module(&doc.text, module, false, SourceEncoding::UTF8);
     let unused = diags
         .iter()
         .find(|d| {

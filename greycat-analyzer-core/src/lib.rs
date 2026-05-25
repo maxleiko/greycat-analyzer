@@ -20,6 +20,7 @@
 //! Re-exports `lsp_types` and `greycat_analyzer_syntax` so downstream
 //! crates depend on this one and pick up both transitively.
 
+pub mod conv;
 pub mod diagnostics;
 mod doc;
 mod manager;

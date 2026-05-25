@@ -1,5 +1,6 @@
 //! Document and range formatting handlers.
 
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Position, TextEdit};
 
@@ -9,13 +10,17 @@ use crate::conv::{byte_to_position, position_to_byte};
 /// the entire document range when the formatter's output differs from
 /// the input. Returns `None` (no edits) when the document is already
 /// formatted.
-pub fn formatting(text: &str, root: tree_sitter::Node<'_>) -> Option<Vec<TextEdit>> {
+pub fn formatting(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    encoding: SourceEncoding,
+) -> Option<Vec<TextEdit>> {
     let formatted = greycat_analyzer_fmt::format_tree(text, root);
     if formatted == text {
         return Some(Vec::new());
     }
     let last_byte = text.len();
-    let end_pos = byte_to_position(text, last_byte);
+    let end_pos = byte_to_position(text, last_byte, encoding);
     Some(vec![TextEdit {
         range: lsp_types::Range {
             start: Position {
@@ -37,10 +42,11 @@ pub fn range_formatting(
     text: &str,
     root: tree_sitter::Node<'_>,
     range: lsp_types::Range,
+    encoding: SourceEncoding,
 ) -> Option<Vec<TextEdit>> {
     let _ = root;
-    let start = position_to_byte(text, range.start);
-    let end = position_to_byte(text, range.end);
+    let start = position_to_byte(text, range.start, encoding);
+    let end = position_to_byte(text, range.end, encoding);
     if end <= start || end > text.len() {
         return Some(Vec::new());
     }

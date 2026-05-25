@@ -6,7 +6,9 @@
 //! ADT and demote the LSP shapes to a thin server-side converter.
 
 use greycat_analyzer_core::lsp_types::{self, *};
-use greycat_analyzer_core::{ItemId, Symbol, SymbolTable, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_core::{
+    ItemId, SourceEncoding, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
+};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::cst::node_at_offset;
@@ -34,8 +36,9 @@ pub fn completion_with_project(
     uri: &Uri,
     project: &ProjectAnalysis,
     project_root: Option<&std::path::Path>,
+    encoding: SourceEncoding,
 ) -> Option<CompletionList> {
-    let byte = position_to_byte(text, pos);
+    let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
     if let Some(items) = directive_completion(text, byte) {
         return Some(CompletionList {
@@ -45,7 +48,7 @@ pub fn completion_with_project(
     }
     let mut items = if let Some(items) = include_dir_completion(text, node, byte, project_root) {
         items
-    } else if let Some(items) = library_version_completion(text, node, byte) {
+    } else if let Some(items) = library_version_completion(text, node, byte, encoding) {
         // P15.3 — emit the lazy placeholder. `completion_handler` in
         // server.rs intercepts the placeholder and runs
         // [`resolve_library_version_completion`] against its
@@ -56,9 +59,9 @@ pub fn completion_with_project(
         });
     } else if let Some(items) = pragma_completion(text, byte) {
         items
-    } else if let Some(items) = member_completion(text, root, byte, uri, project) {
+    } else if let Some(items) = member_completion(text, root, byte, uri, project, encoding) {
         items
-    } else if let Some(items) = static_completion(text, byte, project) {
+    } else if let Some(items) = static_completion(text, byte, project, encoding) {
         items
     } else if let Some(items) = type_position_completion(text, node, byte, uri, project) {
         items
@@ -67,7 +70,7 @@ pub fn completion_with_project(
     } else {
         ident_or_keyword_completion(text, node, byte, uri, project)?
     };
-    apply_call_paren_snippet(&mut items, text, byte);
+    apply_call_paren_snippet(&mut items, text, byte, encoding);
     Some(CompletionList {
         is_incomplete: false,
         items,
@@ -262,6 +265,7 @@ fn library_version_completion(
     text: &str,
     node: tree_sitter::Node<'_>,
     cursor_byte: usize,
+    encoding: SourceEncoding,
 ) -> Option<Vec<CompletionItem>> {
     let string_node = ancestor_with_kind(node, "string")?;
     let args_node = ancestor_with_kind(string_node, "args")?;
@@ -306,8 +310,8 @@ fn library_version_completion(
         .unwrap_or("")
         .to_string();
     let range = lsp_types::Range {
-        start: byte_to_position(text, inner_start),
-        end: byte_to_position(text, inner_end),
+        start: byte_to_position(text, inner_start, encoding),
+        end: byte_to_position(text, inner_end, encoding),
     };
     let placeholder = LibVersionPlaceholder {
         kind: LIB_VERSION_PLACEHOLDER_KIND.into(),
@@ -1247,14 +1251,19 @@ fn ident_or_keyword_completion(
 /// templates like `@library("$1", "$2")`) for the call-paren rewrite,
 /// and skips items already carrying their own `text_edit` for the
 /// replace-range conversion.
-fn apply_call_paren_snippet(items: &mut [CompletionItem], text: &str, cursor_byte: usize) {
+fn apply_call_paren_snippet(
+    items: &mut [CompletionItem],
+    text: &str,
+    cursor_byte: usize,
+    encoding: SourceEncoding,
+) {
     let prefix_len = ident_prefix_at_cursor(text, cursor_byte).len();
     let suffix_len = ident_suffix_at_cursor(text, cursor_byte).len();
     let ident_start = cursor_byte.saturating_sub(prefix_len);
     let ident_end = cursor_byte + suffix_len;
     let parens_already_there = next_non_ws_is_open_paren(text.as_bytes(), ident_end);
     let replace_range =
-        (suffix_len > 0).then(|| byte_range_to_lsp(text, &(ident_start..ident_end)));
+        (suffix_len > 0).then(|| byte_range_to_lsp(text, &(ident_start..ident_end), encoding));
 
     for item in items.iter_mut() {
         // 1) Append `($0)` to FUNCTION / METHOD items unless the
@@ -1713,6 +1722,7 @@ fn member_completion(
     cursor_byte: usize,
     uri: &Uri,
     project: &ProjectAnalysis,
+    encoding: SourceEncoding,
 ) -> Option<Vec<CompletionItem>> {
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
@@ -1874,8 +1884,8 @@ fn member_completion(
             // `.` → `->` rewrite. The edit replaces the `.` byte with
             // `->` so the accepted item lands in the correct shape.
             let edit_range = lsp_types::Range {
-                start: byte_to_position(text, sep_start),
-                end: byte_to_position(text, sep_end),
+                start: byte_to_position(text, sep_start, encoding),
+                end: byte_to_position(text, sep_end, encoding),
             };
             for item in &mut inner_items {
                 item.additional_text_edits = Some(vec![TextEdit {
@@ -1912,8 +1922,8 @@ fn member_completion(
         .unwrap_or(false);
     if receiver_nullable && !already_nullsafe && !chain_protected {
         let insert_at = lsp_types::Range {
-            start: byte_to_position(text, sep_start),
-            end: byte_to_position(text, sep_start),
+            start: byte_to_position(text, sep_start, encoding),
+            end: byte_to_position(text, sep_start, encoding),
         };
         let prefix = if is_arrow { "?->" } else { "?." };
         for item in &mut items {
@@ -2362,12 +2372,13 @@ fn static_completion(
     text: &str,
     cursor_byte: usize,
     project: &crate::project::ProjectAnalysis,
+    encoding: SourceEncoding,
 ) -> Option<Vec<CompletionItem>> {
     let ctx = static_receiver_at(text, cursor_byte)?;
     let prefix_lower = ctx.typed.to_lowercase();
     let replace_range = lsp_types::Range {
-        start: byte_to_position(text, ctx.replace_range.start),
-        end: byte_to_position(text, ctx.replace_range.end),
+        start: byte_to_position(text, ctx.replace_range.start, encoding),
+        end: byte_to_position(text, ctx.replace_range.end, encoding),
     };
 
     let mut items: Vec<CompletionItem> = Vec::new();

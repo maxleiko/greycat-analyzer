@@ -4,6 +4,7 @@
 //! shared a method name with the cursor.
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_server::capabilities;
@@ -64,8 +65,14 @@ fn main() {}
 
     // Cursor on `process` in `abstract fn process(): int;` (Base's decl).
     let cursor_pos = position_of(src, "process(): int;");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(
         locs.len(),
@@ -99,8 +106,14 @@ fn call(b: Base): int {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "process();");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(
         locs.len(),
@@ -137,8 +150,14 @@ type Bystander {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(base_src, "run();");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &base_uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &base_uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(
         locs.len(),
@@ -166,8 +185,14 @@ fn main() {}
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "process(): int { return 1");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(locs.len(), 1, "expected Child::process only, got {locs:?}");
 }
@@ -189,8 +214,14 @@ type Bystander {}
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "Shape {}");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(
         locs.len(),
@@ -214,8 +245,14 @@ fn use_it(s: Shape) {}
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "Shape) {}");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(
         locs.len(),
@@ -236,8 +273,14 @@ fn goto_impl_on_type_name_across_modules() {
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(base_src, "Shape {}");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &base_uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &base_uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(locs.len(), 2, "expected 2 subtype locations: {locs:?}");
     let mut uris: Vec<_> = locs.iter().map(|l| l.uri.clone()).collect();
@@ -260,8 +303,14 @@ fn main() {}
     let pa = ProjectAnalysis::analyze(&mgr);
 
     let cursor_pos = position_of(src, "run() {}");
-    let resp = capabilities::goto_implementation_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto-impl returned a response");
+    let resp = capabilities::goto_implementation_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto-impl returned a response");
     let locs = locations(resp);
     assert_eq!(locs.len(), 1, "expected Solo::run only, got {locs:?}");
 }

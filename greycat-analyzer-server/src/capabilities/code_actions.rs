@@ -4,6 +4,7 @@
 //! and discards anything that would introduce new parse errors.
 
 use greycat_analyzer_analysis::{ide, project::ModuleAnalysis};
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, NumberOrString, TextEdit, Uri,
@@ -25,11 +26,12 @@ pub fn code_actions_with_project(
     root: tree_sitter::Node<'_>,
     uri: &Uri,
     range: lsp_types::Range,
+    encoding: SourceEncoding,
 ) -> Vec<CodeActionOrCommand> {
     // Code actions don't differentiate lib vs project — the user's
     // already pointing at a specific diagnostic when invoking them.
-    let semantic = diagnostics_from_module(text, module, true);
-    code_actions_from_diagnostics(root, text, uri, range, semantic)
+    let semantic = diagnostics_from_module(text, module, true, encoding);
+    code_actions_from_diagnostics(root, text, uri, range, semantic, encoding)
 }
 
 fn code_actions_from_diagnostics(
@@ -38,18 +40,19 @@ fn code_actions_from_diagnostics(
     uri: &Uri,
     range: lsp_types::Range,
     semantic: Vec<Diagnostic>,
+    encoding: SourceEncoding,
 ) -> Vec<CodeActionOrCommand> {
     semantic
         .into_iter()
         .filter(|d| ranges_overlap(&d.range, &range))
         .map(|d| {
-            let raw_edits = synthesize_fix(root, text, &d);
+            let raw_edits = synthesize_fix(root, text, &d, encoding);
             // **P22.5** — never offer an edit whose application would
             // break the document's parse. Apply the edit in-memory,
             // re-parse, and drop the edit if it adds new parse errors
             // the original didn't have. Mirrors the cli `--fix`
             // safety net.
-            let edits = if !raw_edits.is_empty() && would_break_parse(text, &raw_edits) {
+            let edits = if !raw_edits.is_empty() && would_break_parse(text, &raw_edits, encoding) {
                 Vec::new()
             } else {
                 raw_edits
@@ -84,14 +87,15 @@ fn code_actions_from_diagnostics(
 /// Apply `edits` against `text` in-memory and check if the result has
 /// new parse errors. Returns `true` if the edit would break a
 /// previously-valid parse. Used to gate quickfix offers.
-fn would_break_parse(text: &str, edits: &[TextEdit]) -> bool {
+fn would_break_parse(text: &str, edits: &[TextEdit], encoding: SourceEncoding) -> bool {
     let original_has_errors = greycat_analyzer_syntax::parse(text).root_node().has_error();
     // Apply edits in reverse byte order so prior offsets stay stable.
     let mut byte_edits: Vec<(std::ops::Range<usize>, &str)> = edits
         .iter()
         .map(|e| {
             (
-                position_to_byte(text, e.range.start)..position_to_byte(text, e.range.end),
+                position_to_byte(text, e.range.start, encoding)
+                    ..position_to_byte(text, e.range.end, encoding),
                 e.new_text.as_str(),
             )
         })
@@ -120,20 +124,25 @@ fn would_break_parse(text: &str, edits: &[TextEdit]) -> bool {
 /// Map a diagnostic to a concrete `Vec<TextEdit>`. Routes through the
 /// shared [`greycat_analyzer_analysis::ide::quickfix`] module so the LSP and
 /// the cli `lint --fix` path share a single source of truth.
-fn synthesize_fix(root: tree_sitter::Node<'_>, text: &str, diag: &Diagnostic) -> Vec<TextEdit> {
+fn synthesize_fix(
+    root: tree_sitter::Node<'_>,
+    text: &str,
+    diag: &Diagnostic,
+    encoding: SourceEncoding,
+) -> Vec<TextEdit> {
     let code = match &diag.code {
         Some(NumberOrString::String(s)) => s.as_str(),
         _ => return Vec::new(),
     };
-    let start = position_to_byte(text, diag.range.start);
-    let end = position_to_byte(text, diag.range.end);
+    let start = position_to_byte(text, diag.range.start, encoding);
+    let end = position_to_byte(text, diag.range.end, encoding);
     let edits = ide::quickfix::edit_for_diagnostic(root, text, code, &(start..end), &diag.message);
     edits
         .into_iter()
         .map(|e| TextEdit {
             range: lsp_types::Range {
-                start: byte_to_position(text, e.byte_range.start),
-                end: byte_to_position(text, e.byte_range.end),
+                start: byte_to_position(text, e.byte_range.start, encoding),
+                end: byte_to_position(text, e.byte_range.end, encoding),
             },
             new_text: e.new_text,
         })

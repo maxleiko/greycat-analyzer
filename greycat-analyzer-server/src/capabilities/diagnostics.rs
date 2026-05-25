@@ -6,6 +6,7 @@
 use greycat_analyzer_analysis::analyzer::Severity;
 use greycat_analyzer_analysis::lint::{DiagTag, LintSeverity};
 use greycat_analyzer_analysis::project::ModuleAnalysis;
+use greycat_analyzer_core::SourceEncoding;
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 
 use crate::conv::byte_range_to_lsp;
@@ -42,6 +43,7 @@ pub fn diagnostics_from_module(
     text: &str,
     module: &ModuleAnalysis,
     lint_libs: bool,
+    encoding: SourceEncoding,
 ) -> Vec<Diagnostic> {
     if !lint_libs && module.lib != "project" {
         return Vec::new();
@@ -51,7 +53,7 @@ pub fn diagnostics_from_module(
         .diagnostics
         .iter()
         .map(|d| Diagnostic {
-            range: byte_range_to_lsp(text, &d.byte_range),
+            range: byte_range_to_lsp(text, &d.byte_range, encoding),
             severity: Some(match d.severity {
                 Severity::Error => DiagnosticSeverity::ERROR,
                 Severity::Warning => DiagnosticSeverity::WARNING,
@@ -65,7 +67,7 @@ pub fn diagnostics_from_module(
         .collect();
     for lint in &module.lints {
         out.push(Diagnostic {
-            range: byte_range_to_lsp(text, &lint.byte_range),
+            range: byte_range_to_lsp(text, &lint.byte_range, encoding),
             severity: Some(match lint.severity {
                 LintSeverity::Error => DiagnosticSeverity::ERROR,
                 LintSeverity::Warning => DiagnosticSeverity::WARNING,

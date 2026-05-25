@@ -4,7 +4,7 @@
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, resolve};
-use greycat_analyzer_core::{SourceManager, SymbolTable};
+use greycat_analyzer_core::{SourceEncoding, SourceManager, SymbolTable};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::Decl;
@@ -21,8 +21,9 @@ pub fn goto_definition(
     root: tree_sitter::Node<'_>,
     uri: &Uri,
     pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<GotoDefinitionResponse> {
-    let byte = position_to_byte(text, pos);
+    let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
     if node.kind() != "ident" {
         return None;
@@ -57,7 +58,7 @@ pub fn goto_definition(
         };
         return Some(GotoDefinitionResponse::Scalar(Location {
             uri: uri.clone(),
-            range: byte_range_to_lsp(text, &target_range),
+            range: byte_range_to_lsp(text, &target_range, encoding),
         }));
     }
 
@@ -79,7 +80,7 @@ pub fn goto_definition(
     };
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: uri.clone(),
-        range: byte_range_to_lsp(text, &target_range),
+        range: byte_range_to_lsp(text, &target_range, encoding),
     }))
 }
 
@@ -96,8 +97,9 @@ pub fn goto_module_segment(
     root: tree_sitter::Node<'_>,
     pos: Position,
     manager: &SourceManager,
+    encoding: SourceEncoding,
 ) -> Option<Location> {
-    let byte = position_to_byte(text, pos);
+    let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
     if node.kind() != "ident" {
         return None;
@@ -147,9 +149,14 @@ pub fn cross_module_decl_location(
     foreign_text: &str,
     foreign_hir: &Hir,
     decl_id: greycat_analyzer_hir::arena::Idx<Decl>,
+    encoding: SourceEncoding,
 ) -> Option<Location> {
     let name_id = foreign_hir.decls[decl_id].name()?;
-    let range = byte_range_to_lsp(foreign_text, &foreign_hir.idents[name_id].byte_range);
+    let range = byte_range_to_lsp(
+        foreign_text,
+        &foreign_hir.idents[name_id].byte_range,
+        encoding,
+    );
     Some(Location {
         uri: foreign_uri.clone(),
         range,
@@ -166,6 +173,7 @@ pub fn cross_module_member_location(
     foreign_text: &str,
     foreign_hir: &Hir,
     member: &greycat_analyzer_analysis::analyzer::MemberDef,
+    encoding: SourceEncoding,
 ) -> Option<Location> {
     use greycat_analyzer_analysis::analyzer::MemberDef;
     let range = match *member {
@@ -180,7 +188,7 @@ pub fn cross_module_member_location(
     };
     Some(Location {
         uri: foreign_uri.clone(),
-        range: byte_range_to_lsp(foreign_text, &range),
+        range: byte_range_to_lsp(foreign_text, &range, encoding),
     })
 }
 
@@ -193,8 +201,9 @@ pub fn cursor_ident_idx(
     root: tree_sitter::Node<'_>,
     pos: Position,
     hir: &Hir,
+    encoding: SourceEncoding,
 ) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
-    let byte = position_to_byte(text, pos);
+    let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
     if node.kind() != "ident" {
         return None;
@@ -221,18 +230,33 @@ pub fn goto_definition_across_project(
     manager: &SourceManager,
     cursor_uri: &Uri,
     cursor_pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<GotoDefinitionResponse> {
     let cell = manager.get(cursor_uri)?;
     let doc = cell.borrow();
-    if let Some(loc) = goto_module_segment(&doc.text, doc.root_node(), cursor_pos, manager) {
+    if let Some(loc) =
+        goto_module_segment(&doc.text, doc.root_node(), cursor_pos, manager, encoding)
+    {
         return Some(GotoDefinitionResponse::Scalar(loc));
     }
-    if let Some(loc) = goto_definition(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos)
-    {
+    if let Some(loc) = goto_definition(
+        &doc.text,
+        &doc.lib,
+        doc.root_node(),
+        cursor_uri,
+        cursor_pos,
+        encoding,
+    ) {
         return Some(loc);
     }
     let module = project.module(cursor_uri)?;
-    let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
+    let cursor_idx = cursor_ident_idx(
+        &doc.text,
+        doc.root_node(),
+        cursor_pos,
+        &module.hir,
+        encoding,
+    )?;
 
     if let Some(Definition::ProjectDecl {
         uri: foreign_uri,
@@ -248,6 +272,7 @@ pub fn goto_definition_across_project(
             &foreign_doc.text,
             &foreign_module.hir,
             decl,
+            encoding,
         )
         .map(GotoDefinitionResponse::Scalar);
     }
@@ -263,6 +288,7 @@ pub fn goto_definition_across_project(
             &foreign_doc.text,
             &foreign_module.hir,
             decl,
+            encoding,
         )
         .map(GotoDefinitionResponse::Scalar);
     }
@@ -278,6 +304,7 @@ pub fn goto_definition_across_project(
         &foreign_doc.text,
         &foreign_module.hir,
         &member,
+        encoding,
     )
     .map(GotoDefinitionResponse::Scalar)
 }
@@ -294,11 +321,12 @@ pub fn goto_implementation(
     root: tree_sitter::Node<'_>,
     uri: &Uri,
     pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<GotoDefinitionResponse> {
-    let byte = position_to_byte(text, pos);
+    let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
     if node.kind() != "ident" {
-        return goto_definition(text, lib, root, uri, pos);
+        return goto_definition(text, lib, root, uri, pos, encoding);
     }
     let cursor_text = text.get(node.byte_range())?.to_string();
 
@@ -306,7 +334,7 @@ pub fn goto_implementation(
     let hir = lower_module(text, &symbols, "module", lib, root);
     let mut locations = Vec::new();
     let Some(module) = hir.module.as_ref() else {
-        return goto_definition(text, lib, root, uri, pos);
+        return goto_definition(text, lib, root, uri, pos, encoding);
     };
     for decl_id in &module.decls {
         if let Decl::Type(td) = &hir.decls[*decl_id] {
@@ -318,7 +346,11 @@ pub fn goto_implementation(
                     if symbols[hir.idents[fnd.name].symbol] == *cursor_text {
                         locations.push(Location {
                             uri: uri.clone(),
-                            range: byte_range_to_lsp(text, &hir.idents[fnd.name].byte_range),
+                            range: byte_range_to_lsp(
+                                text,
+                                &hir.idents[fnd.name].byte_range,
+                                encoding,
+                            ),
                         });
                     }
                 }
@@ -326,7 +358,7 @@ pub fn goto_implementation(
         }
     }
     if locations.is_empty() {
-        return goto_definition(text, lib, root, uri, pos);
+        return goto_definition(text, lib, root, uri, pos, encoding);
     }
     Some(GotoDefinitionResponse::Array(locations))
 }
@@ -351,13 +383,21 @@ pub fn goto_implementation_across_project(
     manager: &SourceManager,
     cursor_uri: &Uri,
     cursor_pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<GotoDefinitionResponse> {
     let cell = manager.get(cursor_uri)?;
     let doc = cell.borrow();
-    let byte = position_to_byte(&doc.text, cursor_pos);
+    let byte = position_to_byte(&doc.text, cursor_pos, encoding);
     let node = node_at_offset(doc.root_node(), byte)?;
     if node.kind() != "ident" {
-        return goto_implementation(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos);
+        return goto_implementation(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+            cursor_uri,
+            cursor_pos,
+            encoding,
+        );
     }
     let cursor_text = doc.text.get(node.byte_range())?.to_string();
     drop(doc);
@@ -366,19 +406,27 @@ pub fn goto_implementation_across_project(
     // concrete subtype across the project. Tried before the method
     // path because the type-name shape can't be a method ident, and
     // the method path won't match types.
-    if let Some(target_type) = type_target_for_cursor(project, manager, cursor_uri, cursor_pos)
-        && let Some(resp) = type_implementations(project, manager, &target_type)
+    if let Some(target_type) =
+        type_target_for_cursor(project, manager, cursor_uri, cursor_pos, encoding)
+        && let Some(resp) = type_implementations(project, manager, &target_type, encoding)
     {
         return Some(resp);
     }
 
     let Some(declaring_type) =
-        declaring_type_for_method_cursor(project, manager, cursor_uri, cursor_pos)
+        declaring_type_for_method_cursor(project, manager, cursor_uri, cursor_pos, encoding)
     else {
         // No declaring type → fall through to the naive in-module path.
         let cell = manager.get(cursor_uri)?;
         let doc = cell.borrow();
-        return goto_implementation(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos);
+        return goto_implementation(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+            cursor_uri,
+            cursor_pos,
+            encoding,
+        );
     };
 
     let mut locations = Vec::new();
@@ -431,6 +479,7 @@ pub fn goto_implementation_across_project(
                         range: byte_range_to_lsp(
                             &other_doc.text,
                             &module.hir.idents[fnd.name].byte_range,
+                            encoding,
                         ),
                     });
                 }
@@ -440,7 +489,14 @@ pub fn goto_implementation_across_project(
     if locations.is_empty() {
         let cell = manager.get(cursor_uri)?;
         let doc = cell.borrow();
-        return goto_implementation(&doc.text, &doc.lib, doc.root_node(), cursor_uri, cursor_pos);
+        return goto_implementation(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+            cursor_uri,
+            cursor_pos,
+            encoding,
+        );
     }
     Some(GotoDefinitionResponse::Array(locations))
 }
@@ -464,21 +520,22 @@ pub fn goto_declaration_across_project(
     manager: &SourceManager,
     cursor_uri: &Uri,
     cursor_pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<GotoDefinitionResponse> {
     let cell = manager.get(cursor_uri)?;
     let doc = cell.borrow();
-    let byte = position_to_byte(&doc.text, cursor_pos);
+    let byte = position_to_byte(&doc.text, cursor_pos, encoding);
     let node = node_at_offset(doc.root_node(), byte)?;
     if node.kind() != "ident" {
-        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos);
+        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos, encoding);
     }
     let cursor_text = doc.text.get(node.byte_range())?.to_string();
     drop(doc);
 
     let Some(declaring_type) =
-        declaring_type_for_method_cursor(project, manager, cursor_uri, cursor_pos)
+        declaring_type_for_method_cursor(project, manager, cursor_uri, cursor_pos, encoding)
     else {
-        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos);
+        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos, encoding);
     };
 
     // Cross-module find: pick the first non-private candidate whose
@@ -504,7 +561,7 @@ pub fn goto_declaration_across_project(
     let Some((foreign_uri, decl_id)) = ancestor else {
         // No abstract ancestor — fall through to goto-definition so
         // the client still produces a useful jump for the cursor.
-        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos);
+        return goto_definition_across_project(project, manager, cursor_uri, cursor_pos, encoding);
     };
 
     let foreign_module = project.module(&foreign_uri)?;
@@ -514,7 +571,7 @@ pub fn goto_declaration_across_project(
     let range = foreign_module.hir.idents[name_id].byte_range.clone();
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: foreign_uri.clone(),
-        range: byte_range_to_lsp(&foreign_doc.text, &range),
+        range: byte_range_to_lsp(&foreign_doc.text, &range, encoding),
     }))
 }
 
@@ -529,11 +586,18 @@ fn type_target_for_cursor(
     manager: &SourceManager,
     cursor_uri: &Uri,
     cursor_pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<String> {
     let cell = manager.get(cursor_uri)?;
     let doc = cell.borrow();
     let module = project.module(cursor_uri)?;
-    let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
+    let cursor_idx = cursor_ident_idx(
+        &doc.text,
+        doc.root_node(),
+        cursor_pos,
+        &module.hir,
+        encoding,
+    )?;
     drop(doc);
 
     // Binding-site: cursor on a `type Foo {}` / `enum Foo` ident.
@@ -580,6 +644,7 @@ fn type_implementations(
     project: &ProjectAnalysis,
     manager: &SourceManager,
     target_type: &str,
+    encoding: SourceEncoding,
 ) -> Option<GotoDefinitionResponse> {
     let target_sym = project.symbols().lookup(target_type)?;
     // Pick the first non-private candidate whose name matches the
@@ -620,7 +685,11 @@ fn type_implementations(
             }
             locations.push(Location {
                 uri: uri.clone(),
-                range: byte_range_to_lsp(&doc.text, &module.hir.idents[td.name].byte_range),
+                range: byte_range_to_lsp(
+                    &doc.text,
+                    &module.hir.idents[td.name].byte_range,
+                    encoding,
+                ),
             });
         }
     }
@@ -650,11 +719,18 @@ fn declaring_type_for_method_cursor(
     manager: &SourceManager,
     cursor_uri: &Uri,
     cursor_pos: Position,
+    encoding: SourceEncoding,
 ) -> Option<String> {
     let cell = manager.get(cursor_uri)?;
     let doc = cell.borrow();
     let module = project.module(cursor_uri)?;
-    let cursor_idx = cursor_ident_idx(&doc.text, doc.root_node(), cursor_pos, &module.hir)?;
+    let cursor_idx = cursor_ident_idx(
+        &doc.text,
+        doc.root_node(),
+        cursor_pos,
+        &module.hir,
+        encoding,
+    )?;
     let cursor_sym = module.hir.idents[cursor_idx].symbol;
     let cursor_range = module.hir.idents[cursor_idx].byte_range.clone();
     drop(doc);

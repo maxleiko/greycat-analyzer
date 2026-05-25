@@ -5,6 +5,7 @@
 //! declaration site.
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
+use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_server::capabilities;
@@ -53,8 +54,14 @@ fn use_sub(s: Sub): String {
 
     let pa = ProjectAnalysis::analyze(&mgr);
     let cursor_pos = position_of(main_src, "greet()");
-    let resp = capabilities::goto_definition_across_project(&pa, &mgr, &main_uri, cursor_pos)
-        .expect("goto produced a location");
+    let resp = capabilities::goto_definition_across_project(
+        &pa,
+        &mgr,
+        &main_uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto produced a location");
     let GotoDefinitionResponse::Scalar(loc) = resp else {
         panic!("expected scalar location, got {resp:?}");
     };
@@ -92,8 +99,14 @@ fn use_sub(s: Sub): String {
 
     let pa = ProjectAnalysis::analyze(&mgr);
     let cursor_pos = position_of(main_src, "name;");
-    let resp = capabilities::goto_definition_across_project(&pa, &mgr, &main_uri, cursor_pos)
-        .expect("goto produced a location");
+    let resp = capabilities::goto_definition_across_project(
+        &pa,
+        &mgr,
+        &main_uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto produced a location");
     let GotoDefinitionResponse::Scalar(loc) = resp else {
         panic!("expected scalar location, got {resp:?}");
     };
@@ -113,8 +126,14 @@ fn goto_def_in_module_method_still_works() {
 
     let pa = ProjectAnalysis::analyze(&mgr);
     let cursor_pos = position_of(src, "helper();");
-    let resp = capabilities::goto_definition_across_project(&pa, &mgr, &uri, cursor_pos)
-        .expect("goto produced a location");
+    let resp = capabilities::goto_definition_across_project(
+        &pa,
+        &mgr,
+        &uri,
+        cursor_pos,
+        SourceEncoding::UTF8,
+    )
+    .expect("goto produced a location");
     let GotoDefinitionResponse::Scalar(loc) = resp else {
         panic!("expected scalar location, got {resp:?}");
     };
