@@ -2326,22 +2326,26 @@ impl ProjectAnalysis {
         self.compute_qualified_refs(manager);
     }
 
-    /// Walk every module's `Expr::Call` and emit a diagnostic for
-    /// Walks every module's `Expr::Call`, resolves the callee to its
-    /// declared `FnDecl` (in-module via `Resolutions::uses` + `member_uses`,
-    /// cross-module via `foreign_member_uses` + `QualifiedStatic`),
-    /// and emits a `value of type X is not assignable to parameter Y`
-    /// diagnostic for each mismatched arg.
+    /// Walks every module's `Expr::Call` and emits arity / arg-type
+    /// diagnostics. Two signature carriers are supported:
+    ///
+    /// 1. Direct fn-decl callees (in-module via `Resolutions::uses` +
+    ///    `member_uses`, cross-module via `foreign_member_uses` +
+    ///    `QualifiedStatic`) — resolved via [`resolve_call_target`].
+    /// 2. Lambda-typed callees — when (1) returns `None`, the callee's
+    ///    settled `expr_types` entry is consulted; if it's
+    ///    `TypeKind::Lambda { params, ret }` (a lambda literal in a
+    ///    var, or a fn-ref minted by `fn_ref_ty_from_sig`), arity and
+    ///    per-arg checks run against the lambda's pre-lowered params.
+    ///    Opaque `function` and everything else carry no signature
+    ///    and are skipped here.
     ///
     /// Runs after pass 3.5 so the arg-side `expr_types` reflect any
     /// cross-module return-type inferences (otherwise outer calls
     /// whose args are inner static-expr calls would all surface
-    /// "value of type `any`" false positives).
-    /// Walk every module's `Expr::Call` and emit a diagnostic for
-    /// each arg whose settled type isn't assignable to the
-    /// corresponding declared param. Folded into the unified
-    /// validation phase so all type-relation diagnostics share one
-    /// producer.
+    /// "value of type `any`" false positives). Folded into the
+    /// unified validation phase so all type-relation diagnostics share
+    /// one producer.
     // P19
     /// Split-borrow variant: takes `&modules`, `&index`, and a
     /// mutable borrow on the shared arena. The validation loop holds
@@ -2374,6 +2378,19 @@ impl ProjectAnalysis {
             let Some((foreign_uri_opt, fn_decl_id)) =
                 resolve_call_target(modules, index, cur_module, call.callee)
             else {
+                // No fn-decl handle — fall back to the callee's settled
+                // type. Lambda-typed callees (lambda literals / fn-ref
+                // values) carry their signature in the type; opaque
+                // `function` and other kinds skip.
+                lambda_call_arg_diags(
+                    cur_module,
+                    index,
+                    well_known,
+                    decl_registry,
+                    arena,
+                    call,
+                    diags,
+                );
                 continue;
             };
             let foreign_module = match &foreign_uri_opt {
@@ -3316,7 +3333,93 @@ fn collect_chain(node: Node<'_>, text: &str, out: &mut Vec<String>) {
 ///     bare-fn / static calls.
 ///   * `Expr::QualifiedStatic` -> `resolve_qualified_chain` -> `MemberDef::Method`.
 ///
-/// Lambda callees and unresolved member accesses return `None`.
+/// Lambda callees and unresolved member accesses return `None` from
+/// `resolve_call_target` — they take the lambda-callee fallback path in
+/// [`lambda_call_arg_diags`] below.
+//
+/// Lambda-callee arm of the call-arg validator. Reads the callee's
+/// settled `expr_types` entry; if it's `TypeKind::Lambda { params, ret }`
+/// (a lambda literal stored in a var, or a fn-ref minted by
+/// `Analyzer::fn_ref_ty_from_sig` in step 2 of the lambda-unify plan),
+/// emits the same `call-arity` and `argument-type-mismatch` diagnostics
+/// as the fn-decl path against the lambda's pre-lowered params.
+///
+/// Opaque `function` (the nominal `Type(function_decl)`) carries no
+/// signature and is skipped — the call still types as `any?` via the
+/// `Expr::Call` default, no validation possible. Same for any other
+/// `TypeKind` (unresolved, primitive, etc.).
+///
+/// Strips the outer nullable bit before inspection so `function?`-typed
+/// callees still validate against the underlying lambda shape, mirroring
+/// the runtime which null-checks once then dispatches against the
+/// signature.
+fn lambda_call_arg_diags(
+    cur_module: &ModuleAnalysis,
+    index: &ProjectIndex,
+    well_known: &crate::well_known::WellKnown,
+    decl_registry: &crate::well_known::DeclRegistry,
+    arena: &mut TypeArena,
+    call: &greycat_analyzer_hir::types::CallExpr,
+    diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
+) {
+    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    use greycat_analyzer_core::TypeKind;
+
+    let Some(callee_ty) = cur_module.analysis.expr_types.get(&call.callee).copied() else {
+        return;
+    };
+    // Clone the kind so we can read params / ret without holding the
+    // arena borrow across the diagnostic loop (which may allocate via
+    // `display_type` -> nullable wrappers internally).
+    let kind = arena.get(callee_ty).kind.clone();
+    let (params, _ret) = match kind {
+        TypeKind::Lambda { params, ret } => (params, ret),
+        _ => return,
+    };
+    let expected = params.len();
+    let actual = call.args.len();
+    if expected != actual {
+        let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
+        let plural = if expected == 1 { "" } else { "s" };
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            code: "call-arity",
+            message: format!("call expects {expected} argument{plural}, but got {actual}"),
+            byte_range: callee_end..call.byte_range.end,
+            category: DiagCategory::TypeRelation,
+        });
+        return;
+    }
+    for i in 0..expected {
+        let declared_ty = params[i];
+        let arg_ty = match cur_module.analysis.expr_types.get(&call.args[i]).copied() {
+            Some(t) => t,
+            None => continue,
+        };
+        if !is_assignable_to_with_index(
+            index,
+            well_known,
+            decl_registry,
+            arena,
+            arg_ty,
+            declared_ty,
+        ) {
+            let r = cur_module.hir.exprs[call.args[i]].byte_range();
+            diags.push(SemanticDiagnostic {
+                severity: Severity::Error,
+                code: "argument-type-mismatch",
+                message: format!(
+                    "value of type `{}` is not assignable to parameter of type `{}`",
+                    display_type(arena, decl_registry, &index.symbols, arg_ty),
+                    display_type(arena, decl_registry, &index.symbols, declared_ty),
+                ),
+                byte_range: r,
+                category: DiagCategory::TypeRelation,
+            });
+        }
+    }
+}
+
 #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
 fn resolve_call_target(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
