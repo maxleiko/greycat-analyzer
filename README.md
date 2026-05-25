@@ -8,7 +8,7 @@ One binary, `greycat-analyzer`, ships every tool. Editors point at `greycat-anal
 
 Pre-built binaries — each snippet pulls the latest release. Pick your platform:
 
-**Linux x86_64 (glibc)**
+**Linux x86_64 (glibc 2.39+)**
 
 ```sh
 curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-gnu.zip -o /tmp/gca.zip
