@@ -323,7 +323,7 @@ Quick reminders for analyzer work:
 - Field access on inner type: `n->name`. Method on the node itself: `n.resolve()`.
 - Native types (`geo`, `time`, `duration`) have no fields — methods only.
 - `Array<T>{}`, not `Array<T>::new()`. No ternary. No `void` keyword.
-- `function` parameter type is opaque; calls return `any?` and require casting.
+- Function-valued expressions (lambdas, `top_level_fn`, `Foo::static_method`) carry their structural signature `TypeKind::Lambda { params, ret }`, displayed as `fn(P0, P1)` or `fn(P0, P1): R`. They're assignable to the opaque `function` slot type via the wrapper rule; values that flow back out of `function`-typed slots stay opaque. **See § "Function values, lambdas, and the opaque `function`" below for the full model — instance-method value refs are a hard error.**
 - Built-in runtime type names (`Array`, `Map`, `Set`, `node`, `nodeTime`, `nodeGeo`, `nodeList`, `nodeIndex`, `function`, `tuple`, `field`, `t2`-`t4`, `t2f`-`t4f`) are seeded into `ProjectIndex::new()` and resolve through `Definition::Project`. They are *not* declared in `.gcl` — they live in the GreyCat runtime.
 
 ### `private` semantics (NOT "hidden")
@@ -335,3 +335,25 @@ GreyCat's `private` keyword has two distinct meanings, **neither** of which matc
 **2. `private` on a type attribute (`private attr: int;`)** — the attr is **read-public, write-private**. Anyone, anywhere, can `read obj.attr`. Only the type's constructor (`object_expr`, e.g. `Foo { attr: 1 }`) can write to it. Direct assignment `obj.attr = x` from outside the constructor is forbidden. The legitimate gate lives on the *assignment* side (`Stmt::Assign` / `AssignExpr` whose LHS is a member-access on a `private` attr from outside the constructor). Read access, including inherited-attr walks, treats private attrs as fully accessible.
 
 If you find code excluding something on `is_private` that isn't one of those two specific cases, it's wrong. The defect that surfaced this rule: [stdlib.rs:804](../greycat-analyzer-analysis/src/stdlib.rs#L804) gated `type_members` insertion on `!is_private`, which broke inherited-member resolution for private types in their own module — the supertype walk in `type_attr_id_chain` / `walk_member_chain` couldn't even start, so `LabelDrawing.height` (with `private LabelDrawing extends ElementDrawing` declaring `height`) reported a spurious `unknown-member`, and `LabelDrawing { does_not_exists: "rekt" }` skipped the unknown-field check entirely.
+
+### Function values, lambdas, and the opaque `function`
+
+A lambda is a top-level fn declared inside a scope. The analyzer enforces that mental model — lambdas and fn references share **one** structural type representation, and the opaque `function` slot type is just the nominal handle they assign INTO. Earlier docs claimed `function` parameter calls "return `any?` and require casting" — that's only true for genuinely opaque values (e.g. a `function`-typed param read inside its own fn body). Values that the analyzer KNOWS the signature of carry it through.
+
+**The structural carrier.** [`TypeKind::Lambda { params: Box<[TypeId]>, ret: Option<TypeId> }`](../greycat-analyzer-core/src/types.rs) is the single shape for every "function-valued" expression:
+
+- Lambda literals (`fn(a: int): int { return a; }`) — params from the typed-param list, `ret` from the declared `: R` annotation OR from body inference (mirrors the fn-level `infer-return-type` lint via the shared [`return_inference`](../greycat-analyzer-analysis/src/return_inference.rs) module). Inference only commits when the join produces a single GCL-expressible `T` or `T?`; mixed branches (`int + String`) stay `None`.
+- Top-level fn refs (`top_level_fn`, `module::top_level_fn`) — minted from `FnSignature` via `Analyzer::fn_ref_ty_from_sig`. Generic fns stay opaque (no GCL-expressible Lambda shape for `fn<T>(x: T): T` in value position).
+- `static` method refs (`Foo::static_method`, `module::Foo::static_method`) — same helper, same rules.
+
+**The display syntax is the same as GCL fn-decl syntax**, body dropped: `fn(P0, P1)` when `ret == None`, `fn(P0, P1): R` when `ret == Some(R)`. The arrow form `(P) -> R` does NOT appear anywhere — adding it would create a syntax nowhere else in GCL.
+
+**Assignability has one new wrapper rule:** `Lambda → Type(function_decl)` (gated on `well_known.function_decl`). Any structural lambda flows into the opaque `function` slot type. The reverse direction (`function → Lambda{specific}`) stays rejected — the opaque side carries no signature so admitting it into a typed slot would be unsound.
+
+**Calls check args via the structural signature, not the nominal slot.** When `Expr::Call`'s callee resolves to `TypeKind::Lambda { params, ret }` (lambda literal in a var, fn-ref via the helper, etc.), `collect_call_arg_diags_split` runs arity + per-arg `is_assignable_to_with_index(arg_ty, params[i])`, and the call expression's result type is `ret.unwrap_or(any?)`. Outer-nullable stripping handles `function?`-typed callees. The OPAQUE path still applies: callees whose `expr_types` entry is `TypeKind::Type(function_decl)` carry no signature and the call falls back to `any?` with no arg validation.
+
+**Instance-method value refs are a hard error.** Only context-free fn references are first-class values: top-level fns and `static` methods. An instance method carries an implicit `this` — no GCL representation as a free function value. Taking `obj.method` (or `Foo::instance_method` via the static syntax) and using it outside callee position raises `instance-method-value-ref`. The error wording suggests the lambda workaround: `fn(...) { obj.method(...); }`. The walk lives in [`collect_instance_method_value_ref_diags`](../greycat-analyzer-analysis/src/project.rs) next to the call-arg / object-field validators — one pass collects every `Expr::Call`'s callee Idx into a set, then negation gives the value-position set, and `MemberDef::Method(decl_id)` resolved members whose backing `Decl::Fn.modifiers.static_` is false get flagged.
+
+**`FnSignature.return_ty: Option<TypeId>`** carries the same Some/None distinction so the structural-Lambda helper can read "did the source decl write a `:` return type" honestly. Consumers that need a TypeId for "what does this call return" default `None → any?` at the use site. Don't widen `stage_lower_signatures` to register non-return-typed top-level fns with `ret = any?` fallback — those genuinely have an unknown return shape and should mint opaque `function` in value position.
+
+If you add a new fn-ref-shaped site (e.g. a new completion source, a new code-action that synthesises one), route it through `fn_ref_ty_from_sig` or one of the existing call sites — don't reintroduce `self.function_ty()` for shapes that have a known signature.
