@@ -1428,58 +1428,57 @@ fn lower_module_signatures(
                         );
                         entry.methods.push((type_id, method_sym, ty));
                     }
-                    // P-typeof-inference — pre-lower the full signature
-                    // for methods that carry their own generic params
-                    // so call-site inference can witness `T` from arg
-                    // types. The non-generic case skips this (the
-                    // simpler `method_returns` lookup is enough) to
-                    // avoid duplicating per-call signature work.
-                    if !fnd.generics.is_empty() {
-                        let method_generics: Vec<Symbol> =
-                            fnd.generics.iter().map(|g| hir.idents[*g].symbol).collect();
-                        let mut method_params: Vec<TypeId> = Vec::with_capacity(fnd.params.len());
-                        for p_id in &fnd.params {
-                            let p = &hir.fn_params[*p_id];
-                            let pt = if let Some(tr) = p.ty {
-                                lower_type_ref_project(
-                                    hir,
-                                    tr,
-                                    arena_mut,
-                                    &*index,
-                                    decl_registry,
-                                    &generics_in_scope,
-                                )
-                            } else {
-                                arena_mut.any_nullable()
-                            };
-                            method_params.push(pt);
-                        }
-                        // `return_ty: None` when the method declares no
-                        // return type — preserves the "no observable
-                        // return" semantic for the structural-Lambda
-                        // mint downstream. Call-typing consumers fall
-                        // back to `any?` at their use site.
-                        let method_ret_ty = fnd.return_type.map(|ret| {
+                    // Pre-lower the full method signature for every
+                    // method, generic or not. Generic methods need it
+                    // for call-site inference (`run_method_generic_inference`);
+                    // non-generic ones need it for the lambda-unify
+                    // `fn_ref_ty_from_sig` helper to mint a structural
+                    // Lambda when a static method is referenced in
+                    // value position (`Runtime::on_files_put`).
+                    let method_generics: Vec<Symbol> =
+                        fnd.generics.iter().map(|g| hir.idents[*g].symbol).collect();
+                    let mut method_params: Vec<TypeId> = Vec::with_capacity(fnd.params.len());
+                    for p_id in &fnd.params {
+                        let p = &hir.fn_params[*p_id];
+                        let pt = if let Some(tr) = p.ty {
                             lower_type_ref_project(
                                 hir,
-                                ret,
+                                tr,
                                 arena_mut,
                                 &*index,
                                 decl_registry,
                                 &generics_in_scope,
                             )
-                        });
-                        entry.method_sigs.push((
-                            type_id,
-                            method_sym,
-                            FnSignature {
-                                home_uri: uri.clone(),
-                                return_ty: method_ret_ty,
-                                generics: method_generics,
-                                params: method_params,
-                            },
-                        ));
+                        } else {
+                            arena_mut.any_nullable()
+                        };
+                        method_params.push(pt);
                     }
+                    // `return_ty: None` when the method declares no
+                    // return type — preserves the "no observable
+                    // return" semantic for the structural-Lambda
+                    // mint downstream. Call-typing consumers fall
+                    // back to `any?` at their use site.
+                    let method_ret_ty = fnd.return_type.map(|ret| {
+                        lower_type_ref_project(
+                            hir,
+                            ret,
+                            arena_mut,
+                            &*index,
+                            decl_registry,
+                            &generics_in_scope,
+                        )
+                    });
+                    entry.method_sigs.push((
+                        type_id,
+                        method_sym,
+                        FnSignature {
+                            home_uri: uri.clone(),
+                            return_ty: method_ret_ty,
+                            generics: method_generics,
+                            params: method_params,
+                        },
+                    ));
                     // Restore: undo every push (in reverse so a method
                     // that re-shadows an outer name plays back correctly).
                     for (k, prev) in saved.into_iter().rev() {

@@ -1642,6 +1642,23 @@ impl<'a> Cx<'a> {
             }
         }
     }
+    /// Mint the structural `TypeKind::Lambda` for a value-position
+    /// reference to a top-level fn or `static` method. Generic fns
+    /// fall back to the opaque `function` type — there's no GCL-
+    /// expressible Lambda shape for `fn<T>(x: T): T` in value position
+    /// (the user would have to instantiate `T` somehow at the use
+    /// site, which isn't a thing in GCL).
+    ///
+    /// `sig.return_ty: Option<TypeId>` flows through verbatim: a fn
+    /// declared without `:` return type produces a Lambda with `ret =
+    /// None`, rendered `fn(P)`; with `: R` declared, `ret = Some(R)`,
+    /// rendered `fn(P): R`.
+    fn fn_ref_ty_from_sig(&mut self, sig: &crate::stdlib::FnSignature) -> TypeId {
+        if !sig.generics.is_empty() {
+            return self.function_ty();
+        }
+        self.arena.lambda(sig.params.clone(), sig.return_ty)
+    }
     fn field_ty(&mut self) -> TypeId {
         match self.well_known.field_decl {
             Some(d) => self.arena.alloc_type(d),
@@ -2781,8 +2798,39 @@ impl<'a> Cx<'a> {
         })?;
         Some(match kind {
             MemberDef::Attr(_) => self.field_ty(),
-            MemberDef::Method(_) => self.function_ty(),
+            MemberDef::Method(_) => self.method_ref_ty(recv_ty, prop_sym),
         })
+    }
+
+    /// Mint the value-position type for a method reference. Static
+    /// methods get a structural Lambda (built from the type's
+    /// `method_signatures`); non-static methods keep the opaque
+    /// `function` (instance-method value refs are caught separately by
+    /// the `instance-method-value-ref` diagnostic in the validation
+    /// phase — the type minted here doesn't affect that walk).
+    fn method_ref_ty(&mut self, recv_ty: TypeId, method_sym: Symbol) -> TypeId {
+        let owner_id: Option<ItemId> = match &self.arena.get(recv_ty).kind {
+            TypeKind::Type(d) => Some(*d),
+            TypeKind::Generic { decl, .. } => Some(*decl),
+            TypeKind::Primitive(p) => {
+                let core_mod = self.index.symbols.intern("core");
+                let name_sym = self.index.symbols.intern(p.name());
+                Some(ItemId::new(core_mod, name_sym))
+            }
+            _ => None,
+        };
+        let sig_opt = owner_id
+            .and_then(|id| self.index.type_members.get(&id))
+            .and_then(|m| {
+                m.static_methods
+                    .contains(&method_sym)
+                    .then(|| m.method_signatures.get(&method_sym).cloned())
+                    .flatten()
+            });
+        match sig_opt {
+            Some(sig) => self.fn_ref_ty_from_sig(&sig),
+            None => self.function_ty(),
+        }
     }
 
     // P23
@@ -2801,14 +2849,15 @@ impl<'a> Cx<'a> {
                 let module_sym = self.hir.idents[chain[0]].symbol;
                 let sym = self.hir.idents[chain[1]].symbol;
                 let item = ItemId::new(module_sym, sym);
-                if self.index.fn_signatures.contains_key(&item) {
-                    Some(self.function_ty())
+                if let Some(sig) = self.index.fn_signatures.get(&item).cloned() {
+                    Some(self.fn_ref_ty_from_sig(&sig))
                 } else if self.index.values.contains(&sym) {
                     // Non-native fn (`private fn foo()` or fn without
                     // declared return type) — present in `values` but
                     // skipped from `fn_signatures`. The runtime still
                     // treats `module::fn_name` as a function ref, so
-                    // type it as `function` (not `type`).
+                    // type it as opaque `function` (no signature shape
+                    // to mint into a structural Lambda).
                     Some(self.function_ty())
                 } else if let Some(enum_id) = self.index.enum_types.get(&item).copied() {
                     // P-typeof — `module::EnumName` in value position
@@ -2847,7 +2896,17 @@ impl<'a> Cx<'a> {
                 }
                 let members = self.index.type_members.get(&type_id)?;
                 if members.methods.contains_key(&member_sym) {
-                    Some(self.function_ty())
+                    // Static method mints a structural Lambda from
+                    // `method_signatures`; instance methods stay opaque
+                    // — the `instance-method-value-ref` validation
+                    // walk handles the value-position-error case.
+                    if members.static_methods.contains(&member_sym)
+                        && let Some(sig) = members.method_signatures.get(&member_sym).cloned()
+                    {
+                        Some(self.fn_ref_ty_from_sig(&sig))
+                    } else {
+                        Some(self.function_ty())
+                    }
                 } else if members.attrs.contains_key(&member_sym) {
                     // P19.13 — static-attr value access from a
                     // `module::Type::name` chain. Returns the
@@ -5201,7 +5260,17 @@ impl<'a> Cx<'a> {
                             .unwrap_or_else(|| self.arena.alloc_type(item));
                         self.arena.type_of(inner)
                     }
-                    Decl::Fn(_) => self.function_ty(),
+                    Decl::Fn(_) => {
+                        // In-module fn ref: consult fn_signatures via
+                        // the local ItemId so the structural Lambda
+                        // carries the real params / declared return.
+                        let fn_sym = self.hir.idents[idx].symbol;
+                        let item = ItemId::new(self.module_sym, fn_sym);
+                        match self.index.fn_signatures.get(&item).cloned() {
+                            Some(sig) => self.fn_ref_ty_from_sig(&sig),
+                            None => self.function_ty(),
+                        }
+                    }
                     _ => self.any_nullable(),
                 },
                 Some(Definition::ProjectDecl {
@@ -5221,15 +5290,22 @@ impl<'a> Cx<'a> {
                     if let Some(var_ty) = item.and_then(|id| self.index.var_types.get(&id)).copied()
                     {
                         var_ty
-                    } else if item.is_some_and(|id| self.index.fn_signatures.contains_key(&id))
-                        || self.index.non_native_fn_names.contains(&sym)
+                    } else if let Some(sig) = item
+                        .and_then(|id| self.index.fn_signatures.get(&id))
+                        .cloned()
                     {
-                        // P38.1 — native fns live in `fn_signatures`,
-                        // non-native (user / stdlib `.gcl`) fns in
-                        // `non_native_fn_names`. Both shapes are
-                        // `function`-typed values when referenced
-                        // bare; only the `type_ty()` fallback below
-                        // remains for genuine type / enum names.
+                        // P38.1 — native + non-native (.gcl) fns with a
+                        // declared return live in `fn_signatures`. Mint
+                        // a structural Lambda from the pre-lowered
+                        // params/return so calls through the ident
+                        // check against the real signature.
+                        self.fn_ref_ty_from_sig(&sig)
+                    } else if self.index.non_native_fn_names.contains(&sym) {
+                        // Non-native fn without a declared return type
+                        // (skipped from `fn_signatures` per
+                        // `stage_lower_signatures`'s `let Some(ret) =
+                        // ... else continue`). Opaque `function`
+                        // fallback — no structural shape to mint.
                         self.function_ty()
                     } else if let Some(enum_id) =
                         item.and_then(|id| self.index.enum_types.get(&id).copied())

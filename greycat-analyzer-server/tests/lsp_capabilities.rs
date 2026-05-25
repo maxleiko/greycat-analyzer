@@ -1959,8 +1959,10 @@ fn qualified_static_call_infers_return_type() {
     );
 }
 
-/// P15.8 — `var y = runtime::Identity::create;` (chained method ref)
-/// infers `y: function`.
+/// `var y = runtime::Identity::create;` (chained static method ref)
+/// infers `y` as the structural lambda matching `create`'s signature.
+/// Was opaque `function` pre-lambda-unify; now carries the real shape
+/// so calls through `y` check arg types.
 #[test]
 fn qualified_static_method_ref_infers_function() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -1999,8 +2001,8 @@ fn qualified_static_method_ref_infers_function() {
         .expect("def_type for y");
     let display = pa.display_type(ty).to_string();
     assert_eq!(
-        display, "function",
-        "y should infer as `function`, got `{display}`"
+        display, "fn(String, String): Identity",
+        "y should infer as the structural lambda for `create`, got `{display}`"
     );
 }
 
@@ -2142,8 +2144,9 @@ fn hover_renders_typeof_t_param_keyword() {
     );
 }
 
-/// P15.7 — `var y = Identity::create;` (method reference, no call)
-/// infers as `function` (a runtime native type).
+/// `var y = Identity::create;` (cross-module static method ref, no
+/// call) infers the structural lambda. Was opaque `function` pre-
+/// lambda-unify; now carries the real signature.
 #[test]
 fn cross_module_static_method_ref_infers_function() {
     use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -2182,8 +2185,8 @@ fn cross_module_static_method_ref_infers_function() {
         .expect("def_type for y");
     let display = pa.display_type(ty).to_string();
     assert_eq!(
-        display, "function",
-        "y should infer as `function`, got `{display}`"
+        display, "fn(String, String): Identity",
+        "y should infer as the structural lambda for `create`, got `{display}`"
     );
 }
 
