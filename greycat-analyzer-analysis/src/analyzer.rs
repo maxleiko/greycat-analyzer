@@ -5697,7 +5697,22 @@ impl<'a> Cx<'a> {
                 // validate against settled arg types. Doing it here
                 // would surface false positives for arg shapes whose
                 // type isn't known until pass 3.5 fixes them up.
-                let _ = callee_ty;
+                //
+                // lambda-unify(6): if the callee resolves to a
+                // structural Lambda (lambda literal in a var, or a
+                // fn-ref minted by `fn_ref_ty_from_sig`), the call's
+                // result type is the lambda's `ret` slot. `None` →
+                // `any?` fallback (lambda has no observable return).
+                // Strip the callee's outer nullable bit so `function?`-
+                // typed callees still produce the underlying ret.
+                let stripped = self.strip_nullable(callee_ty);
+                let lambda_ret = match &self.arena.get(stripped).kind {
+                    TypeKind::Lambda { ret, .. } => Some(*ret),
+                    _ => None,
+                };
+                if let Some(ret_opt) = lambda_ret {
+                    return ret_opt.unwrap_or_else(|| self.any_nullable());
+                }
                 self.any_nullable()
             }
             Expr::Binary(BinaryExpr {
