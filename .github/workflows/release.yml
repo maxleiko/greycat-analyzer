@@ -8,7 +8,8 @@ name: Release
 #     re-tagging.
 #
 # Builds the `greycat-analyzer` CLI on each target, packages it as a
-# `.tar.gz` (Unix) or `.zip` (Windows), and attaches the archives plus a
+# `.zip` archive (Info-ZIP `zip` on Unix to preserve the executable
+# bit, `Compress-Archive` on Windows), and attaches the archives plus a
 # `SHA256SUMS` file to a GitHub Release named after the tag.
 #
 # **The release is created in draft mode** so you can review the
@@ -39,16 +40,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            archive: zip
 
     steps:
       - name: Resolve tag
@@ -90,7 +87,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release -p greycat-analyzer --target ${{ matrix.target }}
 
-      - name: Stage artifacts
+      - name: Stage binary
         id: stage
         shell: bash
         run: |
@@ -98,40 +95,40 @@ jobs:
           tag="${{ steps.tag.outputs.tag }}"
           target="${{ matrix.target }}"
           name="greycat-analyzer-${tag}-${target}"
-          stage="$(pwd)/_dist/${name}"
-          mkdir -p "$stage"
+          mkdir -p _dist
           if [[ "${{ matrix.os }}" == windows-* ]]; then
-            cp "target/${target}/release/greycat-analyzer.exe" "$stage/"
+            cp "target/${target}/release/greycat-analyzer.exe" _dist/
           else
-            cp "target/${target}/release/greycat-analyzer" "$stage/"
+            cp "target/${target}/release/greycat-analyzer" _dist/
             # Strip is a no-op on already-stripped builds; tolerate
             # `strip` differences across platforms.
-            strip "$stage/greycat-analyzer" 2>/dev/null || true
+            strip "_dist/greycat-analyzer" 2>/dev/null || true
           fi
-          cp LICENSE-MIT LICENSE-APACHE README.md "$stage/" 2>/dev/null || true
           echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "stage=$stage" >> "$GITHUB_OUTPUT"
 
-      - name: Pack (tar.gz)
-        if: matrix.archive == 'tar.gz'
+      - name: Pack (zip, unix)
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           set -euo pipefail
           cd _dist
-          tar -czf "${{ steps.stage.outputs.name }}.tar.gz" "${{ steps.stage.outputs.name }}"
+          # Info-ZIP preserves the executable bit via the ZIP extra
+          # fields; `Compress-Archive` on Windows strips it but Windows
+          # builds have no Unix mode bits anyway.
+          zip "${{ steps.stage.outputs.name }}.zip" greycat-analyzer
 
-      - name: Pack (zip)
-        if: matrix.archive == 'zip'
+      - name: Pack (zip, windows)
+        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           Set-Location _dist
-          Compress-Archive -Path "${{ steps.stage.outputs.name }}" -DestinationPath "${{ steps.stage.outputs.name }}.zip"
+          Compress-Archive -Path greycat-analyzer.exe -DestinationPath "${{ steps.stage.outputs.name }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.name }}
-          path: _dist/${{ steps.stage.outputs.name }}.${{ matrix.archive }}
+          path: _dist/${{ steps.stage.outputs.name }}.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -161,9 +158,9 @@ jobs:
           set -euo pipefail
           mkdir -p _release
           # Each artifact landed in its own subdir; flatten + checksum.
-          find _artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} _release/ \;
+          find _artifacts -type f -name '*.zip' -exec cp {} _release/ \;
           cd _release
-          sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS
+          sha256sum *.zip > SHA256SUMS
           ls -la
 
       - name: Draft GitHub Release
@@ -174,6 +171,5 @@ jobs:
           draft: true
           generate_release_notes: true
           files: |
-            _release/*.tar.gz
             _release/*.zip
             _release/SHA256SUMS
