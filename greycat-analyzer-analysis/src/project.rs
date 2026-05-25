@@ -2864,6 +2864,7 @@ impl ProjectAnalysis {
                 arena_mut,
                 &mut diags,
             );
+            collect_instance_method_value_ref_diags(&self.modules, cur_uri, &mut diags);
             if !diags.is_empty() {
                 diag_updates.insert(cur_uri.clone(), diags);
             }
@@ -3417,6 +3418,89 @@ fn lambda_call_arg_diags(
                 category: DiagCategory::TypeRelation,
             });
         }
+    }
+}
+
+/// Instance-method value-reference walker (lambda-unify step 4).
+///
+/// Only context-free fn references are first-class values in GCL:
+/// top-level fns and `static` methods. An instance method carries an
+/// implicit `this`, which has no representation as a free function
+/// value — taking `obj.m` / `Foo::m` (where `m` is non-static) and
+/// using it as a value (not as the callee of a `Call`) is a hard
+/// error.
+///
+/// Walks every `Expr::Member` / `Expr::Arrow` / `Expr::Static` whose
+/// resolved member is a non-static method. The expression is in
+/// "value position" iff it is NOT the callee of an enclosing
+/// `Expr::Call` — a one-pass scan collects all callee `Idx<Expr>`s
+/// into a set, then negation gives the value-position set.
+///
+/// Cross-module decls are read through `foreign_member_uses.uri` →
+/// `modules[uri].hir.decls[decl_id].modifiers.static_`. No FnSignature
+/// lookup needed; the modifier bit is on the HIR decl directly.
+#[allow(clippy::mutable_key_type)]
+fn collect_instance_method_value_ref_diags(
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
+    cur_uri: &Uri,
+    diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
+) {
+    use crate::analyzer::{DiagCategory, MemberDef, SemanticDiagnostic, Severity};
+    use greycat_analyzer_hir::types::Expr;
+    use rustc_hash::FxHashSet;
+
+    let Some(cur_module) = modules.get(cur_uri) else {
+        return;
+    };
+    // Collect every callee Idx so we can ask "is this expr the callee
+    // of a Call?" in O(1).
+    let mut callee_set: FxHashSet<Idx<Expr>> = FxHashSet::default();
+    for (_eid, expr) in cur_module.hir.exprs.iter() {
+        if let Expr::Call(call) = expr {
+            callee_set.insert(call.callee);
+        }
+    }
+
+    for (expr_id, expr) in cur_module.hir.exprs.iter() {
+        if callee_set.contains(&expr_id) {
+            continue;
+        }
+        let (property, byte_range) = match expr {
+            Expr::Member(m) | Expr::Arrow(m) => (m.property.ident(), m.byte_range.clone()),
+            Expr::Static(s) => (s.property.ident(), s.byte_range.clone()),
+            _ => continue,
+        };
+        // In-module binding.
+        let (member, decl_uri) = if let Some(member) = cur_module.analysis.member_lookup(property) {
+            (member, cur_uri.clone())
+        } else if let Some(foreign) = cur_module.analysis.foreign_member_lookup(property) {
+            (foreign.member, foreign.uri.clone())
+        } else {
+            continue;
+        };
+        let MemberDef::Method(decl_id) = member else {
+            continue;
+        };
+        let decl_module = match modules.get(&decl_uri) {
+            Some(m) => m,
+            None => continue,
+        };
+        let Decl::Fn(fnd) = &decl_module.hir.decls[decl_id] else {
+            continue;
+        };
+        if fnd.modifiers.static_ {
+            continue;
+        }
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            code: "instance-method-value-ref",
+            message: "cannot take a reference to an instance method — \
+                      only top-level functions and `static` methods are first-class values. \
+                      Wrap it in a lambda (`fn(...) { obj.method(...); }`) to capture the receiver."
+                .to_string(),
+            byte_range,
+            category: DiagCategory::TypeRelation,
+        });
     }
 }
 
