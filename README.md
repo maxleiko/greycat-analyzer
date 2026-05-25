@@ -6,24 +6,32 @@ One binary, `greycat-analyzer`, ships every tool. Editors point at `greycat-anal
 
 ## Install
 
-Pre-built binaries — each snippet pulls the latest release:
+Pre-built binaries — each snippet pulls the latest release. Pick your platform:
+
+**Linux x86_64 (glibc)**
 
 ```sh
-# Linux x86_64 (glibc)
 curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-gnu.zip -o /tmp/gca.zip
 unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
+```
 
-# Linux x86_64 (musl, fully static)
+**Linux x86_64 (musl, fully static)**
+
+```sh
 curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-musl.zip -o /tmp/gca.zip
 unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
+```
 
-# macOS (Apple Silicon)
+**macOS (Apple Silicon)**
+
+```sh
 curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-aarch64-apple-darwin.zip -o /tmp/gca.zip
 unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
 ```
 
+**Windows x86_64 (PowerShell)**
+
 ```powershell
-# Windows x86_64 (PowerShell)
 $dest = "$env:LOCALAPPDATA\Programs\greycat-analyzer"
 New-Item -ItemType Directory -Force $dest | Out-Null
 Invoke-WebRequest "https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\gca.zip"
