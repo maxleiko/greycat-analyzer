@@ -3494,9 +3494,8 @@ fn collect_instance_method_value_ref_diags(
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             code: "instance-method-value-ref",
-            message: "cannot take a reference to an instance method — \
-                      only top-level functions and `static` methods are first-class values. \
-                      Wrap it in a lambda (`fn(...) { obj.method(...); }`) to capture the receiver."
+            message: "cannot take a reference to an instance method \
+                      (only top-level functions and `static` methods are first-class values)."
                 .to_string(),
             byte_range,
             category: DiagCategory::TypeRelation,
