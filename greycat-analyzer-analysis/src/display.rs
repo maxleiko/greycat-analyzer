@@ -73,11 +73,14 @@ pub fn display_fqn(
                 .iter()
                 .map(|p| display_fqn(arena, _decl_registry, symbols, *p, home_lib))
                 .collect();
-            format!(
-                "({}) -> {}",
-                parts.join(", "),
-                display_fqn(arena, _decl_registry, symbols, *ret, home_lib)
-            )
+            match ret {
+                Some(r) => format!(
+                    "fn({}): {}",
+                    parts.join(", "),
+                    display_fqn(arena, _decl_registry, symbols, *r, home_lib)
+                ),
+                None => format!("fn({})", parts.join(", ")),
+            }
         }
         TypeKind::Enum { name, .. } => {
             let name = &symbols[*name];

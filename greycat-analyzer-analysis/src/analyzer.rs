@@ -2544,7 +2544,11 @@ impl<'a> Cx<'a> {
         } = def
         {
             let fn_id = self.index.item_id_for(dec_uri, fn_sym)?;
-            return self.index.fn_signatures.get(&fn_id).map(|s| s.return_ty);
+            return self
+                .index
+                .fn_signatures
+                .get(&fn_id)
+                .and_then(|s| s.return_ty);
         }
         // `Definition::Project` fallback (no specific owning module):
         // walk non-private fn-ns candidates, first match wins.
@@ -2559,7 +2563,7 @@ impl<'a> Cx<'a> {
                 continue;
             };
             if let Some(sig) = self.index.fn_signatures.get(&fn_id) {
-                return Some(sig.return_ty);
+                return sig.return_ty;
             }
         }
         None
@@ -2583,7 +2587,7 @@ impl<'a> Cx<'a> {
                     self.hir.idents[chain[1]].symbol,
                 );
                 let sig = self.index.fn_signatures.get(&fn_id)?;
-                Some(sig.return_ty)
+                sig.return_ty
             }
             3 => {
                 // `module::Type::method` — chain[0] is the module
@@ -3459,7 +3463,9 @@ impl<'a> Cx<'a> {
                     return None;
                 }
                 let declared_params = sig.params.clone();
-                let declared_return = sig.return_ty;
+                // No declared return → no shape to infer into. The
+                // outer Expr::Call default (`any?`) is the right answer.
+                let declared_return = sig.return_ty?;
                 let mut tbl = InferenceTable::new();
                 let pair_count = declared_params.len().min(arg_tys.len());
                 for i in 0..pair_count {
@@ -3525,10 +3531,13 @@ impl<'a> Cx<'a> {
                 .map(|p| self.arena.substitute(*p, &recv_subst))
                 .collect()
         };
+        // No declared return → no shape to infer into. Outer caller
+        // falls back to `any?` at the Expr::Call default.
+        let sig_return = sig.return_ty?;
         let declared_return = if recv_subst.is_empty() {
-            sig.return_ty
+            sig_return
         } else {
-            self.arena.substitute(sig.return_ty, &recv_subst)
+            self.arena.substitute(sig_return, &recv_subst)
         };
         let mut tbl = InferenceTable::new();
         let pair_count = declared_params.len().min(arg_tys.len());
@@ -5798,8 +5807,11 @@ impl<'a> Cx<'a> {
                 }
                 let declared_ret = return_type.map(|t| self.lower_type_ref(t));
                 self.visit_block(&body, declared_ret);
-                let ret_ty = declared_ret.unwrap_or_else(|| self.any_nullable());
-                self.arena.lambda(param_tys, ret_ty)
+                // Body-inference for `ret = None` lambdas lands in
+                // step 5 of the lambda-unify plan; today we just store
+                // the declared return when present and leave `None`
+                // for unannotated lambdas (display: `fn(...)`).
+                self.arena.lambda(param_tys, declared_ret)
             }
             Expr::Is { value, .. } => {
                 let _ = self.visit_expr(value);

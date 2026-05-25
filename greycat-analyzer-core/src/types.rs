@@ -130,11 +130,16 @@ pub enum TypeKind {
     // P25.4
     GenericParam { name: Symbol, owner: GenericOwner },
     /// Function / lambda type.
+    ///
+    /// `ret` is `None` when the source decl / lambda literal did not
+    /// declare a return type AND body-inference could not produce a
+    /// single GCL-expressible type. `Some(t)` carries the explicit
+    /// or inferred return. Display renders `fn(P)` for `None` and
+    /// `fn(P): R` for `Some(R)`.
     Lambda {
         /// Can be zero-length
         params: Box<[TypeId]>,
-        /// TODO: should this be `Option<TypeId>` because return-type is optional in GCL
-        ret: TypeId,
+        ret: Option<TypeId>,
     },
     /// Enum type.
     // P25.4
@@ -347,7 +352,7 @@ impl TypeArena {
         })
     }
 
-    pub fn lambda(&mut self, params: Vec<TypeId>, ret: TypeId) -> TypeId {
+    pub fn lambda(&mut self, params: Vec<TypeId>, ret: Option<TypeId>) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Lambda {
                 params: params.into_boxed_slice(),
@@ -430,7 +435,7 @@ impl TypeArena {
             TypeKind::Lambda { params, ret } => {
                 let new_params: Vec<TypeId> =
                     params.iter().map(|p| self.substitute(*p, subst)).collect();
-                let new_ret = self.substitute(*ret, subst);
+                let new_ret = ret.map(|r| self.substitute(r, subst));
                 if new_ret == *ret && new_params.as_slice() == params.as_ref() {
                     ty
                 } else {
@@ -700,7 +705,16 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
                         .iter()
                         .zip(bparams.as_ref())
                         .all(|(p_a, p_b)| is_assignable_to(arena, *p_b, *p_a))
-                    && is_assignable_to(arena, *aret, *bret)
+                    && match (aret, bret) {
+                        // Both known: covariant return.
+                        (Some(a), Some(b)) => is_assignable_to(arena, *a, *b),
+                        // Source returns, target discards: fine (slot ignores the value).
+                        (Some(_), None) => true,
+                        // Target wants a return, source produces none: not assignable.
+                        (None, Some(_)) => false,
+                        // Neither side observes a return: identity.
+                        (None, None) => true,
+                    }
             }
             TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
             TypeKind::Null
@@ -1305,8 +1319,8 @@ mod tests {
         // `f1: (any) -> int` ↔ `f2: (int) -> any`:
         //   * f1 → f2: param needs `int → any` ✓, return needs `int → any` ✓.
         //   * f2 → f1: param needs `any → int` ✓ (P20.1), return needs `any → int` ✓.
-        let f1 = cx.arena.lambda(vec![any], int);
-        let f2 = cx.arena.lambda(vec![int], any);
+        let f1 = cx.arena.lambda(vec![any], Some(int));
+        let f2 = cx.arena.lambda(vec![int], Some(any));
         assert!(is_assignable_to(&cx.arena, f1, f2));
         assert!(is_assignable_to(&cx.arena, f2, f1));
     }
@@ -1317,8 +1331,8 @@ mod tests {
         let int = cx.arena.primitive(Primitive::Int);
         // Arity mismatch is hard-rejected regardless of the `any`
         // bidirectionality from P20.1 — no slot count, no relation.
-        let f1 = cx.arena.lambda(vec![int], int);
-        let f2 = cx.arena.lambda(vec![int, int], int);
+        let f1 = cx.arena.lambda(vec![int], Some(int));
+        let f2 = cx.arena.lambda(vec![int, int], Some(int));
         assert!(!is_assignable_to(&cx.arena, f1, f2));
         assert!(!is_assignable_to(&cx.arena, f2, f1));
     }

@@ -315,7 +315,12 @@ pub struct ProjectIndex {
 #[derive(Debug, Clone)]
 pub struct FnSignature {
     pub home_uri: Uri,
-    pub return_ty: TypeId,
+    /// `None` when the source decl didn't write a `:` return type.
+    /// Consumers that need a TypeId for "what does this call return"
+    /// fall back to `any_nullable` at the use site. Consumers building
+    /// a structural `TypeKind::Lambda` (the fn-ref helper) pass `None`
+    /// through verbatim so the rendered shape is `fn(...)` (no return).
+    pub return_ty: Option<TypeId>,
     // P19.9
     /// Interned generic param names. Resolve back to text
     /// via the owning [`ProjectIndex::symbols`].

@@ -692,15 +692,18 @@ fn write_type_qualified(
         TypeKind::Unresolved { name, .. } => f.write_str(project.symbol(name))?,
         TypeKind::GenericParam { name, .. } => f.write_str(project.symbol(name))?,
         TypeKind::Lambda { params, ret } => {
-            f.write_str("(")?;
+            f.write_str("fn(")?;
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
                 write_type_qualified(f, project, *p)?;
             }
-            f.write_str(") -> ")?;
-            write_type_qualified(f, project, *ret)?;
+            f.write_str(")")?;
+            if let Some(r) = ret {
+                f.write_str(": ")?;
+                write_type_qualified(f, project, *r)?;
+            }
         }
         TypeKind::Enum { name, .. } => f.write_str(project.symbol(name))?,
         TypeKind::Union { alts } => {
@@ -809,15 +812,18 @@ fn write_type_with_decls(
         TypeKind::Unresolved { name, .. } => f.write_str(&symbols[*name])?,
         TypeKind::GenericParam { name, .. } => f.write_str(&symbols[*name])?,
         TypeKind::Lambda { params, ret } => {
-            f.write_str("(")?;
+            f.write_str("fn(")?;
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
                 write_type_with_decls(f, arena, _decl_registry, symbols, *p)?;
             }
-            f.write_str(") -> ")?;
-            write_type_with_decls(f, arena, _decl_registry, symbols, *ret)?;
+            f.write_str(")")?;
+            if let Some(r) = ret {
+                f.write_str(": ")?;
+                write_type_with_decls(f, arena, _decl_registry, symbols, *r)?;
+            }
         }
         TypeKind::Enum { name, .. } => f.write_str(&symbols[*name])?,
         TypeKind::Union { alts } => {
@@ -1448,19 +1454,21 @@ fn lower_module_signatures(
                             };
                             method_params.push(pt);
                         }
-                        let method_ret_ty = fnd
-                            .return_type
-                            .map(|ret| {
-                                lower_type_ref_project(
-                                    hir,
-                                    ret,
-                                    arena_mut,
-                                    &*index,
-                                    decl_registry,
-                                    &generics_in_scope,
-                                )
-                            })
-                            .unwrap_or_else(|| arena_mut.any_nullable());
+                        // `return_ty: None` when the method declares no
+                        // return type — preserves the "no observable
+                        // return" semantic for the structural-Lambda
+                        // mint downstream. Call-typing consumers fall
+                        // back to `any?` at their use site.
+                        let method_ret_ty = fnd.return_type.map(|ret| {
+                            lower_type_ref_project(
+                                hir,
+                                ret,
+                                arena_mut,
+                                &*index,
+                                decl_registry,
+                                &generics_in_scope,
+                            )
+                        });
                         entry.method_sigs.push((
                             type_id,
                             method_sym,
@@ -1549,7 +1557,7 @@ fn lower_module_signatures(
                     fn_id,
                     FnSignature {
                         home_uri: uri.clone(),
-                        return_ty: ret_ty,
+                        return_ty: Some(ret_ty),
                         generics,
                         params,
                     },
@@ -4851,7 +4859,9 @@ mod tests {
             .fn_signatures
             .get(&a_id)
             .expect("a sig present after invalidate");
-        let display = pa.display_type(sig.return_ty).to_string();
+        let display = pa
+            .display_type(sig.return_ty.expect("a has declared return type"))
+            .to_string();
         assert!(
             display.contains("String"),
             "expected refreshed return type to be String, got {display:?}"
