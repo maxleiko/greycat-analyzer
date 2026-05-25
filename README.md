@@ -6,12 +6,37 @@ One binary, `greycat-analyzer`, ships every tool. Editors point at `greycat-anal
 
 ## Install
 
+Pre-built binaries — each snippet pulls the latest release:
+
 ```sh
-cargo install --git https://github.com/maxleiko/greycat-analyzer greycat-analyzer
-greycat-analyzer --version
+# Linux x86_64 (glibc)
+curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-gnu.zip -o /tmp/gca.zip
+unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
+
+# Linux x86_64 (musl, fully static)
+curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-musl.zip -o /tmp/gca.zip
+unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
+
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-aarch64-apple-darwin.zip -o /tmp/gca.zip
+unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
 ```
 
-Pre-built binaries are attached to each [GitHub release](https://github.com/maxleiko/greycat-analyzer/releases).
+```powershell
+# Windows x86_64 (PowerShell)
+$dest = "$env:LOCALAPPDATA\Programs\greycat-analyzer"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Invoke-WebRequest "https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\gca.zip"
+Expand-Archive "$env:TEMP\gca.zip" -DestinationPath $dest -Force
+```
+
+Confirm: `greycat-analyzer --version`. Make sure `~/.local/bin` (Unix) or `$env:LOCALAPPDATA\Programs\greycat-analyzer` (Windows) is on your `PATH`. All [GitHub releases](https://github.com/maxleiko/greycat-analyzer/releases) carry the same artifacts if you want to pin a specific version.
+
+### From source
+
+```sh
+cargo install --git https://github.com/maxleiko/greycat-analyzer greycat-analyzer
+```
 
 ## Usage
 

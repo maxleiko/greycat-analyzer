@@ -92,9 +92,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
           target="${{ matrix.target }}"
-          name="greycat-analyzer-${tag}-${target}"
+          # Asset filename intentionally version-less so that
+          # `https://github.com/<repo>/releases/latest/download/<name>.zip`
+          # resolves stably across releases. Version is implicit from the
+          # release tag, and `greycat-analyzer --version` self-reports.
+          name="greycat-analyzer-${target}"
           mkdir -p _dist
           if [[ "${{ matrix.os }}" == windows-* ]]; then
             cp "target/${target}/release/greycat-analyzer.exe" _dist/
