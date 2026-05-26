@@ -20,6 +20,7 @@
 
 use std::str::FromStr;
 
+use greycat_analyzer_analysis::ide::code_actions::{CodeAction, code_actions_with_project};
 use greycat_analyzer_analysis::ide::completion::{CompletionList, completion_with_project};
 use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
 use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
@@ -30,6 +31,7 @@ use greycat_analyzer_analysis::ide::inlay_hints::{InlayHint, inlay_hints_with_pr
 use greycat_analyzer_analysis::ide::rename::{
     RenameTarget as AnalysisRenameTarget, cursor_ident_idx, resolve_target, target_sites,
 };
+use greycat_analyzer_analysis::ide::selection_ranges::selection_ranges;
 use greycat_analyzer_analysis::ide::semantic_tokens::{SemanticTokens, semantic_tokens};
 use greycat_analyzer_analysis::ide::signature_help::{SignatureHelp, signature_help};
 use greycat_analyzer_analysis::ide::types::{
@@ -347,6 +349,71 @@ impl Project {
             &doc.lib,
             doc.root_node(),
             pos,
+            self.encoding,
+        ))
+    }
+
+    /// Selection range chain for a cursor position — leaf-to-root order
+    /// of nested CST spans. Returns an empty vec when the cursor doesn't
+    /// land on a node. Editors use this for "expand selection" /
+    /// "shrink selection" commands.
+    #[wasm_bindgen(js_name = selectionRanges)]
+    pub fn selection_ranges(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<IdeRange>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let doc = cell.borrow();
+        let pos = Position { line, character };
+        Ok(selection_ranges(
+            &doc.text,
+            doc.root_node(),
+            pos,
+            self.encoding,
+        ))
+    }
+
+    /// Code actions / quickfixes overlapping `(start_line, start_character,
+    /// end_line, end_character)` in `uri`. Empty vec for unknown URIs.
+    #[wasm_bindgen(js_name = codeActions)]
+    pub fn code_actions(
+        &self,
+        uri: &str,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Result<Vec<CodeAction>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let doc = cell.borrow();
+        let Some(module) = self.analysis.module(&uri) else {
+            return Ok(Vec::new());
+        };
+        let range = IdeRange {
+            start: IdePosition {
+                line: start_line,
+                character: start_character,
+            },
+            end: IdePosition {
+                line: end_line,
+                character: end_character,
+            },
+        };
+        Ok(code_actions_with_project(
+            module,
+            self.analysis.symbols(),
+            &doc.text,
+            doc.root_node(),
+            &uri,
+            range,
             self.encoding,
         ))
     }

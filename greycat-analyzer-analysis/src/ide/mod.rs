@@ -11,6 +11,7 @@
 //! conversion. See [`rename`] for the reference pattern.
 
 pub mod actions;
+pub mod code_actions;
 pub mod completion;
 pub mod diagnostics;
 pub mod document_highlights;
@@ -22,6 +23,7 @@ pub mod quickfix;
 pub mod rename;
 pub mod render;
 pub mod scope;
+pub mod selection_ranges;
 pub mod semantic_tokens;
 pub mod signature_help;
 pub mod types;

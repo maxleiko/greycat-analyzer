@@ -4,5 +4,5 @@
 //! a single definition. This module is the server-side facade.
 
 pub(crate) use greycat_analyzer_analysis::conv::{
-    byte_range_to_lsp, byte_to_position, position_to_byte, ranges_overlap,
+    byte_range_to_lsp, byte_to_position, position_to_byte,
 };
