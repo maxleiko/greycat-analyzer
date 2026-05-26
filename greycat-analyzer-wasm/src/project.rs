@@ -24,6 +24,7 @@ use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
 use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
+use greycat_analyzer_analysis::ide::signature_help::{SignatureHelp, signature_help};
 use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange, TextEdit};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
@@ -193,6 +194,29 @@ impl Project {
         let pos = Position { line, character };
         Ok(document_highlights(
             &doc.text,
+            doc.root_node(),
+            pos,
+            self.encoding,
+        ))
+    }
+
+    /// Signature help when the cursor is inside a `call_expr`.
+    #[wasm_bindgen(js_name = signatureHelp)]
+    pub fn signature_help(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<SignatureHelp>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(None);
+        };
+        let doc = cell.borrow();
+        let pos = Position { line, character };
+        Ok(signature_help(
+            &doc.text,
+            &doc.lib,
             doc.root_node(),
             pos,
             self.encoding,
