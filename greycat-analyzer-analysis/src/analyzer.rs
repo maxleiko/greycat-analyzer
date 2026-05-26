@@ -527,6 +527,7 @@ pub fn analyze_with_index_into(
         narrows: Vec::new(),
         member_narrows: Vec::new(),
         member_typed_narrows: Vec::new(),
+        enum_value_narrows: Vec::new(),
         chain_member_ifs: FxHashSet::default(),
         generics_in_scope: Vec::new(),
         this_stack: Vec::new(),
@@ -879,6 +880,16 @@ struct CondNarrows {
     /// complement is sound *per-shape* but disjunctive narrowing is
     /// owned by P42.4. Gate the `narrow_complement` call on this flag.
     is_atomic_is: bool,
+    /// Enum-value-set narrows: `(binding, enum_sym, allowed_variants)`
+    /// triples. The binding is constrained to one of `allowed_variants`
+    /// of the named enum on the matching branch. Populated by
+    /// `x == E::V` (a singleton set) and chains of those joined by
+    /// `||` (which union the sets per (binding, enum)). On apply, the
+    /// `Stmt::If` then/else entry intersects with any narrow already
+    /// on the stack — so an inner `if (c == Red)` inside an outer
+    /// `if (c == Red || c == Green) { ... }` lands at `{Red}`.
+    then_enum_values: Vec<(Idx<Ident>, Symbol, Vec<Symbol>)>,
+    else_enum_values: Vec<(Idx<Ident>, Symbol, Vec<Symbol>)>,
 }
 
 /// One arm in an enum-equality chain.
@@ -887,8 +898,18 @@ struct EnumChainArm {
     variant: String,
 }
 
+/// Enum-value narrow value: which enum the binding is restricted to,
+/// and the set of allowed variants. Stored per binding ident in the
+/// `enum_value_narrows` stack frames.
+type EnumValueNarrow = (Symbol, FxHashSet<Symbol>);
+
 /// An `if (x == E::A) else if (x == E::B) ...` chain.
 struct EnumChain {
+    /// The shared binding ident the chain dispatches on. Used by the
+    /// exhaustiveness check to consult any enum-value narrow already
+    /// on the stack — an outer `if (x == E::A || x == E::B) { ... }`
+    /// shrinks the set of expected variants the chain has to cover.
+    binding: Idx<Ident>,
     enum_name: String,
     arms: Vec<EnumChainArm>,
     /// `true` when the chain ends with a final `else { ... }` or with
@@ -980,6 +1001,16 @@ struct Cx<'a> {
     /// current scope. Frames are pushed / popped in lockstep with
     /// `narrows`. Mirrors `then_typed` for member paths.
     member_typed_narrows: Vec<FxHashMap<String, TypeId>>,
+    /// Parallel enum-value-set narrow stack. Each frame maps a binding
+    /// ident to `(enum_sym, allowed_variants)` — "this binding is one
+    /// of these variants of this enum in the current scope." Populated
+    /// from `CondNarrows::{then,else}_enum_values` on `Stmt::If`
+    /// branch entry. Read by `check_enum_exhaustiveness` to scope the
+    /// "expected" variant set to whatever an enclosing guard already
+    /// allowed (so an outer `if (c == Red || c == Green) { ... }`
+    /// makes a contained `if (c == Red) else if (c == Green) ...` chain
+    /// exhaustive).
+    enum_value_narrows: Vec<FxHashMap<Idx<Ident>, EnumValueNarrow>>,
     /// `Stmt::If` ids already accounted for as nested members of an
     /// enclosing exhaustiveness chain. Suppresses duplicate
     /// "non-exhaustive" diagnostics on inner `else if` arms.
@@ -1788,11 +1819,13 @@ impl<'a> Cx<'a> {
         self.narrows.push(FxHashMap::default());
         self.member_narrows.push(FxHashSet::default());
         self.member_typed_narrows.push(FxHashMap::default());
+        self.enum_value_narrows.push(FxHashMap::default());
     }
     fn pop_narrow(&mut self) {
         self.narrows.pop();
         self.member_narrows.pop();
         self.member_typed_narrows.pop();
+        self.enum_value_narrows.pop();
     }
     fn write_narrow(&mut self, name: Idx<Ident>, ty: TypeId) {
         if let Some(top) = self.narrows.last_mut() {
@@ -1841,6 +1874,39 @@ impl<'a> Cx<'a> {
         for frame in self.member_typed_narrows.iter().rev() {
             if let Some(t) = frame.get(path) {
                 return Some(*t);
+            }
+        }
+        None
+    }
+    /// Record that `name` is constrained to one of `variants` of the
+    /// enum named by `enum_sym` in the current scope. When a narrow
+    /// already exists on the stack for the same `(name, enum_sym)`
+    /// pair, the new set is intersected with it — so a `c == Red`
+    /// inside an outer `c == Red || c == Green` lands at `{Red}`. A
+    /// narrow naming a *different* enum than the existing one is
+    /// silently dropped (the binding can only be of one type).
+    fn write_enum_value_narrow(&mut self, name: Idx<Ident>, enum_sym: Symbol, variants: &[Symbol]) {
+        let new_set: FxHashSet<Symbol> = variants.iter().copied().collect();
+        let final_set = match self.lookup_enum_value_narrow(name) {
+            Some((existing_enum, existing_set)) => {
+                if existing_enum != enum_sym {
+                    return;
+                }
+                existing_set.intersection(&new_set).copied().collect()
+            }
+            None => new_set,
+        };
+        if let Some(top) = self.enum_value_narrows.last_mut() {
+            top.insert(name, (enum_sym, final_set));
+        }
+    }
+    /// Innermost-first lookup of the enum-value narrow for `name`.
+    /// Returns `(enum_sym, allowed_variants)` when a narrow exists in
+    /// some enclosing frame.
+    fn lookup_enum_value_narrow(&self, name: Idx<Ident>) -> Option<EnumValueNarrow> {
+        for frame in self.enum_value_narrows.iter().rev() {
+            if let Some((sym, set)) = frame.get(&name) {
+                return Some((*sym, set.clone()));
             }
         }
         None
@@ -3987,6 +4053,8 @@ impl<'a> Cx<'a> {
                     then_member_null,
                     else_member_null,
                     is_atomic_is,
+                    then_enum_values,
+                    else_enum_values,
                 } = self.derive_cond_narrows(condition);
 
                 // P41.2 / P42.4 — compute the else-side complement
@@ -4221,6 +4289,15 @@ impl<'a> Cx<'a> {
                     let null_ty = self.null();
                     self.write_member_typed(path.clone(), null_ty);
                 }
+                // Enum-value narrows: each entry constrains a binding
+                // to a set of variants of one enum. `write_enum_value_narrow`
+                // intersects with any outer narrow already on the
+                // stack, so nested guards compose (e.g. inner `c ==
+                // Red` inside outer `c == Red || c == Green` lands at
+                // `{Red}`).
+                for (ident, enum_sym, variants) in &then_enum_values {
+                    self.write_enum_value_narrow(*ident, *enum_sym, variants);
+                }
                 // **P19.16** — inline the then-branch's stmts (instead
                 // of `visit_block`) so the narrow frame we just pushed
                 // captures any assignments inside the branch. The
@@ -4271,6 +4348,9 @@ impl<'a> Cx<'a> {
                         for path in &else_member_null {
                             let null_ty = self.null();
                             self.write_member_typed(path.clone(), null_ty);
+                        }
+                        for (ident, enum_sym, variants) in &else_enum_values {
+                            self.write_enum_value_narrow(*ident, *enum_sym, variants);
                         }
                         // P19.16 — same inline pattern for the else
                         // branch. `eb` may be a Block or a nested If
@@ -4820,6 +4900,12 @@ impl<'a> Cx<'a> {
                     // P41.1 — pre-lowered narrows propagate the same way.
                     out.then_typed_id.extend(l.then_typed_id);
                     out.then_typed_id.extend(r.then_typed_id);
+                    // Enum-value narrows: both subtrees' then-side
+                    // entries propagate. The apply step intersects
+                    // per (binding, enum), so two entries against the
+                    // same binding land at their intersection.
+                    out.then_enum_values.extend(l.then_enum_values);
+                    out.then_enum_values.extend(r.then_enum_values);
                     // Else: at least one failed — can't narrow confidently.
                 }
                 BinOp::Or => {
@@ -4869,6 +4955,31 @@ impl<'a> Cx<'a> {
                             out.then_typed_union.push((ident, ltys));
                         }
                     }
+                    // Enum-value narrows under `||`. `(x == A) || (x ==
+                    // B)` on then narrows x to `{A, B}` when both sides
+                    // name the same binding+enum. Idents narrowed on
+                    // only one side stay unnarrowed (could be true via
+                    // either side; we don't know which set holds). The
+                    // else side has NOT(A || B) ≡ !A AND !B — both
+                    // subtrees' else_enum_values propagate.
+                    let mut lm_ev: FxHashMap<(Idx<Ident>, Symbol), Vec<Symbol>> =
+                        FxHashMap::default();
+                    for (id, en, vs) in l.then_enum_values {
+                        lm_ev.entry((id, en)).or_default().extend(vs);
+                    }
+                    let mut rm_ev: FxHashMap<(Idx<Ident>, Symbol), Vec<Symbol>> =
+                        FxHashMap::default();
+                    for (id, en, vs) in r.then_enum_values {
+                        rm_ev.entry((id, en)).or_default().extend(vs);
+                    }
+                    for ((id, en), mut lvs) in lm_ev {
+                        if let Some(rvs) = rm_ev.get(&(id, en)) {
+                            lvs.extend(rvs.iter().copied());
+                            out.then_enum_values.push((id, en, lvs));
+                        }
+                    }
+                    out.else_enum_values.extend(l.else_enum_values);
+                    out.else_enum_values.extend(r.else_enum_values);
                 }
                 BinOp::Eq | BinOp::Neq => {
                     // Ident-vs-null path (P6.4).
@@ -4888,6 +4999,29 @@ impl<'a> Cx<'a> {
                             _ => {}
                         }
                         return out;
+                    }
+                    // `x == E::V` / `E::V == x` — singleton enum-value
+                    // narrow. The match helper accepts either operand
+                    // order and gates on `op ∈ {Eq, Neq}`. The else
+                    // side of `==` (and the then side of `!=`) names
+                    // the variant being *excluded*, but with no enum
+                    // arity in scope we'd produce a "x ∈ E \ {V}" set
+                    // we can't expand here. Skip the else-of-Eq /
+                    // then-of-Neq populates for now — the
+                    // exhaustiveness check only consults the *positive*
+                    // side anyway.
+                    if let Some((def, enum_sym, variant_sym)) = self.match_enum_cmp_syms(cond_id) {
+                        match *op {
+                            BinOp::Eq => {
+                                out.then_enum_values
+                                    .push((def, enum_sym, vec![variant_sym]));
+                            }
+                            BinOp::Neq => {
+                                out.else_enum_values
+                                    .push((def, enum_sym, vec![variant_sym]));
+                            }
+                            _ => {}
+                        }
                     }
                     // **P19.16** — member-access path null comparison.
                     // `foo.bar != null` / `null != foo.bar` (and `==`)
@@ -5003,6 +5137,10 @@ impl<'a> Cx<'a> {
                 // existing pairs.
                 out.then_typed_id = inner.else_typed_id;
                 out.else_typed_id = inner.then_typed_id;
+                // Swap enum-value narrows. `!(c == Red)` narrows c
+                // away from Red on the then side, toward Red on else.
+                out.then_enum_values = inner.else_enum_values;
+                out.else_enum_values = inner.then_enum_values;
                 // P41.2 — `!`-of-atomic stays atomic. `!(x is T)`
                 // should still produce a complement narrow.
                 out.is_atomic_is = inner.is_atomic_is;
@@ -5043,9 +5181,25 @@ impl<'a> Cx<'a> {
         let TypeKind::Enum { variants, .. } = &enum_ty.kind else {
             return;
         };
-        let variants = variants.clone();
+        let declared: Vec<Symbol> = variants.to_vec();
+        // Scope the "expected" variants by any enum-value narrow on
+        // the chain's binding: an enclosing `if (x == E::A || x ==
+        // E::B) { ... }` already restricts `x` to `{A, B}`, so the
+        // inner chain only needs to cover that subset to be
+        // exhaustive. The narrow's enum_sym must match the chain's
+        // enum (different enums on the same binding shouldn't happen
+        // in well-typed code, but we ignore the narrow rather than
+        // crashing).
+        let expected: Vec<Symbol> = match self.lookup_enum_value_narrow(chain.binding) {
+            Some((narrow_enum, narrow_set)) if narrow_enum == enum_sym => declared
+                .iter()
+                .copied()
+                .filter(|v| narrow_set.contains(v))
+                .collect(),
+            _ => declared,
+        };
         let covered: FxHashSet<&str> = chain.arms.iter().map(|a| a.variant.as_str()).collect();
-        let missing: Vec<&str> = variants
+        let missing: Vec<&str> = expected
             .iter()
             .map(|sym| &self.index.symbols[*sym])
             .filter(|v| !covered.contains(v))
@@ -5125,6 +5279,7 @@ impl<'a> Cx<'a> {
             }
         }
         Some(EnumChain {
+            binding,
             enum_name,
             arms,
             has_final_else,
@@ -5145,6 +5300,47 @@ impl<'a> Cx<'a> {
             return Some(t);
         }
         self.try_extract_eq(*right, *left)
+    }
+
+    /// Symbol-keyed companion to [`match_enum_eq`]: returns
+    /// `(binding, enum_sym, variant_sym)` for a `Binary` `Eq`/`Neq`
+    /// expression of shape `x == E::V` (either operand order). Used by
+    /// `derive_cond_narrows` to populate enum-value narrows without
+    /// round-tripping through interned strings.
+    fn match_enum_cmp_syms(&self, cond_id: Idx<Expr>) -> Option<(Idx<Ident>, Symbol, Symbol)> {
+        let Expr::Binary(BinaryExpr {
+            op, left, right, ..
+        }) = &self.hir.exprs[cond_id]
+        else {
+            return None;
+        };
+        if !matches!(op, BinOp::Eq | BinOp::Neq) {
+            return None;
+        }
+        if let Some(t) = self.try_extract_eq_syms(*left, *right) {
+            return Some(t);
+        }
+        self.try_extract_eq_syms(*right, *left)
+    }
+
+    fn try_extract_eq_syms(
+        &self,
+        ident_side: Idx<Expr>,
+        static_side: Idx<Expr>,
+    ) -> Option<(Idx<Ident>, Symbol, Symbol)> {
+        let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[ident_side] else {
+            return None;
+        };
+        let binding = match self.res.lookup(*name_idx)? {
+            Definition::Param(d) | Definition::Local(d) => d,
+            _ => return None,
+        };
+        let Expr::Static(StaticExpr { ty, property, .. }) = &self.hir.exprs[static_side] else {
+            return None;
+        };
+        let enum_sym = self.hir.idents[self.hir.type_refs[*ty].name].symbol;
+        let variant_sym = self.hir.idents[property.ident()].symbol;
+        Some((binding, enum_sym, variant_sym))
     }
 
     fn try_extract_eq(
@@ -5847,6 +6043,8 @@ impl<'a> Cx<'a> {
                             then_member_null,
                             else_member_null,
                             is_atomic_is: _,
+                            then_enum_values: _,
+                            else_enum_values: _,
                         } = self.derive_cond_narrows(left);
                         let (
                             non_null,
