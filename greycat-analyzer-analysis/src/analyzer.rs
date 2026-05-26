@@ -4001,7 +4001,11 @@ impl<'a> Cx<'a> {
                 // contradiction pass doesn't also fire "is already
                 // of type …" on the same span.
                 if is_atomic_is {
-                    let mut hit: Option<(String, bool)> = None;
+                    // (known_disp, asserted_disp, is_negated). The
+                    // asserted display is the actionable info — for an
+                    // abstract `known` with a single concrete subtype,
+                    // it names the type the value is guaranteed to be.
+                    let mut hit: Option<(String, String, bool)> = None;
                     let then_side_pairs: Vec<(Idx<Ident>, Idx<TypeRef>)> = then_typed.clone();
                     let then_side_unions: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)> =
                         then_typed_union.clone();
@@ -4018,7 +4022,8 @@ impl<'a> Cx<'a> {
                         let asserted = self.lower_type_ref(*ty_ref);
                         if self.narrow_is_exhausted(known, asserted) {
                             let known_disp = self.display(known).to_string();
-                            hit = Some((known_disp, false));
+                            let asserted_disp = self.display(asserted).to_string();
+                            hit = Some((known_disp, asserted_disp, false));
                         }
                     }
                     for (ident, ty_refs) in &then_side_unions {
@@ -4031,7 +4036,8 @@ impl<'a> Cx<'a> {
                         let asserted = self.lower_typed_union(ty_refs);
                         if self.narrow_is_exhausted(known, asserted) {
                             let known_disp = self.display(known).to_string();
-                            hit = Some((known_disp, false));
+                            let asserted_disp = self.display(asserted).to_string();
+                            hit = Some((known_disp, asserted_disp, false));
                         }
                     }
                     // Else-side (under `!` swap): exhaustion means the
@@ -4046,7 +4052,8 @@ impl<'a> Cx<'a> {
                         let asserted = self.lower_type_ref(*ty_ref);
                         if self.narrow_is_exhausted(known, asserted) {
                             let known_disp = self.display(known).to_string();
-                            hit = Some((known_disp, true));
+                            let asserted_disp = self.display(asserted).to_string();
+                            hit = Some((known_disp, asserted_disp, true));
                         }
                     }
                     for (ident, ty_refs) in &else_side_unions {
@@ -4059,16 +4066,31 @@ impl<'a> Cx<'a> {
                         let asserted = self.lower_typed_union(ty_refs);
                         if self.narrow_is_exhausted(known, asserted) {
                             let known_disp = self.display(known).to_string();
-                            hit = Some((known_disp, true));
+                            let asserted_disp = self.display(asserted).to_string();
+                            hit = Some((known_disp, asserted_disp, true));
                         }
                     }
-                    if let Some((known_disp, is_negated)) = hit {
+                    if let Some((known_disp, asserted_disp, is_negated)) = hit {
                         let dead = if is_negated { "then" } else { "else" };
-                        let msg = format!(
-                            "exhaustive `is`-check: every concrete runtime case of `{known_disp}` is covered; the {dead}-branch is unreachable",
-                        );
-                        let range = self.hir.exprs[condition].byte_range();
-                        self.diag(Severity::Warning, "exhaustive-is-check", msg, range);
+                        // Only emit when the dead branch is actually
+                        // present in source. When `is_negated = false`,
+                        // the dead branch is `else`; if the user didn't
+                        // write one, there's nothing redundant about the
+                        // type test — they're using it to gate the
+                        // then-body, no implicit reliance on an
+                        // unreachable else. When `is_negated = true`, the
+                        // dead branch is `then`, which the grammar
+                        // requires — always emit.
+                        if is_negated || else_branch.is_some() {
+                            let msg = format!(
+                                "every value of `{known_disp}` matches `{asserted_disp}`: the {dead}-branch is unreachable",
+                            );
+                            let range = self.hir.exprs[condition].byte_range();
+                            self.diag(Severity::Warning, "exhaustive-is-check", msg, range);
+                        }
+                        // Mark decidable regardless of whether we
+                        // surfaced the warning — downstream `unreachable`
+                        // / contradiction passes consume this independently.
                         // `is_negated = false` means the if-cond is always
                         // true (then-branch always runs). `is_negated = true`
                         // means the cond is `!(…always-true…)` → always
@@ -7674,7 +7696,7 @@ fn caller(s: Shape) {
         let diags = analyze_project_src(src);
         let hit: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .filter(|d| d.code == "exhaustive-is-check")
             .collect();
         assert_eq!(
             hit.len(),
@@ -7690,6 +7712,8 @@ fn caller(s: Shape) {
 
     /// Union source: every alt covered by the disjunction.
     /// Closure-of-asserted equals known's full set → exhausted.
+    /// Requires an `else` branch in source — without one the dead
+    /// branch doesn't exist and the warning is suppressed.
     #[test]
     fn p42_exhaustive_is_check_union_source() {
         let src = r#"
@@ -7700,18 +7724,79 @@ fn caller(p: A?, q: B?) {
     if (u == null) { return; }
     if (u is A || u is B) {
         var _ = u;
+    } else {
+        var _ = u;
     }
 }
 "#;
         let diags = analyze_project_src(src);
         let hit: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .filter(|d| d.code == "exhaustive-is-check")
             .collect();
         assert_eq!(
             hit.len(),
             1,
             "expected exhaustive-is-check on union covering both alts: {diags:#?}"
+        );
+    }
+
+    /// No `else` branch on the head if: even when the asserted set
+    /// exhausts the known type, there's no dead branch to flag.
+    /// `is`-check is just a narrow guard on the then-body — emitting
+    /// would point at an imaginary `else` and offer no actionable
+    /// signal.
+    #[test]
+    fn p42_exhaustive_is_check_no_else_silent() {
+        let src = r#"
+abstract type AbstractType {}
+type ConcreteType extends AbstractType {}
+fn foo(x: AbstractType) {
+    if (x is ConcreteType) {
+        var _ = x;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        let hit: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == "exhaustive-is-check")
+            .collect();
+        assert!(
+            hit.is_empty(),
+            "no-else single-subtype gate must not flag: {hit:#?}"
+        );
+    }
+
+    /// Same shape with an explicit (even empty) `else` branch: the
+    /// dead branch is now present in source, so the warning fires.
+    #[test]
+    fn p42_exhaustive_is_check_no_else_with_else_fires() {
+        let src = r#"
+abstract type AbstractType {}
+type ConcreteType extends AbstractType {}
+fn foo(x: AbstractType) {
+    if (x is ConcreteType) {
+        var _ = x;
+    } else {
+        var _ = x;
+    }
+}
+"#;
+        let diags = analyze_project_src(src);
+        let hit: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == "exhaustive-is-check")
+            .collect();
+        assert_eq!(
+            hit.len(),
+            1,
+            "with else branch present, exhaustion should flag: {diags:#?}"
+        );
+        assert!(
+            hit[0].message.contains("else-branch is unreachable"),
+            "diagnostic should name the unreachable branch; got: {}",
+            hit[0].message
         );
     }
 
@@ -7733,7 +7818,7 @@ fn caller(s: Shape) {
         let diags = analyze_project_src(src);
         let hit: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .filter(|d| d.code == "exhaustive-is-check")
             .collect();
         assert_eq!(hit.len(), 1, "expected one diagnostic; got: {diags:#?}");
         assert!(
@@ -7761,7 +7846,7 @@ fn caller(s: Shape) {
         let diags = analyze_project_src(src);
         let hit: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .filter(|d| d.code == "exhaustive-is-check")
             .collect();
         assert!(
             hit.is_empty(),
@@ -7793,7 +7878,7 @@ fn caller(r: Rect) {
         let diags = &module.analysis.diagnostics;
         let exhaustion: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("exhaustive `is`-check"))
+            .filter(|d| d.code == "exhaustive-is-check")
             .collect();
         assert!(
             exhaustion.is_empty(),
