@@ -1,0 +1,58 @@
+{
+  "name": "@greycat/analyzer",
+  "version": "0.1.0",
+  "description": "Static analyzer + IDE services for the GreyCat language. Wraps the WASM build of greycat-analyzer with a Project-handle API and helpers for stdlib bootstrap + Web Worker offload.",
+  "keywords": [
+    "greycat",
+    "language-server",
+    "lsp",
+    "static-analysis",
+    "tree-sitter",
+    "wasm"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maxleiko/greycat-analyzer",
+    "directory": "packages/analyzer"
+  },
+  "files": [
+    "dist",
+    "wasm/greycat_analyzer_wasm_bg.wasm",
+    "wasm/greycat_analyzer_wasm.js",
+    "wasm/greycat_analyzer_wasm.d.ts",
+    "wasm/greycat_analyzer_wasm_bg.wasm.d.ts"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "import": "./dist/worker.js"
+    }
+  },
+  "scripts": {
+    "wasm": "../../scripts/build-wasm.sh --out-dir packages/analyzer/wasm",
+    "build": "vp pack",
+    "dev": "vp pack --watch",
+    "check": "vp check",
+    "test": "vp test"
+  },
+  "dependencies": {
+    "comlink": "^4.4.2",
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.0.0",
+    "rolldown-plugin-wasm": "^0.2.1",
+    "tsdown": "latest",
+    "typescript": "~6.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@latest",
+    "vite-plus": "latest",
+    "vitest": "npm:@voidzero-dev/vite-plus-test@latest"
+  }
+}

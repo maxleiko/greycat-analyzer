@@ -1,0 +1,48 @@
+{
+  "name": "@greycat/shiki",
+  "version": "0.1.0",
+  "description": "Shiki TextMate grammar bundle for the GreyCat language. Mirrors the VSCode extension's grammar 1:1 — no analyzer dependency.",
+  "keywords": [
+    "greycat",
+    "shiki",
+    "syntax-highlighting",
+    "textmate"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maxleiko/greycat-analyzer",
+    "directory": "packages/shiki"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./grammar": {
+      "types": "./dist/grammar.d.ts",
+      "import": "./dist/grammar.js"
+    }
+  },
+  "scripts": {
+    "sync-grammar": "node scripts/sync-grammar.mjs",
+    "build": "pnpm run sync-grammar && vp pack",
+    "dev": "vp pack --watch",
+    "check": "vp check"
+  },
+  "devDependencies": {
+    "shiki": "^3.0.0",
+    "tsdown": "latest",
+    "typescript": "~6.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@latest",
+    "vite-plus": "latest"
+  },
+  "peerDependencies": {
+    "shiki": "^1.0.0 || ^2.0.0 || ^3.0.0"
+  }
+}

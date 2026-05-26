@@ -1,0 +1,46 @@
+{
+  "name": "@greycat/monaco",
+  "version": "0.1.0",
+  "description": "Monaco language providers for GreyCat — completion, hover, signature help, inlay hints, code actions, references, rename, document symbols, folding ranges, selection ranges, document highlights, formatting, semantic tokens, diagnostics — backed by @greycat/analyzer.",
+  "keywords": [
+    "greycat",
+    "language-server",
+    "lsp",
+    "monaco",
+    "monaco-editor"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maxleiko/greycat-analyzer",
+    "directory": "packages/monaco"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "vp pack",
+    "dev": "vp pack --watch",
+    "check": "vp check"
+  },
+  "devDependencies": {
+    "@greycat/analyzer": "workspace:*",
+    "monaco-editor": "^0.55.1",
+    "tsdown": "latest",
+    "typescript": "~6.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@latest",
+    "vite-plus": "latest"
+  },
+  "peerDependencies": {
+    "@greycat/analyzer": "workspace:*",
+    "monaco-editor": "^0.55.0"
+  }
+}

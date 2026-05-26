@@ -14,8 +14,7 @@
 // The response shape is defined in `analyzer-client.ts`; the two
 // files stay in lockstep on the message contract.
 
-import init, * as wasm from "greycat-analyzer-wasm";
-import wasmUrl from "greycat-analyzer-wasm/greycat_analyzer_wasm_bg.wasm?url";
+import * as wasm from "greycat-analyzer-wasm";
 
 type AnalyzerWasm = typeof wasm;
 
@@ -40,7 +39,12 @@ interface Response {
   error?: string;
 }
 
-const ready: Promise<AnalyzerWasm> = init({ module_or_path: wasmUrl }).then(() => wasm);
+// `--target bundler` wasm-pack output — the bundler resolves the
+// `.wasm` import inside the wasm-pack-generated JS glue, so no
+// explicit `init()` call is needed here. We still wrap the module in
+// a Promise so the message-handler shape stays unchanged when we
+// later introduce async-loaded modules.
+const ready: Promise<AnalyzerWasm> = Promise.resolve(wasm);
 
 self.addEventListener("message", (ev: MessageEvent<Request>) => {
   const { id, method, source } = ev.data;

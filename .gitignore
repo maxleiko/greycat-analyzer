@@ -18,5 +18,13 @@
 /playground/node_modules
 /playground/dist
 
+# Workspace TS packages — wasm/ holds wasm-pack output, dist/ holds
+# tsdown output, node_modules/ holds pnpm-linked deps. Reproducible
+# from source via `pnpm wasm` + `pnpm build`.
+/packages/*/wasm
+/packages/*/dist
+/packages/*/node_modules
+/node_modules
+
 # Claude
 /.claude/worktrees/

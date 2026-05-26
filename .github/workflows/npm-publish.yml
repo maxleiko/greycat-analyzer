@@ -1,0 +1,117 @@
+name: npm Publish
+
+# Publish the `@greycat/*` workspace packages to npm.
+#
+# Trigger:
+#   - Pushing a tag matching `npm-v*` (e.g. `npm-v0.1.0`).
+#   - Manual `workflow_dispatch` with a `tag` input.
+#
+# Scaffold-only as of this commit: the actual `npm publish` step is
+# guarded by the `NPM_TOKEN` repository secret. When the secret is
+# absent the workflow runs all build / pack steps and surfaces what
+# WOULD be published, then exits cleanly without touching the registry.
+# Add `NPM_TOKEN` (an "Automation" token from npmjs.com) to flip the
+# workflow into real publish mode.
+#
+# Builds:
+#   1. WASM bundle (`scripts/build-wasm.sh --out-dir packages/analyzer/wasm`)
+#      via wasm-pack `--target bundler`, no `playground` feature.
+#   2. TS workspace packages via `pnpm -r build` — each package's
+#      `vp pack` config drives tsdown.
+#   3. Pack each package via `pnpm pack` (produces a `.tgz`) so the
+#      uploaded artifact matches what `npm publish` would send.
+
+on:
+  push:
+    tags:
+      - 'npm-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build (e.g. npm-v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write  # required for npm provenance attestation (when enabled)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version ^0.13
+
+      - name: Install Emscripten (for tree-sitter's C scanner)
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+          actions-cache-folder: emsdk-cache
+
+      - name: Set EMSDK env
+        run: echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build wasm bundle
+        run: ./scripts/build-wasm.sh --out-dir packages/analyzer/wasm
+
+      - name: Build TS packages
+        run: pnpm --filter "@greycat/*" run build
+
+      - name: Pack TS packages (dry-run inspection)
+        run: pnpm --filter "@greycat/*" pack --pack-destination _release
+
+      - name: List artifacts that would be published
+        run: ls -la _release/
+
+      - name: Publish (NPM_TOKEN-gated)
+        if: env.NPM_TOKEN != ''
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # `pnpm publish -r` walks the workspace, publishing each
+          # package once. `--access public` is required for scoped
+          # names (`@greycat/...`) on first publish.
+          pnpm --filter "@greycat/*" publish --access public --no-git-checks
+
+      - name: Skip publish (no NPM_TOKEN)
+        if: env.NPM_TOKEN == ''
+        run: |
+          echo "::warning::NPM_TOKEN secret not set — skipping actual publish."
+          echo "Built and packed; artifacts above are what would have been published."
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
