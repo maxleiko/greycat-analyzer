@@ -4665,7 +4665,16 @@ impl<'a> Cx<'a> {
             Stmt::DoWhile(DoWhileStmt {
                 condition, body, ..
             }) => {
-                self.visit_block(&body, return_ty);
+                // Inline the body's stmts inside a dedicated narrow
+                // frame so reassignments inside the body (`id =
+                // generate();`) survive long enough for the condition
+                // to see them — `visit_block` would push + pop its
+                // own frame and discard them, leaving the cond
+                // staring at the pre-loop narrow.
+                self.push_narrow();
+                for s in &body.stmts {
+                    self.visit_stmt(*s, return_ty);
+                }
                 self.expect_bool(condition, "do-while condition");
                 // Body runs once regardless of the condition, so a
                 // decidable `do-while` is informational only — emit
@@ -4680,12 +4689,17 @@ impl<'a> Cx<'a> {
                     };
                     self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
                 }
+                // Capture the cond's narrows before popping the body
+                // frame — `derive_cond_narrows` reads the AST, not
+                // the narrow stack, so the captured `CondNarrows`
+                // outlives the pop unchanged.
+                let narrows = self.derive_cond_narrows(condition);
+                self.pop_narrow();
                 // Post-loop else-narrow lift. Body always runs at
                 // least once, so by the time we're past the loop the
                 // cond *was* evaluated (and was false, since we're
                 // past). No push/apply on the body side — that would
                 // be unsound on iter 1, before the cond is checked.
-                let narrows = self.derive_cond_narrows(condition);
                 if !block_breaks_current_loop(self.hir, &body) {
                     self.apply_else_narrows(&narrows);
                 }
