@@ -245,3 +245,56 @@ fn hint_severity_is_hint() {
         .expect("hint should fire");
     assert_eq!(hit.severity, LintSeverity::Hint);
 }
+
+#[test]
+fn ambiguous_decl_name_renders_with_module_qualifier() {
+    // Two sibling modules both declare `PowerNetwork`. A consumer
+    // module instantiates one of them and the lint suggests a return
+    // type. Because the bare name is ambiguous project-wide, the hint
+    // (and therefore the `--fix` it drives) must carry the
+    // `<module>::Name` qualifier — pasting the bare name back into
+    // source would immediately produce an `ambiguous-symbol` error.
+    let mut mgr = SourceManager::new();
+    let a_uri = Uri::from_str("file:///proj/src/a.gcl").unwrap();
+    mgr.add_simple(a_uri, "type PowerNetwork {}\n", "project", false);
+    let b_uri = Uri::from_str("file:///proj/src/b.gcl").unwrap();
+    mgr.add_simple(b_uri, "type PowerNetwork {}\n", "project", false);
+    let main_uri = Uri::from_str("file:///proj/src/main.gcl").unwrap();
+    mgr.add_simple(
+        main_uri.clone(),
+        "fn small() {\n    return a::PowerNetwork {};\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let hints = infer_return_hints(&pa, &main_uri);
+    assert_eq!(hints.len(), 1, "got: {hints:?}");
+    assert!(
+        hints[0].contains("`a::PowerNetwork`"),
+        "expected qualified `a::PowerNetwork`, got: {hints:?}"
+    );
+}
+
+#[test]
+fn unambiguous_decl_name_stays_bare() {
+    // Symmetric guard: when only one module exports the name, the hint
+    // must NOT qualify (an unnecessary `mod::Name` would be churn in
+    // the --fix output and confuse the user reading the diagnostic).
+    let mut mgr = SourceManager::new();
+    let a_uri = Uri::from_str("file:///proj/src/a.gcl").unwrap();
+    mgr.add_simple(a_uri, "type PowerNetwork {}\n", "project", false);
+    let main_uri = Uri::from_str("file:///proj/src/main.gcl").unwrap();
+    mgr.add_simple(
+        main_uri.clone(),
+        "fn small() {\n    return PowerNetwork {};\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let hints = infer_return_hints(&pa, &main_uri);
+    assert_eq!(hints.len(), 1, "got: {hints:?}");
+    assert!(
+        hints[0].contains("`PowerNetwork`") && !hints[0].contains("::"),
+        "expected bare `PowerNetwork`, got: {hints:?}"
+    );
+}

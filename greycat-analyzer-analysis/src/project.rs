@@ -668,50 +668,78 @@ pub struct ProjectTypeDisplay<'a> {
 
 impl std::fmt::Display for ProjectTypeDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_type_qualified(f, self.project, self.id)
+        write_type_qualified(f, self.project.arena(), &self.project.index, self.id)
+    }
+}
+
+/// Index-aware [`Display`] wrapper for a [`TypeId`]. Renders the same
+/// way as [`ProjectAnalysis::display_type`] — `module::Name` when the
+/// bare decl name is ambiguous within the project, bare otherwise — but
+/// without requiring a full `ProjectAnalysis`. Lets per-module
+/// consumers (the lints invoked from `run_typed_lints_for_module`)
+/// emit ambiguity-qualified type names in their diagnostic messages so
+/// downstream consumers (the `infer-return-type` quickfix) paste the
+/// qualified form back into source.
+pub fn display_type_qualified<'a>(
+    arena: &'a TypeArena,
+    index: &'a ProjectIndex,
+    id: TypeId,
+) -> QualifiedTypeDisplay<'a> {
+    QualifiedTypeDisplay { arena, index, id }
+}
+
+pub struct QualifiedTypeDisplay<'a> {
+    arena: &'a TypeArena,
+    index: &'a ProjectIndex,
+    id: TypeId,
+}
+
+impl std::fmt::Display for QualifiedTypeDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_type_qualified(f, self.arena, self.index, self.id)
     }
 }
 
 fn write_type_qualified(
     f: &mut std::fmt::Formatter<'_>,
-    project: &ProjectAnalysis,
+    arena: &TypeArena,
+    index: &ProjectIndex,
     id: TypeId,
 ) -> std::fmt::Result {
-    let arena = project.arena();
     let ty = arena.get(id);
     match &ty.kind {
         TypeKind::Null => f.write_str("null")?,
         TypeKind::Any => f.write_str("any")?,
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
-        TypeKind::Type(d) => write_decl_qualified(f, project, *d)?,
+        TypeKind::Type(d) => write_decl_qualified(f, index, *d)?,
         TypeKind::Generic { decl, args } => {
-            write_decl_qualified(f, project, *decl)?;
-            write_args_qualified(f, project, args)?;
+            write_decl_qualified(f, index, *decl)?;
+            write_args_qualified(f, arena, index, args)?;
         }
-        TypeKind::Unresolved { name, .. } => f.write_str(project.symbol(name))?,
-        TypeKind::GenericParam { name, .. } => f.write_str(project.symbol(name))?,
+        TypeKind::Unresolved { name, .. } => f.write_str(&index.symbols[*name])?,
+        TypeKind::GenericParam { name, .. } => f.write_str(&index.symbols[*name])?,
         TypeKind::Lambda { params, ret } => {
             f.write_str("fn(")?;
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write_type_qualified(f, project, *p)?;
+                write_type_qualified(f, arena, index, *p)?;
             }
             f.write_str(")")?;
             if let Some(r) = ret {
                 f.write_str(": ")?;
-                write_type_qualified(f, project, *r)?;
+                write_type_qualified(f, arena, index, *r)?;
             }
         }
-        TypeKind::Enum { name, .. } => f.write_str(project.symbol(name))?,
+        TypeKind::Enum { name, .. } => f.write_str(&index.symbols[*name])?,
         TypeKind::Union { alts } => {
             for (i, a) in alts.iter().enumerate() {
                 if i > 0 {
                     f.write_str(" | ")?;
                 }
-                write_type_qualified(f, project, *a)?;
+                write_type_qualified(f, arena, index, *a)?;
             }
             if ty.nullable
                 && !alts
@@ -723,7 +751,7 @@ fn write_type_qualified(
         }
         TypeKind::TypeOf(inner) => {
             f.write_str("typeof ")?;
-            write_type_qualified(f, project, *inner)?;
+            write_type_qualified(f, arena, index, *inner)?;
         }
     }
     if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
@@ -734,7 +762,8 @@ fn write_type_qualified(
 
 fn write_args_qualified(
     f: &mut std::fmt::Formatter<'_>,
-    project: &ProjectAnalysis,
+    arena: &TypeArena,
+    index: &ProjectIndex,
     args: &[TypeId],
 ) -> std::fmt::Result {
     f.write_str("<")?;
@@ -742,7 +771,7 @@ fn write_args_qualified(
         if i > 0 {
             f.write_str(", ")?;
         }
-        write_type_qualified(f, project, *a)?;
+        write_type_qualified(f, arena, index, *a)?;
     }
     f.write_str(">")
 }
@@ -854,16 +883,16 @@ fn write_type_with_decls(
 
 fn write_decl_qualified(
     f: &mut std::fmt::Formatter<'_>,
-    project: &ProjectAnalysis,
+    index: &ProjectIndex,
     decl: ItemId,
 ) -> std::fmt::Result {
     // Two same-named items in different modules → render with the
     // `module::` qualifier; otherwise the bare name is unambiguous.
-    if project.index.locate_decl(decl.name).len() > 1 {
-        f.write_str(&project.index.symbols[decl.module])?;
+    if index.locate_decl(decl.name).len() > 1 {
+        f.write_str(&index.symbols[decl.module])?;
         f.write_str("::")?;
     }
-    f.write_str(&project.index.symbols[decl.name])
+    f.write_str(&index.symbols[decl.name])
 }
 
 // P19.6
@@ -3749,8 +3778,7 @@ fn run_typed_lints_for_module(
         &module.hir,
         &module.analysis,
         arena,
-        &index.symbols,
-        decl_registry,
+        index,
         &mut module.lints,
         &mut module.directives,
         bypass,

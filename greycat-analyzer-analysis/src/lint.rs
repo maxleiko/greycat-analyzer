@@ -1608,20 +1608,10 @@ pub fn lint_inferred_return_type(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
-    symbols: &SymbolTable,
-    decl_registry: &DeclRegistry,
+    index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
 ) {
-    lint_inferred_return_type_inner(
-        hir,
-        analysis,
-        arena,
-        symbols,
-        decl_registry,
-        out,
-        None,
-        false,
-    );
+    lint_inferred_return_type_inner(hir, analysis, arena, index, out, None, false);
 }
 
 /// Directive-aware variant of [`lint_inferred_return_type`].
@@ -1630,8 +1620,7 @@ pub fn lint_inferred_return_type_with_directives(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
-    symbols: &SymbolTable,
-    decl_registry: &DeclRegistry,
+    index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut Directives,
     bypass_suppressions: bool,
@@ -1640,21 +1629,18 @@ pub fn lint_inferred_return_type_with_directives(
         hir,
         analysis,
         arena,
-        symbols,
-        decl_registry,
+        index,
         out,
         Some(directives),
         bypass_suppressions,
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lint_inferred_return_type_inner(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
-    symbols: &SymbolTable,
-    decl_registry: &DeclRegistry,
+    index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut Directives>,
     bypass_suppressions: bool,
@@ -1668,8 +1654,7 @@ fn lint_inferred_return_type_inner(
                 hir,
                 analysis,
                 arena,
-                symbols,
-                decl_registry,
+                index,
                 fnd,
                 out,
                 directives.as_deref_mut(),
@@ -1682,8 +1667,7 @@ fn lint_inferred_return_type_inner(
                             hir,
                             analysis,
                             arena,
-                            symbols,
-                            decl_registry,
+                            index,
                             fnd,
                             out,
                             directives.as_deref_mut(),
@@ -1702,8 +1686,7 @@ fn check_fn_inferred_return(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
-    symbols: &SymbolTable,
-    decl_registry: &DeclRegistry,
+    index: &ProjectIndex,
     fnd: &FnDecl,
     out: &mut Vec<LintDiagnostic>,
     directives: Option<&mut Directives>,
@@ -1736,7 +1719,13 @@ fn check_fn_inferred_return(
     if !crate::return_inference::is_expressible_type_ident(arena, ret_ty) {
         return;
     }
-    let display = crate::project::display_type(arena, decl_registry, symbols, ret_ty);
+    // Project-aware display: prefix `<module>::` when the bare decl
+    // name is exported by ≥2 modules in this project. The quickfix
+    // (`infer_return_type_fix`) pastes whatever sits between backticks
+    // in this message verbatim, so the qualifier needs to land here —
+    // otherwise `--fix` writes an ambiguous bare name and immediately
+    // produces an `ambiguous-symbol` diagnostic on the same line.
+    let display = crate::project::display_type_qualified(arena, index, ret_ty);
     let name = &hir.idents[fnd.name];
     emit_typed(
         out,
