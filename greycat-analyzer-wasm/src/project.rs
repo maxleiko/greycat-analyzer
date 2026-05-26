@@ -21,10 +21,11 @@
 use std::str::FromStr;
 
 use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
+use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
-use greycat_analyzer_core::lsp_types::Uri;
+use greycat_analyzer_core::lsp_types::{Position, Uri};
 use wasm_bindgen::prelude::*;
 
 /// JS-facing handle to a loaded GreyCat project. Owns the
@@ -137,6 +138,28 @@ impl Project {
         // `lint_libs = false` matches the LSP default — users editing
         // a project don't want lints on the stdlib they don't own.
         Ok(from_module(&doc.text, module, false, self.encoding))
+    }
+
+    /// Hover at `(line, character)` in `uri`. Returns `None` when the
+    /// URI is unknown or when nothing under the cursor produces hover
+    /// content.
+    pub fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Option<Hover>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(None);
+        };
+        let doc = cell.borrow();
+        let pos = Position { line, character };
+        Ok(hover_with_project(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+            pos,
+            &uri,
+            &self.analysis,
+            &self.manager,
+            self.encoding,
+        ))
     }
 }
 

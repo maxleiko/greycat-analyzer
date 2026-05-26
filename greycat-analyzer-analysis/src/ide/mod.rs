@@ -13,6 +13,7 @@
 pub mod actions;
 pub mod completion;
 pub mod diagnostics;
+pub mod hover;
 pub mod quickfix;
 pub mod rename;
 pub mod render;

@@ -140,7 +140,7 @@ The current `greycat-analyzer-wasm` is shaped for the playground (seven single-f
 
 - [x] **41.3 `Project` opaque handle in wasm crate** (M) — new `#[wasm_bindgen] pub struct Project` wrapping `(SourceManager, ProjectAnalysis, TypeArena, ProjectIndex)`. Methods: `new(entrypoint_uri, files: js_sys::Map)`, `open(uri, source)`, `change(uri, source)`, `close(uri)`, `diagnostics(uri) -> Vec<Diagnostic>`. Mirrors [`Backend`](greycat-analyzer-server/src/backend.rs) but with no `lsp-server` channels — JS calls methods directly.
 
-- [ ] **41.4 Hover ADT + Project method** (S) — mirror of 41.2 for hover. `Project::hover(uri, line, character) -> Option<Hover>`. Position / Range ADTs land here too (the smallest wasm-friendly shape that all subsequent capabilities consume).
+- [x] **41.4 Hover ADT + Project method** (S) — mirror of 41.2 for hover. `Project::hover(uri, line, character) -> Option<Hover>`. Position / Range ADTs land here too (the smallest wasm-friendly shape that all subsequent capabilities consume).
 
 - [ ] **41.5 Bulk feature-gate migration for primitive-shaped ADTs** (M) — `FoldingRange`, `DocumentHighlight`, `InlayHint`, `SemanticTokens`, `SignatureHelp` (+ `SignatureInformation` + `ParameterInformation`), `CompletionItem` (+ `CompletionItemKind`), `TextEdit`. Each gets its `analysis::ide` ADT + server converter + `Project` method. Bundle into one commit per ADT, or batch the trivial ones if the friction is low.
 
