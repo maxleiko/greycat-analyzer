@@ -52,7 +52,7 @@ use crate::stdlib::ProjectIndex;
 /// { return; } use(x);` idiom.
 fn stmt_terminates(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
     match &hir.stmts[stmt_id] {
-        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break | Stmt::Continue => true,
+        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::Block(b) => block_terminates(hir, b),
         Stmt::If(IfStmt {
             then_branch,
@@ -94,7 +94,7 @@ fn block_breaks_current_loop(hir: &Hir, block: &greycat_analyzer_hir::types::Blo
 
 fn stmt_breaks_current_loop(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
     match &hir.stmts[stmt_id] {
-        Stmt::Break => true,
+        Stmt::Break(_) => true,
         Stmt::While(_) | Stmt::For(_) | Stmt::DoWhile(_) | Stmt::ForIn(_) => false,
         Stmt::Block(b) => block_breaks_current_loop(hir, b),
         Stmt::If(IfStmt {
@@ -117,8 +117,8 @@ fn stmt_breaks_current_loop(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
         | Stmt::Var(_)
         | Stmt::Assign(_)
         | Stmt::Return(_)
-        | Stmt::Continue
-        | Stmt::Breakpoint
+        | Stmt::Continue(_)
+        | Stmt::Breakpoint(_)
         | Stmt::Throw(_) => false,
     }
 }
@@ -4857,17 +4857,17 @@ impl<'a> Cx<'a> {
                 }
                 self.visit_block(&body, return_ty);
             }
-            Stmt::Return(value) => {
-                if let Some(v) = value {
+            Stmt::Return(r) => {
+                if let Some(v) = r.value {
                     let _ = self.visit_expr(v);
                     // Type-relation diagnostic deferred to
                     // `ProjectAnalysis::validate_type_relations`.
                     let _ = return_ty;
                 }
             }
-            Stmt::Break | Stmt::Continue | Stmt::Breakpoint => {}
-            Stmt::Throw(e) => {
-                let _ = self.visit_expr(e);
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Breakpoint(_) => {}
+            Stmt::Throw(t) => {
+                let _ = self.visit_expr(t.value);
             }
             Stmt::Try(TryStmt {
                 try_block,

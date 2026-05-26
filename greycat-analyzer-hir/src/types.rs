@@ -291,13 +291,49 @@ pub enum Stmt {
     DoWhile(DoWhileStmt),
     For(ForStmt),
     ForIn(ForInStmt),
-    Return(Option<Idx<Expr>>),
-    Break,
-    Continue,
-    Breakpoint,
-    Throw(Idx<Expr>),
+    Return(ReturnStmt),
+    Break(BreakStmt),
+    Continue(ContinueStmt),
+    Breakpoint(BreakpointStmt),
+    Throw(ThrowStmt),
     Try(TryStmt),
     At(AtStmt),
+}
+
+/// `return [expr];`. Carries the whole CST span (keyword through
+/// trailing semicolon) so capabilities and lints can point at the
+/// keyword instead of falling back to the inner expression's span
+/// (missing entirely on a bare `return ;`).
+#[derive(Debug, Clone)]
+pub struct ReturnStmt {
+    pub value: Option<Idx<Expr>>,
+    pub byte_range: Span,
+}
+
+/// `throw expr;`. Carries the whole CST span so dead-code / lint
+/// diagnostics aren't anchored at the inner expression alone.
+#[derive(Debug, Clone)]
+pub struct ThrowStmt {
+    pub value: Idx<Expr>,
+    pub byte_range: Span,
+}
+
+/// `break;` — keyword-only stmt with its own range.
+#[derive(Debug, Clone)]
+pub struct BreakStmt {
+    pub byte_range: Span,
+}
+
+/// `continue;` — keyword-only stmt with its own range.
+#[derive(Debug, Clone)]
+pub struct ContinueStmt {
+    pub byte_range: Span,
+}
+
+/// `breakpoint;` — keyword-only stmt with its own range.
+#[derive(Debug, Clone)]
+pub struct BreakpointStmt {
+    pub byte_range: Span,
 }
 
 /// `{ … }` block. Carries its own `byte_range` (the curly-brace

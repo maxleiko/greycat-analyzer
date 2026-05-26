@@ -149,7 +149,8 @@ fn collect_return_types(
     seen: &mut Option<TypeId>,
 ) -> Result<(), ()> {
     match &hir.stmts[stmt_id] {
-        Stmt::Return(Some(e)) => {
+        Stmt::Return(r) if r.value.is_some() => {
+            let e = r.value.as_ref().unwrap();
             if let Some(ty) = analysis.expr_types.get(e).copied() {
                 match *seen {
                     None => *seen = Some(ty),
@@ -161,7 +162,7 @@ fn collect_return_types(
             }
             Ok(())
         }
-        Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Breakpoint => Ok(()),
+        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Breakpoint(_) => Ok(()),
         Stmt::Block(b) => collect_returns_in_block(hir, analysis, arena, &b.stmts, seen),
         Stmt::If(i) => {
             collect_returns_in_block(hir, analysis, arena, &i.then_branch.stmts, seen)?;

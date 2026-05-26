@@ -830,13 +830,13 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             visit_block(cx, &body);
             cx.pop_scope();
         }
-        Stmt::Return(value) => {
-            if let Some(v) = value {
+        Stmt::Return(r) => {
+            if let Some(v) = r.value {
                 visit_expr(cx, v);
             }
         }
-        Stmt::Break | Stmt::Continue | Stmt::Breakpoint => {}
-        Stmt::Throw(e) => visit_expr(cx, e),
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Breakpoint(_) => {}
+        Stmt::Throw(t) => visit_expr(cx, t.value),
         Stmt::Try(TryStmt {
             try_block,
             error_param,

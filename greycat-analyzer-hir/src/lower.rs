@@ -949,17 +949,29 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                 .named_children(&mut node.walk())
                 .next()
                 .and_then(|e| lower_expr(cx, e));
-            Stmt::Return(value)
+            Stmt::Return(ReturnStmt {
+                value,
+                byte_range: node.byte_range(),
+            })
         }
-        "break_stmt" => Stmt::Break,
-        "continue_stmt" => Stmt::Continue,
-        "breakpoint_stmt" => Stmt::Breakpoint,
+        "break_stmt" => Stmt::Break(BreakStmt {
+            byte_range: node.byte_range(),
+        }),
+        "continue_stmt" => Stmt::Continue(ContinueStmt {
+            byte_range: node.byte_range(),
+        }),
+        "breakpoint_stmt" => Stmt::Breakpoint(BreakpointStmt {
+            byte_range: node.byte_range(),
+        }),
         "throw_stmt" => {
             let e = node
                 .named_children(&mut node.walk())
                 .next()
                 .and_then(|x| lower_expr(cx, x))?;
-            Stmt::Throw(e)
+            Stmt::Throw(ThrowStmt {
+                value: e,
+                byte_range: node.byte_range(),
+            })
         }
         "try_stmt" => {
             let try_block = node

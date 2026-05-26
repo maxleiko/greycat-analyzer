@@ -592,36 +592,37 @@ fn stmt_node(
                 children: kids,
             }
         }
-        Stmt::Return(v) => HirNode {
+        Stmt::Return(r) => HirNode {
             kind: "stmt:return".into(),
             label: None,
-            range: v.map(|e| hir.exprs[e].byte_range()).unwrap_or(0..0).into(),
-            children: v
+            range: r.byte_range.clone().into(),
+            children: r
+                .value
                 .map(|e| vec![expr_node(hir, symbols, e)])
                 .unwrap_or_default(),
         },
-        Stmt::Throw(e) => HirNode {
+        Stmt::Throw(t) => HirNode {
             kind: "stmt:throw".into(),
             label: None,
-            range: hir.exprs[*e].byte_range().into(),
-            children: vec![expr_node(hir, symbols, *e)],
+            range: t.byte_range.clone().into(),
+            children: vec![expr_node(hir, symbols, t.value)],
         },
-        Stmt::Break => HirNode {
+        Stmt::Break(b) => HirNode {
             kind: "stmt:break".into(),
             label: None,
-            range: (0..0).into(),
+            range: b.byte_range.clone().into(),
             children: Vec::new(),
         },
-        Stmt::Continue => HirNode {
+        Stmt::Continue(c) => HirNode {
             kind: "stmt:continue".into(),
             label: None,
-            range: (0..0).into(),
+            range: c.byte_range.clone().into(),
             children: Vec::new(),
         },
-        Stmt::Breakpoint => HirNode {
+        Stmt::Breakpoint(b) => HirNode {
             kind: "stmt:breakpoint".into(),
             label: None,
-            range: (0..0).into(),
+            range: b.byte_range.clone().into(),
             children: Vec::new(),
         },
         Stmt::Try(t) => {

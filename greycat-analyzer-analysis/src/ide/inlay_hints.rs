@@ -171,7 +171,9 @@ fn inferred_fn_return(hir: &Hir, analysis: &AnalysisResult, body: Idx<Stmt>) -> 
         _ => return None,
     };
     for s in block.stmts.iter().rev() {
-        if let Stmt::Return(Some(e)) = &hir.stmts[*s] {
+        if let Stmt::Return(r) = &hir.stmts[*s]
+            && let Some(e) = &r.value
+        {
             return analysis.expr_types.get(e).copied();
         }
     }
@@ -210,11 +212,25 @@ fn emit_call_arg_hints(
         Stmt::Block(b) => {
             emit_call_arg_hints_block(hir, symbols, resolutions, b, want, text, encoding, out)
         }
-        Stmt::Expr(e)
-        | Stmt::Return(Some(e))
-        | Stmt::Throw(e)
-        | Stmt::Var(greycat_analyzer_hir::types::LocalVar { init: Some(e), .. }) => {
+        Stmt::Expr(e) | Stmt::Var(greycat_analyzer_hir::types::LocalVar { init: Some(e), .. }) => {
             emit_call_arg_hints_expr(hir, symbols, resolutions, *e, want, text, encoding, out);
+        }
+        Stmt::Return(r) => {
+            if let Some(e) = &r.value {
+                emit_call_arg_hints_expr(hir, symbols, resolutions, *e, want, text, encoding, out);
+            }
+        }
+        Stmt::Throw(t) => {
+            emit_call_arg_hints_expr(
+                hir,
+                symbols,
+                resolutions,
+                t.value,
+                want,
+                text,
+                encoding,
+                out,
+            );
         }
         Stmt::Assign(a) => {
             emit_call_arg_hints_expr(

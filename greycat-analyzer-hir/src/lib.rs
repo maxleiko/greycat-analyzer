@@ -143,7 +143,10 @@ type Point {
             panic!()
         };
         assert_eq!(block.stmts.len(), 1);
-        let Stmt::Return(Some(ret)) = &hir.stmts[block.stmts[0]] else {
+        let Stmt::Return(ReturnStmt {
+            value: Some(ret), ..
+        }) = &hir.stmts[block.stmts[0]]
+        else {
             panic!()
         };
         let Expr::Binary(top) = &hir.exprs[*ret] else {
@@ -181,7 +184,10 @@ fn build(n: String, a: int): Foo {
         let Stmt::Block(block) = &hir.stmts[body] else {
             panic!("expected block")
         };
-        let Stmt::Return(Some(ret)) = &hir.stmts[block.stmts[0]] else {
+        let Stmt::Return(ReturnStmt {
+            value: Some(ret), ..
+        }) = &hir.stmts[block.stmts[0]]
+        else {
             panic!("expected return")
         };
         let Expr::Object(obj) = &hir.exprs[*ret] else {

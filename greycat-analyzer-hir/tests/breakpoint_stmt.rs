@@ -30,7 +30,7 @@ fn breakpoint_lowers_to_breakpoint_variant() {
     };
     assert_eq!(stmts.len(), 1, "expected exactly one inner stmt");
     match &hir.stmts[stmts[0]] {
-        Stmt::Breakpoint => {}
+        Stmt::Breakpoint(_) => {}
         other => panic!("expected Stmt::Breakpoint, got {other:?}"),
     }
 }

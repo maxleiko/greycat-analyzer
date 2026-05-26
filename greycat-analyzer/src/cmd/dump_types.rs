@@ -841,9 +841,9 @@ fn collect_stmt_decl_idents(
         Stmt::Expr(_)
         | Stmt::Assign(_)
         | Stmt::Return(_)
-        | Stmt::Break
-        | Stmt::Continue
-        | Stmt::Breakpoint
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::Breakpoint(_)
         | Stmt::Throw(_)
         | Stmt::At(_) => {}
     }

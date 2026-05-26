@@ -37,7 +37,7 @@ use crate::analyzer::AnalysisResult;
 /// caveats.
 pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
     match &hir.stmts[stmt_id] {
-        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break | Stmt::Continue => true,
+        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::Block(b) => block_diverges(hir, b),
         Stmt::If(i) => if_diverges(hir, i),
         Stmt::Try(t) => try_diverges(hir, t),
@@ -53,7 +53,7 @@ pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
         // here — it pauses the worker for debugging, then execution
         // resumes from the next statement. Treating it as divergent
         // would mark legitimate post-debug code as unreachable.
-        Stmt::Expr(_) | Stmt::Var(_) | Stmt::Assign(_) | Stmt::Breakpoint => false,
+        Stmt::Expr(_) | Stmt::Var(_) | Stmt::Assign(_) | Stmt::Breakpoint(_) => false,
     }
 }
 

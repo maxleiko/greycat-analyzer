@@ -4464,16 +4464,17 @@ fn validate_module_type_relations(
                     diags,
                 );
             }
-            Stmt::Return(Some(v)) => {
+            Stmt::Return(r) if r.value.is_some() => {
+                let v = r.value.unwrap();
                 if let Some(rt) = return_ty {
-                    let r = expr_byte_range(hir, *v);
+                    let r = expr_byte_range(hir, v);
                     check_assign(
                         analysis,
                         index,
                         well_known,
                         decl_registry,
                         arena,
-                        *v,
+                        v,
                         rt,
                         "return value",
                         "declared return type",
@@ -4482,11 +4483,11 @@ fn validate_module_type_relations(
                     );
                 }
             }
-            Stmt::Return(None)
+            Stmt::Return(_)
             | Stmt::Expr(_)
-            | Stmt::Break
-            | Stmt::Continue
-            | Stmt::Breakpoint
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Breakpoint(_)
             | Stmt::Throw(_) => {}
         }
     }

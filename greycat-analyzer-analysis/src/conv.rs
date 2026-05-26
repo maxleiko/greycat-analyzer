@@ -27,8 +27,10 @@ pub fn stmt_byte_range(hir: &Hir, stmt_id: Idx<Stmt>) -> Range<usize> {
         HS::Try(s) => s.byte_range.clone(),
         HS::At(s) => s.byte_range.clone(),
         HS::Expr(e) => hir.exprs[*e].byte_range(),
-        HS::Return(Some(e)) => hir.exprs[*e].byte_range(),
-        HS::Throw(e) => hir.exprs[*e].byte_range(),
-        HS::Return(None) | HS::Break | HS::Continue | HS::Breakpoint => 0..0,
+        HS::Return(r) => r.byte_range.clone(),
+        HS::Break(b) => b.byte_range.clone(),
+        HS::Continue(c) => c.byte_range.clone(),
+        HS::Breakpoint(b) => b.byte_range.clone(),
+        HS::Throw(t) => t.byte_range.clone(),
     }
 }
