@@ -24,6 +24,7 @@ use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
 use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
+use greycat_analyzer_analysis::ide::inlay_hints::{InlayHint, inlay_hints_with_project};
 use greycat_analyzer_analysis::ide::signature_help::{SignatureHelp, signature_help};
 use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange, TextEdit};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -196,6 +197,44 @@ impl Project {
             &doc.text,
             doc.root_node(),
             pos,
+            self.encoding,
+        ))
+    }
+
+    /// Inlay hints overlapping the given `(start_line, start_character,
+    /// end_line, end_character)` viewport. Empty vec for unknown URIs.
+    #[wasm_bindgen(js_name = inlayHints)]
+    pub fn inlay_hints(
+        &self,
+        uri: &str,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Result<Vec<InlayHint>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let doc = cell.borrow();
+        let Some(module) = self.analysis.module(&uri) else {
+            return Ok(Vec::new());
+        };
+        let range = IdeRange {
+            start: IdePosition {
+                line: start_line,
+                character: start_character,
+            },
+            end: IdePosition {
+                line: end_line,
+                character: end_character,
+            },
+        };
+        Ok(inlay_hints_with_project(
+            module,
+            &self.analysis,
+            &doc.text,
+            &range,
             self.encoding,
         ))
     }

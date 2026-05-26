@@ -16,6 +16,7 @@ pub mod diagnostics;
 pub mod document_highlights;
 pub mod folding_ranges;
 pub mod hover;
+pub mod inlay_hints;
 pub mod quickfix;
 pub mod rename;
 pub mod render;
