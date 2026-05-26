@@ -717,7 +717,11 @@ fn write_type_qualified(
             write_decl_qualified(f, index, *decl)?;
             write_args_qualified(f, arena, index, args)?;
         }
-        TypeKind::Unresolved { name, .. } => f.write_str(&index.symbols[*name])?,
+        // A type-ref that didn't resolve flows through as opaque
+        // `any?` — print the degraded form so callers see the honest
+        // shape (the `?` is added by the nullable postfix below
+        // because `arena.unresolved()` builds with nullable: true).
+        TypeKind::Unresolved { .. } => f.write_str("any")?,
         TypeKind::GenericParam { name, .. } => f.write_str(&index.symbols[*name])?,
         TypeKind::Lambda { params, ret } => {
             f.write_str("fn(")?;
@@ -796,6 +800,143 @@ pub fn display_type<'a>(
     }
 }
 
+/// Sibling of [`display_type`] that qualifies decls *only when bare
+/// lookup from `current_uri` wouldn't reach them* — i.e. the bare form
+/// is ambiguous, private cross-module, or absent. Used by error
+/// messages that name foreign decls (e.g. cross-module
+/// `argument-type-mismatch`) so the rendered text is itself a valid
+/// reference from the diagnostic's source position. Decls reachable
+/// bare from `current_uri` stay bare to avoid `core::Map` noise.
+pub fn display_type_for_module<'a>(
+    arena: &'a TypeArena,
+    index: &'a ProjectIndex,
+    decl_registry: &'a crate::well_known::DeclRegistry,
+    id: TypeId,
+    current_uri: Option<&'a Uri>,
+) -> TypeForModule<'a> {
+    TypeForModule {
+        arena,
+        index,
+        decl_registry,
+        id,
+        current_uri,
+    }
+}
+
+pub struct TypeForModule<'a> {
+    arena: &'a TypeArena,
+    index: &'a ProjectIndex,
+    decl_registry: &'a crate::well_known::DeclRegistry,
+    id: TypeId,
+    /// When `Some(uri)`, qualify any decl that bare lookup from `uri`
+    /// wouldn't reach (private cross-module, ambiguous across two
+    /// public modules, or shadowed). When `None`, qualification falls
+    /// back to the project-wide `locate_decl(...).len() > 1`
+    /// ambiguity heuristic — same as [`write_type_qualified`].
+    current_uri: Option<&'a Uri>,
+}
+
+impl std::fmt::Display for TypeForModule<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_type_for_module(
+            f,
+            self.arena,
+            self.index,
+            self.decl_registry,
+            self.id,
+            self.current_uri,
+        )
+    }
+}
+
+fn write_type_for_module(
+    f: &mut std::fmt::Formatter<'_>,
+    arena: &TypeArena,
+    index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
+    id: TypeId,
+    current_uri: Option<&Uri>,
+) -> std::fmt::Result {
+    use greycat_analyzer_core::TypeKind;
+    let ty = arena.get(id);
+    let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
+        let name = &index.symbols[d.name];
+        // Qualify iff bare-name lookup from `current_uri` wouldn't
+        // bind to this exact decl — i.e. the bare form would either
+        // miss (None) or bind to a different decl.
+        let needs_qual = match resolve_decl_handle_from(index, decl_registry, current_uri, name) {
+            Some(found) => found != d,
+            None => true,
+        };
+        if needs_qual {
+            f.write_str(&index.symbols[d.module])?;
+            f.write_str("::")?;
+        }
+        f.write_str(name)
+    };
+    match &ty.kind {
+        TypeKind::Null => f.write_str("null")?,
+        TypeKind::Any => f.write_str("any")?,
+        TypeKind::Never => f.write_str("never")?,
+        TypeKind::Primitive(p) => f.write_str(p.name())?,
+        TypeKind::Type(d) => decl_name(*d, f)?,
+        TypeKind::Generic { decl, args } => {
+            decl_name(*decl, f)?;
+            f.write_str("<")?;
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type_for_module(f, arena, index, decl_registry, *a, current_uri)?;
+            }
+            f.write_str(">")?;
+        }
+        // See `write_type_qualified`: degrade unresolved type-refs to
+        // `any?` in display so error messages don't pretend the name
+        // resolved to something it didn't.
+        TypeKind::Unresolved { .. } => f.write_str("any")?,
+        TypeKind::GenericParam { name, .. } => f.write_str(&index.symbols[*name])?,
+        TypeKind::Lambda { params, ret } => {
+            f.write_str("fn(")?;
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_type_for_module(f, arena, index, decl_registry, *p, current_uri)?;
+            }
+            f.write_str(")")?;
+            if let Some(r) = ret {
+                f.write_str(": ")?;
+                write_type_for_module(f, arena, index, decl_registry, *r, current_uri)?;
+            }
+        }
+        TypeKind::Enum { name, .. } => f.write_str(&index.symbols[*name])?,
+        TypeKind::Union { alts } => {
+            for (i, a) in alts.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" | ")?;
+                }
+                write_type_for_module(f, arena, index, decl_registry, *a, current_uri)?;
+            }
+            if ty.nullable
+                && !alts
+                    .iter()
+                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
+            {
+                f.write_str(" | null")?;
+            }
+        }
+        TypeKind::TypeOf(inner) => {
+            f.write_str("typeof ")?;
+            write_type_for_module(f, arena, index, decl_registry, *inner, current_uri)?;
+        }
+    }
+    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
+        f.write_str("?")?;
+    }
+    Ok(())
+}
+
 pub struct TypeWithDecls<'a> {
     arena: &'a TypeArena,
     decl_registry: &'a crate::well_known::DeclRegistry,
@@ -838,7 +979,10 @@ fn write_type_with_decls(
             }
             f.write_str(">")?;
         }
-        TypeKind::Unresolved { name, .. } => f.write_str(&symbols[*name])?,
+        // See `write_type_qualified`: degrade unresolved type-refs to
+        // `any?` in display so error messages don't pretend the name
+        // resolved to something it didn't.
+        TypeKind::Unresolved { .. } => f.write_str("any")?,
         TypeKind::GenericParam { name, .. } => f.write_str(&symbols[*name])?,
         TypeKind::Lambda { params, ret } => {
             f.write_str("fn(")?;
@@ -1407,6 +1551,7 @@ fn lower_module_signatures(
                             &*index,
                             decl_registry,
                             &generics_in_scope,
+                            Some(uri),
                         );
                         entry.supertypes.push((type_id, ty));
                     }
@@ -1424,6 +1569,7 @@ fn lower_module_signatures(
                         &*index,
                         decl_registry,
                         &generics_in_scope,
+                        Some(uri),
                     );
                     entry.attrs.push((type_id, attr_sym, ty));
                 }
@@ -1454,6 +1600,7 @@ fn lower_module_signatures(
                             &*index,
                             decl_registry,
                             &generics_in_scope,
+                            Some(uri),
                         );
                         entry.methods.push((type_id, method_sym, ty));
                     }
@@ -1477,6 +1624,7 @@ fn lower_module_signatures(
                                 &*index,
                                 decl_registry,
                                 &generics_in_scope,
+                                Some(uri),
                             )
                         } else {
                             arena_mut.any_nullable()
@@ -1496,6 +1644,7 @@ fn lower_module_signatures(
                             &*index,
                             decl_registry,
                             &generics_in_scope,
+                            Some(uri),
                         )
                     });
                     entry.method_sigs.push((
@@ -1560,6 +1709,7 @@ fn lower_module_signatures(
                     &*index,
                     decl_registry,
                     &generics_in_scope,
+                    Some(uri),
                 );
                 // **P19.15** — also pre-lower parameter types so the
                 // analyzer's generic-call inference can run on
@@ -1575,6 +1725,7 @@ fn lower_module_signatures(
                             &*index,
                             decl_registry,
                             &generics_in_scope,
+                            Some(uri),
                         )
                     } else {
                         arena_mut.any_nullable()
@@ -1609,8 +1760,15 @@ fn lower_module_signatures(
                 };
                 // Vars never declare generics, so no scope needed.
                 let empty: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
-                let var_ty =
-                    lower_type_ref_project(hir, tr, arena_mut, &*index, decl_registry, &empty);
+                let var_ty = lower_type_ref_project(
+                    hir,
+                    tr,
+                    arena_mut,
+                    &*index,
+                    decl_registry,
+                    &empty,
+                    Some(uri),
+                );
                 entry.vars.push((var_id, var_ty));
             }
             _ => {}
@@ -2413,6 +2571,7 @@ impl ProjectAnalysis {
                 // `function` and other kinds skip.
                 lambda_call_arg_diags(
                     cur_module,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -2497,6 +2656,7 @@ impl ProjectAnalysis {
                 // `arena.substitute`. Replaces the old TypeShape
                 // round-trip — one less type representation, fewer
                 // per-call allocations, no foreign-HIR re-walk.
+                let fn_uri = foreign_uri_opt.as_ref().unwrap_or(cur_uri);
                 let declared_raw = lower_type_ref_project(
                     &fn_module.hir,
                     declared_ref,
@@ -2504,6 +2664,7 @@ impl ProjectAnalysis {
                     index,
                     decl_registry,
                     &method_generics_in_scope,
+                    Some(fn_uri),
                 );
                 let declared_ty = if method_subst.is_empty() {
                     declared_raw
@@ -2529,9 +2690,21 @@ impl ProjectAnalysis {
                         code: "argument-type-mismatch",
                         message: format!(
                             "value of type `{}` is not assignable to parameter `{}: {}`",
-                            display_type(arena, decl_registry, &index.symbols, arg_ty),
+                            display_type_for_module(
+                                arena,
+                                index,
+                                decl_registry,
+                                arg_ty,
+                                Some(cur_uri),
+                            ),
                             p_name,
-                            display_type(arena, decl_registry, &index.symbols, declared_ty),
+                            display_type_for_module(
+                                arena,
+                                index,
+                                decl_registry,
+                                declared_ty,
+                                Some(cur_uri),
+                            ),
                         ),
                         byte_range: r,
                         category: DiagCategory::TypeRelation,
@@ -2864,6 +3037,7 @@ impl ProjectAnalysis {
             let mut diags: Vec<SemanticDiagnostic> = Vec::new();
             validate_module_type_relations(
                 cur_module,
+                cur_uri,
                 index,
                 well_known,
                 decl_registry,
@@ -3383,8 +3557,10 @@ fn collect_chain(node: Node<'_>, text: &str, out: &mut Vec<String>) {
 /// callees still validate against the underlying lambda shape, mirroring
 /// the runtime which null-checks once then dispatches against the
 /// signature.
+#[allow(clippy::too_many_arguments)]
 fn lambda_call_arg_diags(
     cur_module: &ModuleAnalysis,
+    cur_uri: &Uri,
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
     decl_registry: &crate::well_known::DeclRegistry,
@@ -3440,8 +3616,14 @@ fn lambda_call_arg_diags(
                 code: "argument-type-mismatch",
                 message: format!(
                     "value of type `{}` is not assignable to parameter of type `{}`",
-                    display_type(arena, decl_registry, &index.symbols, arg_ty),
-                    display_type(arena, decl_registry, &index.symbols, declared_ty),
+                    display_type_for_module(arena, index, decl_registry, arg_ty, Some(cur_uri),),
+                    display_type_for_module(
+                        arena,
+                        index,
+                        decl_registry,
+                        declared_ty,
+                        Some(cur_uri),
+                    ),
                 ),
                 byte_range: r,
                 category: DiagCategory::TypeRelation,
@@ -3822,6 +4004,7 @@ fn run_typed_lints_for_module(
 /// append-only and intern-collapsed.
 fn validate_module_type_relations(
     module: &ModuleAnalysis,
+    cur_uri: &Uri,
     index: &ProjectIndex,
     well_known: &WellKnown,
     decl_registry: &DeclRegistry,
@@ -3842,6 +4025,7 @@ fn validate_module_type_relations(
         validate_decl(
             hir,
             analysis,
+            cur_uri,
             index,
             well_known,
             decl_registry,
@@ -3856,6 +4040,7 @@ fn validate_module_type_relations(
     fn validate_decl(
         hir: &Hir,
         analysis: &AnalysisResult,
+        cur_uri: &Uri,
         index: &ProjectIndex,
         well_known: &WellKnown,
         decl_registry: &DeclRegistry,
@@ -3875,12 +4060,14 @@ fn validate_module_type_relations(
                         decl_registry,
                         &analysis.type_decls,
                         arena,
+                        Some(cur_uri),
                     )
                 });
                 if let Some(body) = fnd.body {
                     validate_stmt(
                         hir,
                         analysis,
+                        cur_uri,
                         index,
                         well_known,
                         decl_registry,
@@ -3904,6 +4091,7 @@ fn validate_module_type_relations(
                             decl_registry,
                             &analysis.type_decls,
                             arena,
+                            Some(cur_uri),
                         )
                     {
                         check_assign(
@@ -3925,6 +4113,7 @@ fn validate_module_type_relations(
                     validate_decl(
                         hir,
                         analysis,
+                        cur_uri,
                         index,
                         well_known,
                         decl_registry,
@@ -3945,6 +4134,7 @@ fn validate_module_type_relations(
                         decl_registry,
                         &analysis.type_decls,
                         arena,
+                        Some(cur_uri),
                     )
                 {
                     check_assign(
@@ -3970,6 +4160,7 @@ fn validate_module_type_relations(
     fn validate_block(
         hir: &Hir,
         analysis: &AnalysisResult,
+        cur_uri: &Uri,
         index: &ProjectIndex,
         well_known: &WellKnown,
         decl_registry: &DeclRegistry,
@@ -3983,6 +4174,7 @@ fn validate_module_type_relations(
             validate_stmt(
                 hir,
                 analysis,
+                cur_uri,
                 index,
                 well_known,
                 decl_registry,
@@ -3999,6 +4191,7 @@ fn validate_module_type_relations(
     fn validate_stmt(
         hir: &Hir,
         analysis: &AnalysisResult,
+        cur_uri: &Uri,
         index: &ProjectIndex,
         well_known: &WellKnown,
         decl_registry: &DeclRegistry,
@@ -4016,6 +4209,7 @@ fn validate_module_type_relations(
             Stmt::Block(b) => validate_block(
                 hir,
                 analysis,
+                cur_uri,
                 index,
                 well_known,
                 decl_registry,
@@ -4035,6 +4229,7 @@ fn validate_module_type_relations(
                         decl_registry,
                         &analysis.type_decls,
                         arena,
+                        Some(cur_uri),
                     )
                 {
                     let r = expr_byte_range(hir, *init_id);
@@ -4095,6 +4290,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4108,6 +4304,7 @@ fn validate_module_type_relations(
                     validate_stmt(
                         hir,
                         analysis,
+                        cur_uri,
                         index,
                         well_known,
                         decl_registry,
@@ -4136,6 +4333,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4163,6 +4361,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4192,6 +4391,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4206,6 +4406,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4224,6 +4425,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4236,6 +4438,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4250,6 +4453,7 @@ fn validate_module_type_relations(
                 validate_block(
                     hir,
                     analysis,
+                    cur_uri,
                     index,
                     well_known,
                     decl_registry,
@@ -4376,6 +4580,7 @@ fn lower_type_ref_project(
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
     generics_in_scope: &FxHashMap<Symbol, GenericOwner>,
+    current_uri: Option<&Uri>,
 ) -> TypeId {
     let tr = hir.type_refs[type_ref].clone();
     // Qualified ref (`b::Foo`, …): bypass the bare-name ladder. The
@@ -4390,10 +4595,17 @@ fn lower_type_ref_project(
             index,
             decl_registry,
             generics_in_scope,
+            current_uri,
         );
     }
     let name_sym = hir.idents[tr.name].symbol;
     let name = &index.symbols[name_sym];
+    // Same-module-first decl handle lookup: `private` decls declared
+    // in `current_uri` resolve to themselves; cross-module bare-name
+    // lookups still filter out foreign private decls (matches
+    // GreyCat's `private` semantics enforced in the resolver's
+    // `record_use`).
+    let lookup = |name: &str| resolve_decl_handle_from(index, decl_registry, current_uri, name);
     let mut base = match name {
         "bool" => arena.primitive(Primitive::Bool),
         "int" => arena.primitive(Primitive::Int),
@@ -4418,16 +4630,17 @@ fn lower_type_ref_project(
                             index,
                             decl_registry,
                             generics_in_scope,
+                            current_uri,
                         )
                     })
                     .collect();
-                match resolve_decl_handle(index, decl_registry, name) {
+                match lookup(name) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(owner) = generics_in_scope.get(&name_sym) {
                 arena.generic_param(name_sym, *owner)
-            } else if let Some(arity) = resolve_decl_handle(index, decl_registry, name)
+            } else if let Some(arity) = lookup(name)
                 .and_then(|item| index.type_members.get(&item))
                 .map(|m| m.generics.len())
                 .filter(|n| *n > 0)
@@ -4437,16 +4650,17 @@ fn lower_type_ref_project(
                 // the body walker and validation pass agree on the
                 // same shape; kills the need for any raw-form bridge
                 // in `is_assignable_to`. Routes through
-                // `resolve_decl_handle` so the ItemId picks the same
-                // non-private candidate as everywhere else.
+                // `resolve_decl_handle_from` so the ItemId picks the
+                // same non-private candidate as everywhere else, with
+                // same-module private preferred when applicable.
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
-                match resolve_decl_handle(index, decl_registry, name) {
+                match lookup(name) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
-            } else if let Some(enum_id) = resolve_decl_handle(index, decl_registry, name)
-                .and_then(|item| index.enum_types.get(&item).copied())
+            } else if let Some(enum_id) =
+                lookup(name).and_then(|item| index.enum_types.get(&item).copied())
             {
                 // P19.10 — canonical enum TypeId from S7-S11.
                 // Without this, a cross-module enum reference would
@@ -4454,7 +4668,7 @@ fn lower_type_ref_project(
                 // the analyzer's `Static` enum-variant arm
                 // (`if let TypeKind::Enum { variants, .. } = ...`).
                 enum_id
-            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+            } else if let Some(handle) = lookup(name) {
                 // Non-generic concrete type with a known home decl:
                 // mint a handle-keyed `Type(handle)` so it interns
                 // equal to whatever `register_module_types` produced
@@ -4552,6 +4766,7 @@ fn lower_qualified_type_ref_project(
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
     generics_in_scope: &FxHashMap<Symbol, GenericOwner>,
+    current_uri: Option<&Uri>,
 ) -> TypeId {
     let module_segment = *tr
         .qualifier
@@ -4577,7 +4792,15 @@ fn lower_qualified_type_ref_project(
             .params
             .iter()
             .map(|p| {
-                lower_type_ref_project(hir, *p, arena, index, decl_registry, generics_in_scope)
+                lower_type_ref_project(
+                    hir,
+                    *p,
+                    arena,
+                    index,
+                    decl_registry,
+                    generics_in_scope,
+                    current_uri,
+                )
             })
             .collect();
         let mut base = match index
@@ -4616,6 +4839,7 @@ fn lower_qualified_type_ref_project(
 /// into `arena`. `arena` is the validation-pass's working clone of
 /// `analysis.types`, so any new mints land where `is_assignable_to`
 /// can see them.
+#[allow(clippy::too_many_arguments)]
 fn lower_type_ref_id(
     hir: &Hir,
     type_ref: Idx<TypeRef>,
@@ -4624,6 +4848,7 @@ fn lower_type_ref_id(
     decl_registry: &DeclRegistry,
     type_decls: &FxHashMap<Symbol, Idx<Decl>>,
     arena: &mut TypeArena,
+    current_uri: Option<&Uri>,
 ) -> Option<TypeId> {
     let tr = &hir.type_refs[type_ref];
     // Qualified ref (`b::Foo`, …) — route through the same
@@ -4638,6 +4863,7 @@ fn lower_type_ref_id(
             index,
             decl_registry,
             &generics_in_scope,
+            current_uri,
         ));
     }
     let name_sym = hir.idents[tr.name].symbol;
@@ -4654,6 +4880,11 @@ fn lower_type_ref_id(
         "null" => arena.null(),
         _ => {
             let name = &index.symbols[name_sym];
+            // Same-module-first decl handle lookup — mirrors the
+            // `lookup` closure in `lower_type_ref_project`. Reaches
+            // `private` decls in `current_uri`'s own module.
+            let lookup =
+                |name: &str| resolve_decl_handle_from(index, decl_registry, current_uri, name);
             if !tr.params.is_empty() {
                 let mut args = Vec::with_capacity(tr.params.len());
                 for p in &tr.params {
@@ -4665,9 +4896,10 @@ fn lower_type_ref_id(
                         decl_registry,
                         type_decls,
                         arena,
+                        current_uri,
                     )?);
                 }
-                match resolve_decl_handle(index, decl_registry, name) {
+                match lookup(name) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
@@ -4678,14 +4910,14 @@ fn lower_type_ref_id(
                 // `lower_type_ref` produce the same shape.
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
-                match resolve_decl_handle(index, decl_registry, name) {
+                match lookup(name) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(id) = registry.lookup(name_sym) {
                 id
-            } else if let Some(enum_id) = resolve_decl_handle(index, decl_registry, name)
-                .and_then(|item| index.enum_types.get(&item).copied())
+            } else if let Some(enum_id) =
+                lookup(name).and_then(|item| index.enum_types.get(&item).copied())
             {
                 // Canonical enum TypeId from S7-S11. The body walker's
                 // `lower_type_ref` and `lower_type_ref_project` both
@@ -4695,7 +4927,7 @@ fn lower_type_ref_id(
                 // [Type(handle)])` (validation) fails invariant
                 // arg-equality.
                 enum_id
-            } else if let Some(handle) = resolve_decl_handle(index, decl_registry, name) {
+            } else if let Some(handle) = lookup(name) {
                 // Foreign non-generic decl: mint `Type(handle)` to
                 // match what the body walker's `lower_type_ref` and
                 // the signature pass's `lower_type_ref_project`

@@ -537,12 +537,16 @@ pub fn analyze_with_index_into(
 
     // Surface resolver's unresolved-name list as analyzer diagnostics so
     // P2.7 (LSP publish) only needs one list per file.
-    // P38.4 — idents flagged `ambiguous` get a richer diagnostic (with
-    // candidate modules + FQN quick-fixes); skip them here to avoid a
-    // duplicate generic "unresolved name" alongside the helpful one.
+    // P38.4 — idents flagged `ambiguous` or `private_cross_module` get
+    // a richer diagnostic (with candidate modules + FQN quick-fixes);
+    // skip them here to avoid a duplicate generic "unresolved name"
+    // alongside the helpful one.
     let unresolved = res.unresolved.clone();
     for ident_idx in unresolved {
         if res.ambiguous.contains_key(&ident_idx) {
+            continue;
+        }
+        if res.private_cross_module.contains_key(&ident_idx) {
             continue;
         }
         let ident = &hir.idents[ident_idx];
@@ -618,6 +622,30 @@ pub fn analyze_with_index_into(
                 module_names.join(", "),
                 module_names.first().copied().unwrap_or("<module>"),
             ),
+            ident.byte_range.clone(),
+        ));
+    }
+
+    // `private-cross-module-name` — the bare ident only matched
+    // `private` decls in foreign modules, so the runtime rejects it as
+    // "unresolved identifier" but the project closure *does* contain a
+    // decl by that name reachable through its FQN. Surface the FQN so
+    // the user (and the quickfix at
+    // `ide::quickfix::private_cross_module_fix`) can rewrite the call
+    // site. Lexicographic-min module pick keeps the message stable
+    // when several modules happen to have a private namesake.
+    for (ident_idx, candidates) in &res.private_cross_module {
+        let ident = &hir.idents[*ident_idx];
+        let name = &index.symbols[ident.symbol];
+        let module = candidates
+            .iter()
+            .filter_map(|(uri, _)| crate::stdlib::module_name_from_uri(uri))
+            .min()
+            .unwrap_or("<module>");
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            "private-cross-module-name",
+            format!("`{name}` is private in `{module}`; use `{module}::{name}`"),
             ident.byte_range.clone(),
         ));
     }

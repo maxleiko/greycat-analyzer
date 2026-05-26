@@ -144,6 +144,13 @@ pub struct Resolutions {
     /// diagnostic naming each candidate, with quick-fixes that
     /// rewrite the bare ident to one of `<module>::<name>`.
     pub ambiguous: FxHashMap<Idx<Ident>, Vec<(Uri, Idx<Decl>)>>,
+    /// Idents whose only cross-module candidates were rejected because
+    /// every hit was `private`. Keyed by use-site Idx, value lists the
+    /// private hits so the analyzer can name the module + offer an FQN
+    /// rewrite. Same shape as `ambiguous` — both feed
+    /// `unresolved` and supersede the generic `unresolved-name`
+    /// diagnostic with a richer one.
+    pub private_cross_module: FxHashMap<Idx<Ident>, Vec<(Uri, Idx<Decl>)>>,
     /// Idents inside a lambda body that resolved to a Local/Param bound
     /// in an enclosing scope. GreyCat lambdas don't capture — the
     /// runtime rejects these as `unresolved identifier`. The resolver
@@ -405,6 +412,13 @@ impl<'a> Cx<'a> {
         }
 
         // 2 + 3, per namespace in the position's priority order.
+        // Cross-namespace accumulator for cross-module candidates the
+        // private filter dropped — committed at the final unresolved
+        // point so the analyzer can surface `private-cross-module-name`
+        // in lieu of the generic `unresolved-name`. Only populated when
+        // no namespace yielded a public hit, so a Fn-ns public hit still
+        // wins over a Type-ns private candidate.
+        let mut private_cross_module_accum: Vec<(Uri, Idx<Decl>)> = Vec::new();
         for &ns in pos.namespaces() {
             // Step 2: module-local (public OR private) in this
             // namespace. Module-local always shadows cross-module.
@@ -420,17 +434,22 @@ impl<'a> Cx<'a> {
                 self.res.uses.insert(idx, def);
                 return;
             }
-            // Step 3: cross-module PUBLIC in this namespace, with
-            // current-module and `private` filters.
-            let cross_module_hits: Vec<(Uri, Idx<Decl>)> = self
-                .index
-                .locate_decl_in_ns(name_sym, ns)
-                .filter(|(uri, decl)| {
-                    let from_other_module = self.current_uri.map(|cur| uri != &cur).unwrap_or(true);
-                    from_other_module && !self.index.is_decl_private(uri, *decl)
-                })
-                .map(|(uri, decl)| (uri.clone(), decl))
-                .collect();
+            // Step 3: cross-module in this namespace. Partition into
+            // public (the resolution set) and private (the
+            // would-have-resolved-but-for-privacy set, captured for the
+            // richer diagnostic).
+            let mut cross_module_hits: Vec<(Uri, Idx<Decl>)> = Vec::new();
+            for (uri, decl) in self.index.locate_decl_in_ns(name_sym, ns) {
+                let from_other_module = self.current_uri.is_none_or(|cur| uri != cur);
+                if !from_other_module {
+                    continue;
+                }
+                if self.index.is_decl_private(uri, decl) {
+                    private_cross_module_accum.push((uri.clone(), decl));
+                } else {
+                    cross_module_hits.push((uri.clone(), decl));
+                }
+            }
             match cross_module_hits.len() {
                 0 => continue,
                 1 => {
@@ -460,6 +479,14 @@ impl<'a> Cx<'a> {
         if self.index.module_names.contains_key(&name_sym) {
             self.res.uses.insert(idx, Definition::Project);
             return;
+        }
+        // Final unresolved point. If the cross-module ladder turned up
+        // only private hits, commit them now so the analyzer emits
+        // `private-cross-module-name` instead of `unresolved-name`.
+        if !private_cross_module_accum.is_empty() {
+            self.res
+                .private_cross_module
+                .insert(idx, private_cross_module_accum);
         }
         self.res.unresolved.push(idx);
     }

@@ -86,9 +86,11 @@ fn private_type_is_invisible_when_no_public_namesake_exists() {
     let pa = ProjectAnalysis::analyze(&mgr);
     let codes = error_codes(&pa, &a_uri);
     assert!(
-        codes.iter().any(|c| c == "unresolved-name"),
-        "expected `unresolved-name` on `Helper` — \
-         b.gcl's private type must not leak into a.gcl. \
+        codes.iter().any(|c| c == "private-cross-module-name"),
+        "expected `private-cross-module-name` on `Helper` — \
+         b.gcl's private type must not bare-leak into a.gcl, but the \
+         resolver should know the FQN `b::Helper` and surface a \
+         richer diagnostic than `unresolved-name`. \
          Got diagnostics: {:#?}",
         pa.module(&a_uri).unwrap().analysis.diagnostics
     );

@@ -94,8 +94,33 @@ pub fn edit_for_diagnostic(
         "redundant-semicolon" => redundant_semicolon_fix(start, end),
         "no-breakpoint" => no_breakpoint_fix(cx.text, start, end),
         "infer-return-type" => infer_return_type_fix(cx.root, start, message),
+        "private-cross-module-name" => private_cross_module_fix(start, end, message),
         _ => Vec::new(),
     }
+}
+
+/// Rewrite a bare ident that referenced a `private` cross-module decl
+/// to the suggested `module::Name` FQN. The analyzer's diagnostic
+/// message always ends with `` … use `<module>::<Name>` ``, so the
+/// last backtick pair carries the replacement string verbatim.
+fn private_cross_module_fix(start: usize, end: usize, message: &str) -> Vec<TextEdit> {
+    if end <= start {
+        return Vec::new();
+    }
+    let Some(last_close) = message.rfind('`') else {
+        return Vec::new();
+    };
+    let Some(last_open) = message[..last_close].rfind('`') else {
+        return Vec::new();
+    };
+    let fqn = &message[last_open + 1..last_close];
+    if !fqn.contains("::") {
+        return Vec::new();
+    }
+    vec![TextEdit {
+        byte_range: start..end,
+        new_text: fqn.to_owned(),
+    }]
 }
 
 /// Insert `: T` between the parameter list's closing `)` and the body's

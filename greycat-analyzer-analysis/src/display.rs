@@ -58,15 +58,12 @@ pub fn display_fqn(
                 parts.join(", ")
             )
         }
-        // P35.3 — unresolved name, render verbatim with the same
-        // `<lib>::` prefix the rest of the resolver would have used.
-        TypeKind::Unresolved { name, .. } => {
-            let name = &symbols[*name];
-            format!(
-                "{}::{name}",
-                home_lib(name).unwrap_or_else(|| "core".to_string()),
-            )
-        }
+        // Unresolved type-refs degrade to `core::any` in display so
+        // diagnostics quoting full type structures don't pretend the
+        // unbound name resolved to something it didn't. The arena
+        // still carries `Unresolved { name, byte_range }` for goto /
+        // hover anchoring; only the printed form is degraded.
+        TypeKind::Unresolved { .. } => "core::any".to_string(),
         TypeKind::GenericParam { name, .. } => symbols[*name].to_string(),
         TypeKind::Lambda { params, ret } => {
             let parts: Box<[String]> = params
