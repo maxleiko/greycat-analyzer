@@ -12,7 +12,6 @@ use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{GotoDefinitionResponse, Location, Position, Uri};
 
-use super::references_rename;
 use crate::conv::{byte_range_to_lsp, position_to_byte};
 
 pub fn goto_definition(
@@ -192,10 +191,9 @@ pub fn cross_module_member_location(
     })
 }
 
-///  helper — map a cursor position in `text` to its `Idx<Ident>`
-/// against the cached `hir`'s `idents` arena, by byte-range match.
-/// Returns `None` if the cursor isn't over an ident or no matching
-/// idx was allocated (e.g. lowering skipped this shape).
+/// Thin re-export of the analysis-side helper. Kept here so existing
+/// callers (`goto_definition_across_project`, `references_across_project`,
+/// `rename_across_project`) don't need updating.
 pub fn cursor_ident_idx(
     text: &str,
     root: tree_sitter::Node<'_>,
@@ -203,12 +201,7 @@ pub fn cursor_ident_idx(
     hir: &Hir,
     encoding: SourceEncoding,
 ) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
-    let byte = position_to_byte(text, pos, encoding);
-    let node = node_at_offset(root, byte)?;
-    if node.kind() != "ident" {
-        return None;
-    }
-    references_rename::idx_for_node(hir, node)
+    greycat_analyzer_analysis::ide::rename::cursor_ident_idx(text, root, pos, hir, encoding)
 }
 
 // P31.1

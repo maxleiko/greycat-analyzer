@@ -27,9 +27,14 @@ use greycat_analyzer_analysis::ide::document_symbols::{DocumentSymbol, document_
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
 use greycat_analyzer_analysis::ide::inlay_hints::{InlayHint, inlay_hints_with_project};
+use greycat_analyzer_analysis::ide::rename::{
+    RenameTarget as AnalysisRenameTarget, cursor_ident_idx, resolve_target, target_sites,
+};
 use greycat_analyzer_analysis::ide::semantic_tokens::{SemanticTokens, semantic_tokens};
 use greycat_analyzer_analysis::ide::signature_help::{SignatureHelp, signature_help};
-use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange, TextEdit};
+use greycat_analyzer_analysis::ide::types::{
+    Location, Position as IdePosition, Range as IdeRange, TextEdit,
+};
 use greycat_analyzer_analysis::ide::workspace_symbols::{WorkspaceSymbol, workspace_symbols};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
@@ -346,6 +351,48 @@ impl Project {
         ))
     }
 
+    /// Classify the cursor's binding as a rename / find-references
+    /// target. Returns `None` for cursors not on an ident, for runtime-
+    /// only names (`Array`, `Map`, native fns, primitives), and for
+    /// unrecognized binding shapes. The returned [`RenameTarget`] is
+    /// opaque to JS — pass it back to [`renameTargetSites`] /
+    /// [`references`] to get concrete source locations.
+    #[wasm_bindgen(js_name = resolveRenameTarget)]
+    pub fn resolve_rename_target(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<RenameTarget>, JsValue> {
+        let uri = parse_uri(uri)?;
+        Ok(self
+            .cursor_target(&uri, Position { line, character })
+            .map(RenameTarget))
+    }
+
+    /// Every (URI, source-range) pair the target binds. Empty vec for
+    /// unknown handles.
+    #[wasm_bindgen(js_name = renameTargetSites)]
+    pub fn rename_target_sites(&self, target: &RenameTarget) -> Vec<Location> {
+        self.sites_to_locations(target_sites(&self.analysis, &target.0))
+    }
+
+    /// Convenience: classify the cursor's binding and return all of its
+    /// reference sites in one call. Equivalent to
+    /// `resolveRenameTarget` followed by `renameTargetSites`.
+    pub fn references(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Location>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(target) = self.cursor_target(&uri, Position { line, character }) else {
+            return Ok(Vec::new());
+        };
+        Ok(self.sites_to_locations(target_sites(&self.analysis, &target)))
+    }
+
     /// Whole-document formatting. Returns a single full-range edit
     /// when the formatter's output differs; an empty vec otherwise.
     /// Empty vec is also returned for unknown URIs (idempotent shape).
@@ -387,7 +434,49 @@ impl Project {
         }
         lib_from_uri(uri)
     }
+
+    /// Cursor `(line, character)` in `uri` to a rename / references
+    /// target. Internal-only — JS goes through `resolve_rename_target`
+    /// to get an opaque [`RenameTarget`] handle.
+    fn cursor_target(&self, uri: &Uri, pos: Position) -> Option<AnalysisRenameTarget> {
+        let cell = self.manager.get(uri)?;
+        let doc = cell.borrow();
+        let module = self.analysis.module(uri)?;
+        let cursor_idx =
+            cursor_ident_idx(&doc.text, doc.root_node(), pos, &module.hir, self.encoding)?;
+        drop(doc);
+        resolve_target(&self.analysis, uri, cursor_idx)
+    }
+
+    /// Walk a list of analysis-side `TargetSite`s and lift each into an
+    /// IDE `Location`, fetching the home document's text from the
+    /// `SourceManager` for byte → range conversion. Sites whose URI is
+    /// no longer in the manager are silently dropped (e.g. the source
+    /// was unloaded between resolve_target and target_sites).
+    fn sites_to_locations(
+        &self,
+        sites: Vec<greycat_analyzer_analysis::ide::rename::TargetSite>,
+    ) -> Vec<Location> {
+        sites
+            .into_iter()
+            .filter_map(|site| {
+                let cell = self.manager.get(&site.uri)?;
+                let doc = cell.borrow();
+                Some(Location {
+                    uri: site.uri,
+                    range: IdeRange::from_byte_range(&doc.text, &site.byte_range, self.encoding),
+                })
+            })
+            .collect()
+    }
 }
+
+/// Opaque JS handle wrapping an [`AnalysisRenameTarget`]. Constructed
+/// by [`Project::resolve_rename_target`]; consumed by
+/// [`Project::rename_target_sites`]. JS never inspects the `Idx`
+/// payload directly — the wrapper is the API contract.
+#[wasm_bindgen]
+pub struct RenameTarget(AnalysisRenameTarget);
 
 /// Derive the `lib` tag from a URI path. Anything under `.../lib/<name>/...`
 /// belongs to library `<name>`; everything else is project source.

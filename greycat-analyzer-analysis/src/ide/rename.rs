@@ -15,13 +15,40 @@
 
 use std::ops::Range;
 
-use greycat_analyzer_core::lsp_types::Uri;
+use greycat_analyzer_core::SourceEncoding;
+use greycat_analyzer_core::lsp_types::{Position, Uri};
+use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Decl, Ident, TypeAttr};
+use greycat_analyzer_syntax::cst::node_at_offset;
+use greycat_analyzer_syntax::tree_sitter;
 
 use crate::analyzer::MemberDef;
+use crate::conv::position_to_byte;
 use crate::project::ProjectAnalysis;
 use crate::resolver::Definition;
+
+/// Map a cursor position in `text` to its `Idx<Ident>` against `hir`'s
+/// `idents` arena, by byte-range match. Returns `None` if the cursor
+/// isn't over an ident or no matching idx was allocated (e.g. lowering
+/// skipped this shape).
+pub fn cursor_ident_idx(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    pos: Position,
+    hir: &Hir,
+    encoding: SourceEncoding,
+) -> Option<Idx<Ident>> {
+    let byte = position_to_byte(text, pos, encoding);
+    let node = node_at_offset(root, byte)?;
+    if node.kind() != "ident" {
+        return None;
+    }
+    hir.idents
+        .iter()
+        .find(|(_, i)| i.byte_range == node.byte_range())
+        .map(|(idx, _)| idx)
+}
 
 /// What the cursor is asking us to rename / find references for.
 /// Returned by [`resolve_target`] and consumed by [`target_sites`].

@@ -10,7 +10,6 @@
 use greycat_analyzer_analysis::ide::rename;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::{SourceEncoding, SourceManager};
-use greycat_analyzer_hir::Hir;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{Location, Position, PrepareRenameResponse, TextEdit, Uri, WorkspaceEdit};
@@ -19,19 +18,6 @@ pub use greycat_analyzer_analysis::ide::rename::RenameTarget;
 
 use super::goto::cursor_ident_idx;
 use crate::conv::{byte_range_to_lsp, position_to_byte};
-
-/// Map a tree-sitter ident node back to its `Idx<Ident>` in the HIR
-/// arena by byte-range match. Returns `None` if no matching ident was
-/// allocated (e.g., the lowering skipped this shape).
-pub(super) fn idx_for_node(
-    hir: &Hir,
-    node: tree_sitter::Node<'_>,
-) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
-    hir.idents
-        .iter()
-        .find(|(_, i)| i.byte_range == node.byte_range())
-        .map(|(idx, _)| idx)
-}
 
 pub fn prepare_rename(
     text: &str,
