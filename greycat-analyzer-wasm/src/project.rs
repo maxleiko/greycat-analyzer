@@ -21,6 +21,7 @@
 use std::str::FromStr;
 
 use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
+use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
@@ -160,6 +161,17 @@ impl Project {
             &self.manager,
             self.encoding,
         ))
+    }
+
+    /// Folding regions for the given URI. Empty vec for unknown URIs.
+    #[wasm_bindgen(js_name = foldingRanges)]
+    pub fn folding_ranges(&self, uri: &str) -> Result<Vec<FoldingRange>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let doc = cell.borrow();
+        Ok(folding_ranges(&doc.text, doc.root_node(), self.encoding))
     }
 }
 

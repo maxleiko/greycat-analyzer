@@ -1,38 +1,36 @@
-//! Folding range handler — region folds for block-shaped CST nodes.
+//! Thin converter from the IDE-shape `analysis::ide::folding_ranges`
+//! ADT to `lsp_types::FoldingRange`.
 
+use greycat_analyzer_analysis::ide::folding_ranges::{
+    FoldingRange as IdeFoldingRange, FoldingRangeKind as IdeFoldingRangeKind,
+    folding_ranges as folding_ranges_inner,
+};
 use greycat_analyzer_core::SourceEncoding;
-use greycat_analyzer_syntax::cst::walk_named;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{FoldingRange, FoldingRangeKind};
-
-use crate::conv::byte_to_position;
 
 pub fn folding_ranges(
     text: &str,
     root: tree_sitter::Node<'_>,
     encoding: SourceEncoding,
 ) -> Vec<FoldingRange> {
-    let mut out = Vec::new();
-    walk_named(root, |n| {
-        if matches!(
-            n.kind(),
-            "block" | "type_body" | "enum_body" | "object_initializers"
-        ) {
-            let r = n.byte_range();
-            let start = byte_to_position(text, r.start, encoding);
-            let end = byte_to_position(text, r.end, encoding);
-            if end.line > start.line {
-                out.push(FoldingRange {
-                    start_line: start.line,
-                    start_character: None,
-                    end_line: end.line,
-                    end_character: None,
-                    kind: Some(FoldingRangeKind::Region),
-                    collapsed_text: None,
-                });
-            }
-        }
-        true
-    });
-    out
+    folding_ranges_inner(text, root, encoding)
+        .into_iter()
+        .map(to_lsp)
+        .collect()
+}
+
+fn to_lsp(r: IdeFoldingRange) -> FoldingRange {
+    FoldingRange {
+        start_line: r.start_line,
+        start_character: None,
+        end_line: r.end_line,
+        end_character: None,
+        kind: Some(match r.kind {
+            IdeFoldingRangeKind::Comment => FoldingRangeKind::Comment,
+            IdeFoldingRangeKind::Imports => FoldingRangeKind::Imports,
+            IdeFoldingRangeKind::Region => FoldingRangeKind::Region,
+        }),
+        collapsed_text: None,
+    }
 }
