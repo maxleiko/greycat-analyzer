@@ -25,48 +25,75 @@
 use std::ops::Range;
 
 use super::actions::TextEdit;
+use greycat_analyzer_core::SymbolTable;
+use greycat_analyzer_hir::Hir;
 use greycat_analyzer_syntax::tree_sitter::Node;
 
-/// Compute the auto-fix edits for `diag` against `text`. Returns an
-/// empty Vec when the rule has no fix or its preconditions don't hold.
+/// Shared inputs every quickfix may need. Bundled so the public entry
+/// signature doesn't grow per added analysis dependency.
 ///
-/// `root` is the parsed tree-sitter root for `text` — callers (LSP
-/// `code_actions`, CLI `lint --fix`) own the parse so this module
-/// doesn't re-parse the same buffer once per helper.
+/// `hir` / `symbols` are optional so quickfix unit tests and callers
+/// that only have CST + text in hand (no full pipeline) still work —
+/// rules that genuinely need scope information (currently only
+/// `unused-local`'s rename-on-impure-init path) check `Option::is_some`
+/// and degrade gracefully when absent. Production callers (the LSP
+/// `textDocument/codeAction` handler and the CLI `lint --fix` driver)
+/// always populate them; both have a cached `ModuleAnalysis` in hand.
+pub struct QuickfixCx<'a> {
+    pub root: Node<'a>,
+    pub text: &'a str,
+    pub hir: Option<&'a Hir>,
+    pub symbols: Option<&'a SymbolTable>,
+}
+
+impl<'a> QuickfixCx<'a> {
+    /// CST-only context. Use when no `ModuleAnalysis` is available.
+    /// Rules that need scope information fall back to a safe default.
+    pub fn from_cst(root: Node<'a>, text: &'a str) -> Self {
+        Self {
+            root,
+            text,
+            hir: None,
+            symbols: None,
+        }
+    }
+}
+
+/// Compute the auto-fix edits for `diag` against `cx`. Returns an
+/// empty Vec when the rule has no fix or its preconditions don't hold.
 pub fn edit_for_diagnostic(
-    root: Node<'_>,
-    text: &str,
+    cx: &QuickfixCx<'_>,
     code: &str,
     byte_range: &Range<usize>,
     message: &str,
 ) -> Vec<TextEdit> {
     let start = byte_range.start;
     let end = byte_range.end;
-    if end > text.len() || start > end {
+    if end > cx.text.len() || start > end {
         return Vec::new();
     }
     match code {
         "missing-token" => missing_token_fix(start, message),
-        "unused-local" => unused_local_fix(root, text, start, end),
-        "unused-decl" => unused_decl_fix(root, start),
-        "unused-param" => unused_param_fix(text, start, end),
-        "unused-generic-param" => unused_generic_param_fix(root, text, start, end),
-        "possibly-null" => possibly_null_fix(text, end),
-        "redundant-nullable-access" => redundant_nullable_access_fix(text, start, end),
+        "unused-local" => unused_local_fix(cx, start, end),
+        "unused-decl" => unused_decl_fix(cx.root, start),
+        "unused-param" => unused_param_fix(cx.text, start, end),
+        "unused-generic-param" => unused_generic_param_fix(cx.root, cx.text, start, end),
+        "possibly-null" => possibly_null_fix(cx.text, end),
+        "redundant-nullable-access" => redundant_nullable_access_fix(cx.text, start, end),
         "redundant-non-null-assertion" | "redundant-coalesce" => redundant_slice_fix(start, end),
-        "modvar-node-cannot-be-nullable" => modvar_strip_outer_nullable_fix(text, end),
+        "modvar-node-cannot-be-nullable" => modvar_strip_outer_nullable_fix(cx.text, end),
         "modvar-node-inner-must-be-nullable" => modvar_append_inner_nullable_fix(end),
-        "unused-suppression" => unused_suppression_fix(root, text, start, end),
+        "unused-suppression" => unused_suppression_fix(cx.root, cx.text, start, end),
         "empty-suppression" | "unbalanced-lint-off" | "unbalanced-fmt-off" => {
-            delete_comment_line_fix(root, text, start)
+            delete_comment_line_fix(cx.root, cx.text, start)
         }
-        "unreachable" => unreachable_fix(root, text, start, end),
-        "non-exhaustive" => non_exhaustive_fix(root, text, start, message),
-        "catch-empty-parens" => catch_empty_parens_fix(text, start, end),
-        "unused-catch-param" => unused_catch_param_fix(root, text, start),
+        "unreachable" => unreachable_fix(cx.root, cx.text, start, end),
+        "non-exhaustive" => non_exhaustive_fix(cx.root, cx.text, start, message),
+        "catch-empty-parens" => catch_empty_parens_fix(cx.text, start, end),
+        "unused-catch-param" => unused_catch_param_fix(cx.root, cx.text, start),
         "redundant-semicolon" => redundant_semicolon_fix(start, end),
-        "no-breakpoint" => no_breakpoint_fix(text, start, end),
-        "infer-return-type" => infer_return_type_fix(root, start, message),
+        "no-breakpoint" => no_breakpoint_fix(cx.text, start, end),
+        "infer-return-type" => infer_return_type_fix(cx.root, start, message),
         _ => Vec::new(),
     }
 }
@@ -252,31 +279,227 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
 }
 
 // P22.1
-/// Replace the **whole** `var x = expr;` statement, not just
-/// the ident. The diagnostic's range covers the ident only (for cursor
-/// placement); we widen the fix range to the enclosing `var_decl` by
-/// walking up the CST.
+/// Pick a safe quickfix for `unused-local`:
 ///
-/// For for-init (`for (var i = …; …)`) and for-in (`for (k, v in …)`)
-/// binders, the ident sits in a structural slot — the whole binding
-/// can't be removed without breaking the loop — so the fix renames to
-/// `_name` instead, matching `unused-param`'s shape.
-fn unused_local_fix(
-    root: Node<'_>,
-    text: &str,
-    ident_start: usize,
-    ident_end: usize,
-) -> Vec<TextEdit> {
-    if let Some(stmt_range) = enclosing_node_range(root, ident_start, &["var_decl"]) {
+/// - For for-init (`for (var i = …; …)`) and for-in (`for (k, v in …)`)
+///   binders, the ident sits in a structural slot — the binding can't
+///   be removed without breaking the loop — so rename to `_name`,
+///   matching `unused-param`'s shape.
+/// - For a plain `var x = expr;` with **no initializer** or an
+///   initializer whose RHS is provably side-effect-free, delete the
+///   whole statement.
+/// - For a plain `var x = expr;` whose RHS **may have side effects**
+///   (calls, mutating ops, throwing checks, container subscripts, or
+///   any kind we don't recognize), rename the binder to `_name` so
+///   the initializer (and its side effects) still execute. When
+///   `_name` is already taken in the local scope, escalate to
+///   `_name_2`, `_name_3`, … — the collision set comes from the
+///   shared `ide::scope::names_in_scope_at`, which mirrors the
+///   resolver's lexical scoping.
+fn unused_local_fix(cx: &QuickfixCx<'_>, ident_start: usize, ident_end: usize) -> Vec<TextEdit> {
+    // for-init / for-in: rename (the bind is structurally required).
+    if enclosing_node_range(cx.root, ident_start, &["for_stmt", "for_in_stmt"]).is_some() {
+        return unused_param_fix(cx.text, ident_start, ident_end);
+    }
+    let Some(var_decl) = enclosing_kind(cx.root, ident_start, "var_decl") else {
+        return Vec::new();
+    };
+    let mut cursor = var_decl.walk();
+    let init_expr = var_decl
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "initializer")
+        .and_then(|init| init.child_by_field_name("expr"));
+    let safe_to_delete = match init_expr {
+        None => true,
+        Some(expr) => is_side_effect_free(expr, cx.text),
+    };
+    if safe_to_delete {
         return vec![TextEdit {
-            byte_range: stmt_range,
+            byte_range: var_decl.byte_range(),
             new_text: String::new(),
         }];
     }
-    if enclosing_node_range(root, ident_start, &["for_stmt", "for_in_stmt"]).is_some() {
-        return unused_param_fix(text, ident_start, ident_end);
+    rename_to_fresh_underscore(cx, ident_start, ident_end)
+}
+
+/// Conservative purity classifier for an expression CST node. Returns
+/// `true` only when the expression provably cannot:
+///
+/// - call user code (fn / method / `++` / `--` operators that mutate a
+///   place, `!!` runtime non-null assertion that may throw),
+/// - mutate observable state (`=` / `?=` binary operators),
+/// - alter control flow via a runtime throw (out-of-bounds subscript).
+///
+/// Unknown node kinds default to `false` (impure) — under-deletion is
+/// a benign worsening of the fix; over-deletion silently eats side
+/// effects the user did not consent to.
+fn is_side_effect_free(node: Node<'_>, text: &str) -> bool {
+    match node.kind() {
+        // Pure terminals.
+        "string" | "number" | "char" | "true" | "false" | "null" | "this" | "ident" => true,
+        // Static path — name lookup, no call.
+        "static_expr" => true,
+        // Closure value. Calling it would be impure; constructing it
+        // is not.
+        "lambda_expr" => true,
+        // Recurse on the single inner expr.
+        "paren_expr" => node
+            .child_by_field_name("expr")
+            .map(|inner| is_side_effect_free(inner, text))
+            .unwrap_or(false),
+        // Member / arrow read — recurse on the receiver. The property
+        // name itself isn't an expression.
+        "member_expr" | "arrow_expr" => {
+            named_child_exprs(node).all(|child| is_side_effect_free(child, text))
+        }
+        // Two-operand exprs whose operator decides purity. `=` / `?=`
+        // are mutating; `as` / `is` are pure type checks (right
+        // operand is a `type_ident`, not an `_expr`).
+        "binary_expr" => {
+            binary_op_is_pure(node, text)
+                && named_child_exprs(node).all(|child| is_side_effect_free(child, text))
+        }
+        // Prefix `++` / `--` mutate the operand; postfix `++` / `--`
+        // do too; postfix `!!` throws on null. All other unary ops
+        // (`-`, `!`, `+`, `*`) are pure when the operand is.
+        "unary_expr" => {
+            unary_op_is_pure(node, text)
+                && named_child_exprs(node).all(|child| is_side_effect_free(child, text))
+        }
+        // Container constructors — pure when every element is.
+        "tuple_expr" | "array_expr" | "range_expr" | "interval_expr" => {
+            named_child_exprs(node).all(|child| is_side_effect_free(child, text))
+        }
+        // Object literal: `Foo { name: value, … }`. Recurse on every
+        // `object_field`'s `value` (the `name` slot can carry a
+        // computed key but is conventionally an ident — recurse
+        // anyway). `object_initializers` (positional) wraps `_expr`s
+        // directly.
+        "object_expr" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).all(|child| match child.kind() {
+                "object_initializers" => {
+                    let mut c2 = child.walk();
+                    child
+                        .named_children(&mut c2)
+                        .all(|e| is_side_effect_free(e, text))
+                }
+                "object_fields" => {
+                    let mut c2 = child.walk();
+                    child.named_children(&mut c2).all(|field| {
+                        let name_pure = field
+                            .child_by_field_name("name")
+                            .map(|n| is_side_effect_free(n, text))
+                            .unwrap_or(true);
+                        let value_pure = field
+                            .child_by_field_name("value")
+                            .map(|v| is_side_effect_free(v, text))
+                            .unwrap_or(true);
+                        name_pure && value_pure
+                    })
+                }
+                _ => true,
+            })
+        }
+        // Calls, subscripts, anything else: impure (or unknown — same
+        // treatment).
+        _ => false,
     }
-    Vec::new()
+}
+
+/// True when `binary_expr`'s operator is one of the pure ones. Reads
+/// the operator from the source between `left` and `right`.
+fn binary_op_is_pure(node: Node<'_>, text: &str) -> bool {
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return false;
+    };
+    let between = text[left.end_byte()..right.start_byte()].trim();
+    // `=` / `?=` are the only mutating binary operators in GreyCat.
+    // Every other op is value-pure (`as` / `is` included — they're
+    // type checks that don't run user code).
+    !matches!(between, "=" | "?=")
+}
+
+/// True when `unary_expr`'s operator is one of the pure ones. Mirrors
+/// `binary_op_is_pure` — reads the operator slice around the operand.
+fn unary_op_is_pure(node: Node<'_>, text: &str) -> bool {
+    let mut cursor = node.walk();
+    let operand = node
+        .named_children(&mut cursor)
+        .next()
+        .map(|c| c.byte_range());
+    let Some(operand) = operand else {
+        return false;
+    };
+    let leading = text[node.start_byte()..operand.start].trim();
+    let trailing = text[operand.end..node.end_byte()].trim();
+    // Mutating: `++` / `--` either side. Throwing: postfix `!!`.
+    // Everything else (`-`, `!`, `+`, `*`) is pure on a pure operand.
+    !matches!(leading, "++" | "--") && !matches!(trailing, "++" | "--" | "!!")
+}
+
+/// Iterator over a node's named children that are themselves
+/// expressions — i.e. anything that could be passed to
+/// `is_side_effect_free`. Filters out `type_ident`-shaped children
+/// (the right operand of `as` / `is`) and the property slot of
+/// `member_expr` / `arrow_expr` (an `ident` is pure on its own).
+fn named_child_exprs<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'tree>> = node
+        .named_children(&mut cursor)
+        .filter(|c| !matches!(c.kind(), "type_ident" | "optional"))
+        .collect();
+    children.into_iter()
+}
+
+/// Rename the binder at `ident_start..ident_end` to the first
+/// `_name`-shaped candidate that doesn't collide with any name
+/// visible in the local scope at that position. Probes `_<name>`,
+/// `_<name>_2`, `_<name>_3`, … in order.
+///
+/// When no HIR is available (CST-only context), falls back to a plain
+/// `_<name>` rename — accepts the (unlikely) risk of shadowing
+/// because the alternative (refusing the fix entirely) is worse for
+/// the unit-test path.
+fn rename_to_fresh_underscore(
+    cx: &QuickfixCx<'_>,
+    ident_start: usize,
+    ident_end: usize,
+) -> Vec<TextEdit> {
+    if ident_end <= ident_start {
+        return Vec::new();
+    }
+    let name = &cx.text[ident_start..ident_end];
+    if name.starts_with('_') {
+        return Vec::new();
+    }
+    let fresh = match (cx.hir, cx.symbols) {
+        (Some(hir), Some(symbols)) => {
+            let taken = crate::ide::scope::names_in_scope_at(hir, symbols, ident_start);
+            let mut candidate = format!("_{name}");
+            let mut n: u32 = 2;
+            loop {
+                let candidate_sym = symbols.lookup(&candidate);
+                let collision = candidate_sym
+                    .map(|sym| taken.contains(&sym))
+                    .unwrap_or(false);
+                if !collision {
+                    break;
+                }
+                candidate = format!("_{name}_{n}");
+                n += 1;
+            }
+            candidate
+        }
+        _ => format!("_{name}"),
+    };
+    vec![TextEdit {
+        byte_range: ident_start..ident_end,
+        new_text: fresh,
+    }]
 }
 
 // P22.2
@@ -961,16 +1184,36 @@ fn enclosing_node_range(root: Node<'_>, byte: usize, kinds: &[&str]) -> Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
 
+    /// CST-only fix invocation. Used by rule tests that don't depend
+    /// on scope information (everything other than the scope-aware
+    /// `unused-local` rename path).
     fn fix_with_msg(code: &str, text: &str, range: Range<usize>, message: &str) -> Vec<TextEdit> {
         let tree = parse(text);
-        let root = tree.root_node();
-        edit_for_diagnostic(root, text, code, &range, message)
+        let cx = QuickfixCx::from_cst(tree.root_node(), text);
+        edit_for_diagnostic(&cx, code, &range, message)
     }
 
     fn fix(code: &str, text: &str, range: Range<usize>) -> Vec<TextEdit> {
         fix_with_msg(code, text, range, "")
+    }
+
+    /// HIR-backed fix invocation. Use for rules whose fix consults
+    /// scope information (currently `unused-local`'s rename-on-impure-
+    /// init path, for collision-free `_name` synthesis).
+    fn fix_with_scope(code: &str, text: &str, range: Range<usize>) -> Vec<TextEdit> {
+        let tree = parse(text);
+        let symbols = SymbolTable::new();
+        let hir = lower_module(text, &symbols, "mod", "project", tree.root_node());
+        let cx = QuickfixCx {
+            root: tree.root_node(),
+            text,
+            hir: Some(&hir),
+            symbols: Some(&symbols),
+        };
+        edit_for_diagnostic(&cx, code, &range, "")
     }
 
     #[test]
@@ -1103,15 +1346,13 @@ mod tests {
     }
 
     #[test]
-    fn unused_local_removes_whole_var_stmt() {
-        // `var foo = bar();` — the lint flags `foo`'s ident range
-        // (bytes 14..17). Fix should expand to the full statement.
-        let src = "fn f() {\n    var foo = bar();\n    return 0;\n}\n";
+    fn unused_local_removes_whole_var_stmt_when_init_is_pure() {
+        // `var foo = 42;` — pure literal initializer, no side effect to
+        // preserve. Fix should expand to the full statement and drop it.
+        let src = "fn f() {\n    var foo = 42;\n    return 0;\n}\n";
         let foo_start = src.find("foo").unwrap();
         let edits = fix("unused-local", src, foo_start..(foo_start + 3));
         assert_eq!(edits.len(), 1);
-        // The edit should cover from `var ` through `;` inclusive —
-        // i.e. delete the whole `var foo = bar();` slice.
         let stmt_start = src.find("var foo").unwrap();
         let stmt_end = src.find(";\n    return").unwrap() + 1;
         assert_eq!(edits[0].byte_range, stmt_start..stmt_end);
@@ -1123,6 +1364,122 @@ mod tests {
         assert!(
             !tree.root_node().has_error(),
             "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    // Reproducer for the side-effect-eating bug: `var unused = call();`
+    // must not have its whole statement deleted (the call would be
+    // silently dropped). The fix renames the binder to `_unused` so the
+    // initializer (and its side effects) still execute.
+    #[test]
+    fn unused_local_keeps_var_when_init_has_side_effects() {
+        let src = "\
+fn main() {
+    var unused = anything_with_sideeffect();
+}
+
+fn anything_with_sideeffect() {}
+";
+        let name_start = src.find("unused").unwrap();
+        let edits = fix_with_scope("unused-local", src, name_start..(name_start + 6));
+        assert_eq!(edits.len(), 1, "expected exactly one edit, got {edits:?}");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            after.contains("anything_with_sideeffect()"),
+            "fix nuked the side-effecting call site:\nbefore:\n{src}\nafter:\n{after}"
+        );
+        assert!(
+            after.contains("var _unused = anything_with_sideeffect();"),
+            "expected `var _unused = anything_with_sideeffect();`, got:\n{after}"
+        );
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    // The rename target `_unused` already exists in the local scope, so
+    // the fix must escalate to `_unused_2` to avoid shadowing.
+    #[test]
+    fn unused_local_renames_with_suffix_on_collision() {
+        let src = "\
+fn main() {
+    var _unused = 0;
+    var unused = side_effect();
+}
+
+fn side_effect() {}
+";
+        let name_start = src.find("var unused").unwrap() + 4;
+        let edits = fix_with_scope("unused-local", src, name_start..(name_start + 6));
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            after.contains("var _unused_2 = side_effect();"),
+            "expected `_unused_2`, got:\n{after}"
+        );
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    // Both `_unused` and `_unused_2` are taken; the fix picks
+    // `_unused_3`.
+    #[test]
+    fn unused_local_renames_with_higher_suffix_when_chain_collides() {
+        let src = "\
+fn main() {
+    var _unused = 0;
+    var _unused_2 = 1;
+    var unused = side_effect();
+}
+
+fn side_effect() {}
+";
+        let name_start = src.find("var unused").unwrap() + 4;
+        let edits = fix_with_scope("unused-local", src, name_start..(name_start + 6));
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            after.contains("var _unused_3 = side_effect();"),
+            "expected `_unused_3`, got:\n{after}"
+        );
+    }
+
+    // Pure initializer, but the fn body has side effects elsewhere —
+    // the var-stmt itself is still safe to delete.
+    #[test]
+    fn unused_local_with_pure_ident_init_is_deleted() {
+        let src = "fn f(x: int) {\n    var foo = x;\n    return 0;\n}\n";
+        let foo_start = src.find("foo").unwrap();
+        let edits = fix("unused-local", src, foo_start..(foo_start + 3));
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            !after.contains("var foo"),
+            "expected stmt deleted:\n{after}"
+        );
+    }
+
+    // No initializer at all — safe to delete unconditionally.
+    #[test]
+    fn unused_local_without_initializer_is_deleted() {
+        let src = "fn f() {\n    var foo: int;\n    return 0;\n}\n";
+        let foo_start = src.find("foo").unwrap();
+        let edits = fix("unused-local", src, foo_start..(foo_start + 3));
+        assert_eq!(edits.len(), 1);
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(
+            !after.contains("var foo"),
+            "expected stmt deleted:\n{after}"
         );
     }
 

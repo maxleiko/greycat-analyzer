@@ -65,8 +65,8 @@ fn quickfix_deletes_breakpoint_stmt_and_trailing_newline() {
         .find(|l| l.rule == "no-breakpoint")
         .expect("expected no-breakpoint diagnostic");
     let tree = greycat_analyzer_syntax::parse(src);
-    let edits =
-        quickfix::edit_for_diagnostic(tree.root_node(), src, d.rule, &d.byte_range, &d.message);
+    let cx = quickfix::QuickfixCx::from_cst(tree.root_node(), src);
+    let edits = quickfix::edit_for_diagnostic(&cx, d.rule, &d.byte_range, &d.message);
     assert_eq!(edits.len(), 1);
     let mut fixed = src.to_string();
     fixed.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);

@@ -4,7 +4,7 @@
 //! and discards anything that would introduce new parse errors.
 
 use greycat_analyzer_analysis::{ide, project::ModuleAnalysis};
-use greycat_analyzer_core::SourceEncoding;
+use greycat_analyzer_core::{SourceEncoding, SymbolTable};
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, NumberOrString, TextEdit, Uri,
@@ -22,6 +22,7 @@ use crate::conv::{byte_to_position, position_to_byte, ranges_overlap};
 /// fixup passes feed into the diagnostic list.
 pub fn code_actions_with_project(
     module: &ModuleAnalysis,
+    symbols: &SymbolTable,
     text: &str,
     root: tree_sitter::Node<'_>,
     uri: &Uri,
@@ -31,10 +32,13 @@ pub fn code_actions_with_project(
     // Code actions don't differentiate lib vs project — the user's
     // already pointing at a specific diagnostic when invoking them.
     let semantic = diagnostics_from_module(text, module, true, encoding);
-    code_actions_from_diagnostics(root, text, uri, range, semantic, encoding)
+    code_actions_from_diagnostics(module, symbols, root, text, uri, range, semantic, encoding)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn code_actions_from_diagnostics(
+    module: &ModuleAnalysis,
+    symbols: &SymbolTable,
     root: tree_sitter::Node<'_>,
     text: &str,
     uri: &Uri,
@@ -46,7 +50,7 @@ fn code_actions_from_diagnostics(
         .into_iter()
         .filter(|d| ranges_overlap(&d.range, &range))
         .map(|d| {
-            let raw_edits = synthesize_fix(root, text, &d, encoding);
+            let raw_edits = synthesize_fix(module, symbols, root, text, &d, encoding);
             // **P22.5** — never offer an edit whose application would
             // break the document's parse. Apply the edit in-memory,
             // re-parse, and drop the edit if it adds new parse errors
@@ -125,6 +129,8 @@ fn would_break_parse(text: &str, edits: &[TextEdit], encoding: SourceEncoding) -
 /// shared [`greycat_analyzer_analysis::ide::quickfix`] module so the LSP and
 /// the cli `lint --fix` path share a single source of truth.
 fn synthesize_fix(
+    module: &ModuleAnalysis,
+    symbols: &SymbolTable,
     root: tree_sitter::Node<'_>,
     text: &str,
     diag: &Diagnostic,
@@ -136,7 +142,13 @@ fn synthesize_fix(
     };
     let start = position_to_byte(text, diag.range.start, encoding);
     let end = position_to_byte(text, diag.range.end, encoding);
-    let edits = ide::quickfix::edit_for_diagnostic(root, text, code, &(start..end), &diag.message);
+    let cx = ide::quickfix::QuickfixCx {
+        root,
+        text,
+        hir: Some(&module.hir),
+        symbols: Some(symbols),
+    };
+    let edits = ide::quickfix::edit_for_diagnostic(&cx, code, &(start..end), &diag.message);
     edits
         .into_iter()
         .map(|e| TextEdit {

@@ -174,6 +174,7 @@ impl TestProject {
         let doc = self.doc();
         capabilities::code_actions_with_project(
             self.module(),
+            self.analysis.symbols(),
             &doc.text,
             doc.root_node(),
             &self.uri,

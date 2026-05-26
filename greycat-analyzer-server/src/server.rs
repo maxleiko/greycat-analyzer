@@ -543,6 +543,7 @@ fn code_actions_handler(server: &Backend, params: CodeActionParams) -> Option<Co
     let module = project.analysis.module(&params.text_document.uri)?;
     Some(capabilities::code_actions_with_project(
         module,
+        project.analysis.symbols(),
         &doc.text,
         doc.root_node(),
         &params.text_document.uri,

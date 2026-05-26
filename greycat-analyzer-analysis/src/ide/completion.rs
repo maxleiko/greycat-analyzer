@@ -1338,13 +1338,14 @@ fn scope_name_meta(
     arena: &TypeArena,
     decl_registry: &crate::well_known::DeclRegistry,
     symbols: &SymbolTable,
-    source: &NameSource,
+    source: &crate::ide::scope::NameSource,
     uri: &Uri,
 ) -> (
     Option<CompletionItemLabelDetails>,
     Option<String>,
     Option<Documentation>,
 ) {
+    use crate::ide::scope::NameSource;
     match source {
         NameSource::ModuleDecl(decl_id) => {
             let decl = &module.hir.decls[*decl_id];
@@ -1480,226 +1481,48 @@ fn decl_locs_kind(
     }
 }
 
-/// Where a [`scope_names_at`] entry came from. Lets the completion
-/// emitter reach back to the underlying decl / binding so it can
-/// render a proper `detail` string for the popup (matches the TS
-/// reference's `(<module>) name: T` quick-detail layout).
-#[derive(Debug, Clone, Copy)]
-enum NameSource {
-    /// Top-level decl in the current module (`fn` / `type` / `enum` /
-    /// `var`).
-    ModuleDecl(greycat_analyzer_hir::arena::Idx<Decl>),
-    /// Local `var x = …` binding. Carries the *binding* name idx so
-    /// `def_types` resolves the inferred type.
-    Local(greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>),
-    /// Function parameter. Same payload as `Local` — capabilities
-    /// disambiguate via `CompletionItemKind`.
-    Param(greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>),
-    /// Generic type parameter (`fn<T>` / `type Foo<T>`). No type to
-    /// surface — kind alone tells the user enough.
-    Generic,
+/// Bridge from the shared scope walker's [`ScopeNameKind`] to the
+/// LSP-shaped `(CompletionItemKind, sort_priority)` tuple completion
+/// renders into popup items.
+///
+/// `sort_priority` is a static prefix string — lower strings sort
+/// earlier in the popup, so locals/params (`a_` / `b_`) win over
+/// module decls (`n_`) at the same name.
+fn scope_kind_to_completion(
+    kind: crate::ide::scope::ScopeNameKind,
+) -> (CompletionItemKind, &'static str) {
+    use crate::ide::scope::ScopeNameKind as SK;
+    match kind {
+        SK::Fn => (CompletionItemKind::FUNCTION, "n_"),
+        SK::Type => (CompletionItemKind::CLASS, "n_"),
+        SK::Enum => (CompletionItemKind::ENUM, "n_"),
+        SK::Var => (CompletionItemKind::VARIABLE, "n_"),
+        SK::Param => (CompletionItemKind::VARIABLE, "a_"),
+        SK::Local => (CompletionItemKind::VARIABLE, "b_"),
+        SK::Generic => (CompletionItemKind::TYPE_PARAMETER, "g_"),
+    }
 }
 
-/// Walk the HIR to collect every name visible at `cursor_byte`. Returns
-/// `(name, completion_kind, sort_priority, source)` quadruples. Lower
-/// sort_priority strings sort earlier — locals win over module decls.
-///
-/// This is a stand-alone walker that doesn't share state with the
-/// resolver. The duplication is intentional — the resolver's `Cx`
-/// builds full bindings (with `Definition` data), but completion only
-/// needs the name + a kind hint, and re-running the resolver per
-/// keystroke would be wasteful.
+/// Walk the HIR to collect every name visible at `cursor_byte`, with
+/// the completion-popup metadata layered on. Thin wrapper around the
+/// shared [`crate::ide::scope::scope_names_at`].
 fn scope_names_at(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
     cursor_byte: usize,
-) -> Vec<(String, CompletionItemKind, &'static str, NameSource)> {
-    use greycat_analyzer_hir::types::Decl as HD;
-    let mut out: Vec<(String, CompletionItemKind, &'static str, NameSource)> = Vec::new();
-    let Some(module) = hir.module.as_ref() else {
-        return out;
-    };
-    // Module-level decls are always visible (forward-ref allowed).
-    for &decl_id in &module.decls {
-        if let Some(name_id) = hir.decls[decl_id].name() {
-            let name = symbols[hir.idents[name_id].symbol].to_string();
-            let kind = match &hir.decls[decl_id] {
-                HD::Fn(_) => CompletionItemKind::FUNCTION,
-                HD::Type(_) => CompletionItemKind::CLASS,
-                HD::Enum(_) => CompletionItemKind::ENUM,
-                HD::Var(_) => CompletionItemKind::VARIABLE,
-                HD::Pragma(_) => continue,
-            };
-            out.push((name, kind, "n_", NameSource::ModuleDecl(decl_id)));
-        }
-    }
-    // Descend into the declaration that contains the cursor.
-    for &decl_id in &module.decls {
-        let r = hir.decls[decl_id].byte_range();
-        if !(r.start <= cursor_byte && cursor_byte <= r.end) {
-            continue;
-        }
-        match &hir.decls[decl_id] {
-            HD::Fn(d) => collect_fn_scope(hir, symbols, d, cursor_byte, &mut out),
-            HD::Type(d) => {
-                for g in &d.generics {
-                    let n = symbols[hir.idents[*g].symbol].to_string();
-                    out.push((
-                        n,
-                        CompletionItemKind::TYPE_PARAMETER,
-                        "g_",
-                        NameSource::Generic,
-                    ));
-                }
-                for &m_id in &d.methods {
-                    let mr = hir.decls[m_id].byte_range();
-                    if !(mr.start <= cursor_byte && cursor_byte <= mr.end) {
-                        continue;
-                    }
-                    if let HD::Fn(fd) = &hir.decls[m_id] {
-                        collect_fn_scope(hir, symbols, fd, cursor_byte, &mut out);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn collect_fn_scope(
-    hir: &greycat_analyzer_hir::Hir,
-    symbols: &SymbolTable,
-    fnd: &greycat_analyzer_hir::types::FnDecl,
-    cursor_byte: usize,
-    out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
-) {
-    for g in &fnd.generics {
-        let n = symbols[hir.idents[*g].symbol].to_string();
-        out.push((
-            n,
-            CompletionItemKind::TYPE_PARAMETER,
-            "g_",
-            NameSource::Generic,
-        ));
-    }
-    for p in &fnd.params {
-        let p = &hir.fn_params[*p];
-        let n = symbols[hir.idents[p.name].symbol].to_string();
-        out.push((
-            n,
-            CompletionItemKind::VARIABLE,
-            "a_",
-            NameSource::Param(p.name),
-        ));
-    }
-    if let Some(body) = fnd.body {
-        collect_stmt_scope(hir, symbols, body, cursor_byte, out);
-    }
-}
-
-fn cursor_in_block(block: &greycat_analyzer_hir::types::BlockStmt, cursor_byte: usize) -> bool {
-    block.byte_range.start <= cursor_byte && cursor_byte <= block.byte_range.end
-}
-
-/// Walk a `BlockStmt` collecting cursor-visible names. Pre-cursor
-/// `var` bindings surface; in-cursor stmts recurse. Replaces the
-/// `HS::Block` arm of `collect_stmt_scope` since body-bearing
-/// statements hold the block inline now and the byte-range bracket
-/// comes from the block's own `byte_range` field (which is non-empty
-/// even for `{ }` empty bodies — fixing the for-in scope-walker bug).
-fn collect_block_scope(
-    hir: &greycat_analyzer_hir::Hir,
-    symbols: &SymbolTable,
-    block: &greycat_analyzer_hir::types::BlockStmt,
-    cursor_byte: usize,
-    out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
-) {
-    use greycat_analyzer_hir::types::Stmt as HS;
-    if !(block.byte_range.start <= cursor_byte && cursor_byte <= block.byte_range.end) {
-        return;
-    }
-    for s in &block.stmts {
-        let r = stmt_byte_range(hir, *s);
-        if r.end <= cursor_byte {
-            if let HS::Var(lv) = &hir.stmts[*s] {
-                let n = symbols[hir.idents[lv.name].symbol].to_string();
-                out.push((
-                    n,
-                    CompletionItemKind::VARIABLE,
-                    "b_",
-                    NameSource::Local(lv.name),
-                ));
-            }
-        } else if r.start <= cursor_byte && cursor_byte <= r.end {
-            collect_stmt_scope(hir, symbols, *s, cursor_byte, out);
-        }
-    }
-}
-
-fn collect_stmt_scope(
-    hir: &greycat_analyzer_hir::Hir,
-    symbols: &SymbolTable,
-    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
-    cursor_byte: usize,
-    out: &mut Vec<(String, CompletionItemKind, &'static str, NameSource)>,
-) {
-    use greycat_analyzer_hir::types::Stmt as HS;
-    match &hir.stmts[stmt_id] {
-        HS::Block(b) => collect_block_scope(hir, symbols, b, cursor_byte, out),
-        HS::If(s) => {
-            collect_block_scope(hir, symbols, &s.then_branch, cursor_byte, out);
-            if let Some(eb) = s.else_branch {
-                let er = stmt_byte_range(hir, eb);
-                if er.start <= cursor_byte && cursor_byte <= er.end {
-                    collect_stmt_scope(hir, symbols, eb, cursor_byte, out);
-                }
-            }
-        }
-        HS::While(s) => collect_block_scope(hir, symbols, &s.body, cursor_byte, out),
-        HS::DoWhile(s) => collect_block_scope(hir, symbols, &s.body, cursor_byte, out),
-        HS::For(s) if cursor_in_block(&s.body, cursor_byte) => {
-            if let Some(name_id) = s.init_name {
-                let n = symbols[hir.idents[name_id].symbol].to_string();
-                out.push((
-                    n,
-                    CompletionItemKind::VARIABLE,
-                    "b_",
-                    NameSource::Local(name_id),
-                ));
-            }
-            collect_block_scope(hir, symbols, &s.body, cursor_byte, out);
-        }
-        HS::ForIn(s) if cursor_in_block(&s.body, cursor_byte) => {
-            for p in &s.params {
-                let n = symbols[hir.idents[p.name].symbol].to_string();
-                out.push((
-                    n,
-                    CompletionItemKind::VARIABLE,
-                    "b_",
-                    NameSource::Local(p.name),
-                ));
-            }
-            collect_block_scope(hir, symbols, &s.body, cursor_byte, out);
-        }
-        HS::Try(s) => {
-            collect_block_scope(hir, symbols, &s.try_block, cursor_byte, out);
-            if cursor_in_block(&s.catch_block, cursor_byte) {
-                if let Some(err_id) = s.error_param {
-                    let n = symbols[hir.idents[err_id].symbol].to_string();
-                    out.push((
-                        n,
-                        CompletionItemKind::VARIABLE,
-                        "b_",
-                        NameSource::Local(err_id),
-                    ));
-                }
-                collect_block_scope(hir, symbols, &s.catch_block, cursor_byte, out);
-            }
-        }
-        HS::At(s) => collect_block_scope(hir, symbols, &s.block, cursor_byte, out),
-        _ => {}
-    }
+) -> Vec<(
+    String,
+    CompletionItemKind,
+    &'static str,
+    crate::ide::scope::NameSource,
+)> {
+    crate::ide::scope::scope_names_at(hir, symbols, cursor_byte)
+        .into_iter()
+        .map(|entry| {
+            let (kind, sort) = scope_kind_to_completion(entry.kind);
+            (symbols[entry.symbol].to_string(), kind, sort, entry.source)
+        })
+        .collect()
 }
 
 // =============================================================================

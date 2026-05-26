@@ -15,3 +15,4 @@ pub mod completion;
 pub mod quickfix;
 pub mod rename;
 pub mod render;
+pub mod scope;

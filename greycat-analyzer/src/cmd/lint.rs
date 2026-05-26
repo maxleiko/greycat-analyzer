@@ -352,6 +352,7 @@ impl Lint {
             }
             Entry {
                 path,
+                uri: uri.clone(),
                 read: load.read,
                 parse: load.parse,
                 lower: timings.lower,
@@ -410,7 +411,9 @@ impl Lint {
                     let mut edits: Vec<(std::ops::Range<usize>, String)> = entry
                         .diagnostics
                         .iter()
-                        .filter_map(|d| diag_to_edit(original_root, &original, d))
+                        .filter_map(|d| {
+                            diag_to_edit(original_root, &original, d, &analysis, &entry.uri)
+                        })
                         .collect();
                     if edits.is_empty() {
                         continue;
@@ -538,6 +541,7 @@ impl Lint {
                     }
                     entries.push(Entry {
                         path,
+                        uri: uri.clone(),
                         read: load.read,
                         parse: load.parse,
                         lower: timings.lower,
@@ -548,6 +552,10 @@ impl Lint {
                         diagnostics,
                     });
                 }
+                // Keep `analysis` pointing at the latest generation so
+                // the next pass's `diag_to_edit` sees the HIR that
+                // produced this pass's diagnostics.
+                analysis = new_analysis;
             }
         }
 
@@ -663,6 +671,7 @@ fn render_csv_timings(entries: &mut [Entry]) -> std::io::Result<()> {
 
 struct Entry {
     path: PathBuf,
+    uri: Uri,
     /// File I/O (`Context::read`).
     read: Duration,
     /// Tree-sitter parse (`syntax::parse`).
@@ -805,6 +814,8 @@ fn diag_to_edit(
     root: greycat_analyzer_syntax::tree_sitter::Node<'_>,
     text: &str,
     diag: &Diagnostic,
+    analysis: &ProjectAnalysis,
+    uri: &Uri,
 ) -> Option<(std::ops::Range<usize>, String)> {
     let code = match diag.code.as_ref()? {
         NumberOrString::String(s) => s.as_str(),
@@ -812,9 +823,15 @@ fn diag_to_edit(
     };
     let start = lsp_to_byte(text, diag.range.start);
     let end = lsp_to_byte(text, diag.range.end);
-    let edits = greycat_analyzer_analysis::ide::quickfix::edit_for_diagnostic(
+    let module = analysis.module(uri);
+    let cx = greycat_analyzer_analysis::ide::quickfix::QuickfixCx {
         root,
         text,
+        hir: module.map(|m| &m.hir),
+        symbols: Some(analysis.symbols()),
+    };
+    let edits = greycat_analyzer_analysis::ide::quickfix::edit_for_diagnostic(
+        &cx,
         code,
         &(start..end),
         &diag.message,
