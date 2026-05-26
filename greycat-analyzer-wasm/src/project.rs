@@ -25,6 +25,7 @@ use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, doc
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
 use greycat_analyzer_analysis::ide::inlay_hints::{InlayHint, inlay_hints_with_project};
+use greycat_analyzer_analysis::ide::semantic_tokens::{SemanticTokens, semantic_tokens};
 use greycat_analyzer_analysis::ide::signature_help::{SignatureHelp, signature_help};
 use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange, TextEdit};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -235,6 +236,23 @@ impl Project {
             &self.analysis,
             &doc.text,
             &range,
+            self.encoding,
+        ))
+    }
+
+    /// Delta-encoded semantic tokens for the whole file. Returns an
+    /// empty `SemanticTokens` for unknown URIs.
+    #[wasm_bindgen(js_name = semanticTokens)]
+    pub fn semantic_tokens(&self, uri: &str) -> Result<SemanticTokens, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(SemanticTokens::default());
+        };
+        let doc = cell.borrow();
+        Ok(semantic_tokens(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
             self.encoding,
         ))
     }

@@ -21,5 +21,6 @@ pub mod quickfix;
 pub mod rename;
 pub mod render;
 pub mod scope;
+pub mod semantic_tokens;
 pub mod signature_help;
 pub mod types;
