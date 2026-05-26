@@ -136,7 +136,7 @@ The current `greycat-analyzer-wasm` is shaped for the playground (seven single-f
 
 - [x] **41.1 `wasm` feature flag scaffolding** (S) — add `[features] wasm = ["dep:wasm-bindgen"]` to [`greycat-analyzer-analysis/Cargo.toml`](greycat-analyzer-analysis/Cargo.toml); `greycat-analyzer-wasm` enables it. No ADTs migrated yet — verifies the feature compiles through the dep graph and the existing playground build still works.
 
-- [ ] **41.2 `Diagnostic` ADT migration (proof of pattern)** (S) — move `lsp_types::Diagnostic` consumption out of [`capabilities/diagnostics.rs`](greycat-analyzer-server/src/capabilities/diagnostics.rs) into a new `analysis::ide::diagnostics::Diagnostic` ADT, feature-gated with `#[cfg_attr(feature = "wasm", wasm_bindgen)]`. Server file becomes a 5-line converter to `lsp_types::Diagnostic`. Wasm crate re-exports the ADT.
+- [x] **41.2 `Diagnostic` ADT migration (proof of pattern)** (S) — move `lsp_types::Diagnostic` consumption out of [`capabilities/diagnostics.rs`](greycat-analyzer-server/src/capabilities/diagnostics.rs) into a new `analysis::ide::diagnostics::Diagnostic` ADT, feature-gated with `#[cfg_attr(feature = "wasm", wasm_bindgen)]`. Server file becomes a 5-line converter to `lsp_types::Diagnostic`. Wasm crate re-exports the ADT.
 
 - [ ] **41.3 `Project` opaque handle in wasm crate** (M) — new `#[wasm_bindgen] pub struct Project` wrapping `(SourceManager, ProjectAnalysis, TypeArena, ProjectIndex)`. Methods: `new(entrypoint_uri, files: js_sys::Map)`, `open(uri, source)`, `change(uri, source)`, `close(uri)`, `diagnostics(uri) -> Vec<Diagnostic>`. Mirrors [`Backend`](greycat-analyzer-server/src/backend.rs) but with no `lsp-server` channels — JS calls methods directly.
 

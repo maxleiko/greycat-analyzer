@@ -12,7 +12,9 @@
 
 pub mod actions;
 pub mod completion;
+pub mod diagnostics;
 pub mod quickfix;
 pub mod rename;
 pub mod render;
 pub mod scope;
+pub mod types;

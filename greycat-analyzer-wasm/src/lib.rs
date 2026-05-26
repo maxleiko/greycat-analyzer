@@ -35,6 +35,17 @@ use greycat_analyzer_analysis::{
     project::ProjectAnalysis,
     resolver::resolve,
 };
+
+// P41.2
+// Surface the IDE-shape `Diagnostic` ADT (and its `Position` / `Range`
+// shared primitives) so wasm-bindgen emits JS bindings for them. The
+// `#[cfg_attr(feature = "wasm", wasm_bindgen)]` annotations live in the
+// analysis crate — `greycat-analyzer-wasm` is the only consumer that
+// enables that feature, so the JS surface only materializes here.
+pub use greycat_analyzer_analysis::ide::diagnostics::{
+    Diagnostic as IdeDiagnostic, Severity as IdeSeverity, Tag as IdeTag,
+};
+pub use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange};
 use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::SymbolTable;
