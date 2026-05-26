@@ -120,6 +120,56 @@ Finish what Phase 35 started: delete `TypeKind::Named` and `TypeKind::Generic` (
 
 ---
 
+## Phase 41 — wasm bridge restructure + `@greycat/*` npm packages (~3-5 weeks)
+
+The current `greycat-analyzer-wasm` is shaped for the playground (seven single-file `source-in / JSON-out` functions) and ships no `@greycat/*` npm package. This phase reshapes it into a persistent `Project`-handle API, validates the `#[cfg_attr(feature = "wasm", wasm_bindgen)]` pattern across the `analysis::ide::*` ADTs, and lands three npm packages: `@greycat/analyzer` (wasm + TS), `@greycat/monaco` (TS-only Monaco providers consuming `@greycat/analyzer`), `@greycat/shiki` (TS-only TextMate grammar bundle, no wasm).
+
+**Behavioural contract:**
+
+- One Rust crate, `greycat-analyzer-wasm`. Two wasm-pack build configurations: default features → published `@greycat/analyzer`; `--features playground` → playground-local build that adds the CST / HIR / tokens / types dumper exports. Each app loads exactly one of these wasm bundles.
+- LSP capability ADTs live in [`greycat-analyzer-analysis/src/ide/<capability>.rs`](greycat-analyzer-analysis/src/ide/) and are wasm-friendly: `#[cfg_attr(feature = "wasm", wasm_bindgen)]`-gated for the 15-of-22 shapes that flatten cleanly (primitives + C-style enums + `Vec<primitive>`), newtype-wrapped opaque handles in the wasm crate for the `Idx`/`Symbol`-bearing shapes (`RenameTarget`, `ScopeName`, `NameSource`).
+- The LSP server's [`capabilities/<file>.rs`](greycat-analyzer-server/src/capabilities/) becomes a thin converter from the analysis ADT to `lsp_types::*`. The analysis crate's ADTs stop being shaped by `lsp_types` — the dependency in `analysis` stays only for `Position` / `Range` re-export pending a later cleanup.
+- `Project::new` accepts a pre-built `Map<filename, source>` for the project's `@library` / `@include` closure. Wasm is fetch / storage-agnostic. The JS side of `@greycat/analyzer` handles `fetch https://get.greycat.io/... → unzip → IndexedDB cache by version → pass map to Project::new`.
+- `@greycat/analyzer` ships both a main-thread entry (`@greycat/analyzer`) and an opt-in worker entry (`@greycat/analyzer/worker`). Same TS interface; worker version Promise-wraps everything.
+
+**Chunks:**
+
+- [x] **41.1 `wasm` feature flag scaffolding** (S) — add `[features] wasm = ["dep:wasm-bindgen"]` to [`greycat-analyzer-analysis/Cargo.toml`](greycat-analyzer-analysis/Cargo.toml); `greycat-analyzer-wasm` enables it. No ADTs migrated yet — verifies the feature compiles through the dep graph and the existing playground build still works.
+
+- [ ] **41.2 `Diagnostic` ADT migration (proof of pattern)** (S) — move `lsp_types::Diagnostic` consumption out of [`capabilities/diagnostics.rs`](greycat-analyzer-server/src/capabilities/diagnostics.rs) into a new `analysis::ide::diagnostics::Diagnostic` ADT, feature-gated with `#[cfg_attr(feature = "wasm", wasm_bindgen)]`. Server file becomes a 5-line converter to `lsp_types::Diagnostic`. Wasm crate re-exports the ADT.
+
+- [ ] **41.3 `Project` opaque handle in wasm crate** (M) — new `#[wasm_bindgen] pub struct Project` wrapping `(SourceManager, ProjectAnalysis, TypeArena, ProjectIndex)`. Methods: `new(entrypoint_uri, files: js_sys::Map)`, `open(uri, source)`, `change(uri, source)`, `close(uri)`, `diagnostics(uri) -> Vec<Diagnostic>`. Mirrors [`Backend`](greycat-analyzer-server/src/backend.rs) but with no `lsp-server` channels — JS calls methods directly.
+
+- [ ] **41.4 Hover ADT + Project method** (S) — mirror of 41.2 for hover. `Project::hover(uri, line, character) -> Option<Hover>`. Position / Range ADTs land here too (the smallest wasm-friendly shape that all subsequent capabilities consume).
+
+- [ ] **41.5 Bulk feature-gate migration for primitive-shaped ADTs** (M) — `FoldingRange`, `DocumentHighlight`, `InlayHint`, `SemanticTokens`, `SignatureHelp` (+ `SignatureInformation` + `ParameterInformation`), `CompletionItem` (+ `CompletionItemKind`), `TextEdit`. Each gets its `analysis::ide` ADT + server converter + `Project` method. Bundle into one commit per ADT, or batch the trivial ones if the friction is low.
+
+- [ ] **41.6 URI-bearing ADTs with `uri()` getters** (M) — `Location` (goto), `WorkspaceSymbol`, `DocumentSymbol` (with self-recursive `children`). Pattern: `uri: Uri` field stays in the struct; `#[wasm_bindgen(getter)] fn uri(&self) -> String` exposes it as a JS string.
+
+- [ ] **41.7 Opaque newtype wrappers for `Idx`-bearing handles** (M) — wrap `RenameTarget`, `ScopeName`, `NameSource` as opaque `#[wasm_bindgen] pub struct ...(...)` in the wasm crate (not the analysis crate). Validates the `resolve_target → handle → target_sites → Vec<TargetSite>` round-trip without JS ever inspecting the `Idx` payloads.
+
+- [ ] **41.8 Recursive / map-shaped outputs** (S) — `SelectionRange` parent linked-list flattens to `Vec<SelectionRangeFlat { parent_index: Option<u32>, ... }>` at the wasm boundary. `CodeAction`'s `WorkspaceEdit { changes: HashMap<Uri, Vec<TextEdit>> }` flattens to `Vec<UriEdits { uri: String, edits: Vec<TextEdit> }>`. JS reassembles where it needs the original shape.
+
+- [ ] **41.9 Stdlib bootstrap helper** (M) — JS-side `loadStdlib(version) -> Promise<Map<filename, source>>` in `@greycat/analyzer`: `fetch https://get.greycat.io/...` (CORS-OK), unzip in-memory, cache in IndexedDB keyed by version. Version derives from the consumer's `project.gcl`'s `@library("std", "x.y.z")`. Wasm stays oblivious — receives the map and feeds `Project::new`.
+
+- [ ] **41.10 Worker scaffolding in `@greycat/analyzer`** (M) — two TS entry points sharing the same surface: bare (`@greycat/analyzer`, main-thread, sync-or-Promise per call) and worker (`@greycat/analyzer/worker`, all Promise via Comlink or hand-rolled protocol). Bundler-friendly `new Worker(new URL('./worker.js', import.meta.url), { type: 'module' })`.
+
+- [ ] **41.11 `@greycat/analyzer` package publish setup** (S) — `package.json` exports map, wasm-pack build script wired into the existing [`playground/scripts/build-wasm.sh`](playground/scripts/build-wasm.sh) lineage, CI workflow for npm publish gated on a tag prefix.
+
+- [ ] **41.12 `@greycat/monaco` package** (M) — Monaco language providers consuming `@greycat/analyzer`: completion, hover, signature help, inlay hints, code actions, references, rename, document symbols, folding ranges, selection ranges, document highlights, formatting, semantic tokens registration, diagnostic markers. One commit per provider once the first two prove the shape.
+
+- [ ] **41.13 `@greycat/shiki` package** (S) — ship the TextMate grammar at [`editors/code/grammar/Greycat.tmLanguage.json`](editors/code/grammar/Greycat.tmLanguage.json) + a `register(highlighter, theme?)` helper. No wasm, no `@greycat/analyzer` dependency. Independent of 41.1-12; can land first if priorities shift.
+
+- [ ] **41.14 Playground migration** (M) — move the existing CST / HIR / tokens / types dumpers into `greycat-analyzer-wasm/src/playground/` and gate the whole module with a single `#[cfg(feature = "playground")] mod playground;` at the crate root (no per-item `#[cfg]`). Playground build script enables `--features playground`. Replace the playground's current direct wasm calls with `Project`-handle ones; debug panels stay, driven by the gated `playground` module's exports. Editor panel uses `@greycat/analyzer` + `@greycat/monaco`, so the playground becomes its own dogfooding consumer.
+
+**Out of scope:**
+
+- Multi-project routing inside `Project`. One Rust `Project` per JS-side instance; JS can instantiate multiple if it needs to multi-edit, mirroring how the LSP `Backend::projects` lives at a layer above the analyzer core.
+- A native (non-wasm) `@greycat/analyzer-node` package via napi-rs. Possible later; not needed for the playground or Monaco web editors.
+- Divorcing `analysis` from `lsp_types::Position` / `Range`. The ADT shapes move; the position primitives keep their current re-export from `core` until a later cleanup phase justifies the churn.
+
+---
+
 ## How to update this doc
 
 - Tick chunks (`[ ]` → `[x]`) as they land. When every chunk in a phase is done, delete the whole phase section — git log holds the history.

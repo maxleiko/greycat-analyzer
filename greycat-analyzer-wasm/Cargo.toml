@@ -13,7 +13,7 @@ categories.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-greycat-analyzer-analysis.workspace = true
+greycat-analyzer-analysis = { workspace = true, features = ["wasm"] }
 greycat-analyzer-core.workspace = true
 greycat-analyzer-fmt.workspace = true
 greycat-analyzer-hir.workspace = true

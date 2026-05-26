@@ -9,6 +9,13 @@ description.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Opt-in: enables `#[wasm_bindgen]` derives on the analysis-side
+# IDE ADTs (hover / diagnostic / completion / ...) so they can be
+# re-exported by `greycat-analyzer-wasm`. Off by default — native
+# builds (CLI, LSP server) skip the dep entirely.
+wasm = ["dep:wasm-bindgen"]
+
 [dependencies]
 greycat-analyzer-hir.workspace = true
 greycat-analyzer-core.workspace = true
@@ -17,6 +24,7 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol_str.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
 
 # P27.1 — rayon is unconditional on native targets and absent on wasm.
 # `wasm32-unknown-unknown` doesn't have `std::thread::spawn` without
