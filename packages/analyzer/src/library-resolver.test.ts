@@ -33,12 +33,20 @@ function okResponse(bytes: Uint8Array): Response {
   return new Response(bytes.slice(), { status: 200 });
 }
 
-/** Yield to the microtask queue enough times for any pending `.then`
- *  to run. Used by the dedup test to observe state mid-resolve, after
- *  `resolveImpl`'s first `await` has settled. */
-function flushMicrotasks(): Promise<void> {
+/** Yield for one microtask tick — enough time for a single pending
+ *  `await` to settle. The dedup test uses this to observe state right
+ *  after `resolveImpl` finishes its first `await this.cache.get(...)`
+ *  and reaches the `this.fetchImpl(url)` call (before that call's own
+ *  `await` suspends).
+ *
+ *  `queueMicrotask` (not `setTimeout(0)`) is deliberate: it stays on
+ *  the microtask boundary, exposing implementation drift if a future
+ *  edit slips another `await` between the cache read and the fetch.
+ *  `setTimeout(0)` would mask that by hopping all the way to the next
+ *  macrotask. */
+function nextMicrotask(): Promise<void> {
   return new Promise((resolve) => {
-    setTimeout(resolve, 0);
+    queueMicrotask(resolve);
   });
 }
 
@@ -159,10 +167,11 @@ describe("RegistryLibraryResolver.resolve", () => {
 
     const a = resolver.resolve("std", "7.8.166-stable");
     const b = resolver.resolve("std", "7.8.166-stable");
-    // `resolveImpl` is async — its first `await` (cache.get) yields
-    // before fetch is invoked. Flush microtasks so the assertion
-    // observes the post-cache-miss state of the stub.
-    await flushMicrotasks();
+    // `resolveImpl` runs synchronously up to `await this.cache.get(...)`.
+    // One microtask tick later, the cache.get continuation runs and
+    // reaches `this.fetchImpl(url)` (the call site, before its own
+    // `await`). At that point fetchStub has been invoked exactly once.
+    await nextMicrotask();
     expect(fetchStub).toHaveBeenCalledTimes(1);
 
     release(okResponse(makeZip({ "core.gcl": "type Foo {}\n" })));
