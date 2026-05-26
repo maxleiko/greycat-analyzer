@@ -138,7 +138,7 @@ The current `greycat-analyzer-wasm` is shaped for the playground (seven single-f
 
 - [x] **41.2 `Diagnostic` ADT migration (proof of pattern)** (S) — move `lsp_types::Diagnostic` consumption out of [`capabilities/diagnostics.rs`](greycat-analyzer-server/src/capabilities/diagnostics.rs) into a new `analysis::ide::diagnostics::Diagnostic` ADT, feature-gated with `#[cfg_attr(feature = "wasm", wasm_bindgen)]`. Server file becomes a 5-line converter to `lsp_types::Diagnostic`. Wasm crate re-exports the ADT.
 
-- [ ] **41.3 `Project` opaque handle in wasm crate** (M) — new `#[wasm_bindgen] pub struct Project` wrapping `(SourceManager, ProjectAnalysis, TypeArena, ProjectIndex)`. Methods: `new(entrypoint_uri, files: js_sys::Map)`, `open(uri, source)`, `change(uri, source)`, `close(uri)`, `diagnostics(uri) -> Vec<Diagnostic>`. Mirrors [`Backend`](greycat-analyzer-server/src/backend.rs) but with no `lsp-server` channels — JS calls methods directly.
+- [x] **41.3 `Project` opaque handle in wasm crate** (M) — new `#[wasm_bindgen] pub struct Project` wrapping `(SourceManager, ProjectAnalysis, TypeArena, ProjectIndex)`. Methods: `new(entrypoint_uri, files: js_sys::Map)`, `open(uri, source)`, `change(uri, source)`, `close(uri)`, `diagnostics(uri) -> Vec<Diagnostic>`. Mirrors [`Backend`](greycat-analyzer-server/src/backend.rs) but with no `lsp-server` channels — JS calls methods directly.
 
 - [ ] **41.4 Hover ADT + Project method** (S) — mirror of 41.2 for hover. `Project::hover(uri, line, character) -> Option<Hover>`. Position / Range ADTs land here too (the smallest wasm-friendly shape that all subsequent capabilities consume).
 

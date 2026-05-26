@@ -46,6 +46,9 @@ pub use greycat_analyzer_analysis::ide::diagnostics::{
     Diagnostic as IdeDiagnostic, Severity as IdeSeverity, Tag as IdeTag,
 };
 pub use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange};
+
+// P41.3
+mod project;
 use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::SymbolTable;
@@ -55,6 +58,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_syntax::tree_sitter;
+pub use project::Project;
 
 // =============================================================================
 // Helpers

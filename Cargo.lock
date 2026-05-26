@@ -544,6 +544,7 @@ dependencies = [
  "greycat-analyzer-fmt",
  "greycat-analyzer-hir",
  "greycat-analyzer-syntax",
+ "js-sys",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

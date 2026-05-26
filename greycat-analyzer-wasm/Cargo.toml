@@ -19,6 +19,7 @@ greycat-analyzer-fmt.workspace = true
 greycat-analyzer-hir.workspace = true
 greycat-analyzer-syntax.workspace = true
 
+js-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen.workspace = true
