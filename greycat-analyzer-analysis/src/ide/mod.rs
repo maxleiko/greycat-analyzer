@@ -13,6 +13,7 @@
 pub mod actions;
 pub mod completion;
 pub mod diagnostics;
+pub mod document_highlights;
 pub mod folding_ranges;
 pub mod hover;
 pub mod quickfix;

@@ -1,11 +1,14 @@
-//! Document highlight handler — identifier occurrences in the same file.
+//! Thin converter from `analysis::ide::document_highlights` ADT to
+//! `lsp_types::DocumentHighlight`.
 
+use greycat_analyzer_analysis::ide::document_highlights::{
+    DocumentHighlight as IdeDocumentHighlight, DocumentHighlightKind as IdeDocumentHighlightKind,
+    document_highlights as document_highlights_inner,
+};
+use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange};
 use greycat_analyzer_core::SourceEncoding;
-use greycat_analyzer_syntax::cst::{node_at_offset, walk_named};
 use greycat_analyzer_syntax::tree_sitter;
-use lsp_types::{DocumentHighlight, DocumentHighlightKind, Position};
-
-use crate::conv::{byte_range_to_lsp, position_to_byte};
+use lsp_types::{DocumentHighlight, DocumentHighlightKind, Position, Range};
 
 pub fn document_highlights(
     text: &str,
@@ -13,26 +16,33 @@ pub fn document_highlights(
     pos: Position,
     encoding: SourceEncoding,
 ) -> Vec<DocumentHighlight> {
-    let byte = position_to_byte(text, pos, encoding);
-    let Some(node) = node_at_offset(root, byte) else {
-        return Vec::new();
-    };
-    if node.kind() != "ident" {
-        return Vec::new();
+    document_highlights_inner(text, root, pos, encoding)
+        .into_iter()
+        .map(to_lsp)
+        .collect()
+}
+
+fn to_lsp(h: IdeDocumentHighlight) -> DocumentHighlight {
+    DocumentHighlight {
+        range: range_to_lsp(h.range),
+        kind: Some(match h.kind {
+            IdeDocumentHighlightKind::Text => DocumentHighlightKind::TEXT,
+            IdeDocumentHighlightKind::Read => DocumentHighlightKind::READ,
+            IdeDocumentHighlightKind::Write => DocumentHighlightKind::WRITE,
+        }),
     }
-    let target_text = text.get(node.byte_range()).unwrap_or("").to_string();
-    if target_text.is_empty() {
-        return Vec::new();
+}
+
+fn range_to_lsp(r: IdeRange) -> Range {
+    Range {
+        start: pos_to_lsp(r.start),
+        end: pos_to_lsp(r.end),
     }
-    let mut out = Vec::new();
-    walk_named(root, |n| {
-        if n.kind() == "ident" && text.get(n.byte_range()).unwrap_or("") == target_text {
-            out.push(DocumentHighlight {
-                range: byte_range_to_lsp(text, &n.byte_range(), encoding),
-                kind: Some(DocumentHighlightKind::TEXT),
-            });
-        }
-        true
-    });
-    out
+}
+
+fn pos_to_lsp(p: IdePosition) -> Position {
+    Position {
+        line: p.line,
+        character: p.character,
+    }
 }

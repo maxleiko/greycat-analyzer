@@ -21,6 +21,7 @@
 use std::str::FromStr;
 
 use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
+use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
@@ -172,6 +173,28 @@ impl Project {
         };
         let doc = cell.borrow();
         Ok(folding_ranges(&doc.text, doc.root_node(), self.encoding))
+    }
+
+    /// Same-spelling identifier occurrences in the given URI.
+    #[wasm_bindgen(js_name = documentHighlights)]
+    pub fn document_highlights(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<DocumentHighlight>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let doc = cell.borrow();
+        let pos = Position { line, character };
+        Ok(document_highlights(
+            &doc.text,
+            doc.root_node(),
+            pos,
+            self.encoding,
+        ))
     }
 }
 
