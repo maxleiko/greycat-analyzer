@@ -4465,13 +4465,46 @@ impl<'a> Cx<'a> {
                             .unwrap_or(pre);
                         if !self.arena.get(then_eff).nullable && !self.arena.get(else_eff).nullable
                         {
-                            // Use the non-null stripping of pre to
-                            // keep the narrow uniform — both paths
-                            // agreed the binding is non-null, so the
-                            // value's exact type at each branch end
-                            // doesn't load-bear here.
-                            let stripped = self.strip_nullable(pre);
-                            self.write_narrow(ident, stripped);
+                            // Pick the merged narrow. Default: strip
+                            // nullable off `pre` (works when pre is
+                            // `T?` — both paths land at `T`).
+                            //
+                            // Edge case — `pre` was already narrowed
+                            // to the literal `Null` shape by an outer
+                            // guard (e.g. inside `if (u == null) {
+                            // ...; if (u == null) { u = nonNull } ...
+                            // }`). `strip_nullable(Null)` yields a
+                            // dead `Null` kind with `nullable=false`
+                            // — which passes the per-side non-null
+                            // check above but, written as a narrow,
+                            // makes downstream reads see `null`. In
+                            // that case prefer a side's concrete
+                            // narrow when one exists, else fall back
+                            // to the binding's declared type stripped
+                            // of nullability.
+                            let pre_is_null_shape =
+                                matches!(self.arena.get(pre).kind, TypeKind::Null);
+                            let then_is_null_shape =
+                                matches!(self.arena.get(then_eff).kind, TypeKind::Null);
+                            let else_is_null_shape =
+                                matches!(self.arena.get(else_eff).kind, TypeKind::Null);
+                            let merged = if pre_is_null_shape {
+                                if !then_is_null_shape {
+                                    then_eff
+                                } else if !else_is_null_shape {
+                                    else_eff
+                                } else {
+                                    self.out
+                                        .def_types
+                                        .get(&ident)
+                                        .copied()
+                                        .map(|d| self.strip_nullable(d))
+                                        .unwrap_or_else(|| self.strip_nullable(pre))
+                                }
+                            } else {
+                                self.strip_nullable(pre)
+                            };
+                            self.write_narrow(ident, merged);
                         }
                     }
                     // **P19.16** — same lift for member-access paths.
