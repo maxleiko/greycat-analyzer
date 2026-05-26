@@ -153,6 +153,14 @@ pub struct Resolutions {
     /// `this` byte ranges inside lambda bodies. The runtime segfaults
     /// on this shape today; we forbid it at analyze time.
     pub this_in_lambda: Vec<greycat_analyzer_hir::types::Span>,
+    /// Idents that re-bind a name already declared as a `Local` or
+    /// `Param` in the *same* lexical scope. The runtime rejects this
+    /// shape with `already declared var` / `already declared param`;
+    /// the analyzer surfaces it as `local-rebind`. Nested scopes can
+    /// still shadow — only same-scope collisions are recorded here.
+    /// `Generic` bindings live in a separate conceptual slot and don't
+    /// collide with value bindings.
+    pub rebound: Vec<Idx<Ident>>,
 }
 
 impl Resolutions {
@@ -297,6 +305,30 @@ impl<'a> Cx<'a> {
         self.scopes
             .last_mut()
             .expect("at least one nested scope is live (push_scope must precede insert)")
+    }
+
+    /// Bind a `Local` or `Param` into the current scope, surfacing a
+    /// `local-rebind` if its name is already present in the *same*
+    /// scope as a value binding. Nested-scope shadowing stays silent —
+    /// only same-scope collisions are flagged, mirroring the runtime
+    /// (`already declared var` / `already declared param`).
+    ///
+    /// On collision the original binding is preserved so subsequent
+    /// uses of the name still resolve to the first declaration (matching
+    /// the user's likely intent: the param `x` keeps meaning the param,
+    /// even when a later `var x` shadows it textually).
+    fn bind_value(&mut self, name: Idx<Ident>, def: Definition) {
+        debug_assert!(matches!(def, Definition::Local(_) | Definition::Param(_)));
+        let sym = self.hir.idents[name].symbol;
+        let scope = self.current_mut();
+        match scope.names.get(&sym) {
+            Some(Definition::Local(_) | Definition::Param(_)) => {
+                self.res.rebound.push(name);
+            }
+            _ => {
+                scope.insert(sym, def);
+            }
+        }
     }
 
     /// Walk nested lexical scopes (params / locals / generics /
@@ -595,8 +627,7 @@ fn visit_fn_decl(cx: &mut Cx, d: &FnDecl) {
     // Parameters become Param bindings in the function scope.
     for param_id in &d.params {
         let p = cx.hir.fn_params[*param_id].clone();
-        let sym = cx.hir.idents[p.name].symbol;
-        cx.current_mut().insert(sym, Definition::Param(p.name));
+        cx.bind_value(p.name, Definition::Param(p.name));
         if let Some(ty) = p.ty {
             visit_type_ref(cx, ty);
         }
@@ -604,8 +635,14 @@ fn visit_fn_decl(cx: &mut Cx, d: &FnDecl) {
     if let Some(rt) = d.return_type {
         visit_type_ref(cx, rt);
     }
-    if let Some(body) = d.body {
-        visit_stmt(cx, body);
+    // The body block is the *same* scope as the params (matches the
+    // runtime: `fn foo(x) { var x = …; }` is rejected). Walk the body
+    // block's stmts inline; nested blocks still introduce their own
+    // scopes via the regular `visit_block` path.
+    if let Some(body) = d.body
+        && let Stmt::Block(b) = cx.hir.stmts[body].clone()
+    {
+        visit_block_inline(cx, &b);
     }
     cx.pop_scope();
 }
@@ -665,10 +702,18 @@ fn visit_pragma(cx: &mut Cx, p: &Pragma) {
 /// `Idx<Stmt>` no longer works for those bodies.
 fn visit_block(cx: &mut Cx, block: &greycat_analyzer_hir::types::BlockStmt) {
     cx.push_scope();
+    visit_block_inline(cx, block);
+    cx.pop_scope();
+}
+
+/// Walk a `BlockStmt`'s stmts in the *current* scope (no push/pop).
+/// Used by `visit_fn_decl` / `Expr::Lambda` so the params and the
+/// immediate body block share one scope — matching the runtime, which
+/// rejects `fn foo(x) { var x = …; }` as `already declared var`.
+fn visit_block_inline(cx: &mut Cx, block: &greycat_analyzer_hir::types::BlockStmt) {
     for s in &block.stmts {
         visit_stmt(cx, *s);
     }
-    cx.pop_scope();
 }
 
 fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
@@ -683,8 +728,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             if let Some(init) = init {
                 visit_expr(cx, init);
             }
-            let sym = cx.hir.idents[name].symbol;
-            cx.current_mut().insert(sym, Definition::Local(name));
+            cx.bind_value(name, Definition::Local(name));
         }
         Stmt::Assign(AssignStmt { target, value, .. }) => {
             visit_expr(cx, target);
@@ -731,8 +775,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 visit_expr(cx, v);
             }
             if let Some(name) = init_name {
-                let sym = cx.hir.idents[name].symbol;
-                cx.current_mut().insert(sym, Definition::Local(name));
+                cx.bind_value(name, Definition::Local(name));
             }
             if let Some(c) = condition {
                 visit_expr(cx, c);
@@ -755,8 +798,7 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 if let Some(t) = p.ty {
                     visit_type_ref(cx, t);
                 }
-                let sym = cx.hir.idents[p.name].symbol;
-                cx.current_mut().insert(sym, Definition::Local(p.name));
+                cx.bind_value(p.name, Definition::Local(p.name));
             }
             visit_block(cx, &body);
             cx.pop_scope();
@@ -775,12 +817,14 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
             ..
         }) => {
             visit_block(cx, &try_block);
+            // Catch param shares scope with the catch block body — the
+            // runtime rejects `catch (e) { var e = …; }` as
+            // `already declared var`.
             cx.push_scope();
             if let Some(name) = error_param {
-                let sym = cx.hir.idents[name].symbol;
-                cx.current_mut().insert(sym, Definition::Local(name));
+                cx.bind_value(name, Definition::Local(name));
             }
-            visit_block(cx, &catch_block);
+            visit_block_inline(cx, &catch_block);
             cx.pop_scope();
         }
         Stmt::At(AtStmt { expr, block, .. }) => {
@@ -867,8 +911,7 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             cx.push_lambda_scope();
             for param_id in params {
                 let p = cx.hir.fn_params[param_id].clone();
-                let sym = cx.hir.idents[p.name].symbol;
-                cx.current_mut().insert(sym, Definition::Param(p.name));
+                cx.bind_value(p.name, Definition::Param(p.name));
                 if let Some(t) = p.ty {
                     visit_type_ref(cx, t);
                 }
@@ -876,7 +919,8 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             if let Some(t) = return_type {
                 visit_type_ref(cx, t);
             }
-            visit_block(cx, &body);
+            // Lambda params and body share one scope (mirrors fn-decl).
+            visit_block_inline(cx, &body);
             cx.pop_scope();
         }
         Expr::Is { value, ty, .. } | Expr::Cast { value, ty, .. } => {
@@ -1030,7 +1074,11 @@ fn helper(): int { return 1; }
     }
 
     #[test]
-    fn local_var_shadows_outer_binding() {
+    fn local_var_rebinding_param_is_recorded_and_param_wins() {
+        // `var x` after param `x` in the same fn body is a rebind error
+        // (runtime: `already declared var`). The resolver records the
+        // rebind in `res.rebound` and keeps the param as the active
+        // binding so the use site `return x` resolves to the param.
         let src = r#"
 fn f(x: int): int {
     var x: int = 99;
@@ -1039,18 +1087,65 @@ fn f(x: int): int {
 "#;
         let (hir, res, s) = analyze(src);
         let x_sym = s.lookup("x").expect("x interned");
+        assert_eq!(
+            res.rebound.len(),
+            1,
+            "expected exactly one rebound ident, got: {:?}",
+            res.rebound
+        );
         let return_x_uses: Vec<_> = hir
             .idents
             .iter()
             .filter(|(_, i)| i.symbol == x_sym)
             .filter_map(|(idx, _)| res.uses.get(&idx))
             .collect();
-        // Use site (return x) — we expect it to bind to the local, not the param.
         assert!(
             return_x_uses
                 .iter()
+                .any(|d| matches!(d, Definition::Param(_))),
+            "expected the param to win on collision: {return_x_uses:?}",
+        );
+        assert!(
+            !return_x_uses
+                .iter()
                 .any(|d| matches!(d, Definition::Local(_))),
-            "expected a local binding for shadowed x: {return_x_uses:?}",
+            "no use site should bind to the rejected local: {return_x_uses:?}",
+        );
+    }
+
+    #[test]
+    fn local_var_shadows_outer_binding_in_nested_block() {
+        // Nested scopes can still shadow — `var x` in an `if` body
+        // doesn't collide with an outer param `x`.
+        let src = r#"
+fn f(x: int): int {
+    if (x > 0) {
+        var x: int = 99;
+        return x;
+    }
+    return x;
+}
+"#;
+        let (hir, res, s) = analyze(src);
+        let x_sym = s.lookup("x").expect("x interned");
+        assert!(
+            res.rebound.is_empty(),
+            "nested-scope shadow should not record a rebind: {:?}",
+            res.rebound
+        );
+        let all_x_uses: Vec<_> = hir
+            .idents
+            .iter()
+            .filter(|(_, i)| i.symbol == x_sym)
+            .filter_map(|(idx, _)| res.uses.get(&idx))
+            .collect();
+        assert!(
+            all_x_uses.iter().any(|d| matches!(d, Definition::Local(_))),
+            "expected the inner `return x` to bind the shadowing local: {all_x_uses:?}",
+        );
+        assert!(
+            all_x_uses.iter().any(|d| matches!(d, Definition::Param(_))),
+            "expected the outer `return x` to bind the param: {all_x_uses:?}",
         );
     }
 

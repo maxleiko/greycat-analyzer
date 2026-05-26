@@ -105,7 +105,7 @@ fn static_access_on_enum_non_field() {
 /// Valid enum field access via static_expr must not fire any error.
 #[test]
 fn enum_field_access_no_error() {
-    let src = "enum E { a, b }\nfn f() {\n    var _ = E::a;\n    var _ = E::b;\n}\n";
+    let src = "enum E { a, b }\nfn f() {\n    var a = E::a;\n    var b = E::b;\n}\n";
     let (pa, uri) = analyze(src);
     let msgs = error_messages(&pa, &uri);
     assert!(msgs.is_empty(), "got unexpected errors: {msgs:?}");

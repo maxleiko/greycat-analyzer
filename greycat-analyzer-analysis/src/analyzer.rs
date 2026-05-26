@@ -579,6 +579,23 @@ pub fn analyze_with_index_into(
         ));
     }
 
+    // Same-scope value-binding collisions — the runtime rejects `var x`
+    // after a param `x` or earlier `var x` in the same block with
+    // `already declared var` / `already declared param`. Nested-scope
+    // shadowing is allowed and not recorded here.
+    for ident_idx in &res.rebound {
+        let ident = &hir.idents[*ident_idx];
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            "local-rebind",
+            format!(
+                "name `{}` is already declared in this scope",
+                &index.symbols[ident.symbol]
+            ),
+            ident.byte_range.clone(),
+        ));
+    }
+
     // P38.4 — `ambiguous-symbol` Severity::Error: the bare name is
     // exported publicly by ≥2 distinct modules, with no local hit to
     // resolve it. Matches the GreyCat runtime's "unresolved function"
