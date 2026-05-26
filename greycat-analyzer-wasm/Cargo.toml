@@ -12,6 +12,14 @@ categories.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+# Playground-only debug dumpers (CST / HIR / tokens / types pipelines).
+# Enabled by `playground/scripts/build-wasm.sh`; the published
+# `@greycat/analyzer` package builds with the feature OFF and ships only
+# the `Project` handle + IDE ADTs.
+playground = []
+
 [dependencies]
 greycat-analyzer-analysis = { workspace = true, features = ["wasm"] }
 greycat-analyzer-core.workspace = true

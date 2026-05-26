@@ -28,4 +28,7 @@ fi
 export CFLAGS_wasm32_unknown_unknown="--sysroot=$SYSROOT"
 
 cd "$WASM_CRATE"
-exec wasm-pack build --target web -d pkg "$@"
+# `--features playground` enables the CST / HIR / tokens / types / diagnostics
+# / format dumpers the playground UI consumes. The published `@greycat/analyzer`
+# package is built without this feature.
+exec wasm-pack build --target web -d pkg -- --features playground "$@"

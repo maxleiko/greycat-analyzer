@@ -162,7 +162,7 @@ The current `greycat-analyzer-wasm` is shaped for the playground (seven single-f
 
 - [ ] **41.13 `@greycat/shiki` package** (S) — ship the TextMate grammar at [`editors/code/grammar/Greycat.tmLanguage.json`](editors/code/grammar/Greycat.tmLanguage.json) + a `register(highlighter, theme?)` helper. No wasm, no `@greycat/analyzer` dependency. Independent of 41.1-12; can land first if priorities shift.
 
-- [ ] **41.14 Playground migration** (M) — move the existing CST / HIR / tokens / types dumpers into `greycat-analyzer-wasm/src/playground/` and gate the whole module with a single `#[cfg(feature = "playground")] mod playground;` at the crate root (no per-item `#[cfg]`). Playground build script enables `--features playground`. Replace the playground's current direct wasm calls with `Project`-handle ones; debug panels stay, driven by the gated `playground` module's exports. Editor panel uses `@greycat/analyzer` + `@greycat/monaco`, so the playground becomes its own dogfooding consumer.
+- [x] **41.14 Playground migration** (M) — the CST / HIR / tokens / types / diagnostics / format dumpers moved into [`greycat-analyzer-wasm/src/playground.rs`](greycat-analyzer-wasm/src/playground.rs), gated by `#[cfg(feature = "playground")] mod playground;` at the crate root (no per-item `#[cfg]`). [`playground/scripts/build-wasm.sh`](playground/scripts/build-wasm.sh) passes `--features playground`. The default-feature build (used by the future `@greycat/analyzer` npm package) ships only the `Project` handle + IDE ADTs. **Migrating the playground UI from the dumpers to the `Project` handle is left for after the `@greycat/analyzer` package lands** (41.11) — the dumpers are still active under the `playground` feature so nothing breaks today.
 
 **Out of scope:**
 
