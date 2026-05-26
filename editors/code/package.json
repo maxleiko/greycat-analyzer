@@ -1,11 +1,12 @@
 {
-  "name": "greycat-analyzer",
-  "version": "0.1.0",
+  "name": "greycat",
+  "version": "0.7.0",
   "main": "extension.js",
   "description": "GreyCat language support for Visual Studio Code",
   "author": "Maxime Tricoire <max.tricoire@gmail.com>",
   "license": "MIT",
   "publisher": "maxleiko",
+  "icon": "greycat.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/maxleiko/greycat-analyzer"
@@ -13,7 +14,7 @@
   "scripts": {
     "clean": "rm -f extension.js",
     "build": "node scripts/build.mjs",
-    "vscode:install": "code --install-extension greycat-analyzer.vsix"
+    "vscode:install": "code --install-extension greycat.vsix"
   },
   "activationEvents": [
     "workspaceContains:project.gcl"
@@ -26,8 +27,8 @@
         "extensions": [".gcl"],
         "configuration": "./grammar/language-configuration.json",
         "icon": {
-          "light": "./icons/light/gcl.svg",
-          "dark": "./icons/dark/gcl.svg"
+          "light": "./icons/light.svg",
+          "dark": "./icons/dark.svg"
         }
       }
     ],
@@ -50,19 +51,19 @@
     ],
     "commands": [
       {
-        "command": "greycat-analyzer.restart",
-        "title": "greycat-analyzer: restart"
+        "command": "greycat.restartServer",
+        "title": "GreyCat: Restart LSP Server"
       }
     ],
     "configurationDefaults": {
       "[greycat]": {
-        "editor.defaultFormatter": "maxleiko.greycat-analyzer"
+        "editor.defaultFormatter": "maxleiko.greycat"
       }
     },
     "configuration": {
-      "title": "GreyCat Analyzer",
+      "title": "GreyCat",
       "properties": {
-        "greycat-analyzer.trace.server": {
+        "greycat.trace.server": {
           "type": "string",
           "enum": ["off", "info", "debug", "trace"],
           "default": "info",
@@ -74,12 +75,12 @@
           ],
           "markdownDescription": "Verbosity of the LSP server's log output (sets `RUST_LOG` for `greycat_analyzer_*` crates). Restart the server after changing — the extension will prompt."
         },
-        "greycat-analyzer.lintLibs": {
+        "greycat.lintLibs": {
           "type": "boolean",
           "default": false,
           "markdownDescription": "Surface lint warnings (`unused-decl`, `unused-local`, `unused-param`, `arrow-on-non-deref`) for vendored library modules under `lib/<name>/`. Off by default — those modules aren't yours and the warnings tend to drown out signal in your own code. Type-relation diagnostics always surface regardless of this setting. Restart the server after changing — the extension will prompt."
         },
-        "greycat-analyzer.diagnosticsDebounceMs": {
+        "greycat.diagnosticsDebounceMs": {
           "type": "integer",
           "default": 150,
           "minimum": 0,

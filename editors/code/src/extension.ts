@@ -15,19 +15,19 @@ let channel: OutputChannel;
 let client: LanguageClient | null = null;
 
 export function activate(ctx: ExtensionContext) {
-  channel = window.createOutputChannel('greycat-analyzer');
+  channel = window.createOutputChannel('GreyCat');
 
   ctx.subscriptions.push(
     channel,
-    commands.registerCommand('greycat-analyzer.restart', restart),
+    commands.registerCommand('greycat.restartServer', restart),
     workspace.onDidChangeConfiguration(async (e) => {
       // Every server-affecting setting requires an LSP restart:
       // trace.server changes RUST_LOG (only read at startup),
       // lintLibs / diagnosticsDebounceMs are sent via
       // initializationOptions (only consumed on `initialize`).
-      const traceChanged = e.affectsConfiguration('greycat-analyzer.trace.server');
-      const lintLibsChanged = e.affectsConfiguration('greycat-analyzer.lintLibs');
-      const debounceChanged = e.affectsConfiguration('greycat-analyzer.diagnosticsDebounceMs');
+      const traceChanged = e.affectsConfiguration('greycat.trace.server');
+      const lintLibsChanged = e.affectsConfiguration('greycat.lintLibs');
+      const debounceChanged = e.affectsConfiguration('greycat.diagnosticsDebounceMs');
       if (!traceChanged && !lintLibsChanged && !debounceChanged) {
         return;
       }
@@ -37,7 +37,7 @@ export function activate(ctx: ExtensionContext) {
           ? 'lintLibs'
           : 'diagnosticsDebounceMs';
       const choice = await window.showInformationMessage(
-        `greycat-analyzer ${what} changed. Restart the server now?`,
+        `GreyCat ${what} changed. Restart the LSP server now?`,
         'Restart',
         'Later',
       );
@@ -87,7 +87,7 @@ function startClient() {
   };
 
   client = new LanguageClient(
-    'greycat-analyzer',
+    'greycat',
     {
       run,
       debug: run,
@@ -109,7 +109,7 @@ function startClient() {
  * a stream of `workspace/configuration` requests.
  */
 function buildInitializationOptions(): Record<string, unknown> {
-  const cfg = workspace.getConfiguration('greycat-analyzer');
+  const cfg = workspace.getConfiguration('greycat');
   return {
     lintLibs: cfg.get<boolean>('lintLibs', false),
     diagnosticsDebounceMs: cfg.get<number>('diagnosticsDebounceMs', 150),
@@ -117,13 +117,13 @@ function buildInitializationOptions(): Record<string, unknown> {
 }
 
 /**
- * Build the RUST_LOG value from the `greycat-analyzer.trace.server`
+ * Build the RUST_LOG value from the `greycat.trace.server`
  * setting. The setting is one of `off | info | debug | trace`; the
  * corresponding log spec scopes the level to the analyzer's own
  * crates so external dependencies stay quiet at every tier.
  */
 function buildRustLog(): string {
-  const cfg = workspace.getConfiguration('greycat-analyzer');
+  const cfg = workspace.getConfiguration('greycat');
   const level = cfg.get<string>('trace.server', 'info');
   if (level === 'off') {
     return 'off';
@@ -137,14 +137,14 @@ function buildRustLog(): string {
 
 function statusBar(ctx: ExtensionContext) {
   const statusBarItem = window.createStatusBarItem(StatusBarAlignment.Left, 100);
-  statusBarItem.text = 'greycat-analyzer';
+  statusBarItem.text = 'GreyCat';
   statusBarItem.tooltip = new MarkdownString(
     [
       `Extension: ${version}`,
       '',
       '---',
       '',
-      '[$(refresh) Restart](command:greycat-analyzer.restart)  ',
+      '[$(refresh) Restart](command:greycat.restartServer)  ',
       '',
       '[Need help?](https://doc.greycat.io)',
     ].join('\n'),
@@ -152,7 +152,7 @@ function statusBar(ctx: ExtensionContext) {
   );
   // Required to make links clickable
   statusBarItem.tooltip.isTrusted = true;
-  statusBarItem.command = 'greycat-analyzer.restart';
+  statusBarItem.command = 'greycat.restartServer';
   // statusBarItem.show();
 
   function updateStatusBarVisiblity() {

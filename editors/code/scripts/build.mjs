@@ -19,7 +19,7 @@ try {
   });
 
   // Package the extension with VSCE
-  execSync('vsce package -o greycat-analyzer.vsix', { stdio: 'inherit' });
+  execSync('vsce package -o greycat.vsix', { stdio: 'inherit' });
 
   // Clean up
   rmSync('extension.js', { force: true });
