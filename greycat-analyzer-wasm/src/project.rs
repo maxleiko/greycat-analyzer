@@ -24,9 +24,11 @@ use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
 use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
+use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange, TextEdit};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
+use greycat_analyzer_core::conv::byte_to_position;
 use greycat_analyzer_core::lsp_types::{Position, Uri};
 use wasm_bindgen::prelude::*;
 
@@ -195,6 +197,35 @@ impl Project {
             pos,
             self.encoding,
         ))
+    }
+
+    /// Whole-document formatting. Returns a single full-range edit
+    /// when the formatter's output differs; an empty vec otherwise.
+    /// Empty vec is also returned for unknown URIs (idempotent shape).
+    pub fn format(&self, uri: &str) -> Result<Vec<TextEdit>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let doc = cell.borrow();
+        let formatted = greycat_analyzer_fmt::format_tree(&doc.text, doc.root_node());
+        if formatted == doc.text {
+            return Ok(Vec::new());
+        }
+        let end = byte_to_position(&doc.text, doc.text.len(), self.encoding);
+        Ok(vec![TextEdit {
+            range: IdeRange {
+                start: IdePosition {
+                    line: 0,
+                    character: 0,
+                },
+                end: IdePosition {
+                    line: end.line,
+                    character: end.character,
+                },
+            },
+            new_text: formatted,
+        }])
     }
 }
 

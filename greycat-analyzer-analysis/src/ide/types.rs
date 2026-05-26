@@ -42,3 +42,15 @@ impl Range {
         }
     }
 }
+
+/// Replace `range` (in `(line, character)` coords) with `new_text`.
+/// IDE-shape mirror of `lsp_types::TextEdit`; the analysis crate's
+/// own [`crate::ide::actions::TextEdit`] carries a `byte_range` for
+/// internal quickfix consumers and stays unchanged.
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[derive(Debug, Clone)]
+pub struct TextEdit {
+    pub range: Range,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub new_text: String,
+}
