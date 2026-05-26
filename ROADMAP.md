@@ -146,7 +146,7 @@ The current `greycat-analyzer-wasm` is shaped for the playground (seven single-f
 
 - [x] **41.5b `CompletionItem` IDE ADT migration** (M) — moved the rich completion ADT shape (`CompletionList`, `CompletionItem`, `CompletionItemKind` enum, `InsertTextFormat`, flattened `Documentation` → markdown string, `CompletionTextEdit::Edit` → plain `TextEdit`, optional `additionalTextEdits`) out of `lsp_types` into `analysis::ide::completion`. Server [`capabilities/completion.rs`](greycat-analyzer-server/src/capabilities/completion.rs) is the thin converter; wasm carries `Project::completion(uri, line, character)`. `LibVersionPayload.range` now uses the IDE `Range` shape.
 
-- [ ] **41.6 URI-bearing ADTs with `uri()` getters** (M) — `Location` (goto), `WorkspaceSymbol`, `DocumentSymbol` (with self-recursive `children`). Pattern: `uri: Uri` field stays in the struct; `#[wasm_bindgen(getter)] fn uri(&self) -> String` exposes it as a JS string.
+- [x] **41.6 URI-bearing ADTs with `uri()` getters** (M) — `Location` (in [`analysis::ide::types`](greycat-analyzer-analysis/src/ide/types.rs)), `WorkspaceSymbol`, `DocumentSymbol` (with self-recursive `children`). Pattern: `uri: Uri` field stays in the struct (`#[wasm_bindgen(skip)]`); `#[wasm_bindgen(getter)] fn uri(&self) -> String` exposes it as a JS string. Wasm: `Project::documentSymbols(uri)`, `Project::workspaceSymbols(query)`.
 
 - [ ] **41.7 Opaque newtype wrappers for `Idx`-bearing handles** (M) — wrap `RenameTarget`, `ScopeName`, `NameSource` as opaque `#[wasm_bindgen] pub struct ...(...)` in the wasm crate (not the analysis crate). Validates the `resolve_target → handle → target_sites → Vec<TargetSite>` round-trip without JS ever inspecting the `Idx` payloads.
 

@@ -23,12 +23,14 @@ use std::str::FromStr;
 use greycat_analyzer_analysis::ide::completion::{CompletionList, completion_with_project};
 use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
 use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
+use greycat_analyzer_analysis::ide::document_symbols::{DocumentSymbol, document_symbols};
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
 use greycat_analyzer_analysis::ide::hover::{Hover, hover_with_project};
 use greycat_analyzer_analysis::ide::inlay_hints::{InlayHint, inlay_hints_with_project};
 use greycat_analyzer_analysis::ide::semantic_tokens::{SemanticTokens, semantic_tokens};
 use greycat_analyzer_analysis::ide::signature_help::{SignatureHelp, signature_help};
 use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange, TextEdit};
+use greycat_analyzer_analysis::ide::workspace_symbols::{WorkspaceSymbol, workspace_symbols};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::SourceManager;
@@ -179,6 +181,38 @@ impl Project {
         };
         let doc = cell.borrow();
         Ok(folding_ranges(&doc.text, doc.root_node(), self.encoding))
+    }
+
+    /// Project-wide symbol search filtered by case-insensitive substring
+    /// match against `query`. Walks every loaded document in the
+    /// `SourceManager` (project + libraries).
+    #[wasm_bindgen(js_name = workspaceSymbols)]
+    pub fn workspace_symbols(&self, query: &str) -> Vec<WorkspaceSymbol> {
+        let docs: Vec<_> = self
+            .manager
+            .iter()
+            .map(|(uri, cell)| {
+                let doc = cell.borrow();
+                (uri.clone(), doc.lib.clone(), doc.text.clone())
+            })
+            .collect();
+        workspace_symbols(docs, query, self.encoding)
+    }
+
+    /// Outline tree — top-level decls with type members as children.
+    #[wasm_bindgen(js_name = documentSymbols)]
+    pub fn document_symbols(&self, uri: &str) -> Result<Vec<DocumentSymbol>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let doc = cell.borrow();
+        Ok(document_symbols(
+            &doc.text,
+            &doc.lib,
+            doc.root_node(),
+            self.encoding,
+        ))
     }
 
     /// Same-spelling identifier occurrences in the given URI.

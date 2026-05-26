@@ -1,50 +1,69 @@
-//! Workspace symbol handler — aggregates every document's
-//! [`document_symbols`](super::document_symbols) output, flattens it,
-//! and filters by case-insensitive substring match (matching the TS
-//! reference).
+//! Thin converter from the IDE-shape `analysis::ide::workspace_symbols`
+//! ADT to `lsp_types::WorkspaceSymbol`. Production logic lives in the
+//! analysis crate so the same flattening + substring filter is
+//! reachable from the wasm bridge unchanged.
 
+use greycat_analyzer_analysis::ide::document_symbols::SymbolKind as IdeSymbolKind;
+use greycat_analyzer_analysis::ide::types::{
+    Location as IdeLocation, Position as IdePosition, Range as IdeRange,
+};
+use greycat_analyzer_analysis::ide::workspace_symbols::{
+    WorkspaceSymbol as IdeWorkspaceSymbol, workspace_symbols as workspace_symbols_inner,
+};
 use greycat_analyzer_core::SourceEncoding;
-use lsp_types::{DocumentSymbol, Location, OneOf, Uri, WorkspaceSymbol};
-
-use super::document_symbols::document_symbols;
+use lsp_types::{Location, OneOf, Position, Range, SymbolKind, Uri, WorkspaceSymbol};
 
 pub fn workspace_symbols(
     docs: impl IntoIterator<Item = (Uri, String, String)>,
     query: &str,
     encoding: SourceEncoding,
 ) -> Vec<WorkspaceSymbol> {
-    let needle = query.to_lowercase();
-    let mut out = Vec::new();
-    for (uri, lib, text) in docs {
-        let tree = greycat_analyzer_syntax::parse(&text);
-        let symbols = document_symbols(&text, &lib, tree.root_node(), encoding);
-        flatten_workspace(&uri, &symbols, &needle, &mut out);
-    }
-    out
+    workspace_symbols_inner(docs, query, encoding)
+        .into_iter()
+        .map(to_lsp)
+        .collect()
 }
 
-fn flatten_workspace(
-    uri: &Uri,
-    symbols: &[DocumentSymbol],
-    needle: &str,
-    out: &mut Vec<WorkspaceSymbol>,
-) {
-    for sym in symbols {
-        if needle.is_empty() || sym.name.to_lowercase().contains(needle) {
-            out.push(WorkspaceSymbol {
-                name: sym.name.clone(),
-                kind: sym.kind,
-                tags: sym.tags.clone(),
-                container_name: None,
-                location: OneOf::Left(Location {
-                    uri: uri.clone(),
-                    range: sym.selection_range,
-                }),
-                data: None,
-            });
-        }
-        if let Some(children) = &sym.children {
-            flatten_workspace(uri, children, needle, out);
-        }
+fn to_lsp(sym: IdeWorkspaceSymbol) -> WorkspaceSymbol {
+    WorkspaceSymbol {
+        name: sym.name,
+        kind: kind_to_lsp(sym.kind),
+        tags: None,
+        container_name: None,
+        location: OneOf::Left(location_to_lsp(sym.location)),
+        data: None,
+    }
+}
+
+fn location_to_lsp(loc: IdeLocation) -> Location {
+    Location {
+        uri: loc.uri,
+        range: range_to_lsp(loc.range),
+    }
+}
+
+fn kind_to_lsp(kind: IdeSymbolKind) -> SymbolKind {
+    match kind {
+        IdeSymbolKind::Function => SymbolKind::FUNCTION,
+        IdeSymbolKind::Class => SymbolKind::CLASS,
+        IdeSymbolKind::Enum => SymbolKind::ENUM,
+        IdeSymbolKind::Variable => SymbolKind::VARIABLE,
+        IdeSymbolKind::Key => SymbolKind::KEY,
+        IdeSymbolKind::Field => SymbolKind::FIELD,
+        IdeSymbolKind::Method => SymbolKind::METHOD,
+    }
+}
+
+fn range_to_lsp(r: IdeRange) -> Range {
+    Range {
+        start: pos_to_lsp(r.start),
+        end: pos_to_lsp(r.end),
+    }
+}
+
+fn pos_to_lsp(p: IdePosition) -> Position {
+    Position {
+        line: p.line,
+        character: p.character,
     }
 }
