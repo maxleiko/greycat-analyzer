@@ -1,11 +1,15 @@
 //! Completion subsystem — directive / pragma / library-version / scope /
 //! member / static / type-position / object-field completion. This is
 //! ~2700 lines of dense logic largely independent from the rest of the
-//! analysis pipeline. Currently emits `lsp_types::CompletionItem`
-//! directly; a future refactor will introduce a `CompletionCandidate`
-//! ADT and demote the LSP shapes to a thin server-side converter.
+//! analysis pipeline. Emits IDE-shape `CompletionItem` ADTs decoupled
+//! from `lsp_types`; the LSP server's `capabilities/completion.rs`
+//! converts to `lsp_types::CompletionItem` at the wire boundary and the
+//! wasm bridge consumes the same shape unchanged.
 
-use greycat_analyzer_core::lsp_types::{self, *};
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
+
+use greycat_analyzer_core::lsp_types::{Position, Uri};
 use greycat_analyzer_core::{
     ItemId, SourceEncoding, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
 };
@@ -15,12 +19,96 @@ use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::conv::{byte_range_to_lsp, byte_to_position, position_to_byte, stmt_byte_range};
+use crate::conv::{position_to_byte, stmt_byte_range};
 use crate::ide::render::{
     RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_fn_signature_compact,
     render_type_ref_with_subst,
 };
+use crate::ide::types::{Range, TextEdit};
 use crate::project::{ModuleAnalysis, ProjectAnalysis};
+
+/// IDE-shape `CompletionItemKind` — mirror of the subset of
+/// `lsp_types::CompletionItemKind` constants that the analyzer
+/// produces. Field-for-field crossable to LSP at the wire boundary;
+/// also reachable from the wasm bridge without `lsp_types` in scope.
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionItemKind {
+    Function,
+    Method,
+    Variable,
+    Field,
+    Class,
+    Enum,
+    EnumMember,
+    Constant,
+    Module,
+    Folder,
+    Keyword,
+    Text,
+    TypeParameter,
+}
+
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertTextFormat {
+    PlainText,
+    Snippet,
+}
+
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[derive(Debug, Clone)]
+pub struct CompletionItemLabelDetails {
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub detail: Option<String>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub description: Option<String>,
+}
+
+/// IDE-shape completion item. Field set matches the analyzer's actual
+/// production surface; the LSP / wasm shapes wrap or expose this as-is.
+///
+/// `data` carries an opaque server-side payload for the `@library`
+/// version-completion placeholder. It is wasm-skipped — JS consumers
+/// reach it through [`extract_lib_version_placeholder`] rather than
+/// inspecting the raw JSON. `text_edit` is the simplified single-range
+/// edit shape (no insert / replace split — the analyzer never emits the
+/// LSP `InsertReplaceEdit` variant), so the server wrapper lifts it
+/// into `CompletionTextEdit::Edit(...)` at the wire boundary.
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[derive(Debug, Clone, Default)]
+pub struct CompletionItem {
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub label: String,
+    pub kind: Option<CompletionItemKind>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub detail: Option<String>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub documentation: Option<String>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub insert_text: Option<String>,
+    pub insert_text_format: Option<InsertTextFormat>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub sort_text: Option<String>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub filter_text: Option<String>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub label_details: Option<CompletionItemLabelDetails>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub text_edit: Option<TextEdit>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub additional_text_edits: Option<Vec<TextEdit>>,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(skip))]
+    pub data: Option<serde_json::Value>,
+}
+
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[derive(Debug, Clone, Default)]
+pub struct CompletionList {
+    pub is_incomplete: bool,
+    #[cfg_attr(feature = "wasm", wasm_bindgen(getter_with_clone))]
+    pub items: Vec<CompletionItem>,
+}
 
 // P15.2.3
 /// Completion with project context. Same dispatcher chain as
@@ -179,7 +267,7 @@ fn include_dir_completion(
         }
         items.push(CompletionItem {
             label: name_str.to_string(),
-            kind: Some(CompletionItemKind::FOLDER),
+            kind: Some(CompletionItemKind::Folder),
             detail: Some("@include directory".into()),
             insert_text: Some(name_str.to_string()),
             ..Default::default()
@@ -248,7 +336,7 @@ struct LibVersionPlaceholder {
     /// Inner-content range of the version string (between the quotes).
     /// The concrete items use this as their `textEdit.range` so each
     /// version replaces exactly the user's partial input.
-    range: lsp_types::Range,
+    range: Range,
 }
 
 /// Detect when the cursor sits inside the *version* slot of an
@@ -309,10 +397,7 @@ fn library_version_completion(
         .get(inner_start..cursor_byte.min(inner_end))
         .unwrap_or("")
         .to_string();
-    let range = lsp_types::Range {
-        start: byte_to_position(text, inner_start, encoding),
-        end: byte_to_position(text, inner_end, encoding),
-    };
+    let range = Range::from_byte_range(text, &(inner_start..inner_end), encoding);
     let placeholder = LibVersionPlaceholder {
         kind: LIB_VERSION_PLACEHOLDER_KIND.into(),
         lib: lib_name.clone(),
@@ -321,7 +406,7 @@ fn library_version_completion(
     };
     let item = CompletionItem {
         label: format!("Fetching '{lib_name}' versions..."),
-        kind: Some(CompletionItemKind::MODULE),
+        kind: Some(CompletionItemKind::Module),
         data: Some(serde_json::to_value(&placeholder).ok()?),
         ..Default::default()
     };
@@ -369,7 +454,7 @@ pub fn extract_lib_version_placeholder(list: &CompletionList) -> Option<LibVersi
 pub struct LibVersionPayload {
     pub lib: String,
     pub typed: String,
-    pub range: lsp_types::Range,
+    pub range: Range,
 }
 
 /// Replace the lazy placeholder with concrete version items. Driven
@@ -417,16 +502,16 @@ pub fn resolve_library_version_completion(
             let detail = channel.map(|c| format!("[{c}]"));
             CompletionItem {
                 label: v.text.clone(),
-                kind: Some(CompletionItemKind::CONSTANT),
+                kind: Some(CompletionItemKind::Constant),
                 label_details: Some(CompletionItemLabelDetails {
                     detail,
                     description: Some(v.last_modification.clone()),
                 }),
                 sort_text: Some(format!("{tier}_{i:05}")),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                text_edit: Some(TextEdit {
                     range: payload.range,
                     new_text: v.text,
-                })),
+                }),
                 ..Default::default()
             }
         })
@@ -507,33 +592,33 @@ fn pragma_items() -> Vec<CompletionItem> {
     vec![
         CompletionItem {
             label: "@library".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("library(\"$1\", \"$2\");$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("Adds a library to the project".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "@include".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("include(\"$1\");$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("Adds a source directory to the project".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "@role".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("role(\"$1\", \"$2\");$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("Defines a role for the project".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "@permission".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("permission(\"$1\")$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some(
                 "Defines a permission for the project, or give a permission to a function".into(),
             ),
@@ -541,14 +626,14 @@ fn pragma_items() -> Vec<CompletionItem> {
         },
         CompletionItem {
             label: "@expose".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("expose".into()),
             detail: Some("Registers the function as an http endpoint".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "@volatile".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("volatile".into()),
             detail: Some(
                 "Volatile types cannot be stored in graph and have loose upgrade rules".into(),
@@ -558,34 +643,34 @@ fn pragma_items() -> Vec<CompletionItem> {
         // Fmt-specific pragmas
         CompletionItem {
             label: "@fmt_line_width".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("fmt_line_width($1);$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("Maximum line width before a `Group` breaks. Default: `120`".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "@fmt_indent".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("fmt_indent($1);$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("Spaces per indent step. Default: `4`".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "@fmt_eol_last".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("fmt_eol_last($1);$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("Append a trailing newline at end of file. Default: `false`".into()),
             ..Default::default()
         },
         // Lint-specific pragmas
         CompletionItem {
             label: "@lint_off".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("lint_off(\"$1\");$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some(
                 "Silence specific lint rule(s) globally. Variadic string arguments.".into(),
             ),
@@ -593,9 +678,9 @@ fn pragma_items() -> Vec<CompletionItem> {
         },
         CompletionItem {
             label: "@lint_on".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("lint_on(\"$1\");$0".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some(
                 "Enable advisory lint rule(s) that ship off by default. Variadic string arguments."
                     .into(),
@@ -694,7 +779,7 @@ fn directive_completion(text: &str, cursor_byte: usize) -> Option<Vec<Completion
         .filter(|r| rule_typed.is_empty() || r.name.starts_with(rule_typed))
         .map(|r| CompletionItem {
             label: r.name.into(),
-            kind: Some(CompletionItemKind::ENUM_MEMBER),
+            kind: Some(CompletionItemKind::EnumMember),
             insert_text: Some(r.name.into()),
             detail: Some(r.summary.into()),
             ..Default::default()
@@ -714,33 +799,33 @@ fn directive_items() -> Vec<CompletionItem> {
     vec![
         CompletionItem {
             label: "gcl-lint-off".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-lint-off ${1:rule}".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("silence the named rule(s) until matching `gcl-lint-on` (or EOF)".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "gcl-lint-on".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-lint-on ${1:rule}".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("close a prior `gcl-lint-off` for the named rule(s)".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "gcl-lint-next-off".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-lint-next-off ${1:rule}".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some("silence the named rule(s) for the next AST item only".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "gcl-lint-file-off".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-lint-file-off ${1:rule}".into()),
-            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            insert_text_format: Some(InsertTextFormat::Snippet),
             detail: Some(
                 "silence the named rule(s) for the whole file (must appear at module head)".into(),
             ),
@@ -748,28 +833,28 @@ fn directive_items() -> Vec<CompletionItem> {
         },
         CompletionItem {
             label: "gcl-fmt-off".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-fmt-off".into()),
             detail: Some("preserve source verbatim until matching `gcl-fmt-on` (or EOF)".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "gcl-fmt-on".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-fmt-on".into()),
             detail: Some("close a prior `gcl-fmt-off`".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "gcl-fmt-skip".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-fmt-skip".into()),
             detail: Some("preserve the next AST node verbatim".into()),
             ..Default::default()
         },
         CompletionItem {
             label: "gcl-fmt-file-off".into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some("gcl-fmt-file-off".into()),
             detail: Some("preserve the whole file verbatim (must appear at module head)".into()),
             ..Default::default()
@@ -837,7 +922,7 @@ fn keyword_completion(
         .filter(|kw| prefix_lower.is_empty() || kw.starts_with(&prefix_lower))
         .map(|kw| CompletionItem {
             label: (*kw).into(),
-            kind: Some(CompletionItemKind::KEYWORD),
+            kind: Some(CompletionItemKind::Keyword),
             insert_text: Some((*kw).into()),
             ..Default::default()
         })
@@ -960,7 +1045,7 @@ fn is_ident_like(s: &str) -> bool {
 fn enum_variant_completion_item(
     name: &str,
     in_string: bool,
-    replace_range: lsp_types::Range,
+    replace_range: Range,
 ) -> CompletionItem {
     let display = if in_string || is_ident_like(name) {
         name.to_string()
@@ -979,11 +1064,11 @@ fn enum_variant_completion_item(
     };
     CompletionItem {
         label: display.clone(),
-        kind: Some(CompletionItemKind::ENUM_MEMBER),
-        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+        kind: Some(CompletionItemKind::EnumMember),
+        text_edit: Some(TextEdit {
             range: replace_range,
             new_text: display,
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -999,19 +1084,19 @@ fn enum_variant_completion_item(
 fn static_completion_item(
     name: String,
     kind: CompletionItemKind,
-    replace_range: lsp_types::Range,
+    replace_range: Range,
     label_details: Option<CompletionItemLabelDetails>,
     detail: Option<String>,
-    documentation: Option<Documentation>,
+    documentation: Option<String>,
 ) -> CompletionItem {
     CompletionItem {
         label: name.clone(),
         label_details,
         kind: Some(kind),
-        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+        text_edit: Some(TextEdit {
             range: replace_range,
             new_text: name,
-        })),
+        }),
         detail,
         documentation,
         ..Default::default()
@@ -1093,7 +1178,7 @@ fn ident_or_keyword_completion(
         if seen.insert((*kw).into()) {
             items.push(CompletionItem {
                 label: (*kw).into(),
-                kind: Some(CompletionItemKind::KEYWORD),
+                kind: Some(CompletionItemKind::Keyword),
                 insert_text: Some((*kw).into()),
                 sort_text: Some(format!("z_{kw}")),
                 ..Default::default()
@@ -1189,11 +1274,11 @@ fn ident_or_keyword_completion(
         // FUNCTION only for actual fn names — otherwise the call-paren
         // post-pass appends `($0)` and turns `NaN` into `NaN()`.
         let kind = if project.index.non_native_fn_names.contains(name_sym) {
-            CompletionItemKind::FUNCTION
+            CompletionItemKind::Function
         } else if project.index.runtime_globals.contains_key(name_sym) {
-            CompletionItemKind::CONSTANT
+            CompletionItemKind::Constant
         } else {
-            CompletionItemKind::VARIABLE
+            CompletionItemKind::Variable
         };
         items.push(CompletionItem {
             label: name.to_string(),
@@ -1213,7 +1298,7 @@ fn ident_or_keyword_completion(
         }
         items.push(CompletionItem {
             label: name.to_string(),
-            kind: Some(CompletionItemKind::MODULE),
+            kind: Some(CompletionItemKind::Module),
             insert_text: Some(name.to_string()),
             sort_text: Some(format!("x_{name}")),
             ..Default::default()
@@ -1241,7 +1326,7 @@ fn ident_or_keyword_completion(
 ///
 /// 2. **Call-parens** — for FUNCTION / METHOD items whose `(...)` isn't
 ///    already present immediately after the identifier, append `($0)`
-///    and switch to `InsertTextFormat::SNIPPET` so the cursor lands
+///    and switch to `InsertTextFormat::Snippet` so the cursor lands
 ///    between the parens. The "parens already there" check probes the
 ///    byte right after `ident_end`, *not* the cursor — so on
 ///    `x.|chars()` (cursor before `chars`, parens after `chars`) the
@@ -1263,7 +1348,7 @@ fn apply_call_paren_snippet(
     let ident_end = cursor_byte + suffix_len;
     let parens_already_there = next_non_ws_is_open_paren(text.as_bytes(), ident_end);
     let replace_range =
-        (suffix_len > 0).then(|| byte_range_to_lsp(text, &(ident_start..ident_end), encoding));
+        (suffix_len > 0).then(|| Range::from_byte_range(text, &(ident_start..ident_end), encoding));
 
     for item in items.iter_mut() {
         // 1) Append `($0)` to FUNCTION / METHOD items unless the
@@ -1275,11 +1360,11 @@ fn apply_call_paren_snippet(
         if !parens_already_there
             && matches!(
                 item.kind,
-                Some(CompletionItemKind::FUNCTION) | Some(CompletionItemKind::METHOD)
+                Some(CompletionItemKind::Function) | Some(CompletionItemKind::Method)
             )
-            && !matches!(item.insert_text_format, Some(InsertTextFormat::SNIPPET))
+            && !matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
         {
-            if let Some(CompletionTextEdit::Edit(te)) = item.text_edit.as_mut() {
+            if let Some(te) = item.text_edit.as_mut() {
                 te.new_text = format!("{}($0)", te.new_text);
             } else {
                 let base = item
@@ -1288,7 +1373,7 @@ fn apply_call_paren_snippet(
                     .unwrap_or_else(|| item.label.clone());
                 item.insert_text = Some(format!("{base}($0)"));
             }
-            item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+            item.insert_text_format = Some(InsertTextFormat::Snippet);
         }
 
         // 2) When the cursor is mid-identifier, lift `insert_text` into
@@ -1302,7 +1387,7 @@ fn apply_call_paren_snippet(
                 .insert_text
                 .clone()
                 .unwrap_or_else(|| item.label.clone());
-            item.text_edit = Some(CompletionTextEdit::Edit(TextEdit { range, new_text }));
+            item.text_edit = Some(TextEdit { range, new_text });
         }
     }
 }
@@ -1343,7 +1428,7 @@ fn scope_name_meta(
 ) -> (
     Option<CompletionItemLabelDetails>,
     Option<String>,
-    Option<Documentation>,
+    Option<String>,
 ) {
     use crate::ide::scope::NameSource;
     match source {
@@ -1418,7 +1503,7 @@ fn foreign_decl_completion_meta(
 ) -> (
     Option<CompletionItemLabelDetails>,
     Option<String>,
-    Option<Documentation>,
+    Option<String>,
 ) {
     let Some((uri, decl_id, _)) = locs.first() else {
         return (None, None, None);
@@ -1470,14 +1555,14 @@ fn decl_locs_kind(
         && let Some(m) = project.module(uri)
     {
         match &m.hir.decls[*decl_id] {
-            Decl::Fn(_) => CompletionItemKind::FUNCTION,
-            Decl::Type(_) => CompletionItemKind::CLASS,
-            Decl::Enum(_) => CompletionItemKind::ENUM,
-            Decl::Var(_) => CompletionItemKind::VARIABLE,
-            Decl::Pragma(_) => CompletionItemKind::CONSTANT,
+            Decl::Fn(_) => CompletionItemKind::Function,
+            Decl::Type(_) => CompletionItemKind::Class,
+            Decl::Enum(_) => CompletionItemKind::Enum,
+            Decl::Var(_) => CompletionItemKind::Variable,
+            Decl::Pragma(_) => CompletionItemKind::Constant,
         }
     } else {
-        CompletionItemKind::TEXT
+        CompletionItemKind::Text
     }
 }
 
@@ -1493,13 +1578,13 @@ fn scope_kind_to_completion(
 ) -> (CompletionItemKind, &'static str) {
     use crate::ide::scope::ScopeNameKind as SK;
     match kind {
-        SK::Fn => (CompletionItemKind::FUNCTION, "n_"),
-        SK::Type => (CompletionItemKind::CLASS, "n_"),
-        SK::Enum => (CompletionItemKind::ENUM, "n_"),
-        SK::Var => (CompletionItemKind::VARIABLE, "n_"),
-        SK::Param => (CompletionItemKind::VARIABLE, "a_"),
-        SK::Local => (CompletionItemKind::VARIABLE, "b_"),
-        SK::Generic => (CompletionItemKind::TYPE_PARAMETER, "g_"),
+        SK::Fn => (CompletionItemKind::Function, "n_"),
+        SK::Type => (CompletionItemKind::Class, "n_"),
+        SK::Enum => (CompletionItemKind::Enum, "n_"),
+        SK::Var => (CompletionItemKind::Variable, "n_"),
+        SK::Param => (CompletionItemKind::Variable, "a_"),
+        SK::Local => (CompletionItemKind::Variable, "b_"),
+        SK::Generic => (CompletionItemKind::TypeParameter, "g_"),
     }
 }
 
@@ -1706,10 +1791,7 @@ fn member_completion(
         if !is_arrow && !inner_items.is_empty() {
             // `.` → `->` rewrite. The edit replaces the `.` byte with
             // `->` so the accepted item lands in the correct shape.
-            let edit_range = lsp_types::Range {
-                start: byte_to_position(text, sep_start, encoding),
-                end: byte_to_position(text, sep_end, encoding),
-            };
+            let edit_range = Range::from_byte_range(text, &(sep_start..sep_end), encoding);
             for item in &mut inner_items {
                 item.additional_text_edits = Some(vec![TextEdit {
                     range: edit_range,
@@ -1744,10 +1826,7 @@ fn member_completion(
         .map(|(id, _)| crate::lint::chain_has_upstream_nullsafe(&module.hir, id))
         .unwrap_or(false);
     if receiver_nullable && !already_nullsafe && !chain_protected {
-        let insert_at = lsp_types::Range {
-            start: byte_to_position(text, sep_start, encoding),
-            end: byte_to_position(text, sep_start, encoding),
-        };
+        let insert_at = Range::from_byte_range(text, &(sep_start..sep_start), encoding);
         let prefix = if is_arrow { "?->" } else { "?." };
         for item in &mut items {
             let bare = item.label.clone();
@@ -2123,7 +2202,7 @@ fn collect_type_members(
                 detail: Some(compact.clone()),
                 description: None,
             }),
-            kind: Some(CompletionItemKind::FIELD),
+            kind: Some(CompletionItemKind::Field),
             insert_text: Some(name.clone()),
             detail: Some(compact),
             documentation: doc_to_markup(a.doc.as_deref()),
@@ -2150,7 +2229,7 @@ fn collect_type_members(
                 detail: Some(compact.clone()),
                 description: None,
             }),
-            kind: Some(CompletionItemKind::METHOD),
+            kind: Some(CompletionItemKind::Method),
             insert_text: Some(name),
             detail: Some(compact),
             documentation: doc_to_markup(m.doc.as_deref()),
@@ -2159,18 +2238,17 @@ fn collect_type_members(
     }
 }
 
-/// Wrap a doc-comment paragraph as LSP markup so completion-item
-/// tooltips render it correctly. Returns `None` for missing / blank
-/// docs so the field stays absent on the wire.
-fn doc_to_markup(doc: Option<&str>) -> Option<Documentation> {
+/// Carry a doc-comment paragraph through to the completion item as
+/// markdown text. The server wrapper lifts it into the LSP
+/// `Documentation::MarkupContent(MarkupKind::Markdown)` shape; the
+/// wasm bridge surfaces the bare string. Returns `None` for missing /
+/// blank docs so the field stays absent on the wire.
+fn doc_to_markup(doc: Option<&str>) -> Option<String> {
     let trimmed = doc?.trim();
     if trimmed.is_empty() {
         return None;
     }
-    Some(Documentation::MarkupContent(MarkupContent {
-        kind: MarkupKind::Markdown,
-        value: trimmed.to_string(),
-    }))
+    Some(trimmed.to_string())
 }
 
 // =============================================================================
@@ -2199,10 +2277,7 @@ fn static_completion(
 ) -> Option<Vec<CompletionItem>> {
     let ctx = static_receiver_at(text, cursor_byte)?;
     let prefix_lower = ctx.typed.to_lowercase();
-    let replace_range = lsp_types::Range {
-        start: byte_to_position(text, ctx.replace_range.start, encoding),
-        end: byte_to_position(text, ctx.replace_range.end, encoding),
-    };
+    let replace_range = Range::from_byte_range(text, &ctx.replace_range, encoding);
 
     let mut items: Vec<CompletionItem> = Vec::new();
 
@@ -2240,7 +2315,7 @@ fn static_completion(
                     let documentation = doc_to_markup(m.doc.as_deref());
                     items.push(static_completion_item(
                         name,
-                        CompletionItemKind::METHOD,
+                        CompletionItemKind::Method,
                         replace_range,
                         label_details,
                         Some(compact),
@@ -2269,7 +2344,7 @@ fn static_completion(
                     let documentation = doc_to_markup(attr.doc.as_deref());
                     items.push(static_completion_item(
                         name,
-                        CompletionItemKind::CONSTANT,
+                        CompletionItemKind::Constant,
                         replace_range,
                         label_details,
                         detail,
@@ -2316,10 +2391,10 @@ fn static_completion(
             }
             let decl = &mod_analysis.hir.decls[decl_id];
             let kind = match decl {
-                Decl::Fn(_) => CompletionItemKind::FUNCTION,
-                Decl::Type(_) => CompletionItemKind::CLASS,
-                Decl::Enum(_) => CompletionItemKind::ENUM,
-                Decl::Var(_) => CompletionItemKind::VARIABLE,
+                Decl::Fn(_) => CompletionItemKind::Function,
+                Decl::Type(_) => CompletionItemKind::Class,
+                Decl::Enum(_) => CompletionItemKind::Enum,
+                Decl::Var(_) => CompletionItemKind::Variable,
                 Decl::Pragma(_) => continue,
             };
             let (label_details, detail) = match decl {
@@ -2553,8 +2628,8 @@ fn type_position_completion(
     {
         for decl_id in &m.decls {
             let kind = match &module.hir.decls[*decl_id] {
-                Decl::Type(_) => CompletionItemKind::CLASS,
-                Decl::Enum(_) => CompletionItemKind::ENUM,
+                Decl::Type(_) => CompletionItemKind::Class,
+                Decl::Enum(_) => CompletionItemKind::Enum,
                 _ => continue,
             };
             if let Some(name_id) = module.hir.decls[*decl_id].name() {
@@ -2566,7 +2641,7 @@ fn type_position_completion(
     // In-scope generic type-params from the enclosing fn / type.
     if let Some(module) = project.module(uri) {
         for (name, kind, _, _) in scope_names_at(&module.hir, project.symbols(), cursor_byte) {
-            if matches!(kind, CompletionItemKind::TYPE_PARAMETER) {
+            if matches!(kind, CompletionItemKind::TypeParameter) {
                 push(&mut items, &mut seen, &name, kind);
             }
         }
@@ -2578,8 +2653,8 @@ fn type_position_completion(
             && let Some(m) = project.module(u)
         {
             let kind = match &m.hir.decls[*d] {
-                Decl::Type(_) => CompletionItemKind::CLASS,
-                Decl::Enum(_) => CompletionItemKind::ENUM,
+                Decl::Type(_) => CompletionItemKind::Class,
+                Decl::Enum(_) => CompletionItemKind::Enum,
                 _ => continue,
             };
             push(&mut items, &mut seen, name, kind);
@@ -2589,13 +2664,13 @@ fn type_position_completion(
     for &p in &[
         "int", "float", "bool", "char", "String", "time", "duration", "geo", "any",
     ] {
-        push(&mut items, &mut seen, p, CompletionItemKind::CLASS);
+        push(&mut items, &mut seen, p, CompletionItemKind::Class);
     }
     // Module names — type slots can read `module::Foo`, so module
     // names are valid here as the leading segment.
     for name_sym in project.index.module_names.keys() {
         let name = project.index.symbols.resolve(name_sym);
-        push(&mut items, &mut seen, name, CompletionItemKind::MODULE);
+        push(&mut items, &mut seen, name, CompletionItemKind::Module);
     }
 
     if items.is_empty() {
@@ -2779,7 +2854,7 @@ fn emit_attrs(
                 detail: Some(compact.clone()),
                 description: None,
             }),
-            kind: Some(CompletionItemKind::FIELD),
+            kind: Some(CompletionItemKind::Field),
             insert_text: Some(format!("{name}: ")),
             detail: Some(compact),
             documentation: doc_to_markup(a.doc.as_deref()),

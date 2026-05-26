@@ -20,6 +20,7 @@
 
 use std::str::FromStr;
 
+use greycat_analyzer_analysis::ide::completion::{CompletionList, completion_with_project};
 use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
 use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
@@ -253,6 +254,37 @@ impl Project {
             &doc.text,
             &doc.lib,
             doc.root_node(),
+            self.encoding,
+        ))
+    }
+
+    /// Scope / member / static / type-position / object-field /
+    /// directive / pragma completion at the cursor. Returns `None` when
+    /// the URI is unknown or when no completion source produces a list.
+    pub fn completion(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<CompletionList>, JsValue> {
+        let uri = parse_uri(uri)?;
+        let Some(cell) = self.manager.get(&uri) else {
+            return Ok(None);
+        };
+        let doc = cell.borrow();
+        let pos = Position { line, character };
+        // `project_root: None` — wasm has no filesystem, so the
+        // `@include` directory walk in [`include_dir_completion`] short-
+        // circuits. Everything else (scope, member, static, type-position,
+        // object-field, directive, pragma, library-version) works the
+        // same as the LSP path.
+        Ok(completion_with_project(
+            &doc.text,
+            doc.root_node(),
+            pos,
+            &uri,
+            &self.analysis,
+            None,
             self.encoding,
         ))
     }

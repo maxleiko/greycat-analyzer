@@ -9,14 +9,14 @@ use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::conv::byte_to_position;
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     pub line: u32,
     pub character: u32,
 }
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Range {
     pub start: Position,
     pub end: Position,

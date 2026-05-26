@@ -32,6 +32,17 @@ fn pos(line: u32, character: u32) -> Position {
     Position { line, character }
 }
 
+fn ide_pos(line: u32, character: u32) -> greycat_analyzer_analysis::ide::types::Position {
+    greycat_analyzer_analysis::ide::types::Position { line, character }
+}
+
+fn ide_range(
+    start: greycat_analyzer_analysis::ide::types::Position,
+    end: greycat_analyzer_analysis::ide::types::Position,
+) -> greycat_analyzer_analysis::ide::types::Range {
+    greycat_analyzer_analysis::ide::types::Range { start, end }
+}
+
 fn uri() -> Uri {
     Uri::from_str("file:///test.gcl").unwrap()
 }
@@ -721,8 +732,8 @@ fn completion_inside_at_library_version_emits_placeholder() {
     assert_eq!(payload.lib, "std");
     assert_eq!(payload.typed, "");
     // Inner-content range covers the gap between the quotes.
-    assert_eq!(payload.range.start, pos(0, 17));
-    assert_eq!(payload.range.end, pos(0, 17));
+    assert_eq!(payload.range.start, ide_pos(0, 17));
+    assert_eq!(payload.range.end, ide_pos(0, 17));
 }
 
 /// P15.3 — cursor in the *name* slot (first arg) does NOT emit a
@@ -796,10 +807,7 @@ fn resolve_lib_version_emits_sorted_items_with_channel_detail() {
     let payload = capabilities::LibVersionPayload {
         lib: "std".into(),
         typed: "".into(),
-        range: lsp_types::Range {
-            start: pos(0, 17),
-            end: pos(0, 17),
-        },
+        range: ide_range(ide_pos(0, 17), ide_pos(0, 17)),
     };
     let list = capabilities::resolve_library_version_completion(&payload, &stub);
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
@@ -817,7 +825,13 @@ fn resolve_lib_version_emits_sorted_items_with_channel_detail() {
     // textEdit replaces the inner-content range, not the whole string.
     match stable.text_edit.as_ref().unwrap() {
         CompletionTextEdit::Edit(edit) => {
-            assert_eq!(edit.range, payload.range);
+            assert_eq!(
+                edit.range,
+                lsp_types::Range {
+                    start: pos(0, 17),
+                    end: pos(0, 17),
+                }
+            );
             assert_eq!(edit.new_text, "7.8.166-stable");
         }
         _ => panic!("expected plain TextEdit"),
@@ -876,10 +890,7 @@ fn resolve_lib_version_biases_matching_channel_first() {
     let payload = capabilities::LibVersionPayload {
         lib: "core".into(),
         typed: "8.0.0-dev".into(),
-        range: lsp_types::Range {
-            start: pos(0, 0),
-            end: pos(0, 0),
-        },
+        range: ide_range(ide_pos(0, 0), ide_pos(0, 0)),
     };
     let list = capabilities::resolve_library_version_completion(&payload, &stub);
     let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
