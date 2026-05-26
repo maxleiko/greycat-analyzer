@@ -306,10 +306,13 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
 // P22.1
 /// Pick a safe quickfix for `unused-local`:
 ///
-/// - For for-init (`for (var i = …; …)`) and for-in (`for (k, v in …)`)
-///   binders, the ident sits in a structural slot — the binding can't
-///   be removed without breaking the loop — so rename to `_name`,
-///   matching `unused-param`'s shape.
+/// - For for-in (`for (k, v in …)`) binders, rename to bare `_` — the
+///   runtime treats `_` in a for-in head as a no-binding slot
+///   (multiple `_`s are legal, no stack allocation, no scope entry),
+///   so the cheapest and clearest fix is to drop the name entirely.
+/// - For for-init (`for (var i = …; …)`) binders, the binding is
+///   real (the runtime allocates `i`), so rename to `_name` instead —
+///   matches `unused-param`'s shape.
 /// - For a plain `var x = expr;` with **no initializer** or an
 ///   initializer whose RHS is provably side-effect-free, delete the
 ///   whole statement.
@@ -322,8 +325,19 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
 ///   shared `ide::scope::names_in_scope_at`, which mirrors the
 ///   resolver's lexical scoping.
 fn unused_local_fix(cx: &QuickfixCx<'_>, ident_start: usize, ident_end: usize) -> Vec<TextEdit> {
-    // for-init / for-in: rename (the bind is structurally required).
-    if enclosing_node_range(cx.root, ident_start, &["for_stmt", "for_in_stmt"]).is_some() {
+    // for-in: bare `_` is a no-binding slot in the runtime, so prefer
+    // that over `_name`.
+    if enclosing_kind(cx.root, ident_start, "for_in_stmt").is_some() {
+        if ident_end <= ident_start {
+            return Vec::new();
+        }
+        return vec![TextEdit {
+            byte_range: ident_start..ident_end,
+            new_text: "_".to_string(),
+        }];
+    }
+    // for-init: rename (the bind is structurally required, real local).
+    if enclosing_node_range(cx.root, ident_start, &["for_stmt"]).is_some() {
         return unused_param_fix(cx.text, ident_start, ident_end);
     }
     let Some(var_decl) = enclosing_kind(cx.root, ident_start, "var_decl") else {
@@ -1343,9 +1357,55 @@ mod tests {
         let edits = fix("unused-local", src, k_start..(k_start + 1));
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].byte_range, k_start..(k_start + 1));
-        assert_eq!(edits[0].new_text, "_k");
+        // `_` is the runtime's no-binding slot in for-in heads, so
+        // prefer it over `_k`.
+        assert_eq!(edits[0].new_text, "_");
         let mut after = src.to_string();
         after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    // Multi-char for-in binder still collapses to bare `_` — the rule
+    // is "this slot doesn't bind anything," not "prefix with `_`."
+    #[test]
+    fn unused_local_for_in_binder_collapses_to_underscore() {
+        let src = "fn f(items: Array<int>) {\n    for (idx, val in items) {}\n}\n";
+        let idx_start = src.find("(idx").unwrap() + 1;
+        let edits = fix("unused-local", src, idx_start..(idx_start + 3));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].byte_range, idx_start..(idx_start + 3));
+        assert_eq!(edits[0].new_text, "_");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), &edits[0].new_text);
+        assert!(after.contains("for (_, val in items)"), "after = {after:?}");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    // Two unused for-in binders fixed one after the other — both
+    // collapse to `_`, producing the legal `for (_, _ in arr)` shape
+    // without tripping `local-rebind`.
+    #[test]
+    fn unused_local_for_in_double_collapse_is_legal() {
+        let src = "fn f(arr: Array<int>) {\n    for (k, v in arr) {}\n}\n";
+        let k_start = src.find("(k").unwrap() + 1;
+        let v_start = src.find("v in").unwrap();
+        // Apply both edits (later one first to keep offsets stable).
+        let v_edits = fix("unused-local", src, v_start..(v_start + 1));
+        let k_edits = fix("unused-local", src, k_start..(k_start + 1));
+        assert_eq!(v_edits[0].new_text, "_");
+        assert_eq!(k_edits[0].new_text, "_");
+        let mut after = src.to_string();
+        after.replace_range(v_edits[0].byte_range.clone(), &v_edits[0].new_text);
+        after.replace_range(k_edits[0].byte_range.clone(), &k_edits[0].new_text);
+        assert!(after.contains("for (_, _ in arr)"), "after = {after:?}");
         let tree = greycat_analyzer_syntax::parse(&after);
         assert!(
             !tree.root_node().has_error(),

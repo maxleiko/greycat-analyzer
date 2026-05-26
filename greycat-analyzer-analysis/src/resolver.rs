@@ -825,6 +825,14 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
                 if let Some(t) = p.ty {
                     visit_type_ref(cx, t);
                 }
+                // `_` in for-in is a runtime-special no-binding slot —
+                // the compiler emits no local, so multiple `_`s in the
+                // same `for (..)` head are legal (`for (_, _ in arr)`).
+                // Skip `bind_value` so the scope stays empty and the
+                // rebind detector doesn't false-positive `local-rebind`.
+                if &cx.index.symbols[cx.hir.idents[p.name].symbol] == "_" {
+                    continue;
+                }
                 cx.bind_value(p.name, Definition::Local(p.name));
             }
             visit_block(cx, &body);
@@ -1137,6 +1145,24 @@ fn f(x: int): int {
                 .iter()
                 .any(|d| matches!(d, Definition::Local(_))),
             "no use site should bind to the rejected local: {return_x_uses:?}",
+        );
+    }
+
+    #[test]
+    fn for_in_underscore_binders_do_not_rebind() {
+        // `_` in for-in is the runtime's no-binding slot — multiple
+        // `_`s in the same head are legal (`for (_, _ in arr)`), and
+        // shouldn't trip the same-scope rebind detector.
+        let src = r#"
+fn f(arr: Array<int>) {
+    for (_, _ in arr) {}
+}
+"#;
+        let (_hir, res, _s) = analyze(src);
+        assert!(
+            res.rebound.is_empty(),
+            "expected no rebind on `_` for-in binders, got: {:?}",
+            res.rebound
         );
     }
 

@@ -644,10 +644,15 @@ fn emit_var_hints(
                 if p.ty.is_some() {
                     continue;
                 }
+                let name_range = &hir.idents[p.name].byte_range;
+                // `_` is the compiler's no-binding slot in for-in heads
+                // (`for (_, _ in arr)`); there's no variable to annotate.
+                if &text[name_range.clone()] == "_" {
+                    continue;
+                }
                 let Some(ty) = analysis.def_types.get(&p.name).copied() else {
                     continue;
                 };
-                let name_range = &hir.idents[p.name].byte_range;
                 if name_range.end < want.0 || name_range.start > want.1 {
                     continue;
                 }

@@ -725,6 +725,49 @@ fn inlay_hints_annotate_typeless_locals() {
     assert!(s.contains("int"), "expected int in hint, got `{s}`");
 }
 
+/// `_` in a for-in head is the runtime's no-binding slot — there's
+/// no variable to annotate, so no type hint should appear. The
+/// surrounding non-`_` binder still gets its hint, anchored at its
+/// own ident end, not at `_`'s.
+#[test]
+fn inlay_hints_skip_underscore_for_in_params() {
+    let src = "fn f(arr: Array<int>) {\n    for (k, _ in arr) {}\n}\n";
+    let test_project = TestProject::single_file(src);
+    let range = lsp_types::Range {
+        start: pos(0, 0),
+        end: pos(99, 0),
+    };
+    let hints = test_project.inlay_hints(&range);
+    assert_eq!(
+        hints.len(),
+        1,
+        "expected 1 hint (on `k`, not `_`), got {}: {hints:?}",
+        hints.len()
+    );
+    // The hint should anchor right after `k` on line 1: `for (k`
+    // is offset 9 in the line, so the anchor is column 10.
+    assert_eq!(hints[0].position.line, 1);
+    assert_eq!(hints[0].position.character, 10);
+}
+
+/// Both for-in binders named `_` — the runtime treats both as
+/// no-binding slots, so no hints should appear at all.
+#[test]
+fn inlay_hints_skip_double_underscore_for_in_params() {
+    let src = "fn f(arr: Array<int>) {\n    for (_, _ in arr) {}\n}\n";
+    let test_project = TestProject::single_file(src);
+    let range = lsp_types::Range {
+        start: pos(0, 0),
+        end: pos(99, 0),
+    };
+    let hints = test_project.inlay_hints(&range);
+    assert!(
+        hints.is_empty(),
+        "expected no hints, got {}: {hints:?}",
+        hints.len()
+    );
+}
+
 /// Anchors the architectural rule: LSP inlay hints MUST run through
 /// `inlay_hints_with_project` so the cross-module fixup passes
 /// (P15.7 / P16.3 / P16.4) flow into the inferred-type label.
