@@ -433,7 +433,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "greycat-analyzer"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "env_logger",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "greycat-analyzer-analysis"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-hir",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "greycat-analyzer-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "greycat-analyzer-syntax",
  "lasso",
@@ -486,14 +486,14 @@ dependencies = [
 
 [[package]]
 name = "greycat-analyzer-fmt"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "greycat-analyzer-syntax",
 ]
 
 [[package]]
 name = "greycat-analyzer-hir"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "greycat-analyzer-core",
  "greycat-analyzer-syntax",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "greycat-analyzer-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "greycat-analyzer-syntax"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "insta",
  "serde",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "greycat-analyzer-wasm"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "greycat-analyzer-analysis",
  "greycat-analyzer-core",
