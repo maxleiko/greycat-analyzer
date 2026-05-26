@@ -1,11 +1,5 @@
-// P18.1 — oracle subcommands. P18.2-18.4 — parity gauntlet.
-//! `greycat-lang dump-types` / `dump-resolutions` — typed-AST parity
-//! oracle subcommands.
-//!
 //! Emits one JSONL record per typed expression / type-reference
-//! (`dump-types`) or per ident use (`dump-resolutions`), matching the
-//! TS reference's shape so the parity gauntlet can diff
-//! the two outputs directly.
+//! (`dump-types`) or per ident use (`dump-resolutions`)
 //!
 //! `dump-types` record (per line):
 //! - `file` — path relative to the project root.
@@ -52,8 +46,7 @@ use crate::utils::AnyError;
 #[derive(clap::Parser)]
 #[clap(
     about = "Dump per-expression byte ranges and inferred type display strings as JSONL.\n\
-            Records are sorted by (file, line, col, byteStart, byteEnd) so the parity\n\
-            gauntlet can diff this output against the TS reference's `dump-types`."
+            Records are sorted by (file, line, col, byteStart, byteEnd)."
 )]
 pub struct DumpTypes {
     #[clap(help = "Path to a project.gcl entrypoint, a project directory \

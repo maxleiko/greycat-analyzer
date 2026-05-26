@@ -53,9 +53,9 @@ fn git_stash_pop(repo: &Path) {
 fn cli_binary() -> PathBuf {
     // CARGO_BIN_EXE_<name> is set by cargo when running integration tests
     // for binary crates — points at the freshly-built binary. The crate
-    // ships `greycat-lang` as the canonical bin name (P4.3); fall back
+    // ships `greycat-analyzer` as the canonical bin name (P4.3); fall back
     // to env::current_exe's parent + the binary stem if that fails.
-    if let Some(path) = option_env!("CARGO_BIN_EXE_greycat-lang") {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_greycat-analyzer") {
         return PathBuf::from(path);
     }
     PathBuf::from(env!("CARGO_BIN_EXE_greycat-analyzer"))

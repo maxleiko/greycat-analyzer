@@ -14,7 +14,7 @@ Rust edition 2024. Workspace resolver `"3"`. Workspace metadata (`license = "MIT
 | [greycat-analyzer-analysis](../greycat-analyzer-analysis/) | Resolver, analyzer (inference + null-flow + `is`-narrowing + enum exhaustiveness + member resolution), lints, `ProjectAnalysis` driver, `ProjectIndex` cross-module index. Editor-facing services live under [src/ide/](../greycat-analyzer-analysis/src/ide/) (`actions`, `quickfix`, `rename`, and future capability services). |
 | [greycat-analyzer-fmt](../greycat-analyzer-fmt/) | Formatter. |
 | [greycat-analyzer-server](../greycat-analyzer-server/) | LSP server (`lsp-server` + `crossbeam-channel`). Per-capability handlers under [src/capabilities/](../greycat-analyzer-server/src/capabilities/) (one file per LSP request kind). Shared LSP `Position` / byte-offset helpers in [src/conv.rs](../greycat-analyzer-server/src/conv.rs). |
-| [greycat-analyzer](../greycat-analyzer/) | CLI binary `greycat-lang`. `clap` subcommands in [src/cmd/](../greycat-analyzer/src/cmd/). |
+| [greycat-analyzer](../greycat-analyzer/) | CLI binary `greycat-analyzer`. `clap` subcommands in [src/cmd/](../greycat-analyzer/src/cmd/). |
 | [greycat-analyzer-wasm](../greycat-analyzer-wasm/) | `cdylib` + `rlib`, `wasm-bindgen` bridge. Drives the playground. |
 | [playground/](../playground/) | Vite/TS/Lit/WebAwesome/Monaco UI consuming the wasm pkg. **Committed**, *not* a workspace member. |
 
@@ -164,7 +164,7 @@ cargo build --workspace                               # build everything
 cargo test  --workspace                               # run tests
 cargo install --path greycat-analyzer --debug         # install CLI on host (binary: greycat-analyzer)
 
-# CLI (binary self-identifies as `greycat-lang`)
+# CLI (binary self-identifies as `greycat-analyzer`)
 cargo run -p greycat-analyzer -- lint project.gcl                      # @library/@include closure
 cargo run -p greycat-analyzer -- lint project.gcl --fix                # apply auto-fixable lints
 cargo run -p greycat-analyzer -- lint project.gcl --format=pretty      # miette rendering (default on TTY)
@@ -244,7 +244,7 @@ Removal-side: walk the same touchpoints in reverse. **Watch out for the LSP↔an
 
 ## Formatter — every observable behavior gets an in/out fixture
 
-**Hard rule:** when you add, change, or fix any observable formatter behavior — a new break point, a different indentation rule, a softline / hardline decision, a trailing-newline policy, anything a user could see by running `greycat-lang fmt` — you also add a [tests/corpus/parser_fixtures/](../tests/corpus/parser_fixtures/) `<name>/{in.gcl, out.gcl}` pair that captures the new contract. No exceptions for "small tweaks" or "obviously correct" changes.
+**Hard rule:** when you add, change, or fix any observable formatter behavior — a new break point, a different indentation rule, a softline / hardline decision, a trailing-newline policy, anything a user could see by running `greycat-analyzer fmt` — you also add a [tests/corpus/parser_fixtures/](../tests/corpus/parser_fixtures/) `<name>/{in.gcl, out.gcl}` pair that captures the new contract. No exceptions for "small tweaks" or "obviously correct" changes.
 
 **Why:** the formatter has a lot of independent tunables (Group / Expand / IndentIfBroken / softline / IfBroken / hardline) whose interactions are non-obvious. Without a fixture, a change you made for one shape silently regresses next month when someone adjusts a neighboring rule — and the only way you'd know is by re-deriving the reasoning from memory. The fixture turns "I think this should produce X" into a byte-for-byte assertion the gauntlet (`tests/parity_gauntlet.rs`) enforces on every CI run.
 

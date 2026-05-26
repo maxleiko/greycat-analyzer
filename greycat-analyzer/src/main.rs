@@ -9,7 +9,7 @@ use cmd::*;
 use crate::utils::AnyError;
 
 #[derive(Parser)]
-#[clap(name = "greycat-lang", version)]
+#[clap(name = "greycat-analyzer", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

@@ -1,5 +1,5 @@
 //! Borrow-only HIR view shapes — projection of `ProjectAnalysis` into
-//! a human-readable tree for the `greycat-lang hir` subcommand.
+//! a human-readable tree for the `greycat-analyzer hir` subcommand.
 //!
 //! Hard design rule: the structs here own **no** `String` fields. Every
 //! textual slot is `&'a str` (borrowing from the source text, the

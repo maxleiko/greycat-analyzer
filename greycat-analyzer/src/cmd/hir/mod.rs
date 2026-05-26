@@ -1,4 +1,4 @@
-//! `greycat-lang hir <target> [--json]` — full HIR view of the
+//! `greycat-analyzer hir <target> [--json]` — full HIR view of the
 //! analyzed project.
 //!
 //! Loads the project entrypoint (project.gcl or single .gcl file
