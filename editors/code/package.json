@@ -53,6 +53,18 @@
       {
         "command": "greycat.restartServer",
         "title": "GreyCat: Restart LSP Server"
+      },
+      {
+        "command": "greycat.downloadServer",
+        "title": "GreyCat: Download / Update LSP Server"
+      },
+      {
+        "command": "greycat.showServerPath",
+        "title": "GreyCat: Show LSP Server Path"
+      },
+      {
+        "command": "greycat.checkForUpdates",
+        "title": "GreyCat: Check for LSP Server updates"
       }
     ],
     "configurationDefaults": {
@@ -86,6 +98,23 @@
           "minimum": 0,
           "maximum": 5000,
           "markdownDescription": "Leading-edge + trailing debounce window (ms) for analyzer-side diagnostic publishes. Within this window after the last analyzer publish, edits emit only fast diagnostics (parse / pragma / overlays + cached semantic squiggles) and schedule a trailing fire instead of re-running the analyzer on every keystroke. `0` disables debouncing (every keystroke fires the analyzer immediately). Defaults to `150`. Restart the server after changing — the extension will prompt."
+        },
+        "greycat.serverPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to a `greycat-analyzer` binary. When set, this overrides every other discovery step (PATH lookup, managed cache). Leave empty for the extension to discover or auto-install the binary."
+        },
+        "greycat.checkForUpdates": {
+          "type": "string",
+          "enum": ["off", "onStartup", "daily", "weekly"],
+          "default": "daily",
+          "enumDescriptions": [
+            "Never check for updates.",
+            "Check once per VS Code session at activation.",
+            "Check at activation and again every 24 hours while VS Code is open.",
+            "Check at activation and again every 7 days while VS Code is open."
+          ],
+          "markdownDescription": "How often to probe GitHub for a newer `greycat-analyzer` release. When a newer release is found, the extension shows a notification (no silent updates). Use `GreyCat: Check for LSP Server updates` to force a probe out of band."
         }
       }
     }
@@ -94,9 +123,11 @@
     "vscode": "^1.75.0"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
     "vscode-languageclient": "9.0.1"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
     "@types/node": "^20",
     "@types/vscode": "^1.75.0",
     "@vscode/vsce": "^3.4.2",
