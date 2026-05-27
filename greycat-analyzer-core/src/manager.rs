@@ -2,8 +2,14 @@ use std::{
     cell::{Ref, RefCell},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
 };
+
+// `web-time` is a transparent drop-in for `std::time` — re-exports
+// the std types on native, falls back to `performance.now()` on
+// `wasm32-unknown-unknown` (where `std::time::Instant::now()` panics
+// with "time not implemented on this platform"). The crate's whole
+// purpose is to be cfg-gated internally, so consumers don't need to.
+use web_time::{Duration, Instant};
 
 use lsp_types::{TextDocumentContentChangeEvent, TextDocumentItem, Uri};
 use rustc_hash::{FxHashMap, FxHashSet};

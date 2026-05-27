@@ -46,3 +46,11 @@ pub use project::{Project, RenameTarget};
 
 #[cfg(feature = "playground")]
 mod playground;
+
+// Route Rust panics through `console.error` so traps surface a stack
+// + message instead of bare `RuntimeError: unreachable`. Fires once
+// at module load via `#[wasm_bindgen(start)]`.
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn __start() {
+    console_error_panic_hook::set_once();
+}

@@ -24,6 +24,7 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol_str.workspace = true
+web-time.workspace = true
 wasm-bindgen = { workspace = true, optional = true }
 
 # P27.1 — rayon is unconditional on native targets and absent on wasm.

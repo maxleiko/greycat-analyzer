@@ -13,7 +13,13 @@
 //! gives that work the cache-shaped seam to plug into.
 
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
+
+// `web-time` is a transparent drop-in for `std::time` — re-exports
+// the std types on native, falls back to `performance.now()` on
+// `wasm32-unknown-unknown` (where `std::time::Instant::now()` panics
+// with "time not implemented on this platform"). The crate's whole
+// purpose is to be cfg-gated internally, so consumers don't need to.
+use web_time::{Duration, Instant};
 
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_syntax::tree_sitter::{Node, Tree};
