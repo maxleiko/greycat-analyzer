@@ -11,8 +11,10 @@
     "isolatedModules": true,
     "skipLibCheck": true,
     "verbatimModuleSyntax": true,
-    "rootDir": "src",
-    "outDir": "dist"
+    "noEmit": true,
+    "paths": {
+      "@greycat/analyzer": ["../analyzer/src/index.ts"]
+    }
   },
   "include": ["src"]
 }
