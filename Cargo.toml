@@ -74,4 +74,9 @@ js-sys = "0.3.77"
 [profile.release]
 strip = true
 lto = "thin"
-opt-level = 3
+opt-level = "z"
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
