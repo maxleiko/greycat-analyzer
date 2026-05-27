@@ -1,6 +1,6 @@
 {
   "name": "greycat",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "GreyCat language support for Visual Studio Code",
   "categories": [
     "Debuggers",
