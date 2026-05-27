@@ -589,7 +589,23 @@ impl ProjectIndex {
     /// Bounded at [`MAX_SUPERTYPE_CHAIN_DEPTH`] hops to match the
     /// runtime's inheritance-depth ceiling and defend against accidental
     /// cycles in in-progress source.
-    fn walk_member_chain<P>(&self, type_id: ItemId, mut pred: P) -> Option<&TypeMembers>
+    fn walk_member_chain<P>(&self, type_id: ItemId, pred: P) -> Option<&TypeMembers>
+    where
+        P: FnMut(&TypeMembers) -> bool,
+    {
+        self.walk_member_chain_with_id(type_id, pred)
+            .map(|(_, m)| m)
+    }
+
+    /// Same walk as [`walk_member_chain`] but also returns the
+    /// `ItemId` of the level where the predicate matched. Callers that
+    /// need to know *which* type in the chain owns the member (e.g.
+    /// to compare against an enclosing-type identity) use this.
+    fn walk_member_chain_with_id<P>(
+        &self,
+        type_id: ItemId,
+        mut pred: P,
+    ) -> Option<(ItemId, &TypeMembers)>
     where
         P: FnMut(&TypeMembers) -> bool,
     {
@@ -597,11 +613,33 @@ impl ProjectIndex {
         for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             let members = self.type_members.get(&cur)?;
             if pred(members) {
-                return Some(members);
+                return Some((cur, members));
             }
             cur = members.supertype?;
         }
         None
+    }
+
+    /// `true` iff `child` is the same type as `ancestor` or appears as
+    /// a transitive descendant via the `supertype` chain. Bounded by
+    /// [`MAX_SUPERTYPE_CHAIN_DEPTH`] like the other chain walks.
+    /// Used by `check_private_attr_write` to allow writes from
+    /// non-static methods of subtypes that inherit a private attr.
+    pub fn type_is_descendant_or_self(&self, child: ItemId, ancestor: ItemId) -> bool {
+        let mut cur = child;
+        for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
+            if cur == ancestor {
+                return true;
+            }
+            let Some(members) = self.type_members.get(&cur) else {
+                return false;
+            };
+            cur = match members.supertype {
+                Some(s) => s,
+                None => return false,
+            };
+        }
+        false
     }
 
     // P19.14
@@ -621,18 +659,19 @@ impl ProjectIndex {
             .map(|id| (members.home_uri.clone(), *id))
     }
 
-    /// Find the `TypeMembers` entry in `type_id`'s supertype chain
-    /// that owns `attr_name` (the first hop that has the attr in
-    /// `attrs`). Used by the body walker's `check_private_attr_write`
-    /// to consult the *defining* type's `private_attrs` set rather
-    /// than the receiver's — `private` is sourced from the
-    /// declaration, not the use site.
+    /// Find the entry in `type_id`'s supertype chain that owns
+    /// `attr_name` (the first hop that has the attr in `attrs`).
+    /// Returns the owning level's `ItemId` alongside the members so
+    /// callers can identify *which* type declared the attr — needed
+    /// by `check_private_attr_write` to compare against the enclosing
+    /// method's owner. `private` is sourced from the declaration,
+    /// not the use site.
     pub fn walk_chain_for_private_attr(
         &self,
         type_id: ItemId,
         attr_name: Symbol,
-    ) -> Option<&TypeMembers> {
-        self.walk_member_chain(type_id, |m| m.attrs.contains_key(&attr_name))
+    ) -> Option<(ItemId, &TypeMembers)> {
+        self.walk_member_chain_with_id(type_id, |m| m.attrs.contains_key(&attr_name))
     }
 
     // P19.14

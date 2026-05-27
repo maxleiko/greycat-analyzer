@@ -531,6 +531,7 @@ pub fn analyze_with_index_into(
         chain_member_ifs: FxHashSet::default(),
         generics_in_scope: Vec::new(),
         this_stack: Vec::new(),
+        inside_static_fn: false,
     };
     for d in &module.decls {
         cx.visit_decl(*d);
@@ -1034,6 +1035,14 @@ struct Cx<'a> {
     /// — matches what an external `node<Foo<int>>` deref would see.
     /// Empty outside method bodies (top-level fns / lambdas).
     this_stack: Vec<TypeId>,
+    /// `true` while the body of a `static fn` is being visited.
+    /// `this_stack` alone can't tell static methods from instance
+    /// ones — both are walked under the type-level `this_stack` push.
+    /// `check_private_attr_write` uses this flag to keep `static fn`
+    /// bodies out of the "writes from inside the owning type's body
+    /// are allowed" rule — the runtime accepts private writes only
+    /// from non-static methods (and the constructor).
+    inside_static_fn: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -2421,11 +2430,13 @@ impl<'a> Cx<'a> {
 
     /// Check the LHS of an `=` / `?=` for assignment to a `private`
     /// attr. GreyCat's `private` on an attr is read-public / write-
-    /// private — direct assignment `obj.attr = x` from outside the
-    /// type's constructor is illegal. The constructor uses
-    /// `Foo { attr: 1 }` syntax (an `Expr::Object`), which is a
-    /// different AST node — `Expr::Binary(op="=")` LHS being a
-    /// member access is always the disallowed shape.
+    /// private — direct assignment `obj.attr = x` is allowed only from
+    /// inside the owning type's body via either the constructor
+    /// (`Foo { attr: 1 }`, an `Expr::Object`, never reaches this
+    /// function) or a **non-static** instance method of the owning
+    /// type or any subtype that inherits the attr. Static methods of
+    /// the owning type, and any code outside the owner's hierarchy,
+    /// must use the constructor.
     fn check_private_attr_write(&mut self, lhs: Idx<Expr>) {
         let property = match &self.hir.exprs[lhs] {
             Expr::Member(m) => m.property.ident(),
@@ -2445,37 +2456,56 @@ impl<'a> Cx<'a> {
         // Foreign attr — chain-walk `private_attrs` from the receiver's
         // ItemId. The cross-module decl's HIR isn't directly reachable
         // from here; the per-type `private_attrs` set is the bridge.
-        let is_private_foreign = (|| {
-            let foreign = self.out.foreign_member_uses.get(&property)?;
-            if !matches!(foreign.member, MemberDef::Attr(_)) {
-                return None;
-            }
-            let prop_sym = self.hir.idents[property].symbol;
-            // Walk from the receiver's type to find the chain level
-            // that owns the attr; check that level's `private_attrs`.
+        let recv_id = (|| {
             let recv = match &self.hir.exprs[lhs] {
                 Expr::Member(m) => m.receiver,
                 Expr::Arrow(m) => m.receiver,
                 _ => return None,
             };
             let recv_ty = self.out.expr_types.get(&recv).copied()?;
-            let recv_id = match &self.arena.get(recv_ty).kind {
-                TypeKind::Type(d) => *d,
-                TypeKind::Generic { decl, .. } => *decl,
+            match &self.arena.get(recv_ty).kind {
+                TypeKind::Type(d) => Some(*d),
+                TypeKind::Generic { decl, .. } => Some(*decl),
                 TypeKind::Primitive(p) => {
                     let core_mod = self.index.symbols.intern("core");
                     let pname = self.index.symbols.intern(p.name());
-                    ItemId::new(core_mod, pname)
+                    Some(ItemId::new(core_mod, pname))
                 }
-                _ => return None,
-            };
-            // Walk supertype chain looking for the level whose
-            // `private_attrs` claims this attr.
-            let members = self.index.walk_chain_for_private_attr(recv_id, prop_sym)?;
-            members.private_attrs.contains(&prop_sym).then_some(())
-        })()
-        .is_some();
+                _ => None,
+            }
+        })();
+        let prop_sym = self.hir.idents[property].symbol;
+        let private_owner: Option<ItemId> = recv_id.and_then(|id| {
+            let (owner_id, members) = self.index.walk_chain_for_private_attr(id, prop_sym)?;
+            members
+                .private_attrs
+                .contains(&prop_sym)
+                .then_some(owner_id)
+        });
+        let is_private_foreign = self
+            .out
+            .foreign_member_uses
+            .get(&property)
+            .is_some_and(|f| matches!(f.member, MemberDef::Attr(_)))
+            && private_owner.is_some();
         if !is_private_local && !is_private_foreign {
+            return;
+        }
+        // Allow writes that originate inside the owning type's body
+        // (non-static instance method of the owner or any subtype that
+        // inherits the attr). `inside_static_fn` excludes `static fn`
+        // bodies even when lexically inside the owning type. `this_stack`
+        // being empty means a top-level fn — never inside any type body.
+        if !self.inside_static_fn
+            && let Some(enc_ty) = self.this_stack.last().copied()
+            && let Some(enc_id) = match &self.arena.get(enc_ty).kind {
+                TypeKind::Type(d) => Some(*d),
+                TypeKind::Generic { decl, .. } => Some(*decl),
+                _ => None,
+            }
+            && let Some(owner_id) = private_owner
+            && self.index.type_is_descendant_or_self(enc_id, owner_id)
+        {
             return;
         }
         let prop_text = self.ident_text(property);
@@ -2484,7 +2514,8 @@ impl<'a> Cx<'a> {
             Severity::Error,
             "private-attr-write",
             format!(
-                "attribute `{prop_text}` is `private` only the type's constructor can write to it",
+                "attribute `{prop_text}` is `private`; only the owner type's constructor or its \
+                 (non-static) methods can write to it",
             ),
             span,
         ));
@@ -3810,6 +3841,7 @@ impl<'a> Cx<'a> {
         // instead of falling back to `any`.
         let owner = GenericOwner::Function(self.hir.idents[d.name].symbol);
         self.push_generic_scope(&d.generics, owner);
+        let prev_static = std::mem::replace(&mut self.inside_static_fn, d.modifiers.static_);
         // Bind parameter types into def_types so identifier inference
         // produces real types instead of `any`.
         for p_id in &d.params {
@@ -3826,6 +3858,7 @@ impl<'a> Cx<'a> {
         if let Some(body) = d.body {
             self.visit_stmt(body, Some(return_ty));
         }
+        self.inside_static_fn = prev_static;
         self.pop_generic_scope();
     }
 
