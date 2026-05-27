@@ -20,7 +20,15 @@
     /* Linting */
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+
+    /* Resolve @greycat/* to source so the TS server (in editors and
+       `vp check`) doesn't require a prior `pnpm build:packages` to
+       find the types. Mirrors `vite.config.ts`'s `resolve.alias`. */
+    "paths": {
+      "@greycat/analyzer": ["../packages/analyzer/src/index.ts"],
+      "@greycat/monaco": ["../packages/monaco/src/index.ts"]
+    }
   },
   "include": ["src"]
 }

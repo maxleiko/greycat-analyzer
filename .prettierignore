@@ -1,0 +1,54 @@
+# Root-level oxfmt / oxlint ignore — used by `vp check` when invoked
+# at the workspace root. Only `packages/**` and `playground/**` are
+# formatter/linter territory; everything below is owned by other
+# tooling (Rust crates, the tree-sitter submodule, editor extensions,
+# repo config files).
+#
+# Per-package `vite.config.ts` files own narrower scoping (e.g. skip
+# `dist/`) when `pnpm check` dispatches via `pnpm --filter`.
+
+# Rust workspace + submodule + editor extensions.
+.cargo/
+.claude/
+.github/
+.vscode/
+editors/
+greycat-analyzer/
+greycat-analyzer-wasm/
+greycat-analyzer-analysis/
+greycat-analyzer-core/
+greycat-analyzer-fmt/
+greycat-analyzer-hir/
+greycat-analyzer-server/
+greycat-analyzer-syntax/
+greycat-analyzer-wasm-staging/
+tree-sitter-greycat/
+target/
+scripts/
+docs/
+lib/
+gcdata/
+files/
+webroot/
+bin/
+
+# Repo-level config / docs.
+*.md
+*.toml
+*.yaml
+*.yml
+*.lock
+*.gitignore
+
+# Generated outputs and deps inside the workspace members.
+packages/*/dist/
+packages/*/node_modules/
+playground/dist/
+playground/node_modules/
+
+# Wasm-pack output package (binary + auto-generated JS — IS the
+# package, but every file is generated).
+packages/analyzer-wasm/
+
+# Shiki grammar mirror (auto-generated from editors/code/grammar/).
+packages/shiki/src/grammar.generated.ts

@@ -4,16 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "wasm": "./scripts/build-wasm.sh",
     "dev": "vp dev",
     "build": "tsc && vp build",
     "check": "vp check",
-    "preview": "vp preview"
+    "preview": "vp preview",
+    "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@awesome.me/webawesome": "^3.6.0",
-    "greycat-analyzer-wasm": "link:../greycat-analyzer-wasm/pkg",
-    "lit": "^3.3.2",
+    "@greycat/analyzer": "workspace:*",
+    "@greycat/monaco": "workspace:*",
     "monaco-editor": "^0.55.1"
   },
   "devDependencies": {

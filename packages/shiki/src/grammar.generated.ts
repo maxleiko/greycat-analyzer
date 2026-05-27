@@ -4,567 +4,566 @@
 // Regenerate via `pnpm --filter @greycat/shiki run sync-grammar`.
 
 export const greycatGrammar = {
-  $schema: "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
-  name: "Greycat",
-  scopeName: "source.gcl",
-  fileTypes: ["gcl"],
-  uuid: "395c9937-c471-412d-bdd7-43da892e0cee",
-  patterns: [
-    {
-      include: "#common",
-    },
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Greycat",
+  "scopeName": "source.gcl",
+  "fileTypes": [
+    "gcl"
   ],
-  repository: {
-    common: {
-      patterns: [
+  "uuid": "395c9937-c471-412d-bdd7-43da892e0cee",
+  "patterns": [
+    {
+      "include": "#common"
+    }
+  ],
+  "repository": {
+    "common": {
+      "patterns": [
         {
-          include: "#doc",
+          "include": "#doc"
         },
         {
-          include: "#comment",
+          "include": "#comment"
         },
         {
-          include: "#string",
+          "include": "#string"
         },
         {
-          include: "#literals",
+          "include": "#literals"
         },
         {
-          include: "#identifier-or-keyword",
+          "include": "#identifier-or-keyword"
         },
         {
-          include: "#operators",
+          "include": "#operators"
         },
         {
-          include: "#brackets",
-        },
-      ],
+          "include": "#brackets"
+        }
+      ]
     },
     "identifier-or-keyword": {
-      patterns: [
+      "patterns": [
         {
-          include: "#keyword",
+          "include": "#keyword"
         },
         {
-          include: "#identifier",
-        },
-      ],
+          "include": "#identifier"
+        }
+      ]
     },
-    keyword: {
-      patterns: [
+    "keyword": {
+      "patterns": [
         {
-          name: "storage.modifier.gcl",
-          match:
-            "\\b(abstract|as|at|break|breakpoint|continue|catch|do|else|enum|extends|for|fn|if|in|is|limit|native|private|sampling|skip|static|throw|try|type|use|var|while|without|task)\\b(?![\\(\\)\\]\\.\\;\\:\\=\\>\\}\\{\\-])",
+          "name": "storage.modifier.gcl",
+          "match": "\\b(abstract|as|at|break|breakpoint|continue|catch|do|else|enum|extends|for|fn|if|in|is|limit|native|private|sampling|skip|static|throw|try|type|use|var|while|without|task)\\b(?![\\(\\)\\]\\.\\;\\:\\=\\>\\}\\{\\-])"
         },
         {
-          name: "keyword.control.gcl",
-          match: "\\b(return|break|continue|breakpoint)\\b",
+          "name": "keyword.control.gcl",
+          "match": "\\b(return|break|continue|breakpoint)\\b"
         },
         {
-          name: "variable.language.this.gcl",
-          match: "\\b(this)\\b",
+          "name": "variable.language.this.gcl",
+          "match": "\\b(this)\\b"
         },
         {
-          name: "constant.language.gcl",
-          match: "\\b(true|false|null|NaN|Infinity)\\b",
+          "name": "constant.language.gcl",
+          "match": "\\b(true|false|null|NaN|Infinity)\\b"
         },
         {
-          name: "variable.other.constant.gcl meta.annotation.gcl",
-          match: "\\@\\b[a-zA-Z_][a-zA-Z0-9_]*\\b",
+          "name": "variable.other.constant.gcl meta.annotation.gcl",
+          "match": "\\@\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
         },
         {
-          name: "support.type.primitive.gcl",
-          match:
-            "\\b(int|float|i8|u8|f8|i16|u16|f16|i32|f32|u32|f64|u64|i64|bool|time|duration|geo|any|char|String|node|nodeTime|nodeIndex|nodeList|nodeGeo|Array|Map|Set|tuple|field|function)\\b(?![\\.\\(:=}{-])",
-        },
-      ],
+          "name": "support.type.primitive.gcl",
+          "match": "\\b(int|float|i8|u8|f8|i16|u16|f16|i32|f32|u32|f64|u64|i64|bool|time|duration|geo|any|char|String|node|nodeTime|nodeIndex|nodeList|nodeGeo|Array|Map|Set|tuple|field|function)\\b(?![\\.\\(:=}{-])"
+        }
+      ]
     },
-    identifier: {
-      patterns: [
+    "identifier": {
+      "patterns": [
         {
-          name: "meta.definition.function.gcl entity.name.function.gcl",
-          match: "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\b(?=[^\\.(:=;$->}{]*\\()",
+          "name": "meta.definition.function.gcl entity.name.function.gcl",
+          "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\b(?=[^\\.(:=;$->}{]*\\()"
         },
         {
-          name: "variable.other.constant.gcl",
-          match: "\\b((?=_?[A-Z])([a-zA-Z_][a-zA-Z0-9_]*)?)\\b",
+          "name": "variable.other.constant.gcl",
+          "match": "\\b((?=_?[A-Z])([a-zA-Z_][a-zA-Z0-9_]*)?)\\b"
         },
         {
-          name: "variable.other.readwrite.gcl",
-          match: "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\b",
-        },
-      ],
+          "name": "variable.other.readwrite.gcl",
+          "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\b"
+        }
+      ]
     },
-    operators: {
-      patterns: [
+    "operators": {
+      "patterns": [
         {
-          name: "punctuation.accessor.arrow.gcl",
-          match: "->",
+          "name": "punctuation.accessor.arrow.gcl",
+          "match": "->"
         },
         {
-          name: "punctuation.accessor.namespace.gcl",
-          match: "::",
+          "name": "punctuation.accessor.namespace.gcl",
+          "match": "::"
         },
         {
-          name: "punctuation.accessor.gcl",
-          match: "\\.",
+          "name": "punctuation.accessor.gcl",
+          "match": "\\."
         },
         {
-          name: "keyword.operator.range.gcl",
-          match: "\\.\\.",
+          "name": "keyword.operator.range.gcl",
+          "match": "\\.\\."
         },
         {
-          name: "keyword.operator.null-coalescing.gcl",
-          match: "\\?\\?",
+          "name": "keyword.operator.null-coalescing.gcl",
+          "match": "\\?\\?"
         },
         {
-          name: "keyword.operator.non-null.gcl",
-          match: "!!",
+          "name": "keyword.operator.non-null.gcl",
+          "match": "!!"
         },
         {
-          name: "keyword.operator.optional.gcl",
-          match: "\\?",
+          "name": "keyword.operator.optional.gcl",
+          "match": "\\?"
         },
         {
-          name: "keyword.operator.comparison.gcl",
-          match: "==|!=|<=|>=",
+          "name": "keyword.operator.comparison.gcl",
+          "match": "==|!=|<=|>="
         },
         {
-          name: "keyword.operator.logical.gcl",
-          match: "&&|\\|\\||!",
+          "name": "keyword.operator.logical.gcl",
+          "match": "&&|\\|\\||!"
         },
         {
-          name: "keyword.operator.assignment.gcl",
-          match: "\\?=|=",
+          "name": "keyword.operator.assignment.gcl",
+          "match": "\\?=|="
         },
         {
-          name: "keyword.operator.arithmetic.gcl",
-          match: "\\+|-|\\*|/|%",
+          "name": "keyword.operator.arithmetic.gcl",
+          "match": "\\+|-|\\*|/|%"
         },
         {
-          name: "keyword.operator.relational.gcl",
-          match: "<|>",
+          "name": "keyword.operator.relational.gcl",
+          "match": "<|>"
         },
         {
-          name: "punctuation.separator.gcl",
-          match: "[,;:]",
-        },
-      ],
+          "name": "punctuation.separator.gcl",
+          "match": "[,;:]"
+        }
+      ]
     },
-    doc: {
-      begin: "\\@doc",
-      end: "(?=\\))",
-      beginCaptures: {
+    "doc": {
+      "begin": "\\@doc",
+      "end": "(?=\\))",
+      "beginCaptures": {
         "0": {
-          name: "variable.other.constant.doc.gcl meta.annotation.doc.gcl",
-        },
+          "name": "variable.other.constant.doc.gcl meta.annotation.doc.gcl"
+        }
       },
-      patterns: [
+      "patterns": [
         {
-          include: "#comment",
+          "include": "#comment"
         },
         {
-          include: "#doc-markdown",
-        },
-      ],
+          "include": "#doc-markdown"
+        }
+      ]
     },
     "doc-markdown": {
-      patterns: [
+      "patterns": [
         {
-          include: "#comment",
+          "include": "#comment"
         },
         {
-          match: '(")(.*)(")',
-          captures: {
+          "match": "(\")(.*)(\")",
+          "captures": {
             "1": {
-              name: "string.template.begin.doc.gcl",
+              "name": "string.template.begin.doc.gcl"
             },
             "2": {
-              name: "comment.block.gcl",
+              "name": "comment.block.gcl"
             },
             "3": {
-              name: "string.template.end.doc.gcl",
-            },
-          },
+              "name": "string.template.end.doc.gcl"
+            }
+          }
         },
         {
-          begin: '"',
-          end: '(?<!\\\\)\\s*(")\\s*(?=\\))',
-          beginCaptures: {
+          "begin": "\"",
+          "end": "(?<!\\\\)\\s*(\")\\s*(?=\\))",
+          "beginCaptures": {
             "0": {
-              name: "string.template.begin.doc.gcl",
-            },
+              "name": "string.template.begin.doc.gcl"
+            }
           },
-          endCaptures: {
+          "endCaptures": {
             "1": {
-              name: "string.template.end.doc.gcl",
-            },
+              "name": "string.template.end.doc.gcl"
+            }
           },
-          contentName: "comment.block.gcl",
-        },
-      ],
+          "contentName": "comment.block.gcl"
+        }
+      ]
     },
     "fenced-code-gcl": {
-      begin: "^(\\s*)(`{3,}|~{3,})\\s*(?i:(gcl|greycat)((\\s+|:|\\{)[^`~]*)?$)",
-      end: "^(\\2|\\s{0,3})(\\3)\\s*$",
-      name: "markup.fenced_code.block.gcl",
-      beginCaptures: {
+      "begin": "^(\\s*)(`{3,}|~{3,})\\s*(?i:(gcl|greycat)((\\s+|:|\\{)[^`~]*)?$)",
+      "end": "^(\\2|\\s{0,3})(\\3)\\s*$",
+      "name": "markup.fenced_code.block.gcl",
+      "beginCaptures": {
         "3": {
-          name: "punctuation.definition.gcl",
+          "name": "punctuation.definition.gcl"
         },
         "4": {
-          name: "fenced_code.block.language.gcl",
+          "name": "fenced_code.block.language.gcl"
         },
         "5": {
-          name: "fenced_code.block.language.attributes.gcl",
-        },
+          "name": "fenced_code.block.language.attributes.gcl"
+        }
       },
-      endCaptures: {
+      "endCaptures": {
         "3": {
-          name: "punctuation.definition.gcl",
-        },
+          "name": "punctuation.definition.gcl"
+        }
       },
-      patterns: [
+      "patterns": [
         {
-          begin: "^(\\s*)",
-          while: "^(?!\\s*([`~]{3,})\\s*$)",
-          contentName: "meta.embedded.block.gcl",
-          patterns: [
+          "begin": "^(\\s*)",
+          "while": "^(?!\\s*([`~]{3,})\\s*$)",
+          "contentName": "meta.embedded.block.gcl",
+          "patterns": [
             {
-              include: "source.gcl",
-            },
-          ],
-        },
-      ],
+              "include": "source.gcl"
+            }
+          ]
+        }
+      ]
     },
-    brackets: {
-      patterns: [
+    "brackets": {
+      "patterns": [
         {
-          begin: "\\{",
-          beginCaptures: {
+          "begin": "\\{",
+          "beginCaptures": {
             "0": {
-              name: "punctuation.section.block.begin.gcl",
-            },
+              "name": "punctuation.section.block.begin.gcl"
+            }
           },
-          end: "\\}|(?=\\*/)",
-          endCaptures: {
+          "end": "\\}|(?=\\*/)",
+          "endCaptures": {
             "0": {
-              name: "punctuation.section.block.end.gcl",
-            },
+              "name": "punctuation.section.block.end.gcl"
+            }
           },
-          patterns: [
+          "patterns": [
             {
-              include: "#common",
-            },
-          ],
+              "include": "#common"
+            }
+          ]
         },
         {
-          begin: "\\[",
-          beginCaptures: {
+          "begin": "\\[",
+          "beginCaptures": {
             "0": {
-              name: "punctuation.section.brackets.begin.gcl",
-            },
+              "name": "punctuation.section.brackets.begin.gcl"
+            }
           },
-          end: "\\]|(?=\\*/)",
-          endCaptures: {
+          "end": "\\]|(?=\\*/)",
+          "endCaptures": {
             "0": {
-              name: "punctuation.section.brackets.end.gcl",
-            },
+              "name": "punctuation.section.brackets.end.gcl"
+            }
           },
-          patterns: [
+          "patterns": [
             {
-              include: "#common",
-            },
-          ],
+              "include": "#common"
+            }
+          ]
         },
         {
-          begin: "\\(",
-          beginCaptures: {
+          "begin": "\\(",
+          "beginCaptures": {
             "0": {
-              name: "punctuation.section.parens.begin.gcl",
-            },
+              "name": "punctuation.section.parens.begin.gcl"
+            }
           },
-          end: "\\)|(?=\\*/)",
-          endCaptures: {
+          "end": "\\)|(?=\\*/)",
+          "endCaptures": {
             "0": {
-              name: "punctuation.section.parens.end.gcl",
-            },
+              "name": "punctuation.section.parens.end.gcl"
+            }
           },
-          patterns: [
+          "patterns": [
             {
-              include: "#common",
-            },
-          ],
-        },
-      ],
+              "include": "#common"
+            }
+          ]
+        }
+      ]
     },
-    literals: {
-      patterns: [
+    "literals": {
+      "patterns": [
         {
-          include: "#numeric-literal",
-        },
-      ],
+          "include": "#numeric-literal"
+        }
+      ]
     },
     "numeric-literal": {
-      patterns: [
+      "patterns": [
         {
-          name: "constant.numeric.float.gcl",
-          match:
-            "(?<![\\w.])([0-9][0-9_]*)(\\.)([0-9][0-9_]*)([eE][+-]?[0-9][0-9_]*)?([a-zA-Z_][a-zA-Z0-9_]*)?\\b",
-          captures: {
+          "name": "constant.numeric.float.gcl",
+          "match": "(?<![\\w.])([0-9][0-9_]*)(\\.)([0-9][0-9_]*)([eE][+-]?[0-9][0-9_]*)?([a-zA-Z_][a-zA-Z0-9_]*)?\\b",
+          "captures": {
             "5": {
-              name: "storage.type.numeric.suffix.gcl",
-            },
-          },
+              "name": "storage.type.numeric.suffix.gcl"
+            }
+          }
         },
         {
-          name: "constant.numeric.float.gcl",
-          match: "(?<![\\w.])([0-9][0-9_]*)([eE][+-]?[0-9][0-9_]*)([a-zA-Z_][a-zA-Z0-9_]*)?\\b",
-          captures: {
+          "name": "constant.numeric.float.gcl",
+          "match": "(?<![\\w.])([0-9][0-9_]*)([eE][+-]?[0-9][0-9_]*)([a-zA-Z_][a-zA-Z0-9_]*)?\\b",
+          "captures": {
             "3": {
-              name: "storage.type.numeric.suffix.gcl",
-            },
-          },
+              "name": "storage.type.numeric.suffix.gcl"
+            }
+          }
         },
         {
-          name: "constant.numeric.integer.gcl",
-          match: "(?<![\\w.])([0-9][0-9_]*)([a-zA-Z_][a-zA-Z0-9_]*)?\\b",
-          captures: {
+          "name": "constant.numeric.integer.gcl",
+          "match": "(?<![\\w.])([0-9][0-9_]*)([a-zA-Z_][a-zA-Z0-9_]*)?\\b",
+          "captures": {
             "2": {
-              name: "storage.type.numeric.suffix.gcl",
-            },
-          },
-        },
-      ],
+              "name": "storage.type.numeric.suffix.gcl"
+            }
+          }
+        }
+      ]
     },
-    string: {
-      patterns: [
+    "string": {
+      "patterns": [
         {
-          include: "#char-literal",
+          "include": "#char-literal"
         },
         {
-          include: "#template",
-        },
-      ],
+          "include": "#template"
+        }
+      ]
     },
     "char-literal": {
-      name: "string.quoted.single.gcl",
-      begin: "'",
-      beginCaptures: {
+      "name": "string.quoted.single.gcl",
+      "begin": "'",
+      "beginCaptures": {
         "0": {
-          name: "punctuation.definition.string.begin.gcl",
-        },
+          "name": "punctuation.definition.string.begin.gcl"
+        }
       },
-      end: "(\\')|((?:[^\\\\\\n])$)",
-      endCaptures: {
+      "end": "(\\')|((?:[^\\\\\\n])$)",
+      "endCaptures": {
         "1": {
-          name: "punctuation.definition.string.end.gcl",
+          "name": "punctuation.definition.string.end.gcl"
         },
         "2": {
-          name: "invalid.illegal.newline.gcl",
-        },
+          "name": "invalid.illegal.newline.gcl"
+        }
       },
-      patterns: [
+      "patterns": [
         {
-          include: "#string-character-escape",
-        },
-      ],
+          "include": "#string-character-escape"
+        }
+      ]
     },
-    template: {
-      name: "string.quoted.double.gcl",
-      begin: '"',
-      beginCaptures: {
+    "template": {
+      "name": "string.quoted.double.gcl",
+      "begin": "\"",
+      "beginCaptures": {
         "0": {
-          name: "punctuation.definition.string.begin.gcl",
-        },
+          "name": "punctuation.definition.string.begin.gcl"
+        }
       },
-      end: '"',
-      endCaptures: {
+      "end": "\"",
+      "endCaptures": {
         "0": {
-          name: "punctuation.definition.string.end.gcl",
-        },
+          "name": "punctuation.definition.string.end.gcl"
+        }
       },
-      patterns: [
+      "patterns": [
         {
-          include: "#template-interpolation",
+          "include": "#template-interpolation"
         },
         {
-          include: "#string-character-escape",
-        },
-      ],
+          "include": "#string-character-escape"
+        }
+      ]
     },
     "template-interpolation": {
-      name: "meta.template.expression.gcl",
-      begin: "\\$\\{",
-      beginCaptures: {
+      "name": "meta.template.expression.gcl",
+      "begin": "\\$\\{",
+      "beginCaptures": {
         "0": {
-          name: "punctuation.definition.template-expression.begin.gcl",
-        },
+          "name": "punctuation.definition.template-expression.begin.gcl"
+        }
       },
-      end: "\\}",
-      endCaptures: {
+      "end": "\\}",
+      "endCaptures": {
         "0": {
-          name: "punctuation.definition.template-expression.end.gcl",
-        },
+          "name": "punctuation.definition.template-expression.end.gcl"
+        }
       },
-      contentName: "meta.embedded.line.gcl",
-      patterns: [
+      "contentName": "meta.embedded.line.gcl",
+      "patterns": [
         {
-          include: "#interpolation-contents",
-        },
-      ],
+          "include": "#interpolation-contents"
+        }
+      ]
     },
     "interpolation-contents": {
-      patterns: [
+      "patterns": [
         {
-          include: "#comment",
+          "include": "#comment"
         },
         {
-          include: "#string",
+          "include": "#string"
         },
         {
-          include: "#literals",
+          "include": "#literals"
         },
         {
-          include: "#identifier-or-keyword",
+          "include": "#identifier-or-keyword"
         },
         {
-          include: "#operators",
+          "include": "#operators"
         },
         {
-          include: "#interpolation-brackets",
-        },
-      ],
+          "include": "#interpolation-brackets"
+        }
+      ]
     },
     "interpolation-brackets": {
-      patterns: [
+      "patterns": [
         {
-          begin: "\\{",
-          beginCaptures: {
+          "begin": "\\{",
+          "beginCaptures": {
             "0": {
-              name: "punctuation.section.block.begin.gcl",
-            },
+              "name": "punctuation.section.block.begin.gcl"
+            }
           },
-          end: "\\}",
-          endCaptures: {
+          "end": "\\}",
+          "endCaptures": {
             "0": {
-              name: "punctuation.section.block.end.gcl",
-            },
+              "name": "punctuation.section.block.end.gcl"
+            }
           },
-          patterns: [
+          "patterns": [
             {
-              include: "#interpolation-contents",
-            },
-          ],
+              "include": "#interpolation-contents"
+            }
+          ]
         },
         {
-          begin: "\\[",
-          beginCaptures: {
+          "begin": "\\[",
+          "beginCaptures": {
             "0": {
-              name: "punctuation.section.brackets.begin.gcl",
-            },
+              "name": "punctuation.section.brackets.begin.gcl"
+            }
           },
-          end: "\\]",
-          endCaptures: {
+          "end": "\\]",
+          "endCaptures": {
             "0": {
-              name: "punctuation.section.brackets.end.gcl",
-            },
+              "name": "punctuation.section.brackets.end.gcl"
+            }
           },
-          patterns: [
+          "patterns": [
             {
-              include: "#interpolation-contents",
-            },
-          ],
+              "include": "#interpolation-contents"
+            }
+          ]
         },
         {
-          begin: "\\(",
-          beginCaptures: {
+          "begin": "\\(",
+          "beginCaptures": {
             "0": {
-              name: "punctuation.section.parens.begin.gcl",
-            },
+              "name": "punctuation.section.parens.begin.gcl"
+            }
           },
-          end: "\\)",
-          endCaptures: {
+          "end": "\\)",
+          "endCaptures": {
             "0": {
-              name: "punctuation.section.parens.end.gcl",
-            },
+              "name": "punctuation.section.parens.end.gcl"
+            }
           },
-          patterns: [
+          "patterns": [
             {
-              include: "#interpolation-contents",
-            },
-          ],
-        },
-      ],
+              "include": "#interpolation-contents"
+            }
+          ]
+        }
+      ]
     },
     "string-character-escape": {
-      name: "constant.character.escape.gcl",
-      match: "\\\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|[0-7]{1,3}|.)",
+      "name": "constant.character.escape.gcl",
+      "match": "\\\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|[0-7]{1,3}|.)"
     },
-    comment: {
-      patterns: [
+    "comment": {
+      "patterns": [
         {
-          name: "comment.block.gcl",
-          begin: "(/\\*)",
-          beginCaptures: {
+          "name": "comment.block.gcl",
+          "begin": "(/\\*)",
+          "beginCaptures": {
             "1": {
-              name: "punctuation.definition.comment.gcl",
-            },
+              "name": "punctuation.definition.comment.gcl"
+            }
           },
-          end: "\\*/",
-          endCaptures: {
+          "end": "\\*/",
+          "endCaptures": {
             "0": {
-              name: "punctuation.definition.comment.gcl",
-            },
-          },
+              "name": "punctuation.definition.comment.gcl"
+            }
+          }
         },
         {
-          begin: "(^[ \\t]+)?((//)(?:((@)pragma)\\s))",
-          beginCaptures: {
+          "begin": "(^[ \\t]+)?((//)(?:((@)pragma)\\s))",
+          "beginCaptures": {
             "1": {
-              name: "punctuation.whitespace.comment.leading.gcl",
+              "name": "punctuation.whitespace.comment.leading.gcl"
             },
             "2": {
-              name: "comment.line.double-slash.gcl",
+              "name": "comment.line.double-slash.gcl"
             },
             "3": {
-              name: "punctuation.definition.comment.gcl",
+              "name": "punctuation.definition.comment.gcl"
             },
             "4": {
-              name: "storage.type.internaldeclaration.gcl",
+              "name": "storage.type.internaldeclaration.gcl"
             },
             "5": {
-              name: "punctuation.decorator.internaldeclaration.gcl",
-            },
+              "name": "punctuation.decorator.internaldeclaration.gcl"
+            }
           },
-          end: "(?=$)",
-          patterns: [
+          "end": "(?=$)",
+          "patterns": [
             {
-              name: "variable.other.constant.gcl",
-              match: "\\b((?=_?[A-Z])([a-zA-Z_][a-zA-Z0-9_]*)?)\\b",
+              "name": "variable.other.constant.gcl",
+              "match": "\\b((?=_?[A-Z])([a-zA-Z_][a-zA-Z0-9_]*)?)\\b"
             },
             {
-              name: "meta.definition.function.gcl entity.name.function.gcl",
-              match: "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\b",
-            },
+              "name": "meta.definition.function.gcl entity.name.function.gcl",
+              "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\b"
+            }
           ],
-          contentName: "comment.line.double-slash.gcl",
+          "contentName": "comment.line.double-slash.gcl"
         },
         {
-          begin: "(^[ \\t]+)?((//)(?!@pragma))",
-          beginCaptures: {
+          "begin": "(^[ \\t]+)?((//)(?!@pragma))",
+          "beginCaptures": {
             "1": {
-              name: "punctuation.whitespace.comment.leading.gcl",
+              "name": "punctuation.whitespace.comment.leading.gcl"
             },
             "2": {
-              name: "comment.line.double-slash.gcl",
-            },
+              "name": "comment.line.double-slash.gcl"
+            }
           },
-          end: "(?=$)",
-          contentName: "comment.line.double-slash.gcl",
-        },
-      ],
-    },
-  },
+          "end": "(?=$)",
+          "contentName": "comment.line.double-slash.gcl"
+        }
+      ]
+    }
+  }
 } as const;

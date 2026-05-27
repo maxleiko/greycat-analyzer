@@ -33,7 +33,8 @@
     "sync-grammar": "node scripts/sync-grammar.mjs",
     "build": "pnpm run sync-grammar && vp pack",
     "dev": "vp pack --watch",
-    "check": "vp check"
+    "check": "vp check",
+    "clean": "rm -rf dist"
   },
   "devDependencies": {
     "shiki": "^3.0.0",

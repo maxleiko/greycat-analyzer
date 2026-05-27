@@ -1,7 +1,11 @@
 import { defineConfig } from "vite-plus";
 
 export default defineConfig({
-  lint: { options: { typeAware: true, typeCheck: true } },
+  lint: {
+    ignorePatterns: ["dist/**", "src/grammar.generated.ts"],
+    options: { typeAware: true, typeCheck: true },
+  },
+  fmt: { ignorePatterns: ["dist/**", "src/grammar.generated.ts"] },
   pack: {
     entry: {
       index: "src/index.ts",
@@ -10,6 +14,6 @@ export default defineConfig({
     format: ["esm"],
     dts: true,
     platform: "neutral",
-    external: ["shiki"],
+    deps: { neverBundle: ["shiki"] },
   },
 });

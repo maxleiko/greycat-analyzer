@@ -29,7 +29,8 @@
   "scripts": {
     "build": "vp pack",
     "dev": "vp pack --watch",
-    "check": "vp check"
+    "check": "vp check",
+    "clean": "rm -rf dist"
   },
   "devDependencies": {
     "@greycat/analyzer": "workspace:*",
