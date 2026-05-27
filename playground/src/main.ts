@@ -42,9 +42,18 @@ async function main() {
     throw new Error("missing #editor-host");
   }
 
+  // The model URI MUST match the Project entrypoint — every Monaco
+  // provider in `@greycat/monaco` passes `model.uri.toString()` to
+  // `project.hover/completion/semanticTokens/...`, so a mismatched
+  // URI silently breaks every feature.
+  const model = monaco.editor.createModel(
+    SAMPLE_SOURCE,
+    "greycat",
+    monaco.Uri.parse(ENTRYPOINT),
+  );
+
   const editor = monaco.editor.create(host, {
-    value: SAMPLE_SOURCE,
-    language: "greycat",
+    model,
     theme: matchMedia("(prefers-color-scheme: dark)").matches ? "vs-dark" : "vs",
     automaticLayout: true,
     minimap: { enabled: false },

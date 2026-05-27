@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev": "pnpm --filter playground run dev",
     "build": "pnpm run build:packages && pnpm run build:playground",
     "build:packages": "./scripts/build-wasm.sh --out-dir packages/analyzer/wasm && pnpm --filter \"@greycat/*\" run build",
     "build:playground": "pnpm --filter playground run build",

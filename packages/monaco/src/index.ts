@@ -15,6 +15,7 @@
 import type * as MonacoNs from "monaco-editor";
 import type { Project } from "@greycat/analyzer";
 
+import { LANGUAGE_CONFIGURATION, MONARCH_LANGUAGE } from "./monarch.js";
 import { registerCodeActions } from "./providers/code-actions.js";
 import { registerCompletion } from "./providers/completion.js";
 import { attachDiagnostics } from "./providers/diagnostics.js";
@@ -44,6 +45,8 @@ export function registerGreycat(monaco: typeof MonacoNs, project: Project): Regi
     extensions: [".gcl"],
     aliases: ["GreyCat", "greycat", "gcl"],
   });
+  monaco.languages.setMonarchTokensProvider(LANGUAGE_ID, MONARCH_LANGUAGE);
+  monaco.languages.setLanguageConfiguration(LANGUAGE_ID, LANGUAGE_CONFIGURATION);
 
   const disposables: MonacoNs.IDisposable[] = [
     registerCompletion(monaco, project, LANGUAGE_ID),
