@@ -22,7 +22,7 @@ use std::str::FromStr;
 
 use greycat_analyzer_analysis::ide::code_actions::{CodeAction, code_actions_with_project};
 use greycat_analyzer_analysis::ide::completion::{CompletionList, completion_with_project};
-use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_module};
+use greycat_analyzer_analysis::ide::diagnostics::{Diagnostic, from_document};
 use greycat_analyzer_analysis::ide::document_highlights::{DocumentHighlight, document_highlights};
 use greycat_analyzer_analysis::ide::document_symbols::{DocumentSymbol, document_symbols};
 use greycat_analyzer_analysis::ide::folding_ranges::{FoldingRange, folding_ranges};
@@ -154,7 +154,16 @@ impl Project {
         };
         // `lint_libs = false` matches the LSP default — users editing
         // a project don't want lints on the stdlib they don't own.
-        Ok(from_module(&doc.text, module, false, self.encoding))
+        // `from_document` (parse + semantic + lint) merges what the
+        // LSP server splits across its fast/slow publish loop into a
+        // single pulled vec for the editor.
+        Ok(from_document(
+            &doc.text,
+            doc.root_node(),
+            module,
+            false,
+            self.encoding,
+        ))
     }
 
     /// Hover at `(line, character)` in `uri`. Returns `None` when the
