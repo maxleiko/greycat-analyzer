@@ -3,10 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "wasm": "./scripts/build-wasm.sh --out-dir packages/analyzer/wasm",
-    "wasm:playground": "./playground/scripts/build-wasm.sh",
-    "build:packages": "pnpm --filter \"@greycat/*\" run build",
-    "check:packages": "pnpm --filter \"@greycat/*\" run check"
+    "build": "pnpm run build:packages && pnpm run build:playground",
+    "build:packages": "./scripts/build-wasm.sh --out-dir packages/analyzer/wasm && pnpm --filter \"@greycat/*\" run build",
+    "build:playground": "./playground/scripts/build-wasm.sh && pnpm --filter playground run build",
+    "check": "pnpm run check:packages && pnpm run check:playground",
+    "check:packages": "pnpm --filter \"@greycat/*\" run check",
+    "check:playground": "pnpm --filter playground run check",
+    "test": "pnpm --filter \"@greycat/*\" run test"
   },
   "packageManager": "pnpm@10.26.1",
   "pnpm": {

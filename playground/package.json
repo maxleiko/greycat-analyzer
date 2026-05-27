@@ -7,6 +7,7 @@
     "wasm": "./scripts/build-wasm.sh",
     "dev": "vp dev",
     "build": "tsc && vp build",
+    "check": "vp check",
     "preview": "vp preview"
   },
   "dependencies": {
