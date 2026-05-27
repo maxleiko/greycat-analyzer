@@ -1,0 +1,14 @@
+{
+  "name": "@greycat/analyzer-wasm-env",
+  "version": "0.1.0",
+  "description": "JS-side stubs for the libc symbols the analyzer's wasm imports under the `env` namespace (tree-sitter's C scanner uses `<wctype.h>` predicates). Resolved automatically through node_modules — no bundler alias required.",
+  "license": "MIT OR Apache-2.0",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./index.js",
+  "types": "./index.d.ts"
+}

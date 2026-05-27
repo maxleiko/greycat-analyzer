@@ -17,7 +17,7 @@
 // method so its internal HIR / signatures cache invalidates per-URI
 // instead of from scratch.
 
-import {
+import wasmInit, {
   Project as WasmProject,
   type CodeAction,
   type CompletionList,
@@ -26,7 +26,7 @@ import {
   type DocumentSymbol,
   type FoldingRange,
   type Hover,
-  type IdeRange,
+  type Range,
   type InlayHint,
   type Location,
   type RenameTarget,
@@ -34,7 +34,7 @@ import {
   type SignatureHelp,
   type TextEdit,
   type WorkspaceSymbol,
-} from "../wasm/greycat_analyzer_wasm.js";
+} from "@greycat/analyzer-wasm";
 
 import type { Context } from "./context.js";
 import { InMemoryContext, mergeContexts } from "./context.js";
@@ -74,6 +74,18 @@ function specKey(spec: LibrarySpec): string {
   return `${spec.name}@${spec.version}`;
 }
 
+// One-shot wasm-pack `--target web` init. `wasmInit()` is idempotent
+// (returns the cached module if already loaded), but we cache the
+// promise here so concurrent `Project.create` calls share a single
+// awaited boot instead of racing the fetch.
+let wasmReady: Promise<unknown> | undefined;
+function ensureWasmReady(): Promise<unknown> {
+  if (wasmReady === undefined) {
+    wasmReady = wasmInit();
+  }
+  return wasmReady;
+}
+
 /** Reactive analyzer handle. Construction is async because the
  *  initial `@library` resolution is async; analysis calls (hover,
  *  completion, …) are synchronous against the cached wasm Project.
@@ -82,8 +94,10 @@ function specKey(spec: LibrarySpec): string {
  *  body edits it's near-instant (wasm-side per-URI invalidation); when
  *  the entrypoint's `@library` set changes it awaits the resolver. */
 export class Project {
-  /** Construct + wait for initial library resolution. */
+  /** Boot the wasm module (idempotent), then construct + wait for
+   *  initial library resolution. */
   static async create(options: ProjectCreateOptions): Promise<Project> {
+    await ensureWasmReady();
     const project = new Project(options);
     await project.refresh();
     return project;
@@ -237,7 +251,7 @@ export class Project {
     return this.wasm.semanticTokens(uri);
   }
 
-  selectionRanges(uri: string, line: number, character: number): IdeRange[] {
+  selectionRanges(uri: string, line: number, character: number): Range[] {
     return this.wasm.selectionRanges(uri, line, character);
   }
 

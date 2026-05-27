@@ -17,11 +17,7 @@
     "directory": "packages/analyzer"
   },
   "files": [
-    "dist",
-    "wasm/greycat_analyzer_wasm_bg.wasm",
-    "wasm/greycat_analyzer_wasm.js",
-    "wasm/greycat_analyzer_wasm.d.ts",
-    "wasm/greycat_analyzer_wasm_bg.wasm.d.ts"
+    "dist"
   ],
   "type": "module",
   "sideEffects": false,
@@ -36,19 +32,19 @@
     }
   },
   "scripts": {
-    "wasm": "../../scripts/build-wasm.sh --out-dir packages/analyzer/wasm",
     "build": "vp pack",
     "dev": "vp pack --watch",
     "check": "vp check",
-    "test": "vp test"
+    "test": "vp test",
+    "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@greycat/analyzer-wasm": "workspace:*",
     "comlink": "^4.4.2",
     "fflate": "^0.8.2"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.0.0",
-    "rolldown-plugin-wasm": "^0.2.1",
     "tsdown": "latest",
     "typescript": "~6.0.2",
     "vite": "npm:@voidzero-dev/vite-plus-core@latest",
