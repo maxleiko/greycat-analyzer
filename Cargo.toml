@@ -73,8 +73,9 @@ js-sys = "0.3.77"
 
 [profile.release]
 strip = true
-lto = "thin"
-opt-level = "z"
+lto = "fat"
+opt-level = 3
+codegen-unit = 1
 
 [profile.profiling]
 inherits = "release"

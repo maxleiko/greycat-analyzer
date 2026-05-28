@@ -15,8 +15,8 @@ pub type Span = Range<usize>;
 /// module index into one of the arenas held by [`crate::Hir`].
 #[derive(Debug, Clone)]
 pub struct Module {
-    pub name: String,
-    pub lib: String,
+    pub name: Symbol,
+    pub lib: Symbol,
     pub decls: Box<[Idx<Decl>]>,
     pub byte_range: Span,
 }

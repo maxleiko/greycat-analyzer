@@ -868,7 +868,12 @@ impl ProjectIndex {
                     // project has a single decl-registration point.
                     let item = ItemId::new(module_sym, name_sym);
                     decl_registry.record(item, *decl_id);
-                    well_known.record(&module.lib, &module.name, &self.symbols[name_sym], item);
+                    well_known.record(
+                        &self.symbols[module.lib],
+                        &self.symbols[module.name],
+                        &self.symbols[name_sym],
+                        item,
+                    );
                     // P41.1
                     if td.modifiers.abstract_ {
                         self.is_abstract.insert(item);

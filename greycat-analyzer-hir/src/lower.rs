@@ -126,8 +126,8 @@ fn flatten_errors_named_children<'a>(
 pub fn lower_module(
     source: &str,
     symbols: &SymbolTable,
-    name: impl Into<String>,
-    lib: impl Into<String>,
+    name: &str,
+    lib: &str,
     root: tree_sitter::Node<'_>,
 ) -> Hir {
     let mut cx = LowerCtx::new(source, symbols);
@@ -147,8 +147,8 @@ pub fn lower_module(
     }
 
     cx.hir.module = Some(Module {
-        name: name.into(),
-        lib: lib.into(),
+        name: symbols.intern(name),
+        lib: symbols.intern(lib),
         decls: decl_ids.into_boxed_slice(),
         byte_range: root.byte_range(),
     });
