@@ -29,6 +29,14 @@ pub struct Lint {
     fix: bool,
     #[clap(long, value_enum, help = "Diagnostic rendering style")]
     format: Option<OutputFormat>,
+    #[clap(
+        long,
+        value_enum,
+        default_value_t = LintLevel::Hint,
+        help = "Minimum severity to print (error < warning < hint). \
+                Display-only: the summary totals and exit code are unaffected"
+    )]
+    level: LintLevel,
     #[clap(long, help = "Also lint `lib/<name>/` modules (default: project only)")]
     lint_libs: bool,
     #[clap(
@@ -79,6 +87,42 @@ pub enum OutputFormat {
     /// Trailing severity-count summary only where the exit code is
     /// the gate.
     Quiet,
+}
+
+/// Minimum severity threshold for the per-diagnostic printout. This is
+/// a *display* filter only — it never changes the summary totals (which
+/// always report the true counts so hidden diagnostics stay visible in
+/// aggregate) nor the exit code (`count_blocking` still gates on every
+/// error + warning regardless of what's printed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LintLevel {
+    /// print only errors
+    Error,
+    /// print errors and warnings (hide hints / info)
+    Warning,
+    /// print everything (default)
+    Hint,
+}
+
+impl LintLevel {
+    /// Whether a diagnostic at `severity` clears this threshold and so
+    /// should be printed. Unknown / missing severities are treated as
+    /// errors (fail-closed, matching `count_blocking`) so they're never
+    /// silently hidden.
+    fn shows(self, severity: Option<DiagnosticSeverity>) -> bool {
+        let weight = match severity {
+            Some(DiagnosticSeverity::WARNING) => 2,
+            Some(DiagnosticSeverity::INFORMATION) | Some(DiagnosticSeverity::HINT) => 1,
+            // ERROR, plus unknown / missing severity (fail-closed).
+            _ => 3,
+        };
+        let threshold = match self {
+            LintLevel::Error => 3,
+            LintLevel::Warning => 2,
+            LintLevel::Hint => 1,
+        };
+        weight >= threshold
+    }
 }
 
 impl OutputFormat {
@@ -579,6 +623,7 @@ impl Lint {
                 // paths — grep, the parity oracle, and CI consumers
                 // depend on the stable absolute shape.
                 let color = self.color.enabled();
+                let level = self.level;
                 let project_root = project_filepath.parent();
                 for e in &entries {
                     let path = if color {
@@ -591,6 +636,9 @@ impl Lint {
                     };
                     let source = std::fs::read_to_string(&e.path).unwrap_or_default();
                     for diag in &e.diagnostics {
+                        if !level.shows(diag.severity) {
+                            continue;
+                        }
                         match render {
                             OutputFormat::Compact => {
                                 println!("{}", print_compact_diagnostic(&path, diag, color))
