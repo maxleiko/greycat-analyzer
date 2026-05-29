@@ -298,14 +298,34 @@ fn expr_node(
                 kids.push(type_ref_node(hir, symbols, t));
             }
             for f in &o.fields {
+                // The key is a full expr now (field-name ident / string,
+                // or a `Map` value-key). Label classic ident keys; show
+                // both key and value as children.
+                let label = match &hir.exprs[f.name] {
+                    Expr::Ident { name, .. } => Some(ident_text(hir, symbols, *name)),
+                    _ => None,
+                };
                 kids.push(HirNode {
                     kind: "expr:object-field".into(),
-                    label: f.name.map(|n| ident_text(hir, symbols, n)),
+                    label,
                     range: f.byte_range.clone().into(),
-                    children: vec![expr_node(hir, symbols, f.value)],
+                    children: vec![
+                        expr_node(hir, symbols, f.name),
+                        expr_node(hir, symbols, f.value),
+                    ],
                 });
             }
             ("expr:object", None, kids)
+        }
+        Expr::PositionalObject(o) => {
+            let mut kids = Vec::new();
+            if let Some(t) = o.ty {
+                kids.push(type_ref_node(hir, symbols, t));
+            }
+            for value in &o.fields {
+                kids.push(expr_node(hir, symbols, *value));
+            }
+            ("expr:object-positional", None, kids)
         }
         Expr::Member(m) | Expr::Arrow(m) => {
             let kind = if matches!(e, Expr::Arrow(_)) {
@@ -764,8 +784,10 @@ fn full_hir(hir: &Hir, symbols: &SymbolTable) -> HirRoot {
         .module
         .clone()
         .unwrap_or_else(|| greycat_analyzer_hir::types::Module {
-            name: "<empty>".into(),
-            lib: "project".into(),
+            // `Module.name` / `.lib` are interned `Symbol`s; intern the
+            // placeholders rather than building from `&str`.
+            name: symbols.intern("<empty>"),
+            lib: symbols.intern("project"),
             decls: Box::default(),
             byte_range: 0..0,
         });
@@ -775,8 +797,8 @@ fn full_hir(hir: &Hir, symbols: &SymbolTable) -> HirRoot {
         .map(|&d| decl_node(hir, symbols, d))
         .collect();
     HirRoot {
-        module_name: module.name,
-        lib: module.lib,
+        module_name: symbols[module.name].to_string(),
+        lib: symbols[module.lib].to_string(),
         counts: HirCounts {
             decls: hir.decls.len(),
             stmts: hir.stmts.len(),
