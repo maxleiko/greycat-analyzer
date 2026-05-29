@@ -1493,6 +1493,82 @@ fn completion_inside_object_literal_walks_supertype_chain() {
     );
 }
 
+/// Object-literal field *value* slot (`Foo { x: | }`) is an expression
+/// position — it lists scope names, NOT the type's field names. The
+/// slot classifier distinguishes the name slot (before `:`) from the
+/// value slot (after `:`) within the same literal.
+#[test]
+fn completion_in_object_field_value_is_expr_not_field_names() {
+    let src = "type Point { x: int; y: int; }\n\
+               fn main() { var seed = 0; var _ = Point { x:  }; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor right after `x: ` in the *object literal* (anchor on the
+    // `= Point {` so we don't match the type decl's `x: int` on line 0).
+    let cursor = support::position_after(src, "= Point { x: ", "");
+    let list = project
+        .completion(cursor)
+        .expect("expected expression completion in field value slot");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"seed"),
+        "value slot should offer scope names like `seed`: {labels:?}"
+    );
+    // The sibling field name `y` must NOT appear — that's name-slot only.
+    assert!(
+        !labels.contains(&"y"),
+        "field name `y` leaked into a value slot: {labels:?}"
+    );
+}
+
+/// A complete named-attr literal (every field supplied) offers nothing
+/// in a trailing name slot — it must NOT fall back to the full scope
+/// dump. Regression for the allowlist guarantee.
+#[test]
+fn completion_in_complete_object_literal_is_empty() {
+    let src = "type Point { x: int; y: int; }\n\
+               fn main() { var _ = Point { x: 1, y: 2, }; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor after the trailing comma, before `}` — a name slot with no
+    // fields left to fill.
+    let cursor = support::position_after(src, "x: 1, y: 2, ", "");
+    let labels: Vec<String> = project
+        .completion(cursor)
+        .map(|l| l.items.into_iter().map(|i| i.label).collect())
+        .unwrap_or_default();
+    assert!(
+        labels.is_empty(),
+        "complete literal should offer nothing (no scope leak), got {labels:?}"
+    );
+}
+
+/// A declaration-name slot (the function name being defined) must
+/// suppress completion entirely — the user is binding a new identifier,
+/// not referencing one. Regression for the fn-name false positive.
+#[test]
+fn completion_on_fn_decl_name_is_suppressed() {
+    let src = "fn compute() {}\nfn main() {}\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor in the middle of the declared name `compute`.
+    let cursor = support::position_after(src, "fn comp", "");
+    assert!(
+        project.completion(cursor).is_none(),
+        "completion must be suppressed in a fn-decl name slot"
+    );
+}
+
+/// A parameter-name slot is also a declaration position — suppressed.
+#[test]
+fn completion_on_fn_param_name_is_suppressed() {
+    let src = "fn f(count: int) {}\nfn main() {}\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor in the middle of the param name `count`.
+    let cursor = support::position_after(src, "fn f(cou", "");
+    assert!(
+        project.completion(cursor).is_none(),
+        "completion must be suppressed in a fn-param name slot"
+    );
+}
+
 /// P15.2.6 — type-position completion at `var x: |` lists in-module
 /// type decls and runtime types, but not values like fn names.
 #[test]
