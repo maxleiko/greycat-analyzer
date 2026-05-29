@@ -194,7 +194,12 @@ fn build(n: String, a: int): Foo {
             panic!("expected object expr, got {:?}", &hir.exprs[*ret])
         };
         assert_eq!(obj.fields.len(), 2, "named fields must be lowered");
-        assert!(obj.fields[0].name.is_some(), "name slot is bound");
+        // The name slot is now a full `Expr` — for a classic field it
+        // is the bare-ident key (`name`).
+        let Expr::Ident { name: key_use, .. } = &hir.exprs[obj.fields[0].name] else {
+            panic!("expected ident key for field name")
+        };
+        assert_eq!(&symbols[hir.idents[*key_use].symbol], "name");
         let Expr::Ident { name: name_use, .. } = &hir.exprs[obj.fields[0].value] else {
             panic!("expected ident use for value")
         };
@@ -299,15 +304,13 @@ fn make(g: Group) {
             panic!("expected var stmt")
         };
         let init_expr = var.init.expect("initializer present");
-        let Expr::Object(obj) = &hir.exprs[init_expr] else {
-            panic!("expected object expr")
+        let Expr::PositionalObject(obj) = &hir.exprs[init_expr] else {
+            panic!("expected positional object expr")
         };
         assert_eq!(obj.fields.len(), 1, "single positional value");
-        assert!(
-            obj.fields[0].name.is_none(),
-            "positional values have no name slot"
-        );
-        let Expr::Ident { name: used, .. } = &hir.exprs[obj.fields[0].value] else {
+        // Positional fields are bare value exprs — no name slot exists
+        // in the shape at all.
+        let Expr::Ident { name: used, .. } = &hir.exprs[obj.fields[0]] else {
             panic!("expected ident use")
         };
         assert_eq!(&symbols[hir.idents[*used].symbol], "g");

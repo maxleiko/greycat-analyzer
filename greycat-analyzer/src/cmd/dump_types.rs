@@ -38,7 +38,9 @@ use greycat_analyzer_core::{Primitive, TypeArena, TypeId};
 use greycat_analyzer_hir::{
     Hir,
     arena::Idx,
-    types::{Decl, Expr, LiteralKind, Pragma, StringPart, TypeRef, UnaryOp},
+    types::{
+        BlockStmt, Decl, Expr, Ident, LiteralKind, Pragma, Stmt, StringPart, TypeRef, UnaryOp,
+    },
 };
 
 use crate::utils::AnyError;
@@ -496,6 +498,7 @@ fn expr_kind_and_range(hir: &Hir, expr: &Expr) -> Option<(&'static str, std::ops
         Expr::Tuple(..) => "ArrayExpr",
         Expr::Array(..) => "ArrayExpr",
         Expr::Object(_) => "ObjectExpr",
+        Expr::PositionalObject(_) => "ObjectExpr",
         Expr::Member(_) => "InstanceAccessExpr",
         Expr::Arrow(_) => "RefAccessExpr",
         Expr::Static(_) => "StaticAccessExpr",
@@ -569,6 +572,11 @@ fn collect_expr_descendants(
         Expr::Object(o) => {
             for f in &o.fields {
                 collect_expr_descendants(hir, f.value, out);
+            }
+        }
+        Expr::PositionalObject(o) => {
+            for value in &o.fields {
+                collect_expr_descendants(hir, *value, out);
             }
         }
         Expr::Member(m) | Expr::Arrow(m) => {
@@ -734,13 +742,7 @@ fn home_lib_for_self_bindings(rel: &Path) -> String {
 
 /// Walks the HIR decl tree and yields every "binding site" ident — the
 /// ones the TS reference's `dump-resolutions` records as self-bindings.
-fn collect_decl_idents(
-    hir: &Hir,
-) -> Vec<(
-    Idx<greycat_analyzer_hir::types::Ident>,
-    &'static str,
-    &'static str,
-)> {
+fn collect_decl_idents(hir: &Hir) -> Vec<(Idx<Ident>, &'static str, &'static str)> {
     let mut out = Vec::new();
     let Some(module) = hir.module.as_ref() else {
         return out;
@@ -784,12 +786,8 @@ fn collect_decl_idents(
 
 fn collect_block_decl_idents(
     hir: &Hir,
-    block: &greycat_analyzer_hir::types::BlockStmt,
-    out: &mut Vec<(
-        Idx<greycat_analyzer_hir::types::Ident>,
-        &'static str,
-        &'static str,
-    )>,
+    block: &BlockStmt,
+    out: &mut Vec<(Idx<Ident>, &'static str, &'static str)>,
 ) {
     for s in &block.stmts {
         collect_stmt_decl_idents(hir, *s, out);
@@ -798,14 +796,9 @@ fn collect_block_decl_idents(
 
 fn collect_stmt_decl_idents(
     hir: &Hir,
-    stmt_idx: Idx<greycat_analyzer_hir::types::Stmt>,
-    out: &mut Vec<(
-        Idx<greycat_analyzer_hir::types::Ident>,
-        &'static str,
-        &'static str,
-    )>,
+    stmt_idx: Idx<Stmt>,
+    out: &mut Vec<(Idx<Ident>, &'static str, &'static str)>,
 ) {
-    use greycat_analyzer_hir::types::Stmt;
     match &hir.stmts[stmt_idx] {
         Stmt::Block(b) => collect_block_decl_idents(hir, b, out),
         Stmt::Var(v) => {

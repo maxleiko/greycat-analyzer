@@ -1372,45 +1372,55 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             // resolver on every ident inside an object literal and
             // produced cascading `unused-local` / `unused-param` /
             // `unresolved name` false positives downstream.
+            // The two body productions are disjoint and map to
+            // distinct HIR variants: `object_initializers` →
+            // `Expr::PositionalObject`, `object_fields` →
+            // `Expr::Object`. Keeping them apart makes "a field with
+            // no name" / "a positional element with a name"
+            // unrepresentable, so downstream consumers read the
+            // construction form off the variant rather than inferring
+            // it from the fields.
             let ty = node
                 .child_by_field_name("type")
                 .and_then(|n| lower_type_ref(cx, n));
-            let mut fields = Vec::new();
+            let mut positional_fields: Option<Vec<Idx<Expr>>> = None;
+            let mut named_fields: Option<Vec<ObjectField>> = None;
             let mut walk = node.walk();
             for child in node.named_children(&mut walk) {
                 match child.kind() {
                     "object_initializers" => {
                         // P43.4 — positional `Foo { a, b, c }` salvage.
+                        let mut fields = Vec::new();
                         for (value_node, _salvaged) in flatten_errors_named_children(child) {
                             if let Some(value) = lower_expr(cx, value_node) {
-                                fields.push(ObjectField {
-                                    name: None,
-                                    value,
-                                    byte_range: value_node.byte_range(),
-                                });
+                                fields.push(value);
                             }
                         }
+                        positional_fields = Some(fields);
                     }
                     "object_fields" => {
                         // P43.4 — named `Foo { a: x, b: y }` salvage.
+                        let mut fields = Vec::new();
                         for (of, _salvaged) in flatten_errors_named_children(child) {
                             if of.kind() != "object_field" {
                                 continue;
                             }
-                            // `name` is graphed as `_expr` in the grammar
-                            // but is conventionally a bare ident or a
-                            // quoted string (e.g. `Foo { "a.b": 1 }`).
-                            // Canonicalize both forms to the unquoted
-                            // symbol so member binding matches the attr
-                            // declaration.
+                            // `name` is `_expr` in the grammar — a bare
+                            // ident / quoted string for a classic field
+                            // name, or an arbitrary key expression for a
+                            // `Map` (`Map { Level::Low: 0 }`). Lower it
+                            // faithfully; the field-name-vs-value-key
+                            // interpretation is made downstream by the
+                            // head type. The string → symbol decode that
+                            // used to live here now happens at the
+                            // member-resolution site.
                             let name = of
                                 .child_by_field_name("name")
-                                .filter(|n| matches!(n.kind(), "ident" | "string"))
-                                .map(|n| cx.alloc_property_ident(n));
+                                .and_then(|n| lower_expr(cx, n));
                             let value = of
                                 .child_by_field_name("value")
                                 .and_then(|v| lower_expr(cx, v));
-                            if let Some(value) = value {
+                            if let (Some(name), Some(value)) = (name, value) {
                                 fields.push(ObjectField {
                                     name,
                                     value,
@@ -1418,15 +1428,26 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                                 });
                             }
                         }
+                        named_fields = Some(fields);
                     }
                     _ => {}
                 }
             }
-            Expr::Object(ObjectExpr {
-                ty,
-                fields: fields.into_boxed_slice(),
-                byte_range: node.byte_range(),
-            })
+            match (named_fields, positional_fields) {
+                // Named body wins if present; a malformed object with
+                // neither body falls back to an empty positional shape
+                // (empty `{}` parses as `object_initializers` anyway).
+                (Some(fields), _) => Expr::Object(ObjectExpr {
+                    ty,
+                    fields: fields.into_boxed_slice(),
+                    byte_range: node.byte_range(),
+                }),
+                (None, positional) => Expr::PositionalObject(PositionalObjectExpr {
+                    ty,
+                    fields: positional.unwrap_or_default().into_boxed_slice(),
+                    byte_range: node.byte_range(),
+                }),
+            }
         }
         // **P19.15** — `from..to` (and `from..` / `..to`) plus the
         // math-style `]from..to]` / `[from..to[` interval flatten

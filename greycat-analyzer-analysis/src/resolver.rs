@@ -32,13 +32,14 @@
 use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{Symbol, SymbolTable, TypeArena};
+use greycat_analyzer_core::{ItemId, Symbol, SymbolTable, TypeArena};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     AssignStmt, AtStmt, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt, ForStmt,
-    Ident, IfStmt, LambdaExpr, LocalVar, MemberExpr, ObjectExpr, OffsetExpr, Pragma, Stmt,
-    StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, VarDeclTop, WhileStmt,
+    Ident, IfStmt, LambdaExpr, LocalVar, MemberExpr, ObjectExpr, OffsetExpr, PositionalObjectExpr,
+    Pragma, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, VarDeclTop,
+    WhileStmt,
 };
 
 use crate::stdlib::{Namespace, ProjectIndex};
@@ -243,11 +244,23 @@ struct Cx<'a> {
     // served from `module_public_*` / `module_private_*` rather than
     // re-entering through the cross-module path.
     current_uri: Option<&'a Uri>,
+    /// Identity of the std-core `Map` decl, when the loaded stdlib has
+    /// been ingested. Lets the object-literal walker resolve a `Map`'s
+    /// `{ key: value }` keys as value expressions (they bind to
+    /// locals / params / enum-variants) while classic object field
+    /// names stay member-driven (not value uses). `None` for per-file
+    /// callers / projects without std.
+    map_decl: Option<ItemId>,
     res: Resolutions,
 }
 
 impl<'a> Cx<'a> {
-    fn new(hir: &'a Hir, index: &'a ProjectIndex, current_uri: Option<&'a Uri>) -> Self {
+    fn new(
+        hir: &'a Hir,
+        index: &'a ProjectIndex,
+        current_uri: Option<&'a Uri>,
+        map_decl: Option<ItemId>,
+    ) -> Self {
         Self {
             hir,
             module_public_type: FxHashMap::default(),
@@ -259,7 +272,29 @@ impl<'a> Cx<'a> {
             scopes: Vec::new(),
             index,
             current_uri,
+            map_decl,
             res: Resolutions::default(),
+        }
+    }
+
+    /// `true` when the object-literal head `type_ref` resolves to the
+    /// std-core `Map`. Consults the just-recorded resolution of the
+    /// head's leaf ident (so cross-module `Map` is recognised) and
+    /// compares its `ItemId` against [`Self::map_decl`]. A
+    /// user-declared `type Map` resolves to a `Definition::Decl` in the
+    /// current module, whose `ItemId` differs from the std slot — so it
+    /// is correctly *not* treated as the runtime `Map`.
+    fn object_head_is_map(&self, ty: Idx<TypeRef>) -> bool {
+        let Some(map_decl) = self.map_decl else {
+            return false;
+        };
+        let tr = &self.hir.type_refs[ty];
+        let leaf_sym = self.hir.idents[tr.name].symbol;
+        match self.res.lookup(tr.name) {
+            Some(Definition::ProjectDecl { uri, .. }) => {
+                self.index.item_id_for(&uri, leaf_sym) == Some(map_decl)
+            }
+            _ => false,
         }
     }
 
@@ -547,7 +582,7 @@ impl<'a> Cx<'a> {
 pub fn resolve(hir: &Hir, symbols: &SymbolTable) -> Resolutions {
     let mut arena = TypeArena::new();
     let index = ProjectIndex::with_symbols(symbols.clone(), &mut arena);
-    resolve_inner(hir, &index, None)
+    resolve_inner(hir, &index, None, None)
 }
 
 // P6.2
@@ -557,7 +592,7 @@ pub fn resolve(hir: &Hir, symbols: &SymbolTable) -> Resolutions {
 /// own decls can be filtered out of the global-public lookup; this
 /// shim survives for callers that don't have a URI handy.
 pub fn resolve_with_index(hir: &Hir, index: &ProjectIndex) -> Resolutions {
-    resolve_inner(hir, index, None)
+    resolve_inner(hir, index, None, None)
 }
 
 // P38.3
@@ -567,12 +602,22 @@ pub fn resolve_with_index(hir: &Hir, index: &ProjectIndex) -> Resolutions {
 /// module, so same-module private decls fall through to the
 /// last-resort step 3 instead of accidentally binding to themselves
 /// via `ProjectDecl`.
-pub fn resolve_with_index_for(hir: &Hir, index: &ProjectIndex, current_uri: &Uri) -> Resolutions {
-    resolve_inner(hir, index, Some(current_uri))
+pub fn resolve_with_index_for(
+    hir: &Hir,
+    index: &ProjectIndex,
+    current_uri: &Uri,
+    map_decl: Option<ItemId>,
+) -> Resolutions {
+    resolve_inner(hir, index, Some(current_uri), map_decl)
 }
 
-fn resolve_inner(hir: &Hir, index: &ProjectIndex, current_uri: Option<&Uri>) -> Resolutions {
-    let mut cx = Cx::new(hir, index, current_uri);
+fn resolve_inner(
+    hir: &Hir,
+    index: &ProjectIndex,
+    current_uri: Option<&Uri>,
+    map_decl: Option<ItemId>,
+) -> Resolutions {
+    let mut cx = Cx::new(hir, index, current_uri, map_decl);
 
     let Some(module) = hir.module.as_ref() else {
         return cx.res;
@@ -890,11 +935,32 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             }
         }
         Expr::Object(ObjectExpr { ty, fields, .. }) => {
+            // Resolve the head first so `object_head_is_map` can read
+            // its binding.
+            let is_map = if let Some(t) = ty {
+                visit_type_ref(cx, t);
+                cx.object_head_is_map(t)
+            } else {
+                false
+            };
+            for f in fields {
+                // `Map { k: v }` keys are value expressions (they bind
+                // to locals / params / enum-variants), so resolve them.
+                // Classic object field names are member-driven, *not*
+                // value uses — resolving them would mis-flag a field
+                // name as an unresolved value, so skip the key there.
+                if is_map {
+                    visit_expr(cx, f.name);
+                }
+                visit_expr(cx, f.value);
+            }
+        }
+        Expr::PositionalObject(PositionalObjectExpr { ty, fields, .. }) => {
             if let Some(t) = ty {
                 visit_type_ref(cx, t);
             }
-            for f in fields {
-                visit_expr(cx, f.value);
+            for value in fields {
+                visit_expr(cx, value);
             }
         }
         Expr::Member(MemberExpr { receiver, .. }) | Expr::Arrow(MemberExpr { receiver, .. }) => {

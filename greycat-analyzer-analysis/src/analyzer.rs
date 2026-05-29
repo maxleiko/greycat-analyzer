@@ -34,13 +34,36 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     AssignStmt, AtStmt, BinOp, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt,
     ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr, ObjectExpr,
-    ObjectField, OffsetExpr, Pragma, StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl,
-    TypeRef, UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
+    ObjectField, OffsetExpr, PositionalObjectExpr, Pragma, StaticExpr, Stmt, StringExpr, TryStmt,
+    TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
 };
 
 use crate::lint::{LintDiagnostic, LintSeverity};
 use crate::resolver::{Definition, Resolutions};
 use crate::stdlib::ProjectIndex;
+
+/// Recover a *field-name* symbol from a named object field's key
+/// expression. The grammar lowers `object_field.name` as a full
+/// `_expr`, so a classic field name arrives as `Expr::Ident` (or a
+/// quoted `Expr::String` for names that aren't valid bare idents, e.g.
+/// `Foo { "hello world": 1 }`). Returns the interned symbol plus the
+/// key's `Idx<Ident>` when it's a bare ident (so IDE binding can point
+/// at it); `None` for any other key shape — which is only legal as a
+/// `Map` key (an arbitrary value expression), never as a classic
+/// field name.
+pub(crate) fn object_field_key_name(
+    hir: &Hir,
+    symbols: &SymbolTable,
+    key: Idx<Expr>,
+) -> Option<(Symbol, Option<Idx<Ident>>)> {
+    match &hir.exprs[key] {
+        Expr::Ident { name, .. } => Some((hir.idents[*name].symbol, Some(*name))),
+        // A quoted field name never interpolates; skip template
+        // strings (they can't name an attr).
+        Expr::String(s) if !s.has_interpolation() => Some((symbols.intern(&s.raw_value()), None)),
+        _ => None,
+    }
+}
 
 // P13.1
 /// Does this statement always exit the enclosing control
@@ -3315,6 +3338,19 @@ impl<'a> Cx<'a> {
         base
     }
 
+    /// `true` when `ty`'s head decl is the std-core `Map` — the one
+    /// named-construction head whose `{ k: v }` entries are key/value
+    /// expressions rather than field names. Handle-keyed via
+    /// [`WellKnown`], so a user-declared `type Map` doesn't match.
+    fn head_decl_is_map(&self, ty: TypeId) -> bool {
+        let decl = match &self.arena.get(ty).kind {
+            TypeKind::Generic { decl, .. } => Some(*decl),
+            TypeKind::Type(decl) => Some(*decl),
+            _ => None,
+        };
+        decl.is_some() && decl == self.well_known.map_decl
+    }
+
     /// Object-expr completeness check: `Foo {}` / `Foo { a: 1 }`
     /// against `type Foo { a: int; c: String? }` should require `a`
     /// (non-nullable) and skip `c` (nullable — runtime auto-initializes
@@ -3335,9 +3371,10 @@ impl<'a> Cx<'a> {
     ///   resolves through a different path that isn't wired in here yet;
     /// - the head name isn't in [`ProjectIndex::type_members`] (so it's
     ///   a primitive / runtime-generic / unresolved typo — nothing to
-    ///   check against);
-    /// - any field is positional (`Foo { 1, 2 }`) — those fill in
-    ///   declaration order and need a different check.
+    ///   check against).
+    ///
+    /// Positional construction never reaches here — it's a separate HIR
+    /// variant (`Expr::PositionalObject`) with its own validator.
     fn check_object_required_attrs(&mut self, type_ref: Idx<TypeRef>, fields: &[ObjectField]) {
         let tr = &self.hir.type_refs[type_ref];
         if !tr.qualifier.is_empty() {
@@ -3350,15 +3387,16 @@ impl<'a> Cx<'a> {
         if !self.index.type_members.contains_key(&head_id) {
             return;
         }
-        // Bail on positional / mixed: positional fields fill in attr
-        // declaration order with completely different completeness
-        // semantics.
-        if fields.iter().any(|f| f.name.is_none()) {
-            return;
-        }
+        // Positional construction is a separate HIR variant
+        // (`Expr::PositionalObject`) and never reaches this named-only
+        // validator. Each field's key is the field name — a bare ident
+        // or a quoted string; any other key shape is invalid on a
+        // (non-`Map`) user type and is flagged below.
         let supplied: FxHashSet<Symbol> = fields
             .iter()
-            .filter_map(|f| f.name.map(|n| self.hir.idents[n].symbol))
+            .filter_map(|f| {
+                object_field_key_name(self.hir, &self.index.symbols, f.name).map(|(sym, _)| sym)
+            })
             .collect();
 
         // Walk Sub → Super → SuperSuper via `members.supertype`,
@@ -3370,7 +3408,7 @@ impl<'a> Cx<'a> {
         // Cap depth as a cheap cycle guard — the analyzer rejects
         // cycles elsewhere, but the walk here mustn't loop forever
         // even if one slips through.
-        let mut missing: Vec<SmolStr> = Vec::new();
+        let mut missing: Vec<Symbol> = Vec::new();
         let mut known: FxHashSet<Symbol> = FxHashSet::default();
         // Tracks where each known attr is declared so the IDE-side
         // `object_field_uses` binding below can point at the right
@@ -3410,10 +3448,8 @@ impl<'a> Cx<'a> {
                 if supplied.contains(attr_sym) {
                     continue;
                 }
-                let attr_name: &str = &self.index.symbols[*attr_sym];
-                let smol = SmolStr::new(attr_name);
-                if !missing.iter().any(|m| m == &smol) {
-                    missing.push(smol);
+                if !missing.iter().any(|m| m == attr_sym) {
+                    missing.push(*attr_sym);
                 }
             }
             cursor = members.supertype;
@@ -3424,8 +3460,13 @@ impl<'a> Cx<'a> {
         // intentionally skipped — they get an `unknown-field`
         // diagnostic below and have no attr to point at.
         for f in fields {
-            let Some(name_id) = f.name else { continue };
-            let attr_sym = self.hir.idents[name_id].symbol;
+            // IDE binding needs an `Idx<Ident>` to key on; only bare-ident
+            // keys carry one (string-literal field names have no ident).
+            let Some((attr_sym, Some(name_id))) =
+                object_field_key_name(self.hir, &self.index.symbols, f.name)
+            else {
+                continue;
+            };
             if let Some((declaring_type, attr_idx)) = declarers.get(&attr_sym) {
                 self.out.object_field_uses.insert(
                     name_id,
@@ -3447,13 +3488,27 @@ impl<'a> Cx<'a> {
         // be assigned via object syntax, so naming one here is
         // unknown in the assignment sense.
         for f in fields {
-            let Some(name_id) = f.name else { continue };
-            let attr_sym = self.hir.idents[name_id].symbol;
+            // A key that isn't an ident / quoted string can't name a
+            // field. On a (non-`Map`) user type that's a malformed
+            // construction — the runtime rejects it as "unresolved
+            // field". Flag it at the key's span.
+            let Some((attr_sym, _)) = object_field_key_name(self.hir, &self.index.symbols, f.name)
+            else {
+                self.diag(
+                    Severity::Error,
+                    "unknown-field",
+                    format!(
+                        "object field name must be an identifier or string literal naming an attribute of `{type_name}`"
+                    ),
+                    self.hir.exprs[f.name].byte_range(),
+                );
+                continue;
+            };
             if known.contains(&attr_sym) {
                 continue;
             }
             let attr_name: &str = &self.index.symbols[attr_sym];
-            let span = self.hir.idents[name_id].byte_range.clone();
+            let span = self.hir.exprs[f.name].byte_range();
             self.diag(
                 Severity::Error,
                 "unknown-field",
@@ -3465,13 +3520,21 @@ impl<'a> Cx<'a> {
         if missing.is_empty() {
             return;
         }
-        let names: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
-        let joined = names.join(", ");
         let plural = if missing.len() > 1 { "s" } else { "" };
+        let mut names = String::new();
+        {
+            use std::fmt::Write;
+            for (i, name) in missing.into_iter().enumerate() {
+                if i != 0 {
+                    names.push_str(", ");
+                }
+                write!(&mut names, "`{}`", &self.index.symbols[name]).unwrap();
+            }
+        }
         self.diag(
             Severity::Error,
             "missing-required-fields",
-            format!("missing required field{plural} for `{type_name}`: {joined} (non-nullable)"),
+            format!("missing required field{plural} for `{type_name}`: {names} (non-nullable)"),
             tr.byte_range.clone(),
         );
     }
@@ -5465,6 +5528,7 @@ impl<'a> Cx<'a> {
             | Expr::This { .. }
             | Expr::Array(..)
             | Expr::Object(_)
+            | Expr::PositionalObject(_)
             | Expr::Tuple(..) => true,
             Expr::Paren(inner, _) => self.is_syntactically_non_null(*inner),
             Expr::Unary(UnaryExpr {
@@ -5769,15 +5833,51 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Object(ObjectExpr { ty, fields, .. }) => {
+                let lowered = ty.map(|t| self.lower_type_ref(t));
+                // For a `Map { k: v }` the keys are value expressions
+                // (typed against `K`), so they must be visited too; for
+                // a classic object the key is a field *name*
+                // (member-resolved by `check_object_required_attrs`),
+                // not a value, so visiting it would mis-type a field
+                // name as a value use.
+                let is_map = lowered.is_some_and(|l| self.head_decl_is_map(l));
                 for f in &fields {
+                    if is_map {
+                        let _ = self.visit_expr(f.name);
+                    }
                     let _ = self.visit_expr(f.value);
                 }
-                if let Some(t) = ty {
-                    let lowered = self.lower_type_ref(t);
-                    self.check_object_required_attrs(t, &fields);
-                    lowered
-                } else {
-                    self.any_nullable()
+                match (ty, lowered) {
+                    (Some(t), Some(l)) => {
+                        if !is_map {
+                            self.check_object_required_attrs(t, &fields);
+                        }
+                        l
+                    }
+                    _ => self.any_nullable(),
+                }
+            }
+            Expr::PositionalObject(PositionalObjectExpr { ty, fields, .. }) => {
+                for value in &fields {
+                    let _ = self.visit_expr(*value);
+                }
+                // Construction-shape validation (`Array` / `node` / v7
+                // tuples vs. everything else) lives in the
+                // `collect_object_construction_diags` cross-module pass.
+                // An *empty* positional body is the `Foo {}` default-init
+                // — it still has to satisfy the required-attr check (all
+                // non-nullable attrs missing). A non-empty positional
+                // body on a non-Array/node head is already a construction
+                // error, so the required-attr check would be redundant
+                // noise there.
+                match ty {
+                    Some(t) => {
+                        if fields.is_empty() {
+                            self.check_object_required_attrs(t, &[]);
+                        }
+                        self.lower_type_ref(t)
+                    }
+                    None => self.any_nullable(),
                 }
             }
             Expr::Member(MemberExpr {
@@ -6503,6 +6603,7 @@ impl<'a> Cx<'a> {
                     && self.is_constant_array_element_shape(b.right)
             }
             Expr::Object(obj) => obj.ty.is_some(),
+            Expr::PositionalObject(obj) => obj.ty.is_some(),
             _ => false,
         }
     }

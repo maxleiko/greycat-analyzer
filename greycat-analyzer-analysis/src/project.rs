@@ -31,7 +31,7 @@ use greycat_analyzer_core::{
     GenericOwner, ItemId, Primitive, SourceManager, Symbol, SymbolTable, TypeArena, TypeId,
     TypeKind, is_assignable_to, is_castable,
 };
-use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Stmt, TypeRef};
+use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
 use greycat_analyzer_hir::{Hir, lower_module};
 
 use crate::analyzer::{
@@ -2357,6 +2357,10 @@ impl ProjectAnalysis {
     ) {
         let bypass = self.bypass_suppressions;
         let index = &self.index;
+        // P35.x — the std-core `Map` identity lets the resolver treat
+        // `Map { k: v }` keys as value expressions. `Copy`, so the
+        // parallel pass-A closure captures it by value.
+        let map_decl = self.well_known.map_decl;
 
         // P26.4 — split the per-module pass into two phases:
         //
@@ -2395,7 +2399,7 @@ impl ProjectAnalysis {
         )|
          -> PassAOut {
             let t0 = Instant::now();
-            let resolutions = resolve_with_index_for(&hir, index, &uri);
+            let resolutions = resolve_with_index_for(&hir, index, &uri, map_decl);
             let resolve_took = t0.elapsed();
             let t2 = Instant::now();
             // Seed `lints` with the directive parser's own diagnostics
@@ -2517,388 +2521,6 @@ impl ProjectAnalysis {
     /// through their fully-qualified name from elsewhere.
     fn stage_compute_qualified_refs(&mut self, manager: &SourceManager) {
         self.compute_qualified_refs(manager);
-    }
-
-    /// Walks every module's `Expr::Call` and emits arity / arg-type
-    /// diagnostics. Two signature carriers are supported:
-    ///
-    /// 1. Direct fn-decl callees (in-module via `Resolutions::uses` +
-    ///    `member_uses`, cross-module via `foreign_member_uses` +
-    ///    `QualifiedStatic`) — resolved via [`resolve_call_target`].
-    /// 2. Lambda-typed callees — when (1) returns `None`, the callee's
-    ///    settled `expr_types` entry is consulted; if it's
-    ///    `TypeKind::Lambda { params, ret }` (a lambda literal in a
-    ///    var, or a fn-ref minted by `fn_ref_ty_from_sig`), arity and
-    ///    per-arg checks run against the lambda's pre-lowered params.
-    ///    Opaque `function` and everything else carry no signature
-    ///    and are skipped here.
-    ///
-    /// Runs after pass 3.5 so the arg-side `expr_types` reflect any
-    /// cross-module return-type inferences (otherwise outer calls
-    /// whose args are inner static-expr calls would all surface
-    /// "value of type `any`" false positives). Folded into the
-    /// unified validation phase so all type-relation diagnostics share
-    /// one producer.
-    // P19
-    /// Split-borrow variant: takes `&modules`, `&index`, and a
-    /// mutable borrow on the shared arena. The validation loop holds
-    /// `&mut self.arena` during iteration over `&self.modules`, so the
-    /// `&self`-borrowing version can no longer be invoked directly
-    /// from the same scope.
-    #[allow(clippy::mutable_key_type)]
-    fn collect_call_arg_diags_split(
-        modules: &FxHashMap<Uri, ModuleAnalysis>,
-        index: &ProjectIndex,
-        well_known: &crate::well_known::WellKnown,
-        decl_registry: &crate::well_known::DeclRegistry,
-        cur_uri: &Uri,
-        arena: &mut TypeArena,
-        diags: &mut Vec<SemanticDiagnostic>,
-    ) {
-        use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
-        use greycat_analyzer_hir::types::Expr;
-
-        let cur_module = match modules.get(cur_uri) {
-            Some(m) => m,
-            None => {
-                return;
-            }
-        };
-        for (_call_id, call_expr) in cur_module.hir.exprs.iter() {
-            let Expr::Call(call) = call_expr else {
-                continue;
-            };
-            let Some((foreign_uri_opt, fn_decl_id)) =
-                resolve_call_target(modules, index, cur_module, call.callee)
-            else {
-                // No fn-decl handle — fall back to the callee's settled
-                // type. Lambda-typed callees (lambda literals / fn-ref
-                // values) carry their signature in the type; opaque
-                // `function` and other kinds skip.
-                lambda_call_arg_diags(
-                    cur_module,
-                    cur_uri,
-                    index,
-                    well_known,
-                    decl_registry,
-                    arena,
-                    call,
-                    diags,
-                );
-                continue;
-            };
-            let foreign_module = match &foreign_uri_opt {
-                Some(u) => modules.get(u),
-                None => Some(cur_module),
-            };
-            let Some(fn_module) = foreign_module else {
-                continue;
-            };
-            let Decl::Fn(fnd) = &fn_module.hir.decls[fn_decl_id] else {
-                continue;
-            };
-            // **P19.19** — arity check (independent of generics; a
-            // generic fn `<T>(x: T)` still has arity 1). Mirrors the TS
-            // reference's "Function 'foo' expects N arguments, but got
-            // M" diagnostic. Highlight range = the arg-list parens
-            // (callee_end..call_end), matching the reference's span.
-            let expected = fnd.params.len();
-            let actual = call.args.len();
-            if expected != actual {
-                let fn_name = &index.symbols[fn_module.hir.idents[fnd.name].symbol];
-                let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
-                let plural = if expected == 1 { "" } else { "s" };
-                diags.push(SemanticDiagnostic {
-                    severity: Severity::Error,
-                    code: "call-arity",
-                    message: format!(
-                        "function `{fn_name}` expects {expected} argument{plural}, but got {actual}"
-                    ),
-                    byte_range: callee_end..call.byte_range.end,
-                    category: DiagCategory::TypeRelation,
-                });
-                // Skip the per-arg type validation: the pair-mapping is
-                // ambiguous when arity is wrong, so further diagnostics
-                // would be noise.
-                continue;
-            }
-            if !fnd.generics.is_empty() {
-                continue;
-            }
-            // Method call on a generic receiver: substitute the
-            // enclosing type's generic params into each declared
-            // method-param type. For `n.set(42)` with `n: node<int?>`,
-            // this turns `set(value: T)` into `set(value: int?)` before
-            // the arg-type comparison so we don't surface a false
-            // "value of type `int` is not assignable to parameter
-            // `value: T`" diagnostic.
-            // Returns two pieces:
-            //   - `generics_in_scope` so `lower_type_ref_project`
-            //     mints the method's `T` as `GenericParam{T, owner=Type(node)}`
-            //     (rather than the default `Unresolved{T}` which would
-            //     accept anything).
-            //   - `subst` mapping `{T → int?}` so `arena.substitute`
-            //     replaces the `GenericParam` with the concrete arg.
-            // Both maps are empty for non-member callees / non-generic
-            // receivers; the lowering then collapses to the
-            // empty-scope path and substitution is a no-op.
-            let (method_generics_in_scope, method_subst) = method_subst_from_receiver(
-                arena,
-                cur_module,
-                fn_module,
-                index,
-                &cur_module.hir.exprs[call.callee],
-            );
-            let pair_count = fnd.params.len().min(call.args.len());
-            for i in 0..pair_count {
-                let p = &fn_module.hir.fn_params[fnd.params[i]];
-                let Some(declared_ref) = p.ty else {
-                    continue;
-                };
-                // Lower the method's param TypeRef directly into the
-                // shared arena (`lower_type_ref_project` returns a
-                // `TypeId`, no intermediate shape needed), then
-                // substitute the receiver-derived generic args via
-                // `arena.substitute`. Replaces the old TypeShape
-                // round-trip — one less type representation, fewer
-                // per-call allocations, no foreign-HIR re-walk.
-                let fn_uri = foreign_uri_opt.as_ref().unwrap_or(cur_uri);
-                let declared_raw = lower_type_ref_project(
-                    &fn_module.hir,
-                    declared_ref,
-                    arena,
-                    index,
-                    decl_registry,
-                    &method_generics_in_scope,
-                    Some(fn_uri),
-                );
-                let declared_ty = if method_subst.is_empty() {
-                    declared_raw
-                } else {
-                    arena.substitute(declared_raw, &method_subst)
-                };
-                let arg_ty = match cur_module.analysis.expr_types.get(&call.args[i]).copied() {
-                    Some(t) => t,
-                    None => continue,
-                };
-                if !is_assignable_to_with_index(
-                    index,
-                    well_known,
-                    decl_registry,
-                    arena,
-                    arg_ty,
-                    declared_ty,
-                ) {
-                    let p_name = &index.symbols[fn_module.hir.idents[p.name].symbol];
-                    let r = cur_module.hir.exprs[call.args[i]].byte_range();
-                    diags.push(SemanticDiagnostic {
-                        severity: Severity::Error,
-                        code: "argument-type-mismatch",
-                        message: format!(
-                            "value of type `{}` is not assignable to parameter `{}: {}`",
-                            display_type_for_module(
-                                arena,
-                                index,
-                                decl_registry,
-                                arg_ty,
-                                Some(cur_uri),
-                            ),
-                            p_name,
-                            display_type_for_module(
-                                arena,
-                                index,
-                                decl_registry,
-                                declared_ty,
-                                Some(cur_uri),
-                            ),
-                        ),
-                        byte_range: r,
-                        category: DiagCategory::TypeRelation,
-                    });
-                }
-            }
-        }
-    }
-
-    /// Sibling of [`Self::collect_call_arg_diags_split`] for the
-    /// object-construction shape: `Foo<int> { quantizers: false }`.
-    /// Every supplied field's value type must be assignable to the
-    /// attr's declared type, after substituting the object expr's own
-    /// generic args for the decl's `GenericParam` slots. Walks the
-    /// supertype chain so inherited attrs (`type Dog extends Animal`,
-    /// `Dog { name: ... }`) check against `Animal`'s declared `name`
-    /// type. Statics are skipped — the analyzer's unknown-field check
-    /// handles `Foo { static_attr_name: ... }` separately.
-    ///
-    /// Sibling of the structural `check_object_required_attrs` (in
-    /// the analyzer) which does name-level completeness. Type-relation
-    /// work lives here per the architectural invariant on
-    /// [`Self::validate_type_relations`].
-    #[allow(clippy::mutable_key_type)]
-    fn collect_object_field_diags_split(
-        modules: &FxHashMap<Uri, ModuleAnalysis>,
-        index: &ProjectIndex,
-        well_known: &crate::well_known::WellKnown,
-        decl_registry: &crate::well_known::DeclRegistry,
-        cur_uri: &Uri,
-        arena: &mut TypeArena,
-        diags: &mut Vec<SemanticDiagnostic>,
-    ) {
-        use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
-        use greycat_analyzer_hir::types::{Expr, ObjectExpr};
-
-        let cur_module = match modules.get(cur_uri) {
-            Some(m) => m,
-            None => {
-                return;
-            }
-        };
-        for (obj_expr_id, expr) in cur_module.hir.exprs.iter() {
-            let Expr::Object(ObjectExpr {
-                ty: Some(tr_id),
-                fields,
-                ..
-            }) = expr
-            else {
-                continue;
-            };
-            let tr = &cur_module.hir.type_refs[*tr_id];
-            if !tr.qualifier.is_empty() {
-                continue;
-            }
-            let head_sym = cur_module.hir.idents[tr.name].symbol;
-            let Some(head_id) = index.item_id_for(cur_uri, head_sym) else {
-                continue;
-            };
-            let Some(head_members) = index.type_members.get(&head_id) else {
-                continue;
-            };
-            // Positional / mixed fields use a different completeness
-            // model (declaration order); skip for now.
-            if fields.iter().any(|f| f.name.is_none()) {
-                continue;
-            }
-            // Build substitution from the object expr's own settled
-            // TypeId. Non-generic head ⇒ empty subst (a no-op). Arity
-            // mismatch ⇒ skip the whole expr; the head's lowering pass
-            // has already flagged it elsewhere and substituting with
-            // the wrong shape would surface noise.
-            let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
-                continue;
-            };
-            let init_subst: FxHashMap<Symbol, TypeId> = match &arena.get(obj_ty).kind {
-                TypeKind::Generic { args, .. } if args.len() == head_members.generics.len() => {
-                    head_members
-                        .generics
-                        .iter()
-                        .copied()
-                        .zip(args.iter().copied())
-                        .collect()
-                }
-                TypeKind::Type(_) if head_members.generics.is_empty() => FxHashMap::default(),
-                _ => continue,
-            };
-            // Walk the chain Sub → Base<int> → Base<int>'s parent …,
-            // accumulating each level's subst so an attr inherited from
-            // a generic parent (`val: T` on `Base<T>`) gets `T`
-            // substituted with the concrete arg the child instantiates
-            // (`Sub extends Base<int>` → `val: int`). Mirrors the
-            // [`walk_substituted_supertype_chain`] flow used by
-            // assignability; we can't share that helper here because
-            // we need each hop's attr table, not just the final
-            // assignability result.
-            //
-            // `chain_attrs` stores the *already-substituted* declared
-            // type per attr, so the per-field check is a direct lookup
-            // — no second-pass substitution needed.
-            let mut chain_attrs: FxHashMap<Symbol, (TypeId, bool)> = FxHashMap::default();
-            let mut cur_decl = head_id;
-            let mut cur_subst = init_subst;
-            let mut seen: FxHashSet<ItemId> = FxHashSet::default();
-            for _ in 0..32 {
-                if !seen.insert(cur_decl) {
-                    break;
-                }
-                let Some(m) = index.type_members.get(&cur_decl) else {
-                    break;
-                };
-                for (sym, raw_ty) in &m.attr_types {
-                    let ty = if cur_subst.is_empty() {
-                        *raw_ty
-                    } else {
-                        arena.substitute(*raw_ty, &cur_subst)
-                    };
-                    let is_static = m.static_attrs.contains(sym);
-                    chain_attrs.entry(*sym).or_insert((ty, is_static));
-                }
-                let Some(sup_ty_raw) = m.supertype_ty else {
-                    break;
-                };
-                let sup_ty = if cur_subst.is_empty() {
-                    sup_ty_raw
-                } else {
-                    arena.substitute(sup_ty_raw, &cur_subst)
-                };
-                match arena.get(sup_ty).kind.clone() {
-                    TypeKind::Generic { decl, args } => {
-                        let Some(parent_m) = index.type_members.get(&decl) else {
-                            break;
-                        };
-                        if parent_m.generics.len() != args.len() {
-                            break;
-                        }
-                        cur_decl = decl;
-                        cur_subst = parent_m
-                            .generics
-                            .iter()
-                            .copied()
-                            .zip(args.iter().copied())
-                            .collect();
-                    }
-                    TypeKind::Type(decl) => {
-                        cur_decl = decl;
-                        cur_subst.clear();
-                    }
-                    _ => break,
-                }
-            }
-            for f in fields.iter() {
-                let Some(name_id) = f.name else { continue };
-                let attr_sym = cur_module.hir.idents[name_id].symbol;
-                let Some(&(declared_ty, is_static)) = chain_attrs.get(&attr_sym) else {
-                    continue; // unknown-field handled by the structural pass
-                };
-                if is_static {
-                    continue; // unknown-field also handles static-as-instance
-                }
-                let Some(value_ty) = cur_module.analysis.expr_types.get(&f.value).copied() else {
-                    continue;
-                };
-                if !is_assignable_to_with_index(
-                    index,
-                    well_known,
-                    decl_registry,
-                    arena,
-                    value_ty,
-                    declared_ty,
-                ) {
-                    let attr_name = &index.symbols[attr_sym];
-                    let r = cur_module.hir.exprs[f.value].byte_range();
-                    diags.push(SemanticDiagnostic {
-                        severity: Severity::Error,
-                        code: "field-type-mismatch",
-                        message: format!(
-                            "value of type `{}` is not assignable to field `{}: {}`",
-                            display_type(arena, decl_registry, &index.symbols, value_ty),
-                            attr_name,
-                            display_type(arena, decl_registry, &index.symbols, declared_ty),
-                        ),
-                        byte_range: r,
-                        category: DiagCategory::TypeRelation,
-                    });
-                }
-            }
-        }
     }
 
     /// Pass 3.7 — unified type-relation validation. Walks every
@@ -3055,7 +2677,7 @@ impl ProjectAnalysis {
             // free walker. Note: we hold `arena_mut` here, so call into
             // a helper that accepts `&self.modules` + `&self.index` +
             // `arena` instead of borrowing `&self`.
-            Self::collect_call_arg_diags_split(
+            collect_call_arg_diags_split(
                 &self.modules,
                 index,
                 well_known,
@@ -3064,7 +2686,7 @@ impl ProjectAnalysis {
                 arena_mut,
                 &mut diags,
             );
-            Self::collect_object_field_diags_split(
+            collect_object_field_diags_split(
                 &self.modules,
                 index,
                 well_known,
@@ -3074,6 +2696,14 @@ impl ProjectAnalysis {
                 &mut diags,
             );
             collect_instance_method_value_ref_diags(&self.modules, cur_uri, &mut diags);
+            collect_object_construction_diags(
+                &self.modules,
+                arena_mut,
+                index,
+                well_known,
+                cur_uri,
+                &mut diags,
+            );
             if !diags.is_empty() {
                 diag_updates.insert(cur_uri.clone(), diags);
             }
@@ -3390,7 +3020,7 @@ impl ProjectAnalysis {
             ..ModuleTimings::default()
         };
         let t0 = Instant::now();
-        let resolutions = resolve_with_index_for(&hir, &self.index, uri);
+        let resolutions = resolve_with_index_for(&hir, &self.index, uri, self.well_known.map_decl);
         timings.resolve = t0.elapsed();
         let t1 = Instant::now();
         let analysis = analyze_with_index_into(
@@ -3638,6 +3268,392 @@ fn lambda_call_arg_diags(
     }
 }
 
+/// Walks every module's `Expr::Call` and emits arity / arg-type
+/// diagnostics. Two signature carriers are supported:
+///
+/// 1. Direct fn-decl callees (in-module via `Resolutions::uses` +
+///    `member_uses`, cross-module via `foreign_member_uses` +
+///    `QualifiedStatic`) — resolved via [`resolve_call_target`].
+/// 2. Lambda-typed callees — when (1) returns `None`, the callee's
+///    settled `expr_types` entry is consulted; if it's
+///    `TypeKind::Lambda { params, ret }` (a lambda literal in a
+///    var, or a fn-ref minted by `fn_ref_ty_from_sig`), arity and
+///    per-arg checks run against the lambda's pre-lowered params.
+///    Opaque `function` and everything else carry no signature
+///    and are skipped here.
+///
+/// Runs after pass 3.5 so the arg-side `expr_types` reflect any
+/// cross-module return-type inferences (otherwise outer calls
+/// whose args are inner static-expr calls would all surface
+/// "value of type `any`" false positives). Folded into the
+/// unified validation phase so all type-relation diagnostics share
+/// one producer.
+// P19
+/// Split-borrow variant: takes `&modules`, `&index`, and a
+/// mutable borrow on the shared arena. The validation loop holds
+/// `&mut self.arena` during iteration over `&self.modules`, so the
+/// `&self`-borrowing version can no longer be invoked directly
+/// from the same scope.
+#[allow(clippy::mutable_key_type)]
+fn collect_call_arg_diags_split(
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    well_known: &crate::well_known::WellKnown,
+    decl_registry: &crate::well_known::DeclRegistry,
+    cur_uri: &Uri,
+    arena: &mut TypeArena,
+    diags: &mut Vec<SemanticDiagnostic>,
+) {
+    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    use greycat_analyzer_hir::types::Expr;
+
+    let cur_module = match modules.get(cur_uri) {
+        Some(m) => m,
+        None => {
+            return;
+        }
+    };
+    for (_call_id, call_expr) in cur_module.hir.exprs.iter() {
+        let Expr::Call(call) = call_expr else {
+            continue;
+        };
+        let Some((foreign_uri_opt, fn_decl_id)) =
+            resolve_call_target(modules, index, cur_module, call.callee)
+        else {
+            // No fn-decl handle — fall back to the callee's settled
+            // type. Lambda-typed callees (lambda literals / fn-ref
+            // values) carry their signature in the type; opaque
+            // `function` and other kinds skip.
+            lambda_call_arg_diags(
+                cur_module,
+                cur_uri,
+                index,
+                well_known,
+                decl_registry,
+                arena,
+                call,
+                diags,
+            );
+            continue;
+        };
+        let foreign_module = match &foreign_uri_opt {
+            Some(u) => modules.get(u),
+            None => Some(cur_module),
+        };
+        let Some(fn_module) = foreign_module else {
+            continue;
+        };
+        let Decl::Fn(fnd) = &fn_module.hir.decls[fn_decl_id] else {
+            continue;
+        };
+        // **P19.19** — arity check (independent of generics; a
+        // generic fn `<T>(x: T)` still has arity 1). Mirrors the TS
+        // reference's "Function 'foo' expects N arguments, but got
+        // M" diagnostic. Highlight range = the arg-list parens
+        // (callee_end..call_end), matching the reference's span.
+        let expected = fnd.params.len();
+        let actual = call.args.len();
+        if expected != actual {
+            let fn_name = &index.symbols[fn_module.hir.idents[fnd.name].symbol];
+            let callee_end = cur_module.hir.exprs[call.callee].byte_range().end;
+            let plural = if expected == 1 { "" } else { "s" };
+            diags.push(SemanticDiagnostic {
+                severity: Severity::Error,
+                code: "call-arity",
+                message: format!(
+                    "function `{fn_name}` expects {expected} argument{plural}, but got {actual}"
+                ),
+                byte_range: callee_end..call.byte_range.end,
+                category: DiagCategory::TypeRelation,
+            });
+            // Skip the per-arg type validation: the pair-mapping is
+            // ambiguous when arity is wrong, so further diagnostics
+            // would be noise.
+            continue;
+        }
+        if !fnd.generics.is_empty() {
+            continue;
+        }
+        // Method call on a generic receiver: substitute the
+        // enclosing type's generic params into each declared
+        // method-param type. For `n.set(42)` with `n: node<int?>`,
+        // this turns `set(value: T)` into `set(value: int?)` before
+        // the arg-type comparison so we don't surface a false
+        // "value of type `int` is not assignable to parameter
+        // `value: T`" diagnostic.
+        // Returns two pieces:
+        //   - `generics_in_scope` so `lower_type_ref_project`
+        //     mints the method's `T` as `GenericParam{T, owner=Type(node)}`
+        //     (rather than the default `Unresolved{T}` which would
+        //     accept anything).
+        //   - `subst` mapping `{T → int?}` so `arena.substitute`
+        //     replaces the `GenericParam` with the concrete arg.
+        // Both maps are empty for non-member callees / non-generic
+        // receivers; the lowering then collapses to the
+        // empty-scope path and substitution is a no-op.
+        let (method_generics_in_scope, method_subst) = method_subst_from_receiver(
+            arena,
+            cur_module,
+            fn_module,
+            index,
+            &cur_module.hir.exprs[call.callee],
+        );
+        let pair_count = fnd.params.len().min(call.args.len());
+        for i in 0..pair_count {
+            let p = &fn_module.hir.fn_params[fnd.params[i]];
+            let Some(declared_ref) = p.ty else {
+                continue;
+            };
+            // Lower the method's param TypeRef directly into the
+            // shared arena (`lower_type_ref_project` returns a
+            // `TypeId`, no intermediate shape needed), then
+            // substitute the receiver-derived generic args via
+            // `arena.substitute`. Replaces the old TypeShape
+            // round-trip — one less type representation, fewer
+            // per-call allocations, no foreign-HIR re-walk.
+            let fn_uri = foreign_uri_opt.as_ref().unwrap_or(cur_uri);
+            let declared_raw = lower_type_ref_project(
+                &fn_module.hir,
+                declared_ref,
+                arena,
+                index,
+                decl_registry,
+                &method_generics_in_scope,
+                Some(fn_uri),
+            );
+            let declared_ty = if method_subst.is_empty() {
+                declared_raw
+            } else {
+                arena.substitute(declared_raw, &method_subst)
+            };
+            let arg_ty = match cur_module.analysis.expr_types.get(&call.args[i]).copied() {
+                Some(t) => t,
+                None => continue,
+            };
+            if !is_assignable_to_with_index(
+                index,
+                well_known,
+                decl_registry,
+                arena,
+                arg_ty,
+                declared_ty,
+            ) {
+                let p_name = &index.symbols[fn_module.hir.idents[p.name].symbol];
+                let r = cur_module.hir.exprs[call.args[i]].byte_range();
+                diags.push(SemanticDiagnostic {
+                    severity: Severity::Error,
+                    code: "argument-type-mismatch",
+                    message: format!(
+                        "value of type `{}` is not assignable to parameter `{}: {}`",
+                        display_type_for_module(
+                            arena,
+                            index,
+                            decl_registry,
+                            arg_ty,
+                            Some(cur_uri),
+                        ),
+                        p_name,
+                        display_type_for_module(
+                            arena,
+                            index,
+                            decl_registry,
+                            declared_ty,
+                            Some(cur_uri),
+                        ),
+                    ),
+                    byte_range: r,
+                    category: DiagCategory::TypeRelation,
+                });
+            }
+        }
+    }
+}
+
+/// Sibling of [`Self::collect_call_arg_diags_split`] for the
+/// object-construction shape: `Foo<int> { quantizers: false }`.
+/// Every supplied field's value type must be assignable to the
+/// attr's declared type, after substituting the object expr's own
+/// generic args for the decl's `GenericParam` slots. Walks the
+/// supertype chain so inherited attrs (`type Dog extends Animal`,
+/// `Dog { name: ... }`) check against `Animal`'s declared `name`
+/// type. Statics are skipped — the analyzer's unknown-field check
+/// handles `Foo { static_attr_name: ... }` separately.
+///
+/// Sibling of the structural `check_object_required_attrs` (in
+/// the analyzer) which does name-level completeness. Type-relation
+/// work lives here per the architectural invariant on
+/// [`Self::validate_type_relations`].
+#[allow(clippy::mutable_key_type)]
+fn collect_object_field_diags_split(
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
+    index: &ProjectIndex,
+    well_known: &WellKnown,
+    decl_registry: &DeclRegistry,
+    cur_uri: &Uri,
+    arena: &mut TypeArena,
+    diags: &mut Vec<SemanticDiagnostic>,
+) {
+    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    use greycat_analyzer_hir::types::{Expr, ObjectExpr};
+
+    let cur_module = match modules.get(cur_uri) {
+        Some(m) => m,
+        None => {
+            return;
+        }
+    };
+    for (obj_expr_id, expr) in cur_module.hir.exprs.iter() {
+        let Expr::Object(ObjectExpr {
+            ty: Some(tr_id),
+            fields,
+            ..
+        }) = expr
+        else {
+            continue;
+        };
+        let tr = &cur_module.hir.type_refs[*tr_id];
+        if !tr.qualifier.is_empty() {
+            continue;
+        }
+        let head_sym = cur_module.hir.idents[tr.name].symbol;
+        let Some(head_id) = index.item_id_for(cur_uri, head_sym) else {
+            continue;
+        };
+        let Some(head_members) = index.type_members.get(&head_id) else {
+            continue;
+        };
+        // Positional construction is a separate HIR variant
+        // (`Expr::PositionalObject`) and never reaches this named-only
+        // validator.
+        // Build substitution from the object expr's own settled
+        // TypeId. Non-generic head ⇒ empty subst (a no-op). Arity
+        // mismatch ⇒ skip the whole expr; the head's lowering pass
+        // has already flagged it elsewhere and substituting with
+        // the wrong shape would surface noise.
+        let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
+            continue;
+        };
+        let init_subst: FxHashMap<Symbol, TypeId> = match &arena.get(obj_ty).kind {
+            TypeKind::Generic { args, .. } if args.len() == head_members.generics.len() => {
+                head_members
+                    .generics
+                    .iter()
+                    .copied()
+                    .zip(args.iter().copied())
+                    .collect()
+            }
+            TypeKind::Type(_) if head_members.generics.is_empty() => FxHashMap::default(),
+            _ => continue,
+        };
+        // Walk the chain Sub → Base<int> → Base<int>'s parent …,
+        // accumulating each level's subst so an attr inherited from
+        // a generic parent (`val: T` on `Base<T>`) gets `T`
+        // substituted with the concrete arg the child instantiates
+        // (`Sub extends Base<int>` → `val: int`). Mirrors the
+        // [`walk_substituted_supertype_chain`] flow used by
+        // assignability; we can't share that helper here because
+        // we need each hop's attr table, not just the final
+        // assignability result.
+        //
+        // `chain_attrs` stores the *already-substituted* declared
+        // type per attr, so the per-field check is a direct lookup
+        // — no second-pass substitution needed.
+        let mut chain_attrs: FxHashMap<Symbol, (TypeId, bool)> = FxHashMap::default();
+        let mut cur_decl = head_id;
+        let mut cur_subst = init_subst;
+        let mut seen: FxHashSet<ItemId> = FxHashSet::default();
+        for _ in 0..32 {
+            if !seen.insert(cur_decl) {
+                break;
+            }
+            let Some(m) = index.type_members.get(&cur_decl) else {
+                break;
+            };
+            for (sym, raw_ty) in &m.attr_types {
+                let ty = if cur_subst.is_empty() {
+                    *raw_ty
+                } else {
+                    arena.substitute(*raw_ty, &cur_subst)
+                };
+                let is_static = m.static_attrs.contains(sym);
+                chain_attrs.entry(*sym).or_insert((ty, is_static));
+            }
+            let Some(sup_ty_raw) = m.supertype_ty else {
+                break;
+            };
+            let sup_ty = if cur_subst.is_empty() {
+                sup_ty_raw
+            } else {
+                arena.substitute(sup_ty_raw, &cur_subst)
+            };
+            match arena.get(sup_ty).kind.clone() {
+                TypeKind::Generic { decl, args } => {
+                    let Some(parent_m) = index.type_members.get(&decl) else {
+                        break;
+                    };
+                    if parent_m.generics.len() != args.len() {
+                        break;
+                    }
+                    cur_decl = decl;
+                    cur_subst = parent_m
+                        .generics
+                        .iter()
+                        .copied()
+                        .zip(args.iter().copied())
+                        .collect();
+                }
+                TypeKind::Type(decl) => {
+                    cur_decl = decl;
+                    cur_subst.clear();
+                }
+                _ => break,
+            }
+        }
+        for f in fields.iter() {
+            // The key is a field name only when it's an ident / quoted
+            // string; any other key shape (a `Map` value-key) has no
+            // attr to type-check against here.
+            let Some((attr_sym, _)) =
+                crate::analyzer::object_field_key_name(&cur_module.hir, &index.symbols, f.name)
+            else {
+                continue;
+            };
+            let Some(&(declared_ty, is_static)) = chain_attrs.get(&attr_sym) else {
+                continue; // unknown-field handled by the structural pass
+            };
+            if is_static {
+                continue; // unknown-field also handles static-as-instance
+            }
+            let Some(value_ty) = cur_module.analysis.expr_types.get(&f.value).copied() else {
+                continue;
+            };
+            if !is_assignable_to_with_index(
+                index,
+                well_known,
+                decl_registry,
+                arena,
+                value_ty,
+                declared_ty,
+            ) {
+                let attr_name = &index.symbols[attr_sym];
+                let r = cur_module.hir.exprs[f.value].byte_range();
+                diags.push(SemanticDiagnostic {
+                    severity: Severity::Error,
+                    code: "field-type-mismatch",
+                    message: format!(
+                        "value of type `{}` is not assignable to field `{}: {}`",
+                        display_type(arena, decl_registry, &index.symbols, value_ty),
+                        attr_name,
+                        display_type(arena, decl_registry, &index.symbols, declared_ty),
+                    ),
+                    byte_range: r,
+                    category: DiagCategory::TypeRelation,
+                });
+            }
+        }
+    }
+}
+
 /// Instance-method value-reference walker (lambda-unify step 4).
 ///
 /// Only context-free fn references are first-class values in GCL:
@@ -3660,7 +3676,7 @@ fn lambda_call_arg_diags(
 fn collect_instance_method_value_ref_diags(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     cur_uri: &Uri,
-    diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
+    diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{DiagCategory, MemberDef, SemanticDiagnostic, Severity};
     use greycat_analyzer_hir::types::Expr;
@@ -3720,16 +3736,181 @@ fn collect_instance_method_value_ref_diags(
     }
 }
 
+/// Object-construction shape walker.
+///
+/// GreyCat's `T { … }` syntax carries two implicit construction shapes
+/// the grammar can't disambiguate:
+///
+/// - `Array<T> { e1, e2, … }` — positional, any arity. `[e1, …]` is
+///   sugar for the same thing.
+/// - `node<T> { v }` — positional, at most one element.
+///
+/// Every other type — user-declared types, `Map`, `Tuple`, `Buffer`,
+/// the other node-tag family members — must use the named form
+/// (`T { field: value }`). Positional usage is rejected by the
+/// runtime. The check runs here because it needs `WellKnown`
+/// identities for `node` and `Array`, which `parse_diagnostics`
+/// doesn't see.
+#[allow(clippy::mutable_key_type)]
+fn collect_object_construction_diags(
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
+    arena: &TypeArena,
+    index: &ProjectIndex,
+    well_known: &WellKnown,
+    cur_uri: &Uri,
+    diags: &mut Vec<SemanticDiagnostic>,
+) {
+    use crate::analyzer::Severity;
+    use greycat_analyzer_hir::types::{Expr, PositionalObjectExpr};
+
+    let Some(cur_module) = modules.get(cur_uri) else {
+        return;
+    };
+    for (obj_expr_id, expr) in cur_module.hir.exprs.iter() {
+        // Only the positional form (`Foo { a, b }`) is this pass's
+        // concern — named construction (`Foo { k: v }`, including
+        // `Map`) is a different HIR variant and handled elsewhere.
+        let Expr::PositionalObject(PositionalObjectExpr {
+            ty: Some(tr_id),
+            fields,
+            byte_range,
+        }) = expr
+        else {
+            continue;
+        };
+        // Empty `T {}` is always a valid default-init.
+        if fields.is_empty() {
+            continue;
+        }
+        // Dispatch on the already-settled outer type identity.
+        let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
+            continue;
+        };
+        let head_decl = match &arena.get(obj_ty).kind {
+            TypeKind::Generic { decl, .. } => *decl,
+            TypeKind::Type(decl) => *decl,
+            _ => continue,
+        };
+        if Some(head_decl) == well_known.array_decl {
+            continue;
+        }
+        if Some(head_decl) == well_known.node_decl {
+            if fields.len() > 1 {
+                diags.push(SemanticDiagnostic {
+                    severity: Severity::Error,
+                    code: "node-init-arity",
+                    message: "`node` accepts at most one positional initializer".to_string(),
+                    byte_range: byte_range.clone(),
+                    category: DiagCategory::TypeRelation,
+                });
+            }
+            continue;
+        }
+        // v7 fixed-shape tuple natives. Each slot is `Some` only when
+        // the loaded stdlib is v7 (slots stay `None` on v8 / no-stdlib
+        // projects, so the comparisons all miss and the loop falls
+        // through to the named-form rule below). Contract per type:
+        // exact positional arity + every element typed as one of
+        // `accepted`. The float variants asymmetrically accept `int`
+        // (runtime coerces `int → float` — verified against
+        // `greycat run` v7.8); the int variants stay strict (runtime
+        // rejects `float → int` even for literals).
+        let fixed_tuples: [(Option<ItemId>, usize, &[Primitive], &str); 7] = [
+            (well_known.t2_decl, 2, &[Primitive::Int], "t2"),
+            (
+                well_known.t2f_decl,
+                2,
+                &[Primitive::Float, Primitive::Int],
+                "t2f",
+            ),
+            (well_known.t3_decl, 3, &[Primitive::Int], "t3"),
+            (
+                well_known.t3f_decl,
+                3,
+                &[Primitive::Float, Primitive::Int],
+                "t3f",
+            ),
+            (well_known.t4_decl, 4, &[Primitive::Int], "t4"),
+            (
+                well_known.t4f_decl,
+                4,
+                &[Primitive::Float, Primitive::Int],
+                "t4f",
+            ),
+            (well_known.str_decl, 1, &[Primitive::String], "str"),
+        ];
+        let mut matched_v7 = false;
+        for &(slot, arity, accepted, type_name) in &fixed_tuples {
+            if slot != Some(head_decl) {
+                continue;
+            }
+            matched_v7 = true;
+            if fields.len() != arity {
+                diags.push(SemanticDiagnostic {
+                    severity: Severity::Error,
+                    code: "fixed-tuple-arity",
+                    message: format!(
+                        "`{type_name}` requires exactly {arity} positional initializer{plural} (got {got})",
+                        plural = if arity == 1 { "" } else { "s" },
+                        got = fields.len(),
+                    ),
+                    byte_range: byte_range.clone(),
+                    category: DiagCategory::TypeRelation,
+                });
+            } else {
+                for value in fields.iter() {
+                    let Some(val_ty) = cur_module.analysis.expr_types.get(value).copied() else {
+                        continue;
+                    };
+                    let ok = matches!(
+                        &arena.get(val_ty).kind,
+                        TypeKind::Primitive(p) if accepted.contains(p),
+                    );
+                    if !ok {
+                        let accepted_msg = accepted
+                            .iter()
+                            .map(|p| format!("`{}`", p.name()))
+                            .collect::<Vec<_>>()
+                            .join(" or ");
+                        diags.push(SemanticDiagnostic {
+                            severity: Severity::Error,
+                            code: "fixed-tuple-element-type",
+                            message: format!("`{type_name}` element must be {accepted_msg}"),
+                            byte_range: cur_module.hir.exprs[*value].byte_range(),
+                            category: DiagCategory::TypeRelation,
+                        });
+                    }
+                }
+            }
+            break;
+        }
+        if matched_v7 {
+            continue;
+        }
+
+        let tr = &cur_module.hir.type_refs[*tr_id];
+        let head_name = &index.symbols[cur_module.hir.idents[tr.name].symbol];
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            code: "positional-object-init",
+            message: format!(
+                "`{head_name}` does not accept positional initializers; use named form `{head_name} {{ field: value }}`"
+            ),
+            byte_range: byte_range.clone(),
+            category: DiagCategory::TypeRelation,
+        });
+    }
+}
+
 #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.
 fn resolve_call_target(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
     cur: &ModuleAnalysis,
-    callee: Idx<greycat_analyzer_hir::types::Expr>,
+    callee: Idx<Expr>,
 ) -> Option<(Option<Uri>, Idx<Decl>)> {
     use crate::analyzer::MemberDef;
     use crate::resolver::Definition;
-    use greycat_analyzer_hir::types::Expr;
 
     let callee_expr = &cur.hir.exprs[callee];
     match callee_expr {
@@ -3769,7 +3950,7 @@ fn resolve_call_target(
 /// the analyzer's `resolve_member` pass, so dispatch on the property ident.
 fn resolve_member_call(
     cur: &ModuleAnalysis,
-    property: Idx<greycat_analyzer_hir::types::Ident>,
+    property: Idx<Ident>,
 ) -> Option<(Option<Uri>, Idx<Decl>)> {
     use crate::analyzer::MemberDef;
     if let Some(MemberDef::Method(decl_id)) = cur.analysis.member_lookup(property) {
@@ -3804,7 +3985,7 @@ fn resolve_qualified_chain(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
     cur: &ModuleAnalysis,
-    chain: &[Idx<greycat_analyzer_hir::types::Ident>],
+    chain: &[Idx<Ident>],
 ) -> Option<(Uri, Idx<Decl>, QualifiedTarget)> {
     use crate::analyzer::MemberDef;
     if chain.len() != 3 {

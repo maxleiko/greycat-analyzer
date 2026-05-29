@@ -122,6 +122,21 @@ pub struct WellKnown {
     /// the analyzer's `Expr::Tuple` typing mints
     /// `Generic(tuple_decl, [T, U])` when this slot is populated.
     pub tuple_decl: Option<ItemId>,
+
+    // v7 fixed-shape tuple natives. Present only when the loaded
+    // stdlib is v7 — the v8 stdlib removed them.
+    // Each has an implicit construction contract enforced by
+    // `collect_object_construction_diags`: exact positional arity,
+    // every element typed as the corresponding primitive (`int` for
+    // the int-suffix decls, `float` for the `f`-suffix ones,
+    // `String` for `str`).
+    pub t2_decl: Option<ItemId>,
+    pub t2f_decl: Option<ItemId>,
+    pub t3_decl: Option<ItemId>,
+    pub t3f_decl: Option<ItemId>,
+    pub t4_decl: Option<ItemId>,
+    pub t4f_decl: Option<ItemId>,
+    pub str_decl: Option<ItemId>,
 }
 
 impl WellKnown {
@@ -174,6 +189,13 @@ impl WellKnown {
             "Table" => &mut self.table_decl,
             "Tensor" => &mut self.tensor_decl,
             "Tuple" => &mut self.tuple_decl,
+            "t2" => &mut self.t2_decl,
+            "t2f" => &mut self.t2f_decl,
+            "t3" => &mut self.t3_decl,
+            "t3f" => &mut self.t3f_decl,
+            "t4" => &mut self.t4_decl,
+            "t4f" => &mut self.t4f_decl,
+            "str" => &mut self.str_decl,
             _ => return,
         };
         *slot = Some(id);
@@ -187,33 +209,59 @@ mod tests {
     use greycat_analyzer_core::lsp_types::Uri;
     use std::str::FromStr;
 
+    /// String-literal body for the synthetic `std/core.gcl`, wrapped
+    /// in a `macro_rules!` so [`synthetic_std_core_v7`] can fold it
+    /// into a `concat!()` literal at compile time.
+    macro_rules! std_core_body {
+        () => {
+            "native type any {}\n\
+             native type null {}\n\
+             native type bool {}\n\
+             native type int {}\n\
+             native type float {}\n\
+             native type String {}\n\
+             native type time {}\n\
+             native type duration {}\n\
+             native type geo {}\n\
+             native type type {}\n\
+             native type field {}\n\
+             native type function {}\n\
+             native type node<T> {}\n\
+             native type nodeTime<T> {}\n\
+             native type nodeIndex<K, V> {}\n\
+             native type nodeList<T> {}\n\
+             native type nodeGeo<T> {}\n\
+             native type Array<T> {}\n\
+             native type Map<K, V> {}\n\
+             native type Buffer {}\n\
+             native type Table<T> {}\n\
+             native type Tensor {}\n"
+        };
+    }
+
     /// Synthetic `std/core.gcl` with the well-known native types we
     /// dispatch against. Mirrors the real `lib/std/core.gcl` shape
     /// (`native type` decls in module `core`, lib `std`) without
     /// requiring a `greycat install`.
     fn synthetic_std_core() -> &'static str {
-        "native type any {}\n\
-         native type null {}\n\
-         native type bool {}\n\
-         native type int {}\n\
-         native type float {}\n\
-         native type String {}\n\
-         native type time {}\n\
-         native type duration {}\n\
-         native type geo {}\n\
-         native type type {}\n\
-         native type field {}\n\
-         native type function {}\n\
-         native type node<T> {}\n\
-         native type nodeTime<T> {}\n\
-         native type nodeIndex<K, V> {}\n\
-         native type nodeList<T> {}\n\
-         native type nodeGeo<T> {}\n\
-         native type Array<T> {}\n\
-         native type Map<K, V> {}\n\
-         native type Buffer {}\n\
-         native type Table<T> {}\n\
-         native type Tensor {}\n"
+        std_core_body!()
+    }
+
+    /// Synthetic v7-shape `std/core.gcl`: the full
+    /// [`synthetic_std_core`] surface plus the seven fixed-shape
+    /// tuple natives that v7 added (`t2` / `t2f` / `t3` / `t3f` /
+    /// `t4` / `t4f` / `str`). Concatenated at compile time.
+    fn synthetic_std_core_v7() -> &'static str {
+        concat!(
+            std_core_body!(),
+            "native type t2 {}\n\
+             native type t2f {}\n\
+             native type t3 {}\n\
+             native type t3f {}\n\
+             native type t4 {}\n\
+             native type t4f {}\n\
+             native type str {}\n",
+        )
     }
 
     /// After running the project pipeline on a synthetic `std/core`,
@@ -250,11 +298,38 @@ mod tests {
         assert!(w.buffer_decl.is_some(), "Buffer slot");
         assert!(w.table_decl.is_some(), "Table slot");
         assert!(w.tensor_decl.is_some(), "Tensor slot");
+        // v7 slots stay empty on a v8 stdlib.
+        assert!(w.t2_decl.is_none(), "t2 slot empty on v8");
+        assert!(w.t2f_decl.is_none(), "t2f slot empty on v8");
+        assert!(w.t3_decl.is_none(), "t3 slot empty on v8");
+        assert!(w.t3f_decl.is_none(), "t3f slot empty on v8");
+        assert!(w.t4_decl.is_none(), "t4 slot empty on v8");
+        assert!(w.t4f_decl.is_none(), "t4f slot empty on v8");
+        assert!(w.str_decl.is_none(), "str slot empty on v8");
         // node-tag helper agrees with the populated slots.
         let node_id = w.node_decl.unwrap();
         assert!(w.is_node_tag(node_id));
         assert!(w.is_node_tag(w.node_time_decl.unwrap()));
         assert!(!w.is_node_tag(w.array_decl.unwrap()));
+    }
+
+    /// v7 stdlib populates the v7-only slots on top of the common
+    /// surface (`int`, `float`, `String`, …) already covered by the
+    /// base test.
+    #[test]
+    fn well_known_slots_populated_after_loading_std_core_v7() {
+        let mut mgr = SourceManager::new();
+        let uri = Uri::from_str("file:///std/core.gcl").unwrap();
+        mgr.add_simple(uri, synthetic_std_core_v7(), "std", false);
+        let pa = crate::project::ProjectAnalysis::analyze(&mgr);
+        let w = &pa.well_known;
+        assert!(w.t2_decl.is_some(), "t2 slot");
+        assert!(w.t2f_decl.is_some(), "t2f slot");
+        assert!(w.t3_decl.is_some(), "t3 slot");
+        assert!(w.t3f_decl.is_some(), "t3f slot");
+        assert!(w.t4_decl.is_some(), "t4 slot");
+        assert!(w.t4f_decl.is_some(), "t4f slot");
+        assert!(w.str_decl.is_some(), "str slot");
     }
 
     /// A project with no std loaded leaves every slot empty. Guards

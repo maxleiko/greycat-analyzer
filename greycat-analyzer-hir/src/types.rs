@@ -484,6 +484,7 @@ pub enum Expr {
     Tuple(Box<[Idx<Expr>]>, Span),
     Array(Box<[Idx<Expr>]>, Span),
     Object(ObjectExpr),
+    PositionalObject(PositionalObjectExpr),
     Member(MemberExpr),
     Arrow(MemberExpr), // `n->name` — same shape, different access semantics
     Static(StaticExpr),
@@ -553,6 +554,7 @@ impl Expr {
             Expr::String(s) => s.byte_range.clone(),
             Expr::Tuple(_, r) | Expr::Array(_, r) | Expr::Paren(_, r) => r.clone(),
             Expr::Object(o) => o.byte_range.clone(),
+            Expr::PositionalObject(o) => o.byte_range.clone(),
             Expr::Member(m) | Expr::Arrow(m) => m.byte_range.clone(),
             Expr::Static(s) => s.byte_range.clone(),
             Expr::QualifiedStatic { byte_range, .. } => byte_range.clone(),
@@ -684,6 +686,11 @@ pub enum StringPart {
     Interp { expr: Idx<Expr>, byte_range: Span },
 }
 
+/// Named object construction — `Foo { field: value }` (the grammar's
+/// `object_fields` body). Maps are the special case where the keys
+/// are arbitrary value expressions (`Map { k: v }`) rather than field
+/// names; that distinction is made downstream by the head type, not
+/// here. See [`PositionalObjectExpr`] for the `Foo { a, b }` form.
 #[derive(Debug, Clone)]
 pub struct ObjectExpr {
     pub ty: Option<Idx<TypeRef>>,
@@ -691,9 +698,26 @@ pub struct ObjectExpr {
     pub byte_range: Span,
 }
 
+/// Positional object construction — `Foo { a, b }` (the grammar's
+/// `object_initializers` body). Only `Array` (any arity), `node`
+/// (≤ 1), and the v7 fixed-shape tuples accept this form; every other
+/// head is rejected by the object-construction validator.
+#[derive(Debug, Clone)]
+pub struct PositionalObjectExpr {
+    pub ty: Option<Idx<TypeRef>>,
+    pub fields: Box<[Idx<Expr>]>,
+    pub byte_range: Span,
+}
+
+/// One `name: value` entry of an [`ObjectExpr`]. `name` is a full
+/// expression because the grammar's `object_field` is
+/// `name:_expr ":" value:_expr`: for a classic object it is an
+/// `Expr::Ident` / `Expr::String` naming an attr, for a `Map` it is
+/// an arbitrary key value-expression. Consumers that need the attr
+/// symbol decode it from the key expr at the resolution site.
 #[derive(Debug, Clone)]
 pub struct ObjectField {
-    pub name: Option<Idx<Ident>>,
+    pub name: Idx<Expr>,
     pub value: Idx<Expr>,
     pub byte_range: Span,
 }
