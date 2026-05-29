@@ -315,4 +315,56 @@ fn make(g: Group) {
         };
         assert_eq!(&symbols[hir.idents[*used].symbol], "g");
     }
+
+    /// Comments are named nodes that show up as children of expression
+    /// lists; they must NOT lower to phantom elements. `Foo { /* c */ }`
+    /// stays an empty positional body, and `[1, /* c */ 2]` stays a
+    /// two-element array — not three.
+    #[test]
+    fn comments_are_not_lowered_as_expressions() {
+        let src = r#"
+type Foo {}
+fn main() {
+    var _a = Foo { /* nClusters + 2 */ };
+    var _b = [1, /* skip me */ 2];
+}
+"#;
+        let tree = parse(src);
+        let symbols = SymbolTable::default();
+        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
+        let module = hir.module.as_ref().unwrap();
+        let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
+            panic!("expected fn decl")
+        };
+        let Stmt::Block(block) = &hir.stmts[fnd.body.unwrap()] else {
+            panic!("expected block")
+        };
+        // `Foo { /* c */ }` — empty positional body, no phantom field.
+        let Stmt::Var(a) = &hir.stmts[block.stmts[0]] else {
+            panic!("expected var _a")
+        };
+        let Expr::PositionalObject(obj) = &hir.exprs[a.init.unwrap()] else {
+            panic!("expected positional object")
+        };
+        assert!(
+            obj.fields.is_empty(),
+            "comment must not become a field: {:?}",
+            obj.fields
+        );
+        // `[1, /* c */ 2]` — two elements, comment skipped.
+        let Stmt::Var(b) = &hir.stmts[block.stmts[1]] else {
+            panic!("expected var _b")
+        };
+        let Expr::Array(items, _) = &hir.exprs[b.init.unwrap()] else {
+            panic!("expected array")
+        };
+        assert_eq!(items.len(), 2, "comment must not become an element");
+        // And no `Unsupported` leaked into the arena anywhere.
+        assert!(
+            !hir.exprs
+                .iter()
+                .any(|(_, e)| matches!(e, Expr::Unsupported { .. })),
+            "no phantom Unsupported expr should be minted from comments"
+        );
+    }
 }

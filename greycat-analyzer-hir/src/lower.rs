@@ -1014,6 +1014,19 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
 
 fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr>> {
     let kind = node.kind();
+    // Comments are named nodes — `line_comment` / `block_comment` ride
+    // in `extras` and `doc_comment` is structural — so they surface as
+    // named children of expression lists (`[1, /* c */ 2]`,
+    // `Foo { /* c */ }`, `f(/* c */)`). A comment is never an
+    // expression: bail with `None` so the list-lowering callers (which
+    // all filter `None`) skip it, rather than falling through to the
+    // `_ => Expr::Unsupported` arm and minting a phantom element. This
+    // is distinct from a genuinely-unsupported *expression*, which must
+    // stay `Expr::Unsupported` as the regression marker the
+    // `unsupported_audit` test guards.
+    if matches!(kind, "line_comment" | "block_comment" | "doc_comment") {
+        return None;
+    }
     let expr = match kind {
         "ident" => {
             let id = cx.alloc_ident(node);
