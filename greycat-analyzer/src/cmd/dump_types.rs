@@ -55,8 +55,9 @@ pub struct DumpTypes {
                 containing project.gcl, or a single .gcl file. Single-file \
                 mode walks up to the project root, analyzes the whole \
                 project for cross-module bindings, then scopes output to \
-                just the input file.")]
-    target: PathBuf,
+                just the input file. When omitted, looks for `project.gcl` \
+                in the current working directory.")]
+    target: Option<PathBuf>,
     #[clap(
         long,
         help = "Restrict output to a range. Format: 'B' (byte offset), \
@@ -69,7 +70,11 @@ pub struct DumpTypes {
 impl DumpTypes {
     pub fn run(self) -> Result<ExitCode, AnyError> {
         env_logger::init();
-        run_dump(&self.target, self.filter.as_deref(), Mode::Types)
+        run_dump(
+            &resolve_target(self.target)?,
+            self.filter.as_deref(),
+            Mode::Types,
+        )
     }
 }
 
@@ -80,8 +85,9 @@ pub struct DumpResolutions {
     #[clap(help = "Path to a project.gcl entrypoint, a project directory, or \
                 a single .gcl file. Single-file mode scopes output to just \
                 the input file but still analyzes the closure for \
-                cross-module decls.")]
-    target: PathBuf,
+                cross-module decls. When omitted, looks for `project.gcl` \
+                in the current working directory.")]
+    target: Option<PathBuf>,
     #[clap(
         long,
         help = "Restrict output to a range. Format: 'B', 'B-B', 'L:C', \
@@ -93,7 +99,21 @@ pub struct DumpResolutions {
 impl DumpResolutions {
     pub fn run(self) -> Result<ExitCode, AnyError> {
         env_logger::init();
-        run_dump(&self.target, self.filter.as_deref(), Mode::Resolutions)
+        run_dump(
+            &resolve_target(self.target)?,
+            self.filter.as_deref(),
+            Mode::Resolutions,
+        )
+    }
+}
+
+/// Resolve the optional `target` positional: when omitted, default to
+/// the current working directory so `resolve_project` picks up its
+/// `project.gcl` (mirrors `lint` / `fmt`).
+fn resolve_target(target: Option<PathBuf>) -> Result<PathBuf, AnyError> {
+    match target {
+        Some(p) => Ok(p),
+        None => Ok(std::env::current_dir()?),
     }
 }
 

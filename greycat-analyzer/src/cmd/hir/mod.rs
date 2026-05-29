@@ -50,8 +50,9 @@ use view::{
 pub struct HirCmd {
     #[clap(help = "Path to a project.gcl entrypoint, a project directory \
                 containing project.gcl, or a single .gcl file (walks up \
-                to its enclosing project root).")]
-    target: PathBuf,
+                to its enclosing project root). When omitted, looks for \
+                `project.gcl` in the current working directory.")]
+    target: Option<PathBuf>,
     #[clap(long, help = "Emit JSON instead of Rust Debug.")]
     json: bool,
 }
@@ -59,7 +60,13 @@ pub struct HirCmd {
 impl HirCmd {
     pub fn run(self) -> Result<ExitCode, AnyError> {
         env_logger::init();
-        let canonical = self.target.canonicalize()?;
+        // When omitted, default to the current working directory — its
+        // `project.gcl` becomes the entrypoint (mirrors `lint` / `fmt`).
+        let target = match self.target {
+            Some(p) => p,
+            None => std::env::current_dir()?,
+        };
+        let canonical = target.canonicalize()?;
         let (project_root, _single_file) = resolve_project(&canonical)?;
         let project_gcl = project_root.join("project.gcl");
         if !project_gcl.is_file() {

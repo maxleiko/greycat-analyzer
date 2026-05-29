@@ -5,8 +5,10 @@ use crate::utils::AnyError;
 #[derive(clap::Parser)]
 #[clap(about = "Prints the CST s-expression of a .gcl file")]
 pub struct Cst {
-    #[clap(help = "Path to a .gcl file")]
-    file: PathBuf,
+    #[clap(help = "Path to a .gcl file (or a directory containing \
+                project.gcl). When omitted, looks for `project.gcl` in the \
+                current working directory.")]
+    file: Option<PathBuf>,
     #[clap(short, long, help = "Pretty-print the s-expr", default_value = "false")]
     pretty: bool,
 }
@@ -14,7 +16,17 @@ pub struct Cst {
 impl Cst {
     pub fn run(self) -> Result<(), AnyError> {
         env_logger::init();
-        let source = std::fs::read_to_string(self.file)?;
+        // When omitted, default to `./project.gcl`; a directory argument
+        // resolves to its `project.gcl` (mirrors `lint` / `fmt`).
+        let mut file = match self.file {
+            Some(p) => p,
+            None => std::env::current_dir()?,
+        };
+        if file.is_dir() {
+            file = file.join("project.gcl");
+        }
+        let source = std::fs::read_to_string(&file)
+            .map_err(|e| format!("failed to read {}: {e}", file.display()))?;
         let tree = greycat_analyzer_syntax::parse(&source);
         if self.pretty {
             let mut out = String::new();
