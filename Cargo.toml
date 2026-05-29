@@ -75,7 +75,6 @@ js-sys = "0.3.77"
 strip = true
 lto = "fat"
 opt-level = 3
-codegen-unit = 1
 
 [profile.profiling]
 inherits = "release"

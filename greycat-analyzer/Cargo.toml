@@ -17,9 +17,29 @@ greycat-analyzer-hir.workspace = true
 greycat-analyzer-server.workspace = true
 greycat-analyzer-syntax.workspace = true
 
-clap.workspace = true
-env_logger.workspace = true
-miette.workspace = true
+# clap trimmed: drops `color` (→ anstream + anstyle in help output) and
+# `suggestions` (→ strsim for did-you-mean typo hints). Keeps `help`,
+# `usage`, `error-context`, `std`, `derive` — i.e. `--help` and clear
+# error messages still work, just without ANSI color or typo suggestions.
+clap = { version = "4.5.38", default-features = false, features = [
+  "std",
+  "help",
+  "usage",
+  "error-context",
+  "derive",
+] }
+# env_logger trimmed: drops `humantime` (→ jiff), `regex` (→ regex+aho-corasick),
+# `auto-color` (→ anstream+anstyle). Keeps RUST_LOG parsing + stderr output;
+# loses log-line timestamps, regex filter expressions, and ANSI coloring of log
+# lines. The lint binary never emits log lines itself — the analysis crates do,
+# sparsely — so this trade is invisible in normal use.
+env_logger = { version = "0.11.8", default-features = false }
+# miette trimmed: keeps `fancy-no-backtrace` (the full snippet+caret renderer,
+# color autodetect, terminal-width wrap, hyperlinks); drops only the backtrace
+# machinery (`backtrace` → addr2line + object + gimli + miniz_oxide +
+# rustc-demangle + backtrace-ext). We never capture backtraces into miette
+# reports, so this is a pure win.
+miette = { version = "7", default-features = false, features = ["fancy-no-backtrace"] }
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
