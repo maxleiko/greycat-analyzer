@@ -1569,6 +1569,111 @@ fn completion_on_fn_param_name_is_suppressed() {
     );
 }
 
+/// P2 — type-aware ranking: a call argument's expected type (the
+/// callee's param type) boosts type-compatible scope candidates above
+/// the rest via `sort_text`, without hiding anything (rank, not filter).
+#[test]
+fn completion_in_call_arg_ranks_type_compatible_first() {
+    let src = "fn add(a: int, b: int): int { return a + b; }\n\
+               fn main(): int {\n\
+               var n = 0;\n\
+               var s = \"x\";\n\
+               return add();\n\
+               }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor inside `add(|)` — first arg, expected type `int`.
+    let cursor = support::position_after(src, "return add(", "");
+    let list = project.completion(cursor).expect("completion in call arg");
+    let sort = |label: &str| {
+        list.items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.sort_text.clone())
+    };
+    let (n_sort, s_sort) = (sort("n"), sort("s"));
+    // Both still present (rank, not filter).
+    assert!(
+        n_sort.is_some() && s_sort.is_some(),
+        "both candidates present"
+    );
+    // `n: int` matches the `int` param and must outrank `s: String`.
+    assert!(
+        n_sort < s_sort,
+        "int `n` ({n_sort:?}) should rank before String `s` ({s_sort:?})"
+    );
+    assert!(
+        n_sort.as_deref().is_some_and(|s| s.starts_with("0_")),
+        "type-compatible candidate should get the tier-0 sort key, got {n_sort:?}"
+    );
+}
+
+/// P2 — type-aware ranking also fires at an object-literal field value
+/// slot, using the attr's declared type as the expected type. The field
+/// carries a value (`v: 0`) so it parses as a real `object_field` (the
+/// binding the attr-type lookup needs); the cursor sits just before it.
+#[test]
+fn completion_in_object_field_value_ranks_attr_type_first() {
+    let src = "type Box { v: int; }\n\
+               fn main() {\n\
+               var n = 0;\n\
+               var s = \"x\";\n\
+               var _ = Box { v: 0 };\n\
+               }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor after `v: ` (before the `0`) in the object literal.
+    let cursor = support::position_after(src, "= Box { v: ", "");
+    let list = project
+        .completion(cursor)
+        .expect("completion in field value");
+    let sort = |label: &str| {
+        list.items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.sort_text.clone())
+    };
+    let (n_sort, s_sort) = (sort("n"), sort("s"));
+    assert!(
+        n_sort.is_some() && s_sort.is_some(),
+        "both candidates present"
+    );
+    assert!(
+        n_sort < s_sort,
+        "int `n` ({n_sort:?}) should outrank String `s` ({s_sort:?}) for an `int` attr"
+    );
+}
+
+/// P2 — type-aware ranking at a typed binding's initializer slot uses
+/// the declared type as the expected type.
+#[test]
+fn completion_in_typed_initializer_ranks_declared_type_first() {
+    let src = "fn main() {\n\
+               var n = 0;\n\
+               var s = \"x\";\n\
+               var t: int = 0;\n\
+               }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor after `var t: int = ` (before the `0`).
+    let cursor = support::position_after(src, "var t: int = ", "");
+    let list = project
+        .completion(cursor)
+        .expect("completion in initializer");
+    let sort = |label: &str| {
+        list.items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.sort_text.clone())
+    };
+    let (n_sort, s_sort) = (sort("n"), sort("s"));
+    assert!(
+        n_sort.is_some() && s_sort.is_some(),
+        "both candidates present"
+    );
+    assert!(
+        n_sort < s_sort,
+        "int `n` ({n_sort:?}) should outrank String `s` ({s_sort:?}) for an `int` binding"
+    );
+}
+
 /// P15.2.6 — type-position completion at `var x: |` lists in-module
 /// type decls and runtime types, but not values like fn names.
 #[test]

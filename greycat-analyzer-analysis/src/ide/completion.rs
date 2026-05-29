@@ -176,10 +176,13 @@ pub fn completion_with_project(
             // back to expression completion for its positional element.
             match emit_object_field_names(text, body, byte, uri, project) {
                 Some(items) => items,
-                None => expr_completion(text, byte, uri, project)?,
+                None => expr_completion(text, byte, uri, project, None)?,
             }
         }
-        CompletionSlot::Expr => expr_completion(text, byte, uri, project)?,
+        CompletionSlot::Expr { value } => {
+            let expected = value.and_then(|v| resolve_expected(&v, uri, project));
+            expr_completion(text, byte, uri, project, expected)?
+        }
         CompletionSlot::Declaration | CompletionSlot::NoCompletion => return None,
     };
     apply_call_paren_snippet(&mut items, text, byte, encoding);
@@ -193,8 +196,9 @@ pub fn completion_with_project(
 /// replaces the old detector chain + denylist gate. Carries CST node
 /// refs (tied to the parse tree's lifetime) where an emitter needs them.
 ///
-/// `Expr` is the *only* slot that produces full-scope completion. A
-/// later phase enriches it with an expected type for type-aware ranking.
+/// `Expr` is the *only* slot that produces full-scope completion. Its
+/// `value` anchor (when known) lets the dispatcher resolve an *expected
+/// type* for type-aware ranking — see [`ValueSlot`] / [`resolve_expected`].
 enum CompletionSlot<'t> {
     /// Inside a `// …` comment — directive completion (`// gcl…`) or none.
     Comment,
@@ -212,13 +216,33 @@ enum CompletionSlot<'t> {
     /// `object_initializers` / `object_fields` node.
     ObjectFieldName { body: tree_sitter::Node<'t> },
     /// Expression / statement position — scope + keywords + project
-    /// surface.
-    Expr,
+    /// surface. `value` anchors a known value slot for expected-type
+    /// ranking; `None` is a bare statement / unrankable position.
+    Expr { value: Option<ValueSlot<'t>> },
     /// A declaration-name slot (`fn na|me`, `type Fo|o`, param name, …)
     /// or other non-expression container — suppress completion.
     Declaration,
     /// No completion (unrecognized position).
     NoCompletion,
+}
+
+/// A value-bearing expression slot whose expected type the analyzer can
+/// recover from the surrounding construct. Pure CST anchors — the HIR
+/// lookups happen later in [`resolve_expected`], keeping [`classify_slot`]
+/// free of analysis state.
+enum ValueSlot<'t> {
+    /// `Foo { x: | }` — expected type is attr `x`'s type. Anchor is the
+    /// `object_field` node (its `name` child names the attr).
+    FieldValue { object_field: tree_sitter::Node<'t> },
+    /// `f(a, |)` — expected type is the callee's `params[index]`. Anchor
+    /// is the callee CST node (`call_expr`'s `fn` child).
+    CallArg {
+        callee: tree_sitter::Node<'t>,
+        index: usize,
+    },
+    /// `var x: T = |` — expected type is the binding's declared type.
+    /// Anchor is the `var_decl` / `modvar` node (its `name` child).
+    Initializer { binder: tree_sitter::Node<'t> },
 }
 
 /// Separator immediately preceding the cursor's typed prefix.
@@ -333,7 +357,7 @@ fn classify_structural<'t>(
             // Anywhere in a type expression → type-position completion.
             "type_ident" | "type_decorator" | "attr_type" => return CompletionSlot::TypeRef,
             // A field's `name` slot lists field names; its `value` slot
-            // (or any non-name child) is an expression.
+            // (or any non-name child) is an expression typed by the attr.
             "object_field" => {
                 return match (from_field, cur.parent()) {
                     (Some("name"), Some(body))
@@ -341,11 +365,33 @@ fn classify_structural<'t>(
                     {
                         CompletionSlot::ObjectFieldName { body }
                     }
-                    _ => CompletionSlot::Expr,
+                    _ => CompletionSlot::Expr {
+                        value: Some(ValueSlot::FieldValue { object_field: cur }),
+                    },
                 };
             }
             "object_initializers" | "object_fields" => {
                 return classify_object_body(text, cur, cursor_byte);
+            }
+            // Call arguments → expected type is the callee's params[index].
+            "args" => {
+                let value = cur
+                    .parent()
+                    .filter(|p| p.kind() == "call_expr")
+                    .and_then(|call| call.child_by_field_name("fn"))
+                    .map(|callee| ValueSlot::CallArg {
+                        callee,
+                        index: call_arg_index(cur, cursor_byte),
+                    });
+                return CompletionSlot::Expr { value };
+            }
+            // Binding initializer → expected type is the declared type.
+            "initializer" => {
+                let value = cur
+                    .parent()
+                    .filter(|p| matches!(p.kind(), "var_decl" | "modvar"))
+                    .map(|binder| ValueSlot::Initializer { binder });
+                return CompletionSlot::Expr { value };
             }
             // Declaration-name slots: suppress (the user is binding a new
             // identifier, not referencing one).
@@ -360,7 +406,7 @@ fn classify_structural<'t>(
             | "enum_field" | "modifiers" => return CompletionSlot::Declaration,
             // Statement / module position → expression completion. This
             // is the only path to full-scope completion.
-            "block" | "source_file" | "module" => return CompletionSlot::Expr,
+            "block" | "source_file" | "module" => return CompletionSlot::Expr { value: None },
             _ => {}
         }
         let Some(parent) = cur.parent() else {
@@ -381,9 +427,119 @@ fn classify_object_body<'t>(
     cursor_byte: usize,
 ) -> CompletionSlot<'t> {
     if object_cursor_after_colon(text, body, cursor_byte) {
-        return CompletionSlot::Expr;
+        // Recovery-shape value slot (`Foo { a: | }` parsed as
+        // `object_initializers` + ERROR colon) — no clean `object_field`
+        // anchor here, so expression completion runs unranked.
+        return CompletionSlot::Expr { value: None };
     }
     CompletionSlot::ObjectFieldName { body }
+}
+
+/// 0-based argument index of the cursor within an `args` node — the
+/// count of top-level `,` separators before `cursor_byte`. (Commas
+/// nested inside argument sub-expressions live in deeper nodes, so a
+/// direct-child scan is correct.)
+fn call_arg_index(args: tree_sitter::Node<'_>, cursor_byte: usize) -> usize {
+    let mut walker = args.walk();
+    args.children(&mut walker)
+        .filter(|c| c.kind() == "," && c.start_byte() < cursor_byte)
+        .count()
+}
+
+/// Resolve the expected type at a value slot from the analyzer's
+/// resolved-`TypeId` maps (`object_field_uses` + `type_members`,
+/// callee `expr_types` → `Lambda`, `def_types`). Returns `None`
+/// whenever the lookup is uncertain — ranking is non-destructive, so a
+/// missing expected type simply means "don't rank".
+fn resolve_expected(value: &ValueSlot<'_>, uri: &Uri, project: &ProjectAnalysis) -> Option<TypeId> {
+    let module = project.module(uri)?;
+    match value {
+        ValueSlot::FieldValue { object_field } => {
+            // The field's `name` ident, once bound, points at its
+            // declaring type + attr via `object_field_uses`; the resolved
+            // attr type lives in that type's `type_members.attr_types`.
+            let name_node = object_field.child_by_field_name("name")?;
+            let name_range = name_node.byte_range();
+            let (ident_idx, _) = module
+                .hir
+                .idents
+                .iter()
+                .find(|(_, i)| i.byte_range == name_range)?;
+            let binding = module.analysis.object_field_uses.get(&ident_idx)?;
+            let name_sym = module.hir.idents[ident_idx].symbol;
+            project
+                .index
+                .type_members
+                .get(&binding.declaring_type)?
+                .attr_types
+                .get(&name_sym)
+                .copied()
+        }
+        ValueSlot::CallArg { callee, index } => {
+            // Map the callee CST node to its HIR expr and read the
+            // structural `Lambda` signature the analyzer minted for it.
+            let range = callee.byte_range();
+            let (expr_idx, _) = module
+                .hir
+                .exprs
+                .iter()
+                .filter(|(_, e)| e.byte_range() == range)
+                .max_by_key(|(_, e)| e.byte_range().end - e.byte_range().start)?;
+            let callee_ty = module.analysis.expr_types.get(&expr_idx).copied()?;
+            match &project.arena().get(callee_ty).kind {
+                TypeKind::Lambda { params, .. } => params.get(*index).copied(),
+                _ => None,
+            }
+        }
+        ValueSlot::Initializer { binder } => {
+            // Declared (or inferred) type of the binding, keyed by its
+            // `name` ident in `def_types`.
+            let name_node = binder.child_by_field_name("name")?;
+            let name_range = name_node.byte_range();
+            let (ident_idx, _) = module
+                .hir
+                .idents
+                .iter()
+                .find(|(_, i)| i.byte_range == name_range)?;
+            module.analysis.def_types.get(&ident_idx).copied()
+        }
+    }
+}
+
+/// Whether a scope candidate's type is assignable to the slot's expected
+/// type. Variable-like candidates (locals / params / module vars) carry a
+/// resolved `def_types` entry; fns / types / generics have no plain value
+/// type, so they never match (rank-neutral). `arena` is the throwaway
+/// clone the caller owns — `is_assignable_to_with_index` needs `&mut`.
+fn type_matches_expected(
+    project: &ProjectAnalysis,
+    arena: &mut TypeArena,
+    module: &ModuleAnalysis,
+    source: &crate::ide::scope::NameSource,
+    expected: TypeId,
+) -> bool {
+    use crate::ide::scope::NameSource;
+    let cand = match source {
+        NameSource::Local(idx) | NameSource::Param(idx) => {
+            module.analysis.def_types.get(idx).copied()
+        }
+        NameSource::ModuleDecl(decl_id) => match &module.hir.decls[*decl_id] {
+            Decl::Var(vd) => module.analysis.def_types.get(&vd.name).copied(),
+            _ => None,
+        },
+        NameSource::Generic => None,
+    };
+    let Some(cand) = cand else {
+        return false;
+    };
+    crate::project::is_assignable_to_with_index(
+        &project.index,
+        project.well_known(),
+        project.decl_registry(),
+        arena,
+        cand,
+        expected,
+    )
 }
 
 /// `true` when the nearest non-word, non-whitespace char before the
@@ -1312,6 +1468,7 @@ fn expr_completion(
     cursor_byte: usize,
     uri: &Uri,
     project: &ProjectAnalysis,
+    expected: Option<TypeId>,
 ) -> Option<Vec<CompletionItem>> {
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
@@ -1337,6 +1494,13 @@ fn expr_completion(
 
     // Scope-visible names — this module's HIR walked top-to-cursor.
     if let Some(module) = project.module(uri) {
+        // Type-aware ranking: a candidate variable whose type is
+        // assignable to the slot's expected type sorts above everything
+        // (tier `0_`). Non-destructive — non-matching candidates keep
+        // their normal tier, so nothing is hidden. Uses a throwaway
+        // arena clone (the shared arena stays immutable on this read
+        // path); only allocated when an expected type is present.
+        let mut rank_arena = expected.map(|_| project.arena().clone());
         let names = scope_names_at(&module.hir, project.symbols(), cursor_byte);
         for (name, kind, sort_pri, source) in names {
             if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
@@ -1353,12 +1517,18 @@ fn expr_completion(
                 &source,
                 uri,
             );
+            let mut sort_text = sort_pri.to_string();
+            if let (Some(exp), Some(arena)) = (expected, rank_arena.as_mut())
+                && type_matches_expected(project, arena, module, &source, exp)
+            {
+                sort_text = format!("0_{name}");
+            }
             items.push(CompletionItem {
                 label: name.clone(),
                 label_details,
                 kind: Some(kind),
                 insert_text: Some(name),
-                sort_text: Some(sort_pri.to_string()),
+                sort_text: Some(sort_text),
                 detail,
                 documentation,
                 ..Default::default()
