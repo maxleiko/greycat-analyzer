@@ -1661,6 +1661,20 @@ fn expr_completion(
     Some(items)
 }
 
+/// Whether a FUNCTION / METHOD item's rendered signature has an empty
+/// parameter list. The compact signature always opens with the param
+/// list (`(a: int): R` / `(): R` / `()`), so empty params ⟺ it starts
+/// with `()`. Items carrying no signature (e.g. runtime value globals)
+/// answer `false`, keeping the cursor-in-parens default.
+fn signature_has_no_params(item: &CompletionItem) -> bool {
+    let sig = item.detail.as_deref().or_else(|| {
+        item.label_details
+            .as_ref()
+            .and_then(|d| d.detail.as_deref())
+    });
+    matches!(sig.map(str::trim_start), Some(s) if s.starts_with("()"))
+}
+
 /// Post-process completion items so the LSP edit honors what the user
 /// already typed:
 ///
@@ -1675,12 +1689,15 @@ fn expr_completion(
 ///    correct.
 ///
 /// 2. **Call-parens** — for FUNCTION / METHOD items whose `(...)` isn't
-///    already present immediately after the identifier, append `($0)`
-///    and switch to `InsertTextFormat::Snippet` so the cursor lands
-///    between the parens. The "parens already there" check probes the
-///    byte right after `ident_end`, *not* the cursor — so on
+///    already present immediately after the identifier, append the call
+///    parens. A fn *with* parameters gets a `($0)` tabstop
+///    (`InsertTextFormat::Snippet`) so the cursor lands between the
+///    parens ready for the first argument; a *parameterless* fn gets a
+///    bare `()` (plain text) so the cursor lands after the closing paren
+///    — there's nothing to type inside. The "parens already there" check
+///    probes the byte right after `ident_end`, *not* the cursor — so on
 ///    `x.|chars()` (cursor before `chars`, parens after `chars`) the
-///    snippet is suppressed because the user already opened the call.
+///    rewrite is suppressed because the user already opened the call.
 ///
 /// Skips items already carrying a `SNIPPET` body (e.g. pragma
 /// templates like `@library("$1", "$2")`) for the call-paren rewrite,
@@ -1714,16 +1731,23 @@ fn apply_call_paren_snippet(
             )
             && !matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
         {
+            // Parameterless fns get a bare `()` (cursor after the call);
+            // fns with params get a `($0)` tabstop between the parens.
+            let (suffix, fmt) = if signature_has_no_params(item) {
+                ("()", InsertTextFormat::PlainText)
+            } else {
+                ("($0)", InsertTextFormat::Snippet)
+            };
             if let Some(te) = item.text_edit.as_mut() {
-                te.new_text = format!("{}($0)", te.new_text);
+                te.new_text = format!("{}{suffix}", te.new_text);
             } else {
                 let base = item
                     .insert_text
                     .clone()
                     .unwrap_or_else(|| item.label.clone());
-                item.insert_text = Some(format!("{base}($0)"));
+                item.insert_text = Some(format!("{base}{suffix}"));
             }
-            item.insert_text_format = Some(InsertTextFormat::Snippet);
+            item.insert_text_format = Some(fmt);
         }
 
         // 2) When the cursor is mid-identifier, lift `insert_text` into

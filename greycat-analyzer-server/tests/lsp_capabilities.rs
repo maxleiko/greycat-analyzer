@@ -3531,6 +3531,99 @@ fn completion_function_item_appends_call_parens() {
     );
 }
 
+/// A parameterless fn gets a bare `()` (cursor after the call), not the
+/// `($0)` tabstop — there's nothing to type between the parens.
+#[test]
+fn completion_parameterless_function_appends_bare_parens() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn helper(): int { return 0; }\nfn main() {\n  h\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+        ENC,
+    )
+    .expect("completion list");
+    let helper = list
+        .items
+        .iter()
+        .find(|i| i.label == "helper")
+        .expect("`helper` should appear");
+    assert_eq!(
+        helper.insert_text.as_deref(),
+        Some("helper()"),
+        "parameterless fn should get a bare `()`; got {:?}",
+        helper.insert_text
+    );
+    assert_ne!(
+        helper.insert_text_format,
+        Some(InsertTextFormat::SNIPPET),
+        "parameterless fn must not be a snippet — no tabstop to honor"
+    );
+}
+
+/// Same rule for a parameterless *method* reached through `recv.|`.
+#[test]
+fn completion_parameterless_method_appends_bare_parens() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Svc { fn ping(): int { return 0; } }\nfn main() { var s = Svc {}; s. }\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `s.`.
+    let off = doc.text.find("s. ").unwrap() + 2;
+    let line = doc.text[..off].matches('\n').count() as u32;
+    let col = (off - doc.text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(line, col),
+        &user_uri,
+        &pa,
+        None,
+        ENC,
+    )
+    .expect("completion list");
+    let ping = list
+        .items
+        .iter()
+        .find(|i| i.label == "ping")
+        .expect("`ping` method should appear");
+    assert_eq!(
+        ping.insert_text.as_deref(),
+        Some("ping()"),
+        "parameterless method should get a bare `()`; got {:?}",
+        ping.insert_text
+    );
+    assert_ne!(
+        ping.insert_text_format,
+        Some(InsertTextFormat::SNIPPET),
+        "parameterless method must not be a snippet"
+    );
+}
+
 /// Variables / types must NOT be rewritten — only FUNCTION / METHOD
 /// items get the call-parens.
 #[test]
