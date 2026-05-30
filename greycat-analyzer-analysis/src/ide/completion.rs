@@ -128,6 +128,10 @@ pub fn completion_with_project(
 ) -> Option<CompletionList> {
     let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
+    // The structural classifier and type-position emitter want the
+    // identifier *being typed*, which at a word's trailing edge differs
+    // from the node spanning the cursor — see [`word_anchor`].
+    let anchor = word_anchor(text, root, node, byte);
 
     // `// gcl…` directive completion is line-text based (not CST-node
     // based), so it runs before [`classify_slot`]: the cursor often sits
@@ -147,7 +151,7 @@ pub fn completion_with_project(
     // ONLY at a genuine expression / statement position. Unrecognized
     // positions (`Comment` / `Declaration` / `NoCompletion`) yield
     // nothing rather than leaking the scope dump — see [`classify_slot`].
-    let mut items = match classify_slot(text, node, byte) {
+    let mut items = match classify_slot(text, node, anchor, byte) {
         // Inside a comment but not a `// gcl…` directive — nothing.
         CompletionSlot::Comment => return None,
         CompletionSlot::StringArg => {
@@ -169,7 +173,7 @@ pub fn completion_with_project(
         CompletionSlot::PragmaName => pragma_completion(text, byte)?,
         CompletionSlot::Member => member_completion(text, root, byte, uri, project, encoding)?,
         CompletionSlot::Static => static_completion(text, byte, project, encoding)?,
-        CompletionSlot::TypeRef => type_position_completion(text, node, byte, uri, project)?,
+        CompletionSlot::TypeRef => type_position_completion(text, anchor, byte, uri, project)?,
         CompletionSlot::ObjectFieldName { body } => {
             // A named-attr type resolves to its field names; an
             // unresolved head or a collection / tuple (no attrs) falls
@@ -300,6 +304,7 @@ fn field_name_of(
 fn classify_slot<'t>(
     text: &str,
     node: tree_sitter::Node<'t>,
+    anchor: tree_sitter::Node<'t>,
     cursor_byte: usize,
 ) -> CompletionSlot<'t> {
     // ---- Pass 0 ----
@@ -338,7 +343,33 @@ fn classify_slot<'t>(
     }
 
     // ---- Pass 1 ----
-    classify_structural(text, node, cursor_byte)
+    // The structural walk runs on `anchor` (the identifier being typed),
+    // not the cursor node — see [`word_anchor`] for why the trailing edge
+    // of a word needs backing up. Pass 0's operator / string detectors
+    // above keep the cursor `node`; they do their own prefix back-walking.
+    classify_structural(text, anchor, cursor_byte)
+}
+
+/// The node the structural walk (Pass 1) should start from. At a word's
+/// trailing edge (`var s|`, `var v: M|`) `node_at_offset(cursor)` lands
+/// on the *parent* — the identifier's byte range is half-open and ends at
+/// the cursor — so the walk would start on the enclosing `var_decl` /
+/// `type_decorator` with no `name` field and misclassify the slot. Back
+/// up one byte into the typed prefix so the walk starts inside the ident
+/// ("the word under the cursor"). Empty-prefix positions (`Foo { | }`)
+/// are unchanged. Also handed to `type_position_completion` so its own
+/// `type_ident`-ancestor guard sees the ident rather than the parent.
+fn word_anchor<'t>(
+    text: &str,
+    root: tree_sitter::Node<'t>,
+    node: tree_sitter::Node<'t>,
+    cursor_byte: usize,
+) -> tree_sitter::Node<'t> {
+    if ident_prefix_at_cursor(text, cursor_byte).is_empty() {
+        node
+    } else {
+        node_at_offset(root, cursor_byte - 1).unwrap_or(node)
+    }
 }
 
 /// Walk up from `node`, classifying by the first recognized ancestor.
@@ -2999,10 +3030,6 @@ fn type_position_completion(
     Some(items)
 }
 
-// =============================================================================
-// P15.2.7 — object literal field completion
-// =============================================================================
-
 /// Emit object-literal field names for the literal whose body is
 /// `body` (an `object_initializers` / `object_fields` node, supplied by
 /// the slot classifier). Resolves the surrounding `object_expr`'s
@@ -3019,7 +3046,7 @@ fn emit_object_field_names(
     project: &crate::project::ProjectAnalysis,
 ) -> Option<Vec<CompletionItem>> {
     let object_expr = ancestor_with_kind(body, "object_expr")?;
-    let type_ident = children_by_field_name(object_expr, "type")?;
+    let type_ident = object_expr.child_by_field_name("type")?;
     let type_name_node = type_ident.named_child(0)?;
     if type_name_node.kind() != "ident" {
         return None;
@@ -3190,13 +3217,4 @@ fn emit_attrs(
             ..Default::default()
         });
     }
-}
-
-/// Helper mirroring `tree_sitter::Node::child_by_field_name` that
-/// returns an `Option`.
-fn children_by_field_name<'a>(
-    node: tree_sitter::Node<'a>,
-    field: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    node.child_by_field_name(field)
 }

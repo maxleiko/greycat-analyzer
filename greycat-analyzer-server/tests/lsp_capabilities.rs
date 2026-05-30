@@ -1569,6 +1569,22 @@ fn completion_on_fn_param_name_is_suppressed() {
     );
 }
 
+/// Suppression must also hold at the *trailing edge* of the name, not
+/// just mid-name. `var s` parses as `var_decl name:(ident s)`, but at
+/// the end of `s` the ident's half-open byte range ends at the cursor,
+/// so `node_at_offset` lands on the `var_decl`; the classifier backs up
+/// into the typed identifier so the `name` field still suppresses.
+#[test]
+fn completion_at_end_of_var_name_is_suppressed() {
+    let src = "fn main() {\n    var s\n}\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let cursor = support::position_after(src, "var s", "");
+    assert!(
+        project.completion(cursor).is_none(),
+        "completion must be suppressed at the trailing edge of a var-decl name"
+    );
+}
+
 /// P2 — type-aware ranking: a call argument's expected type (the
 /// callee's param type) boosts type-compatible scope candidates above
 /// the rest via `sort_text`, without hiding anything (rank, not filter).
