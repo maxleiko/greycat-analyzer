@@ -80,7 +80,9 @@ pub fn edit_for_diagnostic(
         "unused-generic-param" => unused_generic_param_fix(cx.root, cx.text, start, end),
         "possibly-null" => possibly_null_fix(cx.text, end),
         "redundant-nullable-access" => redundant_nullable_access_fix(cx.text, start, end),
-        "redundant-non-null-assertion" | "redundant-coalesce" => redundant_slice_fix(start, end),
+        "redundant-non-null-assertion" | "redundant-coalesce" | "static-type-args" => {
+            redundant_slice_fix(start, end)
+        }
         "modvar-node-cannot-be-nullable" => modvar_strip_outer_nullable_fix(cx.text, end),
         "modvar-node-inner-must-be-nullable" => modvar_append_inner_nullable_fix(end),
         "unused-suppression" => unused_suppression_fix(cx.root, cx.text, start, end),

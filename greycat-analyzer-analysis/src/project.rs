@@ -2696,6 +2696,7 @@ impl ProjectAnalysis {
                 &mut diags,
             );
             collect_instance_method_value_ref_diags(&self.modules, cur_uri, &mut diags);
+            collect_static_type_args_diags(&self.modules, cur_uri, &mut diags);
             collect_object_construction_diags(
                 &self.modules,
                 arena_mut,
@@ -3731,6 +3732,63 @@ fn collect_instance_method_value_ref_diags(
                       (only top-level functions and `static` methods are first-class values)."
                 .to_string(),
             byte_range,
+            category: DiagCategory::TypeRelation,
+        });
+    }
+}
+
+/// Reject generic type arguments on a static access — `Foo<int>::bar()`,
+/// `Foo<int>::bar` (value-ref), `Foo<int>::ATTR`.
+///
+/// GreyCat has no bounded generics, so the type parameter is inert in any
+/// static context: a static carries no instance to bind `T` from, can't
+/// construct one (`T {}` is rejected), and can't dispatch on it. The
+/// `<...>` therefore never changes which code runs or what it returns —
+/// in *any* program. The runtime rejects the construct outright (with an
+/// unhelpful "syntax error"); we mirror it as a precise hard error whose
+/// span is the removable `<...>` slice, so the auto-fix can strip it back
+/// to `Foo::bar()`. See [`crate::ide::quickfix::edit_for_diagnostic`].
+///
+/// Tagged `TypeRelation` so the `validate_type_relations` retain-and-
+/// re-emit cycle refreshes it on every incremental edit, matching
+/// [`collect_instance_method_value_ref_diags`].
+#[allow(clippy::mutable_key_type)]
+fn collect_static_type_args_diags(
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
+    cur_uri: &Uri,
+    diags: &mut Vec<SemanticDiagnostic>,
+) {
+    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    use greycat_analyzer_hir::types::Expr;
+
+    let Some(cur_module) = modules.get(cur_uri) else {
+        return;
+    };
+    for (_eid, expr) in cur_module.hir.exprs.iter() {
+        let Expr::Static(s) = expr else {
+            continue;
+        };
+        let ty = &cur_module.hir.type_refs[s.ty];
+        if ty.params.is_empty() {
+            continue;
+        }
+        // Span the `<...>` slice only — from the end of the type name
+        // through the end of the type reference (the closing `>`). The
+        // squiggle and the auto-fix both target the removable noise and
+        // leave `Foo` intact.
+        let name_end = cur_module.hir.idents[ty.name].byte_range.end;
+        let close = ty.byte_range.end;
+        if close <= name_end {
+            continue;
+        }
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            code: "static-type-args",
+            message: "generic type arguments are not allowed on a static access — \
+                      a static call does not instantiate a parameterized type, so the \
+                      type arguments are meaningless. Remove them."
+                .to_string(),
+            byte_range: name_end..close,
             category: DiagCategory::TypeRelation,
         });
     }
