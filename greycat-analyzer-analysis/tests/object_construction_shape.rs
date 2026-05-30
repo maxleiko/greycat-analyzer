@@ -74,6 +74,7 @@ fn codes(pa: &ProjectAnalysis, uri: &Uri) -> Vec<&'static str> {
                 d.code,
                 "positional-object-init"
                     | "node-init-arity"
+                    | "node-tag-no-init"
                     | "fixed-tuple-arity"
                     | "fixed-tuple-element-type"
             )
@@ -442,5 +443,46 @@ fn non_ident_key_on_user_type_flags() {
         msgs.iter()
             .any(|m| m.contains("must be an identifier or string literal")),
         "non-ident key on a user type must flag: {msgs:?}"
+    );
+}
+
+/// `nodeList` / `nodeTime` / `nodeGeo` / `nodeIndex` take no initializer
+/// at all (unlike `node`, which accepts one). Any positional content is
+/// a runtime error; the empty default-init `T {}` stays valid.
+#[test]
+fn node_collection_tags_reject_any_initializer() {
+    const STD: &str = concat!(
+        std_core_body!(),
+        "native type nodeTime<T> {}\n\
+         native type nodeIndex<K, V> {}\n\
+         native type nodeList<T> {}\n\
+         native type nodeGeo<T> {}\n",
+    );
+    let (uri, pa) = analyze_with(
+        STD,
+        "fn main() {\n\
+         var a = nodeList<int> { 1 };\n\
+         var b = nodeTime<int> { 1 };\n\
+         var c = nodeGeo<int> { 1 };\n\
+         var d = nodeIndex<int, int> { 1 };\n\
+         var ok = nodeList<int> {};\n\
+         }\n",
+    );
+    let got = codes(&pa, &uri);
+    assert_eq!(
+        got,
+        vec![
+            "node-tag-no-init",
+            "node-tag-no-init",
+            "node-tag-no-init",
+            "node-tag-no-init"
+        ],
+        "each non-empty node-collection init warns once; the empty one is valid: {got:?}"
+    );
+    let msgs = all_messages(&pa, &uri);
+    assert!(
+        msgs.iter()
+            .any(|m| m == "`nodeList` does not accept any initializer"),
+        "message should name the head type and say no initializer: {msgs:?}"
     );
 }

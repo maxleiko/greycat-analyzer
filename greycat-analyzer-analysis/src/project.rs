@@ -3806,6 +3806,30 @@ fn collect_object_construction_diags(
             }
             continue;
         }
+
+        // The other node-tag family members accept NO initializer at all
+        // — only the empty default-init `T {}` is valid (handled by the
+        // empty-fields short-circuit above). Unlike `node` (one element)
+        // and `Array` (any arity), any content here is a runtime error,
+        // and it's neither positional nor named — so we flag it directly
+        // instead of falling through to the "use named form" suggestion.
+        if Some(head_decl) == well_known.node_list_decl
+            || Some(head_decl) == well_known.node_time_decl
+            || Some(head_decl) == well_known.node_geo_decl
+            || Some(head_decl) == well_known.node_index_decl
+        {
+            let tr = &cur_module.hir.type_refs[*tr_id];
+            let head_name = &index.symbols[cur_module.hir.idents[tr.name].symbol];
+            diags.push(SemanticDiagnostic {
+                severity: Severity::Error,
+                code: "node-tag-no-init",
+                message: format!("`{head_name}` does not accept any initializer"),
+                byte_range: byte_range.clone(),
+                category: DiagCategory::TypeRelation,
+            });
+            continue;
+        }
+
         // v7 fixed-shape tuple natives. Each slot is `Some` only when
         // the loaded stdlib is v7 (slots stay `None` on v8 / no-stdlib
         // projects, so the comparisons all miss and the loop falls
