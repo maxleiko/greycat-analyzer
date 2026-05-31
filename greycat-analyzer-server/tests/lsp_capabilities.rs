@@ -1772,6 +1772,50 @@ fn completion_after_double_colon_lists_static_methods() {
     );
 }
 
+/// A generic-instantiated receiver (`Foo<int>::|`) must still resolve
+/// its static members — static dispatch is on the generic decl, so the
+/// receiver walk-back skips the `<…>` instantiation suffix to reach the
+/// base name `Foo`. Regression: the `>` stopped the walk and static
+/// completion returned nothing.
+#[test]
+fn completion_after_double_colon_on_generic_receiver_lists_static_methods() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Foo<T> { val: T?; static fn bar(): String { return \"a\"; } static fn baz(): int { return 42; } }\nfn main() { println(Foo<int>::); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `Foo<int>::`.
+    let off = doc.text.find("Foo<int>::").unwrap() + "Foo<int>::".len();
+    let line = doc.text[..off].matches('\n').count() as u32;
+    let col = (off - doc.text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(line, col),
+        &user_uri,
+        &pa,
+        None,
+        ENC,
+    )
+    .expect("static completion on a generic receiver");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"bar"), "static `bar` missing: {labels:?}");
+    assert!(labels.contains(&"baz"), "static `baz` missing: {labels:?}");
+    // Instance attr `val` is not a static member.
+    assert!(
+        !labels.contains(&"val"),
+        "instance attr leaked into static list: {labels:?}"
+    );
+}
+
 /// `Type::|` static completion also lists the type's `static` attrs,
 /// not just its static methods. Regression: previously the
 /// `Decl::Type(td)` arm only iterated `td.methods`, so a type with

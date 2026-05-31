@@ -2921,10 +2921,41 @@ fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<StaticRecvCtx> {
 
 /// Shared receiver walk-back used by both static-completion modes
 /// (ident property and string property). Walks left from `sep_start`
-/// over `[A-Za-z0-9_]` chars and slices the receiver text. Returns
-/// `None` when no receiver run is present.
+/// over `[A-Za-z0-9_]` chars and slices the receiver text. A
+/// generic-instantiated receiver (`Foo<int>::bar`, `Map<K, V>::x`)
+/// carries a balanced `<…>` suffix before the `::`; that group is
+/// skipped so the receiver resolves to its base name (`Foo` / `Map`) —
+/// static dispatch is on the generic decl, not the instantiation.
+/// Returns `None` when no receiver run is present or the angle group is
+/// unbalanced / spans a line.
 fn walk_back_receiver(bytes: &[u8], sep_start: usize, text: &str) -> Option<String> {
-    let mut i = sep_start;
+    let mut ident_end = sep_start;
+    if ident_end > 0 && bytes[ident_end - 1] == b'>' {
+        let mut depth = 0usize;
+        let mut k = ident_end;
+        loop {
+            if k == 0 {
+                return None; // no matching `<`
+            }
+            let c = bytes[k - 1];
+            if c == b'\n' {
+                return None; // angle group spans a line — bail
+            }
+            k -= 1;
+            match c {
+                b'>' => depth += 1,
+                b'<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        ident_end = k; // index of the matching `<`; the ident ends here
+    }
+    let mut i = ident_end;
     while i > 0 {
         let b = bytes[i - 1];
         if b.is_ascii_alphanumeric() || b == b'_' {
@@ -2933,10 +2964,10 @@ fn walk_back_receiver(bytes: &[u8], sep_start: usize, text: &str) -> Option<Stri
             break;
         }
     }
-    if i == sep_start {
+    if i == ident_end {
         return None;
     }
-    text.get(i..sep_start).map(str::to_string)
+    text.get(i..ident_end).map(str::to_string)
 }
 
 // =============================================================================
