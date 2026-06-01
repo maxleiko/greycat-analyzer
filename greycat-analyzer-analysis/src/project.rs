@@ -3297,6 +3297,41 @@ fn lambda_call_arg_diags(
 /// `&mut self.arena` during iteration over `&self.modules`, so the
 /// `&self`-borrowing version can no longer be invoked directly
 /// from the same scope.
+/// Emit the `generic-erasure` diagnostic: a value whose analyzer-
+/// materialized type is assignable to `slot_desc`, but whose *runtime*
+/// type — after the GreyCat runtime erases the producing fn's generic to
+/// `any?` (see [`crate::erasure`]) — is not. Verified against
+/// `greycat run`: the runtime throws `… not assignable …` at exactly
+/// these sites (arg-passing, field init, return). Error severity, no
+/// suppression — it's a real runtime crash the analyzer would otherwise
+/// hide behind its optimistic monomorphization.
+#[allow(clippy::too_many_arguments)]
+fn push_generic_erasure_diag(
+    diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
+    arena: &TypeArena,
+    index: &ProjectIndex,
+    decl_registry: &crate::well_known::DeclRegistry,
+    cur_uri: &Uri,
+    runtime_ty: TypeId,
+    slot_desc: String,
+    byte_range: std::ops::Range<usize>,
+) {
+    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    let runtime_disp =
+        display_type_for_module(arena, index, decl_registry, runtime_ty, Some(cur_uri));
+    diags.push(SemanticDiagnostic {
+        severity: Severity::Error,
+        code: "generic-erasure",
+        message: format!(
+            "this value is `{runtime_disp}` at runtime — GreyCat erases \
+             function-generic type parameters to `any?` — which is not assignable \
+             to {slot_desc}, so it throws at runtime"
+        ),
+        byte_range,
+        category: DiagCategory::TypeRelation,
+    });
+}
+
 #[allow(clippy::mutable_key_type)]
 fn collect_call_arg_diags_split(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
@@ -3467,6 +3502,41 @@ fn collect_call_arg_diags_split(
                     byte_range: r,
                     category: DiagCategory::TypeRelation,
                 });
+            } else if let Some(runtime_ty) = cur_module
+                .analysis
+                .expr_runtime_types
+                .get(&call.args[i])
+                .copied()
+                && !is_assignable_to_with_index(
+                    index,
+                    well_known,
+                    decl_registry,
+                    arena,
+                    runtime_ty,
+                    declared_ty,
+                )
+            {
+                // The materialized arg type fits, but the runtime-erased
+                // shape doesn't — the runtime throws here.
+                let p_name = &index.symbols[fn_module.hir.idents[p.name].symbol];
+                let declared_disp = display_type_for_module(
+                    arena,
+                    index,
+                    decl_registry,
+                    declared_ty,
+                    Some(cur_uri),
+                );
+                let r = cur_module.hir.exprs[call.args[i]].byte_range();
+                push_generic_erasure_diag(
+                    diags,
+                    arena,
+                    index,
+                    decl_registry,
+                    cur_uri,
+                    runtime_ty,
+                    format!("parameter `{p_name}: {declared_disp}`"),
+                    r,
+                );
             }
         }
     }
@@ -3652,6 +3722,36 @@ fn collect_object_field_diags_split(
                     byte_range: r,
                     category: DiagCategory::TypeRelation,
                 });
+            } else if let Some(runtime_ty) = cur_module
+                .analysis
+                .expr_runtime_types
+                .get(&f.value)
+                .copied()
+                && !is_assignable_to_with_index(
+                    index,
+                    well_known,
+                    decl_registry,
+                    arena,
+                    runtime_ty,
+                    declared_ty,
+                )
+            {
+                // Materialized value fits the field, but its runtime-
+                // erased shape doesn't — constructing this object throws.
+                let attr_name = &index.symbols[attr_sym];
+                let declared_disp =
+                    display_type(arena, decl_registry, &index.symbols, declared_ty).to_string();
+                let r = cur_module.hir.exprs[f.value].byte_range();
+                push_generic_erasure_diag(
+                    diags,
+                    arena,
+                    index,
+                    decl_registry,
+                    cur_uri,
+                    runtime_ty,
+                    format!("field `{attr_name}: {declared_disp}`"),
+                    r,
+                );
             }
         }
     }
@@ -4746,9 +4846,46 @@ fn validate_module_type_relations(
                         rt,
                         "return value",
                         "declared return type",
-                        r,
+                        r.clone(),
                         diags,
                     );
+                    // P-erasure: returning a value whose materialized type
+                    // fits the declared return but whose runtime-erased
+                    // shape doesn't — the runtime throws `wrong return
+                    // type`. Guard on materialized-assignable so we don't
+                    // double-fire with `check_assign`'s type-mismatch.
+                    if let Some(runtime_ty) = analysis.expr_runtime_types.get(&v).copied()
+                        && let Some(value_ty) = analysis.expr_types.get(&v).copied()
+                        && is_assignable_to_with_index(
+                            index,
+                            well_known,
+                            decl_registry,
+                            arena,
+                            value_ty,
+                            rt,
+                        )
+                        && !is_assignable_to_with_index(
+                            index,
+                            well_known,
+                            decl_registry,
+                            arena,
+                            runtime_ty,
+                            rt,
+                        )
+                    {
+                        let want =
+                            display_type(arena, decl_registry, &index.symbols, rt).to_string();
+                        push_generic_erasure_diag(
+                            diags,
+                            arena,
+                            index,
+                            decl_registry,
+                            cur_uri,
+                            runtime_ty,
+                            format!("the declared return type `{want}`"),
+                            r,
+                        );
+                    }
                 }
             }
             Stmt::Return(_)
