@@ -327,6 +327,20 @@ pub struct AnalysisResult {
     /// the `unreachable` lint's dead-branch flagging and the
     /// matching quickfix (delete or unwrap to the live branch).
     pub decidable_conditions: FxHashMap<Idx<Stmt>, bool>,
+    /// Runtime-erased type for expressions whose analyzer-materialized
+    /// type is more specific than what the GreyCat runtime produces —
+    /// i.e. results of generic fns that erase their `T`-bearing container
+    /// return (see [`crate::erasure`]). `expr_types` keeps the
+    /// materialized type (IDE / inference / future-compiler); this side
+    /// table holds the erased shape so the `generic-erasure` diagnostic
+    /// can ask "would the runtime accept this where it's used?" and hover
+    /// can show both. Only diverging exprs get an entry.
+    pub expr_runtime_types: FxHashMap<Idx<Expr>, TypeId>,
+    /// Taint propagation of [`Self::expr_runtime_types`] onto bindings:
+    /// `var x = <erased call>` records `x`'s erased type here (keyed by
+    /// the defining `Idx<Ident>`, like `def_types`) so later references
+    /// to `x` carry the erasure to the use site.
+    pub def_runtime_types: FxHashMap<Idx<Ident>, TypeId>,
 }
 
 /// Where a member-access property name resolves to.
@@ -3692,12 +3706,18 @@ impl<'a> Cx<'a> {
     /// for non-fn callees (lambdas, member calls, cross-module decls
     /// not yet wired into the analyzer's HIR cache, etc.) so the
     /// caller falls back to `any`.
+    /// Returns `(materialized, runtime_erased)`: the analyzer's
+    /// monomorphized return type, plus — when the callee erases its
+    /// `T`-bearing container result at runtime ([`crate::erasure`]) —
+    /// the all-`any?` shape the runtime actually produces. The second
+    /// element is `Some` only for erasing callees; consumers record it
+    /// in `expr_runtime_types` to drive the `generic-erasure` diagnostic.
     fn try_generic_call_inference(
         &mut self,
         callee: Idx<Expr>,
         arg_tys: &[TypeId],
         call_range: Range<usize>,
-    ) -> Option<TypeId> {
+    ) -> Option<(TypeId, Option<TypeId>)> {
         // P-typeof-inference — Static / QualifiedStatic / Member /
         // Arrow callees route through the pre-lowered
         // `TypeMembers::method_signatures` storage. The witness +
@@ -3748,13 +3768,14 @@ impl<'a> Cx<'a> {
                 // the `&mut self` calls below. `params` / `generics`
                 // are `Vec<Idx<_>>` — the clone copies indices, not
                 // the underlying nodes.
-                let (fn_name_idx, fn_generics, fn_params, fn_return_type) =
+                let (fn_name_idx, fn_generics, fn_params, fn_return_type, erases) =
                     match &self.hir.decls[decl_id] {
                         Decl::Fn(fnd) if !fnd.generics.is_empty() => (
                             fnd.name,
                             fnd.generics.clone(),
                             fnd.params.clone(),
                             fnd.return_type,
+                            crate::erasure::fn_result_erases(self.hir, fnd),
                         ),
                         _ => return None,
                     };
@@ -3775,12 +3796,16 @@ impl<'a> Cx<'a> {
                     .unwrap_or_else(|| self.any_nullable());
                 self.pop_generic_scope();
 
+                let generic_syms: Vec<Symbol> = fn_generics
+                    .iter()
+                    .map(|g| self.hir.idents[*g].symbol)
+                    .collect();
                 let mut tbl = InferenceTable::new();
                 let pair_count = declared_params.len().min(arg_tys.len());
                 for i in 0..pair_count {
                     self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
                 }
-                Some(tbl.substitute(self.arena, declared_return))
+                Some(self.materialize_with_erasure(declared_return, &generic_syms, erases, &tbl))
             }
             Definition::ProjectDecl {
                 uri: ref dec_uri, ..
@@ -3804,15 +3829,40 @@ impl<'a> Cx<'a> {
                 // No declared return → no shape to infer into. The
                 // outer Expr::Call default (`any?`) is the right answer.
                 let declared_return = sig.return_ty?;
+                let erases = sig.return_erases;
+                let generic_syms = sig.generics.clone();
                 let mut tbl = InferenceTable::new();
                 let pair_count = declared_params.len().min(arg_tys.len());
                 for i in 0..pair_count {
                     self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
                 }
-                Some(tbl.substitute(self.arena, declared_return))
+                Some(self.materialize_with_erasure(declared_return, &generic_syms, erases, &tbl))
             }
             _ => None,
         }
+    }
+
+    /// Compute a generic call's materialized return (witnesses
+    /// substituted) and, when the callee erases its `T`-bearing container
+    /// result at runtime ([`crate::erasure`]), the all-`any?` erased
+    /// return the runtime actually produces. The erased form is returned
+    /// only when it genuinely differs from the materialized one.
+    fn materialize_with_erasure(
+        &mut self,
+        declared_return: TypeId,
+        generic_syms: &[Symbol],
+        erases: bool,
+        tbl: &InferenceTable,
+    ) -> (TypeId, Option<TypeId>) {
+        let materialized = tbl.substitute(self.arena, declared_return);
+        if !erases {
+            return (materialized, None);
+        }
+        let any_q = self.any_nullable();
+        let erase_map: FxHashMap<Symbol, TypeId> =
+            generic_syms.iter().map(|g| (*g, any_q)).collect();
+        let erased = self.arena.substitute(declared_return, &erase_map);
+        (materialized, (erased != materialized).then_some(erased))
     }
 
     /// Shared body of the Static / Member / Arrow / QualifiedStatic
@@ -3835,7 +3885,7 @@ impl<'a> Cx<'a> {
         property: Idx<Ident>,
         arg_tys: &[TypeId],
         call_range: &Range<usize>,
-    ) -> Option<TypeId> {
+    ) -> Option<(TypeId, Option<TypeId>)> {
         let recv = self.arena.get(recv_ty).clone();
         let (type_id, instantiation): (ItemId, Vec<TypeId>) = match recv.kind {
             TypeKind::Primitive(p) => {
@@ -3877,12 +3927,14 @@ impl<'a> Cx<'a> {
         } else {
             self.arena.substitute(sig_return, &recv_subst)
         };
+        let erases = sig.return_erases;
+        let generic_syms = sig.generics.clone();
         let mut tbl = InferenceTable::new();
         let pair_count = declared_params.len().min(arg_tys.len());
         for i in 0..pair_count {
             self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, call_range);
         }
-        Some(tbl.substitute(self.arena, declared_return))
+        Some(self.materialize_with_erasure(declared_return, &generic_syms, erases, &tbl))
     }
 
     /// Walk `param_ty` (declared) against `arg_ty` (witness). When
@@ -4181,6 +4233,18 @@ impl<'a> Cx<'a> {
                 // `ProjectAnalysis::validate_type_relations`.
                 let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any_nullable());
                 self.out.def_types.insert(name, var_ty);
+                // P-erasure taint: a var initialized from an erasing
+                // generic call holds the erased value at runtime even
+                // when annotated with a more specific type (the
+                // annotation is cosmetic — the runtime tag stays erased,
+                // verified against `greycat run`). Carry the runtime
+                // shape to the binding so later references flag the
+                // narrowing uses the runtime would throw on.
+                if let Some(i) = init
+                    && let Some(rt) = self.out.expr_runtime_types.get(&i).copied()
+                {
+                    self.out.def_runtime_types.insert(name, rt);
+                }
             }
             Stmt::Assign(AssignStmt { target, value, .. }) => {
                 // Lowering currently produces `=` as `Expr::Binary`
@@ -5706,9 +5770,17 @@ impl<'a> Cx<'a> {
         let expr = self.hir.exprs[expr_id].clone();
         match expr {
             Expr::Ident { name: idx, .. } => match self.res.lookup(idx) {
-                Some(Definition::Param(def)) | Some(Definition::Local(def)) => self
-                    .lookup_def_type(def)
-                    .unwrap_or_else(|| self.any_nullable()),
+                Some(Definition::Param(def)) | Some(Definition::Local(def)) => {
+                    // P-erasure taint: carry a binding's runtime-erased
+                    // shape (recorded at its `var x = <erased call>`) to
+                    // this reference so `validate_type_relations` flags
+                    // narrowing uses of `x` the runtime would throw on.
+                    if let Some(rt) = self.out.def_runtime_types.get(&def).copied() {
+                        self.out.expr_runtime_types.insert(expr_id, rt);
+                    }
+                    self.lookup_def_type(def)
+                        .unwrap_or_else(|| self.any_nullable())
+                }
                 Some(Definition::Decl(decl_id)) => match &self.hir.decls[decl_id] {
                     Decl::Var(vd) => vd
                         .ty
@@ -6210,10 +6282,19 @@ impl<'a> Cx<'a> {
                 //
                 // P12.1: the first path handles generic fns / generic
                 // methods via constraint-based inference.
-                let raw = if let Some(ret) =
+                let raw = if let Some((materialized, runtime)) =
                     self.try_generic_call_inference(callee, &arg_tys, call_range)
                 {
-                    ret
+                    // P-erasure — when the callee erases its generic
+                    // container result at runtime, stash the erased shape
+                    // (same nullability lift as the materialized result)
+                    // so `validate_type_relations` can flag narrowing uses
+                    // the runtime would throw on.
+                    if let Some(rt) = runtime {
+                        let lifted = self.lift_call_result_for_nullable_receiver(callee, rt);
+                        self.out.expr_runtime_types.insert(expr_id, lifted);
+                    }
+                    materialized
                 } else if let Some(ret) = self.try_member_call_typing(callee) {
                     // P23 — inline call-return typing for Member / Arrow /
                     // Static method calls. Pulls the method's lowered
@@ -6720,6 +6801,61 @@ mod tests {
     /// Drop-in helper for tests that don't need to inspect the arena.
     fn analyze_src_only(src: &str) -> AnalysisResult {
         analyze_src(src).1
+    }
+
+    /// `(expr_runtime_types.len(), def_runtime_types.len())` for the
+    /// single module in `src`, run through the project pipeline so the
+    /// built-in `Array` / `Map` / … decls are seeded (the bare per-module
+    /// walk has no stdlib, so `Array<T>` wouldn't lower to a `Generic`).
+    fn erasure_table_sizes(src: &str) -> (usize, usize) {
+        use greycat_analyzer_core::SourceManager;
+        use std::str::FromStr;
+        let mut mgr = SourceManager::new();
+        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        mgr.add_simple(uri.clone(), src, "project", false);
+        let pa = crate::project::ProjectAnalysis::analyze(&mgr);
+        let m = pa.module(&uri).unwrap();
+        (
+            m.analysis.expr_runtime_types.len(),
+            m.analysis.def_runtime_types.len(),
+        )
+    }
+
+    #[test]
+    fn erasing_call_records_runtime_type() {
+        // A local generic fn that constructs and returns `Box<T>` erases
+        // at runtime; the call result and the var it's bound to both
+        // carry the erased runtime shape. (User-defined `Box` keeps the
+        // test hermetic — the built-in `Array` only resolves with the
+        // stdlib loaded.)
+        let (exprs, defs) = erasure_table_sizes(
+            "type Box<T> { item: T; }\n\
+             fn wrap<T>(x: T): Box<T> { return Box<T> { item: x }; }\n\
+             fn main() { var r = wrap(1); }\n",
+        );
+        assert!(
+            exprs > 0,
+            "erasing call should record a runtime-erased type"
+        );
+        assert!(
+            defs > 0,
+            "var bound to an erasing call should carry the taint"
+        );
+    }
+
+    #[test]
+    fn honored_call_records_no_runtime_type() {
+        // Pass-through generic fn forwards what it got — no new erasure,
+        // so nothing diverges from the materialized type.
+        let (exprs, _defs) = erasure_table_sizes(
+            "type Box<T> { item: T; }\n\
+             fn id<T>(x: Box<T>): Box<T> { return x; }\n\
+             fn main() { var b = Box<int> { item: 1 }; var r = id(b); }\n",
+        );
+        assert_eq!(
+            exprs, 0,
+            "pass-through call must not record a runtime divergence"
+        );
     }
 
     /// Project-aware variant — exercises the full pipeline including
