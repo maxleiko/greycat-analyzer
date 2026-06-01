@@ -659,7 +659,7 @@ pub fn analyze_with_index_into(
             Severity::Error,
             "ambiguous-symbol",
             format!(
-                "`{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
+                "ambiguous `{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
                 module_names.len(),
                 module_names.join(", "),
                 module_names.first().copied().unwrap_or("<module>"),

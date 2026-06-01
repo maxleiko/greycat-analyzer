@@ -876,8 +876,8 @@ pub fn extract_lib_version_placeholder(list: &CompletionList) -> Option<LibVersi
         return None;
     }
     Some(LibVersionPayload {
-        lib: p.lib.into(),
-        typed: p.typed.into(),
+        lib: p.lib,
+        typed: p.typed,
         range: p.range,
     })
 }

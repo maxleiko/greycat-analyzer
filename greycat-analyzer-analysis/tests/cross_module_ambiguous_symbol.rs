@@ -23,7 +23,7 @@ fn ambiguous_diagnostics(pa: &ProjectAnalysis, uri: &Uri) -> Vec<String> {
     m.analysis
         .diagnostics
         .iter()
-        .filter(|d| d.severity == Severity::Error && d.message.contains("ambiguous-symbol"))
+        .filter(|d| d.severity == Severity::Error && d.code == "ambiguous-symbol")
         .map(|d| d.message.clone())
         .collect()
 }
