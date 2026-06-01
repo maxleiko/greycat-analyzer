@@ -2692,19 +2692,12 @@ impl<'a> Cx<'a> {
                 is_arrow,
             } => {
                 let recv_ty = self.out.expr_types.get(&receiver).copied()?;
-                let ret = self.method_return_for(recv_ty, property, is_arrow)?;
-                // P19.17 — propagate receiver nullability. `x?.foo()`
-                // and `x.foo()` where `x: T?` both yield `Ret?` at
-                // runtime: the call shorts (or NPEs) when the receiver
-                // is null. The Member arm of `infer_expr` does the
-                // same lift for value access; here we mirror it for
-                // calls so chains like `x?.foo().bar` carry the
-                // nullability through.
-                if self.arena.get(recv_ty).nullable {
-                    Some(self.arena.nullable(ret))
-                } else {
-                    Some(ret)
-                }
+                // The receiver-nullability lift (P19.17) is applied
+                // uniformly at the `Expr::Call` funnel
+                // (`lift_call_result_for_nullable_receiver`) so the
+                // generic-inference path and this one stay in lockstep;
+                // return the bare method return type here.
+                self.method_return_for(recv_ty, property, is_arrow)
             }
             CalleeShape::Static { ty, property } => {
                 let recv_ty = self.lower_type_ref(ty);
@@ -2712,6 +2705,46 @@ impl<'a> Cx<'a> {
             }
             CalleeShape::Ident(name_idx) => self.bare_fn_return(name_idx),
             CalleeShape::QualifiedStatic(chain) => self.qualified_static_call_return(&chain),
+        }
+    }
+
+    // P19.17
+    /// Lift a call expression's result type to nullable when the
+    /// callee is an instance-member access (`recv.m()` / `recv->m()`)
+    /// whose receiver type is nullable. The call shorts to null (or
+    /// NPEs) when the receiver is null, so `recvExpr?.m()` and
+    /// `recvExpr.m()` where `recvExpr: T?` both yield `Ret?` — the same
+    /// lift the Member / Offset arms of `infer_expr` apply for value
+    /// access.
+    ///
+    /// This is the single funnel for the call-result lift: it runs
+    /// once at the `Expr::Call` site over whichever path computed the
+    /// raw return type (generic inference, the non-generic
+    /// member/static call path, or the lambda fallback), so a method
+    /// whose return type is the receiver's own generic param (routed
+    /// through `run_method_generic_inference`) lifts identically to a
+    /// method with a concrete return.
+    ///
+    /// Static (`Type::m()`), qualified-static (`mod::Type::m()`),
+    /// bare-fn and lambda-by-ident callees have no instance receiver,
+    /// so the type passes through unchanged.
+    fn lift_call_result_for_nullable_receiver(&mut self, callee: Idx<Expr>, ret: TypeId) -> TypeId {
+        let receiver = match &self.hir.exprs[callee] {
+            Expr::Member(m) | Expr::Arrow(m) => m.receiver,
+            _ => return ret,
+        };
+        // The raw receiver's nullability drives the lift — for arrow
+        // calls that's the node ref itself (`n->m()` shorts when `n` is
+        // null), not the deref'd inner type.
+        let recv_nullable = self
+            .out
+            .expr_types
+            .get(&receiver)
+            .is_some_and(|t| self.arena.get(*t).nullable);
+        if recv_nullable {
+            self.arena.nullable(ret)
+        } else {
+            ret
         }
     }
 
@@ -6158,44 +6191,61 @@ impl<'a> Cx<'a> {
             Expr::Call(CallExpr { callee, args, .. }) => {
                 let callee_ty = self.visit_expr(callee);
                 let arg_tys: Vec<TypeId> = args.iter().map(|a| self.visit_expr(*a)).collect();
-                // P12.1: if the callee resolves to an in-module fn decl
-                // with generics, run constraint-based inference.
                 let call_range = self.hir.exprs[expr_id].byte_range();
-                if let Some(ret) = self.try_generic_call_inference(callee, &arg_tys, call_range) {
-                    return ret;
-                }
-                // P23 — inline call-return typing for Member / Arrow /
-                // Static method calls. Pulls the method's lowered
-                // return type from the S7 signatures index and applies
-                // `arena.substitute` against the receiver's
-                // instantiation. Replaces pass 3.5 + the receiver-
-                // driven shape-substitution shim for these shapes.
-                if let Some(ret) = self.try_member_call_typing(callee) {
-                    return ret;
-                }
-                // P15.10: pairwise arg-type validation runs in
-                // `ProjectAnalysis::validate_type_relations` so outer
-                // calls whose args contain inner static-expr calls
-                // validate against settled arg types. Doing it here
-                // would surface false positives for arg shapes whose
-                // type isn't known until pass 3.5 fixes them up.
+                // Compute the raw return type via the first call-typing
+                // path that applies, then apply the receiver-nullability
+                // lift once, uniformly, at this single funnel. The lift
+                // (P19.17 — `recvExpr?.m()` / `recvExpr.m()` where the
+                // receiver is nullable yields `Ret?`) lives in
+                // `lift_call_result_for_nullable_receiver` rather than
+                // inside each path so the generic-inference path
+                // (`run_method_generic_inference`, which handles methods
+                // whose return is the receiver's own generic param — e.g.
+                // `node<T>::resolve(): T`) and the non-generic path stay
+                // in lockstep. Putting the lift in only one path is what
+                // let `s.loadMethod()?.resolve()` (generic return) drop
+                // the `?` while `s.loadMethod()` (concrete return) kept it.
                 //
-                // lambda-unify(6): if the callee resolves to a
-                // structural Lambda (lambda literal in a var, or a
-                // fn-ref minted by `fn_ref_ty_from_sig`), the call's
-                // result type is the lambda's `ret` slot. `None` →
-                // `any?` fallback (lambda has no observable return).
-                // Strip the callee's outer nullable bit so `function?`-
-                // typed callees still produce the underlying ret.
-                let stripped = self.strip_nullable(callee_ty);
-                let lambda_ret = match &self.arena.get(stripped).kind {
-                    TypeKind::Lambda { ret, .. } => Some(*ret),
-                    _ => None,
+                // P12.1: the first path handles generic fns / generic
+                // methods via constraint-based inference.
+                let raw = if let Some(ret) =
+                    self.try_generic_call_inference(callee, &arg_tys, call_range)
+                {
+                    ret
+                } else if let Some(ret) = self.try_member_call_typing(callee) {
+                    // P23 — inline call-return typing for Member / Arrow /
+                    // Static method calls. Pulls the method's lowered
+                    // return type from the S7 signatures index and applies
+                    // `arena.substitute` against the receiver's
+                    // instantiation. Replaces pass 3.5 + the receiver-
+                    // driven shape-substitution shim for these shapes.
+                    ret
+                } else {
+                    // P15.10: pairwise arg-type validation runs in
+                    // `ProjectAnalysis::validate_type_relations` so outer
+                    // calls whose args contain inner static-expr calls
+                    // validate against settled arg types. Doing it here
+                    // would surface false positives for arg shapes whose
+                    // type isn't known until pass 3.5 fixes them up.
+                    //
+                    // lambda-unify(6): if the callee resolves to a
+                    // structural Lambda (lambda literal in a var, or a
+                    // fn-ref minted by `fn_ref_ty_from_sig`), the call's
+                    // result type is the lambda's `ret` slot. `None` →
+                    // `any?` fallback (lambda has no observable return).
+                    // Strip the callee's outer nullable bit so `function?`-
+                    // typed callees still produce the underlying ret.
+                    let stripped = self.strip_nullable(callee_ty);
+                    let lambda_ret = match &self.arena.get(stripped).kind {
+                        TypeKind::Lambda { ret, .. } => Some(*ret),
+                        _ => None,
+                    };
+                    match lambda_ret {
+                        Some(ret_opt) => ret_opt.unwrap_or_else(|| self.any_nullable()),
+                        None => self.any_nullable(),
+                    }
                 };
-                if let Some(ret_opt) = lambda_ret {
-                    return ret_opt.unwrap_or_else(|| self.any_nullable());
-                }
-                self.any_nullable()
+                self.lift_call_result_for_nullable_receiver(callee, raw)
             }
             Expr::Binary(BinaryExpr {
                 op, left, right, ..
@@ -7447,6 +7497,78 @@ fn caller(n: node<Foo>?) {
         assert_eq!(
             local_init_ty_with_stdlib(synthetic_std_core(), src, "s").as_deref(),
             Some("String?"),
+        );
+    }
+
+    // P19.17 — receiver-nullability lift for *method calls* (the
+    // call-typing analog of the `p16_7_question_*` field-access lifts
+    // above). `recvExpr?.m()` where `recvExpr: T?` yields `Ret?`: the
+    // chain shorts to null when the receiver is null. The three tests
+    // below cover the three ways the nullable receiver of the trailing
+    // `?.resolve()` is produced — instance `.` call, static `::` call,
+    // and arrow `->` call — all returning `node<UserDetails>?`, then
+    // `?.resolve()` (where `resolve(): T` returns the generic param)
+    // must lift `UserDetails` to `UserDetails?`. The generic-return
+    // method is what makes these distinct from the field-access tests:
+    // the call routes through `run_method_generic_inference`, which
+    // must honor the same lift as the non-generic call path.
+
+    #[test]
+    fn chained_call_lifts_nullable_through_instance_method() {
+        // `s.loadMethod()?.resolve()` — `loadMethod(): node<UserDetails>?`
+        // so the `?.resolve()` receiver is nullable. Result is
+        // `UserDetails?`.
+        let src = r#"
+type UserDetails {}
+type UserService {
+    native fn loadMethod(): node<UserDetails>?;
+}
+fn foo(s: UserService) {
+    var d = s.loadMethod()?.resolve();
+}
+"#;
+        assert_eq!(
+            local_init_ty_with_stdlib(synthetic_std_core(), src, "d").as_deref(),
+            Some("UserDetails?"),
+        );
+    }
+
+    #[test]
+    fn chained_call_lifts_nullable_through_static_method() {
+        // `UserService::loadSomething(42)?.resolve()` — the nullable
+        // receiver of `?.resolve()` is a static method call.
+        let src = r#"
+type UserDetails {}
+type UserService {
+    native static fn loadSomething(id: int): node<UserDetails>?;
+}
+fn foo() {
+    var d = UserService::loadSomething(42)?.resolve();
+}
+"#;
+        assert_eq!(
+            local_init_ty_with_stdlib(synthetic_std_core(), src, "d").as_deref(),
+            Some("UserDetails?"),
+        );
+    }
+
+    #[test]
+    fn chained_call_lifts_nullable_through_arrow_method() {
+        // `ns->loadMethod()?.resolve()` — the nullable receiver of
+        // `?.resolve()` is an arrow (`->`) method call; `ns: node<…>`
+        // derefs to `UserService` before `loadMethod` binds.
+        let src = r#"
+type UserDetails {}
+type UserService {
+    native fn loadMethod(): node<UserDetails>?;
+}
+fn foo(ns: node<UserService>) {
+    var d = ns->loadMethod()?.resolve();
+}
+"#;
+        assert_eq!(
+            local_init_ty_with_stdlib(synthetic_std_core(), src, "d").as_deref(),
+            Some("UserDetails?"),
         );
     }
 
