@@ -4389,6 +4389,8 @@ fn validate_module_type_relations(
     let Some(top) = hir.module.as_ref() else {
         return;
     };
+    // Top-level decls have no enclosing-type generics in scope.
+    let no_outer_generics: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
     for d_id in &top.decls {
         validate_decl(
             hir,
@@ -4400,10 +4402,15 @@ fn validate_module_type_relations(
             arena,
             bool_t,
             &hir.decls[*d_id],
+            &no_outer_generics,
             diags,
         );
     }
 
+    /// `outer_generics` carries the enclosing type's generic params
+    /// (`GenericOwner::Type`) when validating a method body, empty for
+    /// top-level fns. Merged with the fn's own generics so the declared
+    /// return type lowers to the same shape the body / signature use.
     #[allow(clippy::too_many_arguments)]
     fn validate_decl(
         hir: &Hir,
@@ -4415,19 +4422,32 @@ fn validate_module_type_relations(
         arena: &mut TypeArena,
         bool_t: TypeId,
         decl: &Decl,
+        outer_generics: &FxHashMap<Symbol, GenericOwner>,
         diags: &mut Vec<SemanticDiagnostic>,
     ) {
         match decl {
             Decl::Fn(fnd) => {
-                let return_ty = fnd.return_type.and_then(|t| {
-                    lower_type_ref_id(
+                // Lower the declared return type WITH the fn's generics
+                // (plus any enclosing-type generics for methods) in scope
+                // so `fn wrap<T>(): Array<T>` keeps `Array<T>`
+                // (`GenericParam`) instead of collapsing `T` to `any?` —
+                // which mismatched the body's `Array<T>`-typed `return`
+                // and produced a spurious return-type-mismatch. Mirrors
+                // signature lowering (S7-S11), so the body validation
+                // compares against the same shape the signature carries.
+                let return_ty = fnd.return_type.map(|t| {
+                    let mut generics_in_scope = outer_generics.clone();
+                    let own_owner = GenericOwner::Function(hir.idents[fnd.name].symbol);
+                    for g in &fnd.generics {
+                        generics_in_scope.insert(hir.idents[*g].symbol, own_owner);
+                    }
+                    lower_type_ref_project(
                         hir,
                         t,
-                        &analysis.registry,
+                        arena,
                         index,
                         decl_registry,
-                        &analysis.type_decls,
-                        arena,
+                        &generics_in_scope,
                         Some(cur_uri),
                     )
                 });
@@ -4477,6 +4497,16 @@ fn validate_module_type_relations(
                         );
                     }
                 }
+                // Method bodies see the enclosing type's generics
+                // (`GenericOwner::Type`) — so `type Box<T> { fn dup():
+                // Array<T> }` validates the body's `Array<T>` return
+                // against `Array<T>`, not a collapsed `Array<any?>`.
+                let type_owner = GenericOwner::Type(hir.idents[td.name].symbol);
+                let type_generics: FxHashMap<Symbol, GenericOwner> = td
+                    .generics
+                    .iter()
+                    .map(|g| (hir.idents[*g].symbol, type_owner))
+                    .collect();
                 for m in &td.methods {
                     validate_decl(
                         hir,
@@ -4488,6 +4518,7 @@ fn validate_module_type_relations(
                         arena,
                         bool_t,
                         &hir.decls[*m],
+                        &type_generics,
                         diags,
                     );
                 }
