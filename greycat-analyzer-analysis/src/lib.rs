@@ -47,6 +47,7 @@ pub mod annotation_validate;
 pub mod conv;
 pub mod directives;
 pub mod display;
+pub mod erasure;
 pub mod ide;
 pub mod lint;
 // P27.1

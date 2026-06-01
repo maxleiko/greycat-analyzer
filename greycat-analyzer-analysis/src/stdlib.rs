@@ -334,6 +334,12 @@ pub struct FnSignature {
     /// reachable from the body walker. Empty for fns declared with
     /// no params.
     pub params: Vec<TypeId>,
+    /// `true` when calling this generic fn yields a runtime-erased
+    /// container result (the GreyCat runtime erases function-level
+    /// generics to `any?`; see [`crate::erasure`]). Drives the
+    /// `generic-erasure` diagnostic for cross-module callees. Always
+    /// `false` for non-generic fns and for fns whose result honors `T`.
+    pub return_erases: bool,
 }
 
 // P21

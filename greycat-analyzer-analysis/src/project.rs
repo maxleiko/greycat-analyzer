@@ -1661,6 +1661,7 @@ fn lower_module_signatures(
                             return_ty: method_ret_ty,
                             generics: method_generics,
                             params: method_params,
+                            return_erases: crate::erasure::fn_result_erases(hir, fnd),
                         },
                     ));
                     // Restore: undo every push (in reverse so a method
@@ -1745,6 +1746,7 @@ fn lower_module_signatures(
                         return_ty: Some(ret_ty),
                         generics,
                         params,
+                        return_erases: crate::erasure::fn_result_erases(hir, fnd),
                     },
                 ));
             }
