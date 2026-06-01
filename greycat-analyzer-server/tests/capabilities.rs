@@ -57,6 +57,37 @@ fn hover_off_named_node_returns_none() {
 }
 
 #[test]
+fn hover_shows_runtime_erased_type_for_generic_result() {
+    // `wrap<T>` constructs & returns `Box<T>`, which the GreyCat runtime
+    // erases to `Box<any?>`. Hover shows BOTH: the analyzer's
+    // materialized `Box<int>` and a `runtime:` note with the erased
+    // shape, so the user isn't misled by the optimistic monomorphization.
+    let src = "\
+type Box<T> { item: T; }
+fn wrap<T>(x: T): Box<T> { return Box<T> { item: x }; }
+fn main() {
+    var b = wrap(42);
+    println(b);
+}
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "b)"); // the `b` in `println(b)`
+    let h = test_project.hover(cursor).expect("hover present");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains("Box<int>"),
+        "expected materialized `Box<int>` in hover, got {v}"
+    );
+    assert!(
+        v.contains("runtime:") && v.contains("Box<any?>"),
+        "expected runtime-erased note `Box<any?>` in hover, got {v}"
+    );
+}
+
+#[test]
 fn hover_on_object_expr_field_shows_attr_signature_doc_and_provenance() {
     let src = "\
 type Reader {

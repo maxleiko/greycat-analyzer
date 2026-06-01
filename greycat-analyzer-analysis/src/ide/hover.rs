@@ -192,11 +192,19 @@ pub fn hover_with_project(
                 })
                 && let Some(ty) = module.analysis.expr_types.get(&expr_id)
             {
-                let label = format!(
+                let mut label = format!(
                     "{}: {}",
                     short_expr_label(&module.hir, project.symbols(), expr),
                     project.display_type(*ty),
                 );
+                // P-erasure honesty: show the runtime-erased shape for a
+                // generic-fn result the runtime erases (see `crate::erasure`).
+                if let Some(rt) = module.analysis.expr_runtime_types.get(&expr_id) {
+                    label.push_str(&format!(
+                        "\n// runtime: {} (GreyCat erases function generics to any?)",
+                        project.display_type(*rt),
+                    ));
+                }
                 return Some(hover_from_markdown(wrap_code(&label), r, text, encoding));
             }
         }
@@ -436,11 +444,22 @@ fn ident_hover_markdown(
     match resolutions.lookup(ident_idx)? {
         Definition::Param(name) | Definition::Local(name) => {
             analysis.def_types.get(&name).map(|ty| {
-                wrap_code(&format!(
+                let mut body = format!(
                     "{}: {}",
                     ident_name,
                     crate::project::display_type(arena, decl_registry, symbols, *ty),
-                ))
+                );
+                // P-erasure honesty: when the binding holds a generic-fn
+                // result the runtime erases, show the erased shape too —
+                // the analyzer's type is more specific than what the
+                // runtime actually has (see `crate::erasure`).
+                if let Some(rt) = analysis.def_runtime_types.get(&name) {
+                    body.push_str(&format!(
+                        "\n// runtime: {} (GreyCat erases function generics to any?)",
+                        crate::project::display_type(arena, decl_registry, symbols, *rt),
+                    ));
+                }
+                wrap_code(&body)
             })
         }
         Definition::Decl(decl_id) => Some(render_decl_hover_markdown(
