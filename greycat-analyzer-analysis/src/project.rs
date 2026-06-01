@@ -2696,6 +2696,7 @@ impl ProjectAnalysis {
                 &mut diags,
             );
             collect_instance_method_value_ref_diags(&self.modules, cur_uri, &mut diags);
+            collect_static_type_args_diags(&self.modules, cur_uri, &mut diags);
             collect_object_construction_diags(
                 &self.modules,
                 arena_mut,
@@ -3736,6 +3737,60 @@ fn collect_instance_method_value_ref_diags(
     }
 }
 
+/// Reject generic type arguments on a static access — `Foo<int>::bar()`,
+/// `Foo<int>::bar` (value-ref), `Foo<int>::ATTR`.
+///
+/// GreyCat has no bounded generics, so the type parameter is inert in any
+/// static context: a static carries no instance to bind `T` from, can't
+/// construct one (`T {}` is rejected), and can't dispatch on it. The
+/// `<...>` therefore never changes which code runs or what it returns —
+/// in *any* program. The runtime rejects the construct outright (with an
+/// unhelpful "syntax error"); we mirror it as a precise hard error whose
+/// span is the removable `<...>` slice, so the auto-fix can strip it back
+/// to `Foo::bar()`. See [`crate::ide::quickfix::edit_for_diagnostic`].
+///
+/// Tagged `TypeRelation` so the `validate_type_relations` retain-and-
+/// re-emit cycle refreshes it on every incremental edit, matching
+/// [`collect_instance_method_value_ref_diags`].
+#[allow(clippy::mutable_key_type)]
+fn collect_static_type_args_diags(
+    modules: &FxHashMap<Uri, ModuleAnalysis>,
+    cur_uri: &Uri,
+    diags: &mut Vec<SemanticDiagnostic>,
+) {
+    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    use greycat_analyzer_hir::types::Expr;
+
+    let Some(cur_module) = modules.get(cur_uri) else {
+        return;
+    };
+    for (_eid, expr) in cur_module.hir.exprs.iter() {
+        let Expr::Static(s) = expr else {
+            continue;
+        };
+        let ty = &cur_module.hir.type_refs[s.ty];
+        if ty.params.is_empty() {
+            continue;
+        }
+        // Span the `<...>` slice only — from the end of the type name
+        // through the end of the type reference (the closing `>`). The
+        // squiggle and the auto-fix both target the removable noise and
+        // leave `Foo` intact.
+        let name_end = cur_module.hir.idents[ty.name].byte_range.end;
+        let close = ty.byte_range.end;
+        if close <= name_end {
+            continue;
+        }
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            code: "static-type-args",
+            message: "generic type arguments are not allowed on a static access".to_string(),
+            byte_range: name_end..close,
+            category: DiagCategory::TypeRelation,
+        });
+    }
+}
+
 /// Object-construction shape walker.
 ///
 /// GreyCat's `T { … }` syntax carries two implicit construction shapes
@@ -3806,6 +3861,30 @@ fn collect_object_construction_diags(
             }
             continue;
         }
+
+        // The other node-tag family members accept NO initializer at all
+        // — only the empty default-init `T {}` is valid (handled by the
+        // empty-fields short-circuit above). Unlike `node` (one element)
+        // and `Array` (any arity), any content here is a runtime error,
+        // and it's neither positional nor named — so we flag it directly
+        // instead of falling through to the "use named form" suggestion.
+        if Some(head_decl) == well_known.node_list_decl
+            || Some(head_decl) == well_known.node_time_decl
+            || Some(head_decl) == well_known.node_geo_decl
+            || Some(head_decl) == well_known.node_index_decl
+        {
+            let tr = &cur_module.hir.type_refs[*tr_id];
+            let head_name = &index.symbols[cur_module.hir.idents[tr.name].symbol];
+            diags.push(SemanticDiagnostic {
+                severity: Severity::Error,
+                code: "node-tag-no-init",
+                message: format!("`{head_name}` does not accept any initializer"),
+                byte_range: byte_range.clone(),
+                category: DiagCategory::TypeRelation,
+            });
+            continue;
+        }
+
         // v7 fixed-shape tuple natives. Each slot is `Some` only when
         // the loaded stdlib is v7 (slots stay `None` on v8 / no-stdlib
         // projects, so the comparisons all miss and the loop falls

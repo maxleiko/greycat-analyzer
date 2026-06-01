@@ -555,9 +555,26 @@ pub fn analyze_with_index_into(
         generics_in_scope: Vec::new(),
         this_stack: Vec::new(),
         inside_static_fn: false,
+        static_generic_uses: FxHashSet::default(),
     };
     for d in &module.decls {
         cx.visit_decl(*d);
+    }
+
+    // Type-level generics used inside `static` methods — `static fn
+    // make(): T`, `T {}`. Recorded during the walk (deduped by
+    // `Idx<TypeRef>`); emitted now that `cx`'s `&mut out` borrow is
+    // released. One error per source reference.
+    let static_generic_uses = std::mem::take(&mut cx.static_generic_uses);
+    for tr_idx in static_generic_uses {
+        let tr = &hir.type_refs[tr_idx];
+        let pname = &index.symbols[hir.idents[tr.name].symbol];
+        out.diagnostics.push(SemanticDiagnostic::structural(
+            Severity::Error,
+            "generic-in-static-context",
+            format!("generic type parameter `{pname}` cannot be used in a `static` method"),
+            tr.byte_range.clone(),
+        ));
     }
 
     // Surface resolver's unresolved-name list as analyzer diagnostics so
@@ -642,7 +659,7 @@ pub fn analyze_with_index_into(
             Severity::Error,
             "ambiguous-symbol",
             format!(
-                "ambiguous-symbol: `{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
+                "`{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
                 module_names.len(),
                 module_names.join(", "),
                 module_names.first().copied().unwrap_or("<module>"),
@@ -1066,6 +1083,15 @@ struct Cx<'a> {
     /// are allowed" rule — the runtime accepts private writes only
     /// from non-static methods (and the constructor).
     inside_static_fn: bool,
+    /// Type-level generic params (`type Foo<T>`) referenced from inside a
+    /// `static` method — `static fn make(): T`, `T {}`, etc. A static
+    /// carries no instance, so the type parameter is unbound: GreyCat has
+    /// no bounded generics, the runtime can't construct or dispatch on
+    /// `T`, and rejects any use of it. Recorded here during
+    /// `lower_type_ref` (deduped by `Idx<TypeRef>`) and surfaced once
+    /// after the walk as `generic-in-static-context` — `lower_type_ref`
+    /// is a multi-call helper, so emitting inline would double-report.
+    static_generic_uses: FxHashSet<Idx<TypeRef>>,
 }
 
 impl<'a> Cx<'a> {
@@ -3238,6 +3264,19 @@ impl<'a> Cx<'a> {
                     // scope — produce a `GenericParam` rather than a
                     // bare `Named`, so call-site inference can record
                     // witnesses for it.
+                    //
+                    // A *type-level* generic referenced from inside a
+                    // `static` method is invalid: a static carries no
+                    // instance, so `T` is unbound (the runtime rejects
+                    // `T {}` and any `T` use). Record the ref for a
+                    // once-per-site `generic-in-static-context` error
+                    // emitted after the walk. Method-level generics
+                    // (`GenericOwner::Function`, e.g. `static fn f<U>()`)
+                    // are the method's own and stay valid. Still mint the
+                    // `GenericParam` so downstream typing is unchanged.
+                    if self.inside_static_fn && matches!(owner, GenericOwner::Type(_)) {
+                        self.static_generic_uses.insert(idx);
+                    }
                     self.arena.generic_param(name_sym, owner)
                 } else if let Some(arity) = self.generic_arity_for(name_sym) {
                     // Raw-form generic reference: `Tensor` (no params)

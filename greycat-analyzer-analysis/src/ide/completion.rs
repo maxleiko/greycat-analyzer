@@ -6,6 +6,7 @@
 //! converts to `lsp_types::CompletionItem` at the wire boundary and the
 //! wasm bridge consumes the same shape unchanged.
 
+use greycat_analyzer_core::registry::RegistryFetcher;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -128,41 +129,474 @@ pub fn completion_with_project(
 ) -> Option<CompletionList> {
     let byte = position_to_byte(text, pos, encoding);
     let node = node_at_offset(root, byte)?;
+    // The structural classifier and type-position emitter want the
+    // identifier *being typed*, which at a word's trailing edge differs
+    // from the node spanning the cursor — see [`word_anchor`].
+    let anchor = word_anchor(text, root, node, byte);
+
+    // `// gcl…` directive completion is line-text based (not CST-node
+    // based), so it runs before [`classify_slot`]: the cursor often sits
+    // at the comment's trailing edge where `node_at_offset` lands *past*
+    // the comment node. Skips the call-paren post-pass — directive items
+    // aren't value items.
     if let Some(items) = directive_completion(text, byte) {
         return Some(CompletionList {
             is_incomplete: false,
             items,
         });
     }
-    let mut items = if let Some(items) = include_dir_completion(text, node, byte, project_root) {
-        items
-    } else if let Some(items) = library_version_completion(text, node, byte, encoding) {
-        // P15.3 — emit the lazy placeholder. `completion_handler` in
-        // server.rs intercepts the placeholder and runs
-        // [`resolve_library_version_completion`] against its
-        // [`RegistryFetcher`] before forwarding to the editor.
-        return Some(CompletionList {
-            is_incomplete: true,
-            items,
-        });
-    } else if let Some(items) = pragma_completion(text, byte) {
-        items
-    } else if let Some(items) = member_completion(text, root, byte, uri, project, encoding) {
-        items
-    } else if let Some(items) = static_completion(text, byte, project, encoding) {
-        items
-    } else if let Some(items) = type_position_completion(text, node, byte, uri, project) {
-        items
-    } else if let Some(items) = object_field_completion(text, node, byte, uri, project) {
-        items
-    } else {
-        ident_or_keyword_completion(text, node, byte, uri, project)?
+
+    // Classify the cursor's slot once, then dispatch. This is an
+    // *allowlist*: every emitter is reached only when the slot is
+    // positively recognized, and full-scope (`Expr`) completion fires
+    // ONLY at a genuine expression / statement position. Unrecognized
+    // positions (`Comment` / `Declaration` / `NoCompletion`) yield
+    // nothing rather than leaking the scope dump — see [`classify_slot`].
+    let mut items = match classify_slot(text, node, anchor, byte) {
+        // Inside a comment but not a `// gcl…` directive — nothing.
+        CompletionSlot::Comment => return None,
+        CompletionSlot::StringArg => {
+            if let Some(items) = include_dir_completion(text, node, byte, project_root) {
+                items
+            } else if let Some(items) = library_version_completion(text, node, byte, encoding) {
+                // P15.3 — emit the lazy placeholder. `completion_handler`
+                // in server.rs intercepts the placeholder and runs
+                // [`resolve_library_version_completion`] against its
+                // [`RegistryFetcher`] before forwarding to the editor.
+                return Some(CompletionList {
+                    is_incomplete: true,
+                    items,
+                });
+            } else {
+                return None;
+            }
+        }
+        CompletionSlot::PragmaName => pragma_completion(text, byte)?,
+        CompletionSlot::Member => member_completion(text, root, byte, uri, project, encoding)?,
+        CompletionSlot::Static => static_completion(text, byte, project, encoding)?,
+        CompletionSlot::TypeRef => type_position_completion(text, anchor, byte, uri, project)?,
+        CompletionSlot::ObjectFieldName { body } => {
+            // A named-attr type resolves to its field names; an
+            // unresolved head or a collection / tuple (no attrs) falls
+            // back to expression completion for its positional element.
+            match emit_object_field_names(text, body, byte, uri, project) {
+                Some(items) => items,
+                None => expr_completion(text, byte, uri, project, None)?,
+            }
+        }
+        CompletionSlot::Expr { value } => {
+            let expected = value.and_then(|v| resolve_expected(&v, uri, project));
+            expr_completion(text, byte, uri, project, expected)?
+        }
+        CompletionSlot::Declaration | CompletionSlot::NoCompletion => return None,
     };
     apply_call_paren_snippet(&mut items, text, byte, encoding);
     Some(CompletionList {
         is_incomplete: false,
         items,
     })
+}
+
+/// The cursor's completion slot — the authoritative classification that
+/// replaces the old detector chain + denylist gate. Carries CST node
+/// refs (tied to the parse tree's lifetime) where an emitter needs them.
+///
+/// `Expr` is the *only* slot that produces full-scope completion. Its
+/// `value` anchor (when known) lets the dispatcher resolve an *expected
+/// type* for type-aware ranking — see [`ValueSlot`] / [`resolve_expected`].
+enum CompletionSlot<'t> {
+    /// Inside a `// …` comment — directive completion (`// gcl…`) or none.
+    Comment,
+    /// Inside a non-substitution `string` — pragma string-arg or none.
+    StringArg,
+    /// Right after `@` — pragma-name completion.
+    PragmaName,
+    /// After `.` / `->` — member completion.
+    Member,
+    /// After `::` (ident or `::"…"` string mode) — static completion.
+    Static,
+    /// Inside a `type_ident` slot — type-position completion.
+    TypeRef,
+    /// Object-literal field-name slot; `body` is the
+    /// `object_initializers` / `object_fields` node.
+    ObjectFieldName { body: tree_sitter::Node<'t> },
+    /// Expression / statement position — scope + keywords + project
+    /// surface. `value` anchors a known value slot for expected-type
+    /// ranking; `None` is a bare statement / unrankable position.
+    Expr { value: Option<ValueSlot<'t>> },
+    /// A declaration-name slot (`fn na|me`, `type Fo|o`, param name, …)
+    /// or other non-expression container — suppress completion.
+    Declaration,
+    /// No completion (unrecognized position).
+    NoCompletion,
+}
+
+/// A value-bearing expression slot whose expected type the analyzer can
+/// recover from the surrounding construct. Pure CST anchors — the HIR
+/// lookups happen later in [`resolve_expected`], keeping [`classify_slot`]
+/// free of analysis state.
+enum ValueSlot<'t> {
+    /// `Foo { x: | }` — expected type is attr `x`'s type. Anchor is the
+    /// `object_field` node (its `name` child names the attr).
+    FieldValue { object_field: tree_sitter::Node<'t> },
+    /// `f(a, |)` — expected type is the callee's `params[index]`. Anchor
+    /// is the callee CST node (`call_expr`'s `fn` child).
+    CallArg {
+        callee: tree_sitter::Node<'t>,
+        index: usize,
+    },
+    /// `var x: T = |` — expected type is the binding's declared type.
+    /// Anchor is the `var_decl` / `modvar` node (its `name` child).
+    Initializer { binder: tree_sitter::Node<'t> },
+}
+
+/// Separator immediately preceding the cursor's typed prefix.
+enum Sep {
+    Dot,
+    Arrow,
+}
+
+/// Inspect the byte(s) immediately before the cursor's `[A-Za-z0-9_]*`
+/// prefix run. Mirrors the separator probe in [`member_completion`] so
+/// the classifier and the emitter agree on what counts as member access.
+fn separator_before_prefix(text: &str, cursor_byte: usize) -> Option<Sep> {
+    let bytes = text.as_bytes();
+    let prefix_len = ident_prefix_at_cursor(text, cursor_byte).len();
+    let ps = cursor_byte.min(bytes.len()).saturating_sub(prefix_len);
+    if ps >= 1 && bytes[ps - 1] == b'.' {
+        return Some(Sep::Dot);
+    }
+    if ps >= 2 && bytes[ps - 2] == b'-' && bytes[ps - 1] == b'>' {
+        return Some(Sep::Arrow);
+    }
+    None
+}
+
+/// Field name of `child` within `parent` (e.g. `"name"`, `"value"`,
+/// `"type"`), or `None` for an unnamed child. Walks `parent`'s direct
+/// children with a `TreeCursor` — the cheap, exact way to distinguish a
+/// declaration-name slot from a value slot during the ancestor walk.
+fn field_name_of(
+    parent: tree_sitter::Node<'_>,
+    child: tree_sitter::Node<'_>,
+) -> Option<&'static str> {
+    let mut c = parent.walk();
+    if c.goto_first_child() {
+        loop {
+            if c.node().id() == child.id() {
+                return c.field_name();
+            }
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Classify the cursor's completion slot. Two passes:
+///
+/// 1. **Lexical / operator / comment / string** — contexts defined by a
+///    trailing operator or enclosing comment / string that survive the
+///    common incomplete-parse case (the cursor sits on a fresh prefix).
+/// 2. **Structural ancestor walk** — the cursor's enclosing construct
+///    decides the slot, with the field name of the child we ascended
+///    from distinguishing a declaration name from a value position.
+fn classify_slot<'t>(
+    text: &str,
+    node: tree_sitter::Node<'t>,
+    anchor: tree_sitter::Node<'t>,
+    cursor_byte: usize,
+) -> CompletionSlot<'t> {
+    // ---- Pass 0 ----
+    // Comments own their slot entirely (directive completion or none).
+    for k in ["line_comment", "_block_comment", "doc_comment"] {
+        if ancestor_with_kind(node, k).is_some() {
+            return CompletionSlot::Comment;
+        }
+    }
+    // Strings: a real expression inside `${…}` falls through to Pass 1;
+    // `Recv::"…|"` static-string mode routes to Static; any other string
+    // content is at most a pragma string-arg.
+    if ancestor_with_kind(node, "string").is_some()
+        && ancestor_with_kind(node, "string_substitution").is_none()
+    {
+        if static_receiver_at(text, cursor_byte).is_some() {
+            return CompletionSlot::Static;
+        }
+        return CompletionSlot::StringArg;
+    }
+    // Pragma name after `@`.
+    if pragma_prefix_at_cursor(text, cursor_byte).is_some() {
+        return CompletionSlot::PragmaName;
+    }
+    // Member access `recv.` / `recv->`.
+    if separator_before_prefix(text, cursor_byte).is_some() {
+        return CompletionSlot::Member;
+    }
+    // Static access `Recv::` (ident mode; string mode handled above).
+    if static_receiver_at(text, cursor_byte).is_some() {
+        return CompletionSlot::Static;
+    }
+    // Annotation interior we don't otherwise complete — don't leak scope.
+    if ancestor_with_kind(node, "annotation").is_some() {
+        return CompletionSlot::NoCompletion;
+    }
+
+    // ---- Pass 1 ----
+    // The structural walk runs on `anchor` (the identifier being typed),
+    // not the cursor node — see [`word_anchor`] for why the trailing edge
+    // of a word needs backing up. Pass 0's operator / string detectors
+    // above keep the cursor `node`; they do their own prefix back-walking.
+    classify_structural(text, anchor, cursor_byte)
+}
+
+/// The node the structural walk (Pass 1) should start from. At a word's
+/// trailing edge (`var s|`, `var v: M|`) `node_at_offset(cursor)` lands
+/// on the *parent* — the identifier's byte range is half-open and ends at
+/// the cursor — so the walk would start on the enclosing `var_decl` /
+/// `type_decorator` with no `name` field and misclassify the slot. Back
+/// up one byte into the typed prefix so the walk starts inside the ident
+/// ("the word under the cursor"). Empty-prefix positions (`Foo { | }`)
+/// are unchanged. Also handed to `type_position_completion` so its own
+/// `type_ident`-ancestor guard sees the ident rather than the parent.
+fn word_anchor<'t>(
+    text: &str,
+    root: tree_sitter::Node<'t>,
+    node: tree_sitter::Node<'t>,
+    cursor_byte: usize,
+) -> tree_sitter::Node<'t> {
+    if ident_prefix_at_cursor(text, cursor_byte).is_empty() {
+        node
+    } else {
+        node_at_offset(root, cursor_byte - 1).unwrap_or(node)
+    }
+}
+
+/// Walk up from `node`, classifying by the first recognized ancestor.
+/// `from_field` tracks the field name of the child we ascended from so
+/// `fn na|me` (the `name` field of `fn_decl`) suppresses while
+/// `fn f(): T { na|me() }` (a statement in the body block) does not.
+fn classify_structural<'t>(
+    text: &str,
+    node: tree_sitter::Node<'t>,
+    cursor_byte: usize,
+) -> CompletionSlot<'t> {
+    let mut cur = node;
+    let mut from_field: Option<&'static str> = None;
+    loop {
+        match cur.kind() {
+            // Anywhere in a type expression → type-position completion.
+            "type_ident" | "type_decorator" | "attr_type" => return CompletionSlot::TypeRef,
+            // A field's `name` slot lists field names; its `value` slot
+            // (or any non-name child) is an expression typed by the attr.
+            "object_field" => {
+                return match (from_field, cur.parent()) {
+                    (Some("name"), Some(body))
+                        if matches!(body.kind(), "object_fields" | "object_initializers") =>
+                    {
+                        CompletionSlot::ObjectFieldName { body }
+                    }
+                    _ => CompletionSlot::Expr {
+                        value: Some(ValueSlot::FieldValue { object_field: cur }),
+                    },
+                };
+            }
+            "object_initializers" | "object_fields" => {
+                return classify_object_body(text, cur, cursor_byte);
+            }
+            // Call arguments → expected type is the callee's params[index].
+            "args" => {
+                let value = cur
+                    .parent()
+                    .filter(|p| p.kind() == "call_expr")
+                    .and_then(|call| call.child_by_field_name("fn"))
+                    .map(|callee| ValueSlot::CallArg {
+                        callee,
+                        index: call_arg_index(cur, cursor_byte),
+                    });
+                return CompletionSlot::Expr { value };
+            }
+            // Binding initializer → expected type is the declared type.
+            "initializer" => {
+                let value = cur
+                    .parent()
+                    .filter(|p| matches!(p.kind(), "var_decl" | "modvar"))
+                    .map(|binder| ValueSlot::Initializer { binder });
+                return CompletionSlot::Expr { value };
+            }
+            // Declaration-name slots: suppress (the user is binding a new
+            // identifier, not referencing one).
+            "fn_decl" | "type_decl" | "enum_decl" | "modvar" | "var_decl"
+                if from_field == Some("name") =>
+            {
+                return CompletionSlot::Declaration;
+            }
+            // Declaration containers: param lists, generic-param lists,
+            // type / enum bodies, modifier runs — never expression slots.
+            "fn_params" | "fn_param" | "type_params" | "type_param" | "type_body" | "enum_body"
+            | "enum_field" | "modifiers" => return CompletionSlot::Declaration,
+            // Statement / module position → expression completion. This
+            // is the only path to full-scope completion.
+            "block" | "source_file" | "module" => return CompletionSlot::Expr { value: None },
+            _ => {}
+        }
+        let Some(parent) = cur.parent() else {
+            return CompletionSlot::NoCompletion;
+        };
+        from_field = field_name_of(parent, cur);
+        cur = parent;
+    }
+}
+
+/// Decide name-vs-value inside an `object_initializers` / `object_fields`
+/// body. After a `:` in the current segment the cursor is at a field
+/// *value* (an expression); otherwise it's a *name* slot (the type-resolve
+/// decision — named-attr type vs collection — is deferred to the emitter).
+fn classify_object_body<'t>(
+    text: &str,
+    body: tree_sitter::Node<'t>,
+    cursor_byte: usize,
+) -> CompletionSlot<'t> {
+    if object_cursor_after_colon(text, body, cursor_byte) {
+        // Recovery-shape value slot (`Foo { a: | }` parsed as
+        // `object_initializers` + ERROR colon) — no clean `object_field`
+        // anchor here, so expression completion runs unranked.
+        return CompletionSlot::Expr { value: None };
+    }
+    CompletionSlot::ObjectFieldName { body }
+}
+
+/// 0-based argument index of the cursor within an `args` node — the
+/// count of top-level `,` separators before `cursor_byte`. (Commas
+/// nested inside argument sub-expressions live in deeper nodes, so a
+/// direct-child scan is correct.)
+fn call_arg_index(args: tree_sitter::Node<'_>, cursor_byte: usize) -> usize {
+    let mut walker = args.walk();
+    args.children(&mut walker)
+        .filter(|c| c.kind() == "," && c.start_byte() < cursor_byte)
+        .count()
+}
+
+/// Resolve the expected type at a value slot from the analyzer's
+/// resolved-`TypeId` maps (`object_field_uses` + `type_members`,
+/// callee `expr_types` → `Lambda`, `def_types`). Returns `None`
+/// whenever the lookup is uncertain — ranking is non-destructive, so a
+/// missing expected type simply means "don't rank".
+fn resolve_expected(value: &ValueSlot<'_>, uri: &Uri, project: &ProjectAnalysis) -> Option<TypeId> {
+    let module = project.module(uri)?;
+    match value {
+        ValueSlot::FieldValue { object_field } => {
+            // The field's `name` ident, once bound, points at its
+            // declaring type + attr via `object_field_uses`; the resolved
+            // attr type lives in that type's `type_members.attr_types`.
+            let name_node = object_field.child_by_field_name("name")?;
+            let name_range = name_node.byte_range();
+            let (ident_idx, _) = module
+                .hir
+                .idents
+                .iter()
+                .find(|(_, i)| i.byte_range == name_range)?;
+            let binding = module.analysis.object_field_uses.get(&ident_idx)?;
+            let name_sym = module.hir.idents[ident_idx].symbol;
+            project
+                .index
+                .type_members
+                .get(&binding.declaring_type)?
+                .attr_types
+                .get(&name_sym)
+                .copied()
+        }
+        ValueSlot::CallArg { callee, index } => {
+            // Map the callee CST node to its HIR expr and read the
+            // structural `Lambda` signature the analyzer minted for it.
+            let range = callee.byte_range();
+            let (expr_idx, _) = module
+                .hir
+                .exprs
+                .iter()
+                .filter(|(_, e)| e.byte_range() == range)
+                .max_by_key(|(_, e)| e.byte_range().end - e.byte_range().start)?;
+            let callee_ty = module.analysis.expr_types.get(&expr_idx).copied()?;
+            match &project.arena().get(callee_ty).kind {
+                TypeKind::Lambda { params, .. } => params.get(*index).copied(),
+                _ => None,
+            }
+        }
+        ValueSlot::Initializer { binder } => {
+            // Declared (or inferred) type of the binding, keyed by its
+            // `name` ident in `def_types`.
+            let name_node = binder.child_by_field_name("name")?;
+            let name_range = name_node.byte_range();
+            let (ident_idx, _) = module
+                .hir
+                .idents
+                .iter()
+                .find(|(_, i)| i.byte_range == name_range)?;
+            module.analysis.def_types.get(&ident_idx).copied()
+        }
+    }
+}
+
+/// Whether a scope candidate's type is assignable to the slot's expected
+/// type. Variable-like candidates (locals / params / module vars) carry a
+/// resolved `def_types` entry; fns / types / generics have no plain value
+/// type, so they never match (rank-neutral). `arena` is the throwaway
+/// clone the caller owns — `is_assignable_to_with_index` needs `&mut`.
+fn type_matches_expected(
+    project: &ProjectAnalysis,
+    arena: &mut TypeArena,
+    module: &ModuleAnalysis,
+    source: &crate::ide::scope::NameSource,
+    expected: TypeId,
+) -> bool {
+    use crate::ide::scope::NameSource;
+    let cand = match source {
+        NameSource::Local(idx) | NameSource::Param(idx) => {
+            module.analysis.def_types.get(idx).copied()
+        }
+        NameSource::ModuleDecl(decl_id) => match &module.hir.decls[*decl_id] {
+            Decl::Var(vd) => module.analysis.def_types.get(&vd.name).copied(),
+            _ => None,
+        },
+        NameSource::Generic => None,
+    };
+    let Some(cand) = cand else {
+        return false;
+    };
+    crate::project::is_assignable_to_with_index(
+        &project.index,
+        project.well_known(),
+        project.decl_registry(),
+        arena,
+        cand,
+        expected,
+    )
+}
+
+/// `true` when the nearest non-word, non-whitespace char before the
+/// cursor (scanning back within `body`) is `:` — i.e. the cursor sits in
+/// a field *value*. Handles the recovery shape where an incomplete
+/// `Foo { a: | }` parses as `object_initializers` + an `ERROR` colon.
+fn object_cursor_after_colon(text: &str, body: tree_sitter::Node<'_>, cursor_byte: usize) -> bool {
+    let bytes = text.as_bytes();
+    let start = body.byte_range().start;
+    let mut i = cursor_byte.min(bytes.len());
+    while i > start {
+        let b = bytes[i - 1];
+        if b == b' '
+            || b == b'\t'
+            || b == b'\n'
+            || b == b'\r'
+            || b.is_ascii_alphanumeric()
+            || b == b'_'
+        {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    i > start && bytes[i - 1] == b':'
 }
 
 // P15.4
@@ -208,8 +642,8 @@ fn include_dir_completion(
     //   "src/"         -> base = project_root/src, prefix = ""
     //   "src/util"     -> base = project_root/src, prefix = "util"
     let (rel_dir, prefix) = match typed.rsplit_once('/') {
-        Some((dir, name)) => (dir.to_string(), name.to_string()),
-        None => (String::new(), typed.clone()),
+        Some((dir, name)) => (dir, name),
+        None => ("", typed),
     };
     let mut base = project_root.to_path_buf();
     if !rel_dir.is_empty() {
@@ -293,21 +727,21 @@ fn ancestor_with_kind<'a>(
 /// Read the text inside a `string` node from its opening quote up to
 /// `cursor_byte`. Used for prefix-matching against the typed text
 /// before the cursor.
-fn string_prefix_at_cursor(
-    text: &str,
+fn string_prefix_at_cursor<'a>(
+    text: &'a str,
     string_node: tree_sitter::Node<'_>,
     cursor_byte: usize,
-) -> String {
+) -> &'a str {
     let r = string_node.byte_range();
     let raw = text.get(r.clone()).unwrap_or("");
     // Strip the leading quote(s).
     let opener_len = if raw.starts_with('"') { 1 } else { 0 };
     let content_start = r.start + opener_len;
     if cursor_byte <= content_start {
-        return String::new();
+        return "";
     }
     let upto = cursor_byte.min(r.end);
-    text.get(content_start..upto).unwrap_or("").to_string()
+    text.get(content_start..upto).unwrap_or("")
 }
 
 // =============================================================================
@@ -378,7 +812,7 @@ fn library_version_completion(
     if args.len() < 2 || args[1].id() != string_node.id() {
         return None;
     }
-    let lib_name = string_inner_text(text, args[0])?.to_string();
+    let lib_name = string_inner_text(text, args[0])?;
 
     // Inner-content range (between the quotes). Used as both the
     // resolver's `textEdit` target and as the channel-filter source
@@ -400,8 +834,8 @@ fn library_version_completion(
     let range = Range::from_byte_range(text, &(inner_start..inner_end), encoding);
     let placeholder = LibVersionPlaceholder {
         kind: LIB_VERSION_PLACEHOLDER_KIND.into(),
-        lib: lib_name.clone(),
-        typed,
+        lib: lib_name.to_string(),
+        typed: typed.to_string(),
         range,
     };
     let item = CompletionItem {
@@ -442,8 +876,8 @@ pub fn extract_lib_version_placeholder(list: &CompletionList) -> Option<LibVersi
         return None;
     }
     Some(LibVersionPayload {
-        lib: p.lib,
-        typed: p.typed,
+        lib: p.lib.into(),
+        typed: p.typed.into(),
         range: p.range,
     })
 }
@@ -476,7 +910,7 @@ pub struct LibVersionPayload {
 /// suffix; `last_modification` keeps the `description` slot.
 pub fn resolve_library_version_completion(
     payload: &LibVersionPayload,
-    fetcher: &dyn greycat_analyzer_core::registry::RegistryFetcher,
+    fetcher: &dyn RegistryFetcher,
 ) -> CompletionList {
     let versions = greycat_analyzer_core::registry::get_lib_versions(&payload.lib, fetcher);
     let preferred = greycat_analyzer_core::registry::prerelease_tag(&payload.typed);
@@ -897,99 +1331,6 @@ fn current_word_around(s: &str, cursor: usize) -> &str {
 // P15.2.2 — keyword completion at statement / expression positions
 // =============================================================================
 
-/// Emit keyword completion items when the cursor sits at a statement
-/// or expression position (not after `.` / `->` / `::` / `@`, not
-/// inside a string / comment / type-ident / annotation). Filters by
-/// the alphabetic prefix the user has already typed.
-///
-/// Type-position only emits the type keywords (`null` / type names);
-/// since dedicated type completion hasn't landed yet, we
-/// just bail when the cursor sits inside a `type_ident` so we don't
-/// pollute that slot with statement keywords.
-#[allow(dead_code)] // kept for the future plain-keyword completion path; callers were removed with the single-file shims.
-fn keyword_completion(
-    text: &str,
-    node: tree_sitter::Node<'_>,
-    cursor_byte: usize,
-) -> Option<Vec<CompletionItem>> {
-    if !is_keyword_position(text, node, cursor_byte) {
-        return None;
-    }
-    let typed = ident_prefix_at_cursor(text, cursor_byte);
-    let prefix_lower = typed.to_lowercase();
-    let mut items: Vec<CompletionItem> = ALL_KEYWORDS
-        .iter()
-        .filter(|kw| prefix_lower.is_empty() || kw.starts_with(&prefix_lower))
-        .map(|kw| CompletionItem {
-            label: (*kw).into(),
-            kind: Some(CompletionItemKind::Keyword),
-            insert_text: Some((*kw).into()),
-            ..Default::default()
-        })
-        .collect();
-    if items.is_empty() {
-        return None;
-    }
-    items.sort_by(|a, b| a.label.cmp(&b.label));
-    Some(items)
-}
-
-/// `true` when the cursor is at a position where bare keywords make
-/// sense — i.e. not in a member/static/ref-access RHS, not inside an
-/// annotation (pragma completion handles that), not inside a string /
-/// comment, and not in a type-ident slot.
-fn is_keyword_position(text: &str, node: tree_sitter::Node<'_>, cursor_byte: usize) -> bool {
-    // `${...}` interpolation: the cursor lives inside a real expression
-    // slot nested in a `string`. Completion has to fire there same as
-    // any other expression context, so allow when `string_substitution`
-    // is an ancestor (cheap to check: the substitution wraps the expr
-    // but is itself a child of `string`).
-    let in_substitution = ancestor_with_kind(node, "string_substitution").is_some();
-    // Skip strings, comments, doc-comments. These ancestors short-
-    // circuit completely — completion has no business firing inside
-    // them at this layer.
-    for kind in [
-        "string",
-        "_string_fragment",
-        "line_comment",
-        "_block_comment",
-        "doc_comment",
-    ] {
-        if ancestor_with_kind(node, kind).is_some() && !(kind == "string" && in_substitution) {
-            return false;
-        }
-    }
-    // Annotation context is owned by `pragma_completion` (P15.2.1).
-    if ancestor_with_kind(node, "annotation").is_some() {
-        return false;
-    }
-    // Type-position is owned by P15.2.6 — defer instead of polluting.
-    if ancestor_with_kind(node, "type_ident").is_some() {
-        return false;
-    }
-    // Walk back from cursor over the typed prefix and inspect the
-    // separator byte. `.` / `:` / `>` / `@` mean we're on the RHS of
-    // a member / static / ref / annotation chain.
-    let bytes = text.as_bytes();
-    let cap = cursor_byte.min(bytes.len());
-    let mut i = cap;
-    while i > 0 {
-        let b = bytes[i - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' {
-            i -= 1;
-        } else {
-            break;
-        }
-    }
-    if i > 0 {
-        let sep = bytes[i - 1];
-        if matches!(sep, b'.' | b':' | b'>' | b'@') {
-            return false;
-        }
-    }
-    true
-}
-
 /// Walk back from `cursor_byte` over `[A-Za-z0-9_]*` and return the
 /// typed run as an owned string. Used to prefix-filter keyword and
 /// (later) ident completion.
@@ -1154,16 +1495,13 @@ const ALL_KEYWORDS: &[&str] = &[
 /// `Environment::suggest` (`packages/lang/src/analysis/environment.ts`)
 /// — the per-suggestion `kind` is derived from each name's
 /// `Definition` shape.
-fn ident_or_keyword_completion(
+fn expr_completion(
     text: &str,
-    node: tree_sitter::Node<'_>,
     cursor_byte: usize,
     uri: &Uri,
     project: &ProjectAnalysis,
+    expected: Option<TypeId>,
 ) -> Option<Vec<CompletionItem>> {
-    if !is_keyword_position(text, node, cursor_byte) {
-        return None;
-    }
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
     let mut seen: FxHashSet<String> = FxHashSet::default();
@@ -1188,6 +1526,13 @@ fn ident_or_keyword_completion(
 
     // Scope-visible names — this module's HIR walked top-to-cursor.
     if let Some(module) = project.module(uri) {
+        // Type-aware ranking: a candidate variable whose type is
+        // assignable to the slot's expected type sorts above everything
+        // (tier `0_`). Non-destructive — non-matching candidates keep
+        // their normal tier, so nothing is hidden. Uses a throwaway
+        // arena clone (the shared arena stays immutable on this read
+        // path); only allocated when an expected type is present.
+        let mut rank_arena = expected.map(|_| project.arena().clone());
         let names = scope_names_at(&module.hir, project.symbols(), cursor_byte);
         for (name, kind, sort_pri, source) in names {
             if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
@@ -1204,12 +1549,18 @@ fn ident_or_keyword_completion(
                 &source,
                 uri,
             );
+            let mut sort_text = sort_pri.to_string();
+            if let (Some(exp), Some(arena)) = (expected, rank_arena.as_mut())
+                && type_matches_expected(project, arena, module, &source, exp)
+            {
+                sort_text = format!("0_{name}");
+            }
             items.push(CompletionItem {
                 label: name.clone(),
                 label_details,
                 kind: Some(kind),
                 insert_text: Some(name),
-                sort_text: Some(sort_pri.to_string()),
+                sort_text: Some(sort_text),
                 detail,
                 documentation,
                 ..Default::default()
@@ -1311,6 +1662,20 @@ fn ident_or_keyword_completion(
     Some(items)
 }
 
+/// Whether a FUNCTION / METHOD item's rendered signature has an empty
+/// parameter list. The compact signature always opens with the param
+/// list (`(a: int): R` / `(): R` / `()`), so empty params ⟺ it starts
+/// with `()`. Items carrying no signature (e.g. runtime value globals)
+/// answer `false`, keeping the cursor-in-parens default.
+fn signature_has_no_params(item: &CompletionItem) -> bool {
+    let sig = item.detail.as_deref().or_else(|| {
+        item.label_details
+            .as_ref()
+            .and_then(|d| d.detail.as_deref())
+    });
+    matches!(sig.map(str::trim_start), Some(s) if s.starts_with("()"))
+}
+
 /// Post-process completion items so the LSP edit honors what the user
 /// already typed:
 ///
@@ -1325,12 +1690,15 @@ fn ident_or_keyword_completion(
 ///    correct.
 ///
 /// 2. **Call-parens** — for FUNCTION / METHOD items whose `(...)` isn't
-///    already present immediately after the identifier, append `($0)`
-///    and switch to `InsertTextFormat::Snippet` so the cursor lands
-///    between the parens. The "parens already there" check probes the
-///    byte right after `ident_end`, *not* the cursor — so on
+///    already present immediately after the identifier, append the call
+///    parens. A fn *with* parameters gets a `($0)` tabstop
+///    (`InsertTextFormat::Snippet`) so the cursor lands between the
+///    parens ready for the first argument; a *parameterless* fn gets a
+///    bare `()` (plain text) so the cursor lands after the closing paren
+///    — there's nothing to type inside. The "parens already there" check
+///    probes the byte right after `ident_end`, *not* the cursor — so on
 ///    `x.|chars()` (cursor before `chars`, parens after `chars`) the
-///    snippet is suppressed because the user already opened the call.
+///    rewrite is suppressed because the user already opened the call.
 ///
 /// Skips items already carrying a `SNIPPET` body (e.g. pragma
 /// templates like `@library("$1", "$2")`) for the call-paren rewrite,
@@ -1364,16 +1732,23 @@ fn apply_call_paren_snippet(
             )
             && !matches!(item.insert_text_format, Some(InsertTextFormat::Snippet))
         {
+            // Parameterless fns get a bare `()` (cursor after the call);
+            // fns with params get a `($0)` tabstop between the parens.
+            let (suffix, fmt) = if signature_has_no_params(item) {
+                ("()", InsertTextFormat::PlainText)
+            } else {
+                ("($0)", InsertTextFormat::Snippet)
+            };
             if let Some(te) = item.text_edit.as_mut() {
-                te.new_text = format!("{}($0)", te.new_text);
+                te.new_text = format!("{}{suffix}", te.new_text);
             } else {
                 let base = item
                     .insert_text
                     .clone()
                     .unwrap_or_else(|| item.label.clone());
-                item.insert_text = Some(format!("{base}($0)"));
+                item.insert_text = Some(format!("{base}{suffix}"));
             }
-            item.insert_text_format = Some(InsertTextFormat::Snippet);
+            item.insert_text_format = Some(fmt);
         }
 
         // 2) When the cursor is mid-identifier, lift `insert_text` into
@@ -2547,10 +2922,41 @@ fn static_receiver_at(text: &str, cursor_byte: usize) -> Option<StaticRecvCtx> {
 
 /// Shared receiver walk-back used by both static-completion modes
 /// (ident property and string property). Walks left from `sep_start`
-/// over `[A-Za-z0-9_]` chars and slices the receiver text. Returns
-/// `None` when no receiver run is present.
+/// over `[A-Za-z0-9_]` chars and slices the receiver text. A
+/// generic-instantiated receiver (`Foo<int>::bar`, `Map<K, V>::x`)
+/// carries a balanced `<…>` suffix before the `::`; that group is
+/// skipped so the receiver resolves to its base name (`Foo` / `Map`) —
+/// static dispatch is on the generic decl, not the instantiation.
+/// Returns `None` when no receiver run is present or the angle group is
+/// unbalanced / spans a line.
 fn walk_back_receiver(bytes: &[u8], sep_start: usize, text: &str) -> Option<String> {
-    let mut i = sep_start;
+    let mut ident_end = sep_start;
+    if ident_end > 0 && bytes[ident_end - 1] == b'>' {
+        let mut depth = 0usize;
+        let mut k = ident_end;
+        loop {
+            if k == 0 {
+                return None; // no matching `<`
+            }
+            let c = bytes[k - 1];
+            if c == b'\n' {
+                return None; // angle group spans a line — bail
+            }
+            k -= 1;
+            match c {
+                b'>' => depth += 1,
+                b'<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        ident_end = k; // index of the matching `<`; the ident ends here
+    }
+    let mut i = ident_end;
     while i > 0 {
         let b = bytes[i - 1];
         if b.is_ascii_alphanumeric() || b == b'_' {
@@ -2559,10 +2965,10 @@ fn walk_back_receiver(bytes: &[u8], sep_start: usize, text: &str) -> Option<Stri
             break;
         }
     }
-    if i == sep_start {
+    if i == ident_end {
         return None;
     }
-    text.get(i..sep_start).map(str::to_string)
+    text.get(i..ident_end).map(str::to_string)
 }
 
 // =============================================================================
@@ -2680,33 +3086,28 @@ fn type_position_completion(
     Some(items)
 }
 
-// =============================================================================
-// P15.2.7 — object literal field completion
-// =============================================================================
-
-/// Object-literal field completion: cursor sits inside an
-/// `object_initializers` / `object_fields` body (`Type { | }` or
-/// `Type { x: 1, | }`). Resolves the surrounding `object_expr`'s
-/// `type_ident` head, walks the local supertype chain, and emits
-/// each non-static `FIELD` not already named in the literal.
-fn object_field_completion(
+/// Emit object-literal field names for the literal whose body is
+/// `body` (an `object_initializers` / `object_fields` node, supplied by
+/// the slot classifier). Resolves the surrounding `object_expr`'s
+/// `type_ident` head, walks the local supertype chain, and emits each
+/// non-static `FIELD` not already named in the literal. Returns `None`
+/// when the head doesn't resolve to a type with attrs (a collection /
+/// tuple / unknown head) — the caller then falls back to positional
+/// expression completion.
+fn emit_object_field_names(
     text: &str,
-    node: tree_sitter::Node<'_>,
+    body: tree_sitter::Node<'_>,
     cursor_byte: usize,
     uri: &Uri,
     project: &crate::project::ProjectAnalysis,
 ) -> Option<Vec<CompletionItem>> {
-    // Walk up to find the enclosing `object_initializers` /
-    // `object_fields` block. `object_field` walks one extra level.
-    let body = ancestor_with_kind(node, "object_initializers")
-        .or_else(|| ancestor_with_kind(node, "object_fields"))?;
     let object_expr = ancestor_with_kind(body, "object_expr")?;
-    let type_ident = children_by_field_name(object_expr, "type")?;
+    let type_ident = object_expr.child_by_field_name("type")?;
     let type_name_node = type_ident.named_child(0)?;
     if type_name_node.kind() != "ident" {
         return None;
     }
-    let type_name = text.get(type_name_node.byte_range())?.to_string();
+    let type_name = text.get(type_name_node.byte_range())?;
 
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
@@ -2739,9 +3140,17 @@ fn object_field_completion(
         );
     };
 
-    if let Some(type_sym) = project.symbols().lookup(type_name.as_str())
+    // Whether the head resolved to a named-attr type at all. Kept
+    // distinct from `items` being empty: a resolved type with every
+    // field already supplied returns `Some(vec![])` (no completion,
+    // no leak), whereas an unresolved head returns `None` so the caller
+    // falls back to positional expression completion (collections, etc).
+    let mut resolved = false;
+
+    if let Some(type_sym) = project.symbols().lookup(type_name)
         && let Some(decl_id) = module.analysis.type_decls.get(&type_sym).copied()
     {
+        resolved = true;
         // Walk Sub → Super (local chain) just like the analyzer's
         // required-attr check.
         let mut hops = 0usize;
@@ -2767,8 +3176,8 @@ fn object_field_completion(
             cursor_decl = module.analysis.type_decls.get(&sup_name_sym).copied();
         }
     }
-    if items.is_empty()
-        && let Some(type_sym) = project.symbols().lookup(type_name.as_str())
+    if !resolved
+        && let Some(type_sym) = project.symbols().lookup(type_name)
         && let Some((foreign_uri, foreign_decl_id)) = project
             .index
             .locate_decl_in_ns(type_sym, crate::stdlib::Namespace::Type)
@@ -2776,9 +3185,12 @@ fn object_field_completion(
         && let Some(fmod) = project.module(foreign_uri)
         && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
     {
+        resolved = true;
         visit_type_decl(&fmod.hir, td, &mut items, &mut emitted);
     }
-    if items.is_empty() {
+    // Unresolved head (collection / tuple / unknown) — let the caller
+    // do positional expression completion instead.
+    if !resolved {
         return None;
     }
     items.sort_by(|a, b| a.label.cmp(&b.label));
@@ -2861,13 +3273,4 @@ fn emit_attrs(
             ..Default::default()
         });
     }
-}
-
-/// Helper mirroring `tree_sitter::Node::child_by_field_name` that
-/// returns an `Option`.
-fn children_by_field_name<'a>(
-    node: tree_sitter::Node<'a>,
-    field: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    node.child_by_field_name(field)
 }

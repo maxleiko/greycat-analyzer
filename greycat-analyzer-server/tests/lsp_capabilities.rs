@@ -1493,6 +1493,203 @@ fn completion_inside_object_literal_walks_supertype_chain() {
     );
 }
 
+/// Object-literal field *value* slot (`Foo { x: | }`) is an expression
+/// position — it lists scope names, NOT the type's field names. The
+/// slot classifier distinguishes the name slot (before `:`) from the
+/// value slot (after `:`) within the same literal.
+#[test]
+fn completion_in_object_field_value_is_expr_not_field_names() {
+    let src = "type Point { x: int; y: int; }\n\
+               fn main() { var seed = 0; var _ = Point { x:  }; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor right after `x: ` in the *object literal* (anchor on the
+    // `= Point {` so we don't match the type decl's `x: int` on line 0).
+    let cursor = support::position_after(src, "= Point { x: ", "");
+    let list = project
+        .completion(cursor)
+        .expect("expected expression completion in field value slot");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.contains(&"seed"),
+        "value slot should offer scope names like `seed`: {labels:?}"
+    );
+    // The sibling field name `y` must NOT appear — that's name-slot only.
+    assert!(
+        !labels.contains(&"y"),
+        "field name `y` leaked into a value slot: {labels:?}"
+    );
+}
+
+/// A complete named-attr literal (every field supplied) offers nothing
+/// in a trailing name slot — it must NOT fall back to the full scope
+/// dump. Regression for the allowlist guarantee.
+#[test]
+fn completion_in_complete_object_literal_is_empty() {
+    let src = "type Point { x: int; y: int; }\n\
+               fn main() { var _ = Point { x: 1, y: 2, }; }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor after the trailing comma, before `}` — a name slot with no
+    // fields left to fill.
+    let cursor = support::position_after(src, "x: 1, y: 2, ", "");
+    let labels: Vec<String> = project
+        .completion(cursor)
+        .map(|l| l.items.into_iter().map(|i| i.label).collect())
+        .unwrap_or_default();
+    assert!(
+        labels.is_empty(),
+        "complete literal should offer nothing (no scope leak), got {labels:?}"
+    );
+}
+
+/// A declaration-name slot (the function name being defined) must
+/// suppress completion entirely — the user is binding a new identifier,
+/// not referencing one. Regression for the fn-name false positive.
+#[test]
+fn completion_on_fn_decl_name_is_suppressed() {
+    let src = "fn compute() {}\nfn main() {}\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor in the middle of the declared name `compute`.
+    let cursor = support::position_after(src, "fn comp", "");
+    assert!(
+        project.completion(cursor).is_none(),
+        "completion must be suppressed in a fn-decl name slot"
+    );
+}
+
+/// A parameter-name slot is also a declaration position — suppressed.
+#[test]
+fn completion_on_fn_param_name_is_suppressed() {
+    let src = "fn f(count: int) {}\nfn main() {}\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor in the middle of the param name `count`.
+    let cursor = support::position_after(src, "fn f(cou", "");
+    assert!(
+        project.completion(cursor).is_none(),
+        "completion must be suppressed in a fn-param name slot"
+    );
+}
+
+/// Suppression must also hold at the *trailing edge* of the name, not
+/// just mid-name. `var s` parses as `var_decl name:(ident s)`, but at
+/// the end of `s` the ident's half-open byte range ends at the cursor,
+/// so `node_at_offset` lands on the `var_decl`; the classifier backs up
+/// into the typed identifier so the `name` field still suppresses.
+#[test]
+fn completion_at_end_of_var_name_is_suppressed() {
+    let src = "fn main() {\n    var s\n}\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    let cursor = support::position_after(src, "var s", "");
+    assert!(
+        project.completion(cursor).is_none(),
+        "completion must be suppressed at the trailing edge of a var-decl name"
+    );
+}
+
+/// P2 — type-aware ranking: a call argument's expected type (the
+/// callee's param type) boosts type-compatible scope candidates above
+/// the rest via `sort_text`, without hiding anything (rank, not filter).
+#[test]
+fn completion_in_call_arg_ranks_type_compatible_first() {
+    let src = "fn add(a: int, b: int): int { return a + b; }\n\
+               fn main(): int {\n\
+               var n = 0;\n\
+               var s = \"x\";\n\
+               return add();\n\
+               }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor inside `add(|)` — first arg, expected type `int`.
+    let cursor = support::position_after(src, "return add(", "");
+    let list = project.completion(cursor).expect("completion in call arg");
+    let sort = |label: &str| {
+        list.items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.sort_text.clone())
+    };
+    let (n_sort, s_sort) = (sort("n"), sort("s"));
+    // Both still present (rank, not filter).
+    assert!(
+        n_sort.is_some() && s_sort.is_some(),
+        "both candidates present"
+    );
+    // `n: int` matches the `int` param and must outrank `s: String`.
+    assert!(
+        n_sort < s_sort,
+        "int `n` ({n_sort:?}) should rank before String `s` ({s_sort:?})"
+    );
+    assert!(
+        n_sort.as_deref().is_some_and(|s| s.starts_with("0_")),
+        "type-compatible candidate should get the tier-0 sort key, got {n_sort:?}"
+    );
+}
+
+/// P2 — type-aware ranking also fires at an object-literal field value
+/// slot, using the attr's declared type as the expected type. The field
+/// carries a value (`v: 0`) so it parses as a real `object_field` (the
+/// binding the attr-type lookup needs); the cursor sits just before it.
+#[test]
+fn completion_in_object_field_value_ranks_attr_type_first() {
+    let src = "type Box { v: int; }\n\
+               fn main() {\n\
+               var n = 0;\n\
+               var s = \"x\";\n\
+               var _ = Box { v: 0 };\n\
+               }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor after `v: ` (before the `0`) in the object literal.
+    let cursor = support::position_after(src, "= Box { v: ", "");
+    let list = project
+        .completion(cursor)
+        .expect("completion in field value");
+    let sort = |label: &str| {
+        list.items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.sort_text.clone())
+    };
+    let (n_sort, s_sort) = (sort("n"), sort("s"));
+    assert!(
+        n_sort.is_some() && s_sort.is_some(),
+        "both candidates present"
+    );
+    assert!(
+        n_sort < s_sort,
+        "int `n` ({n_sort:?}) should outrank String `s` ({s_sort:?}) for an `int` attr"
+    );
+}
+
+/// P2 — type-aware ranking at a typed binding's initializer slot uses
+/// the declared type as the expected type.
+#[test]
+fn completion_in_typed_initializer_ranks_declared_type_first() {
+    let src = "fn main() {\n\
+               var n = 0;\n\
+               var s = \"x\";\n\
+               var t: int = 0;\n\
+               }\n";
+    let project = TestProject::single_file_at("/test.gcl", src);
+    // Cursor after `var t: int = ` (before the `0`).
+    let cursor = support::position_after(src, "var t: int = ", "");
+    let list = project
+        .completion(cursor)
+        .expect("completion in initializer");
+    let sort = |label: &str| {
+        list.items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.sort_text.clone())
+    };
+    let (n_sort, s_sort) = (sort("n"), sort("s"));
+    assert!(
+        n_sort.is_some() && s_sort.is_some(),
+        "both candidates present"
+    );
+    assert!(
+        n_sort < s_sort,
+        "int `n` ({n_sort:?}) should outrank String `s` ({s_sort:?}) for an `int` binding"
+    );
+}
+
 /// P15.2.6 — type-position completion at `var x: |` lists in-module
 /// type decls and runtime types, but not values like fn names.
 #[test]
@@ -1572,6 +1769,50 @@ fn completion_after_double_colon_lists_static_methods() {
     assert!(
         !labels.contains(&"norm"),
         "non-static method leaked: {labels:?}"
+    );
+}
+
+/// A generic-instantiated receiver (`Foo<int>::|`) must still resolve
+/// its static members — static dispatch is on the generic decl, so the
+/// receiver walk-back skips the `<…>` instantiation suffix to reach the
+/// base name `Foo`. Regression: the `>` stopped the walk and static
+/// completion returned nothing.
+#[test]
+fn completion_after_double_colon_on_generic_receiver_lists_static_methods() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Foo<T> { val: T?; static fn bar(): String { return \"a\"; } static fn baz(): int { return 42; } }\nfn main() { println(Foo<int>::); }\n",
+        "p",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `Foo<int>::`.
+    let off = doc.text.find("Foo<int>::").unwrap() + "Foo<int>::".len();
+    let line = doc.text[..off].matches('\n').count() as u32;
+    let col = (off - doc.text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(line, col),
+        &user_uri,
+        &pa,
+        None,
+        ENC,
+    )
+    .expect("static completion on a generic receiver");
+    let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"bar"), "static `bar` missing: {labels:?}");
+    assert!(labels.contains(&"baz"), "static `baz` missing: {labels:?}");
+    // Instance attr `val` is not a static member.
+    assert!(
+        !labels.contains(&"val"),
+        "instance attr leaked into static list: {labels:?}"
     );
 }
 
@@ -3331,6 +3572,99 @@ fn completion_function_item_appends_call_parens() {
         helper.insert_text_format,
         Some(InsertTextFormat::SNIPPET),
         "expected SNIPPET insert_text_format so the editor honors `$0`"
+    );
+}
+
+/// A parameterless fn gets a bare `()` (cursor after the call), not the
+/// `($0)` tabstop — there's nothing to type between the parens.
+#[test]
+fn completion_parameterless_function_appends_bare_parens() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "fn helper(): int { return 0; }\nfn main() {\n  h\n}\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(2, 3),
+        &user_uri,
+        &pa,
+        None,
+        ENC,
+    )
+    .expect("completion list");
+    let helper = list
+        .items
+        .iter()
+        .find(|i| i.label == "helper")
+        .expect("`helper` should appear");
+    assert_eq!(
+        helper.insert_text.as_deref(),
+        Some("helper()"),
+        "parameterless fn should get a bare `()`; got {:?}",
+        helper.insert_text
+    );
+    assert_ne!(
+        helper.insert_text_format,
+        Some(InsertTextFormat::SNIPPET),
+        "parameterless fn must not be a snippet — no tabstop to honor"
+    );
+}
+
+/// Same rule for a parameterless *method* reached through `recv.|`.
+#[test]
+fn completion_parameterless_method_appends_bare_parens() {
+    use greycat_analyzer_analysis::project::ProjectAnalysis;
+    use greycat_analyzer_core::SourceManager;
+    let user_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
+    let mut mgr = SourceManager::new();
+    mgr.add_simple(
+        user_uri.clone(),
+        "type Svc { fn ping(): int { return 0; } }\nfn main() { var s = Svc {}; s. }\n",
+        "project",
+        false,
+    );
+    let pa = ProjectAnalysis::analyze(&mgr);
+    let cell = mgr.get(&user_uri).unwrap();
+    let doc = cell.borrow();
+    // Cursor right after `s.`.
+    let off = doc.text.find("s. ").unwrap() + 2;
+    let line = doc.text[..off].matches('\n').count() as u32;
+    let col = (off - doc.text[..off].rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    let list = capabilities::completion_with_project(
+        &doc.text,
+        doc.root_node(),
+        pos(line, col),
+        &user_uri,
+        &pa,
+        None,
+        ENC,
+    )
+    .expect("completion list");
+    let ping = list
+        .items
+        .iter()
+        .find(|i| i.label == "ping")
+        .expect("`ping` method should appear");
+    assert_eq!(
+        ping.insert_text.as_deref(),
+        Some("ping()"),
+        "parameterless method should get a bare `()`; got {:?}",
+        ping.insert_text
+    );
+    assert_ne!(
+        ping.insert_text_format,
+        Some(InsertTextFormat::SNIPPET),
+        "parameterless method must not be a snippet"
     );
 }
 
