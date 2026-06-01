@@ -6,6 +6,7 @@
 //! converts to `lsp_types::CompletionItem` at the wire boundary and the
 //! wasm bridge consumes the same shape unchanged.
 
+use greycat_analyzer_core::registry::RegistryFetcher;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -641,8 +642,8 @@ fn include_dir_completion(
     //   "src/"         -> base = project_root/src, prefix = ""
     //   "src/util"     -> base = project_root/src, prefix = "util"
     let (rel_dir, prefix) = match typed.rsplit_once('/') {
-        Some((dir, name)) => (dir.to_string(), name.to_string()),
-        None => (String::new(), typed.clone()),
+        Some((dir, name)) => (dir, name),
+        None => ("", typed),
     };
     let mut base = project_root.to_path_buf();
     if !rel_dir.is_empty() {
@@ -726,21 +727,21 @@ fn ancestor_with_kind<'a>(
 /// Read the text inside a `string` node from its opening quote up to
 /// `cursor_byte`. Used for prefix-matching against the typed text
 /// before the cursor.
-fn string_prefix_at_cursor(
-    text: &str,
+fn string_prefix_at_cursor<'a>(
+    text: &'a str,
     string_node: tree_sitter::Node<'_>,
     cursor_byte: usize,
-) -> String {
+) -> &'a str {
     let r = string_node.byte_range();
     let raw = text.get(r.clone()).unwrap_or("");
     // Strip the leading quote(s).
     let opener_len = if raw.starts_with('"') { 1 } else { 0 };
     let content_start = r.start + opener_len;
     if cursor_byte <= content_start {
-        return String::new();
+        return "";
     }
     let upto = cursor_byte.min(r.end);
-    text.get(content_start..upto).unwrap_or("").to_string()
+    text.get(content_start..upto).unwrap_or("")
 }
 
 // =============================================================================
@@ -811,7 +812,7 @@ fn library_version_completion(
     if args.len() < 2 || args[1].id() != string_node.id() {
         return None;
     }
-    let lib_name = string_inner_text(text, args[0])?.to_string();
+    let lib_name = string_inner_text(text, args[0])?;
 
     // Inner-content range (between the quotes). Used as both the
     // resolver's `textEdit` target and as the channel-filter source
@@ -833,8 +834,8 @@ fn library_version_completion(
     let range = Range::from_byte_range(text, &(inner_start..inner_end), encoding);
     let placeholder = LibVersionPlaceholder {
         kind: LIB_VERSION_PLACEHOLDER_KIND.into(),
-        lib: lib_name.clone(),
-        typed,
+        lib: lib_name.to_string(),
+        typed: typed.to_string(),
         range,
     };
     let item = CompletionItem {
@@ -875,8 +876,8 @@ pub fn extract_lib_version_placeholder(list: &CompletionList) -> Option<LibVersi
         return None;
     }
     Some(LibVersionPayload {
-        lib: p.lib,
-        typed: p.typed,
+        lib: p.lib.into(),
+        typed: p.typed.into(),
         range: p.range,
     })
 }
@@ -909,7 +910,7 @@ pub struct LibVersionPayload {
 /// suffix; `last_modification` keeps the `description` slot.
 pub fn resolve_library_version_completion(
     payload: &LibVersionPayload,
-    fetcher: &dyn greycat_analyzer_core::registry::RegistryFetcher,
+    fetcher: &dyn RegistryFetcher,
 ) -> CompletionList {
     let versions = greycat_analyzer_core::registry::get_lib_versions(&payload.lib, fetcher);
     let preferred = greycat_analyzer_core::registry::prerelease_tag(&payload.typed);
@@ -3106,7 +3107,7 @@ fn emit_object_field_names(
     if type_name_node.kind() != "ident" {
         return None;
     }
-    let type_name = text.get(type_name_node.byte_range())?.to_string();
+    let type_name = text.get(type_name_node.byte_range())?;
 
     let typed = ident_prefix_at_cursor(text, cursor_byte);
     let prefix_lower = typed.to_lowercase();
@@ -3146,7 +3147,7 @@ fn emit_object_field_names(
     // falls back to positional expression completion (collections, etc).
     let mut resolved = false;
 
-    if let Some(type_sym) = project.symbols().lookup(type_name.as_str())
+    if let Some(type_sym) = project.symbols().lookup(type_name)
         && let Some(decl_id) = module.analysis.type_decls.get(&type_sym).copied()
     {
         resolved = true;
@@ -3176,7 +3177,7 @@ fn emit_object_field_names(
         }
     }
     if !resolved
-        && let Some(type_sym) = project.symbols().lookup(type_name.as_str())
+        && let Some(type_sym) = project.symbols().lookup(type_name)
         && let Some((foreign_uri, foreign_decl_id)) = project
             .index
             .locate_decl_in_ns(type_sym, crate::stdlib::Namespace::Type)

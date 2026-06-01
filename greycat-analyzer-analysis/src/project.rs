@@ -3784,10 +3784,7 @@ fn collect_static_type_args_diags(
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
             code: "static-type-args",
-            message: "generic type arguments are not allowed on a static access — \
-                      a static call does not instantiate a parameterized type, so the \
-                      type arguments are meaningless. Remove them."
-                .to_string(),
+            message: "generic type arguments are not allowed on a static access".to_string(),
             byte_range: name_end..close,
             category: DiagCategory::TypeRelation,
         });

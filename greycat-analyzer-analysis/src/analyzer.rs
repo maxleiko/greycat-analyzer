@@ -572,10 +572,7 @@ pub fn analyze_with_index_into(
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             "generic-in-static-context",
-            format!(
-                "generic type parameter `{pname}` cannot be used in a `static` method — \
-                 a static carries no instance, so `{pname}` is unbound"
-            ),
+            format!("generic type parameter `{pname}` cannot be used in a `static` method"),
             tr.byte_range.clone(),
         ));
     }
@@ -662,7 +659,7 @@ pub fn analyze_with_index_into(
             Severity::Error,
             "ambiguous-symbol",
             format!(
-                "ambiguous-symbol: `{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
+                "`{name}` is exported by {} modules ({}); use a fully-qualified name like `{}::{name}`",
                 module_names.len(),
                 module_names.join(", "),
                 module_names.first().copied().unwrap_or("<module>"),
