@@ -692,27 +692,29 @@ pub fn analyze_with_index_into(
         ));
     }
 
-    // Reject `type Foo<A, B, C> {}` / `fn f<A, B, C>(...)` — the
-    // GreyCat runtime supports at most 2 generic parameters
-    // (`Map<K, V>` is the widest). The grammar accepts any arity (the
-    // `type_params` rule is `sepBy1(",", ident)`), so this is the
-    // analyzer's job. Point the diagnostic at the first over-limit
-    // generic so quick-fix tooling can target it precisely.
-    const MAX_GENERICS: usize = 2;
+    // Reject more generic parameters than the GreyCat runtime accepts.
+    // A function takes exactly one (`fn f<T>`); two+ is a runtime
+    // *syntax error*. A type takes two (`type Map<K, V>` is the widest).
+    // The grammar accepts any arity (the `type_params` rule is
+    // `sepBy1(",", ident)`), so enforcing the ceiling is the analyzer's
+    // job. Point the diagnostic at the first over-limit generic so
+    // quick-fix tooling can target it precisely.
+    const MAX_FN_GENERICS: usize = 1;
+    const MAX_TYPE_GENERICS: usize = 2;
     for d in &module.decls {
-        let (name_ident, generics, kind_label) = match &hir.decls[*d] {
-            Decl::Fn(fnd) => (fnd.name, &*fnd.generics, "function"),
-            Decl::Type(td) => (td.name, &*td.generics, "type"),
+        let (name_ident, generics, kind_label, max) = match &hir.decls[*d] {
+            Decl::Fn(fnd) => (fnd.name, &*fnd.generics, "function", MAX_FN_GENERICS),
+            Decl::Type(td) => (td.name, &*td.generics, "type", MAX_TYPE_GENERICS),
             _ => continue,
         };
-        if generics.len() > MAX_GENERICS {
-            let first_over_limit = generics[MAX_GENERICS];
+        if generics.len() > max {
+            let first_over_limit = generics[max];
             out.diagnostics.push(SemanticDiagnostic::structural(
                 Severity::Error,
                 "too-many-generics",
                 format!(
                     "{kind_label} `{}` has {} generic parameters; \
-                     the GreyCat runtime supports at most {MAX_GENERICS}",
+                     the GreyCat runtime supports at most {max}",
                     &index.symbols[hir.idents[name_ident].symbol],
                     generics.len(),
                 ),

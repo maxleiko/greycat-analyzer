@@ -197,9 +197,11 @@ impl Decl {
 pub struct FnDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    /// Generic type parameters (`fn foo<T, U>(...)`). The grammar
-    /// allows any arity; the analyzer rejects >2 to match the runtime
-    /// (`Map<K, V>` is the widest the runtime supports).
+    /// Generic type parameters (`fn foo<T>(...)`). The grammar allows
+    /// any arity; the analyzer enforces the runtime ceiling — a function
+    /// accepts exactly one generic (two+ is a runtime *syntax error*),
+    /// unlike a type which accepts two (`Map<K, V>`). See the
+    /// `too-many-generics` check in the analyzer.
     pub generics: Box<[Idx<Ident>]>,
     pub params: Box<[Idx<FnParam>]>,
     pub return_type: Option<Idx<TypeRef>>,
