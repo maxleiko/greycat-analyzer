@@ -84,6 +84,12 @@ strip = true
 lto = "fat"
 opt-level = 3
 
+[profile.release-fast]
+inherits = "release"
+strip = false
+lto = false
+opt-level = 1
+
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
