@@ -774,8 +774,8 @@ fn build_modifiers<'a>(
 }
 
 fn render_arg(symbols: &SymbolTable, arg: &greycat_analyzer_hir::types::AnnotationArg) -> String {
-    use greycat_analyzer_hir::types::AnnotationArg as A;
-    match arg {
+    use greycat_analyzer_hir::types::AnnotationArgKind as A;
+    match &arg.kind {
         A::Int(v) => v.to_string(),
         A::Float(v) => v.to_string(),
         A::Bool(b) => b.to_string(),
@@ -784,12 +784,12 @@ fn render_arg(symbols: &SymbolTable, arg: &greycat_analyzer_hir::types::Annotati
         A::Duration(v) => format!("{v}us"),
         A::Time(v) | A::Iso8601(v) => format!("{v}time"),
         A::Null => "null".to_string(),
-        A::Path { chain, .. } => chain
+        A::Path { chain } => chain
             .iter()
             .map(|s| symbols[*s].to_string())
             .collect::<Vec<_>>()
             .join("::"),
-        A::Invalid { .. } => "<invalid>".to_string(),
+        A::Invalid => "<invalid>".to_string(),
     }
 }
 

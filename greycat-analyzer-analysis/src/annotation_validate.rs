@@ -6,7 +6,7 @@
 //! that resolve to a type declaration or an enum variant. Anything
 //! else (a call, arithmetic, an array / object literal, an instance
 //! member access on a value, …) is captured as
-//! [`AnnotationArg::Invalid`] at HIR-lower time; Paths that don't
+//! [`AnnotationArgKind::Invalid`] at HIR-lower time; Paths that don't
 //! resolve to a type / enum / variant land here too.
 //!
 //! Both shapes surface as `Severity::Error` `SemanticDiagnostic`s
@@ -21,7 +21,7 @@
 use std::ops::Range;
 
 use greycat_analyzer_hir::Hir;
-use greycat_analyzer_hir::types::{AnnotationArg, Decl, Modifiers};
+use greycat_analyzer_hir::types::{AnnotationArgKind, Decl, Modifiers};
 
 use crate::analyzer::{SemanticDiagnostic, Severity};
 use crate::stdlib::ProjectIndex;
@@ -29,10 +29,10 @@ use crate::stdlib::ProjectIndex;
 /// Walk every decl-attached `modifiers.annotations` in `hir` and
 /// push one [`SemanticDiagnostic`] per non-const argument into
 /// `out`. Two failure modes:
-///   - [`AnnotationArg::Invalid`] — structurally non-const at HIR
+///   - [`AnnotationArgKind::Invalid`] — structurally non-const at HIR
 ///     lower time (calls, arithmetic, array / object literals,
 ///     instance member accesses, etc.).
-///   - [`AnnotationArg::Path`] whose chain doesn't resolve against
+///   - [`AnnotationArgKind::Path`] whose chain doesn't resolve against
 ///     `index` to a type / enum / enum-variant / known decl. The
 ///     chain is checked by `path_resolves`.
 pub fn validate_annotation_args(
@@ -67,13 +67,13 @@ fn push_for_modifiers(
 ) {
     for ann in modifiers.annotations.iter() {
         for arg in ann.args.iter() {
-            let bad_range: Option<Range<usize>> = match arg {
-                AnnotationArg::Invalid { start, end } => Some((*start as usize)..(*end as usize)),
-                AnnotationArg::Path { chain, start, end } => {
+            let bad_range: Option<Range<usize>> = match &arg.kind {
+                AnnotationArgKind::Invalid => Some(arg.span.clone()),
+                AnnotationArgKind::Path { chain } => {
                     if path_resolves(chain, index) {
                         None
                     } else {
-                        Some((*start as usize)..(*end as usize))
+                        Some(arg.span.clone())
                     }
                 }
                 _ => None,
@@ -84,10 +84,7 @@ fn push_for_modifiers(
                     "invalid-pragma-arg",
                     "pragma arguments must be constant primitive values \
                      (string / int / float / bool / char / duration / time / null) \
-                     or path references to a type or enum variant — calls, \
-                     arithmetic, array / object literals, instance member access, \
-                     and unresolved names can't be stored on a pragma at \
-                     compile time"
+                     or path references to a type or enum variant"
                         .to_string(),
                     range,
                 ));

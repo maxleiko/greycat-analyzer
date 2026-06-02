@@ -1,313 +1,223 @@
-//! Project-pragma lint / fmt control.
+//! GreyCat language-pragma contract validation — the framework.
 //!
-//! Walks a module's `mod_pragma > annotation` chain and recognizes
-//! `@lint_off("…", "…")` / `@lint_on("…", "…")` pragmas. Returns the
-//! two sets (off / on) without judging scope — callers decide whether
-//! to merge them into [`ProjectAnalysis`]'s project-wide policy (when
-//! the module is the project entrypoint) or store them per-module.
+//! GreyCat pragmas carry implicit contracts: where each may appear
+//! (a fn, a type attribute, a type, …), how many arguments of what
+//! type, plus semantic rules (a `@permission` usage must name a
+//! permission declared somewhere in the project). Each pragma's contract is a
+//! declarative [`Contract`] validated by one uniform driver.
 //!
-//! Validation diagnostics (`unknown-suppression-rule`,
-//! `empty-suppression`, `conflicting-lint-pragma`) ride alongside the
-//! recognized rule sets in [`LintPragmas::diagnostics`].
+//! This file is the **framework** — the contract vocabulary
+//! ([`Site`] / [`Contract`] / [`SiteRule`] / [`ArgSig`] / [`ArgType`])
+//! plus the [`validate_pragmas`] driver. Each concrete pragma's
+//! contract and semantic hook lives in its own submodule
+//! (`pragmas/permission.rs`, …) and contributes one [`Contract`] to
+//! [`CONTRACTS`].
+//!
+//! This is **not** a configurable lint. Like
+//! [`crate::annotation_validate`]'s `invalid-pragma-arg`, hard
+//! violations surface as [`Severity::Error`] [`SemanticDiagnostic`]s
+//! (non-silenceable — the package gate refuses on them); advisory
+//! findings surface as [`Severity::Warning`].
+//!
+//! Distinct from [`crate::meta_pragmas`], which handles the analyzer's
+//! own `@lint_off` / `@lint_on` directives (CST-based, pre-HIR, lint
+//! policy). Those aren't GreyCat language pragmas — the runtime has
+//! never heard of them. The pragmas validated here are runtime-
+//! meaningful and need the lowered HIR plus the full [`ProjectIndex`].
 
-use greycat_analyzer_syntax::tree_sitter::Node;
-use rustc_hash::FxHashSet;
+mod permission;
 
-use crate::lint::{DiagTag, LintDiagnostic, LintSeverity};
+use greycat_analyzer_hir::Hir;
+use greycat_analyzer_hir::types::{Annotation, AnnotationArgKind, Decl, Modifiers};
 
-/// Rule names declared in `@lint_off("…")` / `@lint_on("…")` pragmas at
-/// module head, plus any validation diagnostics produced while parsing
-/// them (`unknown-suppression-rule`, `empty-suppression`,
-/// `conflicting-lint-pragma`).
-#[derive(Debug, Default, Clone)]
-pub struct LintPragmas {
-    /// Names from `@lint_off("rule", "rule", …)` annotations.
-    pub off: FxHashSet<String>,
-    /// Names from `@lint_on("rule", "rule", …)` annotations.
-    pub on: FxHashSet<String>,
-    /// Diagnostics emitted by the walker itself. Seeded into
-    /// `module.lints` so CLI / LSP surface them alongside regular
-    /// lints — same flow as `Directives::diagnostics`.
-    pub diagnostics: Vec<LintDiagnostic>,
+use crate::analyzer::{SemanticDiagnostic, Severity};
+use crate::stdlib::ProjectIndex;
+
+/// The registry. One entry per known language pragma; each lives in
+/// its own submodule.
+const CONTRACTS: &[Contract] = &[permission::CONTRACT];
+
+fn contract_for(name: &str) -> Option<&'static Contract> {
+    CONTRACTS.iter().find(|c| c.name == name)
 }
 
-/// Walk every top-level `mod_pragma` in `root` and collect rule names
-/// from `@lint_off(...)` / `@lint_on(...)` annotations.
+/// Where a pragma / annotation is attached. Selects which per-site
+/// rule of a [`Contract`] applies.
 ///
-/// `is_entrypoint` controls scope: project-wide lint policy lives only
-/// in `project.gcl`. When `false`, every `@lint_off` / `@lint_on` is
-/// rejected as `lint-pragma-outside-entrypoint` (Warning) with a
-/// quickfix that deletes the offending pragma, and the rules are
-/// **not** added to `off` / `on` (so the caller never applies module-
-/// scope pragmas). When `true`, multiple pragmas of the same kind
-/// union; the walker also emits:
-///
-/// - empty argument list (`@lint_off();`) → `empty-suppression`.
-/// - unknown rule name → `unknown-suppression-rule` on the literal.
-/// - rule named in both `@lint_off` and `@lint_on` in the same
-///   entrypoint → `conflicting-lint-pragma` on the offending pragma
-///   (Warning, no auto-fix — the user has to decide).
-pub fn parse_lint_pragmas(source: &str, root: Node<'_>, is_entrypoint: bool) -> LintPragmas {
-    let mut out = LintPragmas::default();
-    let valid_rules: FxHashSet<&'static str> =
-        crate::lint::LINT_RULES.iter().map(|r| r.name).collect();
-    let mut walker = root.walk();
-    for child in root.named_children(&mut walker) {
-        if child.kind() != "mod_pragma" {
-            continue;
-        }
-        // Remember the pragma's full span — used for the entrypoint-only
-        // quickfix when `is_entrypoint == false`.
-        let pragma_span = child.byte_range();
-        let mut sub = child.walk();
-        for c in child.named_children(&mut sub) {
-            if c.kind() != "annotation" {
-                continue;
-            }
-            let mut ann = c.walk();
-            let mut name: Option<&str> = None;
-            let mut args: Option<Node<'_>> = None;
-            for ac in c.named_children(&mut ann) {
-                match ac.kind() {
-                    "ident" => name = Some(&source[ac.byte_range()]),
-                    "args" => args = Some(ac),
-                    _ => {}
-                }
-            }
-            let (Some(name), Some(args)) = (name, args) else {
-                continue;
-            };
-            let is_off = match name {
-                "lint_off" => true,
-                "lint_on" => false,
-                _ => continue,
-            };
-            // P40.5 — pragma found in a non-entrypoint module. Reject:
-            // emit the new diagnostic, discard the rules, skip the
-            // empty/unknown/conflict validation (those would just stack
-            // on top and confuse the editor).
-            if !is_entrypoint {
-                out.diagnostics.push(LintDiagnostic {
-                    rule: "lint-pragma-outside-entrypoint",
-                    severity: LintSeverity::Warning,
-                    message: format!(
-                        "`@{name}` may only appear in the project's entrypoint (`project.gcl`) so \
-                         lint policy lives in one place — move this pragma there (or delete it)"
-                    ),
-                    byte_range: pragma_span.clone(),
-                    tag: None,
-                });
-                continue;
-            }
-            // Collect (rule_name, source_range_of_arg) so we can flag
-            // unknown names with precise spans.
-            let mut harvested: Vec<(String, std::ops::Range<usize>)> = Vec::new();
-            for (rule, range) in string_args_with_ranges(source, args) {
-                harvested.push((rule, range));
-            }
-            if harvested.is_empty() {
-                // Empty argument list — same diagnostic shape the line
-                // directive parser uses for `// gcl-lint-off` (no rule).
-                out.diagnostics.push(LintDiagnostic {
-                    rule: "empty-suppression",
-                    severity: LintSeverity::Warning,
-                    message: format!("`@{name}` requires at least one rule name (no wildcard)"),
-                    byte_range: c.byte_range(),
-                    tag: None,
-                });
-                continue;
-            }
-            for (rule_name, span) in harvested {
-                if !valid_rules.contains(rule_name.as_str()) {
-                    out.diagnostics.push(LintDiagnostic {
-                        rule: "unknown-suppression-rule",
-                        severity: LintSeverity::Warning,
-                        message: format!("unknown lint rule `{rule_name}` in `@{name}`"),
-                        byte_range: span,
-                        tag: None,
-                    });
-                    continue;
-                }
-                if is_off {
-                    if out.on.contains(rule_name.as_str()) {
-                        out.diagnostics.push(LintDiagnostic {
-                            rule: "conflicting-lint-pragma",
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "`{rule_name}` is named in both `@lint_off` and `@lint_on` in this \
-                                 module — `@lint_off` wins; remove one of the two"
-                            ),
-                            byte_range: span.clone(),
-                            tag: None,
-                        });
-                    }
-                    out.off.insert(rule_name);
-                } else {
-                    if out.off.contains(rule_name.as_str()) {
-                        out.diagnostics.push(LintDiagnostic {
-                            rule: "conflicting-lint-pragma",
-                            severity: LintSeverity::Warning,
-                            message: format!(
-                                "`{rule_name}` is named in both `@lint_off` and `@lint_on` in this \
-                                 module — `@lint_off` wins; remove one of the two"
-                            ),
-                            byte_range: span.clone(),
-                            tag: None,
-                        });
-                    }
-                    out.on.insert(rule_name);
-                }
-            }
-        }
-    }
-    // Tag-fill: editors render UNNECESSARY-tagged diagnostics dimmed,
-    // and `conflicting-lint-pragma` qualifies (the conflicting line is
-    // editorially "dead").
-    for diag in &mut out.diagnostics {
-        if diag.tag.is_none() {
-            diag.tag = match diag.rule {
-                "conflicting-lint-pragma" => Some(DiagTag::Unnecessary),
-                _ => None,
-            };
-        }
-    }
-    out
+/// Payload-free today. When type-conditional pragmas land (`@format`
+/// keys on whether the attribute is `time` / `duration`; `@expose`
+/// keys on whether a method is `static`), `Attr` / `Fn` grow the
+/// resolved type / static-ness, and the arg-shape vocabulary grows to
+/// match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Site {
+    Fn,
+    Attr,
+    Type,
+    Enum,
+    Var,
 }
 
-/// Yield `(content, span)` for every `string` child of `args`. The
-/// content is the concatenated text of `string_fragment` children; the
-/// span is the whole `string` node's byte range (including the quotes)
-/// so validation diagnostics can point at the literal cleanly.
-fn string_args_with_ranges<'src, 'tree>(
-    source: &'src str,
-    args: Node<'tree>,
-) -> impl Iterator<Item = (String, std::ops::Range<usize>)> + use<'src, 'tree> {
-    let mut cursor = args.walk();
-    let children: Vec<_> = args
-        .named_children(&mut cursor)
-        .filter(|c| c.kind() == "string")
+/// A normalized pragma use. Wraps the HIR [`Annotation`], which already
+/// carries the name, the per-argument values and spans, and the
+/// whole-annotation span. A newtype rather than a bare `&Annotation`
+/// so it can grow site-resolved context (attr type, static-ness)
+/// without churning hook signatures.
+struct PragmaUse<'a> {
+    ann: &'a Annotation,
+}
+
+/// Context the semantic hooks need beyond the use itself.
+struct PragmaCtx<'a> {
+    index: &'a ProjectIndex,
+}
+
+/// A pragma's complete contract: which sites it is valid on, and the
+/// rule (arg shape + optional semantic check) at each.
+struct Contract {
+    name: &'static str,
+    sites: &'static [SiteRule],
+}
+
+/// Hook for the semantic / cross-pragma validation a declarative arg
+/// shape can't express. Runs after the arg shape is checked, and
+/// receives the sibling pragmas at the same site so it can reason
+/// about relations like "permission needs expose".
+type CheckFn = fn(&PragmaUse, &[PragmaUse], &PragmaCtx, &mut Vec<SemanticDiagnostic>);
+
+struct SiteRule {
+    site: Site,
+    args: ArgSig,
+    check: Option<CheckFn>,
+}
+
+/// Argument-shape rule. Only `Variadic` exists today — the bounded /
+/// positional / overloaded / attr-type-conditional shapes (`Exact`,
+/// `Params`, `OneOf`, …) land with their first real contract.
+enum ArgSig {
+    /// `min` or more arguments, each of type `ty`. Fewer than `min`
+    /// is an advisory warning (the construct is a no-op, e.g.
+    /// `@permission()` names no permission); a wrong-typed arg is a
+    /// hard error (the runtime rejects it).
+    Variadic { min: u8, ty: ArgType },
+}
+
+#[derive(Clone, Copy)]
+enum ArgType {
+    String,
+}
+
+impl ArgType {
+    fn label(self) -> &'static str {
+        match self {
+            ArgType::String => "string",
+        }
+    }
+
+    fn matches(self, kind: &AnnotationArgKind) -> bool {
+        match self {
+            ArgType::String => matches!(kind, AnnotationArgKind::String(_)),
+        }
+    }
+}
+
+/// Validate every decl-attached pragma in `hir` against the contract
+/// registry, pushing diagnostics into `out`.
+pub fn validate_pragmas(hir: &Hir, index: &ProjectIndex, out: &mut Vec<SemanticDiagnostic>) {
+    for (_, decl) in hir.decls.iter() {
+        for (site, modifiers) in decl_sites(hir, decl) {
+            check_site(site, modifiers, index, out);
+        }
+    }
+}
+
+/// The (site, modifiers) pairs a decl contributes. A `type` carries
+/// its own annotations *and* one Attr site per attribute. Methods
+/// arrive through the outer `hir.decls` sweep as their own `Decl::Fn`,
+/// so no recursion into them here.
+fn decl_sites<'a>(hir: &'a Hir, decl: &'a Decl) -> Vec<(Site, &'a Modifiers)> {
+    match decl {
+        Decl::Fn(d) => vec![(Site::Fn, &d.modifiers)],
+        Decl::Type(d) => {
+            let mut sites = vec![(Site::Type, &d.modifiers)];
+            for attr in d.attrs.iter() {
+                sites.push((Site::Attr, &hir.type_attrs[*attr].modifiers));
+            }
+            sites
+        }
+        Decl::Enum(d) => vec![(Site::Enum, &d.modifiers)],
+        Decl::Var(d) => vec![(Site::Var, &d.modifiers)],
+        Decl::Pragma(_) => Vec::new(),
+    }
+}
+
+fn check_site(
+    site: Site,
+    modifiers: &Modifiers,
+    index: &ProjectIndex,
+    out: &mut Vec<SemanticDiagnostic>,
+) {
+    if modifiers.annotations.is_empty() {
+        return;
+    }
+    // Build the sibling set once so hooks can see the other pragmas at
+    // this site (e.g. permission asking "is there an @expose here?").
+    let uses: Vec<PragmaUse> = modifiers
+        .annotations
+        .iter()
+        .map(|ann| PragmaUse { ann })
         .collect();
-    children.into_iter().map(move |s| {
-        let span = s.byte_range();
-        let mut acc = String::new();
-        let mut sc = s.walk();
-        for piece in s.named_children(&mut sc) {
-            if piece.kind() == "string_fragment" {
-                acc.push_str(&source[piece.byte_range()]);
-            }
+    let cx = PragmaCtx { index };
+    for u in &uses {
+        let name = &index.symbols[u.ann.name];
+        let Some(contract) = contract_for(name) else {
+            // Unregistered pragma — ignored for now. A future
+            // "unexpected pragma" catch-all (once the registry covers
+            // every valid pragma) slots in here.
+            continue;
+        };
+        let Some(rule) = contract.sites.iter().find(|r| r.site == site) else {
+            // Registered, but not valid at this site. A future
+            // "pragma not valid here" diagnostic slots in here.
+            continue;
+        };
+        validate_args(u, &rule.args, name, out);
+        if let Some(check) = rule.check {
+            check(u, &uses, &cx, out);
         }
-        (acc, span)
-    })
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(src: &str) -> LintPragmas {
-        let tree = greycat_analyzer_syntax::parse(src);
-        parse_lint_pragmas(src, tree.root_node(), true)
-    }
-
-    fn parse_module(src: &str) -> LintPragmas {
-        let tree = greycat_analyzer_syntax::parse(src);
-        parse_lint_pragmas(src, tree.root_node(), false)
-    }
-
-    #[test]
-    fn lint_off_single_rule() {
-        let p = parse("@lint_off(\"unused-decl\");\n");
-        assert!(p.off.contains("unused-decl"));
-        assert!(p.on.is_empty());
-        assert!(p.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn lint_on_single_rule() {
-        let p = parse("@lint_on(\"no-breakpoint\");\n");
-        assert!(p.on.contains("no-breakpoint"));
-        assert!(p.off.is_empty());
-        assert!(p.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn multiple_pragmas_union() {
-        let src = "@lint_off(\"unused-decl\", \"unused-local\");\n@lint_off(\"unused-param\");\n\
-             @lint_on(\"no-breakpoint\");\n";
-        let p = parse(src);
-        assert_eq!(p.off.len(), 3);
-        assert!(
-            p.off.contains("unused-decl")
-                && p.off.contains("unused-local")
-                && p.off.contains("unused-param")
-        );
-        assert_eq!(p.on.len(), 1);
-        assert!(p.on.contains("no-breakpoint"));
-        assert!(p.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn unrelated_pragmas_ignored() {
-        let p = parse("@library(\"std\", \"8.0\");\n@fmt_indent(2);\n");
-        assert!(p.off.is_empty());
-        assert!(p.on.is_empty());
-        assert!(p.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn unknown_rule_name_emits_diagnostic() {
-        let p = parse("@lint_off(\"bogus-rule\");\n");
-        assert!(p.off.is_empty(), "unknown rule must not enter the set");
-        assert_eq!(p.diagnostics.len(), 1);
-        assert_eq!(p.diagnostics[0].rule, "unknown-suppression-rule");
-        assert!(p.diagnostics[0].message.contains("bogus-rule"));
-    }
-
-    #[test]
-    fn empty_args_emits_empty_suppression() {
-        let p = parse("@lint_off();\n");
-        assert!(p.off.is_empty());
-        assert_eq!(p.diagnostics.len(), 1);
-        assert_eq!(p.diagnostics[0].rule, "empty-suppression");
-    }
-
-    #[test]
-    fn off_then_on_same_rule_emits_conflict_on_the_on_pragma() {
-        let p = parse("@lint_off(\"unused-decl\");\n@lint_on(\"unused-decl\");\n");
-        assert!(p.off.contains("unused-decl"));
-        assert!(p.on.contains("unused-decl"));
-        assert_eq!(p.diagnostics.len(), 1);
-        assert_eq!(p.diagnostics[0].rule, "conflicting-lint-pragma");
-    }
-
-    #[test]
-    fn on_then_off_same_rule_also_emits_conflict() {
-        let p = parse("@lint_on(\"unused-decl\");\n@lint_off(\"unused-decl\");\n");
-        assert_eq!(p.diagnostics.len(), 1);
-        assert_eq!(p.diagnostics[0].rule, "conflicting-lint-pragma");
-    }
-
-    // P40.5 — in non-entrypoint modules, pragmas are rejected with
-    // `lint-pragma-outside-entrypoint` and do NOT populate the off / on
-    // sets. Empty / unknown / conflict validation is suppressed
-    // (those would just stack on top).
-
-    #[test]
-    fn module_pragma_rejected_with_lint_pragma_outside_entrypoint() {
-        let p = parse_module("@lint_off(\"unused-decl\");\n");
-        assert!(p.off.is_empty(), "module-scope pragma must not apply");
-        assert!(p.on.is_empty());
-        assert_eq!(p.diagnostics.len(), 1);
-        assert_eq!(p.diagnostics[0].rule, "lint-pragma-outside-entrypoint");
-    }
-
-    #[test]
-    fn module_pragma_skips_empty_and_unknown_validation() {
-        // The user moved a stale `@lint_off()` from project.gcl. The
-        // walker should NOT emit empty-suppression on top of the
-        // entrypoint-only warning — only one diagnostic surfaces.
-        let p = parse_module("@lint_off();\n");
-        assert_eq!(p.diagnostics.len(), 1);
-        assert_eq!(p.diagnostics[0].rule, "lint-pragma-outside-entrypoint");
+fn validate_args(u: &PragmaUse, sig: &ArgSig, pragma: &str, out: &mut Vec<SemanticDiagnostic>) {
+    match sig {
+        ArgSig::Variadic { min, ty } => {
+            // Too few args — advisory. The runtime tolerates e.g.
+            // `@permission()`, but it names nothing, so the annotation
+            // does nothing.
+            if u.ann.args.len() < *min as usize {
+                let plural = if *min == 1 { "" } else { "s" };
+                out.push(SemanticDiagnostic::structural(
+                    Severity::Warning,
+                    "pragma-missing-args",
+                    format!(
+                        "`@{pragma}` has no effect with no arguments — it expects at least \
+                         {min} {} argument{plural}",
+                        ty.label()
+                    ),
+                    u.ann.byte_range.clone(),
+                ));
+            }
+            // Wrong-typed arg — hard error, matching the runtime.
+            for arg in u.ann.args.iter() {
+                if !ty.matches(&arg.kind) {
+                    out.push(SemanticDiagnostic::structural(
+                        Severity::Error,
+                        "pragma-arg-type",
+                        format!("`@{pragma}` expects {} arguments", ty.label()),
+                        arg.span.clone(),
+                    ));
+                }
+            }
+        }
     }
 }

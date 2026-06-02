@@ -57,6 +57,10 @@ pub struct Annotation {
     /// `tag`, `permission`).
     pub name: Symbol,
     pub args: Box<[AnnotationArg]>,
+    /// Source span of the whole `@name(...)` annotation. Lets the
+    /// pragma validator point a diagnostic at the annotation itself
+    /// (e.g. "@permission has no effect without @expose").
+    pub byte_range: Span,
 }
 
 impl Annotation {
@@ -64,8 +68,8 @@ impl Annotation {
     /// order. Convenience for callers (`@expose`, `@deref`,
     /// `@iterable`) that only care about string args.
     pub fn arg_strings(&self) -> impl Iterator<Item = Symbol> + '_ {
-        self.args.iter().filter_map(|a| match a {
-            AnnotationArg::String(s) => Some(*s),
+        self.args.iter().filter_map(|a| match a.kind {
+            AnnotationArgKind::String(s) => Some(s),
             _ => None,
         })
     }
@@ -76,7 +80,34 @@ impl Annotation {
     }
 }
 
-/// Compile-time-constant argument of an [`Annotation`]. GreyCat
+/// A single annotation argument: its compile-time value
+/// ([`AnnotationArgKind`]) plus the source [`Span`] it came from.
+///
+/// Equality and hashing ignore `span` — an arg's identity is its
+/// value, not where it sits in source (so two `@tag("mcp")` on
+/// different lines compare equal, matching the prior design that
+/// excluded the span from `Path`'s hash).
+#[derive(Debug, Clone)]
+pub struct AnnotationArg {
+    pub kind: AnnotationArgKind,
+    pub span: Span,
+}
+
+impl PartialEq for AnnotationArg {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl Eq for AnnotationArg {}
+
+impl std::hash::Hash for AnnotationArg {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.kind.hash(h);
+    }
+}
+
+/// Compile-time-constant value of an [`AnnotationArg`]. GreyCat
 /// pragmas accept only values the analyzer can resolve without
 /// running code: primitive literals, `null`, and path-shaped
 /// references to types or enum variants (`Foo`, `mod::Foo`,
@@ -84,14 +115,14 @@ impl Annotation {
 ///
 /// Anything else — a call, arithmetic, an array literal, an
 /// instance member-access, etc. — is captured as
-/// [`AnnotationArg::Invalid`] so the analyzer can surface it as a
-/// hard `invalid-pragma-arg` error pointing at the offending span.
+/// [`AnnotationArgKind::Invalid`] so the analyzer can surface it as
+/// a hard `invalid-pragma-arg` error pointing at the arg's span.
 /// Non-resolving paths get the same treatment at validation time.
 ///
 /// `Float` is bit-equal for `Hash` so identical NaN payloads dedup
 /// (matches the literal interning we already do for `LiteralExpr`).
 #[derive(Debug, Clone, PartialEq)]
-pub enum AnnotationArg {
+pub enum AnnotationArgKind {
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -115,24 +146,19 @@ pub enum AnnotationArg {
     /// identifiers in source order; the analyzer's validator
     /// resolves the path to either a type decl or an enum variant
     /// at validation time. Unresolved paths surface as a hard
-    /// `invalid-pragma-arg` error pointing at `start..end`.
+    /// `invalid-pragma-arg` error pointing at the arg span.
     Path {
         chain: Box<[Symbol]>,
-        start: u32,
-        end: u32,
     },
     /// Structurally-non-constant argument — a call, arithmetic, an
     /// array / object literal, an instance member-access, etc.
-    /// Hard error at validation time pointing at `start..end`.
-    Invalid {
-        start: u32,
-        end: u32,
-    },
+    /// Hard error at validation time pointing at the arg span.
+    Invalid,
 }
 
-impl Eq for AnnotationArg {}
+impl Eq for AnnotationArgKind {}
 
-impl std::hash::Hash for AnnotationArg {
+impl std::hash::Hash for AnnotationArgKind {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
         // Discriminant + payload bits. Float hashes via bit pattern
         // so two `Float(f)` with the same bits dedup; NaN payloads
@@ -140,25 +166,16 @@ impl std::hash::Hash for AnnotationArg {
         // distributes them consistently — fine for dedup tables.
         std::mem::discriminant(self).hash(h);
         match self {
-            AnnotationArg::Int(v)
-            | AnnotationArg::Duration(v)
-            | AnnotationArg::Time(v)
-            | AnnotationArg::Iso8601(v) => v.hash(h),
-            AnnotationArg::Float(f) => f.to_bits().hash(h),
-            AnnotationArg::Bool(b) => b.hash(h),
-            AnnotationArg::Char(c) => c.hash(h),
-            AnnotationArg::String(s) => s.hash(h),
-            AnnotationArg::Null => {}
-            AnnotationArg::Path { chain, .. } => {
-                // start/end deliberately excluded from the hash —
-                // two paths with the same chain but different source
-                // spans dedup to the same value.
-                chain.hash(h);
-            }
-            AnnotationArg::Invalid { start, end } => {
-                start.hash(h);
-                end.hash(h);
-            }
+            AnnotationArgKind::Int(v)
+            | AnnotationArgKind::Duration(v)
+            | AnnotationArgKind::Time(v)
+            | AnnotationArgKind::Iso8601(v) => v.hash(h),
+            AnnotationArgKind::Float(f) => f.to_bits().hash(h),
+            AnnotationArgKind::Bool(b) => b.hash(h),
+            AnnotationArgKind::Char(c) => c.hash(h),
+            AnnotationArgKind::String(s) => s.hash(h),
+            AnnotationArgKind::Null | AnnotationArgKind::Invalid => {}
+            AnnotationArgKind::Path { chain } => chain.hash(h),
         }
     }
 }

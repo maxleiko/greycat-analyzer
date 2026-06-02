@@ -50,8 +50,15 @@ pub mod display;
 pub mod erasure;
 pub mod ide;
 pub mod lint;
+/// Analyzer meta-pragmas: `@lint_off` / `@lint_on` suppression
+/// directives. CST-based, runs pre-HIR, extracts the project's lint
+/// policy. Distinct from [`pragmas`], which validates *GreyCat
+/// language* pragmas (`@permission`, …) against the lowered HIR.
+pub mod meta_pragmas;
 // P27.1
 pub mod parallel;
+/// GreyCat language-pragma contract validation (`@permission`, …).
+/// HIR-based, runs post-lowering with the full `ProjectIndex`.
 pub mod pragmas;
 pub mod project;
 pub mod reachability;

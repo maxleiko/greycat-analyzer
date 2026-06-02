@@ -514,7 +514,7 @@ impl ProjectAnalysis {
         String,
         Duration,
         Directives,
-        crate::pragmas::LintPragmas,
+        crate::meta_pragmas::LintPragmas,
     )> {
         // P27.1 — three phases. The middle one runs through the
         // `parallel` shim so native targets get rayon and wasm gets
@@ -553,7 +553,7 @@ impl ProjectAnalysis {
             String,
             Duration,
             Directives,
-            crate::pragmas::LintPragmas,
+            crate::meta_pragmas::LintPragmas,
         )> = crate::parallel::par_map(docs, |(uri, text, lib, tree, is_entry)| {
             let lower_start = Instant::now();
             // P35.1 — pass the real module name (filename minus
@@ -574,7 +574,8 @@ impl ProjectAnalysis {
             // P40.1 + P40.5 — walk `@lint_off` / `@lint_on` annotations.
             // Entrypoint: collect rules + validate. Other modules: emit
             // `lint-pragma-outside-entrypoint` and discard the rules.
-            let pragmas = crate::pragmas::parse_lint_pragmas(&text, tree.root_node(), is_entry);
+            let pragmas =
+                crate::meta_pragmas::parse_lint_pragmas(&text, tree.root_node(), is_entry);
             (uri, hir, lib, lower_took, directives, pragmas)
         });
 
@@ -640,7 +641,7 @@ impl ProjectAnalysis {
             String,
             Duration,
             Directives,
-            crate::pragmas::LintPragmas,
+            crate::meta_pragmas::LintPragmas,
         )],
     ) {
         let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _, _, _)| (u, h)).collect();
@@ -2354,7 +2355,7 @@ impl ProjectAnalysis {
             String,
             Duration,
             Directives,
-            crate::pragmas::LintPragmas,
+            crate::meta_pragmas::LintPragmas,
         )>,
     ) {
         let bypass = self.bypass_suppressions;
@@ -2397,7 +2398,7 @@ impl ProjectAnalysis {
             String,
             Duration,
             Directives,
-            crate::pragmas::LintPragmas,
+            crate::meta_pragmas::LintPragmas,
         )|
          -> PassAOut {
             let t0 = Instant::now();
@@ -2465,6 +2466,11 @@ impl ProjectAnalysis {
                 &self.index,
                 &mut analysis.diagnostics,
             );
+            // Language-pragma contract validation (`@permission`, …).
+            // Runs here so it sees the fully-built project index
+            // (declared-permission set spans std + every included
+            // module).
+            crate::pragmas::validate_pragmas(&p.hir, &self.index, &mut analysis.diagnostics);
             timings.analyze = t1.elapsed();
             self.modules.insert(
                 p.uri,
@@ -2895,7 +2901,7 @@ impl ProjectAnalysis {
         let mut lower_took = Duration::ZERO;
         let mut changed_lib: Option<String> = None;
         let mut changed_directives: Option<Directives> = None;
-        let mut changed_pragmas: Option<crate::pragmas::LintPragmas> = None;
+        let mut changed_pragmas: Option<crate::meta_pragmas::LintPragmas> = None;
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
             let start = Instant::now();
@@ -2919,7 +2925,7 @@ impl ProjectAnalysis {
             // so the walker emits `lint-pragma-outside-entrypoint` when
             // pragmas show up in non-entrypoint modules.
             let is_entry = manager.entrypoint_uri() == Some(uri);
-            changed_pragmas = Some(crate::pragmas::parse_lint_pragmas(
+            changed_pragmas = Some(crate::meta_pragmas::parse_lint_pragmas(
                 &doc.text,
                 doc.root_node(),
                 is_entry,
@@ -3026,7 +3032,7 @@ impl ProjectAnalysis {
         let resolutions = resolve_with_index_for(&hir, &self.index, uri, self.well_known.map_decl);
         timings.resolve = t0.elapsed();
         let t1 = Instant::now();
-        let analysis = analyze_with_index_into(
+        let mut analysis = analyze_with_index_into(
             &hir,
             &resolutions,
             &self.index,
@@ -3035,6 +3041,15 @@ impl ProjectAnalysis {
             uri,
             &mut self.arena,
         );
+        // Hard-error pragma passes — must run on the incremental path
+        // too, not just the full analyze, or `invalid-pragma-arg` /
+        // `unknown-permission` silently stop re-emitting after an edit.
+        crate::annotation_validate::validate_annotation_args(
+            &hir,
+            &self.index,
+            &mut analysis.diagnostics,
+        );
+        crate::pragmas::validate_pragmas(&hir, &self.index, &mut analysis.diagnostics);
         timings.analyze = t1.elapsed();
         let t2 = Instant::now();
         let mut directives = changed_directives.unwrap_or_default();

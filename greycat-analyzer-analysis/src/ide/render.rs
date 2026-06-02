@@ -17,7 +17,7 @@ use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{Symbol, SymbolTable, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeDecl, TypeRef};
+use greycat_analyzer_hir::types::{Annotation, AnnotationArgKind, Decl, FnDecl, TypeDecl, TypeRef};
 use rustc_hash::FxHashMap;
 
 use crate::project::ProjectAnalysis;
@@ -36,11 +36,7 @@ pub struct RenderCtx<'a> {
 /// source form; the signature renderers themselves stay annotation-
 /// free so completion `detail` strings (which clients flatten to a
 /// single line) don't get buried under pragma noise.
-pub fn push_annotations(
-    out: &mut String,
-    symbols: &greycat_analyzer_core::SymbolTable,
-    annotations: &[Annotation],
-) {
+pub fn push_annotations(out: &mut String, symbols: &SymbolTable, annotations: &[Annotation]) {
     use std::fmt::Write;
     for ann in annotations {
         out.push('@');
@@ -51,39 +47,38 @@ pub fn push_annotations(
                 if i > 0 {
                     out.push_str(", ");
                 }
-                match arg {
-                    greycat_analyzer_hir::types::AnnotationArg::String(s) => {
+                match &arg.kind {
+                    AnnotationArgKind::String(s) => {
                         out.push('"');
                         out.push_str(&symbols[*s]);
                         out.push('"');
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Int(v) => {
+                    AnnotationArgKind::Int(v) => {
                         let _ = write!(out, "{v}");
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Float(v) => {
+                    AnnotationArgKind::Float(v) => {
                         let _ = write!(out, "{v}");
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Bool(b) => {
+                    AnnotationArgKind::Bool(b) => {
                         out.push_str(if *b { "true" } else { "false" });
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Char(c) => {
+                    AnnotationArgKind::Char(c) => {
                         let _ = write!(out, "'{c}'");
                     }
                     // Render typed-suffix literals back in their
                     // canonical microsecond form — hover is read-
                     // only, so this is fine even if the source
                     // wrote `5s` rather than `5_000_000us`.
-                    greycat_analyzer_hir::types::AnnotationArg::Duration(v) => {
+                    AnnotationArgKind::Duration(v) => {
                         let _ = write!(out, "{v}us");
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Time(v)
-                    | greycat_analyzer_hir::types::AnnotationArg::Iso8601(v) => {
+                    AnnotationArgKind::Time(v) | AnnotationArgKind::Iso8601(v) => {
                         let _ = write!(out, "{v}time");
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Null => {
+                    AnnotationArgKind::Null => {
                         out.push_str("null");
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Path { chain, .. } => {
+                    AnnotationArgKind::Path { chain } => {
                         for (j, seg) in chain.iter().enumerate() {
                             if j > 0 {
                                 out.push_str("::");
@@ -91,7 +86,7 @@ pub fn push_annotations(
                             out.push_str(&symbols[*seg]);
                         }
                     }
-                    greycat_analyzer_hir::types::AnnotationArg::Invalid { .. } => {
+                    AnnotationArgKind::Invalid => {
                         // Hard errors are surfaced separately as
                         // `invalid-pragma-arg`; in hover output we
                         // render a placeholder so the rest of the

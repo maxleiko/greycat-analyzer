@@ -233,18 +233,23 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[An
         if let Some(args_node) = ann.named_children(&mut c4).find(|n| n.kind() == "args") {
             let mut c5 = args_node.walk();
             for a in args_node.named_children(&mut c5) {
-                args.push(lower_annotation_arg(cx, a));
+                args.push(AnnotationArg {
+                    kind: lower_annotation_arg(cx, a),
+                    span: a.byte_range(),
+                });
             }
         }
         out.push(Annotation {
             name,
             args: args.into_boxed_slice(),
+            byte_range: ann.byte_range(),
         });
     }
     out.into_boxed_slice()
 }
 
-/// Lower a single annotation arg node into an [`AnnotationArg`].
+/// Lower a single annotation arg node into an [`AnnotationArgKind`].
+/// The caller wraps it with the arg's source span.
 ///
 /// String args are interned through `cx.symbols` so identical
 /// values share a `Symbol` — `@tag("mcp")` repeated across fifty
@@ -252,19 +257,18 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[An
 ///
 /// Non-literal arg nodes (idents, calls, member access, anything
 /// not in the primitive literal set) become
-/// [`AnnotationArg::Invalid`] carrying the source byte-range so
-/// the analyzer's `invalid-pragma-arg` lint can point at the
-/// offending span. Pragmas accept only literals; non-literal args
-/// are a hard error.
-fn lower_annotation_arg(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> AnnotationArg {
+/// [`AnnotationArgKind::Invalid`] so the analyzer's
+/// `invalid-pragma-arg` check can point at the arg span. Pragmas
+/// accept only literals; non-literal args are a hard error.
+fn lower_annotation_arg(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> AnnotationArgKind {
     match node.kind() {
         "string" => match string_literal_value(cx, node) {
-            Some(value) => AnnotationArg::String(cx.symbols.intern(&value)),
-            None => invalid_arg(node),
+            Some(value) => AnnotationArgKind::String(cx.symbols.intern(&value)),
+            None => AnnotationArgKind::Invalid,
         },
-        "true" => AnnotationArg::Bool(true),
-        "false" => AnnotationArg::Bool(false),
-        "null" => AnnotationArg::Null,
+        "true" => AnnotationArgKind::Bool(true),
+        "false" => AnnotationArgKind::Bool(false),
+        "null" => AnnotationArgKind::Null,
         "number" => {
             let raw = cx.text(node);
             let (kind, _issue) = classify_and_parse_number(cx, node, raw, false);
@@ -286,26 +290,14 @@ fn lower_annotation_arg(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Annotatio
         // against the project's name tables and rejects ones that
         // don't point at a type / enum / variant.
         "ident" | "type_ident" => {
-            let r = node.byte_range();
             let chain = vec![cx.symbols.intern(cx.text(node))].into_boxed_slice();
-            AnnotationArg::Path {
-                chain,
-                start: r.start as u32,
-                end: r.end as u32,
-            }
+            AnnotationArgKind::Path { chain }
         }
         "static_expr" => match collect_path_chain(cx, node) {
-            Some(chain) => {
-                let r = node.byte_range();
-                AnnotationArg::Path {
-                    chain,
-                    start: r.start as u32,
-                    end: r.end as u32,
-                }
-            }
-            None => invalid_arg(node),
+            Some(chain) => AnnotationArgKind::Path { chain },
+            None => AnnotationArgKind::Invalid,
         },
-        _ => invalid_arg(node),
+        _ => AnnotationArgKind::Invalid,
     }
 }
 
@@ -348,23 +340,15 @@ fn collect_path_chain(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Option<Box<
     Some(chain.into_boxed_slice())
 }
 
-fn invalid_arg(node: tree_sitter::Node<'_>) -> AnnotationArg {
-    let r = node.byte_range();
-    AnnotationArg::Invalid {
-        start: r.start as u32,
-        end: r.end as u32,
-    }
-}
-
-fn lit_to_annotation_arg(kind: LiteralKind) -> AnnotationArg {
+fn lit_to_annotation_arg(kind: LiteralKind) -> AnnotationArgKind {
     match kind {
-        LiteralKind::Int(v) => AnnotationArg::Int(v),
-        LiteralKind::Float(v) => AnnotationArg::Float(v),
-        LiteralKind::Char(c) => AnnotationArg::Char(c),
-        LiteralKind::Bool(b) => AnnotationArg::Bool(b),
-        LiteralKind::Duration(v) => AnnotationArg::Duration(v),
-        LiteralKind::Time(v) => AnnotationArg::Time(v),
-        LiteralKind::Iso8601(v) => AnnotationArg::Iso8601(v),
+        LiteralKind::Int(v) => AnnotationArgKind::Int(v),
+        LiteralKind::Float(v) => AnnotationArgKind::Float(v),
+        LiteralKind::Char(c) => AnnotationArgKind::Char(c),
+        LiteralKind::Bool(b) => AnnotationArgKind::Bool(b),
+        LiteralKind::Duration(v) => AnnotationArgKind::Duration(v),
+        LiteralKind::Time(v) => AnnotationArgKind::Time(v),
+        LiteralKind::Iso8601(v) => AnnotationArgKind::Iso8601(v),
     }
 }
 
