@@ -1917,4 +1917,246 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // =====================================================================
+    // P34.5 — in-process notify watcher
+    // =====================================================================
+
+    /// Build a raw watcher payload for `path` with the given kind. Sets
+    /// the public `paths` field directly (the builder's `attrs` field is
+    /// private) so this doesn't depend on a particular notify builder.
+    fn fs_event(kind: notify::EventKind, path: &Path) -> watcher::RawFsEvent {
+        let mut ev = notify::Event::new(kind);
+        ev.paths.push(path.to_path_buf());
+        Ok(ev)
+    }
+
+    // P34.3
+    /// `on_fs_event` buffers `.gcl` / `lib/installed` paths and arms the
+    /// flush deadline; access events and irrelevant extensions are
+    /// dropped without arming anything.
+    #[test]
+    fn on_fs_event_buffers_relevant_ignores_noise() {
+        let (mut b, _rx) = backend();
+        // Irrelevant extension: not buffered.
+        b.on_fs_event(fs_event(
+            notify::EventKind::Create(notify::event::CreateKind::Any),
+            Path::new("/proj/src/readme.txt"),
+        ));
+        assert!(b.pending_fs_events.is_empty());
+        assert!(b.fs_flush_deadline.is_none());
+
+        // Access event on a .gcl: ignored (no content change).
+        b.on_fs_event(fs_event(
+            notify::EventKind::Access(notify::event::AccessKind::Any),
+            Path::new("/proj/src/a.gcl"),
+        ));
+        assert!(b.pending_fs_events.is_empty());
+        assert!(b.fs_flush_deadline.is_none());
+
+        // A real .gcl change: buffered + deadline armed.
+        let gcl = PathBuf::from("/proj/src/a.gcl");
+        b.on_fs_event(fs_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            &gcl,
+        ));
+        assert!(b.pending_fs_events.contains(&gcl));
+        assert!(b.fs_flush_deadline.is_some());
+
+        // lib/installed is relevant too.
+        let installed = PathBuf::from("/proj/lib/installed");
+        b.on_fs_event(fs_event(
+            notify::EventKind::Create(notify::event::CreateKind::Any),
+            &installed,
+        ));
+        assert!(b.pending_fs_events.contains(&installed));
+    }
+
+    // P34.3
+    /// `flush_fs_events` is a no-op until the debounce deadline passes,
+    /// so a partial burst isn't processed early.
+    #[test]
+    fn flush_fs_events_waits_for_deadline() {
+        let (mut b, _rx) = backend();
+        b.pending_fs_events.insert(PathBuf::from("/proj/src/a.gcl"));
+        b.fs_flush_deadline = Some(Instant::now() + Duration::from_secs(30));
+        b.flush_fs_events();
+        // Deadline in the future → nothing drained.
+        assert_eq!(b.pending_fs_events.len(), 1);
+        assert!(b.fs_flush_deadline.is_some());
+    }
+
+    // P34.5
+    /// The headline contract: a file dropped on disk is picked up via
+    /// the watcher's debounced flush WITHOUT any editor-side
+    /// `didChangeWatchedFiles`. Drive `on_fs_event` (what the select
+    /// loop does on a real notify delivery) + `flush_fs_events`, never
+    /// `did_change_watched_files`, and assert the new module lands in
+    /// the owning project's manager.
+    #[test]
+    fn watcher_picks_up_new_file_without_editor_event() {
+        let (tmp, proj_a, _proj_b) = fixture_sibling_projects("notify_pickup");
+        let (mut b, _rx) = backend();
+        b.workspace_roots.push(tmp.clone());
+        b.load_workspace(&path_uri(&proj_a));
+
+        // Drop a new module in projA/src on disk.
+        let extra = proj_a.join("src").join("extra.gcl");
+        std::fs::write(&extra, "fn extra(): int { return 7; }\n").unwrap();
+        let extra_uri = path_uri(&extra);
+
+        // Pre-condition: not yet known to the project.
+        assert!(
+            b.projects
+                .get(&proj_a)
+                .unwrap()
+                .manager
+                .get(&extra_uri)
+                .is_none(),
+            "extra.gcl must not be loaded before the watcher fires"
+        );
+
+        // Simulate the notify delivery + debounce flush (no editor event).
+        b.on_fs_event(fs_event(
+            notify::EventKind::Create(notify::event::CreateKind::File),
+            &extra,
+        ));
+        // Force the debounce deadline due, then flush as the loop would.
+        b.fs_flush_deadline = Some(Instant::now());
+        b.flush_fs_events();
+
+        assert!(
+            b.projects
+                .get(&proj_a)
+                .unwrap()
+                .manager
+                .get(&extra_uri)
+                .is_some(),
+            "watcher flush must reload projA's closure and pick up extra.gcl"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // P34.4
+    /// Failure-to-start fallback: with no watcher (the `None` state
+    /// `start_watcher` returns when notify can't start), `resync` is a
+    /// no-op, and the editor's `didChangeWatchedFiles` path keeps
+    /// working — i.e. the server operates exactly as it did before P34.
+    #[test]
+    fn no_watcher_degrades_gracefully() {
+        let (tmp, proj_a, _proj_b) = fixture_sibling_projects("notify_fallback");
+        let (mut b, _rx) = backend();
+        assert!(b.watcher.is_none());
+        b.workspace_roots.push(tmp.clone());
+        b.load_workspace(&path_uri(&proj_a));
+
+        // resync without a watcher registers nothing and doesn't panic.
+        b.resync_watch_roots();
+        assert!(b.watched_roots.is_empty());
+
+        // Editor-driven path still picks up a new file.
+        let extra = proj_a.join("src").join("viaeditor.gcl");
+        std::fs::write(&extra, "fn ve(): int { return 1; }\n").unwrap();
+        let extra_uri = path_uri(&extra);
+        b.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: extra_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }],
+        })
+        .unwrap();
+        assert!(
+            b.projects
+                .get(&proj_a)
+                .unwrap()
+                .manager
+                .get(&extra_uri)
+                .is_some(),
+            "editor didChangeWatchedFiles must still work when notify is absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // P34.2
+    /// With a real watcher, `resync_watch_roots` registers the workspace
+    /// folder and unregisters it when it drops out of the desired set.
+    /// Skipped when notify can't start in the test sandbox.
+    #[test]
+    fn resync_registers_and_unregisters_real_roots() {
+        let dir = std::env::temp_dir().join(format!(
+            "gca_resync_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut b, _rx) = backend();
+        let (tx, _wrx) = unbounded();
+        b.watcher = watcher::start_watcher(tx);
+        if b.watcher.is_none() {
+            // notify unavailable in this sandbox — nothing to assert.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        b.workspace_roots.push(dir.clone());
+        b.resync_watch_roots();
+        assert!(
+            !b.watched_roots.is_empty(),
+            "workspace folder should be watched after resync"
+        );
+
+        // Folder removed from the desired set → unwatched on next resync.
+        b.workspace_roots.clear();
+        b.resync_watch_roots();
+        assert!(
+            b.watched_roots.is_empty(),
+            "watch set should be empty after the root drops out"
+        );
+
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P34.2
+    /// `dedup_contained` collapses duplicates and drops paths nested
+    /// under another watched root, while keeping independent roots.
+    #[test]
+    fn dedup_contained_drops_nested_paths() {
+        let roots = vec![
+            PathBuf::from("/ws"),
+            PathBuf::from("/ws/proj/lib"), // under /ws → dropped
+            PathBuf::from("/home/.greycat/lib/std"), // independent → kept
+            PathBuf::from("/ws"),          // dup → collapsed
+        ];
+        let out = dedup_contained(roots);
+        assert!(out.contains(&PathBuf::from("/ws")));
+        assert!(out.contains(&PathBuf::from("/home/.greycat/lib/std")));
+        assert!(!out.contains(&PathBuf::from("/ws/proj/lib")));
+        assert_eq!(out.len(), 2);
+    }
+
+    // P34.3
+    /// `next_deadline` is the earlier of a pending trailing publish and
+    /// a pending fs flush.
+    #[test]
+    fn next_deadline_is_min_of_trailing_and_fs() {
+        let (mut b, _rx) = backend();
+        assert!(b.next_deadline().is_none());
+
+        let fs_at = Instant::now() + Duration::from_secs(5);
+        b.fs_flush_deadline = Some(fs_at);
+        assert_eq!(b.next_deadline(), Some(fs_at));
+
+        let trailing_at = Instant::now() + Duration::from_secs(1);
+        b.pending_trailing
+            .insert(path_uri(Path::new("/p/a.gcl")), trailing_at);
+        // Trailing is sooner → wins.
+        assert_eq!(b.next_deadline(), Some(trailing_at));
+    }
 }

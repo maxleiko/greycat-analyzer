@@ -49,6 +49,8 @@ The analyzer already knows whether a member is static (and `fix(analysis): attrs
 
 ## Phase 34 — Server-side filesystem watcher (~3-5 days, optional)
 
+**Status: shipped (P34.1–34.5).** The in-process `notify` watcher is live: `greycat install` and other external disk changes are picked up regardless of whether the client forwards `didChangeWatchedFiles`. The editor watcher stays registered as a coexisting fallback (and degrades cleanly when notify can't start).
+
 Stop trusting the editor's `workspace/didChangeWatchedFiles` for filesystem deltas and run our own watcher in the LSP process — the rust-analyzer model. When the editor's file watcher misses or coalesces events (notably `rm -rf <dir>` from a terminal, where VSCode's watcher behaviour varies by platform and version), the analyzer can hold stale URIs and goto-def returns locations for files that no longer exist. A server-side watcher gives us a single, predictable code path regardless of the client.
 
 **Trigger to do this phase:** real-world reports of stale URIs or missed reloads. Until then we live with whatever the editor's watcher gives us. The phase is **opt-in** — it adds a thread, a channel, a dep, and a non-trivial amount of plumbing.
@@ -68,7 +70,7 @@ Stop trusting the editor's `workspace/didChangeWatchedFiles` for filesystem delt
 - [x] **34.2 Root registration** (S) — `Backend::register_fs_root(path)` / `unregister_fs_root(path)`, called from `load_workspace`, `spawn_lazy_project`, `drop_project`, `did_change_workspace_folders`. Watch only what's loaded. *(Implemented as a single `resync_watch_roots` that diffs the desired set — workspace folders + global std + project libs, canonicalized + containment-deduped — against the watched set, called from `initialized` / `spawn_lazy_project` / `did_change_workspace_folders`.)*
 - [x] **34.3 Event → handler dispatch** (M) — main loop's `select!` between `conn.receiver` and the watcher channel. Debounce. Translate notify events into the existing `did_change_watched_files`-shaped processing.
 - [x] **34.4 Editor-watcher coexistence** (S) — keep the existing `register_file_watchers` capability registration so editors that *do* forward events still work; route both paths through a shared `apply_fs_event`. Avoid double-counting identical events.
-- [ ] **34.5 Tests** (S) — drop a real file on disk between `did_open` and a subsequent `goto_definition`; assert the LSP picks up the change without an editor-side event. Test the failure-to-start fallback by injecting a watcher mock that always errors.
+- [x] **34.5 Tests** (S) — drop a real file on disk between `did_open` and a subsequent `goto_definition`; assert the LSP picks up the change without an editor-side event. Test the failure-to-start fallback by injecting a watcher mock that always errors. *(`watcher_picks_up_new_file_without_editor_event` drives `on_fs_event` + `flush_fs_events` — never `did_change_watched_files` — and asserts the new module lands in the manager; `watcher_delivers_real_fs_event` proves notify actually delivers on this platform; `resync_registers_and_unregisters_real_roots` covers the real watch/unwatch round-trip; the fallback is tested via the `watcher: None` state — exactly what `start_watcher` returns on failure — rather than a mock, since the field is the concrete `RecommendedWatcher`.)*
 
 **Out of scope:**
 
