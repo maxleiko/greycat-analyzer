@@ -1308,7 +1308,7 @@ fn is_exposed(
     modifiers
         .annotations
         .iter()
-        .any(|a| &symbols[a.name] == "expose")
+        .any(|a| &symbols[a.name.symbol] == "expose")
 }
 
 // =============================================================================

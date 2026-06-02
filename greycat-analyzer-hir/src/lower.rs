@@ -227,7 +227,10 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[An
         let Some(ident) = ann.named_children(&mut c3).find(|n| n.kind() == "ident") else {
             continue;
         };
-        let name = cx.symbols.intern(cx.text(ident));
+        let name = Ident {
+            symbol: cx.symbols.intern(cx.text(ident)),
+            byte_range: ident.byte_range(),
+        };
         let mut args: Vec<AnnotationArg> = Vec::new();
         let mut c4 = ann.walk();
         if let Some(args_node) = ann.named_children(&mut c4).find(|n| n.kind() == "args") {
@@ -242,7 +245,6 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[An
         out.push(Annotation {
             name,
             args: args.into_boxed_slice(),
-            byte_range: ann.byte_range(),
         });
     }
     out.into_boxed_slice()

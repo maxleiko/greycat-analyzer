@@ -766,7 +766,7 @@ fn build_modifiers<'a>(
             .annotations
             .iter()
             .map(|a| AnnotationView {
-                name: &symbols[a.name],
+                name: &symbols[a.name.symbol],
                 args: a.args.iter().map(|arg| render_arg(symbols, arg)).collect(),
             })
             .collect(),

@@ -70,7 +70,7 @@ fn check(u: &PragmaUse, siblings: &[PragmaUse], cx: &PragmaCtx, out: &mut Vec<Se
     if named_permission
         && !siblings
             .iter()
-            .any(|p| &index.symbols[p.ann.name] == "expose")
+            .any(|p| &index.symbols[p.ann.name.symbol] == "expose")
     {
         out.push(SemanticDiagnostic::structural(
             Severity::Warning,
@@ -78,7 +78,7 @@ fn check(u: &PragmaUse, siblings: &[PragmaUse], cx: &PragmaCtx, out: &mut Vec<Se
             "`@permission` has no effect without `@expose` — this function is not exposed, \
              so the permission is never checked; add `@expose` or remove the permission"
                 .to_string(),
-            u.ann.byte_range.clone(),
+            u.ann.name.byte_range.clone(),
         ));
     }
 }

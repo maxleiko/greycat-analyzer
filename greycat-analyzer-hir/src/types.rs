@@ -51,16 +51,16 @@ pub struct Modifiers {
 /// is no interpolation, no `${...}` — and they repeat heavily
 /// across decls (`@expose`, `@tag("mcp")`, `@permission("admin")`
 /// on dozens of fns), so interning them is a straight win.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Annotation {
-    /// Annotation name as an interned symbol (e.g. `expose`,
-    /// `tag`, `permission`).
-    pub name: Symbol,
+    /// Annotation name as an [`Ident`] — the interned symbol (e.g.
+    /// `expose`, `tag`, `permission`) plus the source span of the
+    /// name token. The span lets the pragma validator point a
+    /// diagnostic at the pragma name itself (e.g. "@permission has no
+    /// effect without @expose", or a future "unknown pragma" /
+    /// "redundant permission").
+    pub name: Ident,
     pub args: Box<[AnnotationArg]>,
-    /// Source span of the whole `@name(...)` annotation. Lets the
-    /// pragma validator point a diagnostic at the annotation itself
-    /// (e.g. "@permission has no effect without @expose").
-    pub byte_range: Span,
 }
 
 impl Annotation {
@@ -79,6 +79,17 @@ impl Annotation {
         self.arg_strings().next()
     }
 }
+
+// Equality ignores the name's source span — an annotation's identity
+// is its name symbol + args, not where it sits in source (matches the
+// span-excluding `PartialEq` on [`AnnotationArg`]).
+impl PartialEq for Annotation {
+    fn eq(&self, other: &Self) -> bool {
+        self.name.symbol == other.name.symbol && self.args == other.args
+    }
+}
+
+impl Eq for Annotation {}
 
 /// A single annotation argument: its compile-time value
 /// ([`AnnotationArgKind`]) plus the source [`Span`] it came from.

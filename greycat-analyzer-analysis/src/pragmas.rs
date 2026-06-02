@@ -169,7 +169,7 @@ fn check_site(
         .collect();
     let cx = PragmaCtx { index };
     for u in &uses {
-        let name = &index.symbols[u.ann.name];
+        let name = &index.symbols[u.ann.name.symbol];
         let Some(contract) = contract_for(name) else {
             // Unregistered pragma — ignored for now. A future
             // "unexpected pragma" catch-all (once the registry covers
@@ -204,7 +204,7 @@ fn validate_args(u: &PragmaUse, sig: &ArgSig, pragma: &str, out: &mut Vec<Semant
                          {min} {} argument{plural}",
                         ty.label()
                     ),
-                    u.ann.byte_range.clone(),
+                    u.ann.name.byte_range.clone(),
                 ));
             }
             // Wrong-typed arg — hard error, matching the runtime.

@@ -40,7 +40,7 @@ pub fn push_annotations(out: &mut String, symbols: &SymbolTable, annotations: &[
     use std::fmt::Write;
     for ann in annotations {
         out.push('@');
-        out.push_str(&symbols[ann.name]);
+        out.push_str(&symbols[ann.name.symbol]);
         if !ann.args.is_empty() {
             out.push('(');
             for (i, arg) in ann.args.iter().enumerate() {

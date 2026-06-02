@@ -1115,7 +1115,7 @@ impl ProjectIndex {
                     .map(|n| hir.idents[n].symbol)
                     .unwrap_or_else(|| self.symbols.intern(""));
                 for ann in &modifiers.annotations {
-                    if &self.symbols[ann.name] != "expose" {
+                    if &self.symbols[ann.name.symbol] != "expose" {
                         continue;
                     }
                     let rename = ann.first_string_arg();
@@ -1247,7 +1247,7 @@ pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
 fn derive_type_flags(symbols: &SymbolTable, annotations: &[Annotation]) -> TypeFlags {
     let mut flags = TypeFlags::default();
     for ann in annotations {
-        match &symbols[ann.name] {
+        match &symbols[ann.name.symbol] {
             "iterable" => flags.iterable = true,
             "primitive" => flags.primitive = true,
             "deref" => {
