@@ -65,7 +65,7 @@ Stop trusting the editor's `workspace/didChangeWatchedFiles` for filesystem delt
 **Chunks:**
 
 - [x] **34.1 Add `notify` dep + per-Backend watcher thread** (S) — spawn in `Backend::initialized` (or lazily on first project load). Channel into the main loop. Plumb `WatcherEvent { uri, kind: Create | Modify | Remove }`.
-- [ ] **34.2 Root registration** (S) — `Backend::register_fs_root(path)` / `unregister_fs_root(path)`, called from `load_workspace`, `spawn_lazy_project`, `drop_project`, `did_change_workspace_folders`. Watch only what's loaded.
+- [x] **34.2 Root registration** (S) — `Backend::register_fs_root(path)` / `unregister_fs_root(path)`, called from `load_workspace`, `spawn_lazy_project`, `drop_project`, `did_change_workspace_folders`. Watch only what's loaded. *(Implemented as a single `resync_watch_roots` that diffs the desired set — workspace folders + global std + project libs, canonicalized + containment-deduped — against the watched set, called from `initialized` / `spawn_lazy_project` / `did_change_workspace_folders`.)*
 - [x] **34.3 Event → handler dispatch** (M) — main loop's `select!` between `conn.receiver` and the watcher channel. Debounce. Translate notify events into the existing `did_change_watched_files`-shaped processing.
 - [x] **34.4 Editor-watcher coexistence** (S) — keep the existing `register_file_watchers` capability registration so editors that *do* forward events still work; route both paths through a shared `apply_fs_event`. Avoid double-counting identical events.
 - [ ] **34.5 Tests** (S) — drop a real file on disk between `did_open` and a subsequent `goto_definition`; assert the LSP picks up the change without an editor-side event. Test the failure-to-start fallback by injecting a watcher mock that always errors.

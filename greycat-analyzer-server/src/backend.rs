@@ -8,7 +8,7 @@ use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::module_desc::parse_module_desc;
 use greycat_analyzer_core::path_to_uri;
 use greycat_analyzer_core::registry::RegistryFetcher;
-use greycat_analyzer_core::resolver::FsContext;
+use greycat_analyzer_core::resolver::{FsContext, global_std_dir};
 use greycat_analyzer_core::{
     Document, SourceManager, StdResolution,
     diagnostics::{
@@ -585,6 +585,90 @@ impl Backend {
         }
     }
 
+    // P34.2
+    /// The set of directories the in-process watcher should be watching
+    /// right now, derived from current state: every existing workspace
+    /// folder, the global `<greycat_home>/lib/std` (the std fallback,
+    /// which lives outside any workspace folder), and every loaded
+    /// project's local `lib/` subtree. Roots are canonicalized so the
+    /// paths notify reports match the loader's canonical `uri_owner`
+    /// keys, and contained roots are dropped (a project's `lib/` under a
+    /// watched workspace folder is already covered recursively).
+    ///
+    /// Only existing directories are included: notify errors on a
+    /// missing path, and a not-yet-created `lib/` (before the first
+    /// `greycat install`) is covered by the enclosing workspace-folder
+    /// watch, which sees the directory appear.
+    fn compute_desired_roots(&self) -> FxHashSet<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for ws in &self.workspace_roots {
+            if ws.is_dir() {
+                roots.push(ws.canonicalize().unwrap_or_else(|_| ws.clone()));
+            }
+        }
+        if let Some(home) = &self.greycat_home {
+            let std_dir = global_std_dir(home);
+            if std_dir.is_dir() {
+                roots.push(std_dir.canonicalize().unwrap_or(std_dir));
+            }
+        }
+        for project in self.projects.values() {
+            if project.root.as_os_str().is_empty() {
+                continue;
+            }
+            let lib = project.root.join("lib");
+            if lib.is_dir() {
+                roots.push(lib.canonicalize().unwrap_or(lib));
+            }
+        }
+        dedup_contained(roots)
+    }
+
+    // P34.2
+    /// Diff the desired watch-root set against what's currently watched
+    /// and apply the delta: unwatch roots that dropped out (a project
+    /// closed, a workspace folder removed) and watch the new ones. A
+    /// no-op when there's no watcher (notify failed to start). Called
+    /// after every structural change — eager load, lazy spawn, folder
+    /// add/remove — so the watch set tracks the loaded closure.
+    fn resync_watch_roots(&mut self) {
+        if self.watcher.is_none() {
+            return;
+        }
+        let desired = self.compute_desired_roots();
+        let stale: Vec<PathBuf> = self
+            .watched_roots
+            .iter()
+            .filter(|w| !desired.contains(*w))
+            .cloned()
+            .collect();
+        for old in stale {
+            if let Some(w) = self.watcher.as_mut() {
+                let _ = watcher::unwatch(w, &old);
+            }
+            self.watched_roots.remove(&old);
+            debug!("[{SERVER_LOG_TAG}][watch] unwatched {}", old.display());
+        }
+        for new in &desired {
+            if self.watched_roots.contains(new) {
+                continue;
+            }
+            let Some(w) = self.watcher.as_mut() else {
+                return;
+            };
+            match watcher::watch(w, new) {
+                Ok(()) => {
+                    self.watched_roots.insert(new.clone());
+                    info!("[{SERVER_LOG_TAG}][watch] watching {}", new.display());
+                }
+                Err(e) => warn!(
+                    "[{SERVER_LOG_TAG}][watch] failed to watch {}: {e}",
+                    new.display()
+                ),
+            }
+        }
+    }
+
     pub fn initialized(&mut self, init: &InitializeParams) -> Result<()> {
         // Pull `lintLibs` (and any future settings) out of
         // `initializationOptions` before walking workspace folders so
@@ -628,6 +712,11 @@ impl Backend {
                 "[{SERVER_LOG_TAG}][init] client does not support didChangeWatchedFiles dynamic registration"
             );
         }
+        // P34.2 — begin watching the eagerly-loaded closure (workspace
+        // folders, global std, project libs). Independent of the editor
+        // watcher above: the in-process watcher covers clients that
+        // don't forward `didChangeWatchedFiles`.
+        self.resync_watch_roots();
         Ok(())
     }
 
@@ -847,6 +936,9 @@ impl Backend {
         for u in &reachable {
             self.bind_uri(u.clone(), root_path.clone());
         }
+        // P34.2 — a lazily-spawned project adds its local `lib/` to the
+        // watch set (when not already covered by a workspace-folder watch).
+        self.resync_watch_roots();
     }
 
     pub fn did_change(&mut self, params: DidChangeTextDocumentParams) -> Result<()> {
@@ -1191,6 +1283,10 @@ impl Backend {
             // Drop the workspace root itself.
             self.workspace_roots.retain(|w| w != &path);
         }
+        // P34.2 — folders added → their closures join the watch set;
+        // folders removed → their roots (and now-dropped project libs)
+        // fall out. One resync reconciles both.
+        self.resync_watch_roots();
         Ok(())
     }
 
@@ -1431,6 +1527,30 @@ pub(crate) fn find_owning_project_root(uri: &Uri, workspace_roots: &[PathBuf]) -
             None => return None,
         }
     }
+}
+
+// P34.2
+/// Drop any path that is contained in another path in the set, so we
+/// never register overlapping recursive watches (which would deliver
+/// duplicate events and waste watch descriptors). A `lib/` under a
+/// watched workspace folder, for instance, falls away — the folder
+/// watch already covers it recursively.
+fn dedup_contained(roots: Vec<PathBuf>) -> FxHashSet<PathBuf> {
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        if !unique.contains(&r) {
+            unique.push(r);
+        }
+    }
+    unique
+        .iter()
+        .filter(|r| {
+            !unique
+                .iter()
+                .any(|other| other.as_path() != r.as_path() && r.starts_with(other))
+        })
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn publish_diagnostics(
