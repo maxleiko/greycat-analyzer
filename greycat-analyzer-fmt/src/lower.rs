@@ -1325,8 +1325,19 @@ fn lower_binary_expr<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
             ])),
         ]));
     }
-    // Wrap remaining non-chain binops (`==`, `!=`, `<`, `>`, `<=`, `>=`,
-    // `as`, `is`) in their own Group with a `Line` break-point before
+    // `as` / `is` casts cannot start a continuation line — the parser
+    // treats the preceding line as a complete statement and then chokes
+    // on a leading `as` / `is` (`missing-semicolon` + `parse-error`).
+    // Keep the cast glued to its left operand with a non-breaking space.
+    // The left operand keeps its own break opportunities; the renderer's
+    // fits-check measures the trailing ` as <type>` as continuation, so
+    // a too-wide `left as T` still breaks *inside* `left` rather than
+    // before the operator.
+    if op == "as" || op == "is" {
+        return Doc::concat(vec![left, Doc::space(), Doc::text(op), Doc::space(), right]);
+    }
+    // Wrap remaining non-chain binops (`==`, `!=`, `<`, `>`, `<=`, `>=`)
+    // in their own Group with a `Line` break-point before
     // the operator. This makes the operator the outer break boundary —
     // when the surrounding expression overflows, the binop breaks at the
     // operator first, and any nested member/arrow chain inside `left` /

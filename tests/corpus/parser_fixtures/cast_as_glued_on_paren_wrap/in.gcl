@@ -1,0 +1,4 @@
+fn f(): float {
+    var c = (aaaaaaaaaaaaaaaaaaaa + bbbbbbbbbbbbbbbbbbbb + cccccccccccccccccccc + dddddddddddddddddddd + eeeeeeeeeeeeeeeeeeee) as float;
+    return c;
+}

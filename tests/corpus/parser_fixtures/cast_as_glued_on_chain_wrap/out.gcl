@@ -1,0 +1,7 @@
+fn computeMaxCapacity(idealCycleTime: float): int {
+    var maxCapacityParts = ShiftUtils::getShiftDurationValueWithAVeryLongName(
+        ShiftUtils::getShiftNumberWithLongName(12, 34)
+    ).to(DurationUnit::seconds)
+        / idealCycleTime as int;
+    return maxCapacityParts;
+}

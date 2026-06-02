@@ -1,0 +1,77 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn computeMaxCapacity(idealCycleTime: float): int {\n    var maxCapacityParts = ShiftUtils::getShiftDurationValueWithAVeryLongName(\n        ShiftUtils::getShiftNumberWithLongName(12, 34)\n    ).to(DurationUnit::seconds)\n        / idealCycleTime as int;\n    return maxCapacityParts;\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'computeMaxCapacity')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'idealCycleTime')
+        type: (type_ident
+          name: (ident 'float')
+        )
+      )
+    )
+    return_type: (type_ident
+      name: (ident 'int')
+    )
+    body: (block
+      (var_decl
+        name: (ident 'maxCapacityParts')
+        (initializer
+          expr: (binary_expr
+            left: (binary_expr
+              left: (call_expr
+                fn: (member_expr
+                  (call_expr
+                    fn: (static_expr
+                      (type_ident
+                        name: (ident 'ShiftUtils')
+                      )
+                      property: (ident 'getShiftDurationValueWithAVeryLongName')
+                    )
+                    (args
+                      (call_expr
+                        fn: (static_expr
+                          (type_ident
+                            name: (ident 'ShiftUtils')
+                          )
+                          property: (ident 'getShiftNumberWithLongName')
+                        )
+                        (args
+                          (number
+                            (number_int '12')
+                          )
+                          (number
+                            (number_int '34')
+                          )
+                        )
+                      )
+                    )
+                  )
+                  property: (ident 'to')
+                )
+                (args
+                  (static_expr
+                    (type_ident
+                      name: (ident 'DurationUnit')
+                    )
+                    property: (ident 'seconds')
+                  )
+                )
+              )
+              right: (ident 'idealCycleTime')
+            )
+            right: (type_ident
+              name: (ident 'int')
+            )
+          )
+        )
+      )
+      (return_stmt
+        (ident 'maxCapacityParts')
+      )
+    )
+  )
+)

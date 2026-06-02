@@ -1,0 +1,43 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn f(): float {\n    var c = (aaaaaaaaaaaaaaaaaaaa + bbbbbbbbbbbbbbbbbbbb + cccccccccccccccccccc + dddddddddddddddddddd + eeeeeeeeeeeeeeeeeeee) as float;\n    return c;\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    return_type: (type_ident
+      name: (ident 'float')
+    )
+    body: (block
+      (var_decl
+        name: (ident 'c')
+        (initializer
+          expr: (binary_expr
+            left: (paren_expr
+              expr: (binary_expr
+                left: (binary_expr
+                  left: (binary_expr
+                    left: (binary_expr
+                      left: (ident 'aaaaaaaaaaaaaaaaaaaa')
+                      right: (ident 'bbbbbbbbbbbbbbbbbbbb')
+                    )
+                    right: (ident 'cccccccccccccccccccc')
+                  )
+                  right: (ident 'dddddddddddddddddddd')
+                )
+                right: (ident 'eeeeeeeeeeeeeeeeeeee')
+              )
+            )
+            right: (type_ident
+              name: (ident 'float')
+            )
+          )
+        )
+      )
+      (return_stmt
+        (ident 'c')
+      )
+    )
+  )
+)
