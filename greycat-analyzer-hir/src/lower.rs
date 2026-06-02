@@ -904,6 +904,16 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             // of how the parser split it.
             let iter_node = node.child_by_field_name("iterator").ok_or(()).ok();
             let range_node = node.child_by_field_name("range");
+            // The grammar's single `optional($.optional)` slot sits between
+            // the iterator and the `range` field (grammar.js `for_in_stmt`),
+            // so the only direct `optional` child of `for_in_stmt` is the
+            // iterator's null-safe `?` from `recv?[from..to]`. Thread it into
+            // the synthesized Offset — without it the access reads as a plain
+            // `recv[from..to]` and the possibly-null lint false-fires on what
+            // the source explicitly marked null-safe.
+            let pre_optional = node
+                .named_children(&mut node.walk())
+                .any(|c| c.kind() == "optional");
             let range = match (iter_node, range_node) {
                 (Some(iter), Some(rng)) => {
                     let recv = lower_expr(cx, iter)?;
@@ -912,7 +922,7 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
                     cx.hir.exprs.alloc(Expr::Offset(OffsetExpr {
                         receiver: recv,
                         index: idx,
-                        pre_optional: false,
+                        pre_optional,
                         post_optional: false,
                         byte_range: span,
                     }))

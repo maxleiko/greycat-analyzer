@@ -3003,6 +3003,50 @@ fn f(x: String?) {
     }
 
     #[test]
+    fn for_in_optional_index_suppresses_possibly_null() {
+        // `for (_, _ in recv?[from..to])` — the grammar splits the
+        // null-safe `?[from..to]` into `iterator` + `(optional)` +
+        // `range`, and the lowering folds it back into a single
+        // `Offset` carrying `pre_optional`. The explicit `?` opts into
+        // null-safety, so `possibly-null` must NOT fire on `recv`.
+        let diags = project_lints(
+            r#"
+type Foo {
+    native static fn getLoad(): nodeTime<int>?;
+    static fn f(from: time, to: time) {
+        for (_, _ in Foo::getLoad()?[from..to]) {}
+    }
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "`?[from..to]` on a nullable iterator is explicitly null-safe; should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn for_in_plain_index_on_nullable_still_warns() {
+        // Same shape WITHOUT the `?` — `recv[from..to]` on a nullable
+        // iterator is a genuine unguarded access. The suppression above
+        // must not leak to this case: `possibly-null` SHOULD fire.
+        let diags = project_lints(
+            r#"
+type Foo {
+    native static fn getLoad(): nodeTime<int>?;
+    static fn f(from: time, to: time) {
+        for (_, _ in Foo::getLoad()[from..to]) {}
+    }
+}
+"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "possibly-null"),
+            "`[from..to]` (no `?`) on a nullable iterator is unguarded; should flag: {diags:?}"
+        );
+    }
+
+    #[test]
     fn narrowed_receiver_suppresses_possibly_null() {
         // P19.16's narrows fold into `expr_types`, so the second `x`
         // visit is non-null. The lint reads the narrowed type — no
