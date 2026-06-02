@@ -6,6 +6,7 @@ use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::module_desc::parse_module_desc;
+use greycat_analyzer_core::path_to_uri;
 use greycat_analyzer_core::registry::RegistryFetcher;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
@@ -33,6 +34,7 @@ pub type OwnerList = SmallVec<[PathBuf; 1]>;
 
 use crate::Result;
 use crate::capabilities::diagnostics_from_module;
+use crate::watcher::{self, FsWatcher, is_gcl, is_installed_manifest, is_relevant};
 
 /// Threshold above which a per-edit rebuild is surfaced as a one-line
 /// `info!` so users see hot spots without flooding the log on healthy
@@ -225,6 +227,35 @@ pub struct Backend {
     /// debounce — every keystroke fires the analyzer immediately
     /// (matches pre-debounce behavior).
     pub diagnostics_debounce: Duration,
+    // P34.1
+    /// In-process `notify` watcher. `None` when it failed to start
+    /// (sandbox without inotify, watch exhaustion, …) — the server
+    /// then runs exactly as before, leaning on the editor's
+    /// `didChangeWatchedFiles`. Held here so the OS watch lives as
+    /// long as the server.
+    pub watcher: Option<FsWatcher>,
+    // P34.2
+    /// Roots currently registered with [`Self::watcher`], recursive.
+    /// Diffed against the desired set on every project load / drop so
+    /// watches track the loaded closure (see [`Self::resync_watch_roots`]).
+    /// Empty when there's no watcher.
+    pub watched_roots: FxHashSet<PathBuf>,
+    // P34.3
+    /// Debounce buffer: paths reported by the watcher since the last
+    /// flush, pre-filtered to `.gcl` / `lib/installed`. Coalesced to a
+    /// set so a `greycat install` burst collapses to one flush.
+    pub pending_fs_events: FxHashSet<PathBuf>,
+    // P34.3
+    /// Deadline at which [`Self::pending_fs_events`] flushes. Pushed
+    /// out on every fresh event (trailing debounce) so a contiguous
+    /// burst flushes once it settles. `None` when the buffer is empty.
+    pub fs_flush_deadline: Option<Instant>,
+    // P34.2
+    /// Resolved `$GREYCAT_HOME` (or `$HOME/.greycat`), captured once at
+    /// startup. Drives the global `<home>/lib/std` watch root. `None`
+    /// when the home couldn't be resolved (then std lives only under a
+    /// project's local `lib/std`, already covered by the project watch).
+    pub greycat_home: Option<PathBuf>,
 }
 
 impl Backend {
@@ -463,6 +494,94 @@ impl Backend {
                     tag = self.tag_for(&uri)
                 );
             }
+        }
+    }
+
+    // P34.3
+    /// Earliest deadline the main loop's `select!` timeout-arm must wake
+    /// for: the sooner of a pending trailing analyzer publish and a
+    /// pending filesystem-event flush. `None` when neither is scheduled
+    /// (the loop falls back to a long idle timer).
+    pub fn next_deadline(&self) -> Option<Instant> {
+        match (self.next_trailing_deadline(), self.fs_flush_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    // P34.3
+    /// Buffer one raw notify event into the debounce window. Runs on the
+    /// main thread (the watcher thread only forwards). Irrelevant paths
+    /// (non-`.gcl`, non-`lib/installed`) and pure access events are
+    /// dropped here so the buffer only ever holds paths worth a reload.
+    /// The flush deadline is pushed out on every fresh event so a
+    /// contiguous burst (a `greycat install`) coalesces into one flush.
+    pub fn on_fs_event(&mut self, res: watcher::RawFsEvent) {
+        let event = match res {
+            Ok(ev) => ev,
+            Err(e) => {
+                warn!("[{SERVER_LOG_TAG}][watch] notify error: {e}");
+                return;
+            }
+        };
+        // Access events (reads, opens) never change content — ignore.
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
+        let mut buffered = false;
+        for path in event.paths {
+            if is_relevant(&path) {
+                self.pending_fs_events.insert(path);
+                buffered = true;
+            }
+        }
+        if buffered {
+            self.fs_flush_deadline = Some(Instant::now() + watcher::FS_DEBOUNCE_DEFAULT);
+        }
+    }
+
+    // P34.3
+    /// Flush the debounce buffer once its deadline has passed: classify
+    /// each buffered path by re-statting the disk (notify's per-event
+    /// kind is unreliable across platforms, so we derive CREATED /
+    /// CHANGED / DELETED from current existence + whether the URI is
+    /// already loaded) and hand the batch to the shared
+    /// [`Self::apply_fs_changes`] processor. A no-op until the deadline
+    /// is due, so the main loop can call it unconditionally.
+    pub fn flush_fs_events(&mut self) {
+        let Some(deadline) = self.fs_flush_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.fs_flush_deadline = None;
+        if self.pending_fs_events.is_empty() {
+            return;
+        }
+        let paths = std::mem::take(&mut self.pending_fs_events);
+        let mut changes: Vec<FileEvent> = Vec::with_capacity(paths.len());
+        for path in paths {
+            // Mirror the loader's URI formatting: canonicalize-or-self
+            // then `path_to_uri`, so the synthesized URI matches the key
+            // the manager stored for an already-loaded file.
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let uri = path_to_uri(&canonical);
+            let typ = if !path.exists() {
+                FileChangeType::DELETED
+            } else if self.uri_owner.contains_key(&uri) {
+                FileChangeType::CHANGED
+            } else {
+                FileChangeType::CREATED
+            };
+            changes.push(FileEvent { uri, typ });
+        }
+        debug!(
+            "[{SERVER_LOG_TAG}][watch] flushing {} debounced fs event(s)",
+            changes.len()
+        );
+        if let Err(e) = self.apply_fs_changes(changes) {
+            warn!("[{SERVER_LOG_TAG}][watch] apply_fs_changes failed: {e}");
         }
     }
 
@@ -1116,29 +1235,34 @@ impl Backend {
     ///
     /// In-editor edits (`did_change`) are NOT routed through this path
     /// — they go through the textDocument flow. P32.7 will replace the
-    /// "reload every project" fan-out below with per-project routing
-    /// based on which project owns each event's path.
+    /// The detailed processing lives in [`Self::apply_fs_changes`],
+    /// shared with the in-process notify watcher (P34.4).
     pub fn did_change_watched_files(&mut self, params: DidChangeWatchedFilesParams) -> Result<()> {
-        if params.changes.is_empty() {
+        self.apply_fs_changes(params.changes)
+    }
+
+    // P34.4
+    /// Apply a batch of filesystem change events, regardless of source.
+    /// Both the editor's `didChangeWatchedFiles` and the in-process
+    /// notify watcher's debounced flush funnel here, so there is exactly
+    /// one reload code path. Re-running it for a duplicate event (both
+    /// sources firing for the same change) is idempotent — closure
+    /// reloads preserve already-loaded files and refresh-from-disk is a
+    /// no-op when the bytes match.
+    fn apply_fs_changes(&mut self, changes: Vec<FileEvent>) -> Result<()> {
+        if changes.is_empty() {
             return Ok(());
         }
         // P32.7 — bucket reload triggers per project so a watcher
         // event in projectA never wakes up projectB.
         let mut reload_set: FxHashSet<PathBuf> = FxHashSet::default();
-        for ev in &params.changes {
+        for ev in &changes {
             let uri = &ev.uri;
             let path = match uri_to_path(uri) {
                 Some(p) => p,
                 None => continue,
             };
-            let is_installed = path.file_name().and_then(|n| n.to_str()) == Some("installed")
-                && path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    == Some("lib");
-            let is_gcl = path.extension().and_then(|e| e.to_str()) == Some("gcl");
-            if is_installed {
+            if is_installed_manifest(&path) {
                 // path = <proj_root>/lib/installed; project root is
                 // path.parent().parent(). Only schedule a reload when
                 // the implied root maps to a loaded project; events
@@ -1158,7 +1282,7 @@ impl Backend {
                 }
                 continue;
             }
-            if !is_gcl {
+            if !is_gcl(&path) {
                 continue;
             }
             // Skip files the editor owns the live state of — `did_change`
@@ -1353,6 +1477,16 @@ mod tests {
                 pending_trailing: FxHashMap::default(),
                 last_analyzer_diags: FxHashMap::default(),
                 diagnostics_debounce: DIAGNOSTICS_DEBOUNCE_DEFAULT,
+                // P34 — unit-test backend has no real watcher; the
+                // event-processing path is driven by calling
+                // `on_fs_event` / `flush_fs_events` / `apply_fs_changes`
+                // directly. `watcher: None` also exercises the
+                // failed-to-start fallback (resync is a no-op).
+                watcher: None,
+                watched_roots: FxHashSet::default(),
+                pending_fs_events: FxHashSet::default(),
+                fs_flush_deadline: None,
+                greycat_home: None,
             },
             rx,
         )

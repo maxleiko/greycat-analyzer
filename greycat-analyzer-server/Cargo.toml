@@ -22,6 +22,7 @@ dashmap.workspace = true
 log.workspace = true
 lsp-server.workspace = true
 lsp-types.workspace = true
+notify.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 smallvec.workspace = true

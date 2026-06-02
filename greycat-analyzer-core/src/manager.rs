@@ -465,7 +465,15 @@ impl LoadReport {
     }
 }
 
-fn path_to_uri(path: &Path) -> Uri {
+/// Build a `file://` [`Uri`] from a filesystem path. The single
+/// source of truth for path → URI formatting so every producer
+/// (loader, LSP watcher, tests) yields byte-identical URIs — keys in
+/// `uri_owner` / the manager's document map are compared verbatim, so
+/// a divergent encoding would silently fail to match a loaded file.
+/// Callers that need the URI to match a *loaded* document must pass an
+/// already-canonicalized path (the loader canonicalizes before calling
+/// this).
+pub fn path_to_uri(path: &Path) -> Uri {
     let s = format!("file://{}", path.display());
     s.parse::<Uri>()
         .unwrap_or_else(|_| "file:///invalid".parse().unwrap())

@@ -27,6 +27,7 @@ pub mod capabilities;
 pub(crate) mod conv;
 pub mod registry;
 mod server;
+mod watcher;
 
 pub use server::*;
 

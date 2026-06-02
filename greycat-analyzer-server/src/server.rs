@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{RecvError, select};
+use crossbeam_channel::{RecvError, select, unbounded};
 use greycat_analyzer_core::SourceEncoding;
 use log::{debug, info};
 use lsp_server::*;
@@ -154,6 +154,16 @@ fn negotiated_encoding(init: &InitializeParams) -> SourceEncoding {
 fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding) -> Result<()> {
     info!("greycat-analyzer {VERSION} started");
 
+    // P34.1 — in-process filesystem watcher. The channel outlives the
+    // watcher: keep the original `fs_tx` alive for the whole loop so
+    // `fs_rx` never disconnects (and the `recv(fs_rx)` select arm never
+    // busy-spins) even when `start_watcher` returns `None` (notify
+    // failed to start → the editor-driven `didChangeWatchedFiles` path
+    // stays wired as the fallback).
+    let (fs_tx, fs_rx) = unbounded();
+    let watcher = crate::watcher::start_watcher(fs_tx.clone());
+    let greycat_home = greycat_analyzer_core::resolver::try_greycat_home().ok();
+
     let mut server = Backend {
         client: conn.sender.clone(),
         projects: Default::default(),
@@ -170,6 +180,11 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
         pending_trailing: Default::default(),
         last_analyzer_diags: Default::default(),
         diagnostics_debounce: crate::backend::DIAGNOSTICS_DEBOUNCE_DEFAULT,
+        watcher,
+        watched_roots: Default::default(),
+        pending_fs_events: Default::default(),
+        fs_flush_deadline: None,
+        greycat_home,
     };
 
     server.initialized(&init)?;
@@ -182,7 +197,7 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
 
     loop {
         let timeout = server
-            .next_trailing_deadline()
+            .next_deadline()
             .and_then(|t| t.checked_duration_since(Instant::now()))
             .unwrap_or(IDLE_WAKE);
         select! {
@@ -220,8 +235,19 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
                 },
                 Err(RecvError) => return Ok(()),
             },
+            // P34.3 — in-process watcher events. The watcher thread only
+            // forwards raw notify payloads; debounce + classification +
+            // dispatch into the shared reload path happen here on the
+            // main thread. A disconnected channel (`Err`) can't happen
+            // while `fs_tx` is held above, so an `if let` suffices.
+            recv(fs_rx) -> res => {
+                if let Ok(raw) = res {
+                    server.on_fs_event(raw);
+                }
+            },
             default(timeout) => {
                 server.flush_trailing();
+                server.flush_fs_events();
             }
         }
     }
