@@ -1437,9 +1437,19 @@ impl Backend {
                     };
                     for root in &owners {
                         if let Some(project) = self.projects.get_mut(root) {
+                            // Preserve the existing library tag — a
+                            // hardcoded "project" would reclassify std/lib
+                            // files, defeating the `lint_libs` suppression
+                            // gate and flooding the editor with library
+                            // diagnostics on every `greycat install`.
+                            let lib = project
+                                .manager
+                                .get(uri)
+                                .map(|cell| cell.borrow().lib.clone())
+                                .unwrap_or_else(|| "project".to_string());
                             project
                                 .manager
-                                .add_simple(uri.clone(), text.clone(), "project", false);
+                                .add_simple(uri.clone(), text.clone(), lib, false);
                         }
                     }
                     self.invalidate_with_slow_warning(uri, "watch");
@@ -1929,6 +1939,120 @@ mod tests {
         let mut ev = notify::Event::new(kind);
         ev.paths.push(path.to_path_buf());
         Ok(ev)
+    }
+
+    /// Drain the client channel and return the most recent
+    /// `publishDiagnostics` payload for `uri` (if any).
+    fn latest_published_diags(rx: &Receiver<Message>, uri: &Uri) -> Option<Vec<Diagnostic>> {
+        let mut latest = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Notification(n) = msg
+                && n.method == "textDocument/publishDiagnostics"
+            {
+                let params: PublishDiagnosticsParams =
+                    serde_json::from_value(n.params).expect("valid publishDiagnostics params");
+                if &params.uri == uri {
+                    latest = Some(params.diagnostics);
+                }
+            }
+        }
+        latest
+    }
+
+    /// Project with a local `@library("mylib")` whose single module
+    /// carries a semantic error. Returns (tmp_root, project_root,
+    /// lib_file_path, lib_installed_path).
+    fn fixture_project_with_lib(slug: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!(
+            "gca_libtag_{}_{}_{}",
+            slug,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let proj = tmp.join("proj");
+        let lib_dir = proj.join("lib").join("mylib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(proj.join("project.gcl"), "@library(\"mylib\", \"1.0\");\n").unwrap();
+        // A return-type mismatch: a real semantic diagnostic that must
+        // stay suppressed while the file is library-owned.
+        let lib_file = lib_dir.join("types.gcl");
+        std::fs::write(&lib_file, "fn helper(): int { return \"oops\"; }\n").unwrap();
+        let installed = proj.join("lib").join("installed");
+        std::fs::write(&installed, "mylib=1.0\n").unwrap();
+        (tmp, proj, lib_file, installed)
+    }
+
+    // P34 — lib-tag regression
+    /// Reproduces "diagnostics pile up after `greycat install`": an
+    /// install rewrites every library file (CHANGED events). The watcher
+    /// must refresh content WITHOUT reclassifying the file from its
+    /// library tag (`mylib`) to `project` — otherwise the `lint_libs`
+    /// suppression gate (`from_module` keys off `module.lib != "project"`)
+    /// stops applying and the library's internal diagnostics flood the
+    /// editor. The follow-up `lib/installed` closure reload must not
+    /// resurrect the mistag either (`load_file` skips loaded files, so a
+    /// bad tag would stick).
+    #[test]
+    fn changed_library_file_keeps_tag_and_stays_suppressed() {
+        let (tmp, proj, lib_file, installed) = fixture_project_with_lib("changed");
+        let (mut b, rx) = backend();
+        b.workspace_roots.push(tmp.clone());
+        b.load_workspace(&path_uri(&proj));
+
+        let lib_uri = path_uri(&lib_file);
+        let lib_tag = |b: &Backend| {
+            b.projects
+                .get(&proj)
+                .unwrap()
+                .manager
+                .get(&lib_uri)
+                .unwrap()
+                .borrow()
+                .lib
+                .clone()
+        };
+        // Loaded as a library; its diagnostics are suppressed.
+        assert_eq!(lib_tag(&b), "mylib");
+        assert!(
+            latest_published_diags(&rx, &lib_uri).is_none_or(|d| d.is_empty()),
+            "library diagnostics must be suppressed on initial load"
+        );
+
+        // Simulate `greycat install`: rewrite the library file in place
+        // (CHANGED) + touch lib/installed (triggers a closure reload).
+        std::fs::write(&lib_file, "fn helper(): int { return \"still-bad\"; }\n").unwrap();
+        b.did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![
+                FileEvent {
+                    uri: lib_uri.clone(),
+                    typ: FileChangeType::CHANGED,
+                },
+                FileEvent {
+                    uri: path_uri(&installed),
+                    typ: FileChangeType::CHANGED,
+                },
+            ],
+        })
+        .unwrap();
+
+        // The fix: the tag survives the refresh + reload...
+        assert_eq!(
+            lib_tag(&b),
+            "mylib",
+            "a CHANGED event must not reclassify a library file as project-owned"
+        );
+        // ...so the user-visible symptom is gone: no library diagnostics.
+        assert!(
+            latest_published_diags(&rx, &lib_uri).is_none_or(|d| d.is_empty()),
+            "library diagnostics must STAY suppressed after `greycat install`; \
+             re-tagging to `project` is what made them pile up"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // P34.3
