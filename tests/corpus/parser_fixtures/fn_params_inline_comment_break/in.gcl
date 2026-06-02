@@ -1,0 +1,3 @@
+fn longParamsWithComments(firstParameter: int /* a */, secondParameter: int, thirdParameter: int /* trailing c */, fourthParameter: int, fifthParameter: int): int {
+    return firstParameter;
+}

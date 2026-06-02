@@ -1,0 +1,51 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn longParamsWithComments(firstParameter: int /* a */, secondParameter: int, thirdParameter: int /* trailing c */, fourthParameter: int, fifthParameter: int): int {\n    return firstParameter;\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'longParamsWithComments')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'firstParameter')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      (block_comment '/* a */')
+      param: (fn_param
+        name: (ident 'secondParameter')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'thirdParameter')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      (block_comment '/* trailing c */')
+      param: (fn_param
+        name: (ident 'fourthParameter')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+      param: (fn_param
+        name: (ident 'fifthParameter')
+        type: (type_ident
+          name: (ident 'int')
+        )
+      )
+    )
+    return_type: (type_ident
+      name: (ident 'int')
+    )
+    body: (block
+      (return_stmt
+        (ident 'firstParameter')
+      )
+    )
+  )
+)

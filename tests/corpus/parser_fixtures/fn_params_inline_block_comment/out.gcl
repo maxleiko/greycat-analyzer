@@ -1,0 +1,3 @@
+fn pa_getStopsCounter(useStationName: bool /* ignored */, groupByRef: bool, onlyStation: bool /* ignored */): bool {
+    return useStationName && groupByRef && onlyStation;
+}

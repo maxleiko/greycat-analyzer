@@ -1,0 +1,45 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+expression: "fn pa_getStopsCounter(useStationName: bool /* ignored */, groupByRef: bool, onlyStation: bool /* ignored */): bool {\n    return useStationName && groupByRef && onlyStation;\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'pa_getStopsCounter')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'useStationName')
+        type: (type_ident
+          name: (ident 'bool')
+        )
+      )
+      (block_comment '/* ignored */')
+      param: (fn_param
+        name: (ident 'groupByRef')
+        type: (type_ident
+          name: (ident 'bool')
+        )
+      )
+      param: (fn_param
+        name: (ident 'onlyStation')
+        type: (type_ident
+          name: (ident 'bool')
+        )
+      )
+      (block_comment '/* ignored */')
+    )
+    return_type: (type_ident
+      name: (ident 'bool')
+    )
+    body: (block
+      (return_stmt
+        (binary_expr
+          left: (binary_expr
+            left: (ident 'useStationName')
+            right: (ident 'groupByRef')
+          )
+          right: (ident 'onlyStation')
+        )
+      )
+    )
+  )
+)

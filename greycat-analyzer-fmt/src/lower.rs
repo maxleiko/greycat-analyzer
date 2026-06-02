@@ -684,25 +684,89 @@ fn lower_enum_field<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 // -------- Params / generics --------
 
 fn lower_fn_params<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
+    lower_delim_list(cx, node, "(", ")", "fn_param")
+}
+
+/// Lower a comma-separated, bracketed declaration list (`fn_params`,
+/// `type_params`) walking children in **source order**.
+///
+/// Block / line comments are named extras, so a trailing inline comment
+/// (`a: int /* c */, b: int`) shows up interleaved with the items. The
+/// naive "join named children with commas" loop treated the comment as
+/// its own list slot — inserting a comma before *and* after it
+/// (`a: int, /* c */, b: int`), producing an empty parameter and a parse
+/// error. Walking source order lets a comment glue to whatever it trails
+/// (the item value, or the separating comma) instead of becoming a slot.
+fn lower_delim_list<'a>(
+    cx: &Cx<'a>,
+    node: Node<'a>,
+    open: &'static str,
+    close: &'static str,
+    item_kind: &str,
+) -> Doc {
     let mut walker = node.walk();
-    let params: Vec<Node<'_>> = node.named_children(&mut walker).collect();
-    if params.is_empty() {
-        return Doc::text("()");
+    let children: Vec<Node<'_>> = node.children(&mut walker).collect();
+    if !children.iter().any(|c| c.kind() == item_kind) {
+        return Doc::text(format!("{open}{close}"));
     }
-    let mut inner = Vec::new();
-    inner.push(Doc::softline());
-    for (i, p) in params.iter().enumerate() {
-        if i > 0 {
-            inner.push(Doc::text(","));
-            inner.push(Doc::line());
+    let mut inner: Vec<Doc> = vec![Doc::softline()];
+    let mut prev: Option<Node<'_>> = None;
+    // A `,` was emitted; its breakable `line()` is deferred so a same-line
+    // trailing comment can land before the break.
+    let mut pending_sep = false;
+    // An inline (`/* … */`) comment was emitted; the next item needs one
+    // separating space.
+    let mut pending_space = false;
+    for c in &children {
+        match c.kind() {
+            "," => {
+                inner.push(Doc::text(","));
+                pending_sep = true;
+                pending_space = false;
+            }
+            "line_comment" | "block_comment" => {
+                let eol = prev.is_some_and(|p| cx.newlines_between(p, *c) == 0);
+                if eol {
+                    inner.push(Doc::space());
+                } else if pending_sep {
+                    inner.push(Doc::line());
+                    pending_sep = false;
+                } else {
+                    inner.push(Doc::hardline());
+                }
+                inner.push(Doc::text(cx.text(*c).to_string()));
+                if c.kind() == "line_comment" {
+                    // A `//` comment runs to end-of-line: the next item
+                    // must start on a fresh line, and the group has to
+                    // break.
+                    inner.push(Doc::hardline());
+                    pending_sep = false;
+                    pending_space = false;
+                } else {
+                    pending_space = true;
+                }
+            }
+            k if k == item_kind => {
+                if pending_sep {
+                    inner.push(Doc::line());
+                } else if pending_space {
+                    inner.push(Doc::space());
+                }
+                pending_sep = false;
+                pending_space = false;
+                inner.push(lower_node(cx, *c));
+            }
+            // Brackets and any other anonymous tokens are supplied by the
+            // wrapper below.
+            _ => {}
         }
-        inner.push(lower_node(cx, *p));
+        prev = Some(*c);
     }
     Doc::group(Doc::concat(vec![
-        Doc::text("("),
+        Doc::text(open),
         Doc::indent(Doc::concat(inner)),
         Doc::softline(),
-        Doc::text(")"),
+        Doc::text(close),
     ]))
 }
 
@@ -727,26 +791,7 @@ fn lower_fn_param<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_type_params<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    let mut walker = node.walk();
-    let idents: Vec<Node<'_>> = node.named_children(&mut walker).collect();
-    if idents.is_empty() {
-        return Doc::text("<>");
-    }
-    let mut inner = Vec::new();
-    inner.push(Doc::softline());
-    for (i, p) in idents.iter().enumerate() {
-        if i > 0 {
-            inner.push(Doc::text(","));
-            inner.push(Doc::line());
-        }
-        inner.push(lower_node(cx, *p));
-    }
-    Doc::group(Doc::concat(vec![
-        Doc::text("<"),
-        Doc::indent(Doc::concat(inner)),
-        Doc::softline(),
-        Doc::text(">"),
-    ]))
+    lower_delim_list(cx, node, "<", ">", "ident")
 }
 
 fn lower_type_decorator<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
