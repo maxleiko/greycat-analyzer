@@ -2141,6 +2141,69 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
+    // P34.2
+    /// The property that actually matters: containment is *component-wise*
+    /// (`Path::starts_with`), NOT a string prefix. Siblings that share a
+    /// textual prefix must both survive — a `str::starts_with`
+    /// implementation would wrongly drop `/wsfoo` as "under" `/ws` and
+    /// silently shrink the watch set. This is the test that fails if the
+    /// containment check is ever refactored to string comparison.
+    #[test]
+    fn dedup_contained_keeps_sibling_prefixes() {
+        let roots = vec![
+            PathBuf::from("/ws"),
+            PathBuf::from("/wsfoo"), // shares the text "/ws" but is a sibling
+            PathBuf::from("/ws-2"),  // ditto
+            PathBuf::from("/a/b"),
+            PathBuf::from("/a/bc"), // sibling of /a/b, not nested under it
+        ];
+        let out = dedup_contained(roots.clone());
+        // Nothing is nested under anything else → all five survive.
+        assert_eq!(out.len(), 5, "no sibling should be dropped: {out:?}");
+        for r in &roots {
+            assert!(out.contains(r), "{} must be kept", r.display());
+        }
+    }
+
+    // P34.2
+    /// A containment chain collapses to its single topmost root, and the
+    /// result is independent of input order — each element is tested
+    /// against the whole set, not just earlier entries. (Also covers the
+    /// nested-workspace-folder case: `/ws` + `/ws/inner` → just `/ws`.)
+    #[test]
+    fn dedup_contained_collapses_chains_order_independent() {
+        let forward = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/a/b"),
+            PathBuf::from("/a/b/c"),
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let expected: FxHashSet<PathBuf> = [PathBuf::from("/a")].into_iter().collect();
+        assert_eq!(dedup_contained(forward), expected);
+        assert_eq!(dedup_contained(reversed), expected);
+    }
+
+    // P34.2
+    /// Degenerate inputs: empty stays empty; wholly-independent roots are
+    /// all preserved (no false containment between unrelated trees).
+    #[test]
+    fn dedup_contained_empty_and_independent() {
+        assert!(dedup_contained(Vec::new()).is_empty());
+
+        let roots = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c/d"),
+        ];
+        let out = dedup_contained(roots.clone());
+        assert_eq!(out.len(), 3);
+        for r in &roots {
+            assert!(out.contains(r));
+        }
+    }
+
     // P34.3
     /// `next_deadline` is the earlier of a pending trailing publish and
     /// a pending fs flush.
