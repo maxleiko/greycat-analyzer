@@ -308,13 +308,15 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
 // P22.1
 /// Pick a safe quickfix for `unused-local`:
 ///
-/// - For for-in (`for (k, v in …)`) binders, rename to bare `_` — the
-///   runtime treats `_` in a for-in head as a no-binding slot
-///   (multiple `_`s are legal, no stack allocation, no scope entry),
-///   so the cheapest and clearest fix is to drop the name entirely.
-/// - For for-init (`for (var i = …; …)`) binders, the binding is
-///   real (the runtime allocates `i`), so rename to `_name` instead —
-///   matches `unused-param`'s shape.
+/// - For for-in (`for (k, v in …)`) **head** binders, rename to bare
+///   `_` — the runtime treats `_` in a for-in head as a no-binding
+///   slot (multiple `_`s are legal, no stack allocation, no scope
+///   entry), so the cheapest and clearest fix is to drop the name
+///   entirely. This applies ONLY to the binder itself (the
+///   `for_in_param` node), never to a `var` nested in the loop body.
+/// - For for-init (`for (var i = …; …)`) **head** binders, the
+///   binding is real (the runtime allocates `i`), so rename to
+///   `_name` instead — matches `unused-param`'s shape.
 /// - For a plain `var x = expr;` with **no initializer** or an
 ///   initializer whose RHS is provably side-effect-free, delete the
 ///   whole statement.
@@ -327,9 +329,13 @@ fn missing_token_fix(start: usize, message: &str) -> Vec<TextEdit> {
 ///   shared `ide::scope::names_in_scope_at`, which mirrors the
 ///   resolver's lexical scoping.
 fn unused_local_fix(cx: &QuickfixCx<'_>, ident_start: usize, ident_end: usize) -> Vec<TextEdit> {
-    // for-in: bare `_` is a no-binding slot in the runtime, so prefer
-    // that over `_name`.
-    if enclosing_kind(cx.root, ident_start, "for_in_stmt").is_some() {
+    // for-in HEAD binder: bare `_` is a no-binding slot in the runtime,
+    // so prefer that over `_name`. Gate on `for_in_param` (the node
+    // wrapping the binder), NOT `for_in_stmt` — the latter also matches
+    // any identifier nested in the loop *body*, which would rewrite a
+    // body `var x = …;` to an illegal duplicate `var _ = …;`
+    // (`local-rebind`). Only the head binders live in `for_in_param`.
+    if enclosing_kind(cx.root, ident_start, "for_in_param").is_some() {
         if ident_end <= ident_start {
             return Vec::new();
         }
@@ -338,8 +344,17 @@ fn unused_local_fix(cx: &QuickfixCx<'_>, ident_start: usize, ident_end: usize) -
             new_text: "_".to_string(),
         }];
     }
-    // for-init: rename (the bind is structurally required, real local).
-    if enclosing_node_range(cx.root, ident_start, &["for_stmt"]).is_some() {
+    // for-init HEAD binder: the loop var (`for (var i = …; …)`) is the
+    // `it_name` field of the `for_stmt`, not a `var_decl`, and the bind
+    // is structurally required — rename to `_name`. Match the field
+    // precisely: a `var` in the loop *body* is a `var_decl` (handled
+    // below) and must not be rerouted here just because it sits inside
+    // the for_stmt's block.
+    if let Some(for_stmt) = enclosing_kind(cx.root, ident_start, "for_stmt")
+        && for_stmt
+            .child_by_field_name("it_name")
+            .is_some_and(|it_name| it_name.byte_range().contains(&ident_start))
+    {
         return unused_param_fix(cx.text, ident_start, ident_end);
     }
     let Some(var_decl) = enclosing_kind(cx.root, ident_start, "var_decl") else {
@@ -1430,6 +1445,103 @@ mod tests {
             !tree.root_node().has_error(),
             "applied edit produced parse error:\n{after}"
         );
+    }
+
+    // Regression: a `var` declared in a for-in loop *body* is NOT a
+    // for-in head binder. It must take the var_decl rename path
+    // (`_name`), never collapse to the runtime's bare `_` no-binding
+    // slot — that slot is legal only in a for-in *head*, and two
+    // `var _` in one scope is a `local-rebind` error. This is the
+    // exact shape `lint --fix` mangled on the real project: two
+    // side-effecting `var`s nested under `for (… in …)`.
+    #[test]
+    fn unused_local_var_in_for_in_body_is_not_collapsed() {
+        let src = "\
+fn f(arr: Array<int>) {
+    for (k, v in arr) {
+        var foo = side_effect();
+        var bar = side_effect();
+    }
+}
+
+fn side_effect(): int {
+    return 0;
+}
+";
+        let foo_start = src.find("var foo").unwrap() + 4;
+        let bar_start = src.find("var bar").unwrap() + 4;
+        let foo_edits = fix_with_scope("unused-local", src, foo_start..(foo_start + 3));
+        let bar_edits = fix_with_scope("unused-local", src, bar_start..(bar_start + 3));
+        assert_eq!(foo_edits.len(), 1);
+        assert_eq!(bar_edits.len(), 1);
+        assert_eq!(
+            foo_edits[0].new_text, "_foo",
+            "for-in body var collapsed instead of renaming"
+        );
+        assert_eq!(
+            bar_edits[0].new_text, "_bar",
+            "for-in body var collapsed instead of renaming"
+        );
+        // Apply both (later edit first to keep offsets stable) — the
+        // side-effecting calls survive and there's no duplicate `_`.
+        let mut after = src.to_string();
+        after.replace_range(bar_edits[0].byte_range.clone(), &bar_edits[0].new_text);
+        after.replace_range(foo_edits[0].byte_range.clone(), &foo_edits[0].new_text);
+        assert!(
+            after.contains("var _foo = side_effect();"),
+            "after = {after}"
+        );
+        assert!(
+            after.contains("var _bar = side_effect();"),
+            "after = {after}"
+        );
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(
+            !tree.root_node().has_error(),
+            "applied edit produced parse error:\n{after}"
+        );
+    }
+
+    // A pure-init `var` in a for-in body is DELETED (no side effect to
+    // preserve), not misrouted to the binder paths. Proves the
+    // `for_in_param` gate lets body decls fall through to `var_decl`.
+    #[test]
+    fn unused_local_pure_var_in_for_in_body_is_deleted() {
+        let src =
+            "fn f(arr: Array<int>) {\n    for (k, v in arr) {\n        var x = 42;\n    }\n}\n";
+        let x_start = src.find("var x").unwrap() + 4;
+        let edits = fix("unused-local", src, x_start..(x_start + 1));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "", "for-in body var should be deleted");
+        assert_eq!(&src[edits[0].byte_range.clone()], "var x = 42;");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), "");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(!tree.root_node().has_error(), "parse error:\n{after}");
+    }
+
+    // Twin of the for-in body case for C-style loops: a pure-init `var`
+    // in a `for (…;…;…)` body is DELETED, not renamed to `_x` (which
+    // would leave dead code). The for-init binder (`it_name`) still
+    // renames — covered by `unused_local_renames_for_init_var`; this
+    // guards that a body `var_decl` no longer routes through that path.
+    #[test]
+    fn unused_local_pure_var_in_for_body_is_deleted() {
+        let src =
+            "fn f() {\n    for (var i = 0; i < 3; i = i + 1) {\n        var x = 42;\n    }\n}\n";
+        let x_start = src.find("var x").unwrap() + 4;
+        let edits = fix("unused-local", src, x_start..(x_start + 1));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].new_text, "",
+            "for-body var should be deleted, not renamed"
+        );
+        assert_eq!(&src[edits[0].byte_range.clone()], "var x = 42;");
+        let mut after = src.to_string();
+        after.replace_range(edits[0].byte_range.clone(), "");
+        assert!(!after.contains("var x"), "var x should be gone:\n{after}");
+        let tree = greycat_analyzer_syntax::parse(&after);
+        assert!(!tree.root_node().has_error(), "parse error:\n{after}");
     }
 
     #[test]
