@@ -56,7 +56,14 @@ lsp-server = "0.7.8"
 lsp-types = "0.97.0"
 md5 = "0.8.0"
 miette = { version = "7", features = ["fancy"] }
-notify = "8"
+# Filesystem watcher (LSP in-process, P34). `default-features = false`
+# keeps the feature surface from growing silently across notify releases
+# — we opt into exactly what we ship. Linux `inotify` + Windows
+# `ReadDirectoryChangesW` are target-gated (always compiled, not behind
+# features); `macos_fsevent` is the lone opt-in so macOS uses FSEvents
+# instead of degrading to the polling watcher. `fsevent-sys` is itself
+# macOS-target-gated, so this opt-in costs Linux / Windows builds nothing.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 rayon = "1"
 rustc-hash = "2"
 serde = { version = "1.0.219", features = ["derive"] }
