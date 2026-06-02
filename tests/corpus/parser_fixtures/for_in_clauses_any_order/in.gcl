@@ -1,0 +1,5 @@
+fn x(c: any) {
+for (k, v in c skip 2 limit 5 sampling 1s) {
+println(v);
+}
+}

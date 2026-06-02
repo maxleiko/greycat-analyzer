@@ -1,0 +1,60 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn x(c: any) {\n    for (k, v in c skip 2 limit 5 sampling 1s) {\n        println(v);\n    }\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'x')
+    params: (fn_params
+      param: (fn_param
+        name: (ident 'c')
+        type: (type_ident
+          name: (ident 'any')
+        )
+      )
+    )
+    body: (block
+      (for_in_stmt
+        (for_in_param
+          name: (ident 'k')
+        )
+        (for_in_param
+          name: (ident 'v')
+        )
+        iterator: (ident 'c')
+        (for_in_clause
+          keyword: (ident 'skip')
+          value: (number
+            (number_int '2')
+          )
+        )
+        (for_in_clause
+          keyword: (ident 'limit')
+          value: (number
+            (number_int '5')
+          )
+        )
+        (for_in_clause
+          keyword: (ident 'sampling')
+          value: (number
+            (number_suffixed
+              (number_int '1')
+              (number_suffix 's')
+            )
+          )
+        )
+        block: (block
+          (expr_stmt
+            (call_expr
+              fn: (ident 'println')
+              (args
+                (ident 'v')
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)

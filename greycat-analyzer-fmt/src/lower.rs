@@ -1075,13 +1075,17 @@ fn lower_for_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 }
 
 fn lower_for_in_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
-    // `for (<param>[, <param>...] in <iter>[?][<range>][sampling X][limit Y][skip Z]) <block>`
+    // `for (<param>, <param>[, ...] in <iter>[?][<range>][<clause>...]) <block>`
+    // where each DEPRECATED clause is `<keyword> <expr>` (`sampling` / `limit`
+    // / `skip`), accepted in any order — emit them verbatim in source order.
     let mut params: Vec<Node<'_>> = Vec::new();
+    let mut clauses: Vec<Node<'_>> = Vec::new();
     let mut iter_optional = false;
     let mut walker = node.walk();
     for c in node.named_children(&mut walker) {
         match c.kind() {
             "for_in_param" => params.push(c),
+            "for_in_clause" => clauses.push(c),
             "optional" => iter_optional = true,
             _ => {}
         }
@@ -1091,13 +1095,6 @@ fn lower_for_in_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
         .child_by_field_name("iterator")
         .map(|n| lower_node(cx, n));
     let range = node.child_by_field_name("range").map(|n| lower_node(cx, n));
-    // `sampling` / `limit` / `skip` fields wrap a seq with the keyword
-    // and the expr — same trap as `it_type` on for_stmt: the field
-    // tags both children, and `child_by_field_name` returns the keyword
-    // token. Pick the named expr child directly.
-    let sampling = named_child_by_field(node, "sampling").map(|n| lower_node(cx, n));
-    let limit = named_child_by_field(node, "limit").map(|n| lower_node(cx, n));
-    let skip = named_child_by_field(node, "skip").map(|n| lower_node(cx, n));
 
     let mut header: Vec<Doc> = Vec::new();
     for (i, p) in params.iter().enumerate() {
@@ -1120,17 +1117,17 @@ fn lower_for_in_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
     if let Some(r) = range {
         header.push(r);
     }
-    if let Some(s) = sampling {
-        header.push(Doc::text(" sampling "));
-        header.push(s);
-    }
-    if let Some(l) = limit {
-        header.push(Doc::text(" limit "));
-        header.push(l);
-    }
-    if let Some(sk) = skip {
-        header.push(Doc::text(" skip "));
-        header.push(sk);
+    // Deprecated `sampling` / `limit` / `skip` query clauses, emitted in
+    // source order (any order is valid GreyCat). Each is `<keyword> <expr>`.
+    for clause in &clauses {
+        let kw = clause
+            .child_by_field_name("keyword")
+            .map(|n| cx.text(n))
+            .unwrap_or("");
+        header.push(Doc::text(format!(" {kw} ")));
+        if let Some(val) = clause.child_by_field_name("value") {
+            header.push(lower_node(cx, val));
+        }
     }
 
     let mut parts = vec![
@@ -1149,11 +1146,10 @@ fn lower_for_in_stmt<'a>(cx: &Cx<'a>, node: Node<'a>) -> Doc {
 
 /// `child_by_field_name` matches the *first* child with the given
 /// field name, but when the grammar applies a field to a wrapping
-/// `seq(token, $.named_node)` (as in for_stmt's `it_type` or for_in_stmt's
-/// `sampling` / `limit` / `skip`), tree-sitter tags both children with
-/// the field name and returns the keyword/punctuation first. Walking
-/// the cursor and filtering to named children with the matching field
-/// gives the actual content node.
+/// `seq(token, $.named_node)` (as in for_stmt's `it_type`), tree-sitter
+/// tags both children with the field name and returns the keyword/
+/// punctuation first. Walking the cursor and filtering to named children
+/// with the matching field gives the actual content node.
 fn named_child_by_field<'a>(node: Node<'a>, name: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
     if !cursor.goto_first_child() {

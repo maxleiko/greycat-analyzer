@@ -1594,6 +1594,35 @@ mod tests {
         }
     }
 
+    /// The deprecated for-in `sampling` / `limit` / `skip` clause keywords are
+    /// NOT reserved words — they must parse as ordinary identifiers in every
+    /// other position (method names, member access, call arguments, locals).
+    /// Regression for the `other(f.skip())` parse-ERROR: those clauses used to
+    /// be global keyword tokens, which leaked into expression-completing states.
+    #[test]
+    fn for_in_clause_keywords_as_names_no_parse_error() {
+        let srcs = [
+            // `skip` as a method, called bare AND as a call argument.
+            "type Foo {\n    fn skip(): int { return 42; }\n}\n\
+             fn main(f: Foo) {\n    var x = f.skip();\n    other(f.skip());\n}\n",
+            // `skip` / `limit` / `sampling` as a local, member, and method name.
+            "fn main(c: any) {\n    var skip = 1;\n    var limit = c.limit;\n    \
+             var s = c.sampling();\n    println(skip);\n}\n",
+        ];
+        for src in srcs {
+            let ds = diags(src);
+            let cs = codes(&ds);
+            assert!(
+                !cs.contains(&"parse-error"),
+                "unexpected parse-error in: {src:?}"
+            );
+            assert!(
+                !cs.contains(&"keyword-as-ident"),
+                "unexpected keyword-as-ident in: {src:?}"
+            );
+        }
+    }
+
     // P15.5
     /// `@include` to a missing directory surfaces as
     /// `unresolved-include` with the pragma's range.

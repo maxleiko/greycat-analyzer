@@ -103,6 +103,20 @@ pub fn semantic_tokens(
             "line_comment" | "doc_comment" => push(&mut events, TOK_COMMENT),
             "null" | "true" | "false" | "this" => push(&mut events, TOK_KEYWORD),
             "ident" => {
+                // Deprecated for-in query clause keyword (`sampling` / `limit`
+                // / `skip`): a plain `ident` inside the grammar's
+                // `for_in_clause`, but it reads as a keyword. Scoped to the three
+                // recognized names to mirror the tree-sitter `highlights.scm`.
+                if let Some(parent) = n.parent()
+                    && parent.kind() == "for_in_clause"
+                    && parent.child_by_field_name("keyword").map(|c| c.id()) == Some(n.id())
+                    && text
+                        .get(n.byte_range())
+                        .is_some_and(|s| matches!(s, "sampling" | "limit" | "skip"))
+                {
+                    push(&mut events, TOK_KEYWORD);
+                    return true;
+                }
                 if text
                     .get(n.byte_range())
                     .is_some_and(|s| BUILTIN_RUNTIME_GLOBALS.iter().any(|(name, _)| *name == s))
@@ -279,5 +293,36 @@ mod tests {
             .find(|(_, _, _, ty)| *ty == TOK_COMMENT)
             .expect("doc_comment emits a COMMENT token");
         assert_eq!(comment.2, 19, "comment length is 19 UTF-8 bytes");
+    }
+
+    #[test]
+    fn for_in_clause_keywords_classified_as_keyword_but_var_elsewhere() {
+        // `skip` is a clause keyword on the for-in line, but an ordinary
+        // variable on its own line — the semantic classification must follow
+        // position, mirroring the contextual grammar.
+        let src = "fn x(c: any) {\n    var skip = 1;\n    \
+                   for (k, v in c skip 2 limit 5 sampling 3) {\n        \
+                   println(skip);\n    }\n}\n";
+        let tree = parse(src);
+        let tokens = semantic_tokens(src, "project", tree.root_node(), SourceEncoding::UTF8);
+        let events = decode(&tokens);
+        // Line 2 is the for-in header: `skip` / `limit` / `sampling` are keywords.
+        let kw_on_for_line = events
+            .iter()
+            .filter(|(l, _, _, ty)| *l == 2 && *ty == TOK_KEYWORD)
+            .count();
+        assert_eq!(
+            kw_on_for_line, 3,
+            "3 clause keywords on the for-in line; got {events:?}"
+        );
+        // Line 1 is `var skip = 1;` — here `skip` is a variable, not a keyword.
+        let kw_on_var_line = events
+            .iter()
+            .filter(|(l, _, _, ty)| *l == 1 && *ty == TOK_KEYWORD)
+            .count();
+        assert_eq!(
+            kw_on_var_line, 0,
+            "`var skip` is a variable, not a keyword; got {events:?}"
+        );
     }
 }

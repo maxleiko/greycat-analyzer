@@ -1,5 +1,6 @@
 ---
 source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
 expression: "fn f() {\n    for (i, k, v in indexed_long_iterator_name.member_access.something_else_long_name_aaa sampling 100 limit 50 skip 10) {\n        x;\n    }\n}\n"
 ---
 (module
@@ -24,14 +25,23 @@ expression: "fn f() {\n    for (i, k, v in indexed_long_iterator_name.member_acc
           )
           property: (ident 'something_else_long_name_aaa')
         )
-        sampling: (number
-          (number_int '100')
+        (for_in_clause
+          keyword: (ident 'sampling')
+          value: (number
+            (number_int '100')
+          )
         )
-        limit: (number
-          (number_int '50')
+        (for_in_clause
+          keyword: (ident 'limit')
+          value: (number
+            (number_int '50')
+          )
         )
-        skip: (number
-          (number_int '10')
+        (for_in_clause
+          keyword: (ident 'skip')
+          value: (number
+            (number_int '10')
+          )
         )
         block: (block
           (expr_stmt
