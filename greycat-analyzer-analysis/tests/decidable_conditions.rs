@@ -460,3 +460,66 @@ fn main(s: Shape) {
         "Union<Rect, Circle> must be castable to Shape (common supertype), got: {cast_diags:?}"
     );
 }
+
+// =============================================================================
+// `is` on a runtime-erased generic result (function-generic erasure)
+// =============================================================================
+
+#[test]
+fn is_check_on_erased_generic_result_reasons_about_runtime_type() {
+    // `wrap` constructs & returns `Pair<T, int>`, which the GreyCat
+    // runtime erases to `Pair<any?, int>`. The analyzer once read the
+    // result as `Pair<int, int>` and would call `r is Pair<int, int>`
+    // "always TRUE"; at runtime the erased value can never be the
+    // specific type, so it's always FALSE (verified via greycat run on
+    // the `Tuple<Table<T>, int>` analog). The `is`-decidability must
+    // reason about the runtime-erased type, and say *why*.
+    //
+    // `Pair<A, B>` (two args, second concrete) mirrors the user's
+    // `Tuple<Table<T>, int>`: the erased form isn't all-`any?`, so it
+    // doesn't trip the all-Any wildcard in `is_assignable_to`.
+    let src = "\
+type Pair<A, B> { a: A; b: B; }
+fn wrap<T>(x: T): Pair<T, int> { return Pair<T, int> { a: x, b: 0 }; }
+fn main() {
+    var r = wrap(1);
+    if (r is Pair<int, int>) {
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    let msgs = diag_messages(&pa, &uri);
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("always false") && m.contains("erased")),
+        "expected always-false-due-to-erasure, got: {msgs:?}"
+    );
+    assert!(
+        !msgs.iter().any(|m| m.contains("always true")),
+        "must not claim always true on an erased value, got: {msgs:?}"
+    );
+}
+
+#[test]
+fn is_check_on_non_erased_generic_has_no_erasure_note() {
+    // A genuinely-known `Pair<int, int>` (not from an erasing call) must
+    // keep the plain decidable-condition wording — no erasure note.
+    let src = "\
+type Pair<A, B> { a: A; b: B; }
+fn main() {
+    var r = Pair<int, int> { a: 1, b: 2 };
+    if (r is Pair<int, int>) {
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    let msgs = diag_messages(&pa, &uri);
+    assert!(
+        msgs.iter().any(|m| m.contains("always true")),
+        "non-erased exact-type check is always true: {msgs:?}"
+    );
+    assert!(
+        !msgs.iter().any(|m| m.contains("erased")),
+        "non-erased check must not carry the erasure note: {msgs:?}"
+    );
+}

@@ -1254,6 +1254,15 @@ impl<'a> Cx<'a> {
         let mut emitted = false;
         let mut never_id: Option<TypeId> = None;
         for (ident, (known_opt, tys)) in multi {
+            // When `known` is the runtime-erased shape of a generic
+            // result, the decidability verdict is *because* of erasure —
+            // say so, so the user connects it to the value's runtime type
+            // rather than reading it as a plain logic error.
+            let erased_note = if self.out.def_runtime_types.contains_key(ident) {
+                " (function generics are erased to `any?` at runtime)"
+            } else {
+                ""
+            };
             // Find the most specific asserted type (one assignable to
             // all others). If none → the asserted types may be
             // pairwise disjoint *or* `is_assignable_to` lacks the
@@ -1336,9 +1345,10 @@ impl<'a> Cx<'a> {
                             if !emitted {
                                 let name = self.ident_text(*ident).to_string();
                                 let msg = format!(
-                                    "condition is always true: `{}` is already of type `{}`",
+                                    "condition is always true: `{}` is already of type `{}`{}",
                                     name,
                                     self.display(known),
+                                    erased_note,
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.surface_lint(
@@ -1369,10 +1379,11 @@ impl<'a> Cx<'a> {
                             if !emitted {
                                 let name = self.ident_text(*ident).to_string();
                                 let msg = format!(
-                                    "condition is always false: `{}` of type `{}` can never be `{}`",
+                                    "condition is always false: `{}` of type `{}` can never be `{}`{}",
                                     name,
                                     self.display(known),
                                     self.display(asserted),
+                                    erased_note,
                                 );
                                 let range = self.hir.exprs[condition].byte_range();
                                 self.surface_lint(
@@ -1995,6 +2006,28 @@ impl<'a> Cx<'a> {
             }
         }
         self.out.def_types.get(&name).copied()
+    }
+
+    /// The operand type a *runtime* `is` check actually sees: the
+    /// runtime-erased type when the binding holds an erased generic
+    /// result ([`crate::erasure`]), else the normal known type. The
+    /// runtime evaluates `is` against the erased value, so feeding the
+    /// erased type into the `is`-decidability reasoning keeps it honest —
+    /// `tuple is Tuple<Table<Person>, int>` is always *false* at runtime
+    /// (the value is `Tuple<Table<any?>, int>`), not the "always true"
+    /// the materialized type would wrongly imply. A live narrow still
+    /// wins (explicit refinement within the analysis).
+    fn lookup_def_type_for_is(&self, name: Idx<Ident>) -> Option<TypeId> {
+        for frame in self.narrows.iter().rev() {
+            if let Some(t) = frame.get(&name) {
+                return Some(*t);
+            }
+        }
+        self.out
+            .def_runtime_types
+            .get(&name)
+            .copied()
+            .or_else(|| self.out.def_types.get(&name).copied())
     }
     // P19.16
     /// Build a string path key for an expression that's a
@@ -4483,7 +4516,7 @@ impl<'a> Cx<'a> {
                     let ty = self.lower_type_ref(*ty_ref);
                     let entry = multi_typed
                         .entry(*ident)
-                        .or_insert_with(|| (self.lookup_def_type(*ident), Vec::new()));
+                        .or_insert_with(|| (self.lookup_def_type_for_is(*ident), Vec::new()));
                     entry.1.push(ty);
                 }
                 for (ident, group) in &multi_typed {
