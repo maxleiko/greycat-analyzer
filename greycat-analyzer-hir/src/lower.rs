@@ -1553,9 +1553,13 @@ fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
 }
 
 fn parse_char(raw: &str) -> (LiteralKind, Option<ParseIssue>) {
-    // Char tokens are single-quoted. Strip quotes, decode the
-    // (possibly-escaped) inner content.
-    let inner = raw.trim_matches('\'');
+    // Char tokens are single-quoted. Strip exactly the delimiter
+    // quotes — `trim_matches` would also eat the escaped `'` in `'\''`
+    // — then decode the (possibly-escaped) inner content.
+    let inner = raw
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(raw);
     let decoded: Option<char> = if let Some(esc) = inner.strip_prefix('\\') {
         match esc {
             "n" => Some('\n'),
@@ -2128,5 +2132,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `parse_char` decodes plain chars and every escape, including the
+    /// escaped single quote `'\''` (runtime-verified valid, prints `'`).
+    #[test]
+    fn parse_char_decodes_escapes() {
+        let ok = |raw: &str, want: char| {
+            assert_eq!(parse_char(raw), (LiteralKind::Char(want), None), "{raw}");
+        };
+        ok("'a'", 'a');
+        ok("'\\''", '\''); // escaped single quote — was over-stripped
+        ok("'\\\\'", '\\');
+        ok("'\\n'", '\n');
+        ok("'\\r'", '\r');
+        ok("'\\t'", '\t');
+        ok("'\\\"'", '"');
+        ok("'\\0'", '\0');
+        // Unknown escape and empty char stay malformed.
+        assert_eq!(parse_char("'\\z'").1, Some(ParseIssue::Malformed));
+        assert_eq!(parse_char("''").1, Some(ParseIssue::Malformed));
     }
 }
