@@ -282,6 +282,14 @@ The inline `tests/` in [greycat-analyzer-fmt/src/lib.rs](../greycat-analyzer-fmt
 
 **How to apply:** the per-chunk loop is `fmt → build → clippy → test`. If clippy reports warnings (your code's *or* pre-existing), fix them in the same commit. Never push and "fix in follow-up." If a warning genuinely warrants an exception (e.g. the existing `#[allow(clippy::too_many_arguments)]` precedent on deep analysis helpers in `project.rs`), gate it behind a narrowly-scoped `#[allow(...)]` on the specific item, never at crate or workspace level. Auto-mode does not waive this.
 
+## Hard rule — comments are sharp, sparse, and for tricky parts only
+
+Every comment (doc `///` and inline `//`) stays **under 3 sentences**, sharp, and on-point. Comment the *tricky* parts only — a grammar/CST quirk, a non-local invariant, a runtime-semantics gotcha, a borrow-checker workaround — never the obvious ones.
+
+**Why:** the codebase drifts toward doc blocks that re-narrate the design discussion that produced the code ("this is X NOT Y, so it lives on the statement", "previous lowering misread…", "the old code returned… which was wrong", "we chose X over Y because…"). That prose is noise to someone reading the file cold — it re-justifies a decision instead of stating the fact, and rots the moment the discussion is forgotten. Sharp comments survive; narration decays.
+
+**How to apply:** state the fact, not the journey. ✅ "The grammar parses `t.g?.f` as `(t.g?).f`." ❌ a paragraph on why we handle it that way. Cut historical narration ("previously…", "used to…", "old code…"), design re-justification ("NOT a value op", "distinct from…", "the temptation is…"), and restatements of what the code plainly does. One tight fact lives on the type's doc at most, never repeated at each use site. When unsure, cut it — and never add a comment that recaps a conversation you just had with the user.
+
 ## Commit cadence (ROADMAP execution)
 
 While executing [ROADMAP.md](../ROADMAP.md), **one commit per chunk** (the `[ ]` items inside each phase). This keeps the history bisectable and lets the user review the port one workpackage at a time.
