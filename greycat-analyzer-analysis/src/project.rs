@@ -2710,6 +2710,7 @@ impl ProjectAnalysis {
                 arena_mut,
                 index,
                 well_known,
+                decl_registry,
                 cur_uri,
                 &mut diags,
             );
@@ -3347,6 +3348,108 @@ fn push_generic_erasure_diag(
     });
 }
 
+/// Assignability for a construction *slot* — positional element, `geo`
+/// component, map key / value: [`is_assignable_to_with_index`] plus the
+/// `int → float` widening the runtime applies in container / binding
+/// positions (`node<float> { 3 }` ≡ `{ 3.0 }`, `geo { 1, 2 }` ≡
+/// `{ 1.0, 2.0 }`). `float → int` and every non-numeric mismatch stay
+/// rejected. Named-field slots deliberately use the strict relation
+/// directly — the runtime rejects `T { f: 1 }` where named fields don't
+/// coerce.
+fn is_slot_assignable(
+    index: &ProjectIndex,
+    well_known: &WellKnown,
+    decl_registry: &DeclRegistry,
+    arena: &mut TypeArena,
+    from: TypeId,
+    to: TypeId,
+) -> bool {
+    if is_assignable_to_with_index(index, well_known, decl_registry, arena, from, to) {
+        return true;
+    }
+    let from_t = arena.get(from);
+    let to_t = arena.get(to);
+    // A nullable source can't flow into a non-nullable slot.
+    if from_t.nullable && !to_t.nullable {
+        return false;
+    }
+    matches!(from_t.kind, TypeKind::Primitive(Primitive::Int))
+        && matches!(to_t.kind, TypeKind::Primitive(Primitive::Float))
+}
+
+/// Check one supplied construction value against an expected slot type,
+/// mirroring the two-tier check the named-field / call-arg validators
+/// run: a hard `code` mismatch when the value type isn't assignable,
+/// else a `generic-erasure` diag when the materialized type fits but its
+/// runtime-erased shape doesn't. `slot_desc` is the noun phrase naming
+/// the slot (`` element type `int` ``, `` map key type `String` ``).
+/// Slot assignability is [`is_slot_assignable`] — `int → float` widens.
+#[allow(clippy::too_many_arguments)]
+fn check_construction_value_against_slot(
+    cur_module: &ModuleAnalysis,
+    cur_uri: &Uri,
+    index: &ProjectIndex,
+    well_known: &WellKnown,
+    decl_registry: &DeclRegistry,
+    arena: &mut TypeArena,
+    value_expr: Idx<Expr>,
+    expected_ty: TypeId,
+    code: &'static str,
+    slot_desc: &str,
+    diags: &mut Vec<SemanticDiagnostic>,
+) {
+    use crate::analyzer::Severity;
+
+    let Some(value_ty) = cur_module.analysis.expr_types.get(&value_expr).copied() else {
+        return;
+    };
+    if !is_slot_assignable(
+        index,
+        well_known,
+        decl_registry,
+        arena,
+        value_ty,
+        expected_ty,
+    ) {
+        let r = cur_module.hir.exprs[value_expr].byte_range();
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            code,
+            message: format!(
+                "value of type `{}` is not assignable to {slot_desc}",
+                display_type_for_module(arena, index, decl_registry, value_ty, Some(cur_uri)),
+            ),
+            byte_range: r,
+            category: DiagCategory::TypeRelation,
+        });
+    } else if let Some(runtime_ty) = cur_module
+        .analysis
+        .expr_runtime_types
+        .get(&value_expr)
+        .copied()
+        && !is_slot_assignable(
+            index,
+            well_known,
+            decl_registry,
+            arena,
+            runtime_ty,
+            expected_ty,
+        )
+    {
+        let r = cur_module.hir.exprs[value_expr].byte_range();
+        push_generic_erasure_diag(
+            diags,
+            arena,
+            index,
+            decl_registry,
+            cur_uri,
+            runtime_ty,
+            slot_desc.to_string(),
+            r,
+        );
+    }
+}
+
 #[allow(clippy::mutable_key_type)]
 fn collect_call_arg_diags_split(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
@@ -3592,35 +3695,89 @@ fn collect_object_field_diags_split(
     };
     for (obj_expr_id, expr) in cur_module.hir.exprs.iter() {
         let Expr::Object(ObjectExpr {
-            ty: Some(tr_id),
+            ty: Some(_),
             fields,
             ..
         }) = expr
         else {
             continue;
         };
-        let tr = &cur_module.hir.type_refs[*tr_id];
-        if !tr.qualifier.is_empty() {
+        let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
+            continue;
+        };
+        // `Map<K, V> { k: v }` is a named-form head whose entries are
+        // key/value value-exprs, not attrs — `k` types against `K`, `v`
+        // against `V`. Keyed on the settled `obj_ty` decl (not
+        // `item_id_for`, which resolves `Map` to its seeded builtin id,
+        // not the `type_members` key) and dispatched before the
+        // attr-chain guards below, which Map has no entry for.
+        let map_kv = match &arena.get(obj_ty).kind {
+            TypeKind::Generic { decl, args }
+                if Some(*decl) == well_known.map_decl && args.len() == 2 =>
+            {
+                Some((args[0], args[1]))
+            }
+            _ => None,
+        };
+        if let Some((key_ty, val_ty)) = map_kv {
+            let key_desc = format!(
+                "map key type `{}`",
+                display_type_for_module(arena, index, decl_registry, key_ty, Some(cur_uri)),
+            );
+            let val_desc = format!(
+                "map value type `{}`",
+                display_type_for_module(arena, index, decl_registry, val_ty, Some(cur_uri)),
+            );
+            for f in fields.iter() {
+                check_construction_value_against_slot(
+                    cur_module,
+                    cur_uri,
+                    index,
+                    well_known,
+                    decl_registry,
+                    arena,
+                    f.name,
+                    key_ty,
+                    "map-key-type-mismatch",
+                    &key_desc,
+                    diags,
+                );
+                check_construction_value_against_slot(
+                    cur_module,
+                    cur_uri,
+                    index,
+                    well_known,
+                    decl_registry,
+                    arena,
+                    f.value,
+                    val_ty,
+                    "map-value-type-mismatch",
+                    &val_desc,
+                    diags,
+                );
+            }
             continue;
         }
-        let head_sym = cur_module.hir.idents[tr.name].symbol;
-        let Some(head_id) = index.item_id_for(cur_uri, head_sym) else {
-            continue;
+        // Attr-chain path (every named head except `Map`). Positional
+        // construction is a separate HIR variant (`PositionalObject`)
+        // and never reaches this named-only validator. Take the head
+        // decl from the settled object type — provenance-blind, so
+        // foreign / qualified heads check identically to same-module
+        // ones (the old `item_id_for(cur_uri, …)` fabricated a same-
+        // module ItemId and silently skipped every cross-module head).
+        let head_id = match &arena.get(obj_ty).kind {
+            TypeKind::Generic { decl, .. } => *decl,
+            TypeKind::Type(decl) => *decl,
+            _ => continue,
         };
         let Some(head_members) = index.type_members.get(&head_id) else {
             continue;
         };
-        // Positional construction is a separate HIR variant
-        // (`Expr::PositionalObject`) and never reaches this named-only
-        // validator.
-        // Build substitution from the object expr's own settled
-        // TypeId. Non-generic head ⇒ empty subst (a no-op). Arity
-        // mismatch ⇒ skip the whole expr; the head's lowering pass
-        // has already flagged it elsewhere and substituting with
-        // the wrong shape would surface noise.
-        let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
-            continue;
-        };
+        // Build substitution from the object expr's own settled TypeId.
+        // Non-generic head ⇒ empty subst (a no-op). Arity mismatch ⇒
+        // skip the whole expr; the head's lowering pass already flagged
+        // it elsewhere and substituting with the wrong shape would
+        // surface noise.
         let init_subst: FxHashMap<Symbol, TypeId> = match &arena.get(obj_ty).kind {
             TypeKind::Generic { args, .. } if args.len() == head_members.generics.len() => {
                 head_members
@@ -3923,12 +4080,13 @@ fn collect_static_type_args_diags(
 /// runtime. The check runs here because it needs `WellKnown`
 /// identities for `node` and `Array`, which `parse_diagnostics`
 /// doesn't see.
-#[allow(clippy::mutable_key_type)]
+#[allow(clippy::mutable_key_type, clippy::too_many_arguments)]
 fn collect_object_construction_diags(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
-    arena: &TypeArena,
+    arena: &mut TypeArena,
     index: &ProjectIndex,
     well_known: &WellKnown,
+    decl_registry: &DeclRegistry,
     cur_uri: &Uri,
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
@@ -3958,12 +4116,71 @@ fn collect_object_construction_diags(
         let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
             continue;
         };
-        let head_decl = match &arena.get(obj_ty).kind {
-            TypeKind::Generic { decl, .. } => *decl,
-            TypeKind::Type(decl) => *decl,
+        // `geo { lat, lng }` — exactly two int/float components (int
+        // coerces to float, `geo { 1, 2 }` ≡ `geo { 1.0, 2.0 }`). Typed
+        // as `Primitive(Geo)`, so it carries no head decl and never
+        // reaches the `Generic` / `Type` dispatch below.
+        if matches!(&arena.get(obj_ty).kind, TypeKind::Primitive(Primitive::Geo)) {
+            if fields.len() != 2 {
+                diags.push(SemanticDiagnostic {
+                    severity: Severity::Error,
+                    code: "geo-init-arity",
+                    message: "`geo` requires exactly two positional initializers (lat, lng)"
+                        .to_string(),
+                    byte_range: byte_range.clone(),
+                    category: DiagCategory::TypeRelation,
+                });
+            } else {
+                let float_ty = arena.primitive(Primitive::Float);
+                let slot_desc = "element type `float`".to_string();
+                for value in fields.iter() {
+                    check_construction_value_against_slot(
+                        cur_module,
+                        cur_uri,
+                        index,
+                        well_known,
+                        decl_registry,
+                        arena,
+                        *value,
+                        float_ty,
+                        "element-type-mismatch",
+                        &slot_desc,
+                        diags,
+                    );
+                }
+            }
+            continue;
+        }
+        // The element type for `Array<T>` / `node<T>` is the head's
+        // single generic arg, already settled on `obj_ty` (bare `Array`
+        // expands to `Array<any?>`, so the check is a no-op there).
+        let (head_decl, elem_ty) = match &arena.get(obj_ty).kind {
+            TypeKind::Generic { decl, args } => (*decl, args.first().copied()),
+            TypeKind::Type(decl) => (*decl, None),
             _ => continue,
         };
         if Some(head_decl) == well_known.array_decl {
+            if let Some(elem_ty) = elem_ty {
+                let slot_desc = format!(
+                    "element type `{}`",
+                    display_type_for_module(arena, index, decl_registry, elem_ty, Some(cur_uri)),
+                );
+                for value in fields.iter() {
+                    check_construction_value_against_slot(
+                        cur_module,
+                        cur_uri,
+                        index,
+                        well_known,
+                        decl_registry,
+                        arena,
+                        *value,
+                        elem_ty,
+                        "element-type-mismatch",
+                        &slot_desc,
+                        diags,
+                    );
+                }
+            }
             continue;
         }
         if Some(head_decl) == well_known.node_decl {
@@ -3975,6 +4192,26 @@ fn collect_object_construction_diags(
                     byte_range: byte_range.clone(),
                     category: DiagCategory::TypeRelation,
                 });
+            } else if let Some(elem_ty) = elem_ty {
+                let slot_desc = format!(
+                    "element type `{}`",
+                    display_type_for_module(arena, index, decl_registry, elem_ty, Some(cur_uri)),
+                );
+                for value in fields.iter() {
+                    check_construction_value_against_slot(
+                        cur_module,
+                        cur_uri,
+                        index,
+                        well_known,
+                        decl_registry,
+                        arena,
+                        *value,
+                        elem_ty,
+                        "element-type-mismatch",
+                        &slot_desc,
+                        diags,
+                    );
+                }
             }
             continue;
         }

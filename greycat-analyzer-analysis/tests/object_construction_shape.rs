@@ -77,6 +77,10 @@ fn codes(pa: &ProjectAnalysis, uri: &Uri) -> Vec<&'static str> {
                     | "node-tag-no-init"
                     | "fixed-tuple-arity"
                     | "fixed-tuple-element-type"
+                    | "element-type-mismatch"
+                    | "map-key-type-mismatch"
+                    | "map-value-type-mismatch"
+                    | "geo-init-arity"
             )
         })
         .map(|d| d.code)
@@ -485,4 +489,91 @@ fn node_collection_tags_reject_any_initializer() {
             .any(|m| m == "`nodeList` does not accept any initializer"),
         "message should name the head type and say no initializer: {msgs:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Element / key / value type-checking for the positional & key-value heads
+// (`node`, `Array`, `Map`, `geo`). The runtime erases container generics and
+// doesn't type-check construction, so this is a deliberate safety net: it
+// rejects genuine nonsense (`node<String> { 42 }`, `Array<int> { "x" }`)
+// while honoring the `int → float` widening the runtime *does* coerce
+// (`Array<float> { 1 }` ≡ `{ 1.0 }`). `float → int` stays rejected.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn node_element_type_mismatch_rejected() {
+    let (uri, pa) = analyze("fn main() { var _ = node<String> { 42 }; }\n");
+    assert_eq!(codes(&pa, &uri), vec!["element-type-mismatch"]);
+}
+
+#[test]
+fn node_element_int_widens_to_float_no_diag() {
+    // `node<float> { 3 }` ≡ `node<float> { 3.0 }` — the runtime coerces.
+    let (uri, pa) = analyze("fn main() { var _ = node<float> { 3 }; }\n");
+    assert!(codes(&pa, &uri).is_empty());
+}
+
+#[test]
+fn node_element_correct_no_diag() {
+    let (uri, pa) = analyze("fn main() { var _ = node<String> { \"ok\" }; }\n");
+    assert!(codes(&pa, &uri).is_empty());
+}
+
+#[test]
+fn array_element_type_mismatch_rejected() {
+    // `float → int` and `String → int` are both nonsense; one diag each.
+    let (uri, pa) = analyze("fn main() { var _ = Array<int> { 3.14, \"x\", 3 }; }\n");
+    assert_eq!(
+        codes(&pa, &uri),
+        vec!["element-type-mismatch", "element-type-mismatch"]
+    );
+}
+
+#[test]
+fn array_element_int_widens_to_float_no_diag() {
+    let (uri, pa) = analyze("fn main() { var _ = Array<float> { 1, 2, 3 }; }\n");
+    assert!(codes(&pa, &uri).is_empty());
+}
+
+#[test]
+fn map_key_and_value_type_mismatch_rejected() {
+    let (uri, pa) = analyze("fn main() { var _ = Map<String, int> { 42: \"x\" }; }\n");
+    assert_eq!(
+        codes(&pa, &uri),
+        vec!["map-key-type-mismatch", "map-value-type-mismatch"]
+    );
+}
+
+#[test]
+fn map_int_widens_to_float_no_diag() {
+    let (uri, pa) = analyze("fn main() { var _ = Map<float, float> { 1: 2 }; }\n");
+    assert!(codes(&pa, &uri).is_empty());
+}
+
+#[test]
+fn geo_element_type_mismatch_rejected() {
+    let (uri, pa) = analyze("fn main() { var _ = geo { \"a\", 2 }; }\n");
+    assert_eq!(codes(&pa, &uri), vec!["element-type-mismatch"]);
+}
+
+#[test]
+fn geo_int_float_components_no_diag() {
+    let (uri, pa) = analyze(
+        "fn main() {\n\
+             var _a = geo { 1, 2 };\n\
+             var _b = geo { 1.5, 2.5 };\n\
+         }\n",
+    );
+    assert!(codes(&pa, &uri).is_empty());
+}
+
+#[test]
+fn geo_wrong_arity_rejected() {
+    let (uri, pa) = analyze(
+        "fn main() {\n\
+             var _a = geo { 1 };\n\
+             var _b = geo { 1, 2, 3 };\n\
+         }\n",
+    );
+    assert_eq!(codes(&pa, &uri), vec!["geo-init-arity", "geo-init-arity"]);
 }

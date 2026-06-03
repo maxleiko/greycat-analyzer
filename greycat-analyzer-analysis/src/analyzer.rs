@@ -3496,18 +3496,31 @@ impl<'a> Cx<'a> {
     ///
     /// Positional construction never reaches here — it's a separate HIR
     /// variant (`Expr::PositionalObject`) with its own validator.
-    fn check_object_required_attrs(&mut self, type_ref: Idx<TypeRef>, fields: &[ObjectField]) {
-        let tr = &self.hir.type_refs[type_ref];
-        if !tr.qualifier.is_empty() {
-            return;
-        }
-        let head_sym = self.hir.idents[tr.name].symbol;
-        // Same-module head — the type's `ItemId` is just (this module,
-        // head name) since module symbols are project-wide unique.
-        let head_id = ItemId::new(self.module_sym, head_sym);
+    fn check_object_required_attrs(
+        &mut self,
+        type_ref: Idx<TypeRef>,
+        head_ty: TypeId,
+        fields: &[ObjectField],
+    ) {
+        // Construction soundness is a function of the head's member shape
+        // alone — provenance (same-module / `@library` / `@include`,
+        // bare or `mod::`-qualified) is irrelevant. Take the head decl
+        // from the *settled* object type, which `lower_type_ref` already
+        // resolved uniformly for every spelling, and key the project-wide
+        // `type_members` index off it. (The old code resolved a bare
+        // same-module name and bailed on any qualifier, so it silently
+        // skipped the check for every cross-module / qualified head.)
+        let head_id = match &self.arena.get(head_ty).kind {
+            TypeKind::Generic { decl, .. } => *decl,
+            TypeKind::Type(decl) => *decl,
+            // Unresolved / primitive head — no member shape to check.
+            _ => return,
+        };
         if !self.index.type_members.contains_key(&head_id) {
             return;
         }
+        let tr = &self.hir.type_refs[type_ref];
+        let head_sym = self.hir.idents[tr.name].symbol;
         // Positional construction is a separate HIR variant
         // (`Expr::PositionalObject`) and never reaches this named-only
         // validator. Each field's key is the field name — a bare ident
@@ -5461,11 +5474,22 @@ impl<'a> Cx<'a> {
         let Some(enum_sym) = self.index.symbols.lookup(&chain.enum_name) else {
             return;
         };
-        let Some(enum_id) = self.out.registry.lookup(enum_sym) else {
+        // Resolve the enum through the project index, not the module-
+        // local `out.registry`: an enum declared in another module (std
+        // `@library` / `@include`d) is keyed under its declaring module,
+        // so the local registry misses it and exhaustiveness was
+        // silently skipped for every cross-module enum. Mirrors the enum
+        // arm of `lower_type_ref`.
+        let Some(enum_id) = crate::project::resolve_decl_handle_from(
+            self.index,
+            self.decl_registry,
+            Some(self.module_uri),
+            &chain.enum_name,
+        )
+        .and_then(|item| self.index.enum_types.get(&item).copied()) else {
             return;
         };
-        let enum_ty = self.arena.get(enum_id);
-        let TypeKind::Enum { variants, .. } = &enum_ty.kind else {
+        let TypeKind::Enum { variants, .. } = &self.arena.get(enum_id).kind else {
             return;
         };
         let declared: Vec<Symbol> = variants.to_vec();
@@ -6035,7 +6059,7 @@ impl<'a> Cx<'a> {
                 match (ty, lowered) {
                     (Some(t), Some(l)) => {
                         if !is_map {
-                            self.check_object_required_attrs(t, &fields);
+                            self.check_object_required_attrs(t, l, &fields);
                         }
                         l
                     }
@@ -6057,10 +6081,11 @@ impl<'a> Cx<'a> {
                 // noise there.
                 match ty {
                     Some(t) => {
+                        let l = self.lower_type_ref(t);
                         if fields.is_empty() {
-                            self.check_object_required_attrs(t, &[]);
+                            self.check_object_required_attrs(t, l, &[]);
                         }
-                        self.lower_type_ref(t)
+                        l
                     }
                     None => self.any_nullable(),
                 }
@@ -6842,6 +6867,25 @@ mod tests {
         analyze_src(src).1
     }
 
+    /// Run `src` through the real `ProjectAnalysis` pipeline (single
+    /// module) and return `(driver, uri)`. Use this — not
+    /// [`analyze_src_only`] — for checks that consult the project-wide
+    /// index (enum exhaustiveness, member shapes), which the standalone
+    /// [`analyze`] harness doesn't populate.
+    fn analyze_project_only(
+        src: &str,
+    ) -> (
+        crate::project::ProjectAnalysis,
+        greycat_analyzer_core::lsp_types::Uri,
+    ) {
+        use greycat_analyzer_core::SourceManager;
+        use std::str::FromStr;
+        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///proj/main.gcl").unwrap();
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(uri.clone(), src, "project", false);
+        (crate::project::ProjectAnalysis::analyze(&mgr), uri)
+    }
+
     /// `(expr_runtime_types.len(), def_runtime_types.len())` for the
     /// single module in `src`, run through the project pipeline so the
     /// built-in `Array` / `Map` / … decls are seeded (the bare per-module
@@ -7372,7 +7416,8 @@ fn pick(c: Color): int {
     return 0;
 }
 "#;
-        let r = analyze_src_only(src);
+        let (pa, uri) = analyze_project_only(src);
+        let r = &pa.module(&uri).unwrap().analysis;
         // Recording happens during analysis; the lint pipeline turns
         // this into a `non-exhaustive` LintDiagnostic later.
         assert_eq!(
@@ -7439,7 +7484,8 @@ fn pick(c: Color): int {
     return 0;
 }
 "#;
-        let r = analyze_src_only(src);
+        let (pa, uri) = analyze_project_only(src);
+        let r = &pa.module(&uri).unwrap().analysis;
         assert!(
             r.non_exhaustive_findings.is_empty(),
             "expected no exhaustiveness finding, got: {:?}",
@@ -7459,11 +7505,56 @@ fn pick(c: Color): int {
     }
 }
 "#;
-        let r = analyze_src_only(src);
+        let (pa, uri) = analyze_project_only(src);
+        let r = &pa.module(&uri).unwrap().analysis;
         assert!(
             r.non_exhaustive_findings.is_empty(),
             "expected final-else to suppress finding, got: {:?}",
             r.non_exhaustive_findings
+        );
+    }
+
+    #[test]
+    fn cross_module_enum_chain_records_finding() {
+        // Regression: a non-exhaustive chain over an enum declared in a
+        // *different* module must still flag. The exhaustiveness check
+        // used to resolve the enum through the module-local registry, so
+        // a cross-module enum (std `@library` / `@include`d) was silently
+        // never checked.
+        use greycat_analyzer_core::SourceManager;
+        use std::str::FromStr;
+        let defs_uri =
+            greycat_analyzer_core::lsp_types::Uri::from_str("file:///proj/defs.gcl").unwrap();
+        let main_uri =
+            greycat_analyzer_core::lsp_types::Uri::from_str("file:///proj/main.gcl").unwrap();
+        let mut mgr = SourceManager::new();
+        mgr.add_simple(
+            defs_uri,
+            "enum Color { Red, Green, Blue }\n",
+            "project",
+            false,
+        );
+        mgr.add_simple(
+            main_uri.clone(),
+            "fn pick(c: Color): int {\n\
+                 if (c == Color::Red) { return 1; }\n\
+                 else if (c == Color::Green) { return 2; }\n\
+                 return 0;\n\
+             }\n",
+            "project",
+            false,
+        );
+        let pa = crate::project::ProjectAnalysis::analyze(&mgr);
+        let r = &pa.module(&main_uri).unwrap().analysis;
+        assert_eq!(
+            r.non_exhaustive_findings.len(),
+            1,
+            "cross-module enum chain must flag, got: {:?}",
+            r.non_exhaustive_findings
+        );
+        assert_eq!(
+            r.non_exhaustive_findings[0].missing,
+            vec!["Blue".to_string()]
         );
     }
 
