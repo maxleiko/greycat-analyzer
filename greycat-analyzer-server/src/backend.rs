@@ -686,12 +686,30 @@ impl Backend {
                 debug!("[{SERVER_LOG_TAG}][init] diagnosticsDebounceMs={ms}");
             }
         }
+        // How the editor set up the project. A server launched without
+        // `workspace_folders` never runs `load_workspace`, so its
+        // projects load lazily on `did_open` — a different path worth
+        // seeing in the log when triaging editor-specific behavior.
+        #[allow(deprecated)]
+        let root_uri = init.root_uri.as_ref().map(|u| u.as_str().to_string());
+        info!(
+            "[{SERVER_LOG_TAG}] initialize | workspace_folders={} | root_uri={root_uri:?}",
+            init.workspace_folders
+                .as_ref()
+                .map(|w| w.len())
+                .unwrap_or(0),
+        );
         if let Some(workspaces) = init.workspace_folders.as_ref() {
-            debug!("[{SERVER_LOG_TAG}] workspaces:");
             for ws in workspaces {
-                debug!("[{SERVER_LOG_TAG}] - {}={}", ws.name, ws.uri.as_str());
+                info!(
+                    "[{SERVER_LOG_TAG}] workspace_folder {} = {}",
+                    ws.name,
+                    ws.uri.as_str()
+                );
                 self.load_workspace(&ws.uri);
             }
+        } else {
+            info!("[{SERVER_LOG_TAG}] no workspace_folders — projects load lazily on did_open");
         }
         // **P19.22** — register a workspace file watcher so external
         // tools (notably `greycat install` populating `lib/installed`
@@ -827,7 +845,6 @@ impl Backend {
 
     pub fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Result<()> {
         let uri = params.text_document.uri.clone();
-        let doc = Document::new(params.text_document);
         // P32.5 — three-way routing:
         //
         // - URI already bound to a project (eager-load or prior
@@ -841,12 +858,28 @@ impl Backend {
         match self.resolve_owner_for_did_open(&uri) {
             DocOwner::Project(root) => {
                 if let Some(project) = self.projects.get_mut(&root) {
+                    // Preserve the loader-assigned `lib` (e.g. "std")
+                    // when re-opening an already-loaded module.
+                    // `Document::new` defaults `lib` to "project";
+                    // clobbering a library file's lib makes it lower
+                    // under the wrong lib on the next rebuild, which
+                    // breaks the `well_known.record("std","core",…)`
+                    // gate and leaves `node_decl` (and every other
+                    // std slot) stale against the re-interned symbols.
+                    let doc = match project.manager.get(&uri) {
+                        Some(existing) => {
+                            let lib = existing.borrow().lib.clone();
+                            Document::with_lib(params.text_document, lib, true)
+                        }
+                        None => Document::new(params.text_document),
+                    };
                     debug!("[{}][did_open] {doc}", project.tag);
                     project.manager.add(doc);
                 }
                 self.invalidate_with_slow_warning(&uri, "did_open");
             }
             DocOwner::Orphan => {
+                let doc = Document::new(params.text_document);
                 debug!("[{ORPHAN_LOG_TAG}][did_open] {doc}");
                 self.orphans.add(doc);
             }
@@ -1684,6 +1717,159 @@ mod tests {
 
     fn path_uri(p: &Path) -> Uri {
         Uri::from_str(&format!("file://{}", p.display())).unwrap()
+    }
+
+    /// Drain every queued `publishDiagnostics` notification, returning
+    /// the LATEST diagnostic set seen for `uri`.
+    fn latest_diags(rx: &Receiver<Message>, uri: &Uri) -> Vec<lsp_types::Diagnostic> {
+        let mut latest = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Notification(n) = msg
+                && n.method == PublishDiagnostics::METHOD
+            {
+                let p: lsp_types::PublishDiagnosticsParams =
+                    serde_json::from_value(n.params).unwrap();
+                if &p.uri == uri {
+                    latest = p.diagnostics;
+                }
+            }
+        }
+        latest
+    }
+
+    /// Repro the user report: editing the entrypoint `project.gcl`
+    /// (which holds `node { 42 }`) makes a spurious
+    /// `positional-object-init` appear that wasn't there on load.
+    #[test]
+    fn entrypoint_edit_node_false_positive() {
+        let tmp = std::env::temp_dir().join(format!(
+            "gca_node_repro_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let std_dir = tmp.join("lib").join("std");
+        std::fs::create_dir_all(&std_dir).unwrap();
+        std::fs::write(
+            tmp.join("project.gcl"),
+            "fn main() {\n    node { 42 };\n}\n",
+        )
+        .unwrap();
+        // Real (non-symlinked) std so the canonical URI the loader
+        // stores matches the URI `did_open` later sends.
+        let core_src = "native type any {}\nnative type null {}\nnative type int {}\n\
+             native type float {}\nnative type String {}\nnative type bool {}\n\
+             native type Array<T> {}\nnative type Map<K, V> {}\nnative type node<T> {}\n";
+        std::fs::write(std_dir.join("core.gcl"), core_src).unwrap();
+
+        let (mut b, rx) = backend();
+        b.workspace_roots.push(tmp.clone());
+        let entry = path_uri(&tmp.join("project.gcl"));
+
+        // 1. Workspace load (the "restart" — should be clean).
+        b.load_workspace(&path_uri(&tmp));
+        let on_load = latest_diags(&rx, &entry);
+        let load_bad: Vec<_> = on_load
+            .iter()
+            .filter(|d| d.message.contains("positional initializers"))
+            .collect();
+        assert!(
+            load_bad.is_empty(),
+            "on load (restart) there must be no node diag: {:?}",
+            on_load.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // 2. Editor opens the entrypoint buffer.
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: entry.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "fn main() {\n    node { 42 };\n}\n".into(),
+            },
+        })
+        .unwrap();
+
+        // 2b. THE ZED-SPECIFIC STEP: the editor also opens the std
+        // library file `lib/std/core.gcl`. `did_open` rebuilds the
+        // Document with the default `lib="project"`, clobbering the
+        // `lib="std"` the loader assigned — which is what later breaks
+        // the `well_known.record` gate on rebuild.
+        let core_uri = path_uri(&std_dir.join("core.gcl"));
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: core_uri,
+                language_id: "greycat".into(),
+                version: 1,
+                text: core_src.into(),
+            },
+        })
+        .unwrap();
+
+        // 2c. Zed also opens unrelated `.gcl` files in the tree, which
+        // bind to this project and grow its module set. That perturbs
+        // the symbol table re-interned on the next rebuild — which is
+        // what makes the STALE `node_decl` (from 2b's clobber) actually
+        // mismatch the freshly-resolved head. Files sort before
+        // `lib/std/core.gcl`, so they shift `node`'s interned id.
+        for n in 0..4 {
+            let extra = tmp.join(format!("aaa_{n}.gcl"));
+            std::fs::write(&extra, format!("type Extra{n} {{ field{n}: int; }}\n")).unwrap();
+            b.did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: path_uri(&extra),
+                    language_id: "greycat".into(),
+                    version: 1,
+                    text: format!("type Extra{n} {{ field{n}: int; }}\n"),
+                },
+            })
+            .unwrap();
+        }
+
+        // The deterministic root-cause invariant: re-opening a library
+        // file must NOT rewrite its `lib`. Pre-fix it was clobbered to
+        // "project", which broke the well-known std gate on rebuild.
+        let core_lib = b
+            .project_for(&entry)
+            .unwrap()
+            .manager
+            .get(&path_uri(&tmp.join("lib").join("std").join("core.gcl")))
+            .map(|c| c.borrow().lib.clone());
+        assert_eq!(
+            core_lib.as_deref(),
+            Some("std"),
+            "did_open must preserve a library file's lib (was clobbered to {core_lib:?})"
+        );
+
+        // 3. The entrypoint edit → reload_project_closure → full rebuild.
+        // With `lib` preserved, `node_decl` is re-recorded against the
+        // freshly re-interned symbol table, so `node { 42 }` stays clean.
+        b.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: entry.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "fn main() {\n    node { 42 };\n\n}\n".into(),
+            }],
+        })
+        .unwrap();
+        let after_edit = latest_diags(&rx, &entry);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let edit_bad: Vec<_> = after_edit
+            .iter()
+            .filter(|d| d.message.contains("positional initializers"))
+            .map(|d| &d.message)
+            .collect();
+        assert!(
+            edit_bad.is_empty(),
+            "after editing the entrypoint, node must NOT raise positional-object-init: {after_edit:?}"
+        );
     }
 
     // P32.9

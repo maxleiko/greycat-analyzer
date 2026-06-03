@@ -237,6 +237,8 @@ impl fmt::Debug for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Document")
             .field("uri", &self.uri.as_str())
+            .field("lib", &self.lib)
+            .field("opened", &self.opened)
             .field("version", &self.version)
             .field("text_len", &self.text.len())
             .field("tree", &self.tree)
@@ -248,8 +250,9 @@ impl fmt::Display for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} [{}]{:x} ({} bytes)",
+            "{} lib={} [{}]{:x} ({} bytes)",
             self.uri.as_str(),
+            self.lib,
             self.version,
             md5::compute(self.text.as_bytes()),
             self.text.len(),

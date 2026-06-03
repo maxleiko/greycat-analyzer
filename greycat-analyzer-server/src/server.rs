@@ -152,7 +152,30 @@ fn negotiated_encoding(init: &InitializeParams) -> SourceEncoding {
 }
 
 fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding) -> Result<()> {
-    info!("greycat-analyzer {VERSION} started");
+    // Binary-identity banner: a copy/pasted LSP log proves exactly which
+    // build is serving (path + on-disk freshness + profile), so "is the
+    // editor running the binary I think it is?" is answerable from logs.
+    let exe = std::env::current_exe();
+    let exe_str = exe
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+    let exe_mtime = exe
+        .as_ref()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    info!(
+        "greycat-analyzer v{VERSION} started | exe={exe_str} | exe_mtime_unix={exe_mtime:?} | pid={} | profile={} | encoding={encoding:?}",
+        std::process::id(),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    );
 
     // P34.1 — in-process filesystem watcher. The channel outlives the
     // watcher: keep the original `fs_tx` alive for the whole loop so
