@@ -1,7 +1,6 @@
-//! Tree-sitter CST → HIR lowering. Walks named children, plucks
-//! field-keyed sub-nodes, and pushes typed records into the [`Hir`]
-//! arenas. Tolerant: unknown / not-yet-lowered shapes become
-//! [`Expr::Unsupported`] / are skipped, never panics.
+//! Tree-sitter CST → HIR lowering. Walks named children and pushes
+//! typed records into the [`Hir`] arenas. Tolerant: unknown shapes
+//! become [`Expr::Unsupported`] or are skipped; never panics.
 
 use std::ops::Range;
 
@@ -38,18 +37,12 @@ impl<'src, 'symbols> LowerCtx<'src, 'symbols> {
         })
     }
 
-    /// Allocate an ident for a property-position node that may be
-    /// either a plain `ident` or a quoted `string` (the grammar
-    /// accepts `Foo::a` and `Foo::"a"` interchangeably for enum
-    /// variant access). For the `string` form, store the unquoted
-    /// fragment text so `member_uses` / variant lookups succeed
-    /// without callers having to strip quotes.
-    ///
-    /// Use this when the call site flattens both forms to a bare
-    /// `Idx<Ident>` (e.g. the `Expr::QualifiedStatic` chain).
-    /// New call sites should prefer
-    /// [`Self::alloc_property_name`], which preserves the syntactic
-    /// form via [`PropertyName`].
+    /// Allocate an ident for a property-position node that may be a
+    /// plain `ident` or a quoted `string` (`Foo::a` and `Foo::"a"` are
+    /// interchangeable for enum-variant access). The `string` form
+    /// stores the unquoted fragment text. Use when the call site
+    /// flattens both forms to a bare `Idx<Ident>`; prefer
+    /// [`Self::alloc_property_name`] otherwise.
     fn alloc_property_ident(&mut self, node: tree_sitter::Node<'_>) -> Idx<Ident> {
         if node.kind() == "string" {
             let mut c = node.walk();
@@ -66,10 +59,8 @@ impl<'src, 'symbols> LowerCtx<'src, 'symbols> {
         self.alloc_ident(node)
     }
 
-    /// Allocate a property-position node and tag the returned
-    /// [`PropertyName`] with the syntactic form (`ident` vs quoted
-    /// `string`). The decoded text and byte range are interned the
-    /// same way as [`Self::alloc_property_ident`].
+    /// Allocate a property-position node, tagging the [`PropertyName`]
+    /// with its syntactic form (`ident` vs quoted `string`).
     fn alloc_property_name(&mut self, node: tree_sitter::Node<'_>) -> PropertyName {
         if node.kind() == "string" {
             PropertyName::String(self.alloc_property_ident(node))
@@ -80,30 +71,17 @@ impl<'src, 'symbols> LowerCtx<'src, 'symbols> {
 }
 
 // P43.1
-/// Yield named children of `node`, transparently flattening one level
-/// into any `ERROR` child so the grandchildren appear in place. Each
-/// item is `(child, salvaged_from_error)` — `true` when the child came
-/// from inside an `ERROR` wrapper, `false` for direct named children.
-///
-/// Tree-sitter's error recovery deliberately keeps the parseable inner
-/// shapes alive when an enclosing rule fails: `if (c.sim.)` produces
-/// `(block (ERROR (member_expr ...)))` rather than dropping `c.sim`
-/// entirely. Every list-of-kinds walk in this file goes through this
-/// helper so IDE capabilities downstream (completion, hover, goto-def,
-/// references) see those salvageable shapes via the cached HIR fast
-/// path instead of each capability reimplementing its own CST
-/// fallback.
-///
-/// Depth-bounded at one level — an `ERROR` nested inside an `ERROR`
-/// stays opaque. The recovered shapes tree-sitter produces are
-/// themselves shallow; chasing deeper costs more than it pays for.
+/// Yield named children of `node`, flattening one level into any
+/// `ERROR` child so its grandchildren appear in place. Each item is
+/// `(child, salvaged_from_error)`: `true` when the child came from an
+/// `ERROR` wrapper (e.g. `if (c.sim.)` → `(block (ERROR (member_expr
+/// ...)))`). Depth-bounded — an `ERROR` nested inside an `ERROR` stays
+/// opaque.
 fn flatten_errors_named_children<'a>(
     node: tree_sitter::Node<'a>,
 ) -> Vec<(tree_sitter::Node<'a>, bool)> {
-    // Collect into a Vec — tree_sitter cursors are borrow-checker
-    // hostile to nested iteration. Child lists at every site we touch
-    // are short (a handful of stmts/decls at most), so the allocation
-    // isn't load-bearing.
+    // Collect into a Vec — tree_sitter cursors are hostile to nested
+    // iteration. Child lists here are short.
     let mut out: Vec<(tree_sitter::Node<'a>, bool)> = Vec::new();
     let mut cur1 = node.walk();
     for c in node.named_children(&mut cur1) {
@@ -134,11 +112,9 @@ pub fn lower_module(
     let mut decl_ids: Vec<Idx<Decl>> = Vec::new();
 
     if root.kind() == "module" {
-        // P43.4 — top-level decl walk goes through the salvage helper
-        // so a partial / mid-edit decl wrapped in an `ERROR` still
-        // produces an `Idx<Decl>` when the inner shape is recognizable
-        // (e.g. a `type_decl` whose body is incomplete and bubbles
-        // into an enclosing ERROR).
+        // P43.4 — salvage helper so a mid-edit decl wrapped in an
+        // `ERROR` still produces an `Idx<Decl>` when its inner shape is
+        // recognizable.
         for (child, _salvaged) in flatten_errors_named_children(root) {
             if let Some(d) = lower_decl(&mut cx, child) {
                 decl_ids.push(d);
@@ -202,12 +178,9 @@ fn lower_modifiers(cx: &LowerCtx, node: Option<tree_sitter::Node<'_>>) -> Modifi
 }
 
 /// Collect annotations (`@expose("renamed")`, `@tag("mcp")`,
-/// `@max_count(100)`, `@timeout(5s)`, …) from the `annotations`
-/// named child of a decl-level node. Returns one [`Annotation`] per
-/// `annotation` CST child, with `name` interned through the project
-/// symbol table and `args` carrying every primitive-literal arg in
-/// source order. Non-literal args (idents, exprs) are dropped —
-/// pragmas accept only literal payloads in GreyCat practice.
+/// `@timeout(5s)`, …) from a decl's `annotations` child. One
+/// [`Annotation`] per `annotation` CST child; `args` carries every
+/// primitive-literal arg in source order.
 // P25.7
 fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[Annotation]> {
     let mut cursor = decl_node.walk();
@@ -250,18 +223,10 @@ fn lower_annotations(cx: &LowerCtx, decl_node: tree_sitter::Node<'_>) -> Box<[An
     out.into_boxed_slice()
 }
 
-/// Lower a single annotation arg node into an [`AnnotationArgKind`].
-/// The caller wraps it with the arg's source span.
-///
-/// String args are interned through `cx.symbols` so identical
-/// values share a `Symbol` — `@tag("mcp")` repeated across fifty
-/// fns is one symbol entry, not fifty.
-///
-/// Non-literal arg nodes (idents, calls, member access, anything
-/// not in the primitive literal set) become
-/// [`AnnotationArgKind::Invalid`] so the analyzer's
-/// `invalid-pragma-arg` check can point at the arg span. Pragmas
-/// accept only literals; non-literal args are a hard error.
+/// Lower a single annotation arg into an [`AnnotationArgKind`] (the
+/// caller wraps it with the source span). String args are interned.
+/// Non-literal arg nodes become [`AnnotationArgKind::Invalid`] (hard
+/// `invalid-pragma-arg` error).
 fn lower_annotation_arg(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> AnnotationArgKind {
     match node.kind() {
         "string" => match string_literal_value(cx, node) {
@@ -303,12 +268,10 @@ fn lower_annotation_arg(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Annotatio
     }
 }
 
-/// Walk a `static_expr` CST node left-to-right and collect its
-/// path segments as interned [`Symbol`]s. `static_expr` is
-/// left-recursive in the grammar (`(static_expr | type_ident) ::
-/// property`), so we recurse into the head and append the property
-/// last. Returns `None` if any segment isn't a name-shaped node
-/// (the validator catches the rest).
+/// Collect a `static_expr`'s path segments as interned [`Symbol`]s.
+/// `static_expr` is left-recursive (`(static_expr | type_ident) ::
+/// property`), so recurse into the head and append the property last.
+/// `None` if any segment isn't name-shaped.
 fn collect_path_chain(cx: &LowerCtx, node: tree_sitter::Node<'_>) -> Option<Box<[Symbol]>> {
     let mut chain: Vec<Symbol> = Vec::new();
     fn walk(cx: &LowerCtx, node: tree_sitter::Node<'_>, out: &mut Vec<Symbol>) -> Option<()> {
@@ -576,19 +539,15 @@ fn lower_top_var(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<VarDe
     let name = cx.alloc_ident(name_node);
     let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
     modifiers.annotations = lower_annotations(cx, node);
-    // The grammar wraps the type in a `type_decorator` child rather
-    // than exposing it as a top-level `type` field (mirrors `var_decl`
-    // — see `lower_var_decl`). `lower_type_ref` unwraps the decorator
-    // back to the inner `type_ident`.
+    // The grammar wraps the type in a `type_decorator` child;
+    // `lower_type_ref` unwraps it back to the inner `type_ident`.
     let ty = node
         .named_children(&mut node.walk())
         .find(|c| c.kind() == "type_decorator")
         .and_then(|n| lower_type_ref(cx, n));
-    // The initializer (`= expr`) parses but is semantically invalid on
-    // a module-level `var`; `parse_diagnostics` emits a hard error for
-    // it. We still lower the expression so downstream type / resolve
-    // diagnostics fire on it (otherwise a single grammar-permissive
-    // shape would hide every nested issue).
+    // The initializer (`= expr`) is invalid on a module-level `var`
+    // (`parse_diagnostics` flags it) but still lowered so nested type /
+    // resolve diagnostics fire on it.
     let init = node
         .named_children(&mut node.walk())
         .find(|c| c.kind() == "initializer")
@@ -641,11 +600,9 @@ fn lower_block(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stm
     Some(cx.hir.stmts.alloc(Stmt::Block(block)))
 }
 
-/// Same as [`lower_block`] but returns the [`BlockStmt`] directly
-/// without allocating into the `stmts` arena. Body-bearing statements
-/// (`If::then_branch`, `While::body`, …) embed the `BlockStmt` so
-/// callers reach the curly-brace `byte_range` without going through
-/// the arena.
+/// Like [`lower_block`] but returns the [`BlockStmt`] directly without
+/// allocating into the `stmts` arena. Body-bearing statements
+/// (`If::then_branch`, `While::body`, …) embed it inline.
 fn lower_block_inline(
     cx: &mut LowerCtx,
     node: tree_sitter::Node<'_>,
@@ -654,14 +611,10 @@ fn lower_block_inline(
         return None;
     }
     let mut stmts = Vec::new();
-    // P43.3 — walk through `flatten_errors_named_children` so any
-    // statement-shaped child the parser salvaged from inside an
-    // `ERROR` wrapper is still lowered. For expression-shaped salvage
-    // (the user's `if (c.sim.)` repro produces `(ERROR (member_expr …))`
-    // as a block child), wrap the expr in `Stmt::Expr` so downstream
-    // IDE consumers (completion, hover, goto-def) find the typed expr
-    // via the cached HIR fast path. Salvaged stmt ids are recorded so
-    // lints whose intent assumes complete code can skip them.
+    // P43.3 — salvage helper so a statement-shaped child recovered
+    // from an `ERROR` wrapper is still lowered. Expression-shaped
+    // salvage (`(ERROR (member_expr …))`) is wrapped in `Stmt::Expr`.
+    // Salvaged stmt ids are recorded so lints can skip them.
     for (c, salvaged) in flatten_errors_named_children(node) {
         let s_id = if let Some(s) = lower_stmt(cx, c) {
             s
@@ -684,18 +637,11 @@ fn lower_block_inline(
 }
 
 /// Walk the block's CST subtree (stopping at nested `block` nodes)
-/// for `member_expr` / `arrow_expr` whose `property` field is missing,
-/// lower each receiver as a `Stmt::Expr` salvage, and append it to
-/// the block's stmt list with the `salvaged` tag.
-///
-/// Why: the grammar accepts `s.` / `c.sim.` mid-typing (no
-/// ERROR-cascade) but the outer incomplete member lowers as
-/// `Expr::Unsupported` — the analyzer never visits its receiver, so
-/// completion / hover / goto-def / references on the receiver return
-/// nothing. Lifting the receiver into the block's stmt list mirrors
-/// the original P43.3 ERROR-recovery salvage path: the analyzer
-/// types the salvaged expr normally and IDE capabilities find it
-/// via the cached HIR fast path.
+/// for `member_expr` / `arrow_expr` with a missing `property`, lower
+/// each receiver as a salvaged `Stmt::Expr`, and append it to the
+/// stmt list. The grammar accepts `s.` / `c.sim.` mid-typing (no
+/// ERROR-cascade) but lowers the incomplete member as
+/// `Expr::Unsupported`, so the receiver wouldn't otherwise be typed.
 fn salvage_incomplete_members_in_block(
     cx: &mut LowerCtx,
     block: tree_sitter::Node<'_>,
@@ -714,9 +660,7 @@ fn salvage_incomplete_members_in_block(
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            // Don't descend into nested blocks — their own
-            // `lower_block` invocation will salvage their incomplete
-            // members.
+            // Nested blocks salvage their own members.
             if child.kind() == "block" {
                 continue;
             }
@@ -746,11 +690,9 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
         "var_decl" => {
             let name_node = node.child_by_field_name("name")?;
             let name = cx.alloc_ident(name_node);
-            // The grammar puts the type either as a direct `type_ident`
-            // child (rare local-var shape) or wrapped in a
-            // `type_decorator` (the canonical `var x: T` shape — see
-            // grammar.js's `var_decl`). Accept either; `lower_type_ref`
-            // handles both.
+            // The type is either a direct `type_ident` child or wrapped
+            // in a `type_decorator` (the canonical `var x: T`);
+            // `lower_type_ref` handles both.
             let ty = node
                 .named_children(&mut node.walk())
                 .find(|c| matches!(c.kind(), "type_ident" | "type_decorator"))
@@ -774,12 +716,10 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             let then_branch = node
                 .child_by_field_name("then_branch")
                 .and_then(|n| lower_block_inline(cx, n))?;
-            // The grammar's `_else_branch` is a hidden rule, so field
-            // annotations sometimes don't propagate to the inner
-            // if_stmt / block. Fall back to scanning the if_stmt's
-            // named children for the second `block` or any `if_stmt`
-            // (the first block is the then_branch, the second — if
-            // present — is the else_branch).
+            // `_else_branch` is a hidden rule, so the `else_branch`
+            // field tag sometimes doesn't propagate. Fall back to
+            // scanning named children after the then_branch for the
+            // next `block` / `if_stmt`.
             let else_branch = node
                 .child_by_field_name("else_branch")
                 .and_then(|n| lower_stmt(cx, n))
@@ -865,14 +805,10 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             })
         }
         "for_in_stmt" => {
-            // P17.2 — the grammar's `for_in_stmt` carries `sepBy2(",",
-            // for_in_param)` (no field name on the params themselves)
-            // plus a field-tagged `iterator: _expr` for the iterable
-            // and `block: block` for the body. Previous lowering
-            // misread `child_by_field_name("iterator")` as a param
-            // wrapper and asked for `name` on it, dropping the whole
-            // for-in via `?` short-circuit. Walk named children for
-            // `for_in_param` nodes.
+            // P17.2 — `for_in_stmt` carries `sepBy2(",", for_in_param)`
+            // (no field tag on the params), a field-tagged
+            // `iterator: _expr`, and `block: block`. Walk named
+            // children for the `for_in_param` nodes.
             let mut cursor = node.walk();
             let mut params: Vec<ForInParam> = Vec::new();
             for c in node.named_children(&mut cursor) {
@@ -891,51 +827,44 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
             if params.is_empty() {
                 return None;
             }
-            // **P22.4** — the grammar carries TWO sibling fields here:
-            // `iterator: $._expr` and `range: optional($.interval_expr)`.
-            // When the source is `xs[from..to]`, tree-sitter often
-            // resolves the ambiguity as `iterator: xs` + `range:
-            // [from..to]` (interval_expr at prec 2 winning over
-            // offset_expr at prec 13 in this slot). If we lower only
-            // the iterator, the body's `from`/`to` references never
-            // reach the resolver and the unused-local lint fires
-            // false-positive. Fold the range into the iterator: the
-            // semantic shape is `Offset(iterator, range)` regardless
-            // of how the parser split it.
-            let iter_node = node.child_by_field_name("iterator").ok_or(()).ok();
-            let range_node = node.child_by_field_name("range");
-            // The grammar's single `optional($.optional)` slot sits between
-            // the iterator and the `range` field (grammar.js `for_in_stmt`),
-            // so the only direct `optional` child of `for_in_stmt` is the
-            // iterator's null-safe `?` from `recv?[from..to]`. Thread it into
-            // the synthesized Offset — without it the access reads as a plain
-            // `recv[from..to]` and the possibly-null lint false-fires on what
-            // the source explicitly marked null-safe.
-            let pre_optional = node
+            // Iterable in `iterator: $._expr`, optional slice window in
+            // `range: optional($.interval_expr)` (`[from..to]`).
+            let iter_node = node.child_by_field_name("iterator")?;
+            let iterator = lower_expr(cx, iter_node)?;
+            // The null-ack `?` sits in one of two CST positions: a
+            // direct `optional` child of `for_in_stmt` (Call/Ident/Paren
+            // iterators), or the iterator's trailing `optional` last
+            // named child (Member/Arrow/Offset absorb it as
+            // `post_optional`). Clear the absorbed post so the iterator
+            // keeps only its own `opt_chaining`.
+            let nullable_iter = node
                 .named_children(&mut node.walk())
-                .any(|c| c.kind() == "optional");
-            let range = match (iter_node, range_node) {
-                (Some(iter), Some(rng)) => {
-                    let recv = lower_expr(cx, iter)?;
-                    let idx = lower_expr(cx, rng)?;
-                    let span = iter.start_byte()..rng.end_byte();
-                    cx.hir.exprs.alloc(Expr::Offset(OffsetExpr {
-                        receiver: recv,
-                        index: idx,
-                        pre_optional,
-                        post_optional: false,
-                        byte_range: span,
-                    }))
+                .find(|c| c.kind() == "optional")
+                .or_else(|| {
+                    iter_node
+                        .named_children(&mut iter_node.walk())
+                        .last()
+                        .filter(|c| c.kind() == "optional")
+                })
+                .map(|c| c.byte_range());
+            if nullable_iter.is_some() {
+                match &mut cx.hir.exprs[iterator] {
+                    Expr::Member(m) | Expr::Arrow(m) => m.post_optional = None,
+                    Expr::Offset(o) => o.post_optional = None,
+                    _ => {}
                 }
-                (Some(iter), None) => lower_expr(cx, iter)?,
-                _ => return None,
-            };
+            }
+            let window = node
+                .child_by_field_name("range")
+                .and_then(|rng| lower_expr(cx, rng));
             let body = node
                 .child_by_field_name("block")
                 .and_then(|n| lower_block_inline(cx, n))?;
             Stmt::ForIn(ForInStmt {
                 params: params.into_boxed_slice(),
-                range,
+                iterator,
+                window,
+                nullable_iter,
                 body,
                 byte_range: node.byte_range(),
             })
@@ -1010,16 +939,10 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
 
 fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr>> {
     let kind = node.kind();
-    // Comments are named nodes — `line_comment` / `block_comment` ride
-    // in `extras` and `doc_comment` is structural — so they surface as
-    // named children of expression lists (`[1, /* c */ 2]`,
-    // `Foo { /* c */ }`, `f(/* c */)`). A comment is never an
-    // expression: bail with `None` so the list-lowering callers (which
-    // all filter `None`) skip it, rather than falling through to the
-    // `_ => Expr::Unsupported` arm and minting a phantom element. This
-    // is distinct from a genuinely-unsupported *expression*, which must
-    // stay `Expr::Unsupported` as the regression marker the
-    // `unsupported_audit` test guards.
+    // Comments are named nodes that surface in expression lists
+    // (`[1, /* c */ 2]`, `Foo { /* c */ }`). A comment is never an
+    // expression: bail with `None` so list-lowering callers skip it
+    // instead of minting a phantom `Expr::Unsupported`.
     if matches!(kind, "line_comment" | "block_comment" | "doc_comment") {
         return None;
     }
@@ -1038,21 +961,11 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             byte_range: node.byte_range(),
         },
         "number" | "char" | "false" | "true" => {
-            // Eager-parse every literal into its typed value. The
-            // source text is no longer kept in the HIR — the parsed
-            // value is the source of truth, the CST owns the
-            // original bytes for diagnostics, and the formatter
-            // walks the CST directly so round-trip stays exact.
-            //
-            // Each parser also returns an optional `ParseIssue` so
-            // the analyzer can surface overflow / precision-loss /
-            // malformed-escape diagnostics without the literal
-            // losing its typed kind (typing proceeds normally).
-            //
-            // `char` is special: the grammar nests `iso8601` inside
-            // the surrounding single quotes (`'2024-01-01T00:00Z'`),
-            // so we peek at the first named child before deciding
-            // between a real char and an ISO-8601 literal.
+            // Eager-parse every literal into its typed value plus an
+            // optional `ParseIssue`. `char` is special: the grammar
+            // nests `iso8601` inside the single quotes
+            // (`'2024-01-01T00:00Z'`), so peek at the first named child
+            // to choose between a char and an ISO-8601 literal.
             let raw = cx.text(node);
             let (lit_kind, parse_issue) = match kind {
                 "number" => classify_and_parse_number(cx, node, raw, false),
@@ -1076,11 +989,9 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "string" => {
-            // P17.5 — walk every child in source order and capture
-            // both the text fragments and the `${expr}` interpolation
-            // expressions. Non-template strings lower to a single
-            // `Lit` part; template strings produce alternating
-            // `Lit`/`Interp` parts.
+            // P17.5 — capture text fragments and `${expr}`
+            // interpolations in source order. Non-template strings are
+            // a single `Lit`; templates alternate `Lit` / `Interp`.
             let mut parts: Vec<StringPart> = Vec::new();
             let mut c = node.walk();
             for piece in node.named_children(&mut c) {
@@ -1129,14 +1040,10 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             Expr::Paren(inner, node.byte_range())
         }
         "member_expr" => {
-            // Same lax-parser rationale as `static_expr` below: the
-            // grammar accepts `s.` so mid-typing doesn't ERROR-cascade.
-            // Lower the no-property case as Unsupported; the hard
-            // diagnostic comes from `core::diagnostics`. The receiver
-            // is salvaged into the enclosing block as a `Stmt::Expr`
-            // by `lower_block`'s `salvage_incomplete_members_in_block`
-            // post-pass so the analyzer types it and IDE capabilities
-            // (completion / hover / goto-def / references) still work.
+            // The grammar accepts `s.` mid-typing. Lower the
+            // no-property case as Unsupported (hard diagnostic comes
+            // from `core::diagnostics`); the receiver is salvaged by
+            // `salvage_incomplete_members_in_block`.
             let Some(prop) = node.child_by_field_name("property") else {
                 let id = cx.hir.exprs.alloc(Expr::Unsupported {
                     kind: "member_expr_missing_property",
@@ -1147,11 +1054,11 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_property_name(prop);
-            let (pre_optional, post_optional) = optional_flags_around(node, prop.id());
+            let (opt_chaining, post_optional) = optional_flags_around(node, prop.id());
             Expr::Member(MemberExpr {
                 receiver,
                 property,
-                pre_optional,
+                opt_chaining,
                 post_optional,
                 byte_range: node.byte_range(),
             })
@@ -1168,28 +1075,22 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             let receiver =
                 first_named_child_excluding(node, prop.id()).and_then(|n| lower_expr(cx, n))?;
             let property = cx.alloc_property_name(prop);
-            let (pre_optional, post_optional) = optional_flags_around(node, prop.id());
+            let (opt_chaining, post_optional) = optional_flags_around(node, prop.id());
             Expr::Arrow(MemberExpr {
                 receiver,
                 property,
-                pre_optional,
+                opt_chaining,
                 post_optional,
                 byte_range: node.byte_range(),
             })
         }
         "static_expr" => {
-            // P15.8 — chained `module::Type::name` shapes can't fit
-            // the simple `StaticExpr { ty: TypeRef, property: Ident }`
-            // shape because the head is itself a `static_expr`, not a
-            // `type_ident`. Detect the chain and lower as
-            // `Expr::QualifiedStatic { chain: Vec<Idx<Ident>> }` with
-            // every segment as a flat ident.
-            // The grammar accepts `Foo::` (no property) so the editor
-            // doesn't ERROR-recover the whole containing statement
-            // mid-typing; lower that case as Unsupported so downstream
-            // analysis sees an opaque expression instead of silently
-            // dropping it. The hard diagnostic is emitted by
-            // `core::diagnostics::static_property_diagnostics`.
+            // P15.8 — a chained `module::Type::name` head is itself a
+            // `static_expr`, so it can't fit `StaticExpr { ty, property
+            // }`; lower it as `Expr::QualifiedStatic` with flat idents.
+            // The grammar accepts `Foo::` (no property) mid-typing;
+            // lower that case as Unsupported (hard diagnostic from
+            // `core::diagnostics::static_property_diagnostics`).
             let Some(prop) = node.child_by_field_name("property") else {
                 let id = cx.hir.exprs.alloc(Expr::Unsupported {
                     kind: "static_expr_missing_property",
@@ -1209,11 +1110,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 }
             } else {
                 let ty = lower_type_ref(cx, head)?;
-                // The property can be either an `ident` (`Foo::a`) or a
-                // quoted `string` (`Foo::"a"`); both forms are valid
-                // enum-variant access syntax. The `PropertyName` enum
-                // preserves the syntactic form for diagnostics and
-                // formatter round-trips.
+                // Property is an `ident` (`Foo::a`) or quoted `string`
+                // (`Foo::"a"`); `PropertyName` preserves the form.
                 let property = cx.alloc_property_name(prop);
                 Expr::Static(StaticExpr {
                     ty,
@@ -1223,27 +1121,22 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             }
         }
         "offset_expr" => {
-            // `recv[index]` — two `_expr` children. The grammar also
-            // emits `optional` tokens (`?`) before / after the indexer
-            // for the null-safe forms `a?[i]` / `a[i]?`. We classify
-            // each `optional` named child by whether it precedes the
-            // first `_expr` (no — it's always between the receiver and
-            // `[`) or follows the index expression.
+            // `recv[index]` — two `_expr` children, plus `optional`
+            // tokens for the null-safe forms `a?[i]` / `a[i]?`. Classify
+            // each `optional` by its position relative to receiver / index.
             let mut cursor = node.walk();
             let mut recv: Option<Idx<Expr>> = None;
             let mut idx: Option<Idx<Expr>> = None;
-            let mut pre_optional = false;
-            let mut post_optional = false;
+            let mut pre_optional: Option<Span> = None;
+            let mut post_optional: Option<Span> = None;
             for c in node.named_children(&mut cursor) {
                 match c.kind() {
                     "optional" => {
                         if recv.is_some() && idx.is_some() {
-                            post_optional = true;
+                            post_optional = Some(c.byte_range());
                         } else if recv.is_some() {
-                            // Between receiver and `[` — but the index
-                            // hasn't been seen yet. This is the
-                            // `a?[i]` shape.
-                            pre_optional = true;
+                            // Before the index — the `a?[i]` shape.
+                            pre_optional = Some(c.byte_range());
                         }
                     }
                     _ if recv.is_none() => recv = lower_expr(cx, c),
@@ -1277,9 +1170,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             })
         }
         "binary_expr" => {
-            // P6.5: `is` / `as` use a `type_ident` on the right rather
-            // than another expr. Detect them here and emit dedicated
-            // HIR variants instead of forcing them through Binary.
+            // P6.5: `is` / `as` carry a `type_ident` on the right;
+            // emit dedicated HIR variants rather than Binary.
             let op_text = operator_text(cx, node);
             if op_text == "is" || op_text == "as" {
                 let value = node
@@ -1320,16 +1212,12 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         }
         "unary_expr" => {
             let op = unary_op_for(operator_text(cx, node));
-            // Fold `-<number>` into a single negated literal so the
+            // Fold `-<number>` into one negated literal so the
             // i64-boundary asymmetry (magnitude up to `2^63` is valid
-            // when the result is `i64::MIN`, only up to `i64::MAX`
-            // when the result is positive) is applied at the right
-            // place. Without this, `-9223372036854775808` would
-            // parse the magnitude, saturate to `i64::MAX` with an
-            // overflow warning, then unary-`-` would negate to
-            // `-i64::MAX` — silently wrong by one. Same logic for
-            // `time` / `duration` / `float` suffixes (the magnitude
-            // bounds carry over).
+            // for `i64::MIN`, only `2^63-1` for a positive result) is
+            // applied here — e.g. `-9223372036854775808` must not
+            // saturate the magnitude before negating. Same for
+            // `time` / `duration` / `float` suffixes.
             let operand_node = node.named_children(&mut node.walk()).next();
             if matches!(op, UnaryOp::Neg)
                 && let Some(child) = operand_node
@@ -1373,22 +1261,10 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             //   object_fields       := "{" sepBy(",", object_field) "}"   // named
             //   object_field        := name:_expr ":" value:_expr
             //
-            // Bug fixed (P17.6 investigation): the previous lowering
-            // looked for `object_field` children inside `object_initializers`
-            // and never entered the `object_fields` branch at all. Both
-            // forms ended up producing `fields = []`, dropping every
-            // value expression from the HIR — which silenced the
-            // resolver on every ident inside an object literal and
-            // produced cascading `unused-local` / `unused-param` /
-            // `unresolved name` false positives downstream.
-            // The two body productions are disjoint and map to
-            // distinct HIR variants: `object_initializers` →
-            // `Expr::PositionalObject`, `object_fields` →
-            // `Expr::Object`. Keeping them apart makes "a field with
-            // no name" / "a positional element with a name"
-            // unrepresentable, so downstream consumers read the
-            // construction form off the variant rather than inferring
-            // it from the fields.
+            // The two body productions are disjoint and map to distinct
+            // HIR variants: `object_initializers` → `PositionalObject`,
+            // `object_fields` → `Object`. Consumers read the
+            // construction form off the variant.
             let ty = node
                 .child_by_field_name("type")
                 .and_then(|n| lower_type_ref(cx, n));
@@ -1414,15 +1290,12 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                             if of.kind() != "object_field" {
                                 continue;
                             }
-                            // `name` is `_expr` in the grammar — a bare
-                            // ident / quoted string for a classic field
-                            // name, or an arbitrary key expression for a
-                            // `Map` (`Map { Level::Low: 0 }`). Lower it
-                            // faithfully; the field-name-vs-value-key
-                            // interpretation is made downstream by the
-                            // head type. The string → symbol decode that
-                            // used to live here now happens at the
-                            // member-resolution site.
+                            // `name` is `_expr` — a bare ident / quoted
+                            // string for a classic field, or an
+                            // arbitrary key expr for a `Map`
+                            // (`Map { Level::Low: 0 }`). The
+                            // field-vs-key interpretation is made
+                            // downstream by the head type.
                             let name = of
                                 .child_by_field_name("name")
                                 .and_then(|n| lower_expr(cx, n));
@@ -1443,9 +1316,9 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                 }
             }
             match (named_fields, positional_fields) {
-                // Named body wins if present; a malformed object with
-                // neither body falls back to an empty positional shape
-                // (empty `{}` parses as `object_initializers` anyway).
+                // Named body wins; neither body falls back to an empty
+                // positional shape (empty `{}` parses as
+                // `object_initializers`).
                 (Some(fields), _) => Expr::Object(ObjectExpr {
                     ty,
                     fields: fields.into_boxed_slice(),
@@ -1459,9 +1332,8 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             }
         }
         // **P19.15** — `from..to` (and `from..` / `..to`) plus the
-        // math-style `]from..to]` / `[from..to[` interval flatten
-        // into one HIR shape. Bracket inclusivity isn't load-bearing
-        // for typing.
+        // math-style `]from..to]` / `[from..to[` interval flatten into
+        // one HIR shape; bracket inclusivity doesn't affect typing.
         "range_expr" | "interval_expr" => {
             let from = node
                 .child_by_field_name("from")
@@ -1483,24 +1355,18 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
     Some(cx.hir.exprs.alloc(expr))
 }
 
-/// Classify a `number` CST node by its typed suffix AND parse its
-/// numeric body in one pass. Returns the typed [`LiteralKind`]
-/// variant plus an optional [`ParseIssue`] when the source token
-/// overflowed / lost precision / etc.
-///
-/// Grammar shape: `(number (number_suffixed (number_int |
-/// number_decimal | number_scientific) (number_suffix)?))`.
+/// Classify a `number` CST node by its typed suffix and parse its
+/// body in one pass. Grammar shape: `(number (number_suffixed
+/// (number_int | number_decimal | number_scientific)
+/// (number_suffix)?))`.
 ///
 /// Suffix dispatch:
-/// - `time` → [`LiteralKind::Time`] (value parsed as i64 µs).
+/// - `time` → [`LiteralKind::Time`] (i64 µs).
 /// - `duration` / unit suffixes (`y`, `d`, `h`, `m`, `s`, `ms`, `us`,
-///   `ns`, `min`, `sec`, `hour`, `day`, `week`, `month`, `year` and
-///   their long forms) → [`LiteralKind::Duration`] with the value
-///   scaled to µs.
-/// - bare `f` / `_f` suffix → [`LiteralKind::Float`].
-/// - no suffix:
-///   * `.` or scientific `e`/`E` exponent → [`LiteralKind::Float`].
-///   * otherwise → [`LiteralKind::Int`].
+///   `ns`, … and long forms) → [`LiteralKind::Duration`], scaled to µs.
+/// - bare `f` / `_f` → [`LiteralKind::Float`].
+/// - no suffix: `.` or `e`/`E` exponent → [`LiteralKind::Float`],
+///   otherwise [`LiteralKind::Int`].
 fn classify_and_parse_number(
     cx: &LowerCtx,
     node: tree_sitter::Node<'_>,
@@ -1550,10 +1416,9 @@ fn classify_and_parse_number(
     }
 }
 
-/// Walk a `number` CST node to recover its body text (the numeric
-/// digits without suffix) and the suffix text (if any). Returns
-/// `(None, None)` if the structure doesn't match — caller falls back
-/// to the full `raw` token.
+/// Recover a `number` node's body text (digits without suffix) and
+/// suffix text. Returns `(None, None)` on a structure mismatch —
+/// caller falls back to the full `raw` token.
 fn extract_number_parts(
     cx: &LowerCtx,
     node: tree_sitter::Node<'_>,
@@ -1585,9 +1450,8 @@ fn extract_number_parts(
     (body, suffix)
 }
 
-/// Test whether a numeric body text reads as a float — has a decimal
-/// point or a scientific exponent. Mirrors the old analyzer-side
-/// `numeric_literal_kind` heuristic.
+/// `true` if a numeric body reads as a float — has a decimal point or
+/// a scientific exponent.
 fn looks_like_float(text: &str) -> bool {
     if text.contains('.') {
         return true;
@@ -1607,16 +1471,10 @@ fn looks_like_float(text: &str) -> bool {
 }
 
 /// Saturating decimal integer magnitude parse. The grammar's
-/// `number_int` only accepts `[0-9][0-9_]*` — no hex/binary/octal
-/// prefixes — so this only handles base-10 with optional `_`
-/// separators. Walks bytes directly with `checked_mul` /
-/// `checked_add`, so no allocation and overflow is detected exactly
-/// when the accumulator can no longer absorb the next digit. Returns
+/// `number_int` is `[0-9][0-9_]*` (base-10 with optional `_`). Returns
 /// the absolute magnitude as `u64`; the `i64` boundary (and its
-/// asymmetry between positive max and negative min) is applied by
-/// [`magnitude_to_i64_positive`] / [`magnitude_to_i64_negated`] at
-/// the literal-lowering site, which knows whether a unary `-` is
-/// folding into the literal.
+/// positive/negative asymmetry) is applied by
+/// [`magnitude_to_i64_positive`] / [`magnitude_to_i64_negated`].
 fn parse_integer_magnitude_sat(s: &str) -> (u64, Option<ParseIssue>) {
     let mut acc: u64 = 0;
     let mut overflow = false;
@@ -1625,8 +1483,7 @@ fn parse_integer_magnitude_sat(s: &str) -> (u64, Option<ParseIssue>) {
             continue;
         }
         if !b.is_ascii_digit() {
-            // The grammar guarantees this can't happen; stay safe
-            // anyway and surface as an overflow-style anomaly.
+            // Grammar guarantees digits; surface defensively.
             return (u64::MAX, Some(ParseIssue::Overflow));
         }
         if overflow {
@@ -1656,10 +1513,8 @@ fn magnitude_to_i64_positive(m: u64, mut issue: Option<ParseIssue>) -> (i64, Opt
 }
 
 /// Convert a magnitude to its negation as `i64`. `i64::MIN` has
-/// magnitude `2^63`, which is exactly representable as the negated
-/// value even though it's `i64::MAX + 1` in unsigned terms — that
-/// asymmetry is the whole reason for splitting the positive /
-/// negated converters. Magnitudes strictly greater than `2^63` flag
+/// magnitude `2^63`, exactly representable as the negated value (hence
+/// the split positive / negated converters). Magnitudes `> 2^63` flag
 /// [`ParseIssue::Overflow`] and saturate at `i64::MIN`.
 fn magnitude_to_i64_negated(m: u64, mut issue: Option<ParseIssue>) -> (i64, Option<ParseIssue>) {
     const I64_MIN_MAG: u64 = i64::MIN.unsigned_abs();
@@ -1674,23 +1529,9 @@ fn magnitude_to_i64_negated(m: u64, mut issue: Option<ParseIssue>) -> (i64, Opti
 }
 
 /// f64 parse. Strips GreyCat's underscore digit separators then
-/// delegates to Rust's correctly-rounded `str::parse::<f64>`. The
-/// in-house mantissa-times-pow10 accumulator we used previously
-/// accumulated rounding error fast enough that `f64::MAX`'s canonical
-/// decimal (`1.7976931348623157e+308`) parsed to `+∞`, which the
-/// `literal-overflow` lint then flagged as overflow. `from_str`'s
-/// Eisel-Lemire path is correctly rounded by construction so the
-/// boundary cases agree with the runtime.
-///
-/// Only [`ParseIssue::Overflow`] surfaces here, and only when the
-/// parsed value is `±∞`. The [`ParseIssue::PrecisionLoss`] variant
-/// stays defined for forward compatibility but is intentionally not
-/// emitted: f64 caps precision at ~16 decimal digits regardless of
-/// what the user writes, the parser's result equals what the runtime
-/// computes via `strtod`, and the canonical 20-digit math constants
-/// from `<math.h>` (`M_E`, `M_PI`, …) are idiomatic literals not user
-/// errors. Other mainstream parsers (`gcc`, `clang`, `rustc`, `tsc`)
-/// don't warn here either.
+/// delegates to Rust's correctly-rounded `str::parse::<f64>`. Only
+/// [`ParseIssue::Overflow`] surfaces, and only when the parsed value
+/// is `±∞`; [`ParseIssue::PrecisionLoss`] is defined but not emitted.
 fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
     // GreyCat allows `_` as a digit-grouping marker (`1_000.5_e+1_0`);
     // Rust's parser rejects them. Strip only when present so the
@@ -1702,8 +1543,7 @@ fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
     };
     let value = match cleaned.parse::<f64>() {
         Ok(v) => v,
-        // The lexer / grammar already validated the literal's shape,
-        // so `from_str` shouldn't fail in practice. Defensive return.
+        // Grammar already validated the shape; defensive return.
         Err(_) => return (0.0, Some(ParseIssue::Overflow)),
     };
     if value.is_infinite() {
@@ -1713,9 +1553,8 @@ fn parse_float_sat(s: &str) -> (f64, Option<ParseIssue>) {
 }
 
 fn parse_char(raw: &str) -> (LiteralKind, Option<ParseIssue>) {
-    // Char tokens come wrapped in single quotes. Strip them, then
-    // decode the (possibly-escaped) inner content. A well-formed
-    // single-char source produces exactly one Unicode scalar.
+    // Char tokens are single-quoted. Strip quotes, decode the
+    // (possibly-escaped) inner content.
     let inner = raw.trim_matches('\'');
     let decoded: Option<char> = if let Some(esc) = inner.strip_prefix('\\') {
         match esc {
@@ -1819,10 +1658,8 @@ fn parse_iso8601(raw: &str) -> (LiteralKind, Option<ParseIssue>) {
             return malformed();
         }
 
-        // Fractional seconds, capped at 6 digits = µs precision. Extra
-        // digits are valid ISO-8601 but quietly truncated; the parser
-        // doesn't flag those — they're just below the runtime's
-        // representable precision.
+        // Fractional seconds, capped at 6 digits (µs). Extra digits
+        // are valid ISO-8601 but quietly truncated.
         if bytes.get(i) == Some(&b'.') {
             i += 1;
             let mut frac = 0i64;
@@ -1981,12 +1818,10 @@ fn is_duration_suffix(s: &str) -> bool {
     )
 }
 
-/// Convert `value <suffix>` to microseconds — GreyCat's canonical
-/// unit for `duration`. Returns `None` on overflow or unknown
-/// suffix. `month` / `year` use the conventional 30-day / 365-day
-/// approximations. The `ns` / `nanosecond` suffix is sub-microsecond
-/// and truncates toward zero (`999ns` → `0us`, `1000ns` → `1us`)
-/// rather than multiplying.
+/// Convert `value <suffix>` to microseconds. `None` on overflow or
+/// unknown suffix. `month` / `year` use 30-day / 365-day
+/// approximations; `ns` / `nanosecond` truncates toward zero
+/// (`999ns` → `0us`).
 fn duration_to_us(value: i64, suffix: &str) -> Option<i64> {
     const MS: i64 = 1_000;
     const SEC: i64 = 1_000_000;
@@ -2012,11 +1847,9 @@ fn duration_to_us(value: i64, suffix: &str) -> Option<i64> {
 
 fn lower_expr_list(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Vec<Idx<Expr>> {
     // P43.4 — covers `tuple_expr`, `array_expr`, `call_expr` args, and
-    // `object_initializers`. The user typing `foo(bar., baz)` produces
-    // an ERROR around the `bar.` arg; the salvage helper lets
-    // recognizable inner shapes (`bar` as an ident, or `member_expr`
-    // with property) still land in the call's arg vector so member
-    // completion / signature_help work mid-edit.
+    // `object_initializers`. The salvage helper lets recognizable inner
+    // shapes land in the list even when a sibling arg is mid-edit
+    // (`foo(bar., baz)` wraps `bar.` in an ERROR).
     let mut out = Vec::new();
     for (c, _salvaged) in flatten_errors_named_children(node) {
         if let Some(e) = lower_expr(cx, c) {
@@ -2035,15 +1868,16 @@ fn first_named_child_excluding<'tree>(
         .find(|c| c.id() != excluded_id)
 }
 
-/// Walk `node`'s named children for `optional` siblings of the
-/// property at `prop_id`. Returns `(pre_optional, post_optional)`:
-/// `pre` is true when an `optional` token sits before the property
-/// (`a?.b` / `a?->b`); `post` is true when one sits after
-/// (`a.b?` / `a->b?`).
-fn optional_flags_around(node: tree_sitter::Node<'_>, prop_id: usize) -> (bool, bool) {
+/// Returns `(opt_chaining, post_optional)` from the `optional`
+/// siblings of the property at `prop_id`: `opt_chaining` when one sits
+/// before (`a?.b`), `post_optional` when one sits after (`a.b?`).
+fn optional_flags_around(
+    node: tree_sitter::Node<'_>,
+    prop_id: usize,
+) -> (Option<Span>, Option<Span>) {
     let mut cursor = node.walk();
-    let mut pre = false;
-    let mut post = false;
+    let mut pre: Option<Span> = None;
+    let mut post: Option<Span> = None;
     let mut seen_prop = false;
     for c in node.named_children(&mut cursor) {
         if c.id() == prop_id {
@@ -2052,9 +1886,9 @@ fn optional_flags_around(node: tree_sitter::Node<'_>, prop_id: usize) -> (bool, 
         }
         if c.kind() == "optional" {
             if seen_prop {
-                post = true;
+                post = Some(c.byte_range());
             } else {
-                pre = true;
+                pre = Some(c.byte_range());
             }
         }
     }
@@ -2062,17 +1896,11 @@ fn optional_flags_around(node: tree_sitter::Node<'_>, prop_id: usize) -> (bool, 
 }
 
 // P15.8
-/// Walk a chained `static_expr` node left-to-right and
-/// alloc each segment's ident into the HIR's idents arena, pushing
-/// the resulting `Idx<Ident>` into `out`. Returns `false` if any
-/// segment's ident node is missing (a malformed chain).
-///
-/// For `runtime::Identity::create`, `out` ends up as
-/// `[runtime, Identity, create]`.
-///
-/// The leftmost segment is wrapped in a `type_ident` (because the
-/// grammar sets the head's first form to `type_ident`); subsequent
-/// segments come from each `static_expr.property` ident.
+/// Alloc each segment of a chained `static_expr` into the idents
+/// arena, pushing the `Idx<Ident>` into `out`. `false` on a malformed
+/// chain. `runtime::Identity::create` → `[runtime, Identity, create]`.
+/// The leftmost segment is a `type_ident`; the rest come from each
+/// `static_expr.property`.
 fn collect_static_chain_idents(
     cx: &mut LowerCtx,
     node: tree_sitter::Node<'_>,
@@ -2161,10 +1989,8 @@ fn unary_op_for(text: &str) -> UnaryOp {
     }
 }
 
-/// Tree-sitter kind strings are themselves `&'static str`s embedded in the
-/// generated parser tables, but we can't carry a tree-sitter borrow across
-/// arena allocations. Intern via a leak — the set of node kinds is bounded
-/// (~70) so the leak is bounded too.
+/// Intern a tree-sitter kind string into `&'static` via a leak — the
+/// set of node kinds is bounded (~70), so the leak is bounded too.
 fn kind_to_static(kind: &str) -> &'static str {
     Box::leak(kind.to_string().into_boxed_str())
 }
@@ -2178,8 +2004,8 @@ fn static_str(s: &str) -> &'static str {
 // =============================================================================
 
 fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<TypeRef>> {
-    // The grammar wraps actual ids in `type_ident` (with field `name` and
-    // optional `params`), but `attr_type`, `type_decorator`, etc. embed it.
+    // Ids live in `type_ident` (field `name` + optional `params`);
+    // `attr_type` / `type_decorator` embed one.
     let inner = match node.kind() {
         "type_ident" => node,
         "attr_type" | "type_decorator" => node
@@ -2192,14 +2018,11 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
     }
     let name_node = inner.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
-    // Walk named children once and bucket by kind:
-    //   - `ident` siblings BEFORE the name field tag → module qualifier
-    //     segments (`(ident "::")*` in the grammar, leftmost-first).
-    //   - `type_ident` siblings → generic params.
-    // The grammar emits one `params:`-tagged child per arg
-    // (`Map<K, V>` → two `params: type_ident` nodes), so we can't rely
-    // on `child_by_field_name("params")` — that returns only the
-    // first. Walking the named children directly captures them all.
+    // Bucket named children by kind: `ident` siblings before the name
+    // → module-qualifier segments (leftmost-first); `type_ident`
+    // siblings → generic params. The grammar emits one `params:`-tagged
+    // child per arg (`Map<K, V>` → two), so walk all named children
+    // rather than `child_by_field_name("params")` (returns only the first).
     let mut qualifier: Vec<Idx<Ident>> = Vec::new();
     let mut params: Vec<Idx<TypeRef>> = Vec::new();
     let mut cursor = inner.walk();
@@ -2209,8 +2032,6 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
         }
         match c.kind() {
             "ident" => {
-                // Module-qualifier segment. The grammar produces them
-                // in source order before the field-tagged `name`.
                 qualifier.push(cx.alloc_ident(c));
             }
             "type_ident" => {
@@ -2224,12 +2045,9 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
     let optional = inner
         .named_children(&mut inner.walk())
         .any(|c| c.kind() == "optional");
-    // Anonymous `typeof` keyword child: the grammar admits it at the
-    // head of `type_ident` (grammar.js:483, the parser always prefers
-    // this path even when the surrounding `fn_param` also offers an
-    // optional `typeof` slot). Detect it via the unnamed-children walk
-    // so the marker carries through to type lowering, where it lifts
-    // the lowered shape into `TypeKind::TypeOf(inner)`.
+    // Anonymous `typeof` keyword child at the head of `type_ident`
+    // (the parser prefers this over the `fn_param` slot). Carried
+    // through to type lowering as `TypeKind::TypeOf(inner)`.
     let typeof_marker = inner
         .children(&mut inner.walk())
         .any(|c| c.kind() == "typeof");
@@ -2239,11 +2057,9 @@ fn lower_type_ref(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<
         params: params.into_boxed_slice(),
         optional,
         typeof_marker,
-        // P18.1 — store the `type_ident`'s own byte range, not the
-        // wrapper's (`attr_type` / `type_decorator` include the leading
-        // `:` / annotation tokens). The TS reference's `dump-types`
-        // emits `TypeIdent` records over the type_ident span; matching
-        // that lets the parity oracle diff cleanly.
+        // P18.1 — the `type_ident`'s own range, not the wrapper's
+        // (`attr_type` / `type_decorator` include leading `:` /
+        // annotation tokens); matches the parity oracle's span.
         byte_range: range_of(inner),
     }))
 }
@@ -2290,9 +2106,8 @@ mod tests {
     }
 
     // P43.1
-    /// `if (c.sim.)` — the user's repro shape. Tree-sitter wraps the
-    /// salvaged `member_expr` in `ERROR`; the helper flattens it back
-    /// into the block's child list with `salvaged = true`.
+    /// `if (c.sim.)` — tree-sitter wraps the salvaged `member_expr` in
+    /// `ERROR`; the helper flattens it back with `salvaged = true`.
     #[test]
     fn flatten_errors_descends_one_level_into_error() {
         let src = "type C { x: int; }\nfn test(c: C) {\n    if (c.x.)\n}\n";
@@ -2319,11 +2134,9 @@ mod tests {
     }
 
     // P43.1
-    /// Invariant: yielded items are never themselves `ERROR`. The
-    /// helper either flattens through an ERROR (one level) or skips
-    /// any inner `ERROR` grandchildren. Run against a few error-prone
-    /// shapes (incomplete expr, trailing operator) so any future
-    /// grammar tweak still produces a depth-bounded walk.
+    /// Invariant: yielded items are never themselves `ERROR`. Checked
+    /// against a few error-prone shapes (incomplete expr, trailing
+    /// operator).
     #[test]
     fn flatten_errors_never_yields_error_kind() {
         let inputs = [

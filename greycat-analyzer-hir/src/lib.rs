@@ -1,9 +1,5 @@
 //! HIR for greycat — typed surface tree built by lowering tree-sitter CST.
-//!
-//! Single typed-AST + arena layout (Decision B). Each concrete shape is in
-//! [`types`]; the lowering walker is in [`lower`]. Shapes that don't yet
-//! have a non-`Unsupported` variant are filled in by downstream stages
-//! (resolver / type system / analyzer).
+//! Shapes are in [`types`]; the lowering walker is in [`lower`].
 
 pub mod arena;
 pub mod lower;
@@ -29,10 +25,8 @@ pub struct Hir {
     pub enum_fields: Arena<EnumField>,
     // P43.2
     /// Statement ids salvaged from inside a CST `ERROR` wrapper by
-    /// [`lower::flatten_errors_named_children`]. Downstream consumers
-    /// (lints whose intent assumes complete code, certain diagnostics)
-    /// consult this set so they don't fire on shapes the user is
-    /// mid-editing. Empty for well-formed sources.
+    /// [`lower::flatten_errors_named_children`]. Consumers that assume
+    /// complete code skip these. Empty for well-formed sources.
     pub salvaged_stmts: FxHashSet<Idx<Stmt>>,
 }
 
@@ -161,12 +155,7 @@ type Point {
 
     #[test]
     fn object_expr_named_fields_lower_their_values() {
-        // Regression: lowering used to look for `object_field` children
-        // inside `object_initializers`; the named form (`object_fields`)
-        // was never handled, so every value expression was dropped from
-        // the HIR. That silenced the resolver on every ident inside a
-        // named object literal and produced cascading `unused-local` /
-        // `unused-param` false positives.
+        // Named-object (`object_fields`) value exprs must be lowered.
         let src = r#"
 type Foo { name: String; age: int; }
 fn build(n: String, a: int): Foo {
@@ -194,8 +183,8 @@ fn build(n: String, a: int): Foo {
             panic!("expected object expr, got {:?}", &hir.exprs[*ret])
         };
         assert_eq!(obj.fields.len(), 2, "named fields must be lowered");
-        // The name slot is now a full `Expr` — for a classic field it
-        // is the bare-ident key (`name`).
+        // The name slot is a full `Expr`; a classic field is the
+        // bare-ident key (`name`).
         let Expr::Ident { name: key_use, .. } = &hir.exprs[obj.fields[0].name] else {
             panic!("expected ident key for field name")
         };
@@ -206,19 +195,10 @@ fn build(n: String, a: int): Foo {
         assert_eq!(&symbols[hir.idents[*name_use].symbol], "n");
     }
 
-    /// `if (c.sim.)` — the user's repro shape. Originally
-    /// (P43.3) the grammar required a property after `.` so the
-    /// trailing `.` triggered tree-sitter ERROR-recovery wrapping
-    /// the inner `member_expr (c, sim)`, and HIR salvage lifted it
-    /// into the block's stmts so completion could see the receiver.
-    /// The grammar later relaxed `member_expr.property` to optional
-    /// (mirroring `static_expr`) so `c.sim.` now parses as a
-    /// well-formed nested `member_expr` — no ERROR. The salvage
-    /// invariant moved: `salvage_incomplete_members_in_block` now
-    /// walks the block's CST for member/arrow exprs with a missing
-    /// property and lifts their receivers as `Stmt::Expr` salvage,
-    /// so the analyzer types them and IDE capabilities still work
-    /// on the receiver.
+    /// `if (c.sim.)` parses as a well-formed nested `member_expr` with
+    /// a missing property. `salvage_incomplete_members_in_block` lifts
+    /// the receiver as `Stmt::Expr` salvage so the analyzer types it and
+    /// IDE capabilities work on the receiver.
     #[test]
     fn block_lowering_salvages_incomplete_member_receiver() {
         let src = "type Ctx { sim: int; }\nfn test(c: Ctx) {\n    if (c.sim.)\n}\n";
@@ -238,8 +218,8 @@ fn build(n: String, a: int): Foo {
         let Stmt::Block(block) = &hir.stmts[body] else {
             panic!("body is a block");
         };
-        // Expect exactly one salvaged Stmt::Expr wrapping a
-        // `Member(c, sim)` receiver, tagged salvaged so lints skip it.
+        // Exactly one salvaged Stmt::Expr wrapping a `Member(c, sim)`
+        // receiver, tagged salvaged so lints skip it.
         let salvaged_members: Vec<_> = block
             .stmts
             .iter()
@@ -279,10 +259,8 @@ fn build(n: String, a: int): Foo {
 
     #[test]
     fn object_expr_positional_initializers_lower_each_value() {
-        // The positional form `node<T> { val }` produced empty fields
-        // before — the lowering iterated children searching for
-        // `object_field` nodes that don't exist there. Each child is a
-        // bare `_expr`. Locking the corrected shape in.
+        // Positional form `node<T> { val }` — each child is a bare
+        // `_expr`, lowered as a positional field.
         let src = r#"
 type Group { name: String; }
 fn make(g: Group) {
@@ -308,8 +286,7 @@ fn make(g: Group) {
             panic!("expected positional object expr")
         };
         assert_eq!(obj.fields.len(), 1, "single positional value");
-        // Positional fields are bare value exprs — no name slot exists
-        // in the shape at all.
+        // Positional fields are bare value exprs — no name slot.
         let Expr::Ident { name: used, .. } = &hir.exprs[obj.fields[0]] else {
             panic!("expected ident use")
         };

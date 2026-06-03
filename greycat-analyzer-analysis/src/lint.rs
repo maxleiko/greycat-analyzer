@@ -1763,13 +1763,13 @@ pub fn chain_has_upstream_nullsafe(hir: &Hir, expr_id: Idx<Expr>) -> bool {
     loop {
         match &hir.exprs[cur] {
             Expr::Member(m) | Expr::Arrow(m) => {
-                if m.pre_optional || m.post_optional {
+                if m.opt_chaining.is_some() || m.post_optional.is_some() {
                     return true;
                 }
                 cur = m.receiver;
             }
             Expr::Offset(o) => {
-                if o.pre_optional || o.post_optional {
+                if o.pre_optional.is_some() || o.post_optional.is_some() {
                     return true;
                 }
                 cur = o.receiver;
@@ -1844,14 +1844,14 @@ fn lint_nullability_inner(
             Expr::Member(MemberExpr {
                 receiver,
                 property,
-                pre_optional,
+                opt_chaining,
                 byte_range,
                 ..
             })
             | Expr::Arrow(MemberExpr {
                 receiver,
                 property,
-                pre_optional,
+                opt_chaining,
                 byte_range,
                 ..
             }) => {
@@ -1862,8 +1862,9 @@ fn lint_nullability_inner(
                 if matches!(recv.kind, TypeKind::Any | TypeKind::Null) {
                     continue;
                 }
+                let opt_chaining = opt_chaining.is_some();
                 let recv_range = receiver_byte_range(hir, *receiver);
-                if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
+                if recv.nullable && !opt_chaining && !chain_has_upstream_nullsafe(hir, *receiver) {
                     let display = display_receiver(hir, symbols, *receiver);
                     emit_typed(
                         out,
@@ -1877,7 +1878,7 @@ fn lint_nullability_inner(
                             tag: None,
                         },
                     );
-                } else if !recv.nullable && *pre_optional {
+                } else if !recv.nullable && opt_chaining {
                     let prop_start = hir.idents[property.ident()].byte_range.start;
                     let _ = expr_id;
                     let _ = byte_range;
@@ -1908,8 +1909,9 @@ fn lint_nullability_inner(
                 if matches!(recv.kind, TypeKind::Any | TypeKind::Null) {
                     continue;
                 }
+                let pre_optional = pre_optional.is_some();
                 let recv_range = receiver_byte_range(hir, *receiver);
-                if recv.nullable && !*pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
+                if recv.nullable && !pre_optional && !chain_has_upstream_nullsafe(hir, *receiver) {
                     let display = display_receiver(hir, symbols, *receiver);
                     emit_typed(
                         out,
@@ -1923,7 +1925,7 @@ fn lint_nullability_inner(
                             tag: None,
                         },
                     );
-                } else if !recv.nullable && *pre_optional {
+                } else if !recv.nullable && pre_optional {
                     emit_typed(
                         out,
                         directives.as_deref_mut(),
@@ -1998,6 +2000,36 @@ fn lint_nullability_inner(
             _ => {}
         }
     }
+
+    // A nullable iterator with no `?` ack throws at runtime
+    // (`null field while none nullable iterator`); flag it. `nullable_iter`
+    // (the `?`) suppresses.
+    for (_, stmt) in hir.stmts.iter() {
+        let Stmt::ForIn(f) = stmt else { continue };
+        if f.nullable_iter.is_some() {
+            continue;
+        }
+        let Some(iter_ty) = analysis.expr_types.get(&f.iterator).copied() else {
+            continue;
+        };
+        let ty = arena.get(iter_ty);
+        if !ty.nullable || matches!(ty.kind, TypeKind::Any | TypeKind::Null) {
+            continue;
+        }
+        let display = display_receiver(hir, symbols, f.iterator);
+        emit_typed(
+            out,
+            directives.as_deref_mut(),
+            bypass_suppressions,
+            LintDiagnostic {
+                rule: "possibly-null",
+                severity: LintSeverity::Warning,
+                message: format!("`{display}` is possibly `null`"),
+                byte_range: receiver_byte_range(hir, f.iterator),
+                tag: None,
+            },
+        );
+    }
 }
 
 /// Byte range of an arbitrary expression. Thin wrapper around
@@ -2030,15 +2062,19 @@ fn display_receiver(hir: &Hir, symbols: &SymbolTable, expr_id: Idx<Expr>) -> Str
         Expr::Member(m) => {
             let recv = display_receiver(hir, symbols, m.receiver);
             let prop = display_property(hir, symbols, m.property);
-            let q = if m.pre_optional { "?." } else { "." };
-            let post = if m.post_optional { "?" } else { "" };
+            let q = if m.opt_chaining.is_some() { "?." } else { "." };
+            let post = if m.post_optional.is_some() { "?" } else { "" };
             format!("{recv}{q}{prop}{post}")
         }
         Expr::Arrow(m) => {
             let recv = display_receiver(hir, symbols, m.receiver);
             let prop = display_property(hir, symbols, m.property);
-            let q = if m.pre_optional { "?->" } else { "->" };
-            let post = if m.post_optional { "?" } else { "" };
+            let q = if m.opt_chaining.is_some() {
+                "?->"
+            } else {
+                "->"
+            };
+            let post = if m.post_optional.is_some() { "?" } else { "" };
             format!("{recv}{q}{prop}{post}")
         }
         Expr::Static(s) => {
@@ -3004,11 +3040,10 @@ fn f(x: String?) {
 
     #[test]
     fn for_in_optional_index_suppresses_possibly_null() {
-        // `for (_, _ in recv?[from..to])` — the grammar splits the
-        // null-safe `?[from..to]` into `iterator` + `(optional)` +
-        // `range`, and the lowering folds it back into a single
-        // `Offset` carrying `pre_optional`. The explicit `?` opts into
-        // null-safety, so `possibly-null` must NOT fire on `recv`.
+        // `for (_, _ in recv?[from..to])` — the `?` (a Call iterator can't
+        // carry it, so it lands in `for_in_stmt`'s `optional` slot) lowers to
+        // `ForInStmt.nullable_iter = true`. The explicit ack opts into
+        // skip-on-null, so `possibly-null` must NOT fire on the iterator.
         let diags = project_lints(
             r#"
 type Foo {
@@ -3043,6 +3078,103 @@ type Foo {
         assert!(
             diags.iter().any(|d| d.rule == "possibly-null"),
             "`[from..to]` (no `?`) on a nullable iterator is unguarded; should flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn for_in_member_chain_no_marker_warns() {
+        // `for (_, _ in f?.x[from..to])` — `f?.x` is `nodeTime<int>?`. The
+        // `?.` guards `f`, NOT `x`: when `f` is non-null and `x` is null the
+        // iterator is null and the runtime throws
+        // `null field while none nullable iterator` (verified via
+        // `greycat run`). The inner `?.` must NOT suppress — only a trailing
+        // iterator marker (`f?.x?[..]`) makes it safe. So `possibly-null`
+        // SHOULD fire.
+        let diags = project_lints(
+            r#"
+type Foo { x: nodeTime<int>?; }
+fn f(f: Foo?, from: time, to: time) {
+    for (_, _ in f?.x[from..to]) {}
+}
+"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "possibly-null"),
+            "`f?.x[from..to]` is an unguarded nullable iterator (runtime throws); should flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn for_in_member_chain_marker_silent() {
+        // Same, WITH the iterator marker: `f?.x?[from..to]`. The grammar
+        // absorbs the marker as the member's `post_optional`; lowering moves
+        // it onto `ForInStmt.nullable_iter` (and clears the member's post, so
+        // `f?.x` keeps only its `opt_chaining`). Runtime skips iteration on
+        // null — no diagnostic.
+        let diags = project_lints(
+            r#"
+type Foo { x: nodeTime<int>?; }
+fn f(f: Foo?, from: time, to: time) {
+    for (_, _ in f?.x?[from..to]) {}
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "`f?.x?[from..to]` carries the iterator marker; should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn for_in_arrow_chain_marker_promotes_like_member() {
+        // Arrow is not special — `n?->y?[from..to]` reads its marker from the
+        // arrow's `post_optional` exactly like Member does, and lowering moves
+        // it onto `nullable_iter`. Silent with the marker; the no-marker form
+        // (asserted in the member test) warns identically.
+        let diags = project_lints(
+            r#"
+type Bar { y: nodeTime<int>?; }
+fn f(n: node<Bar>?, from: time, to: time) {
+    for (_, _ in n?->y?[from..to]) {}
+}
+"#,
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == "possibly-null"),
+            "`n?->y?[from..to]` carries the iterator marker; should not flag: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn for_in_bare_nullable_iterator_warns_without_window() {
+        // No `[from..to]` window at all: `for (_, _ in f?.x)`. The iterator
+        // `f?.x` is `nodeTime<int>?` and there's no `?` ack, so the runtime
+        // throws. The statement-level `nullable_iter` check catches this even
+        // without a range (the old synthesized-Offset path could not). The
+        // `?`-acked sibling (`f?.x?`) must stay silent.
+        let warns = project_lints(
+            r#"
+type Foo { x: nodeTime<int>?; }
+fn f(f: Foo?) {
+    for (_, _ in f?.x) {}
+}
+"#,
+        );
+        assert!(
+            warns.iter().any(|d| d.rule == "possibly-null"),
+            "bare nullable iterator without `?` should flag: {warns:?}"
+        );
+        let silent = project_lints(
+            r#"
+type Foo { x: nodeTime<int>?; }
+fn f(f: Foo?) {
+    for (_, _ in f?.x?) {}
+}
+"#,
+        );
+        assert!(
+            !silent.iter().any(|d| d.rule == "possibly-null"),
+            "bare nullable iterator WITH `?` ack should not flag: {silent:?}"
         );
     }
 

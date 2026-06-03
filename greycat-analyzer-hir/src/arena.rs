@@ -1,12 +1,10 @@
 //! Tiny typed arena. Each `Arena<T>` is a `Vec<T>` indexed by a typed
-//! `Idx<T>` newtype, cribbing from rust-analyzer's `la_arena` layout but
-//! kept inline so we don't pull in another dep just for HIR storage.
+//! `Idx<T>` newtype.
 
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
-/// Stable, small index into an [`Arena`]. `Copy` + `Eq` regardless of
-/// `T` so HIR shapes can hash / compare cheaply.
+/// Stable index into an [`Arena`]. `Copy` + `Eq` regardless of `T`.
 pub struct Idx<T> {
     raw: u32,
     _phantom: PhantomData<fn() -> T>,

@@ -1,7 +1,6 @@
 //! HIR node types — declarations, statements, expressions, type refs.
-//! "Type ref" here means *syntactic* type annotation (e.g. `Array<int>`),
-//! distinct from the *semantic* `Type` enum that `greycat-analyzer-core`
-//! computes during inference.
+//! "Type ref" is a *syntactic* type annotation (e.g. `Array<int>`),
+//! distinct from the *semantic* `Type` enum in `greycat-analyzer-core`.
 
 use std::ops::Range;
 
@@ -11,8 +10,8 @@ use crate::arena::Idx;
 
 pub type Span = Range<usize>;
 
-/// The whole HIR for a single source file. All `Idx<…>` handles in this
-/// module index into one of the arenas held by [`crate::Hir`].
+/// Top-level module. All `Idx<…>` handles index into the arenas held
+/// by [`crate::Hir`].
 #[derive(Debug, Clone)]
 pub struct Module {
     pub name: Symbol,
@@ -34,39 +33,26 @@ pub struct Modifiers {
     pub abstract_: bool,
     pub native: bool,
     // P13.4
-    /// Annotations declared on this decl, drawn from grammar
-    /// `annotations`. Each entry carries the annotation name plus
-    /// any primitive-literal arguments — `@expose("renamed")`,
-    /// `@tag("mcp")`, `@max_count(100)`, `@enabled(true)`,
-    /// `@timeout(5s)`, etc. See [`AnnotationArg`] for the per-arg
-    /// shape.
+    /// Annotations on this decl (`@expose("renamed")`, `@tag("mcp")`,
+    /// `@max_count(100)`, …). See [`AnnotationArg`] for the per-arg shape.
     pub annotations: Box<[Annotation]>,
 }
 
-/// Decl annotation — `@<name>(<args>...)`.
-///
-/// Both the annotation name and any string-literal args are
-/// interned through the project's [`SymbolTable`](crate::Symbol)
-/// (no `SmolStr`/`String`). Annotation strings are literal — there
-/// is no interpolation, no `${...}` — and they repeat heavily
-/// across decls (`@expose`, `@tag("mcp")`, `@permission("admin")`
-/// on dozens of fns), so interning them is a straight win.
+/// Decl annotation — `@<name>(<args>...)`. Name and string-literal
+/// args are interned through the project's
+/// [`SymbolTable`](crate::Symbol). Annotation strings are literal —
+/// no interpolation.
 #[derive(Debug, Clone)]
 pub struct Annotation {
-    /// Annotation name as an [`Ident`] — the interned symbol (e.g.
-    /// `expose`, `tag`, `permission`) plus the source span of the
-    /// name token. The span lets the pragma validator point a
-    /// diagnostic at the pragma name itself (e.g. "@permission has no
-    /// effect without @expose", or a future "unknown pragma" /
-    /// "redundant permission").
+    /// Annotation name as an [`Ident`] — interned symbol plus the
+    /// name token's span (lets the pragma validator point a diagnostic
+    /// at the name itself).
     pub name: Ident,
     pub args: Box<[AnnotationArg]>,
 }
 
 impl Annotation {
-    /// Iterator over the string-typed arguments only, in source
-    /// order. Convenience for callers (`@expose`, `@deref`,
-    /// `@iterable`) that only care about string args.
+    /// String-typed args only, in source order.
     pub fn arg_strings(&self) -> impl Iterator<Item = Symbol> + '_ {
         self.args.iter().filter_map(|a| match a.kind {
             AnnotationArgKind::String(s) => Some(s),
@@ -80,9 +66,8 @@ impl Annotation {
     }
 }
 
-// Equality ignores the name's source span — an annotation's identity
-// is its name symbol + args, not where it sits in source (matches the
-// span-excluding `PartialEq` on [`AnnotationArg`]).
+// Equality ignores the name's source span — identity is name symbol
+// + args.
 impl PartialEq for Annotation {
     fn eq(&self, other: &Self) -> bool {
         self.name.symbol == other.name.symbol && self.args == other.args
@@ -92,12 +77,8 @@ impl PartialEq for Annotation {
 impl Eq for Annotation {}
 
 /// A single annotation argument: its compile-time value
-/// ([`AnnotationArgKind`]) plus the source [`Span`] it came from.
-///
-/// Equality and hashing ignore `span` — an arg's identity is its
-/// value, not where it sits in source (so two `@tag("mcp")` on
-/// different lines compare equal, matching the prior design that
-/// excluded the span from `Path`'s hash).
+/// ([`AnnotationArgKind`]) plus its source [`Span`]. Equality and
+/// hashing ignore `span` — identity is the value.
 #[derive(Debug, Clone)]
 pub struct AnnotationArg {
     pub kind: AnnotationArgKind,
@@ -118,52 +99,38 @@ impl std::hash::Hash for AnnotationArg {
     }
 }
 
-/// Compile-time-constant value of an [`AnnotationArg`]. GreyCat
-/// pragmas accept only values the analyzer can resolve without
-/// running code: primitive literals, `null`, and path-shaped
-/// references to types or enum variants (`Foo`, `mod::Foo`,
-/// `DurationUnit::milliseconds`).
-///
-/// Anything else — a call, arithmetic, an array literal, an
-/// instance member-access, etc. — is captured as
-/// [`AnnotationArgKind::Invalid`] so the analyzer can surface it as
-/// a hard `invalid-pragma-arg` error pointing at the arg's span.
-/// Non-resolving paths get the same treatment at validation time.
-///
-/// `Float` is bit-equal for `Hash` so identical NaN payloads dedup
-/// (matches the literal interning we already do for `LiteralExpr`).
+/// Compile-time-constant value of an [`AnnotationArg`]. Pragmas
+/// accept only primitive literals, `null`, and path-shaped references
+/// to types or enum variants (`Foo`, `mod::Foo`,
+/// `DurationUnit::milliseconds`). Anything else becomes
+/// [`AnnotationArgKind::Invalid`] (hard `invalid-pragma-arg` error).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnnotationArgKind {
     Int(i64),
     Float(f64),
     Bool(bool),
     Char(char),
-    /// String args are interned through the project's
-    /// `SymbolTable` — `@tag("mcp")` repeated 50 times shares one
-    /// `Symbol`.
+    /// Interned through the project's `SymbolTable`.
     String(Symbol),
     /// Microseconds (GreyCat's canonical `duration` unit).
     Duration(i64),
     /// Microseconds since the Unix epoch.
     Time(i64),
-    /// Microseconds since the Unix epoch — variant preserved so
-    /// the consumer can distinguish
-    /// `@since("2024-01-01T00:00:00Z")` from a raw numeric `time`.
+    /// Microseconds since the Unix epoch — variant preserved so the
+    /// consumer can distinguish `@since("2024-01-01T00:00:00Z")` from
+    /// a raw numeric `time`.
     Iso8601(i64),
     /// The `null` literal.
     Null,
     /// Path expression — `Foo`, `mod::Foo`, `Foo::bar`,
-    /// `mod::Foo::bar`. The `chain` segments are the parsed
-    /// identifiers in source order; the analyzer's validator
-    /// resolves the path to either a type decl or an enum variant
-    /// at validation time. Unresolved paths surface as a hard
-    /// `invalid-pragma-arg` error pointing at the arg span.
+    /// `mod::Foo::bar`. `chain` segments are the parsed identifiers in
+    /// source order; the validator resolves them to a type decl or
+    /// enum variant. Unresolved → hard `invalid-pragma-arg` error.
     Path {
         chain: Box<[Symbol]>,
     },
-    /// Structurally-non-constant argument — a call, arithmetic, an
-    /// array / object literal, an instance member-access, etc.
-    /// Hard error at validation time pointing at the arg span.
+    /// Structurally-non-constant argument (call, arithmetic, array /
+    /// object literal, instance member-access, …). Hard error.
     Invalid,
 }
 
@@ -171,10 +138,7 @@ impl Eq for AnnotationArgKind {}
 
 impl std::hash::Hash for AnnotationArgKind {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
-        // Discriminant + payload bits. Float hashes via bit pattern
-        // so two `Float(f)` with the same bits dedup; NaN payloads
-        // compare unequal under `PartialEq` but the hasher still
-        // distributes them consistently — fine for dedup tables.
+        // Discriminant + payload bits; Float hashes via bit pattern.
         std::mem::discriminant(self).hash(h);
         match self {
             AnnotationArgKind::Int(v)
@@ -225,11 +189,9 @@ impl Decl {
 pub struct FnDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    /// Generic type parameters (`fn foo<T>(...)`). The grammar allows
-    /// any arity; the analyzer enforces the runtime ceiling — a function
-    /// accepts exactly one generic (two+ is a runtime *syntax error*),
-    /// unlike a type which accepts two (`Map<K, V>`). See the
-    /// `too-many-generics` check in the analyzer.
+    /// Generic type parameters (`fn foo<T>(...)`). Grammar allows any
+    /// arity; a fn accepts exactly one generic at runtime (the
+    /// analyzer's `too-many-generics` check enforces it).
     pub generics: Box<[Idx<Ident>]>,
     pub params: Box<[Idx<FnParam>]>,
     pub return_type: Option<Idx<TypeRef>>,
@@ -250,14 +212,12 @@ pub struct FnParam {
 pub struct TypeDecl {
     pub name: Idx<Ident>,
     pub modifiers: Modifiers,
-    /// Generic type parameters (`type Foo<T, U> {}`). Same arity
-    /// caveat as [`FnDecl::generics`] — grammar accepts any number,
-    /// analyzer rejects >2.
+    /// Generic type parameters (`type Foo<T, U> {}`). Grammar accepts
+    /// any number; analyzer rejects >2.
     pub generics: Box<[Idx<Ident>]>,
     pub supertype: Option<Idx<TypeRef>>,
     pub attrs: Box<[Idx<TypeAttr>]>,
-    /// Methods declared on the type. Each entry is a `Decl::Fn`
-    /// (with `static_` / `abstract_` etc.).
+    /// Methods declared on the type. Each entry is a `Decl::Fn`.
     pub methods: Box<[Idx<Decl>]>,
     pub doc: Option<String>,
     pub byte_range: Span,
@@ -330,48 +290,42 @@ pub enum Stmt {
     At(AtStmt),
 }
 
-/// `return [expr];`. Carries the whole CST span (keyword through
-/// trailing semicolon) so capabilities and lints can point at the
-/// keyword instead of falling back to the inner expression's span
-/// (missing entirely on a bare `return ;`).
+/// `return [expr];`. `byte_range` covers the whole stmt (keyword
+/// through `;`), so lints can anchor on the keyword even for a bare
+/// `return;`.
 #[derive(Debug, Clone)]
 pub struct ReturnStmt {
     pub value: Option<Idx<Expr>>,
     pub byte_range: Span,
 }
 
-/// `throw expr;`. Carries the whole CST span so dead-code / lint
-/// diagnostics aren't anchored at the inner expression alone.
+/// `throw expr;`. `byte_range` covers the whole stmt.
 #[derive(Debug, Clone)]
 pub struct ThrowStmt {
     pub value: Idx<Expr>,
     pub byte_range: Span,
 }
 
-/// `break;` — keyword-only stmt with its own range.
+/// `break;` — keyword-only stmt.
 #[derive(Debug, Clone)]
 pub struct BreakStmt {
     pub byte_range: Span,
 }
 
-/// `continue;` — keyword-only stmt with its own range.
+/// `continue;` — keyword-only stmt.
 #[derive(Debug, Clone)]
 pub struct ContinueStmt {
     pub byte_range: Span,
 }
 
-/// `breakpoint;` — keyword-only stmt with its own range.
+/// `breakpoint;` — keyword-only stmt.
 #[derive(Debug, Clone)]
 pub struct BreakpointStmt {
     pub byte_range: Span,
 }
 
-/// `{ … }` block. Carries its own `byte_range` (the curly-brace
-/// span as parsed) so capabilities can bracket cursor-in-body
-/// without falling back to "first stmt..last stmt" — the latter
-/// returns `0..0` for an empty body, which silently broke
-/// scope-aware completion inside `for { }` / `try { }` / empty
-/// branches.
+/// `{ … }` block. `byte_range` is the curly-brace span (covers an
+/// empty body, unlike "first stmt..last stmt").
 #[derive(Debug, Clone)]
 pub struct BlockStmt {
     pub stmts: Box<[Idx<Stmt>]>,
@@ -408,15 +362,10 @@ pub enum AssignOp {
 #[derive(Debug, Clone)]
 pub struct IfStmt {
     pub condition: Idx<Expr>,
-    /// `if (cond) { … }` body. Always a block per grammar — held
-    /// inline (rather than as `Idx<Stmt>` pointing at a `Stmt::Block`)
-    /// so callers reach the curly-brace span without an extra arena
-    /// lookup, and so the type system enforces the always-a-block
-    /// invariant.
+    /// `if (cond) { … }` body. Always a block per grammar, held inline.
     pub then_branch: BlockStmt,
-    /// `else` branch. Either an `else { … }` block or a nested `if`
-    /// for else-if chains, hence the `Idx<Stmt>` polymorphism — the
-    /// only field that's *not* always a block.
+    /// `else` branch — an `else { … }` block or a nested `if` for
+    /// else-if chains, hence `Idx<Stmt>` rather than `BlockStmt`.
     pub else_branch: Option<Idx<Stmt>>,
     pub byte_range: Span,
 }
@@ -448,11 +397,19 @@ pub struct ForStmt {
 
 #[derive(Debug, Clone)]
 pub struct ForInStmt {
-    /// Binders introduced by this for-in. The grammar's `sepBy2`
-    /// guarantees `params.len() >= 2` — typically `(index, value)` or
-    /// `(key, value)`.
+    /// Binders introduced by this for-in. `params.len() >= 2` (grammar
+    /// `sepBy2`) — typically `(index, value)` or `(key, value)`.
     pub params: Box<[ForInParam]>,
-    pub range: Idx<Expr>,
+    /// The iterable expression. Its type drives the binders' element
+    /// types.
+    pub iterator: Idx<Expr>,
+    /// Optional `[from..to]` slice window (an [`Expr::Range`]); `None`
+    /// for a full iteration.
+    pub window: Option<Idx<Expr>>,
+    /// The for-in `?` token (`for (.. in iter?)`): `Some` spans the `?`
+    /// token, `None` means no token. Without it a nullable iterator
+    /// fires `possibly-null`.
+    pub nullable_iter: Option<Span>,
     pub body: BlockStmt,
     pub byte_range: Span,
 }
@@ -484,29 +441,21 @@ pub struct AtStmt {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    /// A bare-ident expression (a name used in expression position).
-    ///
-    /// Carries `byte_range` inline so [`Expr::byte_range`] is honest for
-    /// every variant. The same span lives on the underlying
-    /// `Ident` arena entry (which also serves declaration-site names,
-    /// fn-param names, property names, type-ref names — anywhere an
-    /// `Idx<Ident>` appears without an enclosing `Expr::Ident`); the
-    /// two are written from the same `tree_sitter::Node` at lowering
-    /// time and the Ident arena is grow-only, so they can't drift.
+    /// A bare-ident expression. `byte_range` mirrors the underlying
+    /// `Ident` arena entry's span.
     Ident {
         name: Idx<Ident>,
         byte_range: Span,
     },
     /// Literal value — numeric, char, bool, duration, time, iso8601.
-    /// Each carries its parsed value directly (see [`LiteralKind`]);
-    /// the source text is no longer kept in the HIR.
+    /// Each carries its parsed value (see [`LiteralKind`]).
     Literal(LiteralExpr),
     /// `null` keyword literal.
     Null {
         byte_range: Span,
     },
-    /// `this` keyword reference. Types as the enclosing
-    /// `TypeDecl`'s self type during analysis.
+    /// `this` keyword reference. Types as the enclosing `TypeDecl`'s
+    /// self type.
     This {
         byte_range: Span,
     },
@@ -519,12 +468,9 @@ pub enum Expr {
     Arrow(MemberExpr), // `n->name` — same shape, different access semantics
     Static(StaticExpr),
     // P15.8
-    /// Chained `module::Type::method` (or longer). The
-    /// HIR `StaticExpr` only models `Type::name` because its `ty`
-    /// slot is a `TypeRef` and the grammar allows a nested
-    /// `static_expr` as the head. For chains the lowering emits
-    /// this flat-`Vec<Idx<Ident>>` shape instead. Each segment is
-    /// an `ident` from the source. Length is always >= 2.
+    /// Chained `module::Type::method` (or longer). [`StaticExpr`] only
+    /// models `Type::name`; chains lower to this flat segment list
+    /// instead. `chain.len() >= 2`.
     QualifiedStatic {
         chain: Box<[Idx<Ident>]>,
         byte_range: Span,
@@ -536,13 +482,10 @@ pub enum Expr {
     Paren(Idx<Expr>, Span),
     Lambda(LambdaExpr),
     // P19.15
-    /// `from..to` (or `from..` / `..to`) range and the
-    /// math-style `]from..to]` / `[from..to[` interval. Both forms
-    /// flatten into the same HIR node since the bracket markers
-    /// don't change typing — they only matter at runtime for
-    /// inclusivity. Used as the index of an `Expr::Offset` to
-    /// signal a slice (`arr[1..10]` returns the same shape as `arr`)
-    /// or as a for-in iterator-range clause.
+    /// `from..to` (or `from..` / `..to`) range and the math-style
+    /// `]from..to]` / `[from..to[` interval — both flatten here since
+    /// bracket inclusivity doesn't affect typing. Used as an
+    /// `Expr::Offset` index (slice) or a for-in iterator-range clause.
     Range {
         from: Option<Idx<Expr>>,
         to: Option<Idx<Expr>>,
@@ -550,24 +493,20 @@ pub enum Expr {
     },
     // P6.5
     /// `value is Type` — runtime type guard, evaluates to `bool`.
-    /// Recognized by the analyzer to narrow `value` in the matching
-    /// branch when used inside an `if` condition.
+    /// Narrows `value` in the matching branch of an `if` condition.
     Is {
         value: Idx<Expr>,
         ty: Idx<TypeRef>,
         byte_range: Span,
     },
     /// `value as Type` — type ascription / cast, evaluates to `Type`.
-    /// The runtime semantics are a checked downcast; the analyzer just
-    /// adopts the cast's declared type as the expression's type.
     Cast {
         value: Idx<Expr>,
         ty: Idx<TypeRef>,
         byte_range: Span,
     },
-    /// Anything we haven't lowered yet — keeps the byte range so downstream
-    /// passes can still gracefully skip. Will shrink as downstream stages
-    /// demand more precise variants.
+    /// Not-yet-lowered shape. Keeps the byte range so downstream passes
+    /// can skip it.
     Unsupported {
         kind: &'static str,
         byte_range: Span,
@@ -603,87 +542,62 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub struct LiteralExpr {
     pub kind: LiteralKind,
-    /// Source-side parse anomaly (overflow, precision loss, …). The
-    /// `kind` field still carries a best-effort value so downstream
-    /// typing proceeds normally; the analyzer reads this field
-    /// separately to emit user-facing warnings / errors.
+    /// Source-side parse anomaly (overflow, precision loss, …). `kind`
+    /// still carries a best-effort value; the analyzer reads this field
+    /// to emit warnings / errors.
     pub parse_issue: Option<ParseIssue>,
     pub byte_range: Span,
 }
 
-/// Typed literal value. Each variant carries the parsed value
-/// directly — lowering does the parsing once; downstream stages
-/// dispatch on the variant tag without touching source text.
-///
-/// `null` and `this` are *not* literals — they're keyword tokens
-/// with no value to inline. They live as dedicated [`Expr::Null`] /
-/// [`Expr::This`] variants instead.
-///
-/// When the source text fails to parse (overflow, precision loss,
-/// malformed escape, …) the variant still commits to a kind and the
-/// best-effort value (`i64::MAX` saturation, `'\0'`, `0` µs, …); the
-/// failure is reported via [`LiteralExpr::parse_issue`]. This keeps
-/// type inference unaffected by parse anomalies.
+/// Typed literal value, parsed once at lowering. `null` / `this` are
+/// keyword tokens, not literals — see [`Expr::Null`] / [`Expr::This`].
+/// On a parse failure the variant still commits to a best-effort value
+/// and the failure is reported via [`LiteralExpr::parse_issue`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LiteralKind {
     Int(i64),
     Float(f64),
     Char(char),
     Bool(bool),
-    /// Duration in microseconds — GreyCat's canonical unit for
-    /// `duration`. Sub-microsecond suffixes (`ns`, `nanosecond`)
-    /// are truncated toward zero by the lowering.
+    /// Duration in microseconds (GreyCat's canonical `duration` unit).
+    /// Sub-µs suffixes (`ns`, `nanosecond`) truncate toward zero.
     Duration(i64),
-    /// Time in microseconds since the Unix epoch — matches the
-    /// GreyCat runtime's storage for `time`.
+    /// Time in microseconds since the Unix epoch.
     Time(i64),
-    /// ISO-8601 time literal, eager-parsed to µs-since-epoch.
-    /// Variant preserved (rather than folded into [`Self::Time`])
-    /// so the analyzer can run ISO-specific diagnostics (deprecated
-    /// forms, suspicious timezone offsets, etc.) that wouldn't make
-    /// sense for a raw numeric `time` literal.
+    /// ISO-8601 time literal, parsed to µs-since-epoch. Kept distinct
+    /// from [`Self::Time`] so the analyzer can run ISO-specific
+    /// diagnostics.
     Iso8601(i64),
 }
 
-/// Parse anomaly recorded at HIR-lowering time. The literal's
-/// [`LiteralKind`] carries a best-effort value alongside; the
-/// analyzer emits the user-facing diagnostic from this tag.
+/// Parse anomaly recorded at lowering time. The analyzer emits the
+/// user-facing diagnostic from this tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseIssue {
-    /// Numeric exceeded the representable range of its kind
-    /// (`Int` → i64, `Duration` / `Time` / `Iso8601` → i64 µs after
-    /// suffix scaling). The kind's value is saturated.
+    /// Numeric exceeded its kind's representable range (`Int` → i64,
+    /// `Duration` / `Time` / `Iso8601` → i64 µs after scaling). The
+    /// value is saturated.
     Overflow,
-    /// Float has more significant decimal digits than f64 can
-    /// represent exactly. The kind's value is the nearest f64.
+    /// Float has more significant decimal digits than f64 can hold.
+    /// The value is the nearest f64.
     PrecisionLoss,
-    /// Char escape unrecognised, ISO-8601 shape malformed, or
-    /// similar structural defect. The kind's value is a placeholder
-    /// (`'\0'`, `0` µs, …).
+    /// Unrecognised char escape, malformed ISO-8601 shape, etc. The
+    /// value is a placeholder (`'\0'`, `0` µs, …).
     Malformed,
 }
 
 #[derive(Debug, Clone)]
 pub struct StringExpr {
     // P17.5
-    /// `parts` carries the lowered text fragments and
-    /// `${expr}` interpolation expressions in source order. A
-    /// non-template string (no `${…}`) lowers to a single
-    /// `StringPart::Lit` covering the inner text. Template strings
-    /// lower to alternating `Lit` / `Interp` entries. Each part keeps
-    /// its own byte range so the parity oracle / capabilities can
-    /// emit per-fragment records (`RawStringExpr` /
-    /// `InterpolationExpr`) and the resolver / analyzer can recurse
-    /// into each `Interp.expr`.
+    /// Text fragments and `${expr}` interpolations in source order. A
+    /// non-template string is a single [`StringPart::Lit`]; templates
+    /// alternate `Lit` / `Interp`. Each part keeps its own byte range.
     pub parts: Box<[StringPart]>,
     pub byte_range: Span,
 }
 
 impl StringExpr {
-    /// Concatenated raw fragments — interpolation parts are skipped.
-    /// Sufficient for "is this a string?" plus the few sites that need
-    /// the literal value (e.g. `@permission("admin")` extraction in
-    /// [`crate`]'s `stdlib::ProjectIndex::ingest`).
+    /// Concatenated raw fragments — interpolation parts skipped.
     pub fn raw_value(&self) -> String {
         let mut out = String::new();
         for p in &self.parts {
@@ -706,21 +620,19 @@ impl StringExpr {
 /// One piece of a [`StringExpr`].
 #[derive(Debug, Clone)]
 pub enum StringPart {
-    /// Raw text between (or around) interpolations. The byte range
-    /// covers just the fragment in source — not the surrounding `"`
-    /// quote chars or `${...}` markers.
+    /// Raw text between (or around) interpolations. `byte_range`
+    /// covers just the fragment — not the `"` quotes or `${...}`
+    /// markers.
     Lit { text: String, byte_range: Span },
-    /// A `${expr}` interpolation. The inner expression lives in the
-    /// HIR `exprs` arena. The byte range covers the whole `${expr}`
-    /// (matches TS reference's `InterpolationExpr` span).
+    /// A `${expr}` interpolation. `byte_range` covers the whole
+    /// `${expr}`.
     Interp { expr: Idx<Expr>, byte_range: Span },
 }
 
-/// Named object construction — `Foo { field: value }` (the grammar's
-/// `object_fields` body). Maps are the special case where the keys
-/// are arbitrary value expressions (`Map { k: v }`) rather than field
-/// names; that distinction is made downstream by the head type, not
-/// here. See [`PositionalObjectExpr`] for the `Foo { a, b }` form.
+/// Named object construction — `Foo { field: value }` (grammar's
+/// `object_fields`). `Map { k: v }` keys are arbitrary value
+/// expressions; the head type makes that distinction downstream. See
+/// [`PositionalObjectExpr`] for `Foo { a, b }`.
 #[derive(Debug, Clone)]
 pub struct ObjectExpr {
     pub ty: Option<Idx<TypeRef>>,
@@ -728,10 +640,10 @@ pub struct ObjectExpr {
     pub byte_range: Span,
 }
 
-/// Positional object construction — `Foo { a, b }` (the grammar's
-/// `object_initializers` body). Only `Array` (any arity), `node`
-/// (≤ 1), and the v7 fixed-shape tuples accept this form; every other
-/// head is rejected by the object-construction validator.
+/// Positional object construction — `Foo { a, b }` (grammar's
+/// `object_initializers`). Only `Array` (any arity), `node` (≤ 1),
+/// and the v7 fixed-shape tuples accept this form; the
+/// object-construction validator rejects every other head.
 #[derive(Debug, Clone)]
 pub struct PositionalObjectExpr {
     pub ty: Option<Idx<TypeRef>>,
@@ -740,11 +652,10 @@ pub struct PositionalObjectExpr {
 }
 
 /// One `name: value` entry of an [`ObjectExpr`]. `name` is a full
-/// expression because the grammar's `object_field` is
-/// `name:_expr ":" value:_expr`: for a classic object it is an
-/// `Expr::Ident` / `Expr::String` naming an attr, for a `Map` it is
-/// an arbitrary key value-expression. Consumers that need the attr
-/// symbol decode it from the key expr at the resolution site.
+/// expr (grammar's `object_field` is `name:_expr ":" value:_expr`):
+/// an `Expr::Ident` / `Expr::String` attr name for a classic object,
+/// an arbitrary key expr for a `Map`. Consumers decode the attr
+/// symbol from the key at resolution time.
 #[derive(Debug, Clone)]
 pub struct ObjectField {
     pub name: Idx<Expr>,
@@ -756,13 +667,12 @@ pub struct ObjectField {
 pub struct MemberExpr {
     pub receiver: Idx<Expr>,
     pub property: PropertyName,
-    /// `a?.b` / `a?->b` — null-safe access. When `a: T?`, the result
-    /// lifts to `(typeof a.b)?`; when `a: T`, the marker is a no-op.
-    pub pre_optional: bool,
-    /// `a.b?` / `a->b?` — explicit "treat as nullable" suffix on the
-    /// access result. Lifts the result to nullable regardless of the
-    /// declared field type.
-    pub post_optional: bool,
+    /// `a?.b` / `a?->b` — optional-chaining. When `a: T?` the chain is
+    /// null if `a` is null; when `a: T` it's a no-op.
+    pub opt_chaining: Option<Span>,
+    /// `a.b?` / `a->b?` — lifts the result to nullable regardless of
+    /// the declared field type.
+    pub post_optional: Option<Span>,
     pub byte_range: Span,
 }
 
@@ -774,28 +684,21 @@ pub struct StaticExpr {
 }
 
 /// Property name in a `member_expr` / `arrow_expr` / `static_expr`.
-///
-/// Both forms resolve to the same field/method by name, so most
-/// consumers should reach for [`PropertyName::ident`] and treat
-/// either variant uniformly. Match on the variant only when the
-/// syntactic form matters (e.g. diagnostics that quote the source,
-/// or formatter round-trips).
+/// Both variants resolve to the same field/method — use
+/// [`PropertyName::ident`] unless the syntactic form matters
+/// (diagnostics, formatter round-trips).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropertyName {
     /// `a.b`, `a->b`, `T::b` — bareword identifier property.
     Ident(Idx<Ident>),
     /// `a."b.c"`, `a->"b.c"`, `T::"b.c"` — string-literal property.
-    /// The pointed-to `Ident.symbol` resolves to the *decoded* property name
-    /// (without surrounding quotes); `Ident.byte_range` covers the
-    /// entire `"..."` literal in source.
+    /// `Ident.symbol` is the *decoded* name (no quotes);
+    /// `Ident.byte_range` covers the whole `"..."` literal.
     String(Idx<Ident>),
 }
 
 impl PropertyName {
     /// The interned ident carrying the property name's text + span.
-    /// Both variants resolve to the same field/method, so most callers
-    /// should use this and only match on the variant when they care
-    /// about the syntactic form.
     #[inline]
     pub fn ident(self) -> Idx<Ident> {
         match self {
@@ -808,12 +711,11 @@ impl PropertyName {
 pub struct OffsetExpr {
     pub receiver: Idx<Expr>,
     pub index: Idx<Expr>,
-    /// `a?[i]` — null-safe index access. When `a: T?`, the result
-    /// lifts to nullable; when `a: T`, the marker is a no-op.
-    pub pre_optional: bool,
-    /// `a[i]?` — explicit "treat as nullable" suffix on the indexer.
-    /// Lifts the result to nullable regardless.
-    pub post_optional: bool,
+    /// `a?[i]` — null-safe index. When `a: T?` the result lifts to
+    /// nullable; when `a: T` it's a no-op.
+    pub pre_optional: Option<Span>,
+    /// `a[i]?` — lifts the result to nullable regardless.
+    pub post_optional: Option<Span>,
     pub byte_range: Span,
 }
 
@@ -853,8 +755,7 @@ pub enum BinOp {
     Shl,
     Shr,
     Coalesce, // ??
-    /// Operator we recognized but haven't categorized. Carry the verbatim
-    /// text so downstream can still process or reject it.
+    /// Recognized but uncategorized operator. Carries the verbatim text.
     Other(&'static str),
 }
 
@@ -868,8 +769,7 @@ pub struct UnaryExpr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
-    /// `+x` — identity (no-op on numeric operand). Grammar accepts it as
-    /// a unary prefix; typing-wise it returns the operand type unchanged.
+    /// `+x` — identity, returns the operand type unchanged.
     Pos,
     Not,
     BitNot,
@@ -880,10 +780,9 @@ pub enum UnaryOp {
     // P6.4
     /// `!!x` — non-null assertion (narrowing).
     NonNullAssert,
-    /// `*n` — node deref. Returns the inner `T` of a
-    /// `node<T>` / `nodeTime<T>` / similar tag-shaped receiver.
-    /// Equivalent to `n.resolve()` for typing purposes but keeps
-    /// the receiver non-null (the dot form returns `T?`).
+    /// `*n` — node deref. Returns the inner `T` of a `node<T>` /
+    /// `nodeTime<T>` / similar receiver, non-null (the dot form
+    /// `n.resolve()` returns `T?`).
     Deref,
 }
 
@@ -899,11 +798,8 @@ pub struct LambdaExpr {
 // Type references (syntactic)
 // =============================================================================
 
-/// A syntactic type reference. Models the grammar's `type_ident` rule
-/// faithfully: `(ident "::")* ident <generics>? "?"?`.
-///
-/// `qualifier` carries the module path prefix (zero or more segments,
-/// leftmost-first). Empty slice = bare reference.
+/// A syntactic type reference, modelling the grammar's `type_ident`:
+/// `(ident "::")* ident <generics>? "?"?`.
 #[derive(Debug, Clone)]
 pub struct TypeRef {
     /// Module-qualifier segments before the leaf name.
@@ -914,12 +810,10 @@ pub struct TypeRef {
     /// Generic args (`Map<K, V>` → `[K, V]`). Empty for non-generic.
     pub params: Box<[Idx<TypeRef>]>,
     pub optional: bool,
-    /// `true` when the source carried a leading `typeof` keyword,
-    /// declaring the reference as a *type literal* (the runtime value
-    /// IS a type, not an instance of one). The grammar admits the
-    /// keyword in two positions — inside `type_ident` itself and on
-    /// the param-slot side of `fn_param` — so the lowering checks
-    /// both and collapses them onto this single flag.
+    /// `true` for a leading `typeof` keyword — the reference is a
+    /// *type literal* (the value IS a type). The grammar admits the
+    /// keyword in two positions (inside `type_ident` and on the
+    /// `fn_param` side); lowering collapses both onto this flag.
     pub typeof_marker: bool,
     pub byte_range: Span,
 }

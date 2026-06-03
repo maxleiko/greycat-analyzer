@@ -5027,11 +5027,17 @@ impl<'a> Cx<'a> {
             }
             Stmt::ForIn(ForInStmt {
                 params,
-                range,
+                iterator,
+                window,
                 body,
                 ..
             }) => {
-                let range_ty = self.visit_expr(range);
+                let range_ty = self.visit_expr(iterator);
+                // Type the slice bounds so `from` / `to` get `expr_types`
+                // entries and the resolver sees their ident uses.
+                if let Some(w) = window {
+                    let _ = self.visit_expr(w);
+                }
                 // P18.x — bind each iterator param's def_type from
                 // the iterable's element type. Iterability in
                 // GreyCat is gated by the `@iterable` type-pragma;
@@ -5711,7 +5717,7 @@ impl<'a> Cx<'a> {
     }
 
     /// Walk `chain` as a Member / Arrow chain. For each null-safe step
-    /// — either the step's own `pre_optional` (`?.` / `?->` with `?`
+    /// — either the step's own `opt_chaining` (`?.` / `?->` with `?`
     /// immediately before the property) or the step's `post_optional`
     /// (`a.b?` / `a->b?` whose result is treated as nullable) —
     /// record the path that must be non-null for the chain to be
@@ -5719,15 +5725,15 @@ impl<'a> Cx<'a> {
     /// node. Idents resolving to a Param / Local land in `out_idents`;
     /// other expressions are recorded via `member_path` into `out_paths`.
     ///
-    /// `pre_optional` narrows the step's RECEIVER (the value before
+    /// `opt_chaining` narrows the step's RECEIVER (the value before
     /// `?` — `t?.f` non-null implies `t` non-null).
     ///
     /// `post_optional` narrows the STEP ITSELF (`t.g?` non-null implies
     /// `t.g` non-null). This case load-bears the chained `?.` shape:
     /// the grammar parses `t.g?.f` as `(t.g?).f`, attaching the `?`
-    /// as `post_optional` on the inner `t.g` rather than `pre_optional`
+    /// as `post_optional` on the inner `t.g` rather than `opt_chaining`
     /// on the outer `.f`. Both flags can be set on a single step
-    /// (`t?.g?` → pre=true, post=true) and are handled independently.
+    /// (`t?.g?` → opt_chaining=true, post=true) and are handled independently.
     fn collect_optional_chain_receivers(
         &self,
         chain: Idx<Expr>,
@@ -5736,26 +5742,26 @@ impl<'a> Cx<'a> {
     ) {
         let mut cursor = chain;
         loop {
-            let (receiver, pre_optional, post_optional) = match &self.hir.exprs[cursor] {
+            let (receiver, opt_chaining, post_optional) = match &self.hir.exprs[cursor] {
                 Expr::Member(MemberExpr {
                     receiver,
-                    pre_optional,
+                    opt_chaining,
                     post_optional,
                     ..
                 })
                 | Expr::Arrow(MemberExpr {
                     receiver,
-                    pre_optional,
+                    opt_chaining,
                     post_optional,
                     ..
-                }) => (*receiver, *pre_optional, *post_optional),
+                }) => (*receiver, opt_chaining.is_some(), post_optional.is_some()),
                 Expr::Paren(inner, _) => {
                     cursor = *inner;
                     continue;
                 }
                 _ => break,
             };
-            if pre_optional {
+            if opt_chaining {
                 self.narrow_path_or_ident(receiver, out_idents, out_paths);
             }
             if post_optional {
@@ -6062,14 +6068,14 @@ impl<'a> Cx<'a> {
             Expr::Member(MemberExpr {
                 receiver,
                 property,
-                pre_optional,
+                opt_chaining,
                 post_optional,
                 ..
             })
             | Expr::Arrow(MemberExpr {
                 receiver,
                 property,
-                pre_optional,
+                opt_chaining,
                 post_optional,
                 ..
             }) => {
@@ -6127,14 +6133,14 @@ impl<'a> Cx<'a> {
                 // whether the user wrote `?.` at this segment. The
                 // runtime evaluates the whole chain to null when any
                 // prior `?.` shorts, so `x?.y.z` types as `Z?`. The
-                // `pre_optional` flag is what the lint reads to decide
+                // `opt_chaining` flag is what the lint reads to decide
                 // whether to flag the dereference as "possibly null"
                 // (no flag → flag fires), but it doesn't change typing.
                 // `a.b?` / `a->b?` still lifts unconditionally as a
                 // user-asserted "treat as nullable" override.
-                let _ = pre_optional;
+                let _ = opt_chaining;
                 let recv_nullable = self.arena.get(recv_ty).nullable;
-                let result_ty = if recv_nullable || post_optional {
+                let result_ty = if recv_nullable || post_optional.is_some() {
                     self.arena.nullable(base_ty)
                 } else {
                     base_ty
@@ -6268,8 +6274,8 @@ impl<'a> Cx<'a> {
                         _ => self.any_nullable(),
                     }
                 };
-                let lift_pre = pre_optional && self.arena.get(recv_ty).nullable;
-                let result_ty = if lift_pre || post_optional {
+                let lift_pre = pre_optional.is_some() && self.arena.get(recv_ty).nullable;
+                let result_ty = if lift_pre || post_optional.is_some() {
                     self.arena.nullable(base)
                 } else {
                     base

@@ -860,11 +860,15 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
         }
         Stmt::ForIn(ForInStmt {
             params,
-            range,
+            iterator,
+            window,
             body,
             ..
         }) => {
-            visit_expr(cx, range);
+            visit_expr(cx, iterator);
+            if let Some(w) = window {
+                visit_expr(cx, w);
+            }
             cx.push_scope();
             for p in &params {
                 if let Some(t) = p.ty {

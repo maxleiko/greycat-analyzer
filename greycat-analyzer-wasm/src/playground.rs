@@ -563,11 +563,14 @@ fn stmt_node(
                     children: pk,
                 });
             }
-            kids.push(expr_node(hir, symbols, f.range));
+            kids.push(expr_node(hir, symbols, f.iterator));
+            if let Some(w) = f.window {
+                kids.push(expr_node(hir, symbols, w));
+            }
             kids.push(block_node(hir, symbols, &f.body));
             HirNode {
                 kind: "stmt:for-in".into(),
-                label: None,
+                label: f.nullable_iter.is_some().then(|| "nullable_iter".into()),
                 range: f.byte_range.clone().into(),
                 children: kids,
             }

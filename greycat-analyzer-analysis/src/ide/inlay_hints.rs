@@ -338,12 +338,15 @@ fn emit_call_arg_hints(
                 hir,
                 symbols,
                 resolutions,
-                f.range,
+                f.iterator,
                 want,
                 text,
                 encoding,
                 out,
             );
+            if let Some(w) = f.window {
+                emit_call_arg_hints_expr(hir, symbols, resolutions, w, want, text, encoding, out);
+            }
             emit_call_arg_hints_block(
                 hir,
                 symbols,
