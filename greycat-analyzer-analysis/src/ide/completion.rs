@@ -14,7 +14,6 @@ use greycat_analyzer_core::lsp_types::{Position, Uri};
 use greycat_analyzer_core::{
     ItemId, SourceEncoding, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
 };
-use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
@@ -2087,37 +2086,33 @@ fn member_completion(
     // `arrow_deref_receiver` mirrors this dispatch.
     let list_tag_members = !(is_arrow && inner_head.is_some());
     if list_tag_members {
-        let name_sym = project.symbols().lookup(name);
-        if let Some(name_sym) = name_sym
-            && let Some(decl_id) = module.analysis.type_decls.get(&name_sym).copied()
-            && let Decl::Type(td) = &module.hir.decls[decl_id]
-        {
-            collect_type_members(
-                &module.hir,
-                project.symbols(),
-                td,
-                &prefix_lower,
-                &mut items,
-                recv_ctx.as_ref(),
-            );
-        }
-        if items.is_empty()
-            && let Some(name_sym) = name_sym
-            && let Some((foreign_uri, foreign_decl_id)) = project
-                .index
-                .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
-                .next()
-            && let Some(fmod) = project.module(foreign_uri)
-            && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
-        {
-            collect_type_members(
-                &fmod.hir,
-                project.symbols(),
-                td,
-                &prefix_lower,
-                &mut items,
-                recv_ctx.as_ref(),
-            );
+        // The receiver's head type is the chain root; walk it
+        // provenance-blind so inherited members (same-module *and*
+        // foreign supertypes) are listed, not just the leaf's own.
+        // Resolve by head name so primitive receivers (`42.`) reach
+        // their native decl's members too.
+        let start_id = project
+            .symbols()
+            .lookup(name)
+            .and_then(|s| type_item_id_by_name(project, uri, s));
+        if let Some(start_id) = start_id {
+            let symbols = project.symbols();
+            let mut emitted: FxHashSet<String> = FxHashSet::default();
+            walk_supertype_chain(project, start_id, |depth, hir, td| {
+                // The receiver's own type renders methods with the
+                // receiver's instantiation; ancestors render in declared
+                // form (their generic params aren't the receiver's).
+                let ctx = if depth == 0 { recv_ctx.as_ref() } else { None };
+                collect_type_members(
+                    hir,
+                    symbols,
+                    td,
+                    &prefix_lower,
+                    &mut emitted,
+                    &mut items,
+                    ctx,
+                );
+            });
         }
     }
 
@@ -2130,38 +2125,23 @@ fn member_completion(
     // the shared project arena. Inner-method rendering stays in the
     // declared form for the deref branch.
     if let Some(inner) = inner_head.as_deref() {
-        let inner_sym = project.symbols().lookup(inner);
         let mut inner_items: Vec<CompletionItem> = Vec::new();
-        if let Some(inner_sym) = inner_sym
-            && let Some(decl_id) = module.analysis.type_decls.get(&inner_sym).copied()
-            && let Decl::Type(td) = &module.hir.decls[decl_id]
+        if let Some(inner_sym) = project.symbols().lookup(inner)
+            && let Some(start_id) = type_item_id_by_name(project, uri, inner_sym)
         {
-            collect_type_members(
-                &module.hir,
-                project.symbols(),
-                td,
-                &prefix_lower,
-                &mut inner_items,
-                None,
-            );
-        }
-        if inner_items.is_empty()
-            && let Some(inner_sym) = inner_sym
-            && let Some((foreign_uri, foreign_decl_id)) = project
-                .index
-                .locate_decl_in_ns(inner_sym, crate::stdlib::Namespace::Type)
-                .next()
-            && let Some(fmod) = project.module(foreign_uri)
-            && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
-        {
-            collect_type_members(
-                &fmod.hir,
-                project.symbols(),
-                td,
-                &prefix_lower,
-                &mut inner_items,
-                None,
-            );
+            let symbols = project.symbols();
+            let mut emitted: FxHashSet<String> = FxHashSet::default();
+            walk_supertype_chain(project, start_id, |_depth, hir, td| {
+                collect_type_members(
+                    hir,
+                    symbols,
+                    td,
+                    &prefix_lower,
+                    &mut emitted,
+                    &mut inner_items,
+                    None,
+                );
+            });
         }
         if !is_arrow && !inner_items.is_empty() {
             // `.` → `->` rewrite. The edit replaces the `.` byte with
@@ -2539,15 +2519,67 @@ fn type_head_name<'a>(
     }
 }
 
-/// Walk a `TypeDecl`'s attrs + methods and emit one `CompletionItem`
-/// per name that survives the `prefix_lower` filter. Skips abstract /
-/// native methods only on the static-completion side;
-/// instance access lists everything.
+/// Resolve a bare type name to its project [`ItemId`], preferring a
+/// declaration in `uri`'s own module and falling back to the project
+/// decl table (a `@library` / `@include` type). `None` when the name
+/// isn't a type the project index knows.
+fn type_item_id_by_name(project: &ProjectAnalysis, uri: &Uri, name_sym: Symbol) -> Option<ItemId> {
+    if let Some(id) = project.index.item_id_for(uri, name_sym)
+        && project.index.type_members.contains_key(&id)
+    {
+        return Some(id);
+    }
+    let (furi, _) = project
+        .index
+        .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
+        .next()?;
+    project.index.item_id_for(furi, name_sym)
+}
+
+/// Walk the `extends` chain of `start` provenance-blind via the project
+/// `type_members` index — the same supertype edges the analyzer's
+/// inherited-member resolution follows — calling `visit(depth, hir, td)`
+/// for each level, subtype (`depth == 0`) before supertype. Foreign /
+/// qualified supertypes are followed: the `supertype: ItemId` edge
+/// carries no provenance. Cycle-guarded; a level whose home HIR can't
+/// be fetched is skipped, not fatal.
+fn walk_supertype_chain<F>(project: &ProjectAnalysis, start: ItemId, mut visit: F)
+where
+    F: FnMut(usize, &greycat_analyzer_hir::Hir, &greycat_analyzer_hir::types::TypeDecl),
+{
+    let mut cur = Some(start);
+    let mut seen: FxHashSet<ItemId> = FxHashSet::default();
+    let mut depth = 0usize;
+    while let Some(item) = cur {
+        if !seen.insert(item) {
+            break;
+        }
+        let Some(members) = project.index.type_members.get(&item) else {
+            break;
+        };
+        if let Some(fmod) = project.module(&members.home_uri)
+            && let Some(decl_id) = fmod.analysis.type_decls.get(&item.name).copied()
+            && let Decl::Type(td) = &fmod.hir.decls[decl_id]
+        {
+            visit(depth, &fmod.hir, td);
+            depth += 1;
+        }
+        cur = members.supertype;
+    }
+}
+
+/// Walk a `TypeDecl`'s attrs + methods, emitting one `CompletionItem`
+/// per name that survives the `prefix_lower` filter and isn't already
+/// in `emitted` (the dedup set the supertype walk threads through so a
+/// subtype member shadows the parent's same-named one). Skips abstract
+/// / native methods only on the static-completion side; instance
+/// access lists everything.
 fn collect_type_members(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
     td: &greycat_analyzer_hir::types::TypeDecl,
     prefix_lower: &str,
+    emitted: &mut FxHashSet<String>,
     items: &mut Vec<CompletionItem>,
     ctx: Option<&RenderCtx<'_>>,
 ) {
@@ -2561,6 +2593,12 @@ fn collect_type_members(
             continue;
         }
         let name = symbols[hir.idents[a.name].symbol].to_string();
+        // `emitted` dedups across a supertype walk: the leaf level is
+        // visited first, so a child's member shadows the parent's
+        // same-named one.
+        if !emitted.insert(name.clone()) {
+            continue;
+        }
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
@@ -2594,6 +2632,9 @@ fn collect_type_members(
             continue;
         }
         let name = symbols[hir.idents[m.name].symbol].to_string();
+        if !emitted.insert(name.clone()) {
+            continue;
+        }
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(prefix_lower) {
             continue;
         }
@@ -3118,78 +3159,36 @@ fn emit_object_field_names(
     // is editing that one — let normal prefix-matching surface it).
     let supplied = supplied_field_names(text, body, cursor_byte);
 
-    // Find the type's HIR (in-module first, then cross-module). Then
-    // walk the local supertype chain, accumulating attrs from each
-    // ancestor we can resolve.
-    let module = project.module(uri)?;
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut emitted: FxHashSet<String> = FxHashSet::default();
+    let symbols = project.symbols();
 
-    let visit_type_decl = |hir: &greycat_analyzer_hir::Hir,
-                           td: &greycat_analyzer_hir::types::TypeDecl,
-                           items: &mut Vec<CompletionItem>,
-                           emitted: &mut FxHashSet<String>| {
-        emit_attrs(
-            hir,
-            project.symbols(),
-            td,
-            &prefix_lower,
-            &supplied,
-            emitted,
-            items,
-        );
+    // Resolve the head provenance-blind, then walk its `extends` chain
+    // via the project `type_members` index so inherited fields surface
+    // for foreign / qualified supertypes too (the old module-local
+    // `type_decls` walk stopped at the module boundary).
+    let resolved = if let Some(type_sym) = symbols.lookup(type_name)
+        && let Some(start_id) = type_item_id_by_name(project, uri, type_sym)
+    {
+        walk_supertype_chain(project, start_id, |_depth, hir, td| {
+            emit_attrs(
+                hir,
+                symbols,
+                td,
+                &prefix_lower,
+                &supplied,
+                &mut emitted,
+                &mut items,
+            );
+        });
+        true
+    } else {
+        false
     };
 
-    // Whether the head resolved to a named-attr type at all. Kept
-    // distinct from `items` being empty: a resolved type with every
-    // field already supplied returns `Some(vec![])` (no completion,
-    // no leak), whereas an unresolved head returns `None` so the caller
-    // falls back to positional expression completion (collections, etc).
-    let mut resolved = false;
-
-    if let Some(type_sym) = project.symbols().lookup(type_name)
-        && let Some(decl_id) = module.analysis.type_decls.get(&type_sym).copied()
-    {
-        resolved = true;
-        // Walk Sub → Super (local chain) just like the analyzer's
-        // required-attr check.
-        let mut hops = 0usize;
-        let mut seen: FxHashSet<Symbol> = FxHashSet::default();
-        let mut cursor_decl: Option<Idx<Decl>> = Some(decl_id);
-        let mut cursor_name = type_sym;
-        while let Some(d_id) = cursor_decl {
-            if !seen.insert(cursor_name) || hops > 32 {
-                break;
-            }
-            hops += 1;
-            let Decl::Type(td) = &module.hir.decls[d_id] else {
-                break;
-            };
-            visit_type_decl(&module.hir, td, &mut items, &mut emitted);
-            let Some(sup_ref) = td.supertype else { break };
-            let sup_tr = &module.hir.type_refs[sup_ref];
-            if !sup_tr.qualifier.is_empty() {
-                break;
-            }
-            let sup_name_sym = module.hir.idents[sup_tr.name].symbol;
-            cursor_name = sup_name_sym;
-            cursor_decl = module.analysis.type_decls.get(&sup_name_sym).copied();
-        }
-    }
-    if !resolved
-        && let Some(type_sym) = project.symbols().lookup(type_name)
-        && let Some((foreign_uri, foreign_decl_id)) = project
-            .index
-            .locate_decl_in_ns(type_sym, crate::stdlib::Namespace::Type)
-            .next()
-        && let Some(fmod) = project.module(foreign_uri)
-        && let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id]
-    {
-        resolved = true;
-        visit_type_decl(&fmod.hir, td, &mut items, &mut emitted);
-    }
     // Unresolved head (collection / tuple / unknown) — let the caller
-    // do positional expression completion instead.
+    // do positional expression completion instead. A resolved type with
+    // every field already supplied returns `Some(vec![])` (no leak).
     if !resolved {
         return None;
     }
