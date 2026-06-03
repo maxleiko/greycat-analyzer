@@ -121,24 +121,37 @@ fn check_property_after(
     out: &mut Vec<Diagnostic>,
     sep: &str,
 ) {
-    if node.child_by_field_name("property").is_some() {
-        return;
+    match node.child_by_field_name("property") {
+        Some(_) => {
+            // if let (_, Some(post)) = cst::optional_flags_around(node, prop.id()) {
+            //     out.push(Diagnostic {
+            //         range: byte_range_to_lsp(source, &post, encoding),
+            //         severity: Some(DiagnosticSeverity::ERROR),
+            //         code: Some(NumberOrString::String("unexpected-token".into())),
+            //         source: Some(DIAGNOSTIC_SOURCE.into()),
+            //         message: "unexpected `?` token".into(),
+            //         ..Default::default()
+            //     });
+            // }
+        }
+        None => {
+            let sep_range = separator_range(node, source, sep).unwrap_or(node.byte_range());
+            let code = match sep {
+                "::" => "missing-static-property",
+                "." => "missing-member-property",
+                "->" => "missing-arrow-property",
+                _ => "missing-property",
+            };
+            out.push(Diagnostic {
+                range: byte_range_to_lsp(source, &sep_range, encoding),
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: Some(NumberOrString::String(code.into())),
+                source: Some(DIAGNOSTIC_SOURCE.into()),
+                message: format!("expected identifier or string property after `{sep}`"),
+                ..Default::default()
+            });
+        }
     }
-    let sep_range = separator_range(node, source, sep).unwrap_or(node.byte_range());
-    let code = match sep {
-        "::" => "missing-static-property",
-        "." => "missing-member-property",
-        "->" => "missing-arrow-property",
-        _ => "missing-property",
-    };
-    out.push(Diagnostic {
-        range: byte_range_to_lsp(source, &sep_range, encoding),
-        severity: Some(DiagnosticSeverity::ERROR),
-        code: Some(NumberOrString::String(code.into())),
-        source: Some(DIAGNOSTIC_SOURCE.into()),
-        message: format!("expected identifier or string property after `{sep}`"),
-        ..Default::default()
-    });
 }
 
 /// `native` and `abstract` legitimately permit a body-less function

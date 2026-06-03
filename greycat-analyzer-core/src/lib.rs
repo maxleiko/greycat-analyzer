@@ -30,6 +30,7 @@ pub mod resolver;
 pub mod span;
 mod symbols;
 mod types;
+pub mod cst;
 
 pub use doc::*;
 pub use manager::*;
