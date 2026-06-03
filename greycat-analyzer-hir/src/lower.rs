@@ -4,8 +4,8 @@
 
 use std::ops::Range;
 
-use greycat_analyzer_core::{Symbol, SymbolTable, cst};
-use greycat_analyzer_syntax::tree_sitter;
+use greycat_analyzer_core::{Symbol, SymbolTable};
+use greycat_analyzer_syntax::{tree_sitter, cst};
 
 use crate::Hir;
 use crate::arena::Idx;
