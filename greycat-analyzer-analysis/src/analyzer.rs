@@ -34,8 +34,8 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     AssignStmt, AtStmt, BinOp, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt,
     ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr, ObjectExpr,
-    ObjectField, OffsetExpr, PositionalObjectExpr, Pragma, StaticExpr, Stmt, StringExpr, TryStmt,
-    TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
+    ObjectField, OffsetExpr, ParseIssue, PositionalObjectExpr, Pragma, StaticExpr, Stmt,
+    StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
 };
 
 use crate::lint::{LintDiagnostic, LintSeverity};
@@ -769,11 +769,7 @@ pub fn analyze_with_index_into(
 /// Map a `(LiteralKind, ParseIssue)` pair to a hard parse error.
 /// Returns `None` for overflow / precision-loss cases, which the
 /// `literal-overflow` lint rule owns.
-fn literal_parse_issue_error(
-    kind: LiteralKind,
-    issue: greycat_analyzer_hir::types::ParseIssue,
-) -> Option<String> {
-    use greycat_analyzer_hir::types::ParseIssue;
+fn literal_parse_issue_error(kind: LiteralKind, issue: ParseIssue) -> Option<String> {
     match (kind, issue) {
         (LiteralKind::Char(_), ParseIssue::Malformed) => {
             Some("malformed char literal: unrecognised escape sequence".to_string())
