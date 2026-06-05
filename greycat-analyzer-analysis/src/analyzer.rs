@@ -744,17 +744,18 @@ pub fn analyze_with_index_into(
     // them site-by-site — the analyzer's diagnostic vec is a one-way
     // surface that doesn't honour `// gcl-lint-off`.
     for (_, expr) in hir.exprs.iter() {
-        if let Expr::Literal(LiteralExpr { kind, parse_issue: Some(issue), byte_range }) = expr {
+        if let Expr::Literal(LiteralExpr {
+            kind,
+            parse_issue: Some(issue),
+            byte_range,
+        }) = expr
+        {
             let message = match (kind, issue) {
                 (LiteralKind::Char(_), ParseIssue::Malformed) => {
                     "malformed char literal: unrecognised escape sequence"
                 }
-                (LiteralKind::Iso8601(_), ParseIssue::Malformed) => {
-                    "malformed ISO-8601 literal"
-                }
-                (_, ParseIssue::Suffix) => {
-                    "unknown suffix"
-                }
+                (LiteralKind::Iso8601(_), ParseIssue::Malformed) => "malformed ISO-8601 literal",
+                (_, ParseIssue::Suffix) => "unknown suffix",
                 _ => continue,
             };
 
