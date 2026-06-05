@@ -1382,12 +1382,12 @@ fn classify_and_parse_number(
         magnitude_to_i64_positive
     };
     match suffix {
-        Some(s) if s.eq_ignore_ascii_case("time") => {
+        Some("time") => {
             let (m, issue) = parse_integer_magnitude_sat(body);
             let (n, issue) = to_signed(m, issue);
             (LiteralKind::Time(n), issue)
         }
-        Some(s) if is_duration_suffix(s) => {
+        Some(s) if matches!(s, "us" | "ms" | "s" | "min" | "hour" | "day") => {
             let (m, issue) = parse_integer_magnitude_sat(body);
             let (n, mut issue) = to_signed(m, issue);
             let us = match duration_to_us(n, s) {
@@ -1399,17 +1399,25 @@ fn classify_and_parse_number(
             };
             (LiteralKind::Duration(us), issue)
         }
-        Some(s) if s.eq_ignore_ascii_case("f") => {
+        Some("f") | Some("F") => {
             let (f, issue) = parse_float_sat(body);
             (LiteralKind::Float(if negate { -f } else { f }), issue)
         }
-        _ => {
+        suffix => {
             if looks_like_float(body) {
                 let (f, issue) = parse_float_sat(body);
+                let issue = match suffix {
+                    Some(_) => issue.or(Some(ParseIssue::Suffix)),
+                    None => issue,
+                };
                 (LiteralKind::Float(if negate { -f } else { f }), issue)
             } else {
                 let (m, issue) = parse_integer_magnitude_sat(body);
                 let (n, issue) = to_signed(m, issue);
+                let issue = match suffix {
+                    Some(_) => issue.or(Some(ParseIssue::Suffix)),
+                    None => issue,
+                };
                 (LiteralKind::Int(n), issue)
             }
         }
@@ -1795,37 +1803,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn is_duration_suffix(s: &str) -> bool {
-    matches!(
-        s,
-        "duration"
-            | "y"
-            | "d"
-            | "h"
-            | "m"
-            | "s"
-            | "ms"
-            | "us"
-            | "ns"
-            | "min"
-            | "sec"
-            | "hour"
-            | "day"
-            | "week"
-            | "month"
-            | "year"
-            | "minute"
-            | "second"
-            | "millisecond"
-            | "microsecond"
-            | "nanosecond"
-    )
-}
-
-/// Convert `value <suffix>` to microseconds. `None` on overflow or
-/// unknown suffix. `month` / `year` use 30-day / 365-day
-/// approximations; `ns` / `nanosecond` truncates toward zero
-/// (`999ns` → `0us`).
+/// Convert `value <suffix>` to microseconds. `None` on overflow or unknown suffix.
 fn duration_to_us(value: i64, suffix: &str) -> Option<i64> {
     const MS: i64 = 1_000;
     const SEC: i64 = 1_000_000;
@@ -1833,18 +1811,12 @@ fn duration_to_us(value: i64, suffix: &str) -> Option<i64> {
     const HOUR: i64 = 60 * MIN;
     const DAY: i64 = 24 * HOUR;
     match suffix {
-        "ns" | "nanosecond" => Some(value / 1_000),
-        "us" | "microsecond" => Some(value),
-        "ms" | "millisecond" => value.checked_mul(MS),
-        "s" | "sec" | "second" => value.checked_mul(SEC),
-        "m" | "min" | "minute" => value.checked_mul(MIN),
-        "h" | "hour" => value.checked_mul(HOUR),
-        "d" | "day" => value.checked_mul(DAY),
-        "week" => value.checked_mul(7 * DAY),
-        "month" => value.checked_mul(30 * DAY),
-        "y" | "year" => value.checked_mul(365 * DAY),
-        // Explicit `_duration` form: value already in µs.
-        "duration" => Some(value),
+        "us" => Some(value),
+        "ms" => value.checked_mul(MS),
+        "s" => value.checked_mul(SEC),
+        "min" => value.checked_mul(MIN),
+        "hour" => value.checked_mul(HOUR),
+        "day" => value.checked_mul(DAY),
         _ => None,
     }
 }

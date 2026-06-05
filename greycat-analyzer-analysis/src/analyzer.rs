@@ -744,41 +744,30 @@ pub fn analyze_with_index_into(
     // them site-by-site — the analyzer's diagnostic vec is a one-way
     // surface that doesn't honour `// gcl-lint-off`.
     for (_, expr) in hir.exprs.iter() {
-        let Expr::Literal(LiteralExpr {
-            kind,
-            parse_issue: Some(issue),
-            byte_range,
-        }) = expr
-        else {
-            continue;
-        };
-        let Some(message) = literal_parse_issue_error(*kind, *issue) else {
-            continue;
-        };
-        out.diagnostics.push(SemanticDiagnostic::structural(
-            Severity::Error,
-            "invalid-literal",
-            message,
-            byte_range.clone(),
-        ));
+        if let Expr::Literal(LiteralExpr { kind, parse_issue: Some(issue), byte_range }) = expr {
+            let message = match (kind, issue) {
+                (LiteralKind::Char(_), ParseIssue::Malformed) => {
+                    "malformed char literal: unrecognised escape sequence"
+                }
+                (LiteralKind::Iso8601(_), ParseIssue::Malformed) => {
+                    "malformed ISO-8601 literal"
+                }
+                (_, ParseIssue::Suffix) => {
+                    "unknown suffix"
+                }
+                _ => continue,
+            };
+
+            out.diagnostics.push(SemanticDiagnostic::structural(
+                Severity::Error,
+                "invalid-literal",
+                message.to_string(),
+                byte_range.clone(),
+            ));
+        }
     }
 
     out
-}
-
-/// Map a `(LiteralKind, ParseIssue)` pair to a hard parse error.
-/// Returns `None` for overflow / precision-loss cases, which the
-/// `literal-overflow` lint rule owns.
-fn literal_parse_issue_error(kind: LiteralKind, issue: ParseIssue) -> Option<String> {
-    match (kind, issue) {
-        (LiteralKind::Char(_), ParseIssue::Malformed) => {
-            Some("malformed char literal: unrecognised escape sequence".to_string())
-        }
-        (LiteralKind::Iso8601(_), ParseIssue::Malformed) => {
-            Some("malformed ISO-8601 literal".to_string())
-        }
-        _ => None,
-    }
 }
 
 /// Seed primitive type ids in the arena so cx.{int, bool, ...} are cheap.

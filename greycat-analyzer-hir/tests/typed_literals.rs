@@ -47,7 +47,7 @@ fn time_suffix_lowers_to_time_kind() {
 #[test]
 fn duration_unit_suffix_lowers_to_duration_kind() {
     // 5h → 5 * 3600 * 1e6 µs (GreyCat stores durations in µs).
-    let src = "fn f() {\n    var d = 5h;\n}\n";
+    let src = "fn f() {\n    var d = 5hour;\n}\n";
     let expected_us: i64 = 5 * 3_600 * 1_000_000;
     assert!(matches!(first_var_init_kind(src, 0), LiteralKind::Duration(us) if us == expected_us));
 }

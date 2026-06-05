@@ -584,6 +584,8 @@ pub enum ParseIssue {
     /// Unrecognised char escape, malformed ISO-8601 shape, etc. The
     /// value is a placeholder (`'\0'`, `0` µs, …).
     Malformed,
+    /// Unknown suffix. The value is fine, but the suffix in unknown (eg. `2year`, `3foo`)
+    Suffix,
 }
 
 #[derive(Debug, Clone)]
