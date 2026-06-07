@@ -108,7 +108,7 @@ fn commenting_out_library_evicts_modules_and_surfaces_unresolved_type() {
     );
 
     let mut analysis = ProjectAnalysis::default();
-    analysis.rebuild(&mgr);
+    analysis.analyze_staged(&mgr);
 
     // 2. Initial state: `Foo` resolves, no unresolved-name diagnostic.
     let main_uri = uri_for("/proj/src/main.gcl");
@@ -150,7 +150,7 @@ fn commenting_out_library_evicts_modules_and_surfaces_unresolved_type() {
     );
 
     // 5. Rebuild — `Foo` should now be unresolved.
-    analysis.rebuild(&mgr);
+    analysis.analyze_staged(&mgr);
     let final_mod = analysis.module(&main_uri).expect("main module re-analyzed");
     let unresolved_final: Vec<_> = final_mod
         .analysis

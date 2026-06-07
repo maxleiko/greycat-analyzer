@@ -960,26 +960,6 @@ struct EnumChain {
     has_final_else: bool,
 }
 
-// P23
-/// Small dispatch enum used by [`Cx::try_member_call_typing`]
-/// so we can read the callee shape from `&self.hir.exprs[idx]` and
-/// then drop that borrow before the recursive `&mut self` call. Plain
-/// `Copy` fields plus an owned `Vec<Idx<Ident>>` for the qualified-
-/// chain case (the only shape that actually allocates).
-enum CalleeShape {
-    Member {
-        receiver: Idx<Expr>,
-        property: Idx<Ident>,
-        is_arrow: bool,
-    },
-    Static {
-        ty: Idx<TypeRef>,
-        property: Idx<Ident>,
-    },
-    Ident(Idx<Ident>),
-    QualifiedStatic(Box<[Idx<Ident>]>),
-}
-
 struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
@@ -1097,15 +1077,22 @@ struct Cx<'a> {
 }
 
 impl<'a> Cx<'a> {
+    #[inline]
     fn primitive(&mut self, p: Primitive) -> TypeId {
         self.arena.primitive(p)
     }
+
+    #[inline]
     fn any_nullable(&mut self) -> TypeId {
         self.arena.any_nullable()
     }
+
+    #[inline]
     fn any(&mut self) -> TypeId {
         self.arena.any()
     }
+
+    #[inline]
     fn null(&mut self) -> TypeId {
         self.arena.null()
     }
@@ -1390,17 +1377,16 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P41.2 / P42.2
     /// Compute the complement of an `is`-guard: given the currently-
     /// known type `known` and the asserted-type `asserted`, return the
     /// `TypeId` that `known` should narrow to in the *else* branch
     /// (and in any continuation past a then-side early exit).
     ///
     /// Dispatches by `known`'s `TypeKind`:
-    /// - `Union { alts }` (P41) — subtract alts assignable to
+    /// - `Union { alts }` — subtract alts assignable to
     ///   `asserted`, collapse single-survivor down to the lone alt,
     ///   otherwise return a fresh `Union { alts: survivors }`.
-    /// - `Type(decl)` with `decl` abstract (P42) — sealed-hierarchy
+    /// - `Type(decl)` with `decl` abstract — sealed-hierarchy
     ///   subtraction over `index.subtype_closure`, with the mandatory
     ///   ancestor-collapse via `abstract_by_closure_set`.
     ///
@@ -1416,10 +1402,7 @@ impl<'a> Cx<'a> {
         let known_ty = self.arena.get(known).clone();
         let nullable = known_ty.nullable;
         let inner = match &known_ty.kind {
-            TypeKind::Union { alts } => {
-                let alts = alts.clone();
-                self.narrow_complement_union(&alts, asserted)?
-            }
+            TypeKind::Union { alts } => self.narrow_complement_union(alts, asserted)?,
             TypeKind::Type(decl) => self.narrow_complement_abstract(*decl, asserted)?,
             // P42.6 — out of scope: generic-root sealed hierarchies.
             //
@@ -1454,7 +1437,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P41.2
     fn narrow_complement_union(&mut self, alts: &[TypeId], asserted: TypeId) -> Option<TypeId> {
         let mut survivors: Vec<TypeId> = Vec::with_capacity(alts.len());
         for alt in alts.iter() {
@@ -1493,7 +1475,7 @@ impl<'a> Cx<'a> {
             survivors.push(*alt);
         }
         if survivors.is_empty() {
-            // Exhausted — P42.5's `exhaustive-is-check` owns the
+            // Exhausted — `exhaustive-is-check` owns the
             // diagnostic. Returning `None` keeps the apply sites
             // untouched (no narrow lifted into the unreachable
             // continuation).
@@ -1509,7 +1491,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P42.2
     /// Sealed-hierarchy `is`-complement: subtract `closure(asserted)`
     /// from `closure(sup_decl)` and collapse the result.
     ///
@@ -1543,7 +1524,7 @@ impl<'a> Cx<'a> {
             _ => return None,
         };
 
-        let sup_closure = self.index.subtype_closure.get(&sup_decl)?.clone();
+        let sup_closure = self.index.subtype_closure.get(&sup_decl)?;
         let asserted_closure = self
             .index
             .subtype_closure
@@ -1565,7 +1546,7 @@ impl<'a> Cx<'a> {
         }
 
         if diff.is_empty() {
-            // Exhausted — P42.5's `exhaustive-is-check` owns the
+            // Exhausted — `exhaustive-is-check` owns the
             // diagnostic. Returning `None` keeps the apply sites
             // untouched.
             return None;
@@ -1600,7 +1581,6 @@ impl<'a> Cx<'a> {
         }))
     }
 
-    // P42.5
     /// Detect whether an `is`-check is *exhaustive*: every concrete
     /// runtime case of `known` is also a runtime case of (one alt of)
     /// `asserted`, so the negative side of the guard is unreachable.
@@ -1675,7 +1655,7 @@ impl<'a> Cx<'a> {
                 for a_alt in &asserted_alts {
                     let a_ty = self.arena.get(*a_alt);
                     let TypeKind::Type(ad) = &a_ty.kind else {
-                        // P42.6 — generic-root asserts. See the
+                        // Generic-root asserts. See the
                         // out-of-scope block on
                         // `narrow_complement`'s `_` arm. Returning
                         // `false` here keeps today's behavior — no
@@ -1694,7 +1674,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P42.4
     /// Chain `narrow_complement` over a list of asserted-type-refs,
     /// starting from `ident`'s currently-known type. Used by the
     /// disjunctive `(x is T1) || (x is T2)` shape — each asserted
@@ -2015,7 +1994,7 @@ impl<'a> Cx<'a> {
             .copied()
             .or_else(|| self.out.def_types.get(&name).copied())
     }
-    // P19.16
+
     /// Build a string path key for an expression that's a
     /// chain of `Expr::Member` rooted at an `Expr::Ident` (the binding
     /// name) or `Expr::Literal(This)` (yielding `"this"` as the root).
@@ -2070,6 +2049,7 @@ impl<'a> Cx<'a> {
             _ => None,
         }
     }
+
     fn strip_nullable(&mut self, ty: TypeId) -> TypeId {
         let t = self.arena.get(ty);
         if !t.nullable {
@@ -2258,7 +2238,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P16.5
     /// Resolve the deref-target type for an `Expr::Arrow` receiver:
     /// `n->field` desugars to `n.<deref_method>().field`, where the
     /// deref method is named by the `@deref("methodName")` annotation
@@ -2349,39 +2328,32 @@ impl<'a> Cx<'a> {
                 self.decl_registry,
                 &self.index.symbols,
                 recv_ty,
-            )
-            .to_string();
-            let prop_text = self.ident_text(property).to_string();
+            );
+            let prop_text = self.ident_text(property);
             let prop_range = self.hir.idents[property].byte_range.clone();
-            let (code, message) = if instance_access {
-                (
+            if instance_access {
+                self.out.diagnostics.push(SemanticDiagnostic::structural(
+                    Severity::Error,
                     "enum-no-instance-members",
                     format!(
                         "enum `{recv_display}` has no instance members; access fields via `{recv_display}::{prop_text}`"
                     ),
-                )
+                    prop_range,
+                ));
             } else {
-                (
+                self.out.diagnostics.push(SemanticDiagnostic::structural(
+                    Severity::Error,
                     "unknown-enum-field",
                     format!("enum `{recv_display}` has no field `{prop_text}`"),
-                )
-            };
-            self.out.diagnostics.push(SemanticDiagnostic::structural(
-                Severity::Error,
-                code,
-                message,
-                prop_range,
-            ));
+                    prop_range,
+                ));
+            }
             return;
         }
         let type_id: Option<ItemId> = match &ty.kind {
-            // P35.7 — handle-keyed variants carry the decl's full
-            // `(module, name)` identity directly.
             TypeKind::Type(d) => Some(*d),
             TypeKind::Generic { decl, .. } => Some(*decl),
-            // P16.2 — primitives (`String`, `int`, ...) carry methods
-            // declared as `native type String { ... }` in
-            // `lib/std/core.gcl`, so their `ItemId` is `(core, name)`.
+            // primitives are from `lib/std/core.gcl`, so their `ItemId` is `(core, name)`.
             TypeKind::Primitive(p) => {
                 let core_mod = self.index.symbols.intern("core");
                 let name_sym = self.index.symbols.intern(p.name());
@@ -2689,7 +2661,6 @@ impl<'a> Cx<'a> {
         ));
     }
 
-    // P23
     /// Inline call-return typing for Member / Arrow /
     /// Static callees. Looks up the method's pre-lowered return
     /// `TypeId` in `index.type_members[type_name].method_returns` and
@@ -2698,6 +2669,20 @@ impl<'a> Cx<'a> {
     /// handle (Ident / QualifiedStatic / Lambda / etc.) so the
     /// caller falls back to `any` until those branches land.
     fn try_member_call_typing(&mut self, callee: Idx<Expr>) -> Option<TypeId> {
+        enum CalleeShape<'a> {
+            Member {
+                receiver: Idx<Expr>,
+                property: Idx<Ident>,
+                is_arrow: bool,
+            },
+            Static {
+                ty: Idx<TypeRef>,
+                property: Idx<Ident>,
+            },
+            Ident(Idx<Ident>),
+            QualifiedStatic(&'a [Idx<Ident>]),
+        }
+
         // Pull the small Copy / cheaply-borrowed bits out of the HIR
         // expression up front so we can drop the `&self.hir.exprs`
         // borrow before the recursive `&mut self` calls.
@@ -2717,7 +2702,7 @@ impl<'a> Cx<'a> {
                 property: s.property.ident(),
             },
             Expr::Ident { name: name_idx, .. } => CalleeShape::Ident(*name_idx),
-            Expr::QualifiedStatic { chain, .. } => CalleeShape::QualifiedStatic(chain.clone()),
+            Expr::QualifiedStatic { chain, .. } => CalleeShape::QualifiedStatic(chain),
             _ => return None,
         };
         match dispatch {
@@ -2727,7 +2712,7 @@ impl<'a> Cx<'a> {
                 is_arrow,
             } => {
                 let recv_ty = self.out.expr_types.get(&receiver).copied()?;
-                // The receiver-nullability lift (P19.17) is applied
+                // The receiver-nullability lift is applied
                 // uniformly at the `Expr::Call` funnel
                 // (`lift_call_result_for_nullable_receiver`) so the
                 // generic-inference path and this one stay in lockstep;
@@ -2739,11 +2724,10 @@ impl<'a> Cx<'a> {
                 self.method_return_for(recv_ty, property, false)
             }
             CalleeShape::Ident(name_idx) => self.bare_fn_return(name_idx),
-            CalleeShape::QualifiedStatic(chain) => self.qualified_static_call_return(&chain),
+            CalleeShape::QualifiedStatic(chain) => self.qualified_static_call_return(chain),
         }
     }
 
-    // P19.17
     /// Lift a call expression's result type to nullable when the
     /// callee is an instance-member access (`recv.m()` / `recv->m()`)
     /// whose receiver type is nullable. The call shorts to null (or
@@ -2783,7 +2767,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P23
     /// Type a bare-Ident call (`foo()` / `module_fn()`) by
     /// looking up the fn's signature. Local fns lower the return
     /// `TypeRef` inline; cross-module fns consult the project
@@ -2845,7 +2828,6 @@ impl<'a> Cx<'a> {
         None
     }
 
-    // P23
     /// Type a `QualifiedStatic` callee. Two shapes:
     /// - `module::fn(...)` — chain has 2 segments. Look up
     ///   `chain[1]` in `index.fn_signatures`.
@@ -3730,7 +3712,6 @@ impl<'a> Cx<'a> {
         base
     }
 
-    // P12.1
     /// Call-site generic inference. Returns `Some(return_ty)`
     /// when `callee` resolves to a non-native fn decl with `generics`
     /// declared; the witnesses come from each `(declared_param,

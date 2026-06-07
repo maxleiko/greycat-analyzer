@@ -344,25 +344,11 @@ impl ProjectAnalysis {
     /// One-pass build over every document currently in `manager`.
     pub fn analyze(manager: &SourceManager) -> Self {
         let mut out = Self::new();
-        out.rebuild(manager);
+        out.analyze_staged(manager);
         out
     }
 
-    /// Rebuild from scratch over the current `manager` state. Existing
-    /// cache entries are dropped.
-    ///
-    // P20
-    /// Routes through [`Self::analyze_staged`], the staged-
-    /// pipeline orchestrator that future phases will fill in
-    /// stage-by-stage. For now, every stage delegates to the existing
-    /// per-module + post-pass machinery — same shape, named seam.
-    pub fn rebuild(&mut self, manager: &SourceManager) {
-        self.analyze_staged(manager);
-    }
-
-    // P20
-    /// Staged-pipeline entry point. The 12-stage design from
-    /// the plan:
+    /// Staged analysis entrypoint.
     ///
     /// ```text
     /// S1   declare type/enum names         → type_id stable
@@ -382,17 +368,6 @@ impl ProjectAnalysis {
     /// S12  walk all bodies (CFG + narrowing + per-expr typing,
     ///                       monomorphize at call sites)
     /// ```
-    ///
-    /// **Status:** the staged interface exists but each stage
-    /// delegates to the existing per-module + post-pass machinery.
-    /// Stages get filled in incrementally:
-    /// - Extract S1-S6 (deletes pass 3 `resolve_cross_module_members`).
-    /// - Extract S7-S11 (deletes passes 3.4 / 3.45 / 3.52 +
-    ///   the receiver-driven substitution shim).
-    /// - Rewrite S12 (deletes passes 3.5 / 3.55 / 3.6 +
-    ///   the propagate / fixed-point cascade).
-    /// - Wire the Q1-Q5 query DAG so `invalidate(uri)` only
-    ///   replays Q5(uri) (and Q4 / Q5(others) when signatures change).
     pub fn analyze_staged(&mut self, manager: &SourceManager) {
         self.reset_state();
 
@@ -401,9 +376,6 @@ impl ProjectAnalysis {
         // downstream stages can resolve cross-module names. Single
         // forward pass, no per-module dependency.
         let lowered = self.stage_lower(manager);
-
-        // std::fs::create_dir_all("stage").unwrap();
-        // std::fs::write("stage/lower.ron", format!("{lowered:#?}")).unwrap();
 
         // P40.1 — fold the entrypoint's `@lint_off("…")` / `@lint_on("…")`
         // pragmas into the project-wide policy. CLI flags (`--off` /

@@ -823,7 +823,7 @@ impl Backend {
         // Single project-wide pipeline pass over everything we just
         // loaded — the per-doc analyses land in the cache.
         let rebuild_start = Instant::now();
-        project.analysis.rebuild(&project.manager);
+        project.analysis.analyze_staged(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
             "[{tag}][load_project] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
@@ -956,7 +956,7 @@ impl Backend {
             warn!("[{tag}][lazy-load] {err}");
         }
         let rebuild_start = Instant::now();
-        project.analysis.rebuild(&project.manager);
+        project.analysis.analyze_staged(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
             "[{tag}][lazy-load] {} files in {load_took:?} (parse+load) + {rebuild_took:?} (analyze) from {}",
@@ -1143,7 +1143,7 @@ impl Backend {
             }
         }
         let rebuild_start = Instant::now();
-        project.analysis.rebuild(&project.manager);
+        project.analysis.analyze_staged(&project.manager);
         let rebuild_took = rebuild_start.elapsed();
         info!(
             "[{tag}][reload_project] {load_took:?} (parse+load) + {rebuild_took:?} (analyze) — closure: {} reachable, {} added, {} evicted",

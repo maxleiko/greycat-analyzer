@@ -97,8 +97,7 @@ impl Project {
             return Err(e);
         }
 
-        let mut analysis = ProjectAnalysis::new();
-        analysis.rebuild(&manager);
+        let analysis = ProjectAnalysis::analyze(&manager);
         Ok(Self {
             manager,
             analysis,

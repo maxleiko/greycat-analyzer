@@ -1,5 +1,3 @@
-// P24 — reachability / divergence analysis. The dead-code `unreachable`
-// rule (P24.3) consumes [`stmt_diverges`].
 //! Reachability / divergence analysis on the HIR.
 //!
 //! Single primitive: [`stmt_diverges`]. Returns `true` iff control flow
@@ -20,9 +18,7 @@
 //!
 //! **Conservative on functions.** Bare expression statements never
 //! diverge — even when the call is to a function whose body always
-//! throws. We don't track per-function "never returns" annotations
-//! (`@never_returns` is deferred). When that lands, this primitive
-//! grows a `&FnIndex` arg.
+//! throws.
 
 use std::ops::Range;
 
@@ -49,60 +45,14 @@ pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
         Stmt::At(a) => block_diverges(hir, &a.block),
         // Loops never diverge from the analyzer's POV — see module docs.
         Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForIn(_) => false,
-        // Pure straight-line statements. `breakpoint;` is intentionally
-        // here — it pauses the worker for debugging, then execution
+        // Pure straight-line statements. `breakpoint` is intentionally
+        // here because it pauses the worker for debugging, then execution
         // resumes from the next statement. Treating it as divergent
         // would mark legitimate post-debug code as unreachable.
         Stmt::Expr(_) | Stmt::Var(_) | Stmt::Assign(_) | Stmt::Breakpoint(_) => false,
     }
 }
 
-/// `true` iff some statement in `block` diverges. Equivalent to "this
-/// block has a guaranteed exit point" — the next statement after the
-/// block is unreachable.
-pub fn block_diverges(hir: &Hir, block: &BlockStmt) -> bool {
-    block.stmts.iter().any(|s| stmt_diverges(hir, *s))
-}
-
-fn if_diverges(hir: &Hir, i: &IfStmt) -> bool {
-    if !block_diverges(hir, &i.then_branch) {
-        return false;
-    }
-    let Some(else_id) = i.else_branch else {
-        // No else → fall-through path exists when condition is false.
-        return false;
-    };
-    stmt_diverges(hir, else_id)
-}
-
-fn try_diverges(hir: &Hir, t: &TryStmt) -> bool {
-    block_diverges(hir, &t.try_block) && block_diverges(hir, &t.catch_block)
-}
-
-/// Index of the first statement in `block` that follows a divergent
-/// sibling — i.e. the first statement that is *unreachable* under
-/// normal control flow. `None` when every statement is reachable.
-///
-/// This is the entry point the dead-code lint consumes: walk a block
-/// once, and the returned index splits `block.stmts` into a reachable
-/// prefix and a dead suffix.
-pub fn first_dead_index(hir: &Hir, block: &BlockStmt) -> Option<usize> {
-    for (i, s) in block.stmts.iter().enumerate() {
-        if stmt_diverges(hir, *s) {
-            // Everything after `i` is unreachable. The divergent
-            // statement itself is reachable — `i + 1` is the first
-            // dead index.
-            return if i + 1 < block.stmts.len() {
-                Some(i + 1)
-            } else {
-                None
-            };
-        }
-    }
-    None
-}
-
-// P24.2
 /// Analyzer-aware divergence: same as [`stmt_diverges`]
 /// but also treats an exhaustive enum-eq if-chain (recorded in
 /// `analysis.exhaustive_enum_chains`) as divergent when every arm body
@@ -128,6 +78,28 @@ pub fn stmt_diverges_with_analysis(
         return true;
     }
     false
+}
+
+/// `true` iff some statement in `block` diverges. Equivalent to "this
+/// block has a guaranteed exit point" — the next statement after the
+/// block is unreachable.
+fn block_diverges(hir: &Hir, block: &BlockStmt) -> bool {
+    block.stmts.iter().any(|s| stmt_diverges(hir, *s))
+}
+
+fn if_diverges(hir: &Hir, i: &IfStmt) -> bool {
+    if !block_diverges(hir, &i.then_branch) {
+        return false;
+    }
+    let Some(else_id) = i.else_branch else {
+        // No else → fall-through path exists when condition is false.
+        return false;
+    };
+    stmt_diverges(hir, else_id)
+}
+
+fn try_diverges(hir: &Hir, t: &TryStmt) -> bool {
+    block_diverges(hir, &t.try_block) && block_diverges(hir, &t.catch_block)
 }
 
 /// `true` iff every reachable arm body in the if-chain rooted at
@@ -227,6 +199,25 @@ mod tests {
             }
         }
         panic!("fn {name} not found");
+    }
+
+    /// Index of the first statement in `block` that follows a divergent
+    /// sibling — i.e. the first statement that is *unreachable* under
+    /// normal control flow. `None` when every statement is reachable.
+    fn first_dead_index(hir: &Hir, block: &BlockStmt) -> Option<usize> {
+        for (i, s) in block.stmts.iter().enumerate() {
+            if stmt_diverges(hir, *s) {
+                // Everything after `i` is unreachable. The divergent
+                // statement itself is reachable — `i + 1` is the first
+                // dead index.
+                return if i + 1 < block.stmts.len() {
+                    Some(i + 1)
+                } else {
+                    None
+                };
+            }
+        }
+        None
     }
 
     #[test]
