@@ -7,6 +7,7 @@
 //! wasm bridge consumes the same shape unchanged.
 
 use greycat_analyzer_core::registry::RegistryFetcher;
+
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -24,8 +25,10 @@ use crate::ide::render::{
     RenderCtx, decl_doc, module_label_for_uri, render_decl_signature, render_fn_signature_compact,
     render_type_ref_with_subst,
 };
+use crate::ide::scope::NameSource;
 use crate::ide::types::{Range, TextEdit};
-use crate::project::{ModuleAnalysis, ProjectAnalysis};
+use crate::index::DeclLocation;
+use crate::project::{DeclRegistry, ModuleAnalysis, ProjectAnalysis};
 
 /// IDE-shape `CompletionItemKind` — mirror of the subset of
 /// `lsp_types::CompletionItemKind` constants that the analyzer
@@ -1611,7 +1614,7 @@ fn expr_completion(
             ..Default::default()
         });
     }
-    for name_sym in project.index.values.iter() {
+    for name_sym in project.index.var_names.iter() {
         let name = project.index.symbols.resolve(name_sym);
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
@@ -1619,20 +1622,41 @@ fn expr_completion(
         if !seen.insert(name.to_string()) {
             continue;
         }
-        // `values` lumps non-native fns, top-level vars, and runtime
-        // value-position globals (`NaN`, `Infinity`) together. Emit
-        // FUNCTION only for actual fn names — otherwise the call-paren
-        // post-pass appends `($0)` and turns `NaN` into `NaN()`.
-        let kind = if project.index.non_native_fn_names.contains(name_sym) {
-            CompletionItemKind::Function
-        } else if project.index.runtime_globals.contains_key(name_sym) {
-            CompletionItemKind::Constant
-        } else {
-            CompletionItemKind::Variable
-        };
         items.push(CompletionItem {
             label: name.to_string(),
-            kind: Some(kind),
+            kind: Some(CompletionItemKind::Variable),
+            insert_text: Some(name.to_string()),
+            sort_text: Some(format!("y_{name}")),
+            ..Default::default()
+        });
+    }
+    for (name_sym, _) in project.index.runtime_globals.iter() {
+        let name = project.index.symbols.resolve(name_sym);
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if !seen.insert(name.to_string()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.to_string(),
+            kind: Some(CompletionItemKind::Constant),
+            insert_text: Some(name.to_string()),
+            sort_text: Some(format!("y_{name}")),
+            ..Default::default()
+        });
+    }
+    for name_sym in project.index.fn_names.iter() {
+        let name = project.index.symbols.resolve(name_sym);
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+            continue;
+        }
+        if !seen.insert(name.to_string()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: name.to_string(),
+            kind: Some(CompletionItemKind::Function),
             insert_text: Some(name.to_string()),
             sort_text: Some(format!("y_{name}")),
             ..Default::default()
@@ -1795,9 +1819,9 @@ fn next_non_ws_is_open_paren(bytes: &[u8], cursor_byte: usize) -> bool {
 fn scope_name_meta(
     module: &ModuleAnalysis,
     arena: &TypeArena,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     symbols: &SymbolTable,
-    source: &crate::ide::scope::NameSource,
+    source: &NameSource,
     uri: &Uri,
 ) -> (
     Option<CompletionItemLabelDetails>,
@@ -1869,25 +1893,21 @@ fn scope_name_meta(
 /// `None` when the decl's home module isn't cached.
 fn foreign_decl_completion_meta(
     project: &ProjectAnalysis,
-    locs: &[(
-        Uri,
-        greycat_analyzer_hir::arena::Idx<Decl>,
-        crate::stdlib::Namespace,
-    )],
+    locs: &[DeclLocation],
 ) -> (
     Option<CompletionItemLabelDetails>,
     Option<String>,
     Option<String>,
 ) {
-    let Some((uri, decl_id, _)) = locs.first() else {
+    let Some(d) = locs.first() else {
         return (None, None, None);
     };
-    let Some(m) = project.module(uri) else {
+    let Some(m) = project.module(&d.uri) else {
         return (None, None, None);
     };
-    let decl = &m.hir.decls[*decl_id];
+    let decl = &m.hir.decls[d.id];
     let documentation = doc_to_markup(decl_doc(decl));
-    let description = module_label_for_uri(uri);
+    let description = module_label_for_uri(&d.uri);
     // Fns: mirror the compact `(args): Ret` form into both
     //   `label_details.detail` (VSCode reads this) and `detail`
     //   (Zed reads this). Hover keeps the full source-form signature.
@@ -1917,18 +1937,11 @@ fn foreign_decl_completion_meta(
 /// project index's decl table. When the name has multiple home
 /// locations we pick the first; that's the same disambiguation policy
 /// the resolver uses.
-fn decl_locs_kind(
-    project: &ProjectAnalysis,
-    locs: &[(
-        Uri,
-        greycat_analyzer_hir::arena::Idx<Decl>,
-        crate::stdlib::Namespace,
-    )],
-) -> CompletionItemKind {
-    if let Some((uri, decl_id, _)) = locs.first()
-        && let Some(m) = project.module(uri)
+fn decl_locs_kind(project: &ProjectAnalysis, locs: &[DeclLocation]) -> CompletionItemKind {
+    if let Some(d) = locs.first()
+        && let Some(m) = project.module(&d.uri)
     {
-        match &m.hir.decls[*decl_id] {
+        match &m.hir.decls[d.id] {
             Decl::Fn(_) => CompletionItemKind::Function,
             Decl::Type(_) => CompletionItemKind::Class,
             Decl::Enum(_) => CompletionItemKind::Enum,
@@ -2531,7 +2544,7 @@ fn type_item_id_by_name(project: &ProjectAnalysis, uri: &Uri, name_sym: Symbol) 
     }
     let (furi, _) = project
         .index
-        .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
+        .locate_decl_in_ns(name_sym, crate::index::Namespace::Type)
         .next()?;
     project.index.item_id_for(furi, name_sym)
 }
@@ -2705,7 +2718,7 @@ fn static_completion(
     if let Some(recv_sym) = project.symbols().lookup(&ctx.recv)
         && let Some((foreign_uri, foreign_decl_id)) = project
             .index
-            .locate_decl_in_ns(recv_sym, crate::stdlib::Namespace::Type)
+            .locate_decl_in_ns(recv_sym, crate::index::Namespace::Type)
             .next()
         && let Some(fmod) = project.module(foreign_uri)
     {
@@ -3096,10 +3109,10 @@ fn type_position_completion(
     // Project-level type / enum decls.
     for (name_sym, locs) in &project.index.decl_locations {
         let name = project.index.symbols.resolve(name_sym);
-        if let Some((u, d, _)) = locs.first()
-            && let Some(m) = project.module(u)
+        if let Some(d) = locs.first()
+            && let Some(m) = project.module(&d.uri)
         {
-            let kind = match &m.hir.decls[*d] {
+            let kind = match &m.hir.decls[d.id] {
                 Decl::Type(_) => CompletionItemKind::Class,
                 Decl::Enum(_) => CompletionItemKind::Enum,
                 _ => continue,

@@ -31,7 +31,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::types::{Annotation, AnnotationArgKind, Decl, Modifiers};
 
 use crate::analyzer::{SemanticDiagnostic, Severity};
-use crate::stdlib::ProjectIndex;
+use crate::index::ProjectIndex;
 
 /// The registry. One entry per known language pragma; each lives in
 /// its own submodule.

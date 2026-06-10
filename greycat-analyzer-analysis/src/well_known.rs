@@ -1,4 +1,3 @@
-// P35.1
 //! Project-wide stable handles for resolved type decls and the
 //! "well-known" std/core slots the analyzer dispatches against.
 //!
@@ -21,48 +20,6 @@
 //!   `("std", "core", N)` stashes its identity into slot `N`.
 
 use greycat_analyzer_core::ItemId;
-use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::Decl;
-use rustc_hash::FxHashMap;
-
-/// Maps every interned [`ItemId`] to the current HIR's `Idx<Decl>` in
-/// the owning module. The `Idx<Decl>` is HIR-allocation-order — a
-/// property of the *current* lower, not of the decl — so it gets
-/// refreshed on every `record` call (which happens once per decl per
-/// ingest). The URI of the owning module isn't stored here; recover
-/// it via `ProjectIndex::module_names[item.module]`.
-#[derive(Debug, Default, Clone)]
-pub struct DeclRegistry {
-    indices: FxHashMap<ItemId, Idx<Decl>>,
-}
-
-impl DeclRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Idempotent on `item` — re-calling with the same `ItemId`
-    /// refreshes the cached `Idx<Decl>` so [`Self::lookup`] stays
-    /// valid against the most recently-ingested HIR.
-    pub fn record(&mut self, item: ItemId, decl: Idx<Decl>) {
-        self.indices.insert(item, decl);
-    }
-
-    /// Current `Idx<Decl>` for `item` in its owning module's HIR.
-    /// Only meaningful against the most recently-ingested HIR for
-    /// `item.module`.
-    pub fn lookup(&self, item: ItemId) -> Option<Idx<Decl>> {
-        self.indices.get(&item).copied()
-    }
-
-    pub fn len(&self) -> usize {
-        self.indices.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
-    }
-}
 
 /// Well-known std/core type decl identities. Each slot is `Some` once
 /// the corresponding `Decl::Type` has been seen during ingest;
@@ -204,7 +161,6 @@ impl WellKnown {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use greycat_analyzer_core::SourceManager;
     use greycat_analyzer_core::lsp_types::Uri;
     use std::str::FromStr;
@@ -350,21 +306,5 @@ mod tests {
         );
         assert!(w.int_decl.is_none(), "no std-core int decl seen");
         assert!(w.array_decl.is_none(), "no std-core Array decl seen");
-    }
-
-    /// `DeclRegistry::record` is idempotent: re-recording the same
-    /// `ItemId` refreshes the cached `Idx<Decl>` without bloating the
-    /// map.
-    #[test]
-    fn decl_registry_record_is_idempotent() {
-        use greycat_analyzer_core::SymbolTable;
-        let mut r = DeclRegistry::new();
-        let decl = Idx::<Decl>::from_raw(0u32);
-        let symbols = SymbolTable::new();
-        let item = ItemId::new(symbols.intern("m"), symbols.intern("Foo"));
-        r.record(item, decl);
-        r.record(item, decl);
-        assert_eq!(r.lookup(item), Some(decl));
-        assert_eq!(r.len(), 1);
     }
 }

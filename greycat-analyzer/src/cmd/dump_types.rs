@@ -24,12 +24,11 @@ use std::{
     sync::Arc,
 };
 
-use greycat_analyzer_analysis::display_fqn;
+use greycat_analyzer_analysis::{display_fqn, project::DeclRegistry};
 use greycat_analyzer_analysis::{
+    index::ProjectIndex,
     project::{ModuleAnalysis, ProjectAnalysis},
     resolver::{Definition, Resolutions},
-    stdlib::ProjectIndex,
-    well_known::DeclRegistry,
 };
 use greycat_analyzer_core::{
     Document, SourceManager, SymbolTable, lsp_types::Uri, resolver::FsContext,
@@ -278,8 +277,7 @@ fn module_stem_from_uri(uri: &Uri) -> Option<String> {
 fn home_lib_for(index: &ProjectIndex, name: &str) -> Option<String> {
     let sym = index.symbols.lookup(name)?;
     let locs = index.locate_decl(sym);
-    locs.first()
-        .and_then(|(uri, _, _)| module_stem_from_uri(uri))
+    locs.first().and_then(|d| module_stem_from_uri(&d.uri))
 }
 
 // ---------------------------------------------------------------------------
@@ -639,14 +637,14 @@ fn collect_expr_descendants(
     }
 }
 
-/// Local copy of `analysis::stdlib::lower_type_ref` (private upstream).
+/// Local copy of `analysis::index::lower_type_ref` (private upstream).
 fn lower_type_ref_local(
     hir: &Hir,
     symbols: &SymbolTable,
     idx: Idx<TypeRef>,
     arena: &mut TypeArena,
     index: &ProjectIndex,
-    decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
 ) -> TypeId {
     let tr = &hir.type_refs[idx];
     let name_sym = hir.idents[tr.name].symbol;
@@ -671,7 +669,7 @@ fn lower_type_ref_local(
                     .map(|p| lower_type_ref_local(hir, symbols, *p, arena, index, decl_registry))
                     .collect();
                 match handle {
-                    Some(h) => arena.generic(h, args),
+                    Some(h) => arena.alloc_generic(h, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else {

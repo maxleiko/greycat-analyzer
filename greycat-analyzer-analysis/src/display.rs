@@ -8,7 +8,7 @@
 
 use greycat_analyzer_core::{SymbolTable, TypeArena, TypeId, TypeKind};
 
-use crate::well_known::DeclRegistry;
+use crate::project::DeclRegistry;
 
 /// Fully-qualified-name display, matching the GreyCat canonical
 /// printer (e.g. `core::int`, `core::Array<core::int?>`,
@@ -64,7 +64,7 @@ pub fn display_fqn(
         // still carries `Unresolved { name, byte_range }` for goto /
         // hover anchoring; only the printed form is degraded.
         TypeKind::Unresolved { .. } => "core::any".to_string(),
-        TypeKind::GenericParam { name, .. } => symbols[*name].to_string(),
+        TypeKind::GenericParam(name) => symbols[*name].to_string(),
         TypeKind::Lambda { params, ret } => {
             let parts: Box<[String]> = params
                 .iter()

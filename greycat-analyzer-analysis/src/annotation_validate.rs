@@ -24,7 +24,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::types::{AnnotationArgKind, Decl, Modifiers};
 
 use crate::analyzer::{SemanticDiagnostic, Severity};
-use crate::stdlib::ProjectIndex;
+use crate::index::ProjectIndex;
 
 /// Walk every decl-attached `modifiers.annotations` in `hir` and
 /// push one [`SemanticDiagnostic`] per non-const argument into

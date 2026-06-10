@@ -1,4 +1,3 @@
-// P27.1
 //! Parallelism shim.
 //!
 //! Single point of dispatch between rayon (on native targets) and a

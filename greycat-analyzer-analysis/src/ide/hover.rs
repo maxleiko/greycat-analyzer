@@ -30,9 +30,8 @@ use crate::ide::render::{
     render_decl_signature, render_type_decl_with_body, render_type_ref, render_type_ref_with_subst,
 };
 use crate::ide::types::Range as IdeRange;
-use crate::project::ProjectAnalysis;
+use crate::project::{DeclRegistry, ProjectAnalysis};
 use crate::resolver::{Definition, Resolutions, resolve};
-use crate::well_known::DeclRegistry;
 
 /// IDE-shape hover result: markdown body + the source byte-range the
 /// hover applies to, already projected into `(line, character)`

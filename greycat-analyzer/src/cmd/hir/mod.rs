@@ -23,10 +23,9 @@ use std::sync::Arc;
 
 use greycat_analyzer_analysis::analyzer::AnalysisResult;
 use greycat_analyzer_analysis::display_fqn;
-use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
+use greycat_analyzer_analysis::index::ProjectIndex;
+use greycat_analyzer_analysis::project::{DeclRegistry, ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_analysis::resolver::Definition;
-use greycat_analyzer_analysis::stdlib::ProjectIndex;
-use greycat_analyzer_analysis::well_known::DeclRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
@@ -234,8 +233,8 @@ struct ModuleFqnBuffers {
 fn home_lib_for(index: &ProjectIndex, name: &str) -> Option<String> {
     let sym = index.symbols.lookup(name)?;
     let locs = index.locate_decl(sym);
-    locs.first().and_then(|(uri, _, _)| {
-        let s = uri.as_str();
+    locs.first().and_then(|d| {
+        let s = d.uri.as_str();
         let stripped = s.strip_prefix("file://").unwrap_or(s);
         let last = stripped.rsplit(['/', '\\']).next()?;
         let stem = last.strip_suffix(".gcl").unwrap_or(last);
@@ -677,8 +676,8 @@ fn name_to_lib_borrow<'a>(
 ) -> Option<&'a str> {
     let sym = index.symbols.lookup(name)?;
     let locs = index.locate_decl(sym);
-    let (uri, _, _) = locs.first()?;
-    let s = uri.as_str();
+    let d = locs.first()?;
+    let s = d.uri.as_str();
     let stripped = s.strip_prefix("file://").unwrap_or(s);
     let last = stripped.rsplit(['/', '\\']).next()?;
     let stem = last.strip_suffix(".gcl").unwrap_or(last);

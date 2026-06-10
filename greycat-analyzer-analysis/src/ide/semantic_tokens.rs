@@ -19,7 +19,7 @@ use greycat_analyzer_syntax::cst::walk_named;
 use greycat_analyzer_syntax::tree_sitter;
 
 use crate::resolver::{Definition, resolve};
-use crate::stdlib::BUILTIN_RUNTIME_GLOBALS;
+use crate::index::BUILTIN_RUNTIME_GLOBALS;
 
 /// Token-type table — the LSP server registers `SemanticTokenType`
 /// equivalents at the wire boundary; the wasm bridge exposes these

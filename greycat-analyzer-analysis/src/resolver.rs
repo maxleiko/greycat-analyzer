@@ -1,4 +1,3 @@
-// P2.3 — initial drop. P6.2 — project-scope extension. P6.3 — member resolution lives elsewhere.
 //! Symbol resolver / name binding.
 //!
 //! Walks an [`Hir`] and produces a [`Resolutions`] table that maps each
@@ -42,7 +41,7 @@ use greycat_analyzer_hir::types::{
     WhileStmt,
 };
 
-use crate::stdlib::{Namespace, ProjectIndex};
+use crate::index::{Namespace, ProjectIndex};
 
 /// Where in source a name was used — drives the per-namespace lookup
 /// order in [`Cx::record_use`]. The GreyCat runtime keeps three
@@ -1086,6 +1085,9 @@ fn visit_type_ref(cx: &mut Cx, ty_id: Idx<TypeRef>) {
 
 #[cfg(test)]
 mod tests {
+    use crate::project::DeclRegistry;
+    use crate::well_known::WellKnown;
+
     use super::*;
     use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_hir::lower_module;
@@ -1337,15 +1339,15 @@ fn f(p: Foo): Foo { return p; }
 
     #[test]
     fn project_index_fallback_resolves_cross_module_name() {
-        use crate::stdlib::ProjectIndex;
+        use crate::index::ProjectIndex;
         use std::str::FromStr;
         // Module A declares `Helper` as a top-level type. Module B
         // refers to `Helper` — without a ProjectIndex it'd be
         // unresolved; with one ingested from A it binds to ProjectDecl
         // carrying A's URI + the Helper decl id (P11.2).
         let mut arena = TypeArena::new();
-        let mut decl_registry = crate::well_known::DeclRegistry::default();
-        let mut well_known = crate::well_known::WellKnown::default();
+        let mut decl_registry = DeclRegistry::default();
+        let mut well_known = WellKnown::default();
         let mut idx = ProjectIndex::new(&mut arena);
 
         let other_src = "type Helper {}\n";

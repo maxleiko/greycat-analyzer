@@ -101,7 +101,7 @@ pub fn join_return_types(arena: &TypeArena, a: TypeId, b: TypeId) -> Option<Type
             kind: t.kind.clone(),
             nullable: true,
         };
-        arena.intern.get(&probe).copied()
+        arena.resolve(&probe)
     };
     // `null + T` (either order) → the nullable form of T. Includes the
     // `T?` case (the companion of an already-nullable type is itself).

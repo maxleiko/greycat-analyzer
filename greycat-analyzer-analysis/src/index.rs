@@ -1,19 +1,4 @@
-//! Stdlib ingestion.
-//!
-//! Loads `lib/std/*.gcl` as ordinary HIR modules and registers their
-//! declared types and native-bound function signatures into shared
-//! [`TypeArena`] / [`TypeRegistry`] / [`NativeRegistry`] structures so
-//! the analyzer can resolve `int`, `String`, `Array`, `node`, etc.
-//! against real declarations rather than the stub `BUILTIN_TYPES`
-//! allowlist the resolver currently pre-seeds.
-//!
-//! Decision F (ROADMAP §3): runtime-implemented (`native`) functions
-//! get a small Rust metadata table — signatures only, no bodies. Their
-//! .gcl source captures the signature; this module collects them so
-//! call-site type checking works even though there's no body to walk.
-
 use rustc_hash::{FxHashMap, FxHashSet};
-use smol_str::SmolStr;
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
@@ -21,9 +6,10 @@ use greycat_analyzer_core::{
 };
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as HirTypeRef};
+use greycat_analyzer_hir::types::{Annotation, Decl, Expr, TypeAttr};
 
-use crate::well_known::DeclRegistry;
+use crate::project::DeclRegistry;
+use crate::well_known::WellKnown;
 
 /// Runtime-exposed value-position globals. The runtime
 /// makes these names available at value position with a fixed type;
@@ -32,6 +18,18 @@ use crate::well_known::DeclRegistry;
 /// confirmed against `greycat run`.
 pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
     &[("Infinity", Primitive::Float), ("NaN", Primitive::Float)];
+
+/// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
+/// declaration whose `extends` chain reaches a 5th level with
+/// `too depth inheritance: <name>` (verified against `greycat build`:
+/// four-level `A <- B <- C <- D` builds clean, five-level
+/// `A <- B <- C <- D <- E` errors out). Walkers that follow
+/// `supertype` cap their iteration at this value both as a defense
+/// against accidental cycles in in-progress source and to match the
+/// runtime's actual limit. Set to the limit itself (4) rather than
+/// `limit - 1` so that legal chains are always reachable even when
+/// the walk starts at the deepest descendant.
+const MAX_SUPERTYPE_CHAIN_DEPTH: usize = 4;
 
 /// Symbol namespace for top-level decls. The GreyCat runtime
 /// (validated against `greycat build` 8.0.301-dev) keeps three name
@@ -49,14 +47,14 @@ pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
 pub enum Namespace {
     /// `type` / `enum` declarations.
     Type,
-    /// `fn` declarations (free functions; methods live on a
-    /// `TypeMembers` entry, not at module top level).
+    /// Module-level `fn` declarations (not type methods).
     Fn,
     /// Module-level `var` declarations (graph-root nodes).
     Var,
 }
 
 impl Namespace {
+    /// Returns the `Namespace` variant of the given decl
     pub fn of_decl(decl: &Decl) -> Option<Self> {
         match decl {
             Decl::Type(_) | Decl::Enum(_) => Some(Self::Type),
@@ -67,63 +65,11 @@ impl Namespace {
     }
 }
 
-/// Name → every (uri, decl, namespace) triple known under that name
-/// across the project. Stored shape of [`ProjectIndex::decl_locations`];
-/// extracted as a type alias because clippy's `type_complexity` rule
-/// fires on the bare `FxHashMap<Symbol, Vec<(Uri, Idx<Decl>, Namespace)>>`
-/// surface when threaded through helper signatures.
-pub type DeclLocationMap = FxHashMap<Symbol, Vec<(Uri, Idx<Decl>, Namespace)>>;
-
-/// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
-/// declaration whose `extends` chain reaches a 5th level with
-/// `too depth inheritance: <name>` (verified against `greycat build`:
-/// four-level `A <- B <- C <- D` builds clean, five-level
-/// `A <- B <- C <- D <- E` errors out). Walkers that follow
-/// `supertype` cap their iteration at this value both as a defense
-/// against accidental cycles in in-progress source and to match the
-/// runtime's actual limit. Set to the limit itself (4) rather than
-/// `limit - 1` so that legal chains are always reachable even when
-/// the walk starts at the deepest descendant.
-const MAX_SUPERTYPE_CHAIN_DEPTH: usize = 4;
-
-/// Cross-module registry of native-bound function signatures. Keyed by
-/// canonical name (`<lib>::<module>::<fn>` once we wire fully-qualified
-/// resolution; just `<fn>` for now until  multi-module work).
-///
-// P19.9
-/// Keys are project-wide [`Symbol`]s. Lookup helpers that
-/// take `&str` translate via the project's [`SymbolTable`] (held on
-/// [`ProjectIndex`]); see [`ProjectIndex::native_for`].
-#[derive(Debug, Default)]
-pub struct NativeRegistry {
-    pub signatures: FxHashMap<Symbol, NativeSignature>,
-}
-
 #[derive(Debug, Clone)]
-pub struct NativeSignature {
-    pub params: Vec<TypeId>,
-    pub return_ty: TypeId,
-}
-
-impl NativeRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    // P19.9
-    /// Register by an already-interned [`Symbol`]. Callers
-    /// that hold a `&str` should go through [`ProjectIndex::ingest`]
-    /// (which interns into `index.symbols` and forwards here).
-    pub fn register(&mut self, sym: Symbol, sig: NativeSignature) {
-        self.signatures.insert(sym, sig);
-    }
-
-    // P19.9
-    /// Lookup by a previously-interned [`Symbol`].
-    /// `&str` callers should use [`ProjectIndex::native_for`].
-    pub fn lookup_sym(&self, sym: Symbol) -> Option<&NativeSignature> {
-        self.signatures.get(&sym)
-    }
+pub struct DeclLocation {
+    pub uri: Uri,
+    pub id: Idx<Decl>,
+    pub ns: Namespace,
 }
 
 /// Cross-module project context: name tables / structure indices /
@@ -140,7 +86,6 @@ impl NativeRegistry {
 /// `enum_types` lag the actual signature pass and surface as a
 /// self-named `T not assignable to T` regression class.
 ///
-// P19.9
 /// Every project-wide map keys on [`Symbol`] instead of
 /// `String`. The names live once in [`Self::symbols`]; map keys are
 /// 32-bit handles. Public lookup helpers ([`Self::has_name`],
@@ -151,38 +96,16 @@ impl NativeRegistry {
 /// internally.
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
-    // P19.9
     /// Project-wide string interner. Owns the canonical
     /// storage for every type / fn / attr / method / enum-variant /
     /// global / module name the analyzer looks up across modules.
     pub symbols: SymbolTable,
-    /// Set of [`Symbol`]s the analyzer recognises as a *type* name:
-    /// every primitive plus every `type` / `enum` / `native type`
-    /// decl ingested from a `.gcl` file (the runtime-implemented
-    /// types all have `native type` decls in `lib/std/core.gcl` and
-    /// land here through the normal ingest path). Drives
-    /// [`Self::has_name`] and the signature-cache fingerprint
-    /// ([`project_name_set_hash`]).
+    /// Set of top-level declared types/enums names
     pub type_names: FxHashSet<Symbol>,
-    pub natives: NativeRegistry,
-    /// Top-level value-position names from every ingested module —
-    /// non-native `fn` declarations, top-level `var` declarations.
-    /// Lets the resolver answer "is this name known anywhere in the
-    /// project?" without needing the cross-module decl pointer
-    /// (a later deliverable).
-    pub values: FxHashSet<Symbol>,
-    // P38.1
-    /// Names of non-native top-level `fn` declarations from every
-    /// ingested module. Subset of `values` — `values` also contains
-    /// top-level `var` names with no way to distinguish them from
-    /// non-native fns by membership alone. Lets the analyzer's
-    /// `Definition::ProjectDecl` value-typing arm route bare fn
-    /// idents to `function_ty()` instead of falling through to
-    /// `type_ty()` via `has_name`. Natives stay in `fn_signatures`
-    /// (which carries the lowered signature) — this set is for the
-    /// "decl exists, type as `function`" question, nothing more.
-    pub non_native_fn_names: FxHashSet<Symbol>,
-    // P38.4
+    /// Set of top-level declared variables names
+    pub var_names: FxHashSet<Symbol>,
+    /// Set of top-level declared functions names
+    pub fn_names: FxHashSet<Symbol>,
     /// `(Uri, Idx<Decl>)` pairs whose decl carries the `private`
     /// modifier. Mirrors the entries in [`Self::decl_locations`] —
     /// every private decl that goes through `record_decl_location`
@@ -201,24 +124,20 @@ pub struct ProjectIndex {
     /// type-position vs value-position hits without re-fetching the
     /// `Decl` from foreign HIR. Pragma decls have no name and are
     /// excluded.
-    pub decl_locations: DeclLocationMap,
-    // P13.4
+    pub decl_locations: FxHashMap<Symbol, Vec<DeclLocation>>,
     /// Runtime-exposed names. Keyed by the rename string of
     /// `@expose("renamed")` (or the decl's own name when `@expose` has
     /// no arg) → every site that exposed under that key. Lets lints /
     /// capabilities ask "is this name part of the runtime API?".
     pub exposed: FxHashMap<Symbol, Vec<ExposureSite>>,
-    // P13.5
     /// Per-type flag bits drawn from `@iterable` / `@deref` /
     /// `@primitive` annotations on a `type` decl. Keyed by the
     /// declared type name (`Array`, `nodeTime`, …).
     pub type_flags: FxHashMap<ItemId, TypeFlags>,
-    // P13.6
     /// Per-module `@permission("name")` pragmas. Lets later
     /// chunks light up "is this module allowed to call X?" checks the
     /// TS reference declarator threads through `mod.permissions`.
     pub module_permissions: FxHashMap<Uri, FxHashSet<Symbol>>,
-    // P15.x
     /// Module-name → URI. Populated from each ingested doc's
     /// filename stem (i.e. `Document::name()`). Lets the resolver
     /// recognize `runtime` in `runtime::Identity::create` as a known
@@ -314,7 +233,6 @@ pub struct ProjectIndex {
     pub modules_ingested: usize,
 }
 
-// P23
 /// Top-level fn signature record. `return_ty` is the
 /// pre-lowered return `TypeId` in the shared project arena; it may
 /// be `GenericParam(T, owner=fn)` for generic fns. The analyzer's
@@ -350,10 +268,7 @@ pub struct FnSignature {
     pub return_erases: bool,
 }
 
-// P21
-/// Per-type cross-module member index. `home_uri` names the
-/// module that declared the type so the analyzer / staged orchestrator
-/// can fish the right `Hir` out of `ProjectAnalysis::modules`.
+/// Per-type cross-module member index.
 ///
 /// **Signature-lowering extension:** `generics`, `attr_types`, and `method_returns`
 /// hold the *project-wide-lowered* signature data. Built by
@@ -365,8 +280,8 @@ pub struct FnSignature {
 /// post-pass round-trip via `TypeShape`.
 #[derive(Debug, Clone)]
 pub struct TypeMembers {
+    /// The uri of the module that declared the type
     pub home_uri: Uri,
-    // P19.9
     /// Attr name → HIR index. Symbol-keyed; resolve to
     /// text via [`ProjectIndex::symbols`].
     pub attrs: FxHashMap<Symbol, Idx<TypeAttr>>,
@@ -377,24 +292,20 @@ pub struct TypeMembers {
     /// of truth for the "missing required fields" diagnostic's wording,
     /// which lists attrs in the order the user declared them.
     pub attr_order: Box<[Symbol]>,
-    // P19.9
     /// Method name → HIR index. Symbol-keyed.
     pub methods: FxHashMap<Symbol, Idx<Decl>>,
-    // P22
     /// Ordered list of generic parameter names declared on the
     /// type (`type Map<K, V> {}` → `[Sym("K"), Sym("V")]`). Empty for
     /// non-generic types. Used by the analyzer to build a
     /// `name → TypeId` substitution map from the receiver's
     /// instantiation args at member-access / call sites.
     pub generics: Vec<Symbol>,
-    // P22
     /// Pre-lowered attr declared types, keyed by attr-name
     /// [`Symbol`]. `TypeId`s reference the shared project arena
     /// ([`crate::project::ProjectAnalysis::arena`]). For generic
     /// types, attr TypeIds may reference `GenericParam(T, owner=this)`
     /// — call-site substitution is the consumer's job.
     pub attr_types: FxHashMap<Symbol, TypeId>,
-    // P22
     /// Pre-lowered method declared return types. Same arena +
     /// substitution semantics as `attr_types`. Methods without an
     /// explicit return type are absent (the analyzer's call-typing
@@ -408,7 +319,6 @@ pub struct TypeMembers {
     /// HIR boundary at body-walk time. Non-generic methods are
     /// absent and route through the simpler `method_returns` path.
     pub method_signatures: FxHashMap<Symbol, FnSignature>,
-    // P19.13
     /// Names of attrs declared with the `static`
     /// modifier (`type Foo { static path: String = "..." }`).
     /// Lets the analyzer's `Expr::Static` value-typing
@@ -436,7 +346,6 @@ pub struct TypeMembers {
     /// ancestor of a concrete override without needing to fetch each
     /// foreign module's HIR.
     pub abstract_methods: FxHashSet<Symbol>,
-    // P19.14
     /// Direct supertype's [`ItemId`] (the `Super` in
     /// `type Sub extends Super`). Drives inheritance: member lookup
     /// walks `supertype` chains to find inherited attrs / methods,
@@ -473,7 +382,6 @@ pub struct TypeMembers {
     pub deref_return_ty: Option<TypeId>,
 }
 
-// P13.5
 /// Annotation-derived flag bits on a type declaration.
 ///
 /// - `iterable`: `for x in t` is legal when `t` is this type.
@@ -491,12 +399,10 @@ pub struct TypeMembers {
 #[derive(Debug, Default, Clone)]
 pub struct TypeFlags {
     pub iterable: bool,
-    // P25.6
-    pub deref: Option<SmolStr>,
+    pub deref: Option<Symbol>,
     pub primitive: bool,
 }
 
-// P13.4
 /// A single `@expose`-annotated decl, recorded for the
 /// runtime-API surface. `local_name` is the source-level name in the
 /// declaring module; `rename` is what `@expose("renamed")` gave it
@@ -525,7 +431,6 @@ impl ProjectIndex {
         Self::with_symbols(SymbolTable::new(), arena)
     }
 
-    // P19.9
     /// Construct a fresh index that reuses an existing
     /// [`SymbolTable`]. Lets `ProjectAnalysis::invalidate` rebuild
     /// the per-module index without invalidating the `Symbol`s held
@@ -536,7 +441,7 @@ impl ProjectIndex {
             ..Self::default()
         };
         seed_builtin_names(&mut idx.symbols, &mut idx.type_names);
-        // **P19.16** — runtime-exposed value-position globals
+        // Runtime-exposed value-position globals
         // (`Infinity`, `NaN`). Registered here (not in
         // `seed_builtin_names`) because they're values, not types,
         // and they need a typed `TypeId` the body walker can consume.
@@ -544,7 +449,6 @@ impl ProjectIndex {
             let sym = idx.symbols.intern(name);
             let ty = arena.primitive(*prim);
             idx.runtime_globals.insert(sym, ty);
-            idx.values.insert(sym);
         }
         idx
     }
@@ -789,13 +693,12 @@ impl ProjectIndex {
         false
     }
 
-    // P36.1 — kept as a thin alias for symmetry with the chain
+    // Kept as a thin alias for symmetry with the chain
     // walkers above. `is_subtype_of` now takes `ItemId` directly so
     // the wrapper is purely cosmetic; consumers can call either.
     pub fn is_subtype_of_decl(&self, sub: ItemId, sup: ItemId) -> bool {
         self.is_subtype_of(sub, sup)
     }
-    // P38.4
     /// `true` iff the decl at `(uri, decl_id)` was ingested with the
     /// `private` modifier. Lets the resolver filter cross-module
     /// candidates by visibility for bare-name lookup while leaving
@@ -821,13 +724,13 @@ impl ProjectIndex {
         uri: &Uri,
         hir: &Hir,
         arena: &mut TypeArena,
-        decl_registry: &mut crate::well_known::DeclRegistry,
-        well_known: &mut crate::well_known::WellKnown,
+        decl_registry: &mut DeclRegistry,
+        well_known: &mut WellKnown,
     ) {
         let Some(module) = hir.module.as_ref() else {
             return;
         };
-        // P15.x — capture the module's name (URI's filename stem
+        // Capture the module's name (URI's filename stem
         // without `.gcl`) so resolver / pass 3.5 can recognize
         // `module::Decl` chains.
         //
@@ -852,7 +755,7 @@ impl ProjectIndex {
             }
             _ => {
                 self.module_names.insert(module_sym, uri.clone());
-                // P32.x — the duplicate registry is keyed by URI,
+                // The duplicate registry is keyed by URI,
                 // not module-name. If a file moves from "duplicate"
                 // back to "winner" across invalidate cycles (e.g.
                 // the previous winner was deleted from the project),
@@ -865,7 +768,6 @@ impl ProjectIndex {
             let modifiers = match &hir.decls[*decl_id] {
                 Decl::Type(td) => {
                     let name_sym = hir.idents[td.name].symbol;
-                    let is_private = td.modifiers.private;
                     // Recognised type name (drives `has_name` and the
                     // sig-cache fingerprint). Private decls aren't
                     // cross-module visible: same-module access goes
@@ -873,7 +775,7 @@ impl ProjectIndex {
                     // `out.registry` paths, which see the private
                     // type from its own HIR without needing it in the
                     // shared name set.
-                    if !is_private {
+                    if !td.modifiers.private {
                         self.type_names.insert(name_sym);
                     }
                     // Project-wide identity + well-known slot
@@ -888,17 +790,16 @@ impl ProjectIndex {
                         &self.symbols[name_sym],
                         item,
                     );
-                    // P41.1
                     if td.modifiers.abstract_ {
                         self.is_abstract.insert(item);
                     }
-                    // P13.5: capture @iterable / @deref / @primitive
+                    // Capture @iterable / @deref / @primitive
                     // flag bits into the per-type table.
                     let flags = derive_type_flags(&self.symbols, &td.modifiers.annotations);
                     if flags.iterable || flags.deref.is_some() || flags.primitive {
                         self.type_flags.entry(item).or_insert(flags);
                     }
-                    // P21 — populate the member shape index. Keyed
+                    // Populate the member shape index. Keyed
                     // by `(module, name)` so two same-named types in
                     // different modules coexist unambiguously. The
                     // first ingested decl for a given `ItemId` wins
@@ -954,8 +855,7 @@ impl ProjectIndex {
                             attr_order,
                             methods: FxHashMap::default(),
                             generics,
-                            // P22 — `attr_types` / `method_returns`
-                            // get filled in by
+                            // `attr_types` / `method_returns` get filled in by
                             // `ProjectAnalysis::stage_lower_signatures`
                             // after every module is loaded.
                             attr_types: FxHashMap::default(),
@@ -977,7 +877,7 @@ impl ProjectIndex {
                             let attr = &hir.type_attrs[*attr_id];
                             let attr_sym = hir.idents[attr.name].symbol;
                             m.attrs.insert(attr_sym, *attr_id);
-                            // P19.13 — capture `static` flag at
+                            // Capture `static` flag at
                             // ingest time so `Expr::Static` value
                             // typing can distinguish static-attr
                             // value access from a runtime `field`
@@ -1054,30 +954,8 @@ impl ProjectIndex {
                 }
                 Decl::Fn(fnd) => {
                     let name_sym = hir.idents[fnd.name].symbol;
-                    let is_private = fnd.modifiers.private;
-                    if fnd.modifiers.native {
-                        // Natives aren't user-written; `private` here is
-                        // unusual but kept consistent: a private native
-                        // wouldn't be reachable from outside its module.
-                        if !is_private {
-                            let sig = native_signature_for(
-                                hir,
-                                fnd,
-                                arena,
-                                decl_registry,
-                                &self.decl_locations,
-                                &self.symbols,
-                            );
-                            self.natives.register(name_sym, sig);
-                        }
-                    } else if !is_private {
-                        self.values.insert(name_sym);
-                        // P38.1 — tag non-native fn names so the
-                        // analyzer's `Definition::ProjectDecl`
-                        // value-typing arm can route them to
-                        // `function_ty()` instead of falling through
-                        // to `type_ty()` via `has_name`.
-                        self.non_native_fn_names.insert(name_sym);
+                    if !fnd.modifiers.private {
+                        self.fn_names.insert(name_sym);
                     }
                     self.record_decl_location(name_sym, uri, *decl_id, Namespace::Fn);
                     Some(&fnd.modifiers)
@@ -1085,17 +963,17 @@ impl ProjectIndex {
                 Decl::Var(vd) => {
                     let name_sym = hir.idents[vd.name].symbol;
                     if !vd.modifiers.private {
-                        self.values.insert(name_sym);
+                        self.var_names.insert(name_sym);
                     }
                     self.record_decl_location(name_sym, uri, *decl_id, Namespace::Var);
                     Some(&vd.modifiers)
                 }
                 Decl::Pragma(p) => {
-                    // P13.6: capture `@permission("name")` mod-pragmas
+                    // Capture `@permission("name")` mod-pragmas
                     // into the project-wide `module_permissions` map.
                     if &self.symbols[hir.idents[p.name].symbol] == "permission"
                         && let Some(arg_expr) = p.args.first()
-                        && let greycat_analyzer_hir::types::Expr::String(s) = &hir.exprs[*arg_expr]
+                        && let Expr::String(s) = &hir.exprs[*arg_expr]
                     {
                         let perm_sym = self.symbols.intern(&s.raw_value());
                         self.module_permissions
@@ -1106,7 +984,7 @@ impl ProjectIndex {
                     None
                 }
             };
-            // P13.4: walk modifiers' annotations for `@expose("name")`
+            // Walk modifiers' annotations for `@expose("name")`
             // and capture the rename target into the project-wide
             // exposed map.
             if let Some(modifiers) = modifiers {
@@ -1199,18 +1077,18 @@ impl ProjectIndex {
         ns: Namespace,
     ) {
         let entry = self.decl_locations.entry(name_sym).or_default();
-        if !entry.iter().any(|(u, d, _)| u == uri && *d == decl_id) {
-            entry.push((uri.clone(), decl_id, ns));
+        if !entry.iter().any(|d| &d.uri == uri && d.id == decl_id) {
+            entry.push(DeclLocation {
+                uri: uri.clone(),
+                id: decl_id,
+                ns,
+            });
         }
     }
 
     /// Cross-module decl lookup: every `(Uri, Idx<Decl>, Namespace)` triple
     /// known under this name. Empty slice when the name is unknown.
-    /// Built-in runtime type names (`Array`, `Map`, …) and language
-    /// primitives have no `.gcl` decl and so never appear here — use
-    /// [`Self::has_name`] to ask the broader "is this name known?"
-    /// question.
-    pub fn locate_decl(&self, name: Symbol) -> &[(Uri, Idx<Decl>, Namespace)] {
+    pub fn locate_decl(&self, name: Symbol) -> &[DeclLocation] {
         self.decl_locations
             .get(&name)
             .map(|v| v.as_slice())
@@ -1228,28 +1106,23 @@ impl ProjectIndex {
     ) -> impl Iterator<Item = (&Uri, Idx<Decl>)> {
         self.locate_decl(name)
             .iter()
-            .filter(move |(_, _, n)| *n == ns)
-            .map(|(u, d, _)| (u, *d))
+            .filter(move |d| d.ns == ns)
+            .map(|d| (&d.uri, d.id))
     }
 
     /// `true` iff `name` resolves against any name the project knows:
-    /// a registered type / enum, a native fn signature, or a top-level
-    /// non-native fn / var. Resolver uses this as the post-local-scope
-    /// fallback.
+    /// a registered type / enum, a function, or a variable.
+    /// Resolver uses this as the post-local-scope fallback.
     pub fn has_name(&self, name: Symbol) -> bool {
         self.type_names.contains(&name)
-            || self.natives.signatures.contains_key(&name)
-            || self.values.contains(&name)
+            || self.fn_names.contains(&name)
+            || self.var_names.contains(&name)
     }
 }
 
-// P15.x
 /// Extract the module name from a URI (filename without
 /// `.gcl`). Mirrors [`Document::name`](greycat_analyzer_core::Document)
-/// without the borrow on a manager. Returns a slice of the URI text —
-/// no allocation. Callers that need an owned `String` go through
-/// `.to_string()` at the call site; callers that intern into a
-/// `SymbolTable` (the common case) consume the `&str` directly.
+/// without the borrow on a manager.
 pub fn module_name_from_uri(uri: &Uri) -> Option<&str> {
     let s = uri.as_str();
     let stripped = s.strip_prefix("file://").unwrap_or(s);
@@ -1287,108 +1160,11 @@ fn derive_type_flags(symbols: &SymbolTable, annotations: &[Annotation]) -> TypeF
         match &symbols[ann.name.symbol] {
             "iterable" => flags.iterable = true,
             "primitive" => flags.primitive = true,
-            "deref" => {
-                flags.deref = ann
-                    .first_string_arg()
-                    .map(|s| SmolStr::from(&symbols[s]))
-                    .or(Some(SmolStr::default()))
-            }
+            "deref" => flags.deref = ann.first_string_arg(),
             _ => {}
         }
     }
     flags
-}
-
-fn native_signature_for(
-    hir: &Hir,
-    fnd: &FnDecl,
-    arena: &mut TypeArena,
-    decl_registry: &crate::well_known::DeclRegistry,
-    locate_decl: &DeclLocationMap,
-    symbols: &SymbolTable,
-) -> NativeSignature {
-    let params = fnd
-        .params
-        .iter()
-        .map(|p_id| {
-            let p = &hir.fn_params[*p_id];
-            p.ty.map(|t| lower_native_type_ref(hir, t, arena, decl_registry, locate_decl, symbols))
-                .unwrap_or_else(|| arena.any())
-        })
-        .collect();
-    let return_ty = fnd
-        .return_type
-        .map(|t| lower_native_type_ref(hir, t, arena, decl_registry, locate_decl, symbols))
-        .unwrap_or_else(|| arena.any());
-    NativeSignature { params, return_ty }
-}
-
-/// Native-fn signature counterpart of
-/// [`crate::project::lower_type_ref_project`]. Same handle-keyed
-/// resolution shape — every reference to a `.gcl`-declared type
-/// mints `Type(handle)` / `Generic(handle, args)` via the
-/// project's `decl_registry`, never the legacy `Named` fallback.
-/// Falls back to `Unresolved` when the referenced decl hasn't been
-/// ingested yet (rare — native fns typically reference primitives
-/// or stdlib types declared earlier in the same module).
-fn lower_native_type_ref(
-    hir: &Hir,
-    idx: Idx<HirTypeRef>,
-    arena: &mut TypeArena,
-    decl_registry: &DeclRegistry,
-    locate_decl: &DeclLocationMap,
-    symbols: &SymbolTable,
-) -> TypeId {
-    let tr = &hir.type_refs[idx];
-    let name_sym = hir.idents[tr.name].symbol;
-    let mut base = match &symbols[name_sym] {
-        "bool" => arena.primitive(Primitive::Bool),
-        "int" => arena.primitive(Primitive::Int),
-        "float" => arena.primitive(Primitive::Float),
-        "char" => arena.primitive(Primitive::Char),
-        "String" => arena.primitive(Primitive::String),
-        "time" => arena.primitive(Primitive::Time),
-        "duration" => arena.primitive(Primitive::Duration),
-        "geo" => arena.primitive(Primitive::Geo),
-        "any" => arena.any(),
-        "null" => arena.null(),
-        _ => {
-            // Resolve the decl handle once (the same lookup powers both
-            // the generic and non-generic branches).
-            let handle = locate_decl.get(&name_sym).and_then(|locs| {
-                locs.iter().find_map(|(uri, _, _)| {
-                    let module_sym = symbols.intern(module_name_from_uri(uri)?);
-                    let item = ItemId::new(module_sym, name_sym);
-                    decl_registry.lookup(item).map(|_| item)
-                })
-            });
-            if !tr.params.is_empty() {
-                let args: Vec<TypeId> = tr
-                    .params
-                    .iter()
-                    .map(|p| {
-                        lower_native_type_ref(hir, *p, arena, decl_registry, locate_decl, symbols)
-                    })
-                    .collect();
-                match handle {
-                    Some(h) => arena.generic(h, args),
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            } else {
-                // Try to mint a handle-keyed `Type(handle)` so native
-                // signatures intern equal to whatever the body-walker
-                // / signature pass produces for the same source token.
-                match handle {
-                    Some(h) => arena.alloc_type(h),
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            }
-        }
-    };
-    if tr.optional {
-        base = arena.nullable(base);
-    }
-    base
 }
 
 #[cfg(test)]
@@ -1412,15 +1188,10 @@ mod tests {
     /// decl-handle interner, the well-known-slot table, and the
     /// index itself. Returned by-value so each test owns an
     /// independent copy.
-    fn fresh_index() -> (
-        TypeArena,
-        crate::well_known::DeclRegistry,
-        crate::well_known::WellKnown,
-        ProjectIndex,
-    ) {
+    fn fresh_index() -> (TypeArena, DeclRegistry, WellKnown, ProjectIndex) {
         let mut arena = TypeArena::new();
-        let decl_registry = crate::well_known::DeclRegistry::default();
-        let well_known = crate::well_known::WellKnown::default();
+        let decl_registry = DeclRegistry::default();
+        let well_known = WellKnown::default();
         let idx = ProjectIndex::new(&mut arena);
         (arena, decl_registry, well_known, idx)
     }
@@ -1484,34 +1255,6 @@ type Company {
     }
 
     #[test]
-    fn ingest_captures_native_signatures() {
-        let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
-        // Non-private natives — `private` would (correctly) cause
-        // ingest to skip them from the cross-module `natives`
-        // registry, which is not the property under test here.
-        let hir = lower(
-            &idx.symbols,
-            r#"
-native fn read_file(path: String): String;
-native fn now(): time;
-"#,
-        );
-        idx.ingest(
-            &uri("/proj/io.gcl"),
-            &hir,
-            &mut arena,
-            &mut decl_registry,
-            &mut well_known,
-        );
-        let read_sym = idx.symbols.lookup("read_file").unwrap();
-        let read = idx.natives.lookup_sym(read_sym).expect("read_file present");
-        assert_eq!(read.params.len(), 1);
-        let now_sym = idx.symbols.lookup("now").unwrap();
-        let now = idx.natives.lookup_sym(now_sym).expect("now present");
-        assert!(now.params.is_empty());
-    }
-
-    #[test]
     fn ingest_is_idempotent_on_repeated_calls() {
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
         let hir = lower(&idx.symbols, "type T {}\n");
@@ -1530,26 +1273,20 @@ native fn now(): time;
     fn locate_decl_records_uri_and_decl_id() {
         // Acceptance for P11.1: querying the index for a declared type
         // returns the URI of the module that introduced it and a
-        // matching `Idx<Decl>`. Synthetic stand-in for `Permission` in
+        // matching `Idx<Decl>`. Synthetic stand-in for `Foo` in
         // `lib/std/runtime.gcl` so the test doesn't depend on `greycat
         // install` having been run.
         let (mut arena, mut decl_registry, mut well_known, mut idx) = fresh_index();
-        let hir = lower(&idx.symbols, "private type Permission {}\n");
-        let permission_uri = uri("/proj/lib/std/runtime.gcl");
-        idx.ingest(
-            &permission_uri,
-            &hir,
-            &mut arena,
-            &mut decl_registry,
-            &mut well_known,
-        );
+        let hir = lower(&idx.symbols, "private type Foo {}\n");
+        let uri = uri("/proj/lib/std/runtime.gcl");
+        idx.ingest(&uri, &hir, &mut arena, &mut decl_registry, &mut well_known);
 
-        let hits = idx.locate_decl(idx.symbols.lookup("Permission").unwrap());
-        assert_eq!(hits.len(), 1, "exactly one Permission decl across project");
-        let (found_uri, decl_id, ns) = &hits[0];
-        assert_eq!(found_uri, &permission_uri);
-        assert!(matches!(&hir.decls[*decl_id], Decl::Type(_)));
-        assert_eq!(*ns, Namespace::Type);
+        let hits = idx.locate_decl(idx.symbols.lookup("Foo").unwrap());
+        assert_eq!(hits.len(), 1, "exactly one Foo decl across project");
+        let d = &hits[0];
+        assert_eq!(d.uri, uri);
+        assert!(matches!(&hir.decls[d.id], Decl::Type(_)));
+        assert_eq!(d.ns, Namespace::Type);
     }
 
     // P19.9
@@ -1602,7 +1339,6 @@ fn helper(): int { return 1; }
         assert!(bag.methods.contains_key(&lift_sym));
     }
 
-    // P36.1
     #[test]
     fn is_subtype_of_decl_resolves_handles_then_delegates_to_name_keyed() {
         // Inheritance graph: `Cat extends Animal`. `is_subtype_of_decl`
@@ -1610,11 +1346,6 @@ fn helper(): int { return 1; }
         // and asks the existing name-keyed walker. Equal handles
         // short-circuit without arena access; missing handles return
         // false.
-        use crate::well_known::DeclRegistry;
-        use greycat_analyzer_core::TypeArena;
-        use greycat_analyzer_hir::arena::Idx;
-        use greycat_analyzer_hir::types::Decl;
-
         let (mut idx_arena, mut idx_decl_registry, mut idx_well_known, mut idx) = fresh_index();
         let hir = lower(
             &idx.symbols,
@@ -1693,8 +1424,8 @@ fn helper(): int { return 1; }
         );
         let hits = idx.locate_decl(idx.symbols.lookup("Helper").unwrap());
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].0, uri("/proj/a.gcl"));
-        assert_eq!(hits[1].0, uri("/proj/b.gcl"));
+        assert_eq!(hits[0].uri, uri("/proj/a.gcl"));
+        assert_eq!(hits[1].uri, uri("/proj/b.gcl"));
     }
 
     #[test]
@@ -1767,7 +1498,7 @@ type Plain {}
         };
         let bag = idx.type_flags.get(&item("Bag")).expect("Bag flags");
         assert!(bag.iterable);
-        assert_eq!(bag.deref.as_deref(), Some("resolve"));
+        assert_eq!(bag.deref.map(|s| &idx.symbols[s]), Some("resolve"));
         assert!(!bag.primitive);
 
         let marker = idx.type_flags.get(&item("Marker")).expect("Marker flags");

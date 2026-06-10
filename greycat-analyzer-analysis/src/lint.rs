@@ -25,9 +25,9 @@ use greycat_analyzer_hir::types::{
 
 use crate::analyzer::AnalysisResult;
 use crate::directives::Directives;
+use crate::index::{Namespace, ProjectIndex};
+use crate::project::DeclRegistry;
 use crate::resolver::{Definition, Resolutions};
-use crate::stdlib::{Namespace, ProjectIndex};
-use crate::well_known::DeclRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintSeverity {

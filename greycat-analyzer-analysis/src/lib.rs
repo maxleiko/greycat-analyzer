@@ -6,8 +6,8 @@
 //!
 //! 1. [`resolver`] — name binding. Maps every ident-use
 //!    site to a `Definition` (Decl / Local / Param / Generic /
-//!    Project) via lexical scope and the shared [`stdlib::ProjectIndex`].
-//! 2. [`stdlib`] — cross-module index. Holds shared `TypeArena` /
+//!    Project) via lexical scope and the shared [`index::ProjectIndex`].
+//! 2. [`index`] — cross-module index. Holds shared `TypeArena` /
 //!    `TypeRegistry` / `NativeRegistry` plus value-level decl names
 //!    so cross-module name resolution works.
 //! 3. [`analyzer`] — type inference per
@@ -68,7 +68,7 @@ pub mod resolver;
 /// "lambda is a top-level fn in a scope" mental model demands one
 /// implementation for both — see `return_inference::inferred_return_from_body`.
 pub mod return_inference;
-pub mod stdlib;
+pub mod index;
 // P35.1
 pub mod well_known;
 

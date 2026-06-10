@@ -8,7 +8,7 @@ use std::{
 
 use greycat_analyzer_analysis::{analyzer::Severity, lint::LintSeverity, project::ProjectAnalysis};
 use greycat_analyzer_core::{
-    LoadTimings, SourceEncoding, SourceManager,
+    LoadTimings, SourceEncoding, SourceManager, TypeKind,
     diagnostics::{parse_diagnostics, print_compact_diagnostic},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
     resolver::FsContext,
@@ -275,7 +275,7 @@ impl Lint {
         let pragma_root = project_filepath.parent().map(Path::to_path_buf);
 
         // One project-level analyzer pipeline over every reachable doc.
-        // **P23.7** — `--no-suppressions` flips the project's
+        // `--no-suppressions` flips the project's
         // `bypass_suppressions` flag so every `// gcl-lint-off …` is
         // ignored and the underlying diagnostics resurface.
         let mut analysis = ProjectAnalysis::new();
@@ -284,23 +284,25 @@ impl Lint {
         analysis.analyze_staged(&mgr);
         let total = total_start.elapsed();
 
-        // FIXME: this is supposed to be a deduped list of all the type of the program, including monomorphized types
-        //        - I see generic param in this (eg. `T`, `T?`). Generic params are not type, they are params to instantiate (monomorphize generic)
-        //        - I see duplicated displayed names hinting at a problem (maybe hashing is too broad?) (collect in Vec<String> len is 609, HashSet len is 423 )
-        // let types: HashSet<_> = analysis
-        //     .arena
-        //     .intern
-        //     .values()
-        //     .map(|&tid| analysis.display_type(tid).to_string())
-        //     .collect();
-        // println!("{types:#?}");
-        // println!("{}", types.len());
-        // for tid in analysis.arena.intern.values() {
-        //     let ty_display = analysis.display_type(*tid);
-        //     println!("{ty_display}");
-        // }
+        for tid in analysis.arena.intern.values() {
+            let ty = analysis.arena.get(*tid);
+            if matches!(
+                ty.kind,
+                TypeKind::GenericParam { .. }
+                    | TypeKind::Primitive(_)
+                    | TypeKind::Null
+                    | TypeKind::Any
+                    | TypeKind::Never
+            ) {
+                continue;
+            }
+            let fqn = analysis.display_type(*tid);
+            println!("{fqn} id={tid}");
+            println!("{ty:#?}");
+            println!();
+        }
 
-        // P14.5: per-uri load-phase timings come from the load report;
+        // Per-uri load-phase timings come from the load report;
         // build an index so the manager.iter() loop below can pick the
         // matching read / parse durations per file.
         #[allow(clippy::mutable_key_type)] // lsp_types::Uri is fine as a key in practice.

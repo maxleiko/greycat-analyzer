@@ -20,7 +20,7 @@
 //! against the live stdlib. Tests below assert the runtime outcome.
 
 use greycat_analyzer_core::{
-    GenericOwner, ItemId, Primitive, SymbolTable, TypeArena, is_assignable_to, is_castable,
+    ItemId, Primitive, SymbolTable, TypeArena, is_assignable_to, is_castable,
 };
 
 fn arena() -> TypeArena {
@@ -165,7 +165,7 @@ fn rt_null_to_nullable_allowed() {
 fn rt_array_int_to_array_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
-    let arr_i = a.generic(synth_decl("Array"), vec![i]);
+    let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     assert!(is_assignable_to(&a, arr_i, arr_i));
 }
 
@@ -176,8 +176,8 @@ fn rt_array_int_to_array_float_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let f = a.primitive(Primitive::Float);
-    let arr_i = a.generic(synth_decl("Array"), vec![i]);
-    let arr_f = a.generic(synth_decl("Array"), vec![f]);
+    let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
+    let arr_f = a.alloc_generic(synth_decl("Array"), vec![f]);
     assert!(!is_assignable_to(&a, arr_i, arr_f));
     assert!(!is_assignable_to(&a, arr_f, arr_i));
 }
@@ -192,8 +192,8 @@ fn rt_array_int_to_array_nullable_int_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic(synth_decl("Array"), vec![i]);
-    let arr_iq = a.generic(synth_decl("Array"), vec![i_q]);
+    let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
+    let arr_iq = a.alloc_generic(synth_decl("Array"), vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
 }
 
@@ -266,8 +266,8 @@ fn rt_array_all_any_source_to_concrete_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let any_q = a.any_nullable();
-    let arr_concrete = a.generic(synth_decl("Array"), vec![i]);
-    let arr_raw = a.generic(synth_decl("Array"), vec![any_q]);
+    let arr_concrete = a.alloc_generic(synth_decl("Array"), vec![i]);
+    let arr_raw = a.alloc_generic(synth_decl("Array"), vec![any_q]);
     assert!(is_assignable_to(&a, arr_concrete, arr_raw));
     assert!(!is_assignable_to(&a, arr_raw, arr_concrete));
 }
@@ -313,10 +313,10 @@ fn rt_generic_param_substitution_through_inference_table() {
     let symbols = SymbolTable::new();
     let t_sym = symbols.intern("T");
     let u_sym = symbols.intern("U");
-    let owner = GenericOwner::Function(symbols.intern("f"));
-    let t1 = a.generic_param(t_sym, owner);
-    let t2 = a.generic_param(t_sym, owner);
-    let u = a.generic_param(u_sym, owner);
+    // let owner = GenericOwner::Function(symbols.intern("f"));
+    let t1 = a.generic_param(t_sym);
+    let t2 = a.generic_param(t_sym);
+    let u = a.generic_param(u_sym);
     assert_eq!(t1, t2, "interning should collapse identical GenericParams");
     assert!(is_assignable_to(&a, t1, t2));
     assert!(!is_assignable_to(&a, t1, u));
@@ -357,8 +357,8 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    let arr_i = a.generic(synth_decl("Array"), vec![i]);
-    let arr_iq = a.generic(synth_decl("Array"), vec![i_q]);
+    let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
+    let arr_iq = a.alloc_generic(synth_decl("Array"), vec![i_q]);
     assert!(!is_assignable_to(&a, arr_i, arr_iq));
     assert!(!is_assignable_to(&a, arr_iq, arr_i));
 }

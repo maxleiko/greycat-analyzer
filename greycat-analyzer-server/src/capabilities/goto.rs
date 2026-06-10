@@ -449,7 +449,7 @@ pub fn goto_implementation_across_project(
                 .index
                 .locate_decl_in_ns(
                     declaring_sym,
-                    greycat_analyzer_analysis::stdlib::Namespace::Type,
+                    greycat_analyzer_analysis::index::Namespace::Type,
                 )
                 .find(|(u, d)| !project.index.is_decl_private(u, *d))
                 .and_then(|(u, _)| project.index.item_id_for(u, declaring_sym))
@@ -543,7 +543,7 @@ pub fn goto_declaration_across_project(
                 .index
                 .locate_decl_in_ns(
                     declaring_sym,
-                    greycat_analyzer_analysis::stdlib::Namespace::Type,
+                    greycat_analyzer_analysis::index::Namespace::Type,
                 )
                 .find(|(u, d)| !project.index.is_decl_private(u, *d))
                 .and_then(|(u, _)| project.index.item_id_for(u, declaring_sym))?;
@@ -647,7 +647,7 @@ fn type_implementations(
         .index
         .locate_decl_in_ns(
             target_sym,
-            greycat_analyzer_analysis::stdlib::Namespace::Type,
+            greycat_analyzer_analysis::index::Namespace::Type,
         )
         .find(|(u, d)| !project.index.is_decl_private(u, *d))
         .and_then(|(u, _)| project.index.item_id_for(u, target_sym))?;

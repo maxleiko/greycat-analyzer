@@ -22,6 +22,7 @@
 
 use std::ops::Range;
 
+use greycat_analyzer_core::lsp_types::Uri;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
@@ -32,15 +33,18 @@ use greycat_analyzer_core::{
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
-    AssignStmt, AtStmt, BinOp, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt,
-    ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr, ObjectExpr,
-    ObjectField, OffsetExpr, ParseIssue, PositionalObjectExpr, Pragma, StaticExpr, Stmt,
-    StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp, VarDeclTop, WhileStmt,
+    AssignStmt, AtStmt, BinOp, BinaryExpr, BlockStmt, CallExpr, Decl, DoWhileStmt, Expr, FnDecl,
+    ForInStmt, ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr,
+    ObjectExpr, ObjectField, OffsetExpr, ParseIssue, PositionalObjectExpr, Pragma, StaticExpr,
+    Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp, VarDeclTop,
+    WhileStmt,
 };
 
+use crate::index::ProjectIndex;
 use crate::lint::{LintDiagnostic, LintSeverity};
+use crate::project::DeclRegistry;
 use crate::resolver::{Definition, Resolutions};
-use crate::stdlib::ProjectIndex;
+use crate::well_known::WellKnown;
 
 /// Recover a *field-name* symbol from a named object field's key
 /// expression. The grammar lowers `object_field.name` as a full
@@ -65,7 +69,6 @@ pub(crate) fn object_field_key_name(
     }
 }
 
-// P13.1
 /// Does this statement always exit the enclosing control
 /// flow (`return`, `throw`, `break`, `continue`)? `Block` recurses
 /// into its last statement. `If` requires *both* branches to
@@ -95,7 +98,7 @@ fn stmt_terminates(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
 /// [`BlockStmt`] — body-bearing fields hold the block inline now,
 /// so going through `Idx<Stmt>` would require an extra arena round
 /// trip just to re-pattern-match.
-fn block_terminates(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -> bool {
+fn block_terminates(hir: &Hir, block: &BlockStmt) -> bool {
     block.stmts.last().is_some_and(|s| stmt_terminates(hir, *s))
 }
 
@@ -108,7 +111,7 @@ fn block_terminates(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -
 /// lift in `Stmt::While` / `Stmt::For` / `Stmt::DoWhile` to gate the
 /// lift: if `break` can escape, exit wasn't necessarily via cond-
 /// false and the cond's negation may not hold post-loop.
-fn block_breaks_current_loop(hir: &Hir, block: &greycat_analyzer_hir::types::BlockStmt) -> bool {
+fn block_breaks_current_loop(hir: &Hir, block: &BlockStmt) -> bool {
     block
         .stmts
         .iter()
@@ -231,7 +234,6 @@ pub struct NonExhaustiveFinding {
 
 /// Output of the analyzer for a single module.
 ///
-// P19
 /// The [`TypeArena`] that backs every `TypeId` in this struct
 /// is owned by [`crate::project::ProjectAnalysis`], not here. Pass it
 /// alongside any `AnalysisResult` you want to inspect — call
@@ -250,7 +252,6 @@ pub struct AnalysisResult {
     /// Built when the analyzer walks top-level decls — lets
     /// member resolution navigate from a receiver's `TypeId` back to
     /// the declaring node so attr / method idents can be bound.
-    // P25.3
     pub type_decls: FxHashMap<Symbol, Idx<Decl>>,
     /// Member-access bindings produced by each property ident in
     /// `a.b` / `a->b` that resolves to a [`TypeAttr`] or to a
@@ -258,19 +259,17 @@ pub struct AnalysisResult {
     /// Capabilities consult this in addition to [`Resolutions`] so
     /// goto-definition / hover work on member access.
     pub member_uses: FxHashMap<Idx<Ident>, MemberDef>,
-    // P11.5, P21
     /// Cross-module member bindings — same keying as `member_uses`
     /// but the resolved attr / method lives in another module's HIR.
     ///
     /// Populated directly by `Cx::resolve_member` against
-    /// [`crate::stdlib::ProjectIndex::type_members`] when the
+    /// [`crate::index::ProjectIndex::type_members`] when the
     /// receiver's type isn't declared in this module. Pass 3
     /// (`resolve_cross_module_members`) and the per-module
     /// `deferred_member_uses` deferral list are gone — S2-S6 build
     /// the structure index up front, so the body walker resolves
     /// inline.
     pub foreign_member_uses: FxHashMap<Idx<Ident>, ForeignMember>,
-    // P15.x
     /// Chain-segment bindings populated by `ProjectAnalysis`
     /// pass 3.5 for `Expr::QualifiedStatic` shapes. Each segment ident
     /// (chain[1] = the type, chain[2] = the member when length is 3)
@@ -287,7 +286,6 @@ pub struct AnalysisResult {
     /// reference to a `TypeAttr`, just at a constructor position.
     pub object_field_uses: FxHashMap<Idx<Ident>, ObjectFieldBinding>,
     pub diagnostics: Vec<SemanticDiagnostic>,
-    // P24.2
     /// Head if-stmt ids of enum-eq chains that
     /// exhaustively cover every variant of the dispatched-on enum.
     /// Consumed by the `unreachable` lint to flag the trailing
@@ -352,24 +350,22 @@ pub enum MemberDef {
     Method(Idx<Decl>),
 }
 
-// P11.5
 /// A member-access binding that resolves into another module.
 /// `uri` names the home module of the foreign type's declaration; the
 /// `member` indices reference that module's HIR arenas, not the
 /// analyzed module's.
 #[derive(Debug, Clone)]
 pub struct ForeignMember {
-    pub uri: greycat_analyzer_core::lsp_types::Uri,
+    pub uri: Uri,
     pub member: MemberDef,
 }
 
-// P15.x
 /// A top-level decl reference resolved into another module.
 /// Used for chain-segment bindings (`runtime::Identity::create`
 /// chain[1] points at runtime.gcl's `type Identity` decl).
 #[derive(Debug, Clone)]
 pub struct ForeignDecl {
-    pub uri: greycat_analyzer_core::lsp_types::Uri,
+    pub uri: Uri,
     pub decl: Idx<Decl>,
 }
 
@@ -399,7 +395,6 @@ impl AnalysisResult {
         self.member_uses.get(&ident).copied()
     }
 
-    // P11.5
     /// Look up a cross-module member-access binding for `ident`.
     /// Falls back to `None` for members that are intra-module
     /// ([`Self::member_lookup`]) or unresolved.
@@ -407,7 +402,6 @@ impl AnalysisResult {
         self.foreign_member_uses.get(&ident)
     }
 
-    // P15.x
     /// Look up a chain-segment binding (e.g. `Identity` in
     /// `runtime::Identity::create` -> the foreign type decl).
     pub fn foreign_decl_lookup(&self, ident: Idx<Ident>) -> Option<&ForeignDecl> {
@@ -427,7 +421,6 @@ impl AnalysisResult {
 /// `any` and cross-module member access can't bind. Used by per-file
 /// capabilities and unit tests.
 ///
-// P19
 /// Allocates a fresh [`TypeArena`] and [`DeclRegistry`] internally
 /// and returns them alongside the analysis — callers that need to
 /// render decl-keyed types (anything routing through
@@ -436,22 +429,22 @@ pub fn analyze(
     hir: &Hir,
     res: &Resolutions,
     symbols: &SymbolTable,
-) -> (TypeArena, crate::well_known::DeclRegistry, AnalysisResult) {
+) -> (TypeArena, DeclRegistry, AnalysisResult) {
     use std::str::FromStr;
     let mut arena = TypeArena::new();
     let index = ProjectIndex::with_symbols(symbols.clone(), &mut arena);
-    // P35.4 — per-file callers don't have a populated `WellKnown`;
+    // Per-file callers don't have a populated `WellKnown`;
     // pass a default (all-`None`) instance. The migrated sentinel
     // sites fall back to `arena.any()` for any slot still `None`.
-    let well_known = crate::well_known::WellKnown::default();
-    let module_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///module.gcl").unwrap();
+    let well_known = WellKnown::default();
+    let module_uri = Uri::from_str("file:///module.gcl").unwrap();
     // Pre-mint a decl handle for every `Decl::Type` / `Decl::Enum`
     // in this module so `register_module_types` and `lower_type_ref`
     // can route every local type ref through the handle-keyed shape
     // — same path the project pipeline uses. Per-file tests don't
     // run `ProjectAnalysis`, so this is the standalone equivalent
     // of `ProjectIndex::ingest`'s decl-registration step.
-    let mut decl_registry = crate::well_known::DeclRegistry::default();
+    let mut decl_registry = DeclRegistry::default();
     if let Some(module) = hir.module.as_ref() {
         for d_id in &module.decls {
             let name = match &hir.decls[*d_id] {
@@ -484,16 +477,16 @@ pub fn analyze_with_index(
     hir: &Hir,
     res: &Resolutions,
     index: &ProjectIndex,
-) -> (TypeArena, crate::well_known::DeclRegistry, AnalysisResult) {
+) -> (TypeArena, DeclRegistry, AnalysisResult) {
     use std::str::FromStr;
     // P35.4 — per-file callers default-construct an empty
     // `WellKnown`; see [`analyze`] for the rationale.
-    let well_known = crate::well_known::WellKnown::default();
-    let module_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///module.gcl").unwrap();
+    let well_known = WellKnown::default();
+    let module_uri = Uri::from_str("file:///module.gcl").unwrap();
     let mut arena = TypeArena::new();
     // Standalone equivalent of `ProjectIndex::ingest`'s decl
     // registration step — see [`analyze`] for the rationale.
-    let mut decl_registry = crate::well_known::DeclRegistry::default();
+    let mut decl_registry = DeclRegistry::default();
     if let Some(module) = hir.module.as_ref() {
         for d_id in &module.decls {
             let name = match &hir.decls[*d_id] {
@@ -534,9 +527,9 @@ pub fn analyze_with_index_into(
     hir: &Hir,
     res: &Resolutions,
     index: &ProjectIndex,
-    well_known: &crate::well_known::WellKnown,
-    decl_registry: &crate::well_known::DeclRegistry,
-    module_uri: &greycat_analyzer_core::lsp_types::Uri,
+    well_known: &WellKnown,
+    decl_registry: &DeclRegistry,
+    module_uri: &Uri,
     arena: &mut TypeArena,
 ) -> AnalysisResult {
     let mut out = AnalysisResult::default();
@@ -548,7 +541,7 @@ pub fn analyze_with_index_into(
     };
     let module_sym = index
         .symbols
-        .intern(crate::stdlib::module_name_from_uri(module_uri).unwrap_or("module"));
+        .intern(crate::index::module_name_from_uri(module_uri).unwrap_or("module"));
     let mut cx = Cx {
         hir,
         res,
@@ -664,7 +657,7 @@ pub fn analyze_with_index_into(
         let ident = &hir.idents[*ident_idx];
         let module_names: Vec<&str> = candidates
             .iter()
-            .map(|(uri, _)| crate::stdlib::module_name_from_uri(uri).unwrap_or("<unknown>"))
+            .map(|(uri, _)| crate::index::module_name_from_uri(uri).unwrap_or("<unknown>"))
             .collect();
         let name = &index.symbols[ident.symbol];
         out.diagnostics.push(SemanticDiagnostic::structural(
@@ -693,7 +686,7 @@ pub fn analyze_with_index_into(
         let name = &index.symbols[ident.symbol];
         let module = candidates
             .iter()
-            .filter_map(|(uri, _)| crate::stdlib::module_name_from_uri(uri))
+            .filter_map(|(uri, _)| crate::index::module_name_from_uri(uri))
             .min()
             .unwrap_or("<module>");
         out.diagnostics.push(SemanticDiagnostic::structural(
@@ -799,8 +792,8 @@ fn register_module_types(
     arena: &mut TypeArena,
     out: &mut AnalysisResult,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
-    module_uri: &greycat_analyzer_core::lsp_types::Uri,
+    decl_registry: &DeclRegistry,
+    module_uri: &Uri,
 ) {
     let Some(module) = hir.module.as_ref() else {
         return;
@@ -965,25 +958,22 @@ struct Cx<'a> {
     /// URI of the module currently being analyzed. Lets cross-module
     /// resolution paths (`resolve_decl_handle_from`) prefer same-
     /// module candidates and reach private decls in their own module.
-    module_uri: &'a greycat_analyzer_core::lsp_types::Uri,
+    module_uri: &'a Uri,
     /// Symbol for the module currently being analyzed — i.e.
     /// `module_name_from_uri(module_uri)` interned. Lets the body
     /// walker mint `ItemId { module: self.module_sym, name }` for
     /// any same-module type lookup without going through
     /// `index.item_id_for`.
     module_sym: Symbol,
-    // P19
     /// Project-wide type arena. Owned by `ProjectAnalysis`, so
     /// every module's analyzer mints into the same `TypeArena` and
     /// `TypeId`s are comparable across module boundaries.
     arena: &'a mut TypeArena,
-    // P11.5
     /// Cross-module project index. Per-file callers pass an
     /// empty [`ProjectIndex::new`]; the project pipeline passes the
     /// index it just rebuilt. Used by `lower_type_ref` to recognize
     /// type names that aren't declared in this module.
     index: &'a ProjectIndex,
-    // P35.4
     /// Project-wide well-known std/core decl handles. Per-file
     /// callers pass a default-constructed (all-`None`) instance; the
     /// project pipeline passes its populated `&self.well_known`.
@@ -991,20 +981,18 @@ struct Cx<'a> {
     /// mint `arena.alloc_type(well_known.X_decl)` when the slot is
     /// populated, falling back to `arena.unresolved(...)` when std
     /// hasn't loaded.
-    well_known: &'a crate::well_known::WellKnown,
-    // P35.7
+    well_known: &'a WellKnown,
     /// Project-wide decl handle registry. Used by sites that resolve
     /// foreign types — they look up `decl_registry.lookup(uri, idx)`
     /// and mint `arena.alloc_type(handle)`. Per-file callers pass an
     /// empty registry; sites then fall back to `Unresolved`.
-    decl_registry: &'a crate::well_known::DeclRegistry,
+    decl_registry: &'a DeclRegistry,
     /// Null-flow narrowing stack. Each frame is a binding ident
     /// → temporary `TypeId` override. Frames are pushed on block /
     /// then-branch / else-branch entry and popped on exit, so a
     /// narrowing introduced inside a block stays alive for the rest
     /// of that block but doesn't leak to siblings.
     narrows: Vec<FxHashMap<Idx<Ident>, TypeId>>,
-    // P19.16
     /// Parallel narrow stack keyed by member-access
     /// *path* (e.g. `"this.matchingNormalisation"`,
     /// `"foo.bar.baz"`). A path's presence in any frame means the
@@ -1036,17 +1024,12 @@ struct Cx<'a> {
     /// enclosing exhaustiveness chain. Suppresses duplicate
     /// "non-exhaustive" diagnostics on inner `else if` arms.
     chain_member_ifs: FxHashSet<Idx<Stmt>>,
-    // P12.1
     /// Generic-context stack: type-parameter names visible at the
     /// current scope, mapped to their declaring [`GenericOwner`].
-    /// Entered on `fn f<T>(...)` / `type Foo<T> {}` and used by
-    /// `lower_type_ref` to mint `GenericParam(name, owner)` instead
-    /// of `Named(name)` / `Any` for in-scope generics. The stack is a
+    /// Entered on `fn f<T>(...)` / `type Foo<T> {}`. The stack is a
     /// `Vec<HashMap>` so nested fns inside a generic type see both
     /// outer and inner names.
-    // P25.5
     generics_in_scope: Vec<FxHashMap<Symbol, GenericOwner>>,
-    // P19.11
     /// `this` typing stack. Pushed on entry to a
     /// type's method body (in `visit_type_decl`), popped on exit.
     /// `LiteralKind::This` returns the top of the stack so a
@@ -1483,7 +1466,9 @@ impl<'a> Cx<'a> {
             Some(survivors[0])
         } else {
             Some(self.arena.alloc(Type {
-                kind: TypeKind::Union { alts: survivors },
+                kind: TypeKind::Union {
+                    alts: survivors.into_boxed_slice(),
+                },
                 nullable: false,
             }))
         }
@@ -1574,7 +1559,9 @@ impl<'a> Cx<'a> {
             return Some(alts[0]);
         }
         Some(self.arena.alloc(Type {
-            kind: TypeKind::Union { alts },
+            kind: TypeKind::Union {
+                alts: alts.into_boxed_slice(),
+            },
             nullable: false,
         }))
     }
@@ -1600,9 +1587,9 @@ impl<'a> Cx<'a> {
     /// [`Self::diagnose_then_typed_contradictions`] already catches
     /// `x: Rect; if (x is Shape)` as "always true" via assignability.
     fn narrow_is_exhausted(&mut self, known: TypeId, asserted: TypeId) -> bool {
-        let asserted_alts: Vec<TypeId> = match &self.arena.get(asserted).kind {
+        let asserted_alts: Box<[TypeId]> = match &self.arena.get(asserted).kind {
             TypeKind::Union { alts } => alts.clone(),
-            _ => vec![asserted],
+            _ => Box::new([asserted]),
         };
         let known_ty = self.arena.get(known).clone();
         match &known_ty.kind {
@@ -1724,7 +1711,9 @@ impl<'a> Cx<'a> {
             return alts[0];
         }
         self.arena.alloc(Type {
-            kind: TypeKind::Union { alts },
+            kind: TypeKind::Union {
+                alts: alts.into_boxed_slice(),
+            },
             nullable: false,
         })
     }
@@ -1777,7 +1766,7 @@ impl<'a> Cx<'a> {
     /// declared without `:` return type produces a Lambda with `ret =
     /// None`, rendered `fn(P)`; with `: R` declared, `ret = Some(R)`,
     /// rendered `fn(P): R`.
-    fn fn_ref_ty_from_sig(&mut self, sig: &crate::stdlib::FnSignature) -> TypeId {
+    fn fn_ref_ty_from_sig(&mut self, sig: &crate::index::FnSignature) -> TypeId {
         if !sig.generics.is_empty() {
             return self.function_ty();
         }
@@ -2285,12 +2274,11 @@ impl<'a> Cx<'a> {
         Some(self.arena.substitute(method_ret, &subst))
     }
 
-    // P6.3
     /// Member resolution: bind the property ident in `a.b` /
     /// `a->b` to the matching `TypeAttr` or method `Decl` whenever the
     /// receiver's type names a `TypeDecl` declared in this module.
     /// Anonymous types and primitives stay no-binding; cross-module
-    /// receivers consult [`crate::stdlib::ProjectIndex::type_members`]
+    /// receivers consult [`crate::index::ProjectIndex::type_members`]
     /// directly and write into `foreign_member_uses` inline
     /// no `deferred_member_uses` deferral.
     /// `instance_access` is `true` for `recv.prop` / `recv->prop` (Member /
@@ -2321,14 +2309,14 @@ impl<'a> Cx<'a> {
             if !instance_access && variants.contains(&prop_sym) {
                 return;
             }
+            let prop_text = self.ident_text(property);
+            let prop_range = self.hir.idents[property].byte_range.clone();
             let recv_display = crate::project::display_type(
                 self.arena,
                 self.decl_registry,
                 &self.index.symbols,
                 recv_ty,
             );
-            let prop_text = self.ident_text(property);
-            let prop_range = self.hir.idents[property].byte_range.clone();
             if instance_access {
                 self.out.diagnostics.push(SemanticDiagnostic::structural(
                     Severity::Error,
@@ -2699,7 +2687,7 @@ impl<'a> Cx<'a> {
                 ty: s.ty,
                 property: s.property.ident(),
             },
-            Expr::Ident { name: name_idx, .. } => CalleeShape::Ident(*name_idx),
+            Expr::Ident { name, .. } => CalleeShape::Ident(*name),
             Expr::QualifiedStatic { chain, .. } => CalleeShape::QualifiedStatic(chain),
             _ => return None,
         };
@@ -2811,7 +2799,7 @@ impl<'a> Cx<'a> {
         // walk non-private fn-ns candidates, first match wins.
         for (uri, decl) in self
             .index
-            .locate_decl_in_ns(fn_sym, crate::stdlib::Namespace::Fn)
+            .locate_decl_in_ns(fn_sym, crate::index::Namespace::Fn)
         {
             if self.index.is_decl_private(uri, decl) {
                 continue;
@@ -2886,10 +2874,9 @@ impl<'a> Cx<'a> {
                 let name_sym = self.index.symbols.intern(p.name());
                 (ItemId::new(core_mod, name_sym), Vec::new())
             }
-            // P35.7 — handle-keyed variants already carry the decl's
+            // Handle-keyed variants already carry the decl's
             // full `(module, name)` identity.
             TypeKind::Type(decl) => (decl, Vec::new()),
-            // P25.7
             TypeKind::Generic { decl, args } => (decl, args.into_vec()),
             _ => return None,
         };
@@ -2907,7 +2894,6 @@ impl<'a> Cx<'a> {
         Some(self.arena.substitute(ret_ty, &subst))
     }
 
-    // P23
     /// Populate `foreign_decl_uses[chain[1]]` (the type
     /// segment) and `foreign_member_uses[chain[2]]` (the member
     /// segment, when present) for a `module::Type[::member]`
@@ -2923,7 +2909,7 @@ impl<'a> Cx<'a> {
             .locate_decl(self.hir.idents[chain[1]].symbol)
             .first()
         {
-            Some((uri, decl_id, _)) => (uri, *decl_id),
+            Some(d) => (&d.uri, d.id),
             None => return,
         };
         self.out.foreign_decl_uses.insert(
@@ -3072,7 +3058,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P23
     /// Type a `module::name` / `module::Type::name`
     /// value-position QualifiedStatic expr. Two shapes:
     /// - 2-segment chain (`module::name`) — fn name resolves via
@@ -3086,17 +3071,11 @@ impl<'a> Cx<'a> {
             2 => {
                 // `module::name` — module symbol + item name → `ItemId`.
                 let module_sym = self.hir.idents[chain[0]].symbol;
-                let sym = self.hir.idents[chain[1]].symbol;
-                let item = ItemId::new(module_sym, sym);
-                if let Some(sig) = self.index.fn_signatures.get(&item).cloned() {
-                    Some(self.fn_ref_ty_from_sig(&sig))
-                } else if self.index.values.contains(&sym) {
-                    // Non-native fn (`private fn foo()` or fn without
-                    // declared return type) — present in `values` but
-                    // skipped from `fn_signatures`. The runtime still
-                    // treats `module::fn_name` as a function ref, so
-                    // type it as opaque `function` (no signature shape
-                    // to mint into a structural Lambda).
+                let name_sym = self.hir.idents[chain[1]].symbol;
+                let item = ItemId::new(module_sym, name_sym);
+                if let Some(sig) = self.index.fn_signatures.get(&item) {
+                    Some(self.fn_ref_ty_from_sig(sig))
+                } else if self.index.fn_names.contains(&name_sym) {
                     Some(self.function_ty())
                 } else if let Some(enum_id) = self.index.enum_types.get(&item).copied() {
                     // P-typeof — `module::EnumName` in value position
@@ -3108,7 +3087,7 @@ impl<'a> Cx<'a> {
                     // P-typeof — same rule for `module::TypeName`.
                     let inner = self.arena.alloc_type(item);
                     Some(self.arena.type_of(inner))
-                } else if self.index.has_name(sym) {
+                } else if self.index.has_name(name_sym) {
                     // Runtime-internal type the user can't author —
                     // keep the unrefined `type` shape so existing
                     // behavior for these stays put.
@@ -3147,7 +3126,7 @@ impl<'a> Cx<'a> {
                         Some(self.function_ty())
                     }
                 } else if members.attrs.contains_key(&member_sym) {
-                    // P19.13 — static-attr value access from a
+                    // Static-attr value access from a
                     // `module::Type::name` chain. Returns the
                     // attr's declared type for static attrs;
                     // `field` handle otherwise.
@@ -3170,7 +3149,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    // P22
     /// Type a `foreign_member_uses`-bound `recv.attr` /
     /// `recv.method()` shape inline by looking up the project
     /// signatures index. `recv_ty` is the resolution-side receiver
@@ -3250,7 +3228,7 @@ impl<'a> Cx<'a> {
         // picks a `TypeDeclId` from the same candidate set.
         for (uri, decl) in self
             .index
-            .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
+            .locate_decl_in_ns(name_sym, crate::index::Namespace::Type)
         {
             if self.index.is_decl_private(uri, decl) {
                 continue;
@@ -3292,20 +3270,22 @@ impl<'a> Cx<'a> {
             "null" => self.null(),
             _ => {
                 if !tr.params.is_empty() {
-                    let args: Vec<TypeId> =
-                        tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
                     match self.index.resolve_item(
                         self.decl_registry,
                         Some(self.module_uri),
                         name_sym,
                     ) {
-                        Some(handle) => self.arena.generic(handle, args),
+                        Some(handle) => {
+                            let args: Vec<TypeId> =
+                                tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
+                            self.arena.alloc_generic(handle, args)
+                        }
                         None => self
                             .arena
                             .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                     }
                 } else if let Some(owner) = self.lookup_generic(name_sym) {
-                    // P12.1: name matches a fn / type generic param in
+                    // Name matches a fn / type generic param in
                     // scope — produce a `GenericParam` rather than a
                     // bare `Named`, so call-site inference can record
                     // witnesses for it.
@@ -3322,7 +3302,10 @@ impl<'a> Cx<'a> {
                     if self.inside_static_fn && matches!(owner, GenericOwner::Type(_)) {
                         self.static_generic_uses.insert(idx);
                     }
-                    self.arena.generic_param(name_sym, owner)
+                    self.arena.alloc(Type {
+                        kind: TypeKind::GenericParam(name_sym),
+                        nullable: false,
+                    })
                 } else if let Some(arity) = self.generic_arity_for(name_sym) {
                     // Raw-form generic reference: `Tensor` (no params)
                     // is equivalent to `Tensor<any?, any?>` per the
@@ -3339,7 +3322,7 @@ impl<'a> Cx<'a> {
                         Some(self.module_uri),
                         name_sym,
                     ) {
-                        Some(handle) => self.arena.generic(handle, args),
+                        Some(handle) => self.arena.alloc_generic(handle, args),
                         None => self
                             .arena
                             .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
@@ -3351,7 +3334,7 @@ impl<'a> Cx<'a> {
                     .resolve_item(self.decl_registry, Some(self.module_uri), name_sym)
                     .and_then(|item| self.index.enum_types.get(&item).copied())
                 {
-                    // P19.10 — canonical enum TypeId from the
+                    // Canonical enum TypeId from the
                     // project signature index. Same reason as
                     // `lower_type_ref_project`: a cross-module enum
                     // ref like `TimeZone` must lower to the
@@ -3366,7 +3349,7 @@ impl<'a> Cx<'a> {
                     self.index
                         .resolve_item(self.decl_registry, Some(self.module_uri), name_sym)
                 {
-                    // P38.2 — non-generic foreign concrete type with
+                    // Non-generic foreign concrete type with
                     // an interned decl handle: mint `Type(handle)` so
                     // the shape matches what `lower_type_ref_project`
                     // produces for the same decl on the fn-signature
@@ -3669,7 +3652,7 @@ impl<'a> Cx<'a> {
                 .item_id_for(&module_uri, leaf_sym)
                 .filter(|item| self.decl_registry.lookup(*item).is_some())
             {
-                Some(item) => self.arena.generic(item, args),
+                Some(item) => self.arena.alloc_generic(item, args),
                 None => self.arena.unresolved(leaf_sym, byte_span),
             };
             if tr.typeof_marker {
@@ -3782,8 +3765,10 @@ impl<'a> Cx<'a> {
                         _ => return None,
                     };
                 // Lower the declared signature with the fn's generics in scope.
-                let owner = GenericOwner::Function(self.hir.idents[fn_name_idx].symbol);
-                self.push_generic_scope(&fn_generics, owner);
+                self.push_generic_scope(
+                    &fn_generics,
+                    GenericOwner::Function(self.hir.idents[fn_name_idx].symbol),
+                );
                 let declared_params: Vec<TypeId> = fn_params
                     .iter()
                     .map(|p_id| {
@@ -3870,7 +3855,7 @@ impl<'a> Cx<'a> {
     /// Shared body of the Static / Member / Arrow / QualifiedStatic
     /// branches of [`Self::try_generic_call_inference`]. Looks up
     /// the method's pre-lowered signature in
-    /// [`crate::stdlib::TypeMembers::method_signatures`], composes
+    /// [`crate::index::TypeMembers::method_signatures`], composes
     /// the receiver-side instantiation substitution with the call-
     /// site witness collection, and substitutes the result through
     /// the declared return type.
@@ -3969,7 +3954,7 @@ impl<'a> Cx<'a> {
             self.collect_witnesses(p_inner, a_inner, tbl, call_range);
             return;
         }
-        if let TypeKind::GenericParam { name, .. } = &pk.kind {
+        if let TypeKind::GenericParam(name) = &pk.kind {
             // If the param is `T?`, the witness is whatever the arg
             // strips down to without nullable.
             let witness = if pk.nullable {
@@ -4067,8 +4052,8 @@ impl<'a> Cx<'a> {
         let chain_len = self
             .index
             .supertype_chain_length(ItemId::new(self.module_sym, type_name_sym));
-        if chain_len > crate::stdlib::ProjectIndex::MAX_INHERITANCE_DEPTH {
-            let limit = crate::stdlib::ProjectIndex::MAX_INHERITANCE_DEPTH;
+        if chain_len > crate::index::ProjectIndex::MAX_INHERITANCE_DEPTH {
+            let limit = crate::index::ProjectIndex::MAX_INHERITANCE_DEPTH;
             let span = d
                 .supertype
                 .map(|tr| self.hir.type_refs[tr].byte_range.clone())
@@ -4107,7 +4092,7 @@ impl<'a> Cx<'a> {
                 .iter()
                 .map(|g| {
                     let g_sym = self.hir.idents[*g].symbol;
-                    self.arena.generic_param(g_sym, owner)
+                    self.arena.generic_param(g_sym)
                 })
                 .collect();
             // P35.7 — mint the generic `this` against the decl handle
@@ -4121,7 +4106,7 @@ impl<'a> Cx<'a> {
                 .index
                 .resolve_item(self.decl_registry, Some(self.module_uri), type_name_sym)
             {
-                Some(handle) => self.arena.generic(handle, args),
+                Some(handle) => self.arena.alloc_generic(handle, args),
                 None => {
                     let span = self.hir.idents[d.name].byte_range.clone();
                     self.arena.unresolved(type_name_sym, (span.start, span.end))
@@ -4196,11 +4181,7 @@ impl<'a> Cx<'a> {
     /// statements (`If::then_branch`, `While::body`, `Try::try_block`,
     /// …) hold their block inline post-refactor, so we can't go
     /// through `visit_stmt(Idx<Stmt>)` for them.
-    fn visit_block(
-        &mut self,
-        block: &greycat_analyzer_hir::types::BlockStmt,
-        return_ty: Option<TypeId>,
-    ) {
+    fn visit_block(&mut self, block: &BlockStmt, return_ty: Option<TypeId>) {
         self.push_narrow();
         for s in &block.stmts {
             self.visit_stmt(*s, return_ty);
@@ -5852,7 +5833,7 @@ impl<'a> Cx<'a> {
                         // params/return so calls through the ident
                         // check against the real signature.
                         self.fn_ref_ty_from_sig(&sig)
-                    } else if self.index.non_native_fn_names.contains(&sym) {
+                    } else if self.index.fn_names.contains(&sym) {
                         // Non-native fn without a declared return type
                         // (skipped from `fn_signatures` per
                         // `stage_lower_signatures`'s `let Some(ret) =
@@ -5970,7 +5951,7 @@ impl<'a> Cx<'a> {
                 let span = self.hir.exprs[expr_id].byte_range();
                 let elem = inferred_elem.unwrap_or_else(|| self.any_nullable());
                 match self.well_known.array_decl {
-                    Some(decl) => self.arena.generic(decl, vec![elem]),
+                    Some(decl) => self.arena.alloc_generic(decl, vec![elem]),
                     None => {
                         let name = self.index.symbols.intern("Array");
                         self.arena.unresolved(name, (span.start, span.end))
@@ -6130,7 +6111,7 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Static(s) => {
-                // P15.6 — `Type::method` resolution. Lower the receiver
+                // `Type::method` resolution. Lower the receiver
                 // type so cross-module receivers land as `Named(name)`
                 // (via `lower_type_ref`'s `index.has_name(&name)` arm),
                 // then run `resolve_member` on the property.
@@ -6146,7 +6127,7 @@ impl<'a> Cx<'a> {
                         return recv_ty;
                     }
                 }
-                // P23 — `Type::attr` (no parens) → `field`,
+                // `Type::attr` (no parens) → `field`,
                 // `Type::method` (no parens) → `function`. Replaces
                 // pass 3.5's static-as-value typing. **P19.13** —
                 // pass `recv_ty` so `static_value_type` can resolve
@@ -6157,7 +6138,7 @@ impl<'a> Cx<'a> {
                 if let Some(ty) = self.static_value_type(recv_ty, property) {
                     return ty;
                 }
-                // P23 — `module::Name` shapes parse as `Static` with
+                // `module::Name` shapes parse as `Static` with
                 // the module name as the "type ref" (the parser
                 // doesn't distinguish modules from types). Fall back
                 // to a 2-segment QualifiedStatic-style lookup against
@@ -6690,7 +6671,7 @@ impl<'a> Cx<'a> {
                 } else {
                     self.arena.alloc(Type {
                         kind: TypeKind::Union {
-                            alts: vec![lt_stripped, rt_stripped],
+                            alts: Box::new([lt_stripped, rt_stripped]),
                         },
                         nullable: false,
                     })
@@ -6808,15 +6789,10 @@ mod tests {
     /// [`analyze_src_only`] — for checks that consult the project-wide
     /// index (enum exhaustiveness, member shapes), which the standalone
     /// [`analyze`] harness doesn't populate.
-    fn analyze_project_only(
-        src: &str,
-    ) -> (
-        crate::project::ProjectAnalysis,
-        greycat_analyzer_core::lsp_types::Uri,
-    ) {
+    fn analyze_project_only(src: &str) -> (crate::project::ProjectAnalysis, Uri) {
         use greycat_analyzer_core::SourceManager;
         use std::str::FromStr;
-        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///proj/main.gcl").unwrap();
+        let uri = Uri::from_str("file:///proj/main.gcl").unwrap();
         let mut mgr = SourceManager::new();
         mgr.add_simple(uri.clone(), src, "project", false);
         (crate::project::ProjectAnalysis::analyze(&mgr), uri)
@@ -6830,7 +6806,7 @@ mod tests {
         use greycat_analyzer_core::SourceManager;
         use std::str::FromStr;
         let mut mgr = SourceManager::new();
-        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(uri.clone(), src, "project", false);
         let pa = crate::project::ProjectAnalysis::analyze(&mgr);
         let m = pa.module(&uri).unwrap();
@@ -6886,7 +6862,7 @@ mod tests {
         use greycat_analyzer_core::SourceManager;
         use std::str::FromStr;
         let mut mgr = SourceManager::new();
-        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(uri.clone(), src, "project", false);
         let pa = crate::project::ProjectAnalysis::analyze(&mgr);
         pa.module(&uri).unwrap().analysis.diagnostics.clone()
@@ -7466,10 +7442,8 @@ fn pick(c: Color): int {
         // never checked.
         use greycat_analyzer_core::SourceManager;
         use std::str::FromStr;
-        let defs_uri =
-            greycat_analyzer_core::lsp_types::Uri::from_str("file:///proj/defs.gcl").unwrap();
-        let main_uri =
-            greycat_analyzer_core::lsp_types::Uri::from_str("file:///proj/main.gcl").unwrap();
+        let defs_uri = Uri::from_str("file:///proj/defs.gcl").unwrap();
+        let main_uri = Uri::from_str("file:///proj/main.gcl").unwrap();
         let mut mgr = SourceManager::new();
         mgr.add_simple(
             defs_uri,
@@ -7578,7 +7552,7 @@ fn f(p: Point): int { return p.bogus; }
         use greycat_analyzer_core::SourceManager;
         use std::str::FromStr;
         let mut mgr = SourceManager::new();
-        let src_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        let src_uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(src_uri.clone(), src, "project", false);
         let pa = crate::project::ProjectAnalysis::analyze(&mgr);
         let module = pa.module(&src_uri)?;
@@ -7604,10 +7578,9 @@ fn f(p: Point): int { return p.bogus; }
         use greycat_analyzer_core::SourceManager;
         use std::str::FromStr;
         let mut mgr = SourceManager::new();
-        let stdlib_uri =
-            greycat_analyzer_core::lsp_types::Uri::from_str("file:///std/core.gcl").unwrap();
+        let stdlib_uri = Uri::from_str("file:///std/core.gcl").unwrap();
         mgr.add_simple(stdlib_uri, stdlib_src, "std", false);
-        let src_uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        let src_uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(src_uri.clone(), src, "project", false);
         let pa = crate::project::ProjectAnalysis::analyze(&mgr);
         let module = pa.module(&src_uri)?;
@@ -8671,7 +8644,7 @@ fn caller(r: Rect) {
 }
 "#;
         let mut mgr = SourceManager::new();
-        let uri = greycat_analyzer_core::lsp_types::Uri::from_str("file:///mod.gcl").unwrap();
+        let uri = Uri::from_str("file:///mod.gcl").unwrap();
         mgr.add_simple(uri.clone(), src, "project", false);
         let pa = crate::project::ProjectAnalysis::analyze(&mgr);
         let module = pa.module(&uri).unwrap();

@@ -31,7 +31,12 @@ impl TypeId {
     }
 }
 
-// P35.1
+impl std::fmt::Display for TypeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Project-wide unique identifier for a top-level item in a module.
 ///
 /// Composed of `(module, name)` where both halves are [`Symbol`]s
@@ -82,7 +87,6 @@ pub enum TypeKind {
     /// Named primitive — `int`, `float`, `String`, `bool`, `char`,
     /// `time`, `duration`, `geo`. Carries the canonical name.
     Primitive(Primitive),
-    // P35.2
     /// A resolved non-generic type — user-defined `type Foo {...}` or
     /// a non-generic native type from `std/core`. The decl's [`ItemId`]
     /// `(module, name)` is the identity; cross-module references to
@@ -95,7 +99,6 @@ pub enum TypeKind {
     /// variance / node-tag-dispatch machinery match only the latter
     /// without runtime `args.is_empty()` checks.
     Type(ItemId),
-    // P35.2
     /// An instantiation of a generic decl — `Array<int>`, `node<int?>`,
     /// `Map<String, V>`. `decl` is the generic template's [`ItemId`];
     /// `args` are the per-use-site type arguments and are guaranteed
@@ -106,7 +109,6 @@ pub enum TypeKind {
         /// Cannot be zero-length (ensured by the lowering phase)
         args: SmallVec<[TypeId; 2]>,
     },
-    // P35.3
     /// A type-ref whose name didn't resolve — typo, missing import,
     /// in-progress code. Carries the source `name` and `byte_range`
     /// (as a `(start, end)` tuple since `Range<usize>` is not `Hash`,
@@ -126,9 +128,10 @@ pub enum TypeKind {
         name: Symbol,
         byte_range: (usize, usize),
     },
-    /// Generic type *parameter* — the `T` inside a `fn<T>(x: T)` body.
-    // P25.4
-    GenericParam { name: Symbol, owner: GenericOwner },
+    /// Generic type *parameter*
+    /// - the `T` inside a `fn<T>(x: T)` body
+    /// - the `T` inside a `type Box<T> { field: T; }`
+    GenericParam(Symbol),
     /// Function / lambda type.
     ///
     /// `ret` is `None` when the source decl / lambda literal did not
@@ -142,14 +145,13 @@ pub enum TypeKind {
         ret: Option<TypeId>,
     },
     /// Enum type.
-    // P25.4
     Enum {
         name: Symbol,
         variants: Box<[Symbol]>,
     },
     /// Union of two-or-more alternatives. Construction normalizes:
     /// `T | T = T`, `T | null = nullable(T)`.
-    Union { alts: Vec<TypeId> },
+    Union { alts: Box<[TypeId]> },
     /// A *type-literal value* — the runtime value is the type `inner`
     /// itself (not an instance of it). Mints from
     /// `typeof T` in source position and from bare type-ident
@@ -191,7 +193,6 @@ impl Primitive {
 }
 
 /// Where a generic parameter was declared.
-// P25.4
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenericOwner {
     /// `fn<T>(...)`.
@@ -199,10 +200,6 @@ pub enum GenericOwner {
     /// `type Foo<T> {...}`.
     Type(Symbol),
 }
-
-// =============================================================================
-// Arena
-// =============================================================================
 
 /// Append-only interning arena for `Type`. Two equal `Type` values get
 /// the same [`TypeId`]; comparing for equality is then just an integer
@@ -239,6 +236,10 @@ impl TypeArena {
         &self.items[id.0 as usize]
     }
 
+    pub fn resolve(&self, ty: &Type) -> Option<TypeId> {
+        self.intern.get(ty).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -249,12 +250,13 @@ impl TypeArena {
 
     /// Make a copy of `id` with `nullable = true`. Idempotent.
     pub fn nullable(&mut self, id: TypeId) -> TypeId {
-        let mut ty = self.get(id).clone();
+        let ty = self.get(id);
         if ty.nullable {
             return id;
         }
-        ty.nullable = true;
-        self.alloc(ty)
+        let mut new_ty = ty.clone();
+        new_ty.nullable = true;
+        self.alloc(new_ty)
     }
 
     pub fn primitive(&mut self, p: Primitive) -> TypeId {
@@ -286,12 +288,7 @@ impl TypeArena {
         })
     }
 
-    /// Nullable `any` — top of *all* values including null.
-    /// `null → any_nullable` is allowed. Equivalent to writing
-    /// `any?` in source. Used as the fallback for unresolved
-    /// names, for generic raw-form arg slots (`Tensor` ≡
-    /// `Tensor<any?, any?>`), and any other place where a
-    /// universally-permissive type is the right answer.
+    /// Allocates a [`TypeKind::Any`]
     pub fn any_nullable(&mut self) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Any,
@@ -299,6 +296,7 @@ impl TypeArena {
         })
     }
 
+    /// Allocates a [`TypeKind::Never`]
     pub fn never(&mut self) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Never,
@@ -306,8 +304,7 @@ impl TypeArena {
         })
     }
 
-    // P35.2
-    /// Allocate a resolved non-generic [`TypeKind::Type`].
+    /// Allocates a [`TypeKind::Type`]
     pub fn alloc_type(&mut self, decl: ItemId) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Type(decl),
@@ -315,12 +312,11 @@ impl TypeArena {
         })
     }
 
-    // P35.2
-    /// Allocate a [`TypeKind::Generic`] (decl-keyed generic
-    /// instantiation). Caller guarantees `args` is non-empty —
+    /// Allocates a [`TypeKind::Generic`].
+    /// Caller guarantees `args` is non-empty:
     /// zero-arg uses of a generic decl are an upstream lowering
     /// error, not a value-shaped concept.
-    pub fn generic(&mut self, decl: ItemId, args: Vec<TypeId>) -> TypeId {
+    pub fn alloc_generic(&mut self, decl: ItemId, args: Vec<TypeId>) -> TypeId {
         debug_assert!(!args.is_empty(), "Generic must have non-empty args");
         self.alloc(Type {
             kind: TypeKind::Generic {
@@ -331,8 +327,7 @@ impl TypeArena {
         })
     }
 
-    // P35.3
-    /// Allocate a [`TypeKind::Unresolved`]. Use this in place of the
+    /// Allocates a [`TypeKind::Unresolved`]. Use this in place of the
     /// `arena.any()` fallback when a type-ref name didn't resolve —
     /// behaves like `any` for assignability but carries the source
     /// name + span for diagnostic rendering. Nullable to match
@@ -345,9 +340,9 @@ impl TypeArena {
         })
     }
 
-    pub fn generic_param(&mut self, name: Symbol, owner: GenericOwner) -> TypeId {
+    pub fn generic_param(&mut self, name: Symbol /*, owner: GenericOwner */) -> TypeId {
         self.alloc(Type {
-            kind: TypeKind::GenericParam { name, owner },
+            kind: TypeKind::GenericParam(name),
             nullable: false,
         })
     }
@@ -382,11 +377,16 @@ impl TypeArena {
     /// `Tuple` decl handle the caller has pulled from
     /// `WellKnown::tuple_decl`.
     pub fn tuple(&mut self, decl: ItemId, x: TypeId, y: TypeId) -> TypeId {
-        self.generic(decl, vec![x, y])
+        self.alloc(Type {
+            kind: TypeKind::Generic {
+                decl,
+                args: [x, y].into(),
+            },
+            nullable: false,
+        })
     }
 
-    // P19
-    /// Substitute `GenericParam(name)` occurrences inside `ty`
+    /// Substitute `TypeParam` occurrences inside `ty`
     /// with the matching entry in `subst`, allocating fresh interned
     /// types for any container that changed shape. Idempotent: calling
     /// twice produces the same TypeId. Mirrors
@@ -404,62 +404,54 @@ impl TypeArena {
         }
         let t = self.get(ty).clone();
         match &t.kind {
-            TypeKind::GenericParam { name, .. } => match subst.get(name) {
+            TypeKind::GenericParam(name) => match subst.get(name) {
                 Some(&witness) if t.nullable => self.nullable(witness),
                 Some(&witness) => witness,
                 None => ty,
             },
-            // P35.2 — `Type(decl)` is non-generic, no params to substitute.
+            // `Type(decl)` is non-generic, no params to substitute.
             TypeKind::Type(_) => ty,
             TypeKind::Generic { decl, args } => {
                 let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(*a, subst)).collect();
-                if new_args == *args {
+                if &new_args == args {
                     ty
                 } else {
-                    let decl = *decl;
-                    // Re-use the name already registered for `decl` when
-                    // we minted the original `Generic` — no caller-side
-                    // bookkeeping needed.
-                    // let name = SmolStr::from(
-                    //     self.decl_name(decl)
-                    //         .expect("decl name registered at first alloc"),
-                    // );
-                    let mut new_t = self.generic(decl, new_args.into_vec());
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
+                    self.alloc(Type {
+                        kind: TypeKind::Generic {
+                            decl: *decl,
+                            args: new_args,
+                        },
+                        nullable: t.nullable,
+                    })
                 }
             }
             TypeKind::Lambda { params, ret } => {
-                let new_params: Vec<TypeId> =
+                let new_params: Box<[TypeId]> =
                     params.iter().map(|p| self.substitute(*p, subst)).collect();
                 let new_ret = ret.map(|r| self.substitute(r, subst));
-                if new_ret == *ret && new_params.as_slice() == params.as_ref() {
+                if new_ret == *ret && &new_params == params {
                     ty
                 } else {
-                    let mut new_t = self.lambda(new_params, new_ret);
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
+                    self.alloc(Type {
+                        kind: TypeKind::Lambda {
+                            params: new_params,
+                            ret: new_ret,
+                        },
+                        nullable: t.nullable,
+                    })
                 }
             }
             TypeKind::Union { alts } => {
-                let new_alts: Vec<TypeId> =
+                let new_alts: Box<[TypeId]> =
                     alts.iter().map(|a| self.substitute(*a, subst)).collect();
-                if new_alts == *alts {
+                if &new_alts == alts {
                     ty
                 } else {
-                    let mut new_t = self.alloc(Type {
+                    self.alloc(Type {
                         kind: TypeKind::Union { alts: new_alts },
-                        nullable: false,
-                    });
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
+                        nullable: t.nullable,
+                    })
                 }
             }
             TypeKind::TypeOf(inner) => {
@@ -467,11 +459,10 @@ impl TypeArena {
                 if new_inner == *inner {
                     ty
                 } else {
-                    let mut new_t = self.type_of(new_inner);
-                    if t.nullable {
-                        new_t = self.nullable(new_t);
-                    }
-                    new_t
+                    self.alloc(Type {
+                        kind: TypeKind::TypeOf(new_inner),
+                        nullable: t.nullable,
+                    })
                 }
             }
             _ => ty,
@@ -479,16 +470,11 @@ impl TypeArena {
     }
 }
 
-// =============================================================================
-// Type registry — holds module-level declared types
-// =============================================================================
-
 /// Looks up named types.
 #[derive(Debug, Default)]
 pub struct TypeRegistry {
     /// Maps `Symbol` (an interned type name) → `TypeId` in the
     /// shared arena.
-    // P25.2
     named: FxHashMap<Symbol, TypeId>,
 }
 
@@ -505,7 +491,6 @@ impl TypeRegistry {
         self.named.get(&name).copied()
     }
 
-    // P19.6
     /// Iterate every registered name [`Symbol`]. Use the project's
     /// [`SymbolTable`] to recover the source text.
     pub fn iter_names(&self) -> impl Iterator<Item = Symbol> + '_ {
@@ -623,7 +608,7 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::TypeOf(_) => false,
         },
 
-        // P35.2 — decl identity via `ItemId`. Cross-module references
+        // Decl identity via `ItemId`. Cross-module references
         // to the same decl share the same `(module, name)` pair.
         // Supertype-chain assignability lives in
         // `is_assignable_to_with_index`.
@@ -643,7 +628,7 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::TypeOf(_) => false,
         },
 
-        // P12.2 / P19.10 / P19.14 — generic args are invariant
+        // Generic args are invariant
         // (matches the runtime, not the TS checker). The "all-any
         // wildcard" rule is *target-only* and asymmetric: `Foo<any?,
         // any?>` as a TARGET accepts any same-decl instantiation
@@ -743,7 +728,7 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
             | TypeKind::TypeOf(_) => false,
         },
 
-        // P25.4 — a generic param `T` (inside a `fn<T>(...)` body) is
+        // A generic param `T` (inside a `fn<T>(...)` body) is
         // an opaque type; without an `InferenceTable` witness it
         // doesn't assign to anything concrete except via the top-
         // level `Any`/`Unresolved` guards. Identity is handled by
@@ -790,19 +775,6 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     }
 }
 
-// `is_node_tag(name: &str)` removed. Name-keyed dispatch let a
-// user-declared `type node<T> {}` impersonate the std-core tag and
-// pick up bivariance / cast semantics it shouldn't. The handle-keyed
-// `WellKnown::is_node_tag(decl)` in
-// [`greycat_analyzer_analysis::well_known`] is the only correct
-// dispatch — node-tag-specific rules now live in
-// `is_assignable_to_with_index` / `is_castable_with_index` in the
-// analysis crate, where `WellKnown` is reachable.
-
-// =============================================================================
-// Inference table (P7.4 — foundational pass)
-// =============================================================================
-
 /// Per-call constraint table that records "type-parameter `T` was
 /// witnessed at type `…`" pairs as the analyzer walks a generic call
 /// site. After all arguments have been visited, [`InferenceTable::solve`]
@@ -842,7 +814,7 @@ impl InferenceTable {
     pub fn substitute(&self, arena: &mut TypeArena, ty: TypeId) -> TypeId {
         let t = arena.get(ty).clone();
         match &t.kind {
-            TypeKind::GenericParam { name, .. } => {
+            TypeKind::GenericParam(name) => {
                 if let Some(witness) = self.bindings.get(name) {
                     let nullable = t.nullable;
                     if !nullable {
@@ -854,25 +826,18 @@ impl InferenceTable {
                 }
             }
             TypeKind::Generic { decl, args } => {
-                // P25.7
                 let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(arena, *a)).collect();
-                if new_args == *args {
+                if &new_args == args {
                     ty
                 } else {
-                    let decl = *decl;
-                    // Re-use the name already registered for `decl` when
-                    // we minted the original `Generic`.
-                    // let name = SmolStr::from(
-                    //     arena
-                    //         .decl_name(decl)
-                    //         .expect("decl name registered at first alloc"),
-                    // );
-                    let mut new_t = arena.generic(decl, new_args.into_vec());
-                    if t.nullable {
-                        new_t = arena.nullable(new_t);
-                    }
-                    new_t
+                    arena.alloc(Type {
+                        kind: TypeKind::Generic {
+                            decl: *decl,
+                            args: new_args,
+                        },
+                        nullable: t.nullable,
+                    })
                 }
             }
             TypeKind::TypeOf(inner) => {
@@ -880,11 +845,10 @@ impl InferenceTable {
                 if new_inner == *inner {
                     ty
                 } else {
-                    let mut new_t = arena.type_of(new_inner);
-                    if t.nullable {
-                        new_t = arena.nullable(new_t);
-                    }
-                    new_t
+                    arena.alloc(Type {
+                        kind: TypeKind::TypeOf(new_inner),
+                        nullable: t.nullable,
+                    })
                 }
             }
             _ => ty,
@@ -946,7 +910,7 @@ pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
     match &from_t.kind {
         TypeKind::Any | TypeKind::Unresolved { .. } => unreachable!("filtered by top-level guards"),
 
-        // **P19.14** — `T as Foo` (where `T` is a generic param)
+        // `T as Foo` (where `T` is a generic param)
         // is allowed: the runtime decides at instantiation time.
         TypeKind::GenericParam { .. } => true,
 
@@ -1148,7 +1112,7 @@ fn is_int_target(t: &Type) -> bool {
 }
 
 fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
-    // P12.4: GreyCat's runtime rejects every primitive-to-primitive
+    // GreyCat's runtime rejects every primitive-to-primitive
     // widening at parameter / variable binding (verified via
     // `greycat run`: `var i: int = 1; take(i)` against `take(_: float)`
     // is rejected as "argument of type 'int' is not assignable to
@@ -1209,8 +1173,8 @@ mod tests {
         let mut cx = TextCx::default();
         let arg_string = cx.arena.primitive(Primitive::Int);
         let array_decl = cx.item("Array");
-        let g_a = cx.arena.generic(array_decl, vec![arg_string]);
-        let g_b = cx.arena.generic(array_decl, vec![arg_string]);
+        let g_a = cx.arena.alloc_generic(array_decl, vec![arg_string]);
+        let g_b = cx.arena.alloc_generic(array_decl, vec![arg_string]);
         assert_eq!(g_a, g_b);
     }
 
@@ -1280,8 +1244,8 @@ mod tests {
         let int = cx.arena.primitive(Primitive::Int);
         let float = cx.arena.primitive(Primitive::Float);
         let array_decl = cx.item("Array");
-        let arr_int = cx.arena.generic(array_decl, vec![int]);
-        let arr_float = cx.arena.generic(array_decl, vec![float]);
+        let arr_int = cx.arena.alloc_generic(array_decl, vec![int]);
+        let arr_float = cx.arena.alloc_generic(array_decl, vec![float]);
         // P12.2 (matches the GreyCat runtime, *not* the TS reference
         // checker): generic args are invariant. Even though `int`
         // widens to `float`, `Array<int>` is **not** assignable to
@@ -1298,8 +1262,8 @@ mod tests {
         let int = cx.arena.primitive(Primitive::Int);
         let array_decl = cx.item("Array");
         let set_decl = cx.item("Set");
-        let arr_int = cx.arena.generic(array_decl, vec![int]);
-        let set_int = cx.arena.generic(set_decl, vec![int]);
+        let arr_int = cx.arena.alloc_generic(array_decl, vec![int]);
+        let set_int = cx.arena.alloc_generic(set_decl, vec![int]);
         // Different generic names with the same args still mismatch.
         // Inheritance-aware assignability (`type Child<T> extends
         // Parent<T>`) is a later phase.
@@ -1344,7 +1308,7 @@ mod tests {
         let str_t = cx.arena.primitive(Primitive::String);
         let union = cx.arena.alloc(Type {
             kind: TypeKind::Union {
-                alts: vec![int, str_t],
+                alts: Box::new([int, str_t]),
             },
             nullable: false,
         });
@@ -1394,7 +1358,7 @@ mod tests {
         let person_decl = cx.item("Person");
         let person = cx.arena.alloc_type(person_decl);
         let node_decl = cx.item("node");
-        let node_person = cx.arena.generic(node_decl, vec![person]);
+        let node_person = cx.arena.alloc_generic(node_decl, vec![person]);
         assert!(!is_assignable_to(&cx.arena, node_person, person));
         assert!(!is_assignable_to(&cx.arena, person, node_person));
     }
@@ -1403,17 +1367,14 @@ mod tests {
     fn inference_table_substitutes_generic_params() {
         let mut cx = TextCx::default();
         let t_sym = cx.symbols.intern("T");
-        let foo_sym = cx.symbols.intern("Foo");
+        // let foo_sym = cx.symbols.intern("Foo");
         let int = cx.arena.primitive(Primitive::Int);
         let t_param = cx.arena.alloc(Type {
-            kind: TypeKind::GenericParam {
-                name: t_sym,
-                owner: GenericOwner::Type(foo_sym),
-            },
+            kind: TypeKind::GenericParam(t_sym),
             nullable: false,
         });
         let array_decl = cx.item("Array");
-        let arr_t = cx.arena.generic(array_decl, vec![t_param]);
+        let arr_t = cx.arena.alloc_generic(array_decl, vec![t_param]);
 
         let mut tbl = InferenceTable::new();
         tbl.bind(t_sym, int);
@@ -1433,26 +1394,20 @@ mod tests {
         let mut cx = TextCx::default();
         let t_sym = cx.symbols.intern("T");
         let u_sym = cx.symbols.intern("U");
-        let foo_sym = cx.symbols.intern("Foo");
+        // let foo_sym = cx.symbols.intern("Foo");
         let int = cx.arena.primitive(Primitive::Int);
         let str_t = cx.arena.primitive(Primitive::String);
         let t_param = cx.arena.alloc(Type {
-            kind: TypeKind::GenericParam {
-                name: t_sym,
-                owner: GenericOwner::Type(foo_sym),
-            },
+            kind: TypeKind::GenericParam(t_sym),
             nullable: false,
         });
         let u_param = cx.arena.alloc(Type {
-            kind: TypeKind::GenericParam {
-                name: u_sym,
-                owner: GenericOwner::Type(foo_sym),
-            },
+            kind: TypeKind::GenericParam(u_sym),
             nullable: false,
         });
         let array_decl = cx.item("Array");
         let map_decl = cx.item("Map");
-        let map_tu = cx.arena.generic(map_decl, vec![t_param, u_param]);
+        let map_tu = cx.arena.alloc_generic(map_decl, vec![t_param, u_param]);
 
         let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
         subst.insert(t_sym, int);
@@ -1472,7 +1427,7 @@ mod tests {
 
         // Nullability preserved: Array<T?> with T → int gives Array<int?>.
         let t_param_q = cx.arena.nullable(t_param);
-        let arr_t_q = cx.arena.generic(array_decl, vec![t_param_q]);
+        let arr_t_q = cx.arena.alloc_generic(array_decl, vec![t_param_q]);
         let resolved_q = cx.arena.substitute(arr_t_q, &subst);
         let TypeKind::Generic { args: q_args, .. } = &cx.arena.get(resolved_q).kind else {
             panic!();
@@ -1485,7 +1440,7 @@ mod tests {
         let mut cx = TextCx::default();
         let int = cx.arena.primitive(Primitive::Int);
         let array_decl = cx.item("Array");
-        let arr = cx.arena.generic(array_decl, vec![int]);
+        let arr = cx.arena.alloc_generic(array_decl, vec![int]);
         let empty: FxHashMap<Symbol, TypeId> = FxHashMap::default();
         assert_eq!(cx.arena.substitute(arr, &empty), arr);
     }

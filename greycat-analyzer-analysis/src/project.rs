@@ -12,7 +12,7 @@
 //! consult it for cross-module name lookup is **** territory.
 //! gives that work the cache-shaped seam to plug into.
 
-use std::hash::{Hash, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 // `web-time` is a transparent drop-in for `std::time` — re-exports
 // the std types on native, falls back to `performance.now()` on
@@ -38,6 +38,7 @@ use crate::analyzer::{
     AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into, seed_builtins,
 };
 use crate::directives::Directives;
+use crate::index::{FnSignature, ProjectIndex};
 use crate::lint::{
     LintDiagnostic, SURFACED_RULES, lint_arrow_on_non_deref_with_directives,
     lint_catch_empty_parens, lint_inferred_return_type_with_directives, lint_no_breakpoint,
@@ -46,8 +47,7 @@ use crate::lint::{
     lint_unused_suppressions, run_lints_with_directives,
 };
 use crate::resolver::{Resolutions, resolve_with_index_for};
-use crate::stdlib::{FnSignature, ProjectIndex};
-use crate::well_known::{DeclRegistry, WellKnown};
+use crate::well_known::WellKnown;
 
 /// Per-document outputs of the analyzer pipeline. Held by
 /// [`ProjectAnalysis`] so LSP / CLI consumers can pull diagnostics
@@ -78,7 +78,6 @@ pub struct ModuleAnalysis {
     pub directives: Directives,
 }
 
-// P14.5
 /// Per-module pipeline timings.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ModuleTimings {
@@ -106,7 +105,6 @@ impl ModuleTimings {
 /// (re)populated, so removed type / enum / native decls are reflected
 /// instead of lingering.
 ///
-// P19
 /// The [`TypeArena`] now lives on the
 /// project (not per [`AnalysisResult`]). Every module's analyzer mints
 /// into the same arena so cross-module `TypeId`s are directly
@@ -116,47 +114,38 @@ impl ModuleTimings {
 #[derive(Debug, Default)]
 pub struct ProjectAnalysis {
     pub index: ProjectIndex,
-    // P19
     /// Project-wide type arena. Populated alongside every
     /// module's analyzer pass. Append-only and interned, so duplicate
     /// `seed_builtins` calls per `analyze_with_index_into` are a
     /// no-op.
     pub arena: TypeArena,
-    // P35.1
     /// Project-wide registry of resolved `(Uri, Idx<Decl>)` →
-    /// [`TypeDeclId`]. Issued during signature lowering; consumed by
-    /// the type system to identify decls without going through their
-    /// SmolStr name.
+    /// [`TypeDeclId`]. Issued during signature lowering.
     pub decl_registry: DeclRegistry,
-    // P35.1
     /// Stable handles for the std/core native types the analyzer
     /// special-cases (node-tag auto-deref, runtime sentinels,
     /// collections). Populated during signature lowering. Slots stay
     /// `None` until the corresponding decl flows through the pipeline
     /// (or forever, when std isn't loaded).
     pub well_known: WellKnown,
-    // P23.7
     /// When `true`, lint suppressions (`// gcl-lint-off …`)
     /// are still recorded but never silence emissions. Drives the CLI's
     /// `--no-suppressions` flag.
     pub bypass_suppressions: bool,
-    // P37.7
     /// Names of rules the caller has explicitly enabled. Only matters
     /// for rules that ship default-off (`default_enabled = false` in
     /// [`LINT_RULES`]); default-on rules are always active. Drives the
     /// CLI's `--on=<rule>` flag, the entrypoint's `@lint_on("…")`
     /// project pragmas (P40), and any future LSP config equivalent.
-    pub enabled_rules: FxHashSet<String>,
-    // P40.1
+    pub enabled_rules: FxHashSet<String>, // FIXME: should be FxHashSet<&'static str>
     /// Names of rules disabled project-wide. Populated by the
     /// entrypoint's `@lint_off("…")` pragmas. `enabled_rules` and
     /// `disabled_rules` together describe project-wide policy; when
     /// both name the same rule, `disabled_rules` wins (explicit
     /// silence beats explicit enable — matches the CLI precedent of
     /// `--off=X --on=X` silencing X).
-    pub disabled_rules: FxHashSet<String>,
+    pub disabled_rules: FxHashSet<String>, // FIXME: should be FxHashSet<&'static str>
     modules: FxHashMap<Uri, ModuleAnalysis>,
-    // P19.6
     /// Per-module signature-stage cache. Records what each
     /// module contributed to the project signature index
     /// (`attr_types`, `method_returns`, `fn_signatures`, `enum_types`)
@@ -172,7 +161,49 @@ pub struct ProjectAnalysis {
     sig_cache: FxHashMap<Uri, ModuleSigCache>,
 }
 
-// P19.6
+/// Maps every interned [`ItemId`] to the current HIR's `Idx<Decl>` in
+/// the owning module. The `Idx<Decl>` is HIR-allocation-order — a
+/// property of the *current* lower, not of the decl — so it gets
+/// refreshed on every `record` call (which happens once per decl per
+/// ingest). The URI of the owning module isn't stored here; recover
+/// it via `ProjectIndex::module_names[item.module]`.
+#[derive(Debug, Default, Clone)]
+#[repr(transparent)]
+pub struct DeclRegistry(FxHashMap<ItemId, Idx<Decl>>);
+
+impl DeclRegistry {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Idempotent on `item` — re-calling with the same `ItemId`
+    /// refreshes the cached `Idx<Decl>` so [`Self::lookup`] stays
+    /// valid against the most recently-ingested HIR.
+    #[inline]
+    pub fn record(&mut self, item: ItemId, decl: Idx<Decl>) {
+        self.0.insert(item, decl);
+    }
+
+    /// Current `Idx<Decl>` for `item` in its owning module's HIR.
+    /// Only meaningful against the most recently-ingested HIR for
+    /// `item.module`.
+    #[inline]
+    pub fn lookup(&self, item: ItemId) -> Option<Idx<Decl>> {
+        self.0.get(&item).copied()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// What one module contributed to the project signature index.
 #[derive(Debug, Clone, Default)]
 struct ModuleSigCache {
@@ -187,11 +218,9 @@ struct ModuleSigCache {
     /// the post-ingest project state — otherwise a previously-`any()`
     /// reference to a now-known type would silently stay `any()`.
     name_set_hash: u64,
-    // P19.9
     /// `(type_id, attr_sym, ty)` — attr name stays bare Symbol
     /// (per-type-internal).
     attrs: Vec<(ItemId, Symbol, TypeId)>,
-    // P19.9
     /// `(type_id, method_sym, ty)`.
     methods: Vec<(ItemId, Symbol, TypeId)>,
     /// `(type_id, method_sym, FnSignature)` — full signature for
@@ -200,10 +229,8 @@ struct ModuleSigCache {
     /// run the same witness-based generic inference the bare-Ident
     /// path uses today (see [`crate::analyzer::Cx::try_generic_call_inference`]).
     method_sigs: Vec<(ItemId, Symbol, FnSignature)>,
-    // P19.9
     /// `(fn_id, signature)`.
     fns: Vec<(ItemId, FnSignature)>,
-    // P19.10
     /// `(var_id, ty)`. Top-level `var` declared types.
     /// Lowered alongside the other signatures in
     /// [`lower_module_signatures`] so the analyzer's bare-Ident path
@@ -228,7 +255,7 @@ impl ProjectAnalysis {
         Self {
             index,
             arena,
-            decl_registry: crate::well_known::DeclRegistry::new(),
+            decl_registry: DeclRegistry::new(),
             well_known: crate::well_known::WellKnown::new(),
             bypass_suppressions: false,
             enabled_rules: FxHashSet::default(),
@@ -261,7 +288,7 @@ impl ProjectAnalysis {
     /// here too: capability handlers thread the registry into
     /// [`display_type`] / [`display_fqn`] so decl-keyed types render
     /// as their source name.
-    pub fn decl_registry(&self) -> &crate::well_known::DeclRegistry {
+    pub fn decl_registry(&self) -> &DeclRegistry {
         &self.decl_registry
     }
 
@@ -322,7 +349,7 @@ impl ProjectAnalysis {
         let name_sym = decl_id.name;
         let (foreign_uri, foreign_decl_id) = self
             .index
-            .locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type)
+            .locate_decl_in_ns(name_sym, crate::index::Namespace::Type)
             .next()?;
         let fmod = self.module(foreign_uri)?;
         let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id] else {
@@ -533,7 +560,7 @@ impl ProjectAnalysis {
             // `(lib, module, name)` triples. Default `"module"`
             // only kicks in for URIs without a recognisable
             // filename, which the recognizer ignores anyway.
-            let module_name = crate::stdlib::module_name_from_uri(&uri).unwrap_or("module");
+            let module_name = crate::index::module_name_from_uri(&uri).unwrap_or("module");
             let hir = lower_module(
                 &text,
                 &self.index.symbols,
@@ -591,7 +618,7 @@ impl ProjectAnalysis {
     /// **Stages S7-S11** — lower every type's attr `TypeRef`s
     /// and method return-`TypeRef`s into the shared arena
     /// project-wide, then store the resulting `TypeId`s on each
-    /// type's [`crate::stdlib::TypeMembers`] entry.
+    /// type's [`crate::index::TypeMembers`] entry.
     ///
     /// With these populated, the analyzer's per-module body walker
     /// can type cross-module `recv.attr` / `recv.method()` shapes
@@ -701,7 +728,7 @@ fn write_type_qualified(
         // shape (the `?` is added by the nullable postfix below
         // because `arena.unresolved()` builds with nullable: true).
         TypeKind::Unresolved { .. } => f.write_str("any")?,
-        TypeKind::GenericParam { name, .. } => f.write_str(&index.symbols[*name])?,
+        TypeKind::GenericParam(name) => f.write_str(&index.symbols[*name])?,
         TypeKind::Lambda { params, ret } => {
             f.write_str("fn(")?;
             for (i, p) in params.iter().enumerate() {
@@ -767,7 +794,7 @@ fn write_args_qualified(
 /// needed.
 pub fn display_type<'a>(
     arena: &'a TypeArena,
-    decl_registry: &'a crate::well_known::DeclRegistry,
+    decl_registry: &'a DeclRegistry,
     symbols: &'a SymbolTable,
     id: TypeId,
 ) -> TypeWithDecls<'a> {
@@ -789,7 +816,7 @@ pub fn display_type<'a>(
 pub fn display_type_for_module<'a>(
     arena: &'a TypeArena,
     index: &'a ProjectIndex,
-    decl_registry: &'a crate::well_known::DeclRegistry,
+    decl_registry: &'a DeclRegistry,
     id: TypeId,
     current_uri: Option<&'a Uri>,
 ) -> TypeForModule<'a> {
@@ -805,7 +832,7 @@ pub fn display_type_for_module<'a>(
 pub struct TypeForModule<'a> {
     arena: &'a TypeArena,
     index: &'a ProjectIndex,
-    decl_registry: &'a crate::well_known::DeclRegistry,
+    decl_registry: &'a DeclRegistry,
     id: TypeId,
     /// When `Some(uri)`, qualify any decl that bare lookup from `uri`
     /// wouldn't reach (private cross-module, ambiguous across two
@@ -832,7 +859,7 @@ fn write_type_for_module(
     f: &mut std::fmt::Formatter<'_>,
     arena: &TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     id: TypeId,
     current_uri: Option<&Uri>,
 ) -> std::fmt::Result {
@@ -873,7 +900,7 @@ fn write_type_for_module(
         // `any?` in display so error messages don't pretend the name
         // resolved to something it didn't.
         TypeKind::Unresolved { .. } => f.write_str("any")?,
-        TypeKind::GenericParam { name, .. } => f.write_str(&index.symbols[*name])?,
+        TypeKind::GenericParam(name) => f.write_str(&index.symbols[*name])?,
         TypeKind::Lambda { params, ret } => {
             f.write_str("fn(")?;
             for (i, p) in params.iter().enumerate() {
@@ -917,7 +944,7 @@ fn write_type_for_module(
 
 pub struct TypeWithDecls<'a> {
     arena: &'a TypeArena,
-    decl_registry: &'a crate::well_known::DeclRegistry,
+    decl_registry: &'a DeclRegistry,
     symbols: &'a SymbolTable,
     id: TypeId,
 }
@@ -931,7 +958,7 @@ impl std::fmt::Display for TypeWithDecls<'_> {
 fn write_type_with_decls(
     f: &mut std::fmt::Formatter<'_>,
     arena: &TypeArena,
-    _decl_registry: &crate::well_known::DeclRegistry,
+    _decl_registry: &DeclRegistry,
     symbols: &SymbolTable,
     id: TypeId,
 ) -> std::fmt::Result {
@@ -961,7 +988,7 @@ fn write_type_with_decls(
         // `any?` in display so error messages don't pretend the name
         // resolved to something it didn't.
         TypeKind::Unresolved { .. } => f.write_str("any")?,
-        TypeKind::GenericParam { name, .. } => f.write_str(&symbols[*name])?,
+        TypeKind::GenericParam(name) => f.write_str(&symbols[*name])?,
         TypeKind::Lambda { params, ret } => {
             f.write_str("fn(")?;
             for (i, p) in params.iter().enumerate() {
@@ -1017,7 +1044,6 @@ fn write_decl_qualified(
     f.write_str(&index.symbols[decl.name])
 }
 
-// P19.6
 /// Fingerprint of the project-wide name set used by
 /// [`lower_type_ref_project`].
 /// We hash the names that *exist* (sorted, so the answer is order-
@@ -1025,30 +1051,25 @@ fn write_decl_qualified(
 /// flip outcome is identical to last time.
 fn project_name_set_hash(index: &ProjectIndex) -> u64 {
     use std::collections::BTreeSet;
-    let mut names: BTreeSet<&str> = BTreeSet::new();
-    // P19.9 — type_names / natives / values are Symbol-keyed; resolve
-    // back to text through the project's symbol table for stable
-    // string hashing.
-    for sym in &index.type_names {
-        names.insert(&index.symbols[*sym]);
-    }
-    for sym in index.natives.signatures.keys() {
-        names.insert(&index.symbols[*sym]);
-    }
-    for sym in &index.values {
-        names.insert(&index.symbols[*sym]);
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for n in &names {
+
+    // collect all: types + modvars + fn into a btreeset for order
+    let ordered_names: BTreeSet<&str> = index
+        .type_names
+        .iter()
+        .chain(&index.var_names)
+        .chain(&index.fn_names)
+        .map(|s| &index.symbols[*s])
+        .collect();
+
+    let mut hasher = DefaultHasher::new();
+    for n in &ordered_names {
         n.hash(&mut hasher);
-        // Field separator — defends against
-        // `["ab", "c"]` vs `["a", "bc"]` colliding.
+        // entry separator: defends against `["ab", "c"]` vs `["a", "bc"]` colliding.
         0u8.hash(&mut hasher);
     }
     hasher.finish()
 }
 
-// P19.6
 /// Fingerprint of every byte
 /// [`lower_module_signatures_walk`] would read out of `hir`. Walks
 /// each top-level type / fn / enum decl name, generic ident text,
@@ -1056,7 +1077,7 @@ fn project_name_set_hash(index: &ProjectIndex) -> u64 {
 /// marker on each ref. Body statements / expressions are skipped
 /// they don't contribute to the project signature index.
 fn module_signature_hash(hir: &Hir) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = DefaultHasher::new();
     let Some(module) = hir.module.as_ref() else {
         0u8.hash(&mut hasher);
         return hasher.finish();
@@ -1139,11 +1160,7 @@ fn module_signature_hash(hir: &Hir) -> u64 {
     hasher.finish()
 }
 
-fn hash_type_ref(
-    hasher: &mut std::collections::hash_map::DefaultHasher,
-    hir: &Hir,
-    tr: Idx<greycat_analyzer_hir::types::TypeRef>,
-) {
+fn hash_type_ref(hasher: &mut DefaultHasher, hir: &Hir, tr: Idx<TypeRef>) {
     let r = &hir.type_refs[tr];
     hir.idents[r.name].symbol.hash(hasher);
     r.optional.hash(hasher);
@@ -1172,7 +1189,7 @@ fn hash_type_ref(
 fn lower_signatures_into(
     arena_mut: &mut TypeArena,
     index: &mut ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     lowered: &[(&Uri, &Hir)],
     cache: &mut FxHashMap<Uri, ModuleSigCache>,
 ) {
@@ -1236,7 +1253,7 @@ fn lower_signatures_into(
 /// dropped — they never form a `TypeMembers` entry to walk to.
 #[allow(clippy::mutable_key_type)]
 fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
-    use crate::stdlib::Namespace;
+    use crate::index::Namespace;
     use greycat_analyzer_hir::types::Decl;
 
     // Two-pass to dodge the `&mut index` + `&index` aliasing the
@@ -1247,7 +1264,7 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
         let Some(module) = hir.module.as_ref() else {
             continue;
         };
-        let Some(stem) = crate::stdlib::module_name_from_uri(uri) else {
+        let Some(stem) = crate::index::module_name_from_uri(uri) else {
             continue;
         };
         let Some(module_sym) = index.symbols.lookup(stem) else {
@@ -1287,7 +1304,7 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
                 let Some(qual_uri) = index.module_names.get(&qual_sym) else {
                     continue;
                 };
-                let Some(qual_stem) = crate::stdlib::module_name_from_uri(qual_uri) else {
+                let Some(qual_stem) = crate::index::module_name_from_uri(qual_uri) else {
                     continue;
                 };
                 let parent_module = index.symbols.intern(qual_stem);
@@ -1305,7 +1322,7 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
                         if index.is_decl_private(cand_uri, decl) {
                             continue;
                         }
-                        let Some(cand_stem) = crate::stdlib::module_name_from_uri(cand_uri) else {
+                        let Some(cand_stem) = crate::index::module_name_from_uri(cand_uri) else {
                             continue;
                         };
                         let cand_module = index.symbols.intern(cand_stem);
@@ -1426,16 +1443,14 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
     // entry — no name-match scan needed.
     let mut resolutions: FxHashMap<ItemId, TypeId> = FxHashMap::default();
     for (type_id, flags) in &index.type_flags {
-        let Some(method_name) = flags.deref.as_deref() else {
+        let Some(method_name) = flags.deref else {
             continue;
         };
-        if method_name.is_empty() {
+        let name = &index.symbols[method_name];
+        if name.is_empty() {
             continue;
         }
-        let Some(method_sym) = index.symbols.lookup(method_name) else {
-            continue;
-        };
-        if let Some(ret) = index.type_method_return_chain(*type_id, method_sym) {
+        if let Some(ret) = index.type_method_return_chain(*type_id, method_name) {
             resolutions.insert(*type_id, ret);
         }
     }
@@ -1446,22 +1461,14 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
     }
 }
 
-// P19.6
 /// Walk a single module's signatures and return the
 /// contributions it would write into the project index. Mutates
 /// `index.symbols` in passing (every contributed name is interned
 /// so cache entries can use `Symbol` keys).
-///
-// P19.9
-/// `generics_in_scope` is keyed by [`Symbol`] now, not
-/// `String`; `GenericOwner::{Type,Function}` still carry the source
-/// text since they're stored on `TypeKind::GenericParam` in the
-/// shared arena. The interner makes the *map* lookup cheap; the
-/// owner still needs the text for display.
 fn lower_module_signatures(
-    arena_mut: &mut TypeArena,
+    arena: &mut TypeArena,
     index: &mut ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     uri: &Uri,
     hir: &Hir,
     sig_hash: u64,
@@ -1476,17 +1483,6 @@ fn lower_module_signatures(
         return entry;
     };
     for d_id in &module.decls {
-        // Private decls go through full signature lowering. With every
-        // per-item map now keyed by `ItemId` (chunks 3+4), two same-
-        // named decls in different modules — including the common
-        // public+private collision shape — no longer fight for a
-        // single slot. Same-module typing of private fn calls / member
-        // access on private-type values / reads of private vars all
-        // need the populated `fn_signatures` / `attr_types` /
-        // `method_returns` / `var_types` entries. The cross-module
-        // bare-name filter is still applied at resolution time via
-        // `private_locations`; sig lowering doesn't need a parallel
-        // gate.
         match &hir.decls[*d_id] {
             Decl::Type(td) => {
                 let type_sym = hir.idents[td.name].symbol;
@@ -1504,35 +1500,17 @@ fn lower_module_signatures(
                     // own generic params in scope so a `Sub extends
                     // Base<T>` for a generic `Sub<T>` lands as
                     // `Generic { decl: Base, args: [GenericParam(T,
-                    // owner=Sub)] }`. Filter out the trivial primitive
-                    // cases (matches the symbol-only ingest filter).
-                    let parent_sym = hir.idents[hir.type_refs[super_tr].name].symbol;
-                    let parent_text: &str = &index.symbols[parent_sym];
-                    let is_primitive_parent = matches!(
-                        parent_text,
-                        "bool"
-                            | "int"
-                            | "float"
-                            | "char"
-                            | "String"
-                            | "time"
-                            | "duration"
-                            | "geo"
-                            | "any"
-                            | "null"
+                    // owner=Sub)] }`.
+                    let ty = lower_type_ref_project2(
+                        hir,
+                        super_tr,
+                        arena,
+                        &*index,
+                        decl_registry,
+                        &generics_in_scope,
+                        Some(uri),
                     );
-                    if !is_primitive_parent {
-                        let ty = lower_type_ref_project(
-                            hir,
-                            super_tr,
-                            arena_mut,
-                            &*index,
-                            decl_registry,
-                            &generics_in_scope,
-                            Some(uri),
-                        );
-                        entry.supertypes.push((type_id, ty));
-                    }
+                    entry.supertypes.push((type_id, ty));
                 }
                 for attr_id in &td.attrs {
                     let attr = &hir.type_attrs[*attr_id];
@@ -1540,10 +1518,10 @@ fn lower_module_signatures(
                     let Some(tr) = attr.ty else {
                         continue;
                     };
-                    let ty = lower_type_ref_project(
+                    let ty = lower_type_ref_project2(
                         hir,
                         tr,
-                        arena_mut,
+                        arena,
                         &*index,
                         decl_registry,
                         &generics_in_scope,
@@ -1571,10 +1549,10 @@ fn lower_module_signatures(
                         saved.push((g_sym, prev));
                     }
                     if let Some(ret) = fnd.return_type {
-                        let ty = lower_type_ref_project(
+                        let ty = lower_type_ref_project2(
                             hir,
                             ret,
-                            arena_mut,
+                            arena,
                             &*index,
                             decl_registry,
                             &generics_in_scope,
@@ -1595,17 +1573,17 @@ fn lower_module_signatures(
                     for p_id in &fnd.params {
                         let p = &hir.fn_params[*p_id];
                         let pt = if let Some(tr) = p.ty {
-                            lower_type_ref_project(
+                            lower_type_ref_project2(
                                 hir,
                                 tr,
-                                arena_mut,
+                                arena,
                                 &*index,
                                 decl_registry,
                                 &generics_in_scope,
                                 Some(uri),
                             )
                         } else {
-                            arena_mut.any_nullable()
+                            arena.any_nullable()
                         };
                         method_params.push(pt);
                     }
@@ -1615,10 +1593,10 @@ fn lower_module_signatures(
                     // mint downstream. Call-typing consumers fall
                     // back to `any?` at their use site.
                     let method_ret_ty = fnd.return_type.map(|ret| {
-                        lower_type_ref_project(
+                        lower_type_ref_project2(
                             hir,
                             ret,
-                            arena_mut,
+                            arena,
                             &*index,
                             decl_registry,
                             &generics_in_scope,
@@ -1681,10 +1659,10 @@ fn lower_module_signatures(
                     generics_in_scope.insert(g_sym, owner);
                     generics.push(g_sym);
                 }
-                let ret_ty = lower_type_ref_project(
+                let ret_ty = lower_type_ref_project2(
                     hir,
                     ret,
-                    arena_mut,
+                    arena,
                     &*index,
                     decl_registry,
                     &generics_in_scope,
@@ -1697,17 +1675,17 @@ fn lower_module_signatures(
                 for p_id in &fnd.params {
                     let p = &hir.fn_params[*p_id];
                     let pt = if let Some(tr) = p.ty {
-                        lower_type_ref_project(
+                        lower_type_ref_project2(
                             hir,
                             tr,
-                            arena_mut,
+                            arena,
                             &*index,
                             decl_registry,
                             &generics_in_scope,
                             Some(uri),
                         )
                     } else {
-                        arena_mut.any_nullable()
+                        arena.any_nullable()
                     };
                     params.push(pt);
                 }
@@ -1740,10 +1718,10 @@ fn lower_module_signatures(
                 };
                 // Vars never declare generics, so no scope needed.
                 let empty: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
-                let var_ty = lower_type_ref_project(
+                let var_ty = lower_type_ref_project2(
                     hir,
                     tr,
-                    arena_mut,
+                    arena,
                     &*index,
                     decl_registry,
                     &empty,
@@ -2878,7 +2856,7 @@ impl ProjectAnalysis {
             let doc = cell.borrow();
             let start = Instant::now();
             // P35.1 — module name from URI for the well-known recogniser.
-            let module_name = crate::stdlib::module_name_from_uri(uri).unwrap_or("module");
+            let module_name = crate::index::module_name_from_uri(uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
                 &self.index.symbols,
@@ -2944,7 +2922,7 @@ impl ProjectAnalysis {
             }
             let doc = cell.borrow();
             // P35.1 — module name from URI for the well-known recogniser.
-            let module_name = crate::stdlib::module_name_from_uri(other_uri).unwrap_or("module");
+            let module_name = crate::index::module_name_from_uri(other_uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
                 &self.index.symbols,
@@ -3189,7 +3167,7 @@ fn lambda_call_arg_diags(
     cur_uri: &Uri,
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     call: &greycat_analyzer_hir::types::CallExpr,
     diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
@@ -3294,16 +3272,16 @@ fn lambda_call_arg_diags(
 /// hide behind its optimistic monomorphization.
 #[allow(clippy::too_many_arguments)]
 fn push_generic_erasure_diag(
-    diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
+    diags: &mut Vec<SemanticDiagnostic>,
     arena: &TypeArena,
     index: &ProjectIndex,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     cur_uri: &Uri,
     runtime_ty: TypeId,
     slot_desc: String,
     byte_range: std::ops::Range<usize>,
 ) {
-    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    use crate::analyzer::{DiagCategory, Severity};
     let runtime_disp =
         display_type_for_module(arena, index, decl_registry, runtime_ty, Some(cur_uri));
     diags.push(SemanticDiagnostic {
@@ -3426,7 +3404,7 @@ fn collect_call_arg_diags_split(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
     well_known: &crate::well_known::WellKnown,
-    decl_registry: &crate::well_known::DeclRegistry,
+    decl_registry: &DeclRegistry,
     cur_uri: &Uri,
     arena: &mut TypeArena,
     diags: &mut Vec<SemanticDiagnostic>,
@@ -3539,7 +3517,7 @@ fn collect_call_arg_diags_split(
             // round-trip — one less type representation, fewer
             // per-call allocations, no foreign-HIR re-walk.
             let fn_uri = foreign_uri_opt.as_ref().unwrap_or(cur_uri);
-            let declared_raw = lower_type_ref_project(
+            let declared_raw = lower_type_ref_project2(
                 &fn_module.hir,
                 declared_ref,
                 arena,
@@ -4665,7 +4643,7 @@ fn validate_module_type_relations(
                     for g in &fnd.generics {
                         generics_in_scope.insert(hir.idents[*g].symbol, own_owner);
                     }
-                    lower_type_ref_project(
+                    lower_type_ref_project2(
                         hir,
                         t,
                         arena,
@@ -5197,7 +5175,7 @@ fn validate_module_type_relations(
         analysis: &AnalysisResult,
         arena: &TypeArena,
         index: &ProjectIndex,
-        decl_registry: &crate::well_known::DeclRegistry,
+        decl_registry: &DeclRegistry,
         expr_id: Idx<Expr>,
         bool_t: TypeId,
         label: &'static str,
@@ -5225,7 +5203,6 @@ fn validate_module_type_relations(
     }
 }
 
-// P22
 /// Project-wide TypeRef lowerer used by
 /// [`ProjectAnalysis::stage_lower_signatures`]. Mirrors
 /// `Cx::lower_type_ref` but uses the project index instead of a
@@ -5234,7 +5211,7 @@ fn validate_module_type_relations(
 /// the names of the generic params owned by the current type / fn to
 /// their `GenericOwner`, so `T` lowers to `GenericParam(T, owner=…)`
 /// instead of `Named { name: "T" }`.
-fn lower_type_ref_project(
+fn lower_type_ref_project2(
     hir: &Hir,
     type_ref: Idx<TypeRef>,
     arena: &mut TypeArena,
@@ -5273,27 +5250,29 @@ fn lower_type_ref_project(
         "null" => arena.null(),
         _ => {
             if !tr.params.is_empty() {
-                let args: Vec<TypeId> = tr
-                    .params
-                    .iter()
-                    .map(|p| {
-                        lower_type_ref_project(
-                            hir,
-                            *p,
-                            arena,
-                            index,
-                            decl_registry,
-                            generics_in_scope,
-                            current_uri,
-                        )
-                    })
-                    .collect();
                 match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => arena.generic(handle, args),
+                    Some(handle) => {
+                        let args: Vec<TypeId> = tr
+                            .params
+                            .iter()
+                            .map(|p| {
+                                lower_type_ref_project2(
+                                    hir,
+                                    *p,
+                                    arena,
+                                    index,
+                                    decl_registry,
+                                    generics_in_scope,
+                                    current_uri,
+                                )
+                            })
+                            .collect();
+                        arena.alloc_generic(handle, args)
+                    }
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
-            } else if let Some(owner) = generics_in_scope.get(&name_sym) {
-                arena.generic_param(name_sym, *owner)
+            } else if let Some(_owner) = generics_in_scope.get(&name_sym) {
+                arena.generic_param(name_sym)
             } else if let Some(arity) = index
                 .resolve_item(decl_registry, current_uri, name_sym)
                 .and_then(|item| index.type_members.get(&item))
@@ -5311,7 +5290,7 @@ fn lower_type_ref_project(
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
                 match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => arena.generic(handle, args),
+                    Some(handle) => arena.alloc_generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(enum_id) = index
@@ -5389,7 +5368,7 @@ fn lower_qualified_type_ref_project(
             .params
             .iter()
             .map(|p| {
-                lower_type_ref_project(
+                lower_type_ref_project2(
                     hir,
                     *p,
                     arena,
@@ -5404,7 +5383,7 @@ fn lower_qualified_type_ref_project(
             .item_id_for(module_uri, leaf_name)
             .filter(|item| decl_registry.lookup(*item).is_some())
         {
-            Some(item) => arena.generic(item, args),
+            Some(item) => arena.alloc_generic(item, args),
             None => arena.unresolved(leaf_name, byte_span),
         };
         if tr.typeof_marker {
@@ -5494,7 +5473,7 @@ fn lower_type_ref_id(
                     )?);
                 }
                 match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => arena.generic(handle, args),
+                    Some(handle) => arena.alloc_generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(arity) = generic_arity_for(name_sym, hir, type_decls, index) {
@@ -5505,7 +5484,7 @@ fn lower_type_ref_id(
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
                 match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => arena.generic(handle, args),
+                    Some(handle) => arena.alloc_generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(id) = registry.lookup(name_sym) {
@@ -5567,7 +5546,7 @@ fn generic_arity_for(
     // Bare-name foreign fallback: walk every non-private Type-ns
     // candidate (mirrors `resolve_decl_handle`'s shape); first with
     // non-zero arity wins.
-    for (uri, decl) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
+    for (uri, decl) in index.locate_decl_in_ns(name_sym, crate::index::Namespace::Type) {
         if index.is_decl_private(uri, decl) {
             continue;
         }
@@ -6253,5 +6232,21 @@ mod tests {
         assert!(pa.index.is_abstract.contains(&id("Animal")));
         assert!(pa.index.is_abstract.contains(&id("Bird")));
         assert!(!pa.index.is_abstract.contains(&id("Cat")));
+    }
+
+    /// `DeclRegistry::record` is idempotent: re-recording the same
+    /// `ItemId` refreshes the cached `Idx<Decl>` without bloating the
+    /// map.
+    #[test]
+    fn decl_registry_record_is_idempotent() {
+        use greycat_analyzer_core::SymbolTable;
+        let mut r = DeclRegistry::new();
+        let decl = Idx::<Decl>::from_raw(0u32);
+        let symbols = SymbolTable::new();
+        let item = ItemId::new(symbols.intern("m"), symbols.intern("Foo"));
+        r.record(item, decl);
+        r.record(item, decl);
+        assert_eq!(r.lookup(item), Some(decl));
+        assert_eq!(r.len(), 1);
     }
 }
