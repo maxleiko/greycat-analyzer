@@ -467,7 +467,6 @@ pub enum Expr {
     Member(MemberExpr),
     Arrow(MemberExpr), // `n->name` — same shape, different access semantics
     Static(StaticExpr),
-    // P15.8
     /// Chained `module::Type::method` (or longer). [`StaticExpr`] only
     /// models `Type::name`; chains lower to this flat segment list
     /// instead. `chain.len() >= 2`.
@@ -481,7 +480,6 @@ pub enum Expr {
     Unary(UnaryExpr),
     Paren(Idx<Expr>, Span),
     Lambda(LambdaExpr),
-    // P19.15
     /// `from..to` (or `from..` / `..to`) range and the math-style
     /// `]from..to]` / `[from..to[` interval — both flatten here since
     /// bracket inclusivity doesn't affect typing. Used as an
@@ -491,7 +489,6 @@ pub enum Expr {
         to: Option<Idx<Expr>>,
         byte_range: Span,
     },
-    // P6.5
     /// `value is Type` — runtime type guard, evaluates to `bool`.
     /// Narrows `value` in the matching branch of an `if` condition.
     Is {
@@ -537,6 +534,10 @@ impl Expr {
             Expr::Unsupported { byte_range, .. } => byte_range.clone(),
         }
     }
+
+    // pub fn is_pathy(&self) -> bool {
+    //     matches!(self, Expr::Member(_) | Expr::Array(_, _) | Expr::Static(_) | Expr::Ident { .. } | Expr::Typ)
+    // }
 }
 
 #[derive(Debug, Clone)]

@@ -25,6 +25,14 @@ use greycat_analyzer_hir::types::{Annotation, Decl, FnDecl, TypeAttr, TypeRef as
 
 use crate::well_known::DeclRegistry;
 
+/// Runtime-exposed value-position globals. The runtime
+/// makes these names available at value position with a fixed type;
+/// they have no `.gcl` declaration, so the resolver/analyzer must seed
+/// them. `(name, primitive)` pairs — extend as new runtime globals are
+/// confirmed against `greycat run`.
+pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
+    &[("Infinity", Primitive::Float), ("NaN", Primitive::Float)];
+
 /// Symbol namespace for top-level decls. The GreyCat runtime
 /// (validated against `greycat build` 8.0.301-dev) keeps three name
 /// slots — type/enum, fn, and module-var (root node) — that may all
@@ -1140,7 +1148,45 @@ impl ProjectIndex {
         self.modules_ingested += 1;
     }
 
-    // P19.9
+    /// Resolves a name to its item id via the project's decl table and registry.
+    ///
+    /// This honors the resolving logic of GreyCat. Local first, then cross-module.
+    pub fn resolve_item(
+        &self,
+        decl_registry: &DeclRegistry,
+        from_uri: Option<&Uri>,
+        name: Symbol,
+    ) -> Option<ItemId> {
+        // Type-namespace only: this mints an [`ItemId`], so a
+        // same-named `Fn` / `Var` decl must never be returned.
+        //
+        // Two-pass: same-module candidates first (unfiltered — private
+        // is visible from within its own module), then cross-module
+        // non-private candidates (private gets filtered to mirror the
+        // resolver's `is_decl_private` rule in `record_use`).
+        if let Some(cur) = from_uri {
+            for (uri, _) in self.locate_decl_in_ns(name, Namespace::Type) {
+                if uri == cur
+                    && let Some(item) = self.item_id_for(uri, name)
+                    && decl_registry.lookup(item).is_some()
+                {
+                    return Some(item);
+                }
+            }
+        }
+        for (uri, decl) in self.locate_decl_in_ns(name, Namespace::Type) {
+            if self.is_decl_private(uri, decl) {
+                continue;
+            }
+            if let Some(item) = self.item_id_for(uri, name)
+                && decl_registry.lookup(item).is_some()
+            {
+                return Some(item);
+            }
+        }
+        None
+    }
+
     /// `Symbol`-keyed location index. Caller must have
     /// already interned `name_sym` through `self.symbols`. `ns` is the
     /// namespace of the decl being registered — letting downstream
@@ -1231,15 +1277,6 @@ fn seed_builtin_names(symbols: &mut SymbolTable, type_names: &mut FxHashSet<Symb
         type_names.insert(sym);
     }
 }
-
-// P19.16
-/// Runtime-exposed value-position globals. The runtime
-/// makes these names available at value position with a fixed type;
-/// they have no `.gcl` declaration, so the resolver/analyzer must seed
-/// them. `(name, primitive)` pairs — extend as new runtime globals are
-/// confirmed against `greycat run`.
-pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
-    &[("Infinity", Primitive::Float), ("NaN", Primitive::Float)];
 
 // P13.5
 /// Read `@iterable` / `@deref` / `@primitive` annotations on a

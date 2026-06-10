@@ -649,8 +649,8 @@ fn lower_type_ref_local(
     decl_registry: &greycat_analyzer_analysis::well_known::DeclRegistry,
 ) -> TypeId {
     let tr = &hir.type_refs[idx];
-    let name = &symbols[hir.idents[tr.name].symbol];
-    let mut base = match name {
+    let name_sym = hir.idents[tr.name].symbol;
+    let mut base = match &symbols[name_sym] {
         "bool" => arena.primitive(Primitive::Bool),
         "int" => arena.primitive(Primitive::Int),
         "float" => arena.primitive(Primitive::Float),
@@ -663,9 +663,7 @@ fn lower_type_ref_local(
         "null" => arena.null(),
         _ => {
             // Resolve the decl handle once — drives both branches below.
-            let handle =
-                greycat_analyzer_analysis::project::resolve_decl_handle(index, decl_registry, name);
-            let name_sym = symbols.intern(name);
+            let handle = index.resolve_item(decl_registry, None, name_sym);
             if !tr.params.is_empty() {
                 let args: Vec<TypeId> = tr
                     .params

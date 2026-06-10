@@ -839,11 +839,10 @@ fn write_type_for_module(
     use greycat_analyzer_core::TypeKind;
     let ty = arena.get(id);
     let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
-        let name = &index.symbols[d.name];
         // Qualify iff bare-name lookup from `current_uri` wouldn't
         // bind to this exact decl — i.e. the bare form would either
         // miss (None) or bind to a different decl.
-        let needs_qual = match resolve_decl_handle_from(index, decl_registry, current_uri, name) {
+        let needs_qual = match index.resolve_item(decl_registry, current_uri, d.name) {
             Some(found) => found != d,
             None => true,
         };
@@ -851,7 +850,7 @@ fn write_type_for_module(
             f.write_str(&index.symbols[d.module])?;
             f.write_str("::")?;
         }
-        f.write_str(name)
+        f.write_str(&index.symbols[d.name])
     };
     match &ty.kind {
         TypeKind::Null => f.write_str("null")?,
@@ -4565,6 +4564,7 @@ fn run_typed_lints_for_module(
         bypass,
     );
     lint_non_exhaustive_with_directives(
+        &index.symbols,
         &module.analysis,
         &mut module.lints,
         &mut module.directives,
@@ -5260,14 +5260,7 @@ fn lower_type_ref_project(
         );
     }
     let name_sym = hir.idents[tr.name].symbol;
-    let name = &index.symbols[name_sym];
-    // Same-module-first decl handle lookup: `private` decls declared
-    // in `current_uri` resolve to themselves; cross-module bare-name
-    // lookups still filter out foreign private decls (matches
-    // GreyCat's `private` semantics enforced in the resolver's
-    // `record_use`).
-    let lookup = |name: &str| resolve_decl_handle_from(index, decl_registry, current_uri, name);
-    let mut base = match name {
+    let mut base = match &index.symbols[name_sym] {
         "bool" => arena.primitive(Primitive::Bool),
         "int" => arena.primitive(Primitive::Int),
         "float" => arena.primitive(Primitive::Float),
@@ -5295,13 +5288,14 @@ fn lower_type_ref_project(
                         )
                     })
                     .collect();
-                match lookup(name) {
+                match index.resolve_item(decl_registry, current_uri, name_sym) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(owner) = generics_in_scope.get(&name_sym) {
                 arena.generic_param(name_sym, *owner)
-            } else if let Some(arity) = lookup(name)
+            } else if let Some(arity) = index
+                .resolve_item(decl_registry, current_uri, name_sym)
                 .and_then(|item| index.type_members.get(&item))
                 .map(|m| m.generics.len())
                 .filter(|n| *n > 0)
@@ -5316,12 +5310,13 @@ fn lower_type_ref_project(
                 // same-module private preferred when applicable.
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
-                match lookup(name) {
+                match index.resolve_item(decl_registry, current_uri, name_sym) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
-            } else if let Some(enum_id) =
-                lookup(name).and_then(|item| index.enum_types.get(&item).copied())
+            } else if let Some(enum_id) = index
+                .resolve_item(decl_registry, current_uri, name_sym)
+                .and_then(|item| index.enum_types.get(&item).copied())
             {
                 // P19.10 — canonical enum TypeId from S7-S11.
                 // Without this, a cross-module enum reference would
@@ -5329,7 +5324,7 @@ fn lower_type_ref_project(
                 // the analyzer's `Static` enum-variant arm
                 // (`if let TypeKind::Enum { variants, .. } = ...`).
                 enum_id
-            } else if let Some(handle) = lookup(name) {
+            } else if let Some(handle) = index.resolve_item(decl_registry, current_uri, name_sym) {
                 // Non-generic concrete type with a known home decl:
                 // mint a handle-keyed `Type(handle)` so it interns
                 // equal to whatever `register_module_types` produced
@@ -5355,65 +5350,6 @@ fn lower_type_ref_project(
         base = arena.nullable(base);
     }
     base
-}
-
-/// P36.2 — resolve a type name to its handle via the project's decl
-/// table and registry. Walks every `(uri, decl)` pair recorded for
-/// `name` and returns the first one already interned in
-/// `decl_registry`. Returns `None` when the name has no recorded
-/// location yet (the per-module analyzer's `register_module_types`
-/// then falls back to `arena.unresolved`).
-// P38.2 — exposed crate-wide so the analyzer's in-module
-// `lower_type_ref` can mint `Type(handle)` for foreign non-generic
-// types.
-pub fn resolve_decl_handle(
-    index: &ProjectIndex,
-    decl_registry: &DeclRegistry,
-    name: &str,
-) -> Option<ItemId> {
-    resolve_decl_handle_from(index, decl_registry, None, name)
-}
-
-/// Same as [`resolve_decl_handle`] but takes the *current* module
-/// URI so same-module access wins over cross-module candidates and
-/// can reach private decls in its own module (matches GreyCat's
-/// `private` semantics — bare-name only requires FQN *across*
-/// modules, not within).
-pub fn resolve_decl_handle_from(
-    index: &ProjectIndex,
-    decl_registry: &DeclRegistry,
-    current_uri: Option<&Uri>,
-    name: &str,
-) -> Option<ItemId> {
-    let name_sym = index.symbols.lookup(name)?;
-    // Type-namespace only: this mints an [`ItemId`], so a
-    // same-named `Fn` / `Var` decl must never be returned.
-    //
-    // Two-pass: same-module candidates first (unfiltered — private
-    // is visible from within its own module), then cross-module
-    // non-private candidates (private gets filtered to mirror the
-    // resolver's `is_decl_private` rule in `record_use`).
-    if let Some(cur) = current_uri {
-        for (uri, _) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
-            if uri == cur
-                && let Some(item) = index.item_id_for(uri, name_sym)
-                && decl_registry.lookup(item).is_some()
-            {
-                return Some(item);
-            }
-        }
-    }
-    for (uri, decl) in index.locate_decl_in_ns(name_sym, crate::stdlib::Namespace::Type) {
-        if index.is_decl_private(uri, decl) {
-            continue;
-        }
-        if let Some(item) = index.item_id_for(uri, name_sym)
-            && decl_registry.lookup(item).is_some()
-        {
-            return Some(item);
-        }
-    }
-    None
 }
 
 /// Signature-side counterpart of [`crate::analyzer::Cx::lower_qualified_type_ref`].
@@ -5540,12 +5476,9 @@ fn lower_type_ref_id(
         "any" => arena.any(),
         "null" => arena.null(),
         _ => {
-            let name = &index.symbols[name_sym];
             // Same-module-first decl handle lookup — mirrors the
             // `lookup` closure in `lower_type_ref_project`. Reaches
             // `private` decls in `current_uri`'s own module.
-            let lookup =
-                |name: &str| resolve_decl_handle_from(index, decl_registry, current_uri, name);
             if !tr.params.is_empty() {
                 let mut args = Vec::with_capacity(tr.params.len());
                 for p in &tr.params {
@@ -5560,7 +5493,7 @@ fn lower_type_ref_id(
                         current_uri,
                     )?);
                 }
-                match lookup(name) {
+                match index.resolve_item(decl_registry, current_uri, name_sym) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
@@ -5571,14 +5504,15 @@ fn lower_type_ref_id(
                 // `lower_type_ref` produce the same shape.
                 let any_q = arena.any_nullable();
                 let args: Vec<TypeId> = vec![any_q; arity];
-                match lookup(name) {
+                match index.resolve_item(decl_registry, current_uri, name_sym) {
                     Some(handle) => arena.generic(handle, args),
                     None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                 }
             } else if let Some(id) = registry.lookup(name_sym) {
                 id
-            } else if let Some(enum_id) =
-                lookup(name).and_then(|item| index.enum_types.get(&item).copied())
+            } else if let Some(enum_id) = index
+                .resolve_item(decl_registry, current_uri, name_sym)
+                .and_then(|item| index.enum_types.get(&item).copied())
             {
                 // Canonical enum TypeId from S7-S11. The body walker's
                 // `lower_type_ref` and `lower_type_ref_project` both
@@ -5588,7 +5522,7 @@ fn lower_type_ref_id(
                 // [Type(handle)])` (validation) fails invariant
                 // arg-equality.
                 enum_id
-            } else if let Some(handle) = lookup(name) {
+            } else if let Some(handle) = index.resolve_item(decl_registry, current_uri, name_sym) {
                 // Foreign non-generic decl: mint `Type(handle)` to
                 // match what the body walker's `lower_type_ref` and
                 // the signature pass's `lower_type_ref_project`

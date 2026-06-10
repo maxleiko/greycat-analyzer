@@ -222,11 +222,9 @@ pub struct NonExhaustiveFinding {
     /// future consumer can correlate against `exhaustive_enum_chains`.
     pub head_id: Idx<Stmt>,
     /// Enum that the chain dispatched on (e.g. `"Example"`).
-    // P25.6
-    pub enum_name: SmolStr,
+    pub enum_name: Symbol,
     /// Variants the chain failed to cover, in declaration order.
-    // P25.6
-    pub missing: Vec<SmolStr>,
+    pub missing: Vec<Symbol>,
     /// Byte range of the head `if`, used as the diagnostic's range.
     pub byte_range: Range<usize>,
 }
@@ -938,7 +936,7 @@ struct CondNarrows {
 /// One arm in an enum-equality chain.
 struct EnumChainArm {
     if_stmt_id: Idx<Stmt>,
-    variant: String,
+    variant: Symbol,
 }
 
 /// Enum-value narrow value: which enum the binding is restricted to,
@@ -953,7 +951,7 @@ struct EnumChain {
     /// on the stack — an outer `if (x == E::A || x == E::B) { ... }`
     /// shrinks the set of expected variants the chain has to cover.
     binding: Idx<Ident>,
-    enum_name: String,
+    enum_name: Symbol,
     arms: Vec<EnumChainArm>,
     /// `true` when the chain ends with a final `else { ... }` or with
     /// a non-conforming `else if` — both act as catch-alls.
@@ -1047,7 +1045,7 @@ struct Cx<'a> {
     /// `Vec<HashMap>` so nested fns inside a generic type see both
     /// outer and inner names.
     // P25.5
-    generics_in_scope: Vec<FxHashMap<SmolStr, GenericOwner>>,
+    generics_in_scope: Vec<FxHashMap<Symbol, GenericOwner>>,
     // P19.11
     /// `this` typing stack. Pushed on entry to a
     /// type's method body (in `visit_type_decl`), popped on exit.
@@ -3281,8 +3279,7 @@ impl<'a> Cx<'a> {
             return self.lower_qualified_type_ref(&tr);
         }
         let name_sym = self.hir.idents[tr.name].symbol;
-        let name: &str = &self.index.symbols[name_sym];
-        let mut base = match name {
+        let mut base = match &self.index.symbols[name_sym] {
             "bool" => self.primitive(Primitive::Bool),
             "int" => self.primitive(Primitive::Int),
             "float" => self.primitive(Primitive::Float),
@@ -3294,22 +3291,20 @@ impl<'a> Cx<'a> {
             "any" => self.any(),
             "null" => self.null(),
             _ => {
-                let name = name.to_string();
                 if !tr.params.is_empty() {
                     let args: Vec<TypeId> =
                         tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
-                    match crate::project::resolve_decl_handle_from(
-                        self.index,
+                    match self.index.resolve_item(
                         self.decl_registry,
                         Some(self.module_uri),
-                        &name,
+                        name_sym,
                     ) {
                         Some(handle) => self.arena.generic(handle, args),
                         None => self
                             .arena
                             .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
                     }
-                } else if let Some(owner) = self.lookup_generic(&name) {
+                } else if let Some(owner) = self.lookup_generic(name_sym) {
                     // P12.1: name matches a fn / type generic param in
                     // scope — produce a `GenericParam` rather than a
                     // bare `Named`, so call-site inference can record
@@ -3339,11 +3334,10 @@ impl<'a> Cx<'a> {
                     // raw-form bridge in `is_assignable_to`.
                     let any_q = self.arena.any_nullable();
                     let args: Vec<TypeId> = vec![any_q; arity];
-                    match crate::project::resolve_decl_handle_from(
-                        self.index,
+                    match self.index.resolve_item(
                         self.decl_registry,
                         Some(self.module_uri),
-                        &name,
+                        name_sym,
                     ) {
                         Some(handle) => self.arena.generic(handle, args),
                         None => self
@@ -3352,13 +3346,10 @@ impl<'a> Cx<'a> {
                     }
                 } else if let Some(id) = self.out.registry.lookup(name_sym) {
                     id
-                } else if let Some(enum_id) = crate::project::resolve_decl_handle_from(
-                    self.index,
-                    self.decl_registry,
-                    Some(self.module_uri),
-                    &name,
-                )
-                .and_then(|item| self.index.enum_types.get(&item).copied())
+                } else if let Some(enum_id) = self
+                    .index
+                    .resolve_item(self.decl_registry, Some(self.module_uri), name_sym)
+                    .and_then(|item| self.index.enum_types.get(&item).copied())
                 {
                     // P19.10 — canonical enum TypeId from the
                     // project signature index. Same reason as
@@ -3371,12 +3362,10 @@ impl<'a> Cx<'a> {
                     // recognise it as the same type as the foreign
                     // declaration site.
                     enum_id
-                } else if let Some(handle) = crate::project::resolve_decl_handle_from(
-                    self.index,
-                    self.decl_registry,
-                    Some(self.module_uri),
-                    &name,
-                ) {
+                } else if let Some(handle) =
+                    self.index
+                        .resolve_item(self.decl_registry, Some(self.module_uri), name_sym)
+                {
                     // P38.2 — non-generic foreign concrete type with
                     // an interned decl handle: mint `Type(handle)` so
                     // the shape matches what `lower_type_ref_project`
@@ -4128,12 +4117,10 @@ impl<'a> Cx<'a> {
             // (no entry in `register_module_types` / pre-ingest path),
             // fall back to `Unresolved` so downstream type-relations
             // stay quiet rather than cascade.
-            match crate::project::resolve_decl_handle_from(
-                self.index,
-                self.decl_registry,
-                Some(self.module_uri),
-                &type_name,
-            ) {
+            match self
+                .index
+                .resolve_item(self.decl_registry, Some(self.module_uri), type_name_sym)
+            {
                 Some(handle) => self.arena.generic(handle, args),
                 None => {
                     let span = self.hir.idents[d.name].byte_range.clone();
@@ -4158,12 +4145,7 @@ impl<'a> Cx<'a> {
     fn push_generic_scope(&mut self, generics: &[Idx<Ident>], owner: GenericOwner) {
         let mut frame = FxHashMap::default();
         for g in generics {
-            // FIXME(symbol-migration): `generics_in_scope` still keys
-            // on `SmolStr` for now — the lookup at the use site
-            // (`lookup_generic(name: &str)`) hasn't moved to `Symbol`
-            // yet. Rebuild the string from the interned symbol.
-            let name: SmolStr = SmolStr::from(&self.index.symbols[self.hir.idents[*g].symbol]);
-            frame.insert(name, owner);
+            frame.insert(self.hir.idents[*g].symbol, owner);
         }
         self.generics_in_scope.push(frame);
     }
@@ -4172,9 +4154,9 @@ impl<'a> Cx<'a> {
         self.generics_in_scope.pop();
     }
 
-    fn lookup_generic(&self, name: &str) -> Option<GenericOwner> {
+    fn lookup_generic(&self, name: Symbol) -> Option<GenericOwner> {
         for frame in self.generics_in_scope.iter().rev() {
-            if let Some(owner) = frame.get(name) {
+            if let Some(owner) = frame.get(&name) {
                 return Some(*owner);
             }
         }
@@ -5438,22 +5420,12 @@ impl<'a> Cx<'a> {
         if chain.arms.len() < 2 {
             return;
         }
-        let Some(enum_sym) = self.index.symbols.lookup(&chain.enum_name) else {
-            return;
-        };
-        // Resolve the enum through the project index, not the module-
-        // local `out.registry`: an enum declared in another module (std
-        // `@library` / `@include`d) is keyed under its declaring module,
-        // so the local registry misses it and exhaustiveness was
-        // silently skipped for every cross-module enum. Mirrors the enum
-        // arm of `lower_type_ref`.
-        let Some(enum_id) = crate::project::resolve_decl_handle_from(
-            self.index,
-            self.decl_registry,
-            Some(self.module_uri),
-            &chain.enum_name,
-        )
-        .and_then(|item| self.index.enum_types.get(&item).copied()) else {
+        // Resolve the enum through the project index
+        let Some(enum_id) = self
+            .index
+            .resolve_item(self.decl_registry, Some(self.module_uri), chain.enum_name)
+            .and_then(|item| self.index.enum_types.get(&item).copied())
+        else {
             return;
         };
         let TypeKind::Enum { variants, .. } = &self.arena.get(enum_id).kind else {
@@ -5469,17 +5441,17 @@ impl<'a> Cx<'a> {
         // in well-typed code, but we ignore the narrow rather than
         // crashing).
         let expected: Vec<Symbol> = match self.lookup_enum_value_narrow(chain.binding) {
-            Some((narrow_enum, narrow_set)) if narrow_enum == enum_sym => declared
+            Some((narrow_enum, narrow_set)) if narrow_enum == chain.enum_name => declared
                 .iter()
                 .copied()
                 .filter(|v| narrow_set.contains(v))
                 .collect(),
             _ => declared,
         };
-        let covered: FxHashSet<&str> = chain.arms.iter().map(|a| a.variant.as_str()).collect();
-        let missing: Vec<&str> = expected
+        let covered: FxHashSet<Symbol> = chain.arms.iter().map(|a| a.variant).collect();
+        let missing: Vec<Symbol> = expected
             .iter()
-            .map(|sym| &self.index.symbols[*sym])
+            .copied()
             .filter(|v| !covered.contains(v))
             .collect();
         if missing.is_empty() {
@@ -5501,9 +5473,8 @@ impl<'a> Cx<'a> {
         }
         self.out.non_exhaustive_findings.push(NonExhaustiveFinding {
             head_id,
-            // P25.6
-            enum_name: chain.enum_name.as_str().into(),
-            missing: missing.iter().map(|v| SmolStr::from(*v)).collect(),
+            enum_name: chain.enum_name,
+            missing,
             byte_range: head_range,
         });
     }
@@ -5564,7 +5535,7 @@ impl<'a> Cx<'a> {
         })
     }
 
-    fn match_enum_eq(&self, cond_id: Idx<Expr>) -> Option<(Idx<Ident>, String, String)> {
+    fn match_enum_eq(&self, cond_id: Idx<Expr>) -> Option<(Idx<Ident>, Symbol, Symbol)> {
         let Expr::Binary(BinaryExpr {
             op: BinOp::Eq,
             left,
@@ -5625,7 +5596,7 @@ impl<'a> Cx<'a> {
         &self,
         ident_side: Idx<Expr>,
         static_side: Idx<Expr>,
-    ) -> Option<(Idx<Ident>, String, String)> {
+    ) -> Option<(Idx<Ident>, Symbol, Symbol)> {
         let Expr::Ident { name: name_idx, .. } = &self.hir.exprs[ident_side] else {
             return None;
         };
@@ -5636,10 +5607,9 @@ impl<'a> Cx<'a> {
         let Expr::Static(StaticExpr { ty, property, .. }) = &self.hir.exprs[static_side] else {
             return None;
         };
-        let enum_name =
-            self.index.symbols[self.hir.idents[self.hir.type_refs[*ty].name].symbol].to_string();
-        let variant = self.index.symbols[self.hir.idents[property.ident()].symbol].to_string();
-        Some((binding, enum_name, variant))
+        let ty_name = self.hir.idents[self.hir.type_refs[*ty].name].symbol;
+        let prop_name = self.hir.idents[property.ident()].symbol;
+        Some((binding, ty_name, prop_name))
     }
 
     fn ident_compared_to_null(&self, l: Idx<Expr>, r: Idx<Expr>) -> Option<Idx<Ident>> {
@@ -5654,7 +5624,6 @@ impl<'a> Cx<'a> {
         None
     }
 
-    // P19.16 + P19.21
     /// `foo.bar != null` / `null != foo.bar`
     /// (and `==`, plus the `->` arrow form `foo->bar` and `arr[N]`
     /// with a literal int index) shape detection. Returns the
@@ -7394,8 +7363,15 @@ fn pick(c: Color): int {
             r.non_exhaustive_findings
         );
         let finding = &r.non_exhaustive_findings[0];
-        assert_eq!(finding.enum_name, "Color");
-        assert_eq!(finding.missing, vec!["Blue".to_string()]);
+        assert_eq!(pa.symbol(&finding.enum_name), "Color");
+        assert_eq!(
+            finding
+                .missing
+                .iter()
+                .map(|s| pa.symbol(s))
+                .collect::<Vec<_>>(),
+            vec!["Blue"]
+        );
         // The legacy `SemanticDiagnostic` channel must not also fire.
         assert!(
             !r.diagnostics
@@ -7520,8 +7496,12 @@ fn pick(c: Color): int {
             r.non_exhaustive_findings
         );
         assert_eq!(
-            r.non_exhaustive_findings[0].missing,
-            vec!["Blue".to_string()]
+            r.non_exhaustive_findings[0]
+                .missing
+                .iter()
+                .map(|s| pa.symbol(s))
+                .collect::<Vec<_>>(),
+            vec!["Blue"]
         );
     }
 

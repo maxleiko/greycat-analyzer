@@ -2188,6 +2188,7 @@ fn lint_unreachable_inner(
 /// directives, `unused-suppression` checks against actual emissions,
 /// quickfixes dispatch by `code`).
 pub fn lint_non_exhaustive_with_directives(
+    symbols: &SymbolTable,
     analysis: &AnalysisResult,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut Directives,
@@ -2196,8 +2197,13 @@ pub fn lint_non_exhaustive_with_directives(
     for finding in &analysis.non_exhaustive_findings {
         let msg = format!(
             "non-exhaustive match over `{}` (missing: {})",
-            finding.enum_name,
-            finding.missing.join(", "),
+            &symbols[finding.enum_name],
+            finding
+                .missing
+                .iter()
+                .map(|s| &symbols[*s])
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         emit_typed(
             out,

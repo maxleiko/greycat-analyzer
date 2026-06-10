@@ -23,14 +23,14 @@ use std::sync::Arc;
 
 use greycat_analyzer_analysis::analyzer::AnalysisResult;
 use greycat_analyzer_analysis::display_fqn;
-use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis, resolve_decl_handle};
+use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_analysis::resolver::Definition;
 use greycat_analyzer_analysis::stdlib::ProjectIndex;
 use greycat_analyzer_analysis::well_known::DeclRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
-    Document, ItemId, SourceManager, SymbolTable, TypeArena, TypeId, TypeKind,
+    Document, ItemId, SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
 };
 use greycat_analyzer_hir::Hir as HirArenas;
 use greycat_analyzer_hir::arena::Idx;
@@ -278,16 +278,16 @@ fn build_module_buffers(
         let decl_raw = decl_idx.into_raw();
         match &hir.decls[decl_idx] {
             Decl::Type(td) => {
-                let name = &symbols[hir.idents[td.name].symbol];
+                let name = hir.idents[td.name].symbol;
                 // Top-level type FQN.
-                if let Some(handle) = resolve_decl_handle(index, registry, name) {
+                if let Some(handle) = index.resolve_item(registry, None, name) {
                     let mut tmp_arena = arena.clone();
                     let id = tmp_arena.alloc_type(handle);
                     let s = fqn_for(&tmp_arena, registry, symbols, index, id);
                     buf.type_fqns.insert(decl_raw, s);
                 }
                 // Extends chain — instantiated parent shape.
-                if let Some(item) = resolve_decl_handle(index, registry, name)
+                if let Some(item) = index.resolve_item(registry, None, name)
                     && let Some(members) = index.type_members.get(&item)
                     && let Some(parent_ty) = members.supertype_ty
                 {
@@ -407,10 +407,10 @@ fn record_fn_signature(
 fn pre_lowered_attr_ty(
     registry: &DeclRegistry,
     index: &ProjectIndex,
-    type_name: &str,
+    type_name: Symbol,
     attr_name: &str,
 ) -> Option<TypeId> {
-    let item = resolve_decl_handle(index, registry, type_name)?;
+    let item = index.resolve_item(registry, None, type_name)?;
     let members = index.type_members.get(&item)?;
     let attr_sym = index.symbols.lookup(attr_name)?;
     members.attr_types.get(&attr_sym).copied()
@@ -461,7 +461,7 @@ fn build_module_view<'a>(
         let decl_raw = decl_idx.into_raw();
         match &hir.decls[decl_idx] {
             Decl::Type(td) => {
-                let name: &'a str = &symbols[hir.idents[td.name].symbol];
+                let name = hir.idents[td.name].symbol;
                 let generics = td
                     .generics
                     .iter()
@@ -496,9 +496,9 @@ fn build_module_view<'a>(
                         _ => placeholder_fn(*m),
                     })
                     .collect();
-                let item = resolve_decl_handle(index, registry, name);
+                let item = index.resolve_item(registry, None, name);
                 types.push(TypeView {
-                    name,
+                    name: &symbols[name],
                     id: decl_raw,
                     type_id: item.and_then(|i| find_type_id_for_item(arena, i)),
                     modifiers: build_modifiers(symbols, &td.modifiers),
@@ -629,8 +629,8 @@ fn build_extends_chain<'a>(
     // have the sub's enclosing `Idx<Decl>` here (the TypeDecl carries
     // only the name ident), so we fall back to a content match — fine
     // for a debug dump and avoids threading another key through.
-    let sub_name = &symbols[hir.idents[td.name].symbol];
-    let sub_item = resolve_decl_handle(index, registry, sub_name);
+    let sub_name = hir.idents[td.name].symbol;
+    let sub_item = index.resolve_item(registry, None, sub_name);
     let first_instantiated: Option<Cow<'a, str>> = buf
         .extends_fqns
         .values()
@@ -836,8 +836,7 @@ fn collect_monomorphizations(
     let mut out: Vec<MonoEntry> = Vec::new();
     for (i, ty) in arena.items.iter().enumerate() {
         if let TypeKind::Generic { decl, args } = &ty.kind {
-            let name = &symbols[decl.name];
-            let handle = resolve_decl_handle(index, registry, name);
+            let handle = index.resolve_item(registry, None, decl.name);
             if handle != Some(*decl) {
                 continue;
             }
