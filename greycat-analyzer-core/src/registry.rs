@@ -1,4 +1,3 @@
-// P15.3
 //! GreyCat registry walker.
 //!
 //! Drives the version-listing dance for `@library("name", "<cursor>")`

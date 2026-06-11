@@ -24,7 +24,7 @@ use std::{
     sync::Arc,
 };
 
-use greycat_analyzer_analysis::{display_fqn, project::DeclRegistry};
+use greycat_analyzer_analysis::display_fqn;
 use greycat_analyzer_analysis::{
     index::ProjectIndex,
     project::{ModuleAnalysis, ProjectAnalysis},
@@ -35,11 +35,9 @@ use greycat_analyzer_core::{
 };
 use greycat_analyzer_core::{Primitive, TypeArena, TypeId};
 use greycat_analyzer_hir::{
-    Hir,
-    arena::Idx,
-    types::{
+    DeclRegistry, Hir, arena::Idx, types::{
         BlockStmt, Decl, Expr, Ident, LiteralKind, Pragma, Stmt, StringPart, TypeRef, UnaryOp,
-    },
+    }
 };
 
 use crate::utils::AnyError;
@@ -341,10 +339,6 @@ fn parse_lc(s: &str) -> Option<(u32, u32)> {
     Some((line, col))
 }
 
-// ---------------------------------------------------------------------------
-// Type-records collection
-// ---------------------------------------------------------------------------
-
 #[allow(clippy::too_many_arguments)]
 fn collect_type_records(
     rel: &Path,
@@ -361,7 +355,7 @@ fn collect_type_records(
     let hir = &module.hir;
     let analysis = &module.analysis;
 
-    // P19 — clone the project arena so `lower_type_ref_local` can
+    // Clone the project arena so `lower_type_ref_local` can
     // mint without disturbing the cached project state. Cloning
     // preserves intern keys, so TypeIds from `analysis.expr_types`
     // remain valid in the local copy.
@@ -391,7 +385,7 @@ fn collect_type_records(
             text,
             &byte_range,
             kind,
-            display_fqn(&arena, decl_registry, symbols, ty, &home),
+            display_fqn(&arena, symbols, ty, &home),
             arena.get(ty).nullable,
         );
         // 1b. P17.5 — for template strings, also emit per-part
@@ -401,7 +395,7 @@ fn collect_type_records(
         if let Expr::String(s) = expr
             && s.has_interpolation()
         {
-            let str_ty_display = display_fqn(&arena, decl_registry, symbols, ty, &home);
+            let str_ty_display = display_fqn(&arena, symbols, ty, &home);
             let str_ty_nullable = arena.get(ty).nullable;
             for part in &s.parts {
                 match part {
@@ -442,7 +436,7 @@ fn collect_type_records(
             text,
             &tref.byte_range,
             "TypeIdent",
-            display_fqn(&arena, decl_registry, symbols, ty, &home),
+            display_fqn(&arena, symbols, ty, &home),
             arena.get(ty).nullable,
         );
     }

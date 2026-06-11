@@ -112,7 +112,7 @@ pub fn lower_module(
     let mut decl_ids: Vec<Idx<Decl>> = Vec::new();
 
     if root.kind() == "module" {
-        // P43.4 — salvage helper so a mid-edit decl wrapped in an
+        // Salvage helper so a mid-edit decl wrapped in an
         // `ERROR` still produces an `Idx<Decl>` when its inner shape is
         // recognizable.
         for (child, _salvaged) in flatten_errors_named_children(root) {
@@ -130,10 +130,6 @@ pub fn lower_module(
     });
     cx.hir
 }
-
-// =============================================================================
-// Declarations
-// =============================================================================
 
 fn lower_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Decl>> {
     match node.kind() {
@@ -427,7 +423,7 @@ fn lower_type_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Typ
     let mut attrs = Vec::new();
     let mut methods = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
-        // P43.4 — type-body walk uses the salvage helper. When an
+        // Type-body walk uses the salvage helper. When an
         // attr or method ends up half-typed (`x: int; foo.` in the
         // body), the surrounding well-formed members still surface.
         for (child, _salvaged) in flatten_errors_named_children(body) {
@@ -491,7 +487,7 @@ fn lower_enum_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Enu
     modifiers.annotations = lower_annotations(cx, node);
     let mut fields = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
-        // P43.4 — enum-body walk via the salvage helper so a mid-edit
+        // Enum-body walk via the salvage helper so a mid-edit
         // variant doesn't drop sibling variants.
         for (c, _salvaged) in flatten_errors_named_children(body) {
             if c.kind() != "enum_field" {
@@ -591,10 +587,6 @@ fn lower_pragma(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Pragma
     })
 }
 
-// =============================================================================
-// Statements
-// =============================================================================
-
 fn lower_block(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt>> {
     let block = lower_block_inline(cx, node)?;
     Some(cx.hir.stmts.alloc(Stmt::Block(block)))
@@ -611,7 +603,7 @@ fn lower_block_inline(
         return None;
     }
     let mut stmts = Vec::new();
-    // P43.3 — salvage helper so a statement-shaped child recovered
+    // Salvage helper so a statement-shaped child recovered
     // from an `ERROR` wrapper is still lowered. Expression-shaped
     // salvage (`(ERROR (member_expr …))`) is wrapped in `Stmt::Expr`.
     // Salvaged stmt ids are recorded so lints can skip them.

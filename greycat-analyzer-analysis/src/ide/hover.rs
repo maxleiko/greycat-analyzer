@@ -16,10 +16,10 @@ use wasm_bindgen::prelude::*;
 
 use greycat_analyzer_core::lsp_types::{Position, Uri};
 use greycat_analyzer_core::{SourceEncoding, SourceManager, SymbolTable, TypeArena, TypeId};
-use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::types::{Decl, Expr, Ident, Stmt, TypeAttr};
+use greycat_analyzer_hir::{DeclRegistry, Hir};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset};
 use greycat_analyzer_syntax::tree_sitter;
 
@@ -30,7 +30,7 @@ use crate::ide::render::{
     render_decl_signature, render_type_decl_with_body, render_type_ref, render_type_ref_with_subst,
 };
 use crate::ide::types::Range as IdeRange;
-use crate::project::{DeclRegistry, ProjectAnalysis};
+use crate::project::ProjectAnalysis;
 use crate::resolver::{Definition, Resolutions, resolve};
 
 /// IDE-shape hover result: markdown body + the source byte-range the
@@ -318,7 +318,7 @@ fn hover_inner(
             let label = format!(
                 "{}: {}",
                 short_expr_label(&hir, &symbols, expr),
-                crate::project::display_type(&arena, &decl_registry, &symbols, *ty),
+                crate::display::display_type(&arena, &decl_registry, &symbols, *ty),
             );
             return Some(hover_from_markdown(wrap_code(&label), r, text, encoding));
         }
@@ -446,7 +446,7 @@ fn ident_hover_markdown(
                 let mut body = format!(
                     "{}: {}",
                     ident_name,
-                    crate::project::display_type(arena, decl_registry, symbols, *ty),
+                    crate::display::display_type(arena, decl_registry, symbols, *ty),
                 );
                 // P-erasure honesty: when the binding holds a generic-fn
                 // result the runtime erases, show the erased shape too —
@@ -455,7 +455,7 @@ fn ident_hover_markdown(
                 if let Some(rt) = analysis.def_runtime_types.get(&name) {
                     body.push_str(&format!(
                         "\n// runtime: {} (GreyCat erases function generics to any?)",
-                        crate::project::display_type(arena, decl_registry, symbols, *rt),
+                        crate::display::display_type(arena, decl_registry, symbols, *rt),
                     ));
                 }
                 wrap_code(&body)
@@ -702,7 +702,7 @@ fn local_binder_hover_inmodule(
         "{}{}: {}",
         prefix,
         name_str,
-        crate::project::display_type(arena, decl_registry, symbols, ty),
+        crate::display::display_type(arena, decl_registry, symbols, ty),
     )))
 }
 

@@ -498,10 +498,6 @@ impl TypeRegistry {
     }
 }
 
-// =============================================================================
-// Subtyping
-// =============================================================================
-
 /// `true` iff a value of `from` is assignable to a slot expecting `to`.
 /// The relation handles primitive widening (int → float), nullability
 /// (T → T?), top/bottom (anything → any, never → anything), and shape

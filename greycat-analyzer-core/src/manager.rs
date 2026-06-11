@@ -29,14 +29,9 @@ pub enum SourceEncoding {
 /// Storage for parsed `.gcl` documents, keyed by LSP `Uri`. Holds a
 /// [`Context`] so callers can trigger recursive loads (`@library` /
 /// `@include`) without threading filesystem access themselves.
-///
-/// Ports `packages/lang/src/project/source_manager.ts` (sources/modules/
-/// errors maps) plus the recursive-load slice of `analyze.ts` (cycle
-/// detection, lib resolution).
 pub struct SourceManager {
     documents: FxHashMap<Uri, RefCell<Document>>,
     ctx: Arc<dyn Context>,
-    // P40.1
     /// URI of the project's entrypoint (`project.gcl` at the project
     /// root). Set by `load_project`, mirrors `LoadReport::entrypoint_uri`
     /// so downstream consumers (the analyzer's pragma walker, in

@@ -30,7 +30,6 @@ use greycat_analyzer_core::{
     GenericOwner, InferenceTable, ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId,
     TypeKind, TypeRegistry, is_assignable_to,
 };
-use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     AssignStmt, AtStmt, BinOp, BinaryExpr, BlockStmt, CallExpr, Decl, DoWhileStmt, Expr, FnDecl,
@@ -39,10 +38,10 @@ use greycat_analyzer_hir::types::{
     Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp, VarDeclTop,
     WhileStmt,
 };
+use greycat_analyzer_hir::{DeclRegistry, Hir};
 
 use crate::index::ProjectIndex;
 use crate::lint::{LintDiagnostic, LintSeverity};
-use crate::project::DeclRegistry;
 use crate::resolver::{Definition, Resolutions};
 use crate::well_known::WellKnown;
 
@@ -850,7 +849,6 @@ struct CondNarrows {
     else_non_null: Vec<Idx<Ident>>,
     /// `(binding, type)` pairs from `x is T` — narrow x to T in then.
     then_typed: Vec<(Idx<Ident>, Idx<TypeRef>)>,
-    // P19.16
     /// Non-null narrows for member-access *paths*
     /// produced by `foo.bar != null` style guards. Same semantics as
     /// `then_non_null` / `else_non_null`, just keyed by a string path
@@ -1831,8 +1829,8 @@ impl<'a> Cx<'a> {
     /// Registry-aware type-display wrapper. Renders `Foo` / `Map<int,
     /// String>` for decl-keyed types. Use this whenever a diagnostic
     /// or lint message surfaces a type to the user.
-    fn display(&self, id: TypeId) -> crate::project::TypeWithDecls<'_> {
-        crate::project::display_type(self.arena, self.decl_registry, &self.index.symbols, id)
+    fn display(&self, id: TypeId) -> crate::display::TypeWithDecls<'_> {
+        crate::display::display_type(self.arena, self.decl_registry, &self.index.symbols, id)
     }
 
     /// Project-aware assignability check. Like
@@ -2311,7 +2309,7 @@ impl<'a> Cx<'a> {
             }
             let prop_text = self.ident_text(property);
             let prop_range = self.hir.idents[property].byte_range.clone();
-            let recv_display = crate::project::display_type(
+            let recv_display = crate::display::display_type(
                 self.arena,
                 self.decl_registry,
                 &self.index.symbols,
@@ -2445,7 +2443,7 @@ impl<'a> Cx<'a> {
         }
         // `display_type` renders generics (`node<String>` not `node`)
         // for clearer messages.
-        let recv_display = crate::project::display_type(
+        let recv_display = crate::display::display_type(
             self.arena,
             self.decl_registry,
             &self.index.symbols,

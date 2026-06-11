@@ -1,10 +1,6 @@
 //! Module / library / include resolution and the filesystem abstraction
 //! the rest of the analyzer reaches I/O through.
 //!
-//! Ported from the TS `packages/resolver/` (~92 LoC) plus the path-math
-//! helpers and `lib/installed` parser scattered across
-//! `packages/lang/src/project/analyze.ts` and `module_desc.ts`.
-//!
 //! Path math is pure (no I/O, no env reads) and lives at the top of the
 //! module. The [`Context`] trait abstracts the filesystem so the analyzer
 //! can run against either a real fs ([`FsContext`]) or an in-memory mock
@@ -17,10 +13,6 @@ use std::path::{Path, PathBuf};
 /// Directory names skipped by [`Context::iter_gcl`] — matches the TS
 /// `IGNORE` list in `packages/resolver/src/{fs,sync-fs}.ts`.
 const IGNORED_DIRS: &[&str] = &["node_modules", "gcdata", ".git"];
-
-// =============================================================================
-// Path math (pure, no I/O)
-// =============================================================================
 
 /// Resolve `@library("<name>", ...)` to its candidate directory under the
 /// project. Mirrors `path.join(project_dir, 'lib', name)` from the TS port.
@@ -47,13 +39,8 @@ pub fn installed_file_path(project_dir: &Path) -> PathBuf {
     project_dir.join("lib").join("installed")
 }
 
-// =============================================================================
-// `lib/installed` parser
-// =============================================================================
-
 /// Parsed view of `<project_dir>/lib/installed`. Each entry is `name → Some(version)`
-/// for `name=version` lines, or `name → None` for `name=` lines (TS treats an
-/// empty version as a sentinel meaning "installed but version-less"; we mirror).
+/// for `name=version` lines, or `name → None` for `name=` lines
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub entries: BTreeMap<String, Option<String>>,
@@ -80,10 +67,6 @@ pub fn parse_installed_file(content: &str) -> Installed {
     }
     Installed { entries }
 }
-
-// =============================================================================
-// `greycat_home` resolution
-// =============================================================================
 
 /// Errors produced when resolving the GreyCat home directory.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -118,10 +101,6 @@ pub fn try_greycat_home() -> Result<PathBuf, HomeError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     resolve_greycat_home(env.as_deref(), home.as_deref())
 }
-
-// =============================================================================
-// `Context` trait + fs-backed impl
-// =============================================================================
 
 /// Filesystem abstraction the analyzer reaches I/O through. Sync — the
 /// analyzer doesn't need async I/O, and an `async fn` in trait would push
@@ -208,10 +187,6 @@ fn walk_gcl(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {

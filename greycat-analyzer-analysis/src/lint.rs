@@ -16,17 +16,16 @@ use std::ops::Range;
 use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::{ItemId, SymbolTable, TypeArena, TypeId, TypeKind};
-use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, PropertyName, Stmt,
     TypeDecl, UnaryExpr, UnaryOp,
 };
+use greycat_analyzer_hir::{DeclRegistry, Hir};
 
 use crate::analyzer::AnalysisResult;
 use crate::directives::Directives;
 use crate::index::{Namespace, ProjectIndex};
-use crate::project::DeclRegistry;
 use crate::resolver::{Definition, Resolutions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1311,10 +1310,6 @@ fn is_exposed(
         .any(|a| &symbols[a.name.symbol] == "expose")
 }
 
-// =============================================================================
-// Rule: arrow-on-non-deref (P16.6 — typed lint)
-// =============================================================================
-
 /// Walk every `Expr::Arrow` and emit an error when the receiver's type
 /// is not declared with `@deref("methodName")` in the
 /// `ProjectIndex::type_flags` table. Mirrors the GreyCat runtime's
@@ -1725,7 +1720,7 @@ fn check_fn_inferred_return(
     // in this message verbatim, so the qualifier needs to land here —
     // otherwise `--fix` writes an ambiguous bare name and immediately
     // produces an `ambiguous-symbol` diagnostic on the same line.
-    let display = crate::project::display_type_qualified(arena, index, ret_ty);
+    let display = crate::display::display_type_qualified(arena, index, ret_ty);
     let name = &hir.idents[fnd.name];
     emit_typed(
         out,

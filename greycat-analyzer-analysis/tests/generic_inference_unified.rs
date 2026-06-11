@@ -13,7 +13,8 @@
 //! These tests pin the inferred binding type for the call's enclosing
 //! `var` so future refactors can't silently regress the substitution.
 
-use greycat_analyzer_analysis::project::{ProjectAnalysis, display_type};
+use greycat_analyzer_analysis::display::display_type;
+use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::types::{Decl, Stmt};

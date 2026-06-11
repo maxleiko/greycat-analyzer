@@ -1085,13 +1085,12 @@ fn visit_type_ref(cx: &mut Cx, ty_id: Idx<TypeRef>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::project::DeclRegistry;
     use crate::well_known::WellKnown;
 
     use super::*;
     use greycat_analyzer_core::SymbolTable;
-    use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_hir::types::{Decl, Expr};
+    use greycat_analyzer_hir::{DeclRegistry, lower_module};
     use greycat_analyzer_syntax::parse;
 
     fn analyze(src: &str) -> (Hir, Resolutions, SymbolTable) {

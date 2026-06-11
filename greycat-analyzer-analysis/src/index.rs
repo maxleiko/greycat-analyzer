@@ -4,11 +4,10 @@ use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
     ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
 };
-use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, Expr, TypeAttr};
+use greycat_analyzer_hir::{DeclRegistry, Hir};
 
-use crate::project::DeclRegistry;
 use crate::well_known::WellKnown;
 
 /// Runtime-exposed value-position globals. The runtime
@@ -72,313 +71,165 @@ pub struct DeclLocation {
     pub ns: Namespace,
 }
 
-/// Cross-module project context: name tables / structure indices /
-/// native-fn signatures that survive across module ingestion. Distinct
-/// from [`crate::analyzer::AnalysisResult`], which is per-module.
-///
-/// The shared `TypeArena` does NOT live here — it's owned by
-/// [`crate::project::ProjectAnalysis`] and threaded through `ingest`
-/// at construction time so type/enum allocations land in the *one*
-/// arena every downstream stage reads. Earlier revisions kept a
-/// second `TypeArena` on `ProjectIndex`, but its TypeIds were
-/// orphans (no consumer ever read them) and the duplication forced
-/// `lower_module_signatures` to re-allocate every enum, which made
-/// `enum_types` lag the actual signature pass and surface as a
-/// self-named `T not assignable to T` regression class.
-///
-/// Every project-wide map keys on [`Symbol`] instead of
-/// `String`. The names live once in [`Self::symbols`]; map keys are
-/// 32-bit handles. Public lookup helpers ([`Self::has_name`],
-/// [`Self::locate_decl`], [`Self::type_members_for`],
-/// [`Self::fn_signature_for`], [`Self::enum_type_for`],
-/// [`Self::native_for`], [`Self::type_flags_for`], …) keep the
-/// historical `&str` API surface — they translate via `symbols`
-/// internally.
+/// Cross-module project context: name tables, structure indices, and native-fn signatures shared across module ingestion.
+/// The shared `TypeArena` lives in `ProjectAnalysis` and is threaded through `ingest` so all type allocations land in
+/// one arena. Public lookup helpers (`has_name`, `locate_decl`, `type_members_for`, etc.) keep a `&str` API and
+/// translate to `Symbol` internally.
 #[derive(Debug, Default)]
 pub struct ProjectIndex {
-    /// Project-wide string interner. Owns the canonical
-    /// storage for every type / fn / attr / method / enum-variant /
-    /// global / module name the analyzer looks up across modules.
+    /// Project-wide string interner.
+    ///
+    /// Owns canonical storage for every name the analyzer looks up across modules.
     pub symbols: SymbolTable,
-    /// Set of top-level declared types/enums names
+    /// Set of public top-level declared type/enum names.
     pub type_names: FxHashSet<Symbol>,
-    /// Set of top-level declared variables names
+    /// Set of public top-level declared variable names.
     pub var_names: FxHashSet<Symbol>,
-    /// Set of top-level declared functions names
+    /// Set of public top-level declared function names.
     pub fn_names: FxHashSet<Symbol>,
-    /// `(Uri, Idx<Decl>)` pairs whose decl carries the `private`
-    /// modifier. Mirrors the entries in [`Self::decl_locations`] —
-    /// every private decl that goes through `record_decl_location`
-    /// also gets recorded here so the resolver's bare-name lookup
-    /// can filter cross-module candidates by visibility (private
-    /// decls don't participate in bare cross-module resolution; they
-    /// stay reachable only via FQN). Empty by default; populated by
-    /// [`Self::ingest`].
+    /// Private-modifier decl locations
+    ///
+    /// Cross-module bare-name resolution skips these, but FQN lookup still reaches them.
     pub private_locations: FxHashSet<(Uri, Idx<Decl>)>,
-    /// Cross-module decl table: name → every `(Uri, Idx<Decl>, Namespace)`
-    /// triple that introduces a top-level decl with this name across the
-    /// project. Collisions are kept; disambiguation happens at the use
-    /// site via the importing module's lib/include closure. The
-    /// [`Namespace`] tag lets namespace-aware callers (resolver
-    /// `record_use`, `duplicate-decl`, `resolve_decl_handle`) filter
-    /// type-position vs value-position hits without re-fetching the
-    /// `Decl` from foreign HIR. Pragma decls have no name and are
-    /// excluded.
+    /// Cross-module decl table: name -> all `(Uri, Idx<Decl>, Namespace)` triples
+    ///
+    /// Collisions kept, disambiguation at use-site.
     pub decl_locations: FxHashMap<Symbol, Vec<DeclLocation>>,
-    /// Runtime-exposed names. Keyed by the rename string of
-    /// `@expose("renamed")` (or the decl's own name when `@expose` has
-    /// no arg) → every site that exposed under that key. Lets lints /
-    /// capabilities ask "is this name part of the runtime API?".
+    /// `@expose`-renamed -> exposure sites
+    ///
+    /// Lets lints ask "is this name part of the runtime API?".
     pub exposed: FxHashMap<Symbol, Vec<ExposureSite>>,
-    /// Per-type flag bits drawn from `@iterable` / `@deref` /
-    /// `@primitive` annotations on a `type` decl. Keyed by the
-    /// declared type name (`Array`, `nodeTime`, …).
+    /// Per-type flag bits from `@iterable` / `@deref` / `@primitive` annotations, keyed by declared type name.
     pub type_flags: FxHashMap<ItemId, TypeFlags>,
-    /// Per-module `@permission("name")` pragmas. Lets later
-    /// chunks light up "is this module allowed to call X?" checks the
-    /// TS reference declarator threads through `mod.permissions`.
+    /// Per-module `@permission("name")` pragmas for capability checks.
     pub module_permissions: FxHashMap<Uri, FxHashSet<Symbol>>,
-    /// Module-name → URI. Populated from each ingested doc's
-    /// filename stem (i.e. `Document::name()`). Lets the resolver
-    /// recognize `runtime` in `runtime::Identity::create` as a known
-    /// module name (rather than flagging it as unresolved), and lets
-    /// pass 3.5 infer types for `module::Decl` static expressions.
+    /// Module-name -> URI
+    ///
+    /// Lets the resolver recognize module prefixes in `module::Decl` expressions.
     pub module_names: FxHashMap<Symbol, Uri>,
-    /// Files whose stem collides with an already-ingested module's
-    /// stem. The duplicate is excluded from the project closure
-    /// (its decls don't land in `type_members` / `fn_signatures` /
-    /// etc.). The LSP / CLI overlay a `duplicate-module-name`
-    /// Error+UNNECESSARY diagnostic on the duplicate file so the
-    /// user sees both the dim treatment AND the hard error. Records
-    /// `(duplicate_uri → (module_name, existing_uri))`.
+    /// Stem-colliding duplicate modules excluded from the project closure
+    ///
+    /// Overlaid with a `duplicate-module-name` diagnostic.
     pub duplicate_modules: FxHashMap<Uri, (Symbol, Uri)>,
-    // P21
-    /// Pre-computed cross-module structure index. Keyed by the type's
-    /// [`ItemId`] `(module, name)` so two same-named types in
-    /// different modules coexist unambiguously. For each type,
-    /// records the home module URI and a (property name → HIR `Idx`)
-    /// lookup for both attrs and methods. Built incrementally by
-    /// [`Self::ingest`].
+    /// Cross-module structure index keyed by `ItemId`
+    ///
+    /// Maps each type to its home URI and attr/method name -> HIR index.
     pub type_members: FxHashMap<ItemId, TypeMembers>,
-    // P23
-    /// Pre-lowered top-level fn signatures, keyed by fn
-    /// name. First-decl-wins, matching `type_members` collision
-    /// semantics. `home_uri` lets the analyzer's call-typing path
-    /// disambiguate the right module when needed; `return_ty` is
-    /// already minted into the shared arena, so the analyzer applies
-    /// `arena.substitute` at the call site for generic fns. Built
-    /// by `ProjectAnalysis::stage_lower_signatures` after every
-    /// module is loaded but before any body walks.
+    /// Pre-lowered top-level fn signatures keyed by `ItemId`
+    ///
+    /// `return_ty` is already in the shared arena for call-site substitution.
     pub fn_signatures: FxHashMap<ItemId, FnSignature>,
-    // P23
-    /// Enum types pre-registered in the shared project
-    /// arena, keyed by enum name. Lets the analyzer's
-    /// `QualifiedStatic` value-position typing recognise
-    /// `other_module::Foo::a` as the enum `Foo` (not `any`).
+    /// Enum types pre-registered in the shared arena
+    ///
+    /// Lets the analyzer type `module::Enum::variant` as the correct enum rather than `any`.
     pub enum_types: FxHashMap<ItemId, TypeId>,
-    // P19.10
-    /// Pre-lowered top-level `var` declared types,
-    /// keyed by var name. First-decl-wins (same collision rule as
-    /// the rest of the per-name indexes). Built by
-    /// `ProjectAnalysis::stage_lower_signatures`. Lets the analyzer
-    /// type a bare cross-module reference (`Definition::ProjectDecl`
-    /// pointing at a `Decl::Var`) inline at body-walk time
-    /// without this, `for (k, v in foreign_groups)` over a
-    /// `nodeIndex<String, node<Group>>` declared in another module
-    /// would type the iterable as `type` and bind `v` to `any`.
+    /// Pre-lowered top-level `var` declared types keyed by `ItemId`
+    ///
+    /// Enables inline typing of cross-module var references at body-walk time.
     pub var_types: FxHashMap<ItemId, TypeId>,
-    // P19.16
-    /// Runtime-implemented value-position globals
-    /// (`Infinity`, `NaN`, `-Infinity`) and their declared type.
-    /// These have no `.gcl` declaration but the runtime exposes them
-    /// at well-known names. Seeded once in `seed_builtin_names` and
-    /// consumed by the analyzer's `Expr::Ident` arm when the
-    /// resolver returns `Definition::Project`. Without this entry
-    /// the names would resolve through `has_name` (we register them
-    /// in `values` too) but the body-walker would type them as
-    /// `any`, masking float/int dispatch downstream.
+    /// Runtime-only globals (`Infinity`, `NaN`, `-Infinity`) and their declared types
+    ///
+    /// Seeded by `seed_builtin_names`.
     pub runtime_globals: FxHashMap<Symbol, TypeId>,
-    // P41.1
-    /// [`ItemId`]s of types declared with the `abstract` modifier.
-    /// Centralized so the sealed-hierarchy narrowing pass can ask
-    /// "is this type abstract?" without chasing the owning module's
-    /// HIR. Populated during [`Self::ingest`].
+    /// `ItemId`s of `abstract`-modifier types
+    ///
+    /// Consulted by the sealed-hierarchy narrowing pass.
     pub is_abstract: FxHashSet<ItemId>,
-    // P41.1
-    /// For every type (abstract *and* concrete), the canonically-sorted
-    /// set of concrete leaves reachable through `extends`:
+    /// Per-type sorted closure of concrete leaves reachable through `extends`
     ///
-    /// ```text
-    /// closure(X) = (X itself, iff X is concrete)
-    ///            ∪ ⋃ closure(child) for each direct child of X
-    /// ```
-    ///
-    /// Stored sorted by `ItemId`'s `Ord` impl so the reverse-index
-    /// lookup in [`Self::abstract_by_closure_set`] is order-independent.
-    /// Built by [`populate_subtype_indices`] at the tail of
-    /// [`crate::project::lower_signatures_into`], after every module's
-    /// `supertype` edges are in place.
+    /// Built by `populate_subtype_indices`.
     pub subtype_closure: FxHashMap<ItemId, Box<[ItemId]>>,
-    // P41.1
-    /// Reverse index for the mandatory ancestor-collapse: maps each
-    /// abstract's canonical-sorted closure to that abstract's `ItemId`.
-    /// `narrow_complement` consults this when its subtraction set
-    /// exactly matches some `closure(A)` — collapsing the narrow
-    /// value to `Type(A)` instead of emitting a `Union`. ItemId
-    /// (module-then-name) tie-break on collision (deterministic
-    /// across re-ingest).
+    /// Reverse index: closure-set -> abstract ancestor `ItemId`
+    ///
+    /// Lets `narrow_complement` collapse unions back to the abstract type.
     pub abstract_by_closure_set: FxHashMap<Box<[ItemId]>, ItemId>,
-    /// Total number of modules ingested. Useful for "did stdlib actually
-    /// load?" smoke checks at the LSP boundary.
+    /// Total modules ingested
+    ///
+    /// Useful for "did stdlib load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
 }
 
-/// Top-level fn signature record. `return_ty` is the
-/// pre-lowered return `TypeId` in the shared project arena; it may
-/// be `GenericParam(T, owner=fn)` for generic fns. The analyzer's
-/// `try_member_call_typing` consults this for cross-module Ident
-/// callees and `QualifiedStatic` `module::fn` shapes.
+/// Pre-lowered top-level fn signature; `return_ty` is a `TypeId` in the shared arena and may be
+/// `GenericParam` for generic fns. Consulted by `try_member_call_typing` for cross-module `Ident`
+/// callees and `module::fn` qualified-static shapes.
 #[derive(Debug, Clone)]
 pub struct FnSignature {
     pub home_uri: Uri,
-    /// `None` when the source decl didn't write a `:` return type.
-    /// Consumers that need a TypeId for "what does this call return"
-    /// fall back to `any_nullable` at the use site. Consumers building
-    /// a structural `TypeKind::Lambda` (the fn-ref helper) pass `None`
-    /// through verbatim so the rendered shape is `fn(...)` (no return).
+    /// `None` when the source decl has no explicit return type
+    ///
+    /// Consumers fall back to `any_nullable` at the use site.
     pub return_ty: Option<TypeId>,
-    // P19.9
-    /// Interned generic param names. Resolve back to text
-    /// via the owning [`ProjectIndex::symbols`].
+    /// Interned generic param names
+    ///
+    /// Resolve to text via `ProjectIndex::symbols`.
     pub generics: Vec<Symbol>,
-    // P19.15
-    /// Pre-lowered parameter types in declared order.
-    /// Lets the analyzer's generic-call inference (`try_generic_call_inference`)
-    /// run for cross-module `Definition::ProjectDecl` callees too
-    /// without these the inference path could only fire for
-    /// in-module `Definition::Decl` because the foreign HIR isn't
-    /// reachable from the body walker. Empty for fns declared with
-    /// no params.
+    /// Pre-lowered parameter types in declared order
+    ///
+    /// Enables generic-call inference for cross-module callees.
     pub params: Vec<TypeId>,
-    /// `true` when calling this generic fn yields a runtime-erased
-    /// container result (the GreyCat runtime erases function-level
-    /// generics to `any?`; see [`crate::erasure`]). Drives the
-    /// `generic-erasure` diagnostic for cross-module callees. Always
-    /// `false` for non-generic fns and for fns whose result honors `T`.
+    /// `true` when the runtime erases this generic fn's result to `any?`
+    ///
+    /// Drives the `generic-erasure` diagnostic.
     pub return_erases: bool,
 }
 
-/// Per-type cross-module member index.
-///
-/// **Signature-lowering extension:** `generics`, `attr_types`, and `method_returns`
-/// hold the *project-wide-lowered* signature data. Built by
-/// `ProjectAnalysis::stage_lower_signatures` after every module is
-/// loaded but before any body walks. With these, the analyzer can
-/// type a foreign `recv.attr` / `recv.method()` inline by looking up
-/// the relevant TypeId in the shared arena and applying
-/// `arena.substitute` against the receiver's instantiation — no
-/// post-pass round-trip via `TypeShape`.
+/// Per-type cross-module member index with pre-lowered attr/method types in the shared project arena.
+/// Lets the analyzer type `recv.attr` / `recv.method()` inline via `arena.substitute` without crossing
+/// the foreign HIR boundary.
 #[derive(Debug, Clone)]
 pub struct TypeMembers {
-    /// The uri of the module that declared the type
+    /// URI of the module that declared this type.
     pub home_uri: Uri,
-    /// Attr name → HIR index. Symbol-keyed; resolve to
-    /// text via [`ProjectIndex::symbols`].
+    /// Attr name -> HIR index.
     pub attrs: FxHashMap<Symbol, Idx<TypeAttr>>,
-    /// Attr names in declaration order (including statics). Lets
-    /// cross-module consumers iterate attrs deterministically without
-    /// reaching back into the home module's HIR — the `attrs` /
-    /// `attr_types` hashmaps don't preserve declaration order. Source
-    /// of truth for the "missing required fields" diagnostic's wording,
-    /// which lists attrs in the order the user declared them.
+    /// Attr names in declaration order
+    ///
+    /// Source of truth for "missing required fields" diagnostic wording.
     pub attr_order: Box<[Symbol]>,
-    /// Method name → HIR index. Symbol-keyed.
+    /// Method name -> HIR index.
     pub methods: FxHashMap<Symbol, Idx<Decl>>,
-    /// Ordered list of generic parameter names declared on the
-    /// type (`type Map<K, V> {}` → `[Sym("K"), Sym("V")]`). Empty for
-    /// non-generic types. Used by the analyzer to build a
-    /// `name → TypeId` substitution map from the receiver's
-    /// instantiation args at member-access / call sites.
+    /// Ordered generic param names (`type Map<K, V>` -> `[K, V]`)
+    ///
+    /// Used to build substitution maps at member-access/call sites.
     pub generics: Vec<Symbol>,
-    /// Pre-lowered attr declared types, keyed by attr-name
-    /// [`Symbol`]. `TypeId`s reference the shared project arena
-    /// ([`crate::project::ProjectAnalysis::arena`]). For generic
-    /// types, attr TypeIds may reference `GenericParam(T, owner=this)`
-    /// — call-site substitution is the consumer's job.
+    /// Pre-lowered attr declared types; `TypeId`s reference the shared arena
+    ///
+    /// Generics use `GenericParam` pending call-site substitution.
     pub attr_types: FxHashMap<Symbol, TypeId>,
-    /// Pre-lowered method declared return types. Same arena +
-    /// substitution semantics as `attr_types`. Methods without an
-    /// explicit return type are absent (the analyzer's call-typing
-    /// falls through to the existing inference path).
+    /// Pre-lowered method return types
+    ///
+    /// Same arena/substitution semantics as `attr_types` absent for methods without explicit return types.
     pub method_returns: FxHashMap<Symbol, TypeId>,
-    /// Pre-lowered full signatures for *generic* methods — keyed by
-    /// method-name symbol, populated only when the method declares
-    /// its own `<T, …>` generic params. Lets call-site inference
-    /// run on static / instance / arrow method calls (e.g.
-    /// `type::enum_by_name<T>(...)`) without crossing the foreign
-    /// HIR boundary at body-walk time. Non-generic methods are
-    /// absent and route through the simpler `method_returns` path.
+    /// Full pre-lowered signatures for generic methods only
+    ///
+    /// Enables call-site inference without crossing the foreign HIR boundary.
     pub method_signatures: FxHashMap<Symbol, FnSignature>,
-    /// Names of attrs declared with the `static`
-    /// modifier (`type Foo { static path: String = "..." }`).
-    /// Lets the analyzer's `Expr::Static` value-typing
-    /// distinguish `Foo::path` (which is the value, typed as
-    /// `String`) from a non-static `Foo::path` reference (which is
-    /// a runtime `field` handle). Empty for types with no static
-    /// attrs.
+    /// Names of `static`-modifier attrs
+    ///
+    /// Distinguishes `Foo::path` (value typed as `String`) from a non-static field handle.
     pub static_attrs: FxHashSet<Symbol>,
-    /// Names of attrs declared with the `private` modifier. GreyCat's
-    /// `private` on an attr is read-public / write-private — anyone
-    /// can read `obj.attr`, only the type's constructor (`object_expr`,
-    /// `Foo { attr: 1 }`) can write. The body walker's
-    /// `Expr::Binary(op="=")` arm consults this set on the receiver's
-    /// `TypeMembers` to emit `private-attr-write` on direct
-    /// assignments from outside the constructor.
+    /// Names of `private`-modifier attrs
+    ///
+    /// The assignment checker emits `private-attr-write` for writes outside the constructor.
     pub private_attrs: FxHashSet<Symbol>,
-    /// Names of methods declared with the `static` modifier. Lets
-    /// `resolve_member` filter them out of instance access — the
-    /// runtime resolves `this.from` to an inherited `from: time` attr
-    /// even when a `static fn from(...)` is declared on the same type.
+    /// Names of `static`-modifier methods
+    ///
+    /// Filtered out of instance-access resolution by `resolve_member`.
     pub static_methods: FxHashSet<Symbol>,
-    /// Names of methods declared with the `abstract` modifier.
-    /// Captured at ingest so the LSP `textDocument/declaration`
-    /// handler can walk the supertype chain looking for the abstract
-    /// ancestor of a concrete override without needing to fetch each
-    /// foreign module's HIR.
+    /// Names of `abstract`-modifier methods
+    ///
+    /// Lets the LSP declaration handler walk the supertype chain without fetching foreign HIR.
     pub abstract_methods: FxHashSet<Symbol>,
-    /// Direct supertype's [`ItemId`] (the `Super` in
-    /// `type Sub extends Super`). Drives inheritance: member lookup
-    /// walks `supertype` chains to find inherited attrs / methods,
-    /// and assignability recognises `Type(Sub)` → `Type(Super)`
-    /// (and `node<Sub>` → `node<Super>`) when `Sub` is a descendant
-    /// of `Super`. `None` for types without an explicit `extends`
-    /// clause OR when the parent name didn't resolve to a known item
-    /// at supertype-link time (post-ingest pass — see
-    /// [`crate::project::link_supertypes`]).
+    /// Direct supertype `ItemId`
+    ///
+    /// Drives inheritance lookup and `Type(Sub)` -> `Type(Super)` assignability.
     pub supertype: Option<ItemId>,
-    /// Pre-lowered direct supertype as a project-arena `TypeId`. Holds
-    /// the *instantiated* parent shape: for `Sub extends Base<int>`
-    /// this is `Generic { decl: Base, args: [int] }`; for the generic
-    /// `MultiQuantizer<T> extends Quantizer<Array<T>>` it is
-    /// `Generic { decl: Quantizer, args: [Array<GenericParam(T,
-    /// owner=MultiQuantizer)>] }`. Populated by the signature-
-    /// lowering stage (after every module's types are ingested, so
-    /// foreign supertypes resolve). Lets assignability walk the chain
-    /// with full generic-arg substitution — the symbol-only
-    /// `supertype` field above can only answer "is it a subtype?",
-    /// not "what concrete shape did the parent get instantiated to?".
-    /// `None` for types without an explicit `extends` clause, or when
-    /// the parent name didn't resolve through the project index.
+    /// Instantiated supertype `TypeId` in the shared arena (e.g. `Generic { decl: Base, args: [int] }`);
+    /// enables generic-arg-substituted assignability chain walks.
     pub supertype_ty: Option<TypeId>,
-    /// Pre-resolved deref-target TypeId for types carrying a
-    /// `@deref("methodName")` annotation. Captured during signature
-    /// lowering: the `@deref` annotation names a method, and this
-    /// field caches the method's pre-lowered return TypeId (still in
-    /// the abstract `GenericParam(T, …)` form — call-site
-    /// substitution applies the receiver's instantiation). Lets
-    /// `arrow_deref_receiver` answer `*n` / `n->m()` typing with a
-    /// single field read instead of a name lookup + chain walk per
-    /// access. `None` when the type has no `@deref` annotation.
+    /// Cached pre-lowered return `TypeId` of the `@deref`-annotated method
+    ///
+    /// Lets `arrow_deref_receiver` resolve `*n` / `n->m()` with a single field read.
     pub deref_return_ty: Option<TypeId>,
 }
 
@@ -414,9 +265,7 @@ pub struct TypeFlags {
 pub struct ExposureSite {
     pub uri: Uri,
     pub decl: Idx<Decl>,
-    // P25.6
     pub local_name: Symbol,
-    // P25.6
     pub rename: Option<Symbol>,
 }
 
@@ -453,7 +302,6 @@ impl ProjectIndex {
         idx
     }
 
-    // P19.9
     /// Read-only `&str` → [`Symbol`] lookup. Returns
     /// `None` if `name` was never interned. Hot lookup paths use
     /// this to avoid mutating the symbol table from a `&self`
@@ -472,7 +320,6 @@ impl ProjectIndex {
         Some(ItemId::new(module_sym, name))
     }
 
-    // P19.14
     /// Walk the supertype chain starting at `type_name`,
     /// returning the first `TypeMembers` entry that contains the
     /// member matched by `pred`. Used to find inherited attrs /
@@ -560,7 +407,6 @@ impl ProjectIndex {
         false
     }
 
-    // P19.14
     /// Attr's HIR index, walking the supertype chain. Returns the
     /// `(home_uri, attr_id)` of the type that owns the attr (which
     /// may be the type itself or a parent), so cross-module hover /
@@ -592,7 +438,6 @@ impl ProjectIndex {
         self.walk_member_chain_with_id(type_id, |m| m.attrs.contains_key(&attr_name))
     }
 
-    // P19.14
     /// Method's HIR index, walking the supertype chain.
     pub fn type_method_id_chain(
         &self,
@@ -652,7 +497,6 @@ impl ProjectIndex {
         None
     }
 
-    // P19.14
     /// Pre-lowered attr type, walking the supertype chain. The
     /// `TypeId` lives in the project arena and may reference
     /// `GenericParam(T, owner=parent_type)` if the attr is declared
@@ -662,7 +506,6 @@ impl ProjectIndex {
         members.attr_types.get(&attr_name).copied()
     }
 
-    // P19.14
     /// Pre-lowered method return type, walking the supertype chain.
     pub fn type_method_return_chain(&self, type_id: ItemId, method_name: Symbol) -> Option<TypeId> {
         let members =
@@ -670,7 +513,6 @@ impl ProjectIndex {
         members.method_returns.get(&method_name).copied()
     }
 
-    // P19.14
     /// `true` iff `sub` is `sup` or any of its transitive supertypes
     /// is `sup`. Bounded at 32 hops.
     pub fn is_subtype_of(&self, sub: ItemId, sup: ItemId) -> bool {
@@ -988,7 +830,7 @@ impl ProjectIndex {
             // and capture the rename target into the project-wide
             // exposed map.
             if let Some(modifiers) = modifiers {
-                // P38.4 — tag private decls so the resolver's
+                // Tag private decls so the resolver's
                 // bare-name lookup can filter them out of the
                 // cross-module candidate set. The decl stays in
                 // `decl_locations` (the FQN path still needs to
@@ -1151,7 +993,6 @@ fn seed_builtin_names(symbols: &mut SymbolTable, type_names: &mut FxHashSet<Symb
     }
 }
 
-// P13.5
 /// Read `@iterable` / `@deref` / `@primitive` annotations on a
 /// type decl into a [`TypeFlags`] record.
 fn derive_type_flags(symbols: &SymbolTable, annotations: &[Annotation]) -> TypeFlags {

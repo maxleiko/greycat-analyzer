@@ -8,6 +8,7 @@
 
 use greycat_analyzer_core::registry::RegistryFetcher;
 
+use greycat_analyzer_hir::DeclRegistry;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -28,7 +29,7 @@ use crate::ide::render::{
 use crate::ide::scope::NameSource;
 use crate::ide::types::{Range, TextEdit};
 use crate::index::DeclLocation;
-use crate::project::{DeclRegistry, ModuleAnalysis, ProjectAnalysis};
+use crate::project::{ModuleAnalysis, ProjectAnalysis};
 
 /// IDE-shape `CompletionItemKind` — mirror of the subset of
 /// `lsp_types::CompletionItemKind` constants that the analyzer
@@ -1874,7 +1875,7 @@ fn scope_name_meta(
         }
         NameSource::Local(name_idx) | NameSource::Param(name_idx) => {
             let detail = module.analysis.def_types.get(name_idx).map(|ty| {
-                crate::project::display_type(arena, decl_registry, symbols, *ty).to_string()
+                crate::display::display_type(arena, decl_registry, symbols, *ty).to_string()
             });
             (None, detail, None)
         }

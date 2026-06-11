@@ -32,12 +32,13 @@ use greycat_analyzer_core::{
     TypeKind, is_assignable_to, is_castable,
 };
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
-use greycat_analyzer_hir::{Hir, lower_module};
+use greycat_analyzer_hir::{DeclRegistry, Hir, lower_module};
 
 use crate::analyzer::{
     AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into, seed_builtins,
 };
 use crate::directives::Directives;
+use crate::display::{ProjectTypeDisplay, display_type, display_type_for_module};
 use crate::index::{FnSignature, ProjectIndex};
 use crate::lint::{
     LintDiagnostic, SURFACED_RULES, lint_arrow_on_non_deref_with_directives,
@@ -46,6 +47,7 @@ use crate::lint::{
     lint_redundant_semicolon, lint_surfaced_with_directives, lint_unreachable_with_directives,
     lint_unused_suppressions, run_lints_with_directives,
 };
+use crate::meta_pragmas::LintPragmas;
 use crate::resolver::{Resolutions, resolve_with_index_for};
 use crate::well_known::WellKnown;
 
@@ -161,47 +163,14 @@ pub struct ProjectAnalysis {
     sig_cache: FxHashMap<Uri, ModuleSigCache>,
 }
 
-/// Maps every interned [`ItemId`] to the current HIR's `Idx<Decl>` in
-/// the owning module. The `Idx<Decl>` is HIR-allocation-order — a
-/// property of the *current* lower, not of the decl — so it gets
-/// refreshed on every `record` call (which happens once per decl per
-/// ingest). The URI of the owning module isn't stored here; recover
-/// it via `ProjectIndex::module_names[item.module]`.
-#[derive(Debug, Default, Clone)]
-#[repr(transparent)]
-pub struct DeclRegistry(FxHashMap<ItemId, Idx<Decl>>);
-
-impl DeclRegistry {
-    #[inline]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Idempotent on `item` — re-calling with the same `ItemId`
-    /// refreshes the cached `Idx<Decl>` so [`Self::lookup`] stays
-    /// valid against the most recently-ingested HIR.
-    #[inline]
-    pub fn record(&mut self, item: ItemId, decl: Idx<Decl>) {
-        self.0.insert(item, decl);
-    }
-
-    /// Current `Idx<Decl>` for `item` in its owning module's HIR.
-    /// Only meaningful against the most recently-ingested HIR for
-    /// `item.module`.
-    #[inline]
-    pub fn lookup(&self, item: ItemId) -> Option<Idx<Decl>> {
-        self.0.get(&item).copied()
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
+/// Per-module lowering data structures
+struct LoweredModule {
+    uri: Uri,
+    hir: Hir,
+    lib: String,
+    lower_took: Duration,
+    directives: Directives,
+    pragmas: LintPragmas,
 }
 
 /// What one module contributed to the project signature index.
@@ -398,73 +367,30 @@ impl ProjectAnalysis {
     pub fn analyze_staged(&mut self, manager: &SourceManager) {
         self.reset_state();
 
-        // S1 (lower) — parse + lower every module to HIR. Also primes
-        // the `ProjectIndex` with each module's top-level decl table so
-        // downstream stages can resolve cross-module names. Single
-        // forward pass, no per-module dependency.
         let lowered = self.stage_lower(manager);
-
-        // P40.1 — fold the entrypoint's `@lint_off("…")` / `@lint_on("…")`
-        // pragmas into the project-wide policy. CLI flags (`--off` /
-        // `--on`) have already been merged into `enabled_rules` /
-        // `disabled_rules` before `analyze_staged` ran, so this is
-        // additive: pragmas widen the sets, CLI flags can also widen
-        // them, conflicts within one source aren't resolved here (P40.3
-        // adds `conflicting-lint-pragma`). Per-module pragmas in
-        // non-entrypoint modules land on `ModuleAnalysis` further down.
-        if let Some(entry_uri) = manager.entrypoint_uri() {
-            let entry_pragmas = lowered.iter().find_map(|(uri, _, _, _, _, pragmas)| {
-                if uri == entry_uri {
-                    Some(pragmas)
-                } else {
-                    None
-                }
-            });
-            if let Some(pragmas) = entry_pragmas {
-                self.disabled_rules.extend(pragmas.off.iter().cloned());
-                self.enabled_rules.extend(pragmas.on.iter().cloned());
-            }
-        }
-
-        // S7-S11 (signatures) — lower every type's attr `TypeRef`s and
-        // method return-`TypeRef`s into the shared arena project-wide,
-        // populating `ProjectIndex::type_members.{attr_types,
-        // method_returns}`. With this index in place the analyzer can
-        // type a foreign `recv.attr` / `recv.method()` call inline at
-        // body-walk time — no post-pass `mint_type_shape` round-trip.
+        self.extend_lint_rules(manager, &lowered);
         self.stage_lower_signatures(&lowered);
-
-        // S2-S6 + S12 (per-module slice) — currently bundled inside
-        // `analyze_with_index_into`, which threads name declaration,
-        // structure declaration, and body walking in one pass. P23
-        // peels S12 off into a project-wide body walker.
         self.stage_per_module_analysis(lowered);
-
-        // S12 (cross-module suffix) — post-passes the per-module
-        // analyzer can't run because they need every module's
-        // signatures to be settled first. P22-P23 absorbs them into
-        // the staged S7-S12 work.
-        self.stage_cross_module_post_passes(manager);
-
-        // Post-S12 — qualified-ref bookkeeping for the unused-decl
-        // lint. Lives outside the 12 stages because it mutates the
-        // project index, not the type table.
-        self.stage_compute_qualified_refs(manager);
-
-        // std::fs::write("analysis.ron", format!("{self:#?}")).unwrap();
-
-        // P40.1 — apply project-wide rule policy (`disabled_rules`,
-        // sourced from CLI `--off` + the entrypoint's `@lint_off(...)`)
-        // at the very end, after every emission site has settled.
-        // Earlier filtering would be undone by
-        // `stage_compute_qualified_refs`'s `unused-decl` re-emission.
-        // P40.5 — module-level pragmas no longer apply locally; they
-        // emit `lint-pragma-outside-entrypoint` instead. So this sweep
-        // only consults the project-wide set.
+        self.run_typed_lints(manager, None);
+        self.validate_type_relations(None);
+        self.compute_qualified_refs(manager);
         self.apply_rule_policy(None);
     }
 
-    // P40.1 + P40.5
+    /// Applies the lint rules `@lint_off(...)` and `@lint_on(...)` from the `project.gcl` module
+    /// globally to thye project analysis.
+    fn extend_lint_rules(&mut self, manager: &SourceManager, lowered: &[LoweredModule]) {
+        if let Some(entry_uri) = manager.entrypoint_uri() {
+            for m in lowered {
+                if &m.uri == entry_uri {
+                    self.disabled_rules.extend(m.pragmas.off.iter().cloned());
+                    self.enabled_rules.extend(m.pragmas.on.iter().cloned());
+                    break;
+                }
+            }
+        }
+    }
+
     /// Drop every diagnostic whose rule is in `self.disabled_rules`
     /// (project-wide policy: CLI `--off` + the entrypoint's
     /// `@lint_off(...)`). Runs at the tail of `analyze_staged` and
@@ -494,7 +420,7 @@ impl ProjectAnalysis {
         self.arena = TypeArena::new();
         seed_builtins(&mut self.arena);
         self.index = ProjectIndex::new(&mut self.arena);
-        // P19.6 — cached `TypeId`s reference the old arena, which
+        // Cached `TypeId`s reference the old arena, which
         // we just replaced. Drop the cache so the next
         // `lower_signatures_into` rebuilds against the fresh arena.
         self.sig_cache.clear();
@@ -504,18 +430,8 @@ impl ProjectAnalysis {
     /// the project index. Returns the lowered modules in document-order
     /// so [`Self::stage_per_module_analysis`] can move them into the
     /// per-module cache without re-lowering.
-    fn stage_lower(
-        &mut self,
-        manager: &SourceManager,
-    ) -> Vec<(
-        Uri,
-        Hir,
-        String,
-        Duration,
-        Directives,
-        crate::meta_pragmas::LintPragmas,
-    )> {
-        // P27.1 — three phases. The middle one runs through the
+    fn stage_lower(&mut self, manager: &SourceManager) -> Vec<LoweredModule> {
+        // Three phases. The middle one runs through the
         // `parallel` shim so native targets get rayon and wasm gets
         // a serial fallback; both branches live in `crate::parallel`.
         //
@@ -526,56 +442,63 @@ impl ProjectAnalysis {
         // boundaries. `Tree::clone` is reference-counted internally,
         // so the only real allocations here are the text + lib
         // strings — both bounded by total source size.
-        // P40.5 — capture the entrypoint URI now so the per-module
+        // Capture the entrypoint URI now so the per-module
         // pragma walker can flip behavior when it's NOT the entrypoint.
-        let entrypoint_uri: Option<Uri> = manager.entrypoint_uri().cloned();
-        let docs: Vec<(Uri, String, String, Tree, bool)> = manager
+        let entrypoint_uri: Option<&Uri> = manager.entrypoint_uri();
+
+        struct ModuleToLower {
+            uri: Uri,
+            src: String,
+            lib: String,
+            tree: Tree,
+            is_entry: bool,
+        }
+        let docs: Vec<ModuleToLower> = manager
             .iter()
             .map(|(uri, cell)| {
                 let doc = cell.borrow();
-                let is_entry = entrypoint_uri.as_ref() == Some(uri);
-                (
-                    uri.clone(),
-                    doc.text.clone(),
-                    doc.lib.clone(),
-                    doc.tree.clone(),
-                    is_entry,
-                )
+                ModuleToLower {
+                    uri: uri.clone(),
+                    src: doc.text.clone(),
+                    lib: doc.lib.clone(),
+                    tree: doc.tree.clone(),
+                    is_entry: entrypoint_uri == Some(uri),
+                }
             })
             .collect();
 
         // Phase B (parallel on native, serial on wasm): lower each
         // module + parse its directives. No shared mutable state.
-        let mut lowered: Vec<(
-            Uri,
-            Hir,
-            String,
-            Duration,
-            Directives,
-            crate::meta_pragmas::LintPragmas,
-        )> = crate::parallel::par_map(docs, |(uri, text, lib, tree, is_entry)| {
+        let mut lowered = crate::parallel::par_map(docs, |m| {
             let lower_start = Instant::now();
-            // P35.1 — pass the real module name (filename minus
+            // Pass the real module name (filename minus
             // `.gcl`) so the well-known recognizer can match
             // `(lib, module, name)` triples. Default `"module"`
             // only kicks in for URIs without a recognisable
             // filename, which the recognizer ignores anyway.
-            let module_name = crate::index::module_name_from_uri(&uri).unwrap_or("module");
+            let module_name = crate::index::module_name_from_uri(&m.uri).unwrap_or("module");
             let hir = lower_module(
-                &text,
+                &m.src,
                 &self.index.symbols,
                 module_name,
-                lib.as_str(),
-                tree.root_node(),
+                m.lib.as_str(),
+                m.tree.root_node(),
             );
             let lower_took = lower_start.elapsed();
-            let directives = crate::directives::parse_directives(&text, tree.root_node());
+            let directives = crate::directives::parse_directives(&m.src, m.tree.root_node());
             // P40.1 + P40.5 — walk `@lint_off` / `@lint_on` annotations.
             // Entrypoint: collect rules + validate. Other modules: emit
             // `lint-pragma-outside-entrypoint` and discard the rules.
             let pragmas =
-                crate::meta_pragmas::parse_lint_pragmas(&text, tree.root_node(), is_entry);
-            (uri, hir, lib, lower_took, directives, pragmas)
+                crate::meta_pragmas::parse_lint_pragmas(&m.src, m.tree.root_node(), m.is_entry);
+            LoweredModule {
+                uri: m.uri,
+                hir,
+                lib: m.lib,
+                lower_took,
+                directives,
+                pragmas,
+            }
         });
 
         // Phase C (serial): ingest into the project-wide index. This
@@ -596,17 +519,17 @@ impl ProjectAnalysis {
         // — and (b) remaining ties resolve in deterministic URI order
         // so CI runs and local runs agree on which file gets the
         // `duplicate-module-name` diagnostic.
-        lowered.sort_by(|(a_uri, _, _, _, _, _), (b_uri, _, _, _, _, _)| {
-            let a_is_entry = entrypoint_uri.as_ref() == Some(a_uri);
-            let b_is_entry = entrypoint_uri.as_ref() == Some(b_uri);
+        lowered.sort_by(|a, b| {
+            let a_is_entry = entrypoint_uri == Some(&a.uri);
+            let b_is_entry = entrypoint_uri == Some(&b.uri);
             b_is_entry
                 .cmp(&a_is_entry)
-                .then_with(|| a_uri.as_str().cmp(b_uri.as_str()))
+                .then_with(|| a.uri.as_str().cmp(b.uri.as_str()))
         });
-        for (uri, hir, _lib, _lower_took, _directives, _pragmas) in &lowered {
+        for m in &lowered {
             self.index.ingest(
-                uri,
-                hir,
+                &m.uri,
+                &m.hir,
                 &mut self.arena,
                 &mut self.decl_registry,
                 &mut self.well_known,
@@ -632,19 +555,9 @@ impl ProjectAnalysis {
     /// in the shared arena — directly comparable to anything else
     /// minted into the same arena. Generic params owned by the type
     /// being walked resolve to `GenericParam(T, owner=Type(name))`.
-    fn stage_lower_signatures(
-        &mut self,
-        lowered: &[(
-            Uri,
-            Hir,
-            String,
-            Duration,
-            Directives,
-            crate::meta_pragmas::LintPragmas,
-        )],
-    ) {
-        let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|(u, h, _, _, _, _)| (u, h)).collect();
-        // P35.1 / P36.2 — `decl_registry` + `well_known` slot
+    fn stage_lower_signatures(&mut self, lowered: &[LoweredModule]) {
+        let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|m| (&m.uri, &m.hir)).collect();
+        // `decl_registry` + `well_known` slot
         // recording happen during [`ProjectIndex::ingest`] now, so
         // the signature-lowering pass below sees a fully-populated
         // registry from its first call. (Previously this stage owned
@@ -660,388 +573,6 @@ impl ProjectAnalysis {
             &mut self.sig_cache,
         );
     }
-}
-
-/// `Display`-implementing wrapper returned by
-/// [`ProjectAnalysis::display_type`]. Prefixes `<module>::` whenever
-/// the bare decl name is ambiguous within the project (≥2 modules
-/// export it). When the name is unique, output matches the
-/// registry-aware [`display_type`] byte-for-byte.
-pub struct ProjectTypeDisplay<'a> {
-    project: &'a ProjectAnalysis,
-    id: TypeId,
-}
-
-impl std::fmt::Display for ProjectTypeDisplay<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_type_qualified(f, self.project.arena(), &self.project.index, self.id)
-    }
-}
-
-/// Index-aware [`Display`] wrapper for a [`TypeId`]. Renders the same
-/// way as [`ProjectAnalysis::display_type`] — `module::Name` when the
-/// bare decl name is ambiguous within the project, bare otherwise — but
-/// without requiring a full `ProjectAnalysis`. Lets per-module
-/// consumers (the lints invoked from `run_typed_lints_for_module`)
-/// emit ambiguity-qualified type names in their diagnostic messages so
-/// downstream consumers (the `infer-return-type` quickfix) paste the
-/// qualified form back into source.
-pub fn display_type_qualified<'a>(
-    arena: &'a TypeArena,
-    index: &'a ProjectIndex,
-    id: TypeId,
-) -> QualifiedTypeDisplay<'a> {
-    QualifiedTypeDisplay { arena, index, id }
-}
-
-pub struct QualifiedTypeDisplay<'a> {
-    arena: &'a TypeArena,
-    index: &'a ProjectIndex,
-    id: TypeId,
-}
-
-impl std::fmt::Display for QualifiedTypeDisplay<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_type_qualified(f, self.arena, self.index, self.id)
-    }
-}
-
-fn write_type_qualified(
-    f: &mut std::fmt::Formatter<'_>,
-    arena: &TypeArena,
-    index: &ProjectIndex,
-    id: TypeId,
-) -> std::fmt::Result {
-    let ty = arena.get(id);
-    match &ty.kind {
-        TypeKind::Null => f.write_str("null")?,
-        TypeKind::Any => f.write_str("any")?,
-        TypeKind::Never => f.write_str("never")?,
-        TypeKind::Primitive(p) => f.write_str(p.name())?,
-        TypeKind::Type(d) => write_decl_qualified(f, index, *d)?,
-        TypeKind::Generic { decl, args } => {
-            write_decl_qualified(f, index, *decl)?;
-            write_args_qualified(f, arena, index, args)?;
-        }
-        // A type-ref that didn't resolve flows through as opaque
-        // `any?` — print the degraded form so callers see the honest
-        // shape (the `?` is added by the nullable postfix below
-        // because `arena.unresolved()` builds with nullable: true).
-        TypeKind::Unresolved { .. } => f.write_str("any")?,
-        TypeKind::GenericParam(name) => f.write_str(&index.symbols[*name])?,
-        TypeKind::Lambda { params, ret } => {
-            f.write_str("fn(")?;
-            for (i, p) in params.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type_qualified(f, arena, index, *p)?;
-            }
-            f.write_str(")")?;
-            if let Some(r) = ret {
-                f.write_str(": ")?;
-                write_type_qualified(f, arena, index, *r)?;
-            }
-        }
-        TypeKind::Enum { name, .. } => f.write_str(&index.symbols[*name])?,
-        TypeKind::Union { alts } => {
-            for (i, a) in alts.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(" | ")?;
-                }
-                write_type_qualified(f, arena, index, *a)?;
-            }
-            if ty.nullable
-                && !alts
-                    .iter()
-                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
-            {
-                f.write_str(" | null")?;
-            }
-        }
-        TypeKind::TypeOf(inner) => {
-            f.write_str("typeof ")?;
-            write_type_qualified(f, arena, index, *inner)?;
-        }
-    }
-    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
-        f.write_str("?")?;
-    }
-    Ok(())
-}
-
-fn write_args_qualified(
-    f: &mut std::fmt::Formatter<'_>,
-    arena: &TypeArena,
-    index: &ProjectIndex,
-    args: &[TypeId],
-) -> std::fmt::Result {
-    f.write_str("<")?;
-    for (i, a) in args.iter().enumerate() {
-        if i > 0 {
-            f.write_str(", ")?;
-        }
-        write_type_qualified(f, arena, index, *a)?;
-    }
-    f.write_str(">")
-}
-
-/// Registry-aware [`Display`] wrapper for a [`TypeId`]. Consults
-/// `decl_registry` to recover decl names for `Type(d)` / `Generic{decl,
-/// args}` so error messages and lint diagnostics surface the real
-/// `Foo` / `Map<int, String>`. No module-qualification logic — use
-/// [`ProjectAnalysis::display_type`] when ambiguity disambiguation is
-/// needed.
-pub fn display_type<'a>(
-    arena: &'a TypeArena,
-    decl_registry: &'a DeclRegistry,
-    symbols: &'a SymbolTable,
-    id: TypeId,
-) -> TypeWithDecls<'a> {
-    TypeWithDecls {
-        arena,
-        decl_registry,
-        symbols,
-        id,
-    }
-}
-
-/// Sibling of [`display_type`] that qualifies decls *only when bare
-/// lookup from `current_uri` wouldn't reach them* — i.e. the bare form
-/// is ambiguous, private cross-module, or absent. Used by error
-/// messages that name foreign decls (e.g. cross-module
-/// `argument-type-mismatch`) so the rendered text is itself a valid
-/// reference from the diagnostic's source position. Decls reachable
-/// bare from `current_uri` stay bare to avoid `core::Map` noise.
-pub fn display_type_for_module<'a>(
-    arena: &'a TypeArena,
-    index: &'a ProjectIndex,
-    decl_registry: &'a DeclRegistry,
-    id: TypeId,
-    current_uri: Option<&'a Uri>,
-) -> TypeForModule<'a> {
-    TypeForModule {
-        arena,
-        index,
-        decl_registry,
-        id,
-        current_uri,
-    }
-}
-
-pub struct TypeForModule<'a> {
-    arena: &'a TypeArena,
-    index: &'a ProjectIndex,
-    decl_registry: &'a DeclRegistry,
-    id: TypeId,
-    /// When `Some(uri)`, qualify any decl that bare lookup from `uri`
-    /// wouldn't reach (private cross-module, ambiguous across two
-    /// public modules, or shadowed). When `None`, qualification falls
-    /// back to the project-wide `locate_decl(...).len() > 1`
-    /// ambiguity heuristic — same as [`write_type_qualified`].
-    current_uri: Option<&'a Uri>,
-}
-
-impl std::fmt::Display for TypeForModule<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_type_for_module(
-            f,
-            self.arena,
-            self.index,
-            self.decl_registry,
-            self.id,
-            self.current_uri,
-        )
-    }
-}
-
-fn write_type_for_module(
-    f: &mut std::fmt::Formatter<'_>,
-    arena: &TypeArena,
-    index: &ProjectIndex,
-    decl_registry: &DeclRegistry,
-    id: TypeId,
-    current_uri: Option<&Uri>,
-) -> std::fmt::Result {
-    use greycat_analyzer_core::TypeKind;
-    let ty = arena.get(id);
-    let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
-        // Qualify iff bare-name lookup from `current_uri` wouldn't
-        // bind to this exact decl — i.e. the bare form would either
-        // miss (None) or bind to a different decl.
-        let needs_qual = match index.resolve_item(decl_registry, current_uri, d.name) {
-            Some(found) => found != d,
-            None => true,
-        };
-        if needs_qual {
-            f.write_str(&index.symbols[d.module])?;
-            f.write_str("::")?;
-        }
-        f.write_str(&index.symbols[d.name])
-    };
-    match &ty.kind {
-        TypeKind::Null => f.write_str("null")?,
-        TypeKind::Any => f.write_str("any")?,
-        TypeKind::Never => f.write_str("never")?,
-        TypeKind::Primitive(p) => f.write_str(p.name())?,
-        TypeKind::Type(d) => decl_name(*d, f)?,
-        TypeKind::Generic { decl, args } => {
-            decl_name(*decl, f)?;
-            f.write_str("<")?;
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type_for_module(f, arena, index, decl_registry, *a, current_uri)?;
-            }
-            f.write_str(">")?;
-        }
-        // See `write_type_qualified`: degrade unresolved type-refs to
-        // `any?` in display so error messages don't pretend the name
-        // resolved to something it didn't.
-        TypeKind::Unresolved { .. } => f.write_str("any")?,
-        TypeKind::GenericParam(name) => f.write_str(&index.symbols[*name])?,
-        TypeKind::Lambda { params, ret } => {
-            f.write_str("fn(")?;
-            for (i, p) in params.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type_for_module(f, arena, index, decl_registry, *p, current_uri)?;
-            }
-            f.write_str(")")?;
-            if let Some(r) = ret {
-                f.write_str(": ")?;
-                write_type_for_module(f, arena, index, decl_registry, *r, current_uri)?;
-            }
-        }
-        TypeKind::Enum { name, .. } => f.write_str(&index.symbols[*name])?,
-        TypeKind::Union { alts } => {
-            for (i, a) in alts.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(" | ")?;
-                }
-                write_type_for_module(f, arena, index, decl_registry, *a, current_uri)?;
-            }
-            if ty.nullable
-                && !alts
-                    .iter()
-                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
-            {
-                f.write_str(" | null")?;
-            }
-        }
-        TypeKind::TypeOf(inner) => {
-            f.write_str("typeof ")?;
-            write_type_for_module(f, arena, index, decl_registry, *inner, current_uri)?;
-        }
-    }
-    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
-        f.write_str("?")?;
-    }
-    Ok(())
-}
-
-pub struct TypeWithDecls<'a> {
-    arena: &'a TypeArena,
-    decl_registry: &'a DeclRegistry,
-    symbols: &'a SymbolTable,
-    id: TypeId,
-}
-
-impl std::fmt::Display for TypeWithDecls<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_type_with_decls(f, self.arena, self.decl_registry, self.symbols, self.id)
-    }
-}
-
-fn write_type_with_decls(
-    f: &mut std::fmt::Formatter<'_>,
-    arena: &TypeArena,
-    _decl_registry: &DeclRegistry,
-    symbols: &SymbolTable,
-    id: TypeId,
-) -> std::fmt::Result {
-    use greycat_analyzer_core::TypeKind;
-    let ty = arena.get(id);
-    let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
-        f.write_str(&symbols[d.name])
-    };
-    match &ty.kind {
-        TypeKind::Null => f.write_str("null")?,
-        TypeKind::Any => f.write_str("any")?,
-        TypeKind::Never => f.write_str("never")?,
-        TypeKind::Primitive(p) => f.write_str(p.name())?,
-        TypeKind::Type(d) => decl_name(*d, f)?,
-        TypeKind::Generic { decl, args } => {
-            decl_name(*decl, f)?;
-            f.write_str("<")?;
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type_with_decls(f, arena, _decl_registry, symbols, *a)?;
-            }
-            f.write_str(">")?;
-        }
-        // See `write_type_qualified`: degrade unresolved type-refs to
-        // `any?` in display so error messages don't pretend the name
-        // resolved to something it didn't.
-        TypeKind::Unresolved { .. } => f.write_str("any")?,
-        TypeKind::GenericParam(name) => f.write_str(&symbols[*name])?,
-        TypeKind::Lambda { params, ret } => {
-            f.write_str("fn(")?;
-            for (i, p) in params.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                write_type_with_decls(f, arena, _decl_registry, symbols, *p)?;
-            }
-            f.write_str(")")?;
-            if let Some(r) = ret {
-                f.write_str(": ")?;
-                write_type_with_decls(f, arena, _decl_registry, symbols, *r)?;
-            }
-        }
-        TypeKind::Enum { name, .. } => f.write_str(&symbols[*name])?,
-        TypeKind::Union { alts } => {
-            for (i, a) in alts.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(" | ")?;
-                }
-                write_type_with_decls(f, arena, _decl_registry, symbols, *a)?;
-            }
-            if ty.nullable
-                && !alts
-                    .iter()
-                    .any(|a| matches!(arena.get(*a).kind, TypeKind::Null))
-            {
-                f.write_str(" | null")?;
-            }
-        }
-        TypeKind::TypeOf(inner) => {
-            f.write_str("typeof ")?;
-            write_type_with_decls(f, arena, _decl_registry, symbols, *inner)?;
-        }
-    }
-    if ty.nullable && !matches!(ty.kind, TypeKind::Null | TypeKind::Union { .. }) {
-        f.write_str("?")?;
-    }
-    Ok(())
-}
-
-fn write_decl_qualified(
-    f: &mut std::fmt::Formatter<'_>,
-    index: &ProjectIndex,
-    decl: ItemId,
-) -> std::fmt::Result {
-    // Two same-named items in different modules → render with the
-    // `module::` qualifier; otherwise the bare name is unambiguous.
-    if index.locate_decl(decl.name).len() > 1 {
-        f.write_str(&index.symbols[decl.module])?;
-        f.write_str("::")?;
-    }
-    f.write_str(&index.symbols[decl.name])
 }
 
 /// Fingerprint of the project-wide name set used by
@@ -1142,7 +673,7 @@ fn module_signature_hash(hir: &Hir) -> u64 {
                 }
             }
             Decl::Var(vd) => {
-                // P19.10 — top-level vars contribute their declared
+                // Top-level vars contribute their declared
                 // type to the project signature index, so the hash
                 // must change when the var name or its TypeRef
                 // shape changes.
@@ -1170,14 +701,12 @@ fn hash_type_ref(hasher: &mut DefaultHasher, hir: &Hir, tr: Idx<TypeRef>) {
     0u8.hash(hasher);
 }
 
-// P24
 /// Free-function variant of [`ProjectAnalysis::stage_lower_signatures`]
 /// that takes the arena + index as separate `&mut` borrows. Lets the
 /// `invalidate` path build the `(Uri, &Hir)` slice from references
 /// into `self.modules` without colliding with the `&mut self` recv
 /// the method form would require.
 ///
-// P19.6
 /// When `cache` already has an entry for a module whose
 /// `(sig_hash, name_set_hash)` pair matches the current state, the
 /// cached contributions are reapplied verbatim instead of re-walking
@@ -2247,7 +1776,6 @@ pub(crate) fn is_castable_with_index(
     }
 }
 
-// P19.6
 /// Apply a cached / freshly-built module contribution to
 /// the project index. Mirrors the apply-loop the original
 /// `lower_signatures_into` ran at end-of-pass: `or_insert` semantics
@@ -2296,25 +1824,15 @@ impl ProjectAnalysis {
     /// inside `Cx::visit_decl`. Subsequent extraction passes will split
     /// out S2-S6, S7-S11, and S12 — at which point this stage shrinks
     /// to a thin "wire it all together" call.
-    fn stage_per_module_analysis(
-        &mut self,
-        hirs: Vec<(
-            Uri,
-            Hir,
-            String,
-            Duration,
-            Directives,
-            crate::meta_pragmas::LintPragmas,
-        )>,
-    ) {
+    fn stage_per_module_analysis(&mut self, hirs: Vec<LoweredModule>) {
         let bypass = self.bypass_suppressions;
         let index = &self.index;
-        // P35.x — the std-core `Map` identity lets the resolver treat
+        // The std-core `Map` identity lets the resolver treat
         // `Map { k: v }` keys as value expressions. `Copy`, so the
         // parallel pass-A closure captures it by value.
         let map_decl = self.well_known.map_decl;
 
-        // P26.4 — split the per-module pass into two phases:
+        // Split the per-module pass into two phases:
         //
         //   Pass A (parallel): resolve + HIR-shape lints. Both are
         //   read-only against `&self.index` and write only to their
@@ -2341,14 +1859,14 @@ impl ProjectAnalysis {
             lint_took: Duration,
         }
 
-        let pass_a_run = |(uri, hir, lib, lower_took, mut directives, mut pragmas): (
-            Uri,
-            Hir,
-            String,
-            Duration,
-            Directives,
-            crate::meta_pragmas::LintPragmas,
-        )|
+        let pass_a_run = |LoweredModule {
+                              uri,
+                              hir,
+                              lib,
+                              lower_took,
+                              mut directives,
+                              mut pragmas,
+                          }|
          -> PassAOut {
             let t0 = Instant::now();
             let resolutions = resolve_with_index_for(&hir, index, &uri, map_decl);
@@ -2384,8 +1902,6 @@ impl ProjectAnalysis {
             }
         };
 
-        // P27.1 — single call site, the rayon-vs-serial branch lives
-        // in `crate::parallel`.
         let pass_a: Vec<PassAOut> = crate::parallel::par_map(hirs, pass_a_run);
 
         // Pass B (serial): body walker mutates `self.arena`.
@@ -2434,50 +1950,6 @@ impl ProjectAnalysis {
                 },
             );
         }
-    }
-
-    /// **Stage S12 cross-module suffix.** Remaining post-passes:
-    ///
-    /// - Pass 3.4: cross-module member-expr typing.
-    /// - Pass 3.5: cross-module call return-type
-    ///   inference for Static / QualifiedStatic / Member / Arrow /
-    ///   Ident callees.
-    /// - Pass 3.52: re-bind for-in iteration vars
-    ///   from now-settled iterable types.
-    /// - Fixed-point cascade-closure loop: each pass propagates
-    ///   type information one hop; bound at 5 iterations so a
-    ///   degenerate/cyclic case can't hang.
-    /// - Pass 3.55: typed lint — `arrow-on-non-deref`.
-    /// - Pass 3.6: type-relation validation.
-    ///
-    /// The work each pass does is
-    /// subsumed by the staged S7-S11 (which lowers TypeRefs into the
-    /// shared arena against the *complete* project name set, so
-    /// cross-module attr / method types are resolved at signature
-    /// time) and S12 (which walks bodies against fully-resolved
-    /// signatures, so call-site monomorphization and member typing
-    /// happen inline rather than in a fix-up sweep).
-    fn stage_cross_module_post_passes(&mut self, manager: &SourceManager) {
-        // P23 — passes 3.4 / 3.45 / 3.5 / 3.52 are all gone. The
-        // analyzer's body walker now types Member / Arrow / Static /
-        // QualifiedStatic / Ident calls inline via the S7-S11
-        // signatures index (`Cx::try_member_call_typing`,
-        // `Cx::foreign_member_type`). For-in iterables that depend on
-        // those typings settle naturally during the same body walk.
-        // Only the typed-lint pass (3.55) and type-relation
-        // validation (3.6) survive — both still need to walk every
-        // module's now-settled `expr_types`.
-        self.run_typed_lints(manager, None);
-        self.validate_type_relations(None);
-    }
-
-    /// **Post-S12** — bump `references_to` for every decl that's
-    /// referenced from another module via a qualified-name access
-    /// (`<module>::<name>`, `<module>::<type>::<name>`, etc.). Lets
-    /// the unused-decl lint correctly skip `private` decls referenced
-    /// through their fully-qualified name from elsewhere.
-    fn stage_compute_qualified_refs(&mut self, manager: &SourceManager) {
-        self.compute_qualified_refs(manager);
     }
 
     /// Pass 3.7 — unified type-relation validation. Walks every
@@ -2818,7 +2290,7 @@ impl ProjectAnalysis {
     /// Drops cache entries for documents that are no longer in
     /// `manager` (e.g. closed without a follow-up `did_open`).
     pub fn invalidate(&mut self, manager: &SourceManager, uri: &Uri) {
-        // P24 — pragmatic incremental invalidation. The full Q1-Q5
+        // Pragmatic incremental invalidation. The full Q1-Q5
         // query-DAG (separate hashes per stage, per-Uri Q5 cascade
         // filtering) is captured as a follow-up; today's
         // implementation is the minimum that's *correct* under P19-P23:
@@ -2851,7 +2323,7 @@ impl ProjectAnalysis {
         let mut lower_took = Duration::ZERO;
         let mut changed_lib: Option<String> = None;
         let mut changed_directives: Option<Directives> = None;
-        let mut changed_pragmas: Option<crate::meta_pragmas::LintPragmas> = None;
+        let mut changed_pragmas: Option<LintPragmas> = None;
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
             let start = Instant::now();
@@ -2946,7 +2418,7 @@ impl ProjectAnalysis {
             return;
         };
 
-        // P24 — feed every cached + freshly-lowered HIR through
+        // Feed every cached + freshly-lowered HIR through
         // `lower_signatures_into` so `index.type_members
         // .{attr_types, method_returns}` / `index.fn_signatures` /
         // `index.enum_types` reflect the post-edit signatures. The

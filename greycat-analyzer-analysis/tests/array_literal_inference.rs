@@ -11,7 +11,8 @@
 //! `duration`. That deliberate deviation is asserted by
 //! `binary_time_minus_duration_uses_analyzer_inference`.
 
-use greycat_analyzer_analysis::project::{ProjectAnalysis, display_type};
+use greycat_analyzer_analysis::display::display_type;
+use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_hir::types::{Decl, Stmt};

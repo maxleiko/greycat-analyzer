@@ -24,16 +24,16 @@ use std::sync::Arc;
 use greycat_analyzer_analysis::analyzer::AnalysisResult;
 use greycat_analyzer_analysis::display_fqn;
 use greycat_analyzer_analysis::index::ProjectIndex;
-use greycat_analyzer_analysis::project::{DeclRegistry, ModuleAnalysis, ProjectAnalysis};
+use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
 use greycat_analyzer_analysis::resolver::Definition;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
     Document, ItemId, SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
 };
-use greycat_analyzer_hir::Hir as HirArenas;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Decl, FnDecl, TypeDecl};
+use greycat_analyzer_hir::{DeclRegistry, Hir as HirArenas};
 
 use crate::utils::AnyError;
 
@@ -246,15 +246,9 @@ fn home_lib_for(index: &ProjectIndex, name: &str) -> Option<String> {
     })
 }
 
-fn fqn_for(
-    arena: &TypeArena,
-    registry: &DeclRegistry,
-    symbols: &SymbolTable,
-    index: &ProjectIndex,
-    ty: TypeId,
-) -> String {
+fn fqn_for(arena: &TypeArena, symbols: &SymbolTable, index: &ProjectIndex, ty: TypeId) -> String {
     let home = |n: &str| home_lib_for(index, n);
-    display_fqn(arena, registry, symbols, ty, &home)
+    display_fqn(arena, symbols, ty, &home)
 }
 
 fn build_module_buffers(
@@ -282,7 +276,7 @@ fn build_module_buffers(
                 if let Some(handle) = index.resolve_item(registry, None, name) {
                     let mut tmp_arena = arena.clone();
                     let id = tmp_arena.alloc_type(handle);
-                    let s = fqn_for(&tmp_arena, registry, symbols, index, id);
+                    let s = fqn_for(&tmp_arena, symbols, index, id);
                     buf.type_fqns.insert(decl_raw, s);
                 }
                 // Extends chain — instantiated parent shape.
@@ -290,7 +284,7 @@ fn build_module_buffers(
                     && let Some(members) = index.type_members.get(&item)
                     && let Some(parent_ty) = members.supertype_ty
                 {
-                    let s = fqn_for(arena, registry, symbols, index, parent_ty);
+                    let s = fqn_for(arena, symbols, index, parent_ty);
                     buf.extends_fqns.insert(decl_raw, s);
                 }
                 // Per-attr types.
@@ -300,7 +294,7 @@ fn build_module_buffers(
                     let attr_ty = pre_lowered_attr_ty(registry, index, name, attr_name)
                         .or_else(|| attr.init.and_then(|e| analysis.expr_types.get(&e).copied()));
                     if let Some(ty) = attr_ty {
-                        let s = fqn_for(arena, registry, symbols, index, ty);
+                        let s = fqn_for(arena, symbols, index, ty);
                         buf.attr_fqns.insert((decl_raw, attr_idx.into_raw()), s);
                     }
                 }
@@ -314,7 +308,6 @@ fn build_module_buffers(
                         hir,
                         analysis,
                         arena,
-                        registry,
                         symbols,
                         index,
                         decl_raw,
@@ -325,8 +318,7 @@ fn build_module_buffers(
             }
             Decl::Fn(fnd) => {
                 record_fn_signature(
-                    &mut buf, hir, analysis, arena, registry, symbols, index, decl_raw, decl_raw,
-                    fnd,
+                    &mut buf, hir, analysis, arena, symbols, index, decl_raw, decl_raw, fnd,
                 );
             }
             Decl::Var(vd) => {
@@ -336,7 +328,7 @@ fn build_module_buffers(
                     .copied()
                     .or_else(|| vd.init.and_then(|e| analysis.expr_types.get(&e).copied()));
                 if let Some(ty) = ty {
-                    let s = fqn_for(arena, registry, symbols, index, ty);
+                    let s = fqn_for(arena, symbols, index, ty);
                     buf.var_fqns.insert(decl_raw, s);
                 }
             }
@@ -380,7 +372,6 @@ fn record_fn_signature(
     hir: &HirArenas,
     analysis: &AnalysisResult,
     arena: &TypeArena,
-    registry: &DeclRegistry,
     symbols: &SymbolTable,
     index: &ProjectIndex,
     owner_decl_raw: u32,
@@ -388,13 +379,13 @@ fn record_fn_signature(
     fnd: &FnDecl,
 ) {
     if let Some(ty) = analysis.def_types.get(&fnd.name).copied() {
-        let s = fqn_for(arena, registry, symbols, index, ty);
+        let s = fqn_for(arena, symbols, index, ty);
         buf.fn_return_fqns.insert((owner_decl_raw, fn_decl_raw), s);
     }
     for (pos, &param_idx) in fnd.params.iter().enumerate() {
         let param = &hir.fn_params[param_idx];
         if let Some(ty) = analysis.def_types.get(&param.name).copied() {
-            let s = fqn_for(arena, registry, symbols, index, ty);
+            let s = fqn_for(arena, symbols, index, ty);
             buf.fn_param_fqns
                 .insert((owner_decl_raw, fn_decl_raw, pos as u32), s);
         }
@@ -840,13 +831,13 @@ fn collect_monomorphizations(
                 continue;
             }
             let id = TypeId::from_raw(i as u32);
-            let display = display_fqn(arena, registry, symbols, id, &home);
+            let display = display_fqn(arena, symbols, id, &home);
             if !seen.insert(display.clone()) {
                 continue;
             }
             let arg_strs: Vec<String> = args
                 .iter()
-                .map(|a| display_fqn(arena, registry, symbols, *a, &home))
+                .map(|a| display_fqn(arena, symbols, *a, &home))
                 .collect();
             out.push(MonoEntry {
                 display,
