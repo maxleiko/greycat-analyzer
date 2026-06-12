@@ -32,7 +32,6 @@ pub struct Modifiers {
     pub static_: bool,
     pub abstract_: bool,
     pub native: bool,
-    // P13.4
     /// Annotations on this decl (`@expose("renamed")`, `@tag("mcp")`,
     /// `@max_count(100)`, …). See [`AnnotationArg`] for the per-arg shape.
     pub annotations: Box<[Annotation]>,
@@ -266,10 +265,6 @@ pub struct Pragma {
     pub byte_range: Span,
 }
 
-// =============================================================================
-// Statements
-// =============================================================================
-
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Expr(Idx<Expr>),
@@ -434,10 +429,6 @@ pub struct AtStmt {
     pub block: BlockStmt,
     pub byte_range: Span,
 }
-
-// =============================================================================
-// Expressions
-// =============================================================================
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -796,10 +787,6 @@ pub struct LambdaExpr {
     pub body: BlockStmt,
     pub byte_range: Span,
 }
-
-// =============================================================================
-// Type references (syntactic)
-// =============================================================================
 
 /// A syntactic type reference, modelling the grammar's `type_ident`:
 /// `(ident "::")* ident <generics>? "?"?`.

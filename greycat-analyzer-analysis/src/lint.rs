@@ -3,13 +3,7 @@
 //! A small rule-based framework on top of HIR + Resolutions. Each rule
 //! is a trait impl that walks the module and emits [`LintDiagnostic`]s.
 //! Rules are stable, named (so they can be configured / suppressed in
-//! future), and pure — they don't mutate the inputs.
-//!
-//! Ports the *rule* slice of `packages/cli/src/lint/` (~242 LoC of TS
-//! plus rules embedded in analyzer.ts). The fix-application driver
-//! (sort edits, apply non-overlapping ones, retry) is deferred until
-//! the LSP code-action layer has concrete edit suggestions to apply
-//! ( placeholder).
+//! future), and pure: they don't mutate the inputs.
 
 mod duplicate_decl;
 mod literal_overflow;
@@ -48,7 +42,7 @@ use crate::resolver::{Definition, Resolutions};
 /// Includes both the pure-HIR rules (driven through [`run_lints`]) and
 /// the typed lints driven from the project pipeline (`arrow-on-non-deref`,
 /// the `nullability` family, `infer-return-type`).
-//
+///
 /// When adding a new rule whose intent assumes the code is
 /// syntactically complete (e.g. "this expression has no effect",
 /// "this statement is unreachable in a complete chain"), consult
@@ -85,16 +79,13 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
     ),
     rule(
         "modvar-node-cannot-be-nullable",
-        "module-variable nodes are auto-initialized — drop the trailing `?`",
+        "module-variable nodes are auto-initialized",
     ),
     rule(
         "modvar-node-inner-must-be-nullable",
-        "`node<T>` requires a nullable inner type — use `node<T?>`",
+        "`node<T>` requires a nullable inner type",
     ),
-    rule(
-        "arrow-on-non-deref",
-        "`->` requires a node-tag or `@deref` receiver",
-    ),
+    rule("arrow-on-non-deref", "`->` requires a node receiver"),
     rule(
         "possibly-null",
         "warn when `.` / `->` / `[…]` is used on a possibly-null receiver",
@@ -115,21 +106,16 @@ pub const LINT_RULES: &[LintRuleInfo] = &[
         "infer-return-type",
         "hint when a fn's return type can be inferred from its body",
     ),
-    rule(
-        "unreachable",
-        "hint when a statement is unreachable (after a divergent prior statement, \
-         or the trailing `else` of an exhaustive enum chain)",
-    ),
+    rule("unreachable", "hint when a statement is unreachable"),
     rule(
         "non-exhaustive",
-        "warn when an `if (x == E::A) … else if (x == E::B) …` chain over an enum \
+        "warn when an `if/else if` chain over an enum \
          doesn't cover every variant (and has no catch-all final `else`)",
     ),
     rule(
         "decidable-condition",
-        "warn when an `if` / `while` / `do-while` / `for` condition is statically \
-         decidable to `true` or `false` (e.g. `if (x is int && x is float)`, \
-         `while (true) {}`). Suppress with `// gcl-lint-off decidable-condition` \
+        "warn when a condition is statically decidable to `true` or `false`.\
+         Suppress with `// gcl-lint-off decidable-condition` \
          when the always-true / always-false outcome is intentional.",
     ),
     rule(
