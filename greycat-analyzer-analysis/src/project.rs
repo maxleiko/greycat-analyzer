@@ -47,6 +47,7 @@ use crate::lint::{
     lint_redundant_semicolon, lint_surfaced_with_directives, lint_unreachable_with_directives,
     lint_unused_suppressions, run_lints_with_directives,
 };
+use crate::lower_type_ref::{self, TypeRefLowering};
 use crate::meta_pragmas::{LintPragmas, parse_lint_pragmas};
 use crate::resolver::{Resolutions, resolve_with_index_for};
 use crate::well_known::WellKnown;
@@ -4658,14 +4659,49 @@ fn validate_module_type_relations(
     }
 }
 
-/// Project-wide TypeRef lowerer used by
-/// [`ProjectAnalysis::stage_lower_signatures`]. Mirrors
-/// `Cx::lower_type_ref` but uses the project index instead of a
-/// per-module registry, so foreign type names resolve directly to
-/// `Named { name }` in the shared arena. `generics_in_scope` maps
-/// the names of the generic params owned by the current type / fn to
-/// their `GenericOwner`, so `T` lowers to `GenericParam(T, owner=…)`
-/// instead of `Named { name: "T" }`.
+/// Signature-lowering view for the shared `TypeRef` ladder. No local
+/// registry (signature lowering mints into the index, not a per-module
+/// registry); generic params come from the flat in-scope map.
+struct SigLowerEnv<'a> {
+    hir: &'a Hir,
+    index: &'a ProjectIndex,
+    decl_registry: &'a DeclRegistry,
+    current_uri: Option<&'a Uri>,
+    generics_in_scope: &'a FxHashMap<Symbol, GenericOwner>,
+}
+
+impl TypeRefLowering for SigLowerEnv<'_> {
+    fn hir(&self) -> &Hir {
+        self.hir
+    }
+    fn index(&self) -> &ProjectIndex {
+        self.index
+    }
+    fn decl_registry(&self) -> &DeclRegistry {
+        self.decl_registry
+    }
+    fn current_uri(&self) -> Option<&Uri> {
+        self.current_uri
+    }
+    fn lookup_generic(&self, name: Symbol) -> Option<GenericOwner> {
+        self.generics_in_scope.get(&name).copied()
+    }
+    fn generic_arity_for(&self, name: Symbol) -> Option<usize> {
+        // Signature lowering's arity check requires the decl already be
+        // in `decl_registry` (via `resolve_item`), unlike the body
+        // walk's index-walking `generic_arity_for`.
+        self.index
+            .resolve_item(self.decl_registry, self.current_uri, name)
+            .and_then(|item| self.index.type_members.get(&item))
+            .map(|m| m.generics.len())
+            .filter(|n| *n > 0)
+    }
+}
+
+/// Project-wide TypeRef lowerer used by signature lowering. Uses the
+/// project index instead of a per-module registry, so foreign type
+/// names resolve in the shared arena. `generics_in_scope` maps the
+/// current type / fn's generic params to their `GenericOwner`.
 fn lower_type_ref_project(
     hir: &Hir,
     type_ref: Idx<TypeRef>,
@@ -4675,201 +4711,52 @@ fn lower_type_ref_project(
     generics_in_scope: &FxHashMap<Symbol, GenericOwner>,
     current_uri: Option<&Uri>,
 ) -> TypeId {
-    let tr = hir.type_refs[type_ref].clone();
-    // Qualified ref (`b::Foo`, …): bypass the bare-name ladder. The
-    // resolver-side `bind_qualified_type_leaf` and the body walker's
-    // `lower_qualified_type_ref` use the same module-scoped lookup;
-    // signature lowering does too so all three agree on the shape.
-    if !tr.qualifier.is_empty() {
-        return lower_qualified_type_ref_project(
-            hir,
-            &tr,
-            arena,
-            index,
-            decl_registry,
-            generics_in_scope,
-            current_uri,
-        );
-    }
-    let name_sym = hir.idents[tr.name].symbol;
-    let mut base = match &index.symbols[name_sym] {
-        "bool" => arena.primitive(Primitive::Bool),
-        "int" => arena.primitive(Primitive::Int),
-        "float" => arena.primitive(Primitive::Float),
-        "char" => arena.primitive(Primitive::Char),
-        "String" => arena.primitive(Primitive::String),
-        "time" => arena.primitive(Primitive::Time),
-        "duration" => arena.primitive(Primitive::Duration),
-        "geo" => arena.primitive(Primitive::Geo),
-        "any" => arena.any(),
-        "null" => arena.null(),
-        _ => {
-            if !tr.params.is_empty() {
-                match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => {
-                        let args: Vec<TypeId> = tr
-                            .params
-                            .iter()
-                            .map(|p| {
-                                lower_type_ref_project(
-                                    hir,
-                                    *p,
-                                    arena,
-                                    index,
-                                    decl_registry,
-                                    generics_in_scope,
-                                    current_uri,
-                                )
-                            })
-                            .collect();
-                        arena.alloc_generic(handle, args)
-                    }
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            } else if let Some(_owner) = generics_in_scope.get(&name_sym) {
-                arena.generic_param(name_sym)
-            } else if let Some(arity) = index
-                .resolve_item(decl_registry, current_uri, name_sym)
-                .and_then(|item| index.type_members.get(&item))
-                .map(|m| m.generics.len())
-                .filter(|n| *n > 0)
-            {
-                // Raw-form generic reference: `Tensor` (no params)
-                // ≡ `Tensor<any?, any?>`. Expand at lowering time so
-                // the body walker and validation pass agree on the
-                // same shape; kills the need for any raw-form bridge
-                // in `is_assignable_to`. Routes through
-                // `resolve_decl_handle_from` so the ItemId picks the
-                // same non-private candidate as everywhere else, with
-                // same-module private preferred when applicable.
-                let any_q = arena.any_nullable();
-                let args: Vec<TypeId> = vec![any_q; arity];
-                match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => arena.alloc_generic(handle, args),
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            } else if let Some(enum_id) = index
-                .resolve_item(decl_registry, current_uri, name_sym)
-                .and_then(|item| index.enum_types.get(&item).copied())
-            {
-                // P19.10 — canonical enum TypeId from S7-S11.
-                // Without this, a cross-module enum reference would
-                // mint `Named(name)` (kind != Enum), which breaks
-                // the analyzer's `Static` enum-variant arm
-                // (`if let TypeKind::Enum { variants, .. } = ...`).
-                enum_id
-            } else if let Some(handle) = index.resolve_item(decl_registry, current_uri, name_sym) {
-                // Non-generic concrete type with a known home decl:
-                // mint a handle-keyed `Type(handle)` so it interns
-                // equal to whatever `register_module_types` produced
-                // for the same decl in the per-module analyzer.
-                arena.alloc_type(handle)
-            } else {
-                // No reachable decl: `Unresolved` so hover / display
-                // surface the typo'd name verbatim, behaves like
-                // `any?` for assignability.
-                arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end))
-            }
-        }
+    let mut env = SigLowerEnv {
+        hir,
+        index,
+        decl_registry,
+        current_uri,
+        generics_in_scope,
     };
-    if tr.typeof_marker {
-        // P-typeof — same wrapping rule as the in-module
-        // `Cx::lower_type_ref`. Lifts the lowered inner into a
-        // `TypeOf(...)` so cross-module `FnSignature.params` end up
-        // with the typeof-aware shape and generic inference can match
-        // them against type-literal arguments.
-        base = arena.type_of(base);
-    }
-    if tr.optional {
-        base = arena.nullable(base);
-    }
-    base
+    lower_type_ref::lower_type_ref_with(&mut env, arena, type_ref)
 }
 
-/// Signature-side counterpart of [`crate::analyzer::Cx::lower_qualified_type_ref`].
-/// Same module-scoped resolution shape — the three lowering paths
-/// (signature, body walker, resolver) must agree on which decl a
-/// qualified ref binds to, or cross-arena identity breaks.
-fn lower_qualified_type_ref_project(
-    hir: &Hir,
-    tr: &TypeRef,
-    arena: &mut TypeArena,
-    index: &ProjectIndex,
-    decl_registry: &DeclRegistry,
-    generics_in_scope: &FxHashMap<Symbol, GenericOwner>,
-    current_uri: Option<&Uri>,
-) -> TypeId {
-    let module_segment = *tr
-        .qualifier
-        .last()
-        .expect("lower_qualified_type_ref_project called with empty qualifier");
-    let module_name = hir.idents[module_segment].symbol;
-    let leaf_name = hir.idents[tr.name].symbol;
-    let byte_span = (tr.byte_range.start, tr.byte_range.end);
-
-    let Some(module_uri) = index.module_names.get(&module_name) else {
-        let mut base = arena.unresolved(leaf_name, byte_span);
-        if tr.typeof_marker {
-            base = arena.type_of(base);
-        }
-        if tr.optional {
-            base = arena.nullable(base);
-        }
-        return base;
-    };
-
-    if !tr.params.is_empty() {
-        let args: Vec<TypeId> = tr
-            .params
-            .iter()
-            .map(|p| {
-                lower_type_ref_project(
-                    hir,
-                    *p,
-                    arena,
-                    index,
-                    decl_registry,
-                    generics_in_scope,
-                    current_uri,
-                )
-            })
-            .collect();
-        let mut base = match index
-            .item_id_for(module_uri, leaf_name)
-            .filter(|item| decl_registry.lookup(*item).is_some())
-        {
-            Some(item) => arena.alloc_generic(item, args),
-            None => arena.unresolved(leaf_name, byte_span),
-        };
-        if tr.typeof_marker {
-            base = arena.type_of(base);
-        }
-        if tr.optional {
-            base = arena.nullable(base);
-        }
-        return base;
-    }
-
-    let mut base = match index
-        .item_id_for(module_uri, leaf_name)
-        .filter(|item| decl_registry.lookup(*item).is_some())
-    {
-        Some(item) => arena.alloc_type(item),
-        None => arena.unresolved(leaf_name, byte_span),
-    };
-    if tr.typeof_marker {
-        base = arena.type_of(base);
-    }
-    if tr.optional {
-        base = arena.nullable(base);
-    }
-    base
+/// Validation-pass view for the shared `TypeRef` ladder. `lookup_local`
+/// consults the validation `TypeRegistry` (the working clone of
+/// `analysis.types`); generic params are not in scope here yet.
+struct ValidateLowerEnv<'a> {
+    hir: &'a Hir,
+    index: &'a ProjectIndex,
+    decl_registry: &'a DeclRegistry,
+    current_uri: Option<&'a Uri>,
+    registry: &'a TypeRegistry,
+    type_decls: &'a FxHashMap<Symbol, Idx<Decl>>,
 }
 
-/// Look up a syntactic `TypeRef` and mint a corresponding `TypeId`
-/// into `arena`. `arena` is the validation-pass's working clone of
-/// `analysis.types`, so any new mints land where `is_assignable_to`
-/// can see them.
+impl TypeRefLowering for ValidateLowerEnv<'_> {
+    fn hir(&self) -> &Hir {
+        self.hir
+    }
+    fn index(&self) -> &ProjectIndex {
+        self.index
+    }
+    fn decl_registry(&self) -> &DeclRegistry {
+        self.decl_registry
+    }
+    fn current_uri(&self) -> Option<&Uri> {
+        self.current_uri
+    }
+    fn lookup_local(&self, name: Symbol) -> Option<TypeId> {
+        self.registry.lookup(name)
+    }
+    fn generic_arity_for(&self, name: Symbol) -> Option<usize> {
+        lower_type_ref::generic_arity_for(name, self.hir, self.type_decls, self.index)
+    }
+}
+
+/// Look up a syntactic `TypeRef` and mint a corresponding `TypeId` into
+/// `arena`, the validation-pass's working clone of `analysis.types`, so
+/// new mints land where `is_assignable_to` can see them.
 #[allow(clippy::too_many_arguments)]
 fn lower_type_ref_id(
     hir: &Hir,
@@ -4881,139 +4768,17 @@ fn lower_type_ref_id(
     arena: &mut TypeArena,
     current_uri: Option<&Uri>,
 ) -> Option<TypeId> {
-    let tr = &hir.type_refs[type_ref];
-    // Qualified ref (`b::Foo`, …) — route through the same
-    // module-scoped lookup the resolver and the body walker use, so
-    // all four lowering paths agree on the leaf decl identity.
-    if !tr.qualifier.is_empty() {
-        let generics_in_scope = FxHashMap::default();
-        return Some(lower_qualified_type_ref_project(
-            hir,
-            tr,
-            arena,
-            index,
-            decl_registry,
-            &generics_in_scope,
-            current_uri,
-        ));
-    }
-    let name_sym = hir.idents[tr.name].symbol;
-    let base = match &index.symbols[name_sym] {
-        "bool" => arena.primitive(Primitive::Bool),
-        "int" => arena.primitive(Primitive::Int),
-        "float" => arena.primitive(Primitive::Float),
-        "char" => arena.primitive(Primitive::Char),
-        "String" => arena.primitive(Primitive::String),
-        "time" => arena.primitive(Primitive::Time),
-        "duration" => arena.primitive(Primitive::Duration),
-        "geo" => arena.primitive(Primitive::Geo),
-        "any" => arena.any(),
-        "null" => arena.null(),
-        _ => {
-            // Same-module-first decl handle lookup — mirrors the
-            // `lookup` closure in `lower_type_ref_project`. Reaches
-            // `private` decls in `current_uri`'s own module.
-            if !tr.params.is_empty() {
-                let mut args = Vec::with_capacity(tr.params.len());
-                for p in &tr.params {
-                    args.push(lower_type_ref_id(
-                        hir,
-                        *p,
-                        registry,
-                        index,
-                        decl_registry,
-                        type_decls,
-                        arena,
-                        current_uri,
-                    )?);
-                }
-                match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => arena.alloc_generic(handle, args),
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            } else if let Some(arity) = generic_arity_for(name_sym, hir, type_decls, index) {
-                // Raw-form generic reference: `Tensor` (no params)
-                // ≡ `Tensor<any?, any?>`. Expand here so the
-                // validation pass and the body walker's
-                // `lower_type_ref` produce the same shape.
-                let any_q = arena.any_nullable();
-                let args: Vec<TypeId> = vec![any_q; arity];
-                match index.resolve_item(decl_registry, current_uri, name_sym) {
-                    Some(handle) => arena.alloc_generic(handle, args),
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            } else if let Some(id) = registry.lookup(name_sym) {
-                id
-            } else if let Some(enum_id) = index
-                .resolve_item(decl_registry, current_uri, name_sym)
-                .and_then(|item| index.enum_types.get(&item).copied())
-            {
-                // Canonical enum TypeId from S7-S11. The body walker's
-                // `lower_type_ref` and `lower_type_ref_project` both
-                // hit this branch ahead of `resolve_decl_handle`; the
-                // validation pass has to agree or `Generic("Array",
-                // [Enum{...}])` (body) vs `Generic("Array",
-                // [Type(handle)])` (validation) fails invariant
-                // arg-equality.
-                enum_id
-            } else if let Some(handle) = index.resolve_item(decl_registry, current_uri, name_sym) {
-                // Foreign non-generic decl: mint `Type(handle)` to
-                // match what the body walker's `lower_type_ref` and
-                // the signature pass's `lower_type_ref_project`
-                // produce. Without this, the validation pass would
-                // mint a different shape than the body walker for
-                // the same source token — surfacing as a self-named
-                // "T is not assignable to T" diagnostic.
-                arena.alloc_type(handle)
-            } else {
-                arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end))
-            }
-        }
+    let mut env = ValidateLowerEnv {
+        hir,
+        index,
+        decl_registry,
+        current_uri,
+        registry,
+        type_decls,
     };
-    let mut base = base;
-    if tr.typeof_marker {
-        base = arena.type_of(base);
-    }
-    Some(if tr.optional {
-        arena.nullable(base)
-    } else {
-        base
-    })
-}
-
-/// Shared arity lookup used by `lower_type_ref_id` and (via
-/// `Cx::generic_arity_for` in `analyzer.rs`) by `lower_type_ref`.
-/// Resolution order: a local declaration shadows the project-wide
-/// index. Returns `None` for non-generic decls (arity 0) so the
-/// caller can fall through to the non-generic branches.
-fn generic_arity_for(
-    name_sym: Symbol,
-    hir: &greycat_analyzer_hir::Hir,
-    type_decls: &rustc_hash::FxHashMap<Symbol, Idx<Decl>>,
-    index: &ProjectIndex,
-) -> Option<usize> {
-    if let Some(decl_id) = type_decls.get(&name_sym)
-        && let Decl::Type(td) = &hir.decls[*decl_id]
-        && !td.generics.is_empty()
-    {
-        return Some(td.generics.len());
-    }
-    // Bare-name foreign fallback: walk every non-private Type-ns
-    // candidate (mirrors `resolve_decl_handle`'s shape); first with
-    // non-zero arity wins.
-    for (uri, decl) in index.locate_decl_in_ns(name_sym, crate::index::Namespace::Type) {
-        if index.is_decl_private(uri, decl) {
-            continue;
-        }
-        let Some(item) = index.item_id_for(uri, name_sym) else {
-            continue;
-        };
-        let arity = index.type_members.get(&item)?.generics.len();
-        if arity > 0 {
-            return Some(arity);
-        }
-    }
-    None
+    Some(lower_type_ref::lower_type_ref_with(
+        &mut env, arena, type_ref,
+    ))
 }
 
 // P15.7

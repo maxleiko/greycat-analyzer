@@ -49,14 +49,17 @@ pub mod directives;
 pub mod display;
 pub mod erasure;
 pub mod ide;
+pub mod index;
 pub mod lint;
+/// Single shared `TypeRef` -> `TypeId` lowering ladder. The body walker,
+/// signature lowering, and validation each supply a [`lower_type_ref::TypeRefLowering`]
+/// env; the ladder lives here once so they cannot mint divergent shapes.
+pub(crate) mod lower_type_ref;
 /// Analyzer meta-pragmas: `@lint_off` / `@lint_on` suppression
 /// directives. CST-based, runs pre-HIR, extracts the project's lint
 /// policy. Distinct from [`pragmas`], which validates *GreyCat
 /// language* pragmas (`@permission`, …) against the lowered HIR.
 pub mod meta_pragmas;
-// P27.1
-pub mod index;
 pub mod parallel;
 /// GreyCat language-pragma contract validation (`@permission`, …).
 /// HIR-based, runs post-lowering with the full `ProjectIndex`.
@@ -69,7 +72,6 @@ pub mod resolver;
 /// "lambda is a top-level fn in a scope" mental model demands one
 /// implementation for both — see `return_inference::inferred_return_from_body`.
 pub mod return_inference;
-// P35.1
 pub mod well_known;
 
 pub use display::display_fqn;

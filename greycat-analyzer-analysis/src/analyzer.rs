@@ -42,6 +42,7 @@ use greycat_analyzer_hir::{DeclRegistry, Hir};
 
 use crate::index::{FnSignature, Namespace, ProjectIndex};
 use crate::lint::{LintDiagnostic, LintSeverity};
+use crate::lower_type_ref::{self, TypeRefLowering};
 use crate::resolver::{Definition, Resolutions};
 use crate::well_known::WellKnown;
 
@@ -1049,6 +1050,51 @@ struct Cx<'a> {
     /// after the walk as `generic-in-static-context` — `lower_type_ref`
     /// is a multi-call helper, so emitting inline would double-report.
     static_generic_uses: FxHashSet<Idx<TypeRef>>,
+}
+
+/// Body-walker view of [`Cx`]'s fields for the shared lowering ladder.
+/// Split-borrowed from `Cx` so the ladder gets `&mut arena` separately
+/// from the rest (incl. the `&mut static_generic_uses` sink).
+struct CxLowerEnv<'a> {
+    hir: &'a Hir,
+    index: &'a ProjectIndex,
+    decl_registry: &'a DeclRegistry,
+    module_uri: &'a Uri,
+    out_registry: &'a TypeRegistry,
+    type_decls: &'a FxHashMap<Symbol, Idx<Decl>>,
+    generics_in_scope: &'a [FxHashMap<Symbol, GenericOwner>],
+    inside_static_fn: bool,
+    static_generic_uses: &'a mut FxHashSet<Idx<TypeRef>>,
+}
+
+impl TypeRefLowering for CxLowerEnv<'_> {
+    fn hir(&self) -> &Hir {
+        self.hir
+    }
+    fn index(&self) -> &ProjectIndex {
+        self.index
+    }
+    fn decl_registry(&self) -> &DeclRegistry {
+        self.decl_registry
+    }
+    fn current_uri(&self) -> Option<&Uri> {
+        Some(self.module_uri)
+    }
+    fn lookup_local(&self, name: Symbol) -> Option<TypeId> {
+        self.out_registry.lookup(name)
+    }
+    fn lookup_generic(&self, name: Symbol) -> Option<GenericOwner> {
+        lower_type_ref::lookup_generic_in(self.generics_in_scope, name)
+    }
+    fn generic_arity_for(&self, name: Symbol) -> Option<usize> {
+        lower_type_ref::generic_arity_for(name, self.hir, self.type_decls, self.index)
+    }
+    fn inside_static_fn(&self) -> bool {
+        self.inside_static_fn
+    }
+    fn note_static_generic_use(&mut self, idx: Idx<TypeRef>) {
+        self.static_generic_uses.insert(idx);
+    }
 }
 
 impl<'a> Cx<'a> {
@@ -3191,198 +3237,20 @@ impl<'a> Cx<'a> {
         Some(self.arena.substitute(attr_ty, &subst))
     }
 
-    // Arity of a generic type decl referenced by `name`, when one
-    // exists. Used by `lower_type_ref` to expand a raw-form
-    // reference (`Tensor` with no params) into the canonical
-    // `Tensor<any?; arity>` form so both lowering paths produce the
-    // same shape.
-    //
-    // Resolution order matches `lower_type_ref`: a local
-    // declaration shadows the project-wide index. Returns `None`
-    // for non-generic decls (arity 0) — those go through the
-    // existing non-generic branches.
-    fn generic_arity_for(&self, name_sym: Symbol) -> Option<usize> {
-        use greycat_analyzer_hir::types::Decl;
-        // Local: find the decl by name and inspect its generics.
-        if let Some(decl_id) = self.out.type_decls.get(&name_sym)
-            && let Decl::Type(td) = &self.hir.decls[*decl_id]
-            && !td.generics.is_empty()
-        {
-            return Some(td.generics.len());
-        }
-        // Foreign: walk every non-private cross-module candidate for
-        // this name, returning the first that's generic. Bare-name
-        // resolution is intentionally tolerant — the first matching
-        // generic decl wins, mirroring how `resolve_decl_handle`
-        // picks a `TypeDeclId` from the same candidate set.
-        for (uri, decl) in self.index.locate_decl_in_ns(name_sym, Namespace::Type) {
-            if self.index.is_decl_private(uri, decl) {
-                continue;
-            }
-            let Some(item) = self.index.item_id_for(uri, name_sym) else {
-                continue;
-            };
-            let arity = self.index.type_members.get(&item)?.generics.len();
-            if arity > 0 {
-                return Some(arity);
-            }
-        }
-        None
-    }
-
     // Lower a syntactic TypeRef to a TypeId.
     fn lower_type_ref(&mut self, idx: Idx<TypeRef>) -> TypeId {
-        let tr = &self.hir.type_refs[idx];
-        // Qualified refs (`b::Foo`) bind to the decl in the named
-        // module specifically — bypass the bare-name resolution ladder
-        // so a leaf that exists in multiple modules doesn't bind to
-        // the wrong one. Primitives, generic-param scope, and the
-        // current module's registry don't apply on the right side of
-        // `::`, so the qualified path is much shorter.
-        if !tr.qualifier.is_empty() {
-            return self.lower_qualified_type_ref(tr);
-        }
-        let name_sym = self.hir.idents[tr.name].symbol;
-        let mut base = match &self.index.symbols[name_sym] {
-            "bool" => self.primitive(Primitive::Bool),
-            "int" => self.primitive(Primitive::Int),
-            "float" => self.primitive(Primitive::Float),
-            "char" => self.primitive(Primitive::Char),
-            "String" => self.primitive(Primitive::String),
-            "time" => self.primitive(Primitive::Time),
-            "duration" => self.primitive(Primitive::Duration),
-            "geo" => self.primitive(Primitive::Geo),
-            "any" => self.any(),
-            "null" => self.null(),
-            _ => {
-                if !tr.params.is_empty() {
-                    match self.index.resolve_item(
-                        self.decl_registry,
-                        Some(self.module_uri),
-                        name_sym,
-                    ) {
-                        Some(handle) => {
-                            let args: Vec<TypeId> =
-                                tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
-                            self.arena.alloc_generic(handle, args)
-                        }
-                        None => self
-                            .arena
-                            .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                    }
-                } else if let Some(owner) = self.lookup_generic(name_sym) {
-                    // Name matches a fn / type generic param in
-                    // scope — produce a `GenericParam` rather than a
-                    // bare `Named`, so call-site inference can record
-                    // witnesses for it.
-                    //
-                    // A *type-level* generic referenced from inside a
-                    // `static` method is invalid: a static carries no
-                    // instance, so `T` is unbound (the runtime rejects
-                    // `T {}` and any `T` use). Record the ref for a
-                    // once-per-site `generic-in-static-context` error
-                    // emitted after the walk. Method-level generics
-                    // (`GenericOwner::Function`, e.g. `static fn f<U>()`)
-                    // are the method's own and stay valid. Still mint the
-                    // `GenericParam` so downstream typing is unchanged.
-                    if self.inside_static_fn && matches!(owner, GenericOwner::Type(_)) {
-                        self.static_generic_uses.insert(idx);
-                    }
-                    self.arena.alloc(Type {
-                        kind: TypeKind::GenericParam(name_sym),
-                        nullable: false,
-                    })
-                } else if let Some(arity) = self.generic_arity_for(name_sym) {
-                    // Raw-form generic reference: `Tensor` (no params)
-                    // is equivalent to `Tensor<any?, any?>` per the
-                    // language semantics ("`nodeIndex {}` ===
-                    // `nodeIndex<any?, any?> {}`"). Expand at lowering
-                    // time so the body walker and validation pass
-                    // produce the *same* shape for the same source
-                    // token — kills the need for any `Named ↔ Generic`
-                    // raw-form bridge in `is_assignable_to`.
-                    let any_q = self.arena.any_nullable();
-                    let args: Vec<TypeId> = vec![any_q; arity];
-                    match self.index.resolve_item(
-                        self.decl_registry,
-                        Some(self.module_uri),
-                        name_sym,
-                    ) {
-                        Some(handle) => self.arena.alloc_generic(handle, args),
-                        None => self
-                            .arena
-                            .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                    }
-                } else if let Some(id) = self.out.registry.lookup(name_sym) {
-                    id
-                } else if let Some(enum_id) = self
-                    .index
-                    .resolve_item(self.decl_registry, Some(self.module_uri), name_sym)
-                    .and_then(|item| self.index.enum_types.get(&item).copied())
-                {
-                    // Canonical enum TypeId from the
-                    // project signature index. Same reason as
-                    // `lower_type_ref_project`: a cross-module enum
-                    // ref like `TimeZone` must lower to the
-                    // `TypeKind::Enum { ... }` that
-                    // `lower_module_signatures` minted in the shared
-                    // arena, so `Expr::Static`'s enum-variant arm
-                    // (and `arena.is_assignable_to` exact-match)
-                    // recognise it as the same type as the foreign
-                    // declaration site.
-                    enum_id
-                } else if let Some(handle) =
-                    self.index
-                        .resolve_item(self.decl_registry, Some(self.module_uri), name_sym)
-                {
-                    // Non-generic foreign concrete type with
-                    // an interned decl handle: mint `Type(handle)` so
-                    // the shape matches what `lower_type_ref_project`
-                    // produces for the same decl on the fn-signature
-                    // side. Without this, `ObjectExpr { ty: Sub }` in
-                    // the current module mints `Named("Sub")` while
-                    // the foreign fn parameter `b: Base` lowers to
-                    // `Type(handle_for_Base)`, and the asymmetric
-                    // pair defeats `is_assignable_to_with_index`'s
-                    // `(Type, Type)` extends-walk arm — surfacing
-                    // false `not assignable` diagnostics on cross-
-                    // module subtype assignment. The `Named` fallback
-                    // below remains for the transitional case where
-                    // the decl handle isn't yet interned in
-                    // `decl_registry` and for genuinely-unknown names
-                    // the runtime nonetheless recognises (which
-                    // `has_name` covers via the seeded primitives /
-                    // runtime-implemented types).
-                    self.arena.alloc_type(handle)
-                } else {
-                    // No decl handle reachable. Either the name is
-                    // genuinely unknown (typo, missing import) or it
-                    // names a runtime-internal type the user can't
-                    // actually write in source. Either way, mint
-                    // `Unresolved` — it surfaces the name verbatim in
-                    // hover / diagnostics and behaves like `any?` for
-                    // assignability so downstream type-relation
-                    // checks don't cascade.
-                    self.arena
-                        .unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end))
-                }
-            }
+        let mut env = CxLowerEnv {
+            hir: self.hir,
+            index: self.index,
+            decl_registry: self.decl_registry,
+            module_uri: self.module_uri,
+            out_registry: &self.out.registry,
+            type_decls: &self.out.type_decls,
+            generics_in_scope: &self.generics_in_scope,
+            inside_static_fn: self.inside_static_fn,
+            static_generic_uses: &mut self.static_generic_uses,
         };
-        if tr.typeof_marker {
-            // P-typeof — `typeof T` in source position. Wrap the lowered
-            // inner shape (which may itself be a `GenericParam`, a
-            // concrete `Type`, an enum, etc.) in `TypeOf(...)` so
-            // generic inference's witness collection can pair it with
-            // a `TypeOf(X)` argument and bind `T := X`. The `?` suffix
-            // (if any) applies on top of the wrapper — `typeof T?` is
-            // a nullable type-literal value, not a typeof of a
-            // nullable inner.
-            base = self.arena.type_of(base);
-        }
-        if tr.optional {
-            base = self.arena.nullable(base);
-        }
-        base
+        lower_type_ref::lower_type_ref_with(&mut env, self.arena, idx)
     }
 
     /// `true` when `ty`'s head decl is the std-core `Map` — the one
@@ -3599,77 +3467,6 @@ impl<'a> Cx<'a> {
             format!("missing required field{plural} for `{type_name}`: {names} (non-nullable)"),
             tr.byte_range.clone(),
         );
-    }
-
-    /// Lower a module-qualified `TypeRef` (`b::Foo`, `b::Map<int>`, …)
-    /// to a `TypeId`. The rightmost qualifier names the module; the
-    /// leaf decl is resolved within that module specifically. Mirrors
-    /// the runtime's qualified-name resolution and matches the
-    /// resolver-side binding emitted by `bind_qualified_type_leaf`.
-    fn lower_qualified_type_ref(&mut self, tr: &TypeRef) -> TypeId {
-        let module_segment = *tr
-            .qualifier
-            .last()
-            .expect("lower_qualified_type_ref called with empty qualifier");
-        let module_sym = self.hir.idents[module_segment].symbol;
-        let leaf_sym = self.hir.idents[tr.name].symbol;
-        let byte_span = (tr.byte_range.start, tr.byte_range.end);
-
-        let Some(module_uri) = self.index.module_names.get(&module_sym).cloned() else {
-            // Qualifier doesn't name a known module — the resolver
-            // already flagged it as unresolved. Surface the leaf as
-            // an Unresolved type so downstream typing doesn't cascade.
-            let mut base = self.arena.unresolved(leaf_sym, byte_span);
-            if tr.typeof_marker {
-                base = self.arena.type_of(base);
-            }
-            if tr.optional {
-                base = self.arena.nullable(base);
-            }
-            return base;
-        };
-
-        // Generic instantiation: `b::Map<int>` etc. Recurse on params
-        // first, then mint via the registry handle when we have one;
-        // fall back to `Unresolved` when the foreign module hasn't
-        // been ingested yet.
-        if !tr.params.is_empty() {
-            let args: Vec<TypeId> = tr.params.iter().map(|p| self.lower_type_ref(*p)).collect();
-            let mut base = match self
-                .index
-                .item_id_for(&module_uri, leaf_sym)
-                .filter(|item| self.decl_registry.lookup(*item).is_some())
-            {
-                Some(item) => self.arena.alloc_generic(item, args),
-                None => self.arena.unresolved(leaf_sym, byte_span),
-            };
-            if tr.typeof_marker {
-                base = self.arena.type_of(base);
-            }
-            if tr.optional {
-                base = self.arena.nullable(base);
-            }
-            return base;
-        }
-
-        // Non-generic. Prefer the handle-keyed shape so cross-module
-        // identity collapses to the same ItemId both sides of the
-        // call boundary.
-        let mut base = match self
-            .index
-            .item_id_for(&module_uri, leaf_sym)
-            .filter(|item| self.decl_registry.lookup(*item).is_some())
-        {
-            Some(item) => self.arena.alloc_type(item),
-            None => self.arena.unresolved(leaf_sym, byte_span),
-        };
-        if tr.typeof_marker {
-            base = self.arena.type_of(base);
-        }
-        if tr.optional {
-            base = self.arena.nullable(base);
-        }
-        base
     }
 
     /// Call-site generic inference. Returns `Some(return_ty)`
@@ -4121,15 +3918,6 @@ impl<'a> Cx<'a> {
 
     fn pop_generic_scope(&mut self) {
         self.generics_in_scope.pop();
-    }
-
-    fn lookup_generic(&self, name: Symbol) -> Option<GenericOwner> {
-        for frame in self.generics_in_scope.iter().rev() {
-            if let Some(owner) = frame.get(&name) {
-                return Some(*owner);
-            }
-        }
-        None
     }
 
     fn visit_type_attr(&mut self, a: &TypeAttr) {
