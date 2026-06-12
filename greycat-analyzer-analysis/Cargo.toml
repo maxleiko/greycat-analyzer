@@ -23,7 +23,6 @@ greycat-analyzer-syntax.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-smol_str.workspace = true
 web-time.workspace = true
 wasm-bindgen = { workspace = true, optional = true }
 

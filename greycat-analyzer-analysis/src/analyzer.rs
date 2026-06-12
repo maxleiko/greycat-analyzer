@@ -20,11 +20,11 @@
 //! The design follows TS `analysis/analyzer.ts`: a single recursive
 //! visitor over HIR with an `Inference` table mutated as it goes.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use greycat_analyzer_core::lsp_types::Uri;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smol_str::SmolStr;
 
 use greycat_analyzer_core::{
     GenericOwner, InferenceTable, ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId,
@@ -40,7 +40,7 @@ use greycat_analyzer_hir::types::{
 };
 use greycat_analyzer_hir::{DeclRegistry, Hir};
 
-use crate::index::{FnSignature, ProjectIndex};
+use crate::index::{FnSignature, Namespace, ProjectIndex};
 use crate::lint::{LintDiagnostic, LintSeverity};
 use crate::resolver::{Definition, Resolutions};
 use crate::well_known::WellKnown;
@@ -873,7 +873,6 @@ struct CondNarrows {
     /// Same as `then_typed_union` but for the else branch (populated
     /// only via negation).
     else_typed_union: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)>,
-    // P41.1
     /// Pre-lowered narrows — same `(binding, type)` shape as
     /// `then_typed` / `else_typed`, but the type is a [`TypeId`]
     /// computed by the analyzer (not a syntactic `Idx<TypeRef>` the
@@ -901,7 +900,6 @@ struct CondNarrows {
     /// Member-path version of `else_null`. Populated by
     /// `a.b != null` / `null != a.b`.
     else_member_null: Vec<String>,
-    // P41.2
     /// `true` iff the condition is a single atomic `Expr::Is` (possibly
     /// wrapped in `Expr::Paren` or negated by `Expr::Unary(Not, …)`).
     /// The complement narrow is only sound on atomic conditions —
@@ -1854,26 +1852,29 @@ impl<'a> Cx<'a> {
         self.member_typed_narrows.push(FxHashMap::default());
         self.enum_value_narrows.push(FxHashMap::default());
     }
+
     fn pop_narrow(&mut self) {
         self.narrows.pop();
         self.member_narrows.pop();
         self.member_typed_narrows.pop();
         self.enum_value_narrows.pop();
     }
+
     fn write_narrow(&mut self, name: Idx<Ident>, ty: TypeId) {
         if let Some(top) = self.narrows.last_mut() {
             top.insert(name, ty);
         }
     }
-    // P19.16
+
     /// Record `path` as guaranteed non-null in the current
     /// scope. Subsequent `Expr::Member` evaluations at the same path
     /// strip the result's nullable bit.
-    fn write_member_non_null(&mut self, path: String) {
+    fn write_member_non_null(&mut self, path: Cow<'_, str>) {
         if let Some(top) = self.member_narrows.last_mut() {
-            top.insert(path);
+            top.insert(path.into());
         }
     }
+
     /// Drop any non-null narrow recorded for `path`. Call when the
     /// path is reassigned to a value whose nullability is unknown,
     /// so a stale narrow doesn't outlive the assignment.
@@ -1882,19 +1883,22 @@ impl<'a> Cx<'a> {
             frame.remove(path);
         }
     }
+
     /// `true` iff `path` is guaranteed non-null in the current scope
     /// (any frame on the member-narrow stack contains it).
     fn member_path_is_non_null(&self, path: &str) -> bool {
         self.member_narrows.iter().any(|f| f.contains(path))
     }
+
     /// Record `path` as guaranteed to be of type `ty` in the current
     /// scope. Subsequent `Expr::Member` / `Expr::Arrow` evaluations at
     /// the same path use this type instead of the declared one.
-    fn write_member_typed(&mut self, path: String, ty: TypeId) {
+    fn write_member_typed(&mut self, path: Cow<'_, str>, ty: TypeId) {
         if let Some(top) = self.member_typed_narrows.last_mut() {
-            top.insert(path, ty);
+            top.insert(path.into(), ty);
         }
     }
+
     /// Drop any typed narrow recorded for `path`. Call when the path
     /// is reassigned to a value whose type is unknown.
     fn drop_member_typed(&mut self, path: &str) {
@@ -1911,6 +1915,7 @@ impl<'a> Cx<'a> {
         }
         None
     }
+
     /// Record that `name` is constrained to one of `variants` of the
     /// enum named by `enum_sym` in the current scope. When a narrow
     /// already exists on the stack for the same `(name, enum_sym)`
@@ -1933,6 +1938,7 @@ impl<'a> Cx<'a> {
             top.insert(name, (enum_sym, final_set));
         }
     }
+
     /// Innermost-first lookup of the enum-value narrow for `name`.
     /// Returns `(enum_sym, allowed_variants)` when a narrow exists in
     /// some enclosing frame.
@@ -1944,6 +1950,7 @@ impl<'a> Cx<'a> {
         }
         None
     }
+
     /// Innermost-first lookup of a binding ident's current type:
     /// narrowing frames win over `def_types`, mirroring the way TS
     /// `narrowing.ts` overlays branch-local strips on the env.
@@ -2062,11 +2069,11 @@ impl<'a> Cx<'a> {
             self.write_narrow(*ident, *ty);
         }
         for path in &narrows.then_member_non_null {
-            self.write_member_non_null(path.clone());
+            self.write_member_non_null(Cow::Borrowed(path));
         }
         for (path, ty_ref) in &narrows.then_member_typed {
             let ty = self.lower_type_ref(*ty_ref);
-            self.write_member_typed(path.clone(), ty);
+            self.write_member_typed(Cow::Borrowed(path), ty);
         }
         for ident in &narrows.then_null {
             let null_ty = self.null();
@@ -2074,7 +2081,7 @@ impl<'a> Cx<'a> {
         }
         for path in &narrows.then_member_null {
             let null_ty = self.null();
-            self.write_member_typed(path.clone(), null_ty);
+            self.write_member_typed(Cow::Borrowed(path), null_ty);
         }
     }
 
@@ -2106,11 +2113,11 @@ impl<'a> Cx<'a> {
             self.write_narrow(*ident, *ty);
         }
         for path in &narrows.else_member_non_null {
-            self.write_member_non_null(path.clone());
+            self.write_member_non_null(Cow::Borrowed(path));
         }
         for (path, ty_ref) in &narrows.else_member_typed {
             let ty = self.lower_type_ref(*ty_ref);
-            self.write_member_typed(path.clone(), ty);
+            self.write_member_typed(Cow::Borrowed(path), ty);
         }
         for ident in &narrows.else_null {
             let null_ty = self.null();
@@ -2118,7 +2125,7 @@ impl<'a> Cx<'a> {
         }
         for path in &narrows.else_member_null {
             let null_ty = self.null();
-            self.write_member_typed(path.clone(), null_ty);
+            self.write_member_typed(Cow::Borrowed(path), null_ty);
         }
     }
 
@@ -2155,7 +2162,7 @@ impl<'a> Cx<'a> {
                 // type again.
                 self.drop_member_non_null(&path);
             } else {
-                self.write_member_non_null(path);
+                self.write_member_non_null(Cow::Borrowed(&path));
             }
         }
     }
@@ -2207,7 +2214,7 @@ impl<'a> Cx<'a> {
             Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
         ) && let Some(path) = self.member_path(target)
         {
-            self.write_member_non_null(path);
+            self.write_member_non_null(Cow::Owned(path));
         }
     }
 
@@ -2783,10 +2790,7 @@ impl<'a> Cx<'a> {
         }
         // `Definition::Project` fallback (no specific owning module):
         // walk non-private fn-ns candidates, first match wins.
-        for (uri, decl) in self
-            .index
-            .locate_decl_in_ns(fn_sym, crate::index::Namespace::Fn)
-        {
+        for (uri, decl) in self.index.locate_decl_in_ns(fn_sym, Namespace::Fn) {
             if self.index.is_decl_private(uri, decl) {
                 continue;
             }
@@ -3153,21 +3157,20 @@ impl<'a> Cx<'a> {
         // Attr — extract receiver shape (need owned name + args because
         // the arena entry borrow has to drop before we re-borrow as
         // mutable for `substitute`).
-        let (type_id, instantiation): (ItemId, Vec<TypeId>) = match &self.arena.get(recv_ty).kind {
-            // P35.7 — handle-keyed variants carry the full identity.
-            TypeKind::Type(d) => (*d, Vec::new()),
-            // P25.7
-            TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
+        let (type_id, instantiation): (ItemId, &[TypeId]) = match &self.arena.get(recv_ty).kind {
+            // Handle-keyed variants carry the full identity.
+            TypeKind::Type(d) => (*d, &[]),
+            TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
             TypeKind::Primitive(p) => {
                 let core_mod = self.index.symbols.intern("core");
                 let name_sym = self.index.symbols.intern(p.name());
-                (ItemId::new(core_mod, name_sym), Vec::new())
+                (ItemId::new(core_mod, name_sym), &[])
             }
             _ => return None,
         };
         // Build the substitution map *before* mutably borrowing the
         // arena (substitute) — `members` borrows `self.index`.
-        // **P19.14** — chain-walking lookup so attrs declared on a
+        // Chain-walking lookup so attrs declared on a
         // parent type (`type Sub extends Super { ... }`) resolve
         // when accessed through a `Sub` receiver.
         let property_sym = self.hir.idents[property].symbol;
@@ -3212,10 +3215,7 @@ impl<'a> Cx<'a> {
         // resolution is intentionally tolerant — the first matching
         // generic decl wins, mirroring how `resolve_decl_handle`
         // picks a `TypeDeclId` from the same candidate set.
-        for (uri, decl) in self
-            .index
-            .locate_decl_in_ns(name_sym, crate::index::Namespace::Type)
-        {
+        for (uri, decl) in self.index.locate_decl_in_ns(name_sym, Namespace::Type) {
             if self.index.is_decl_private(uri, decl) {
                 continue;
             }
@@ -3858,8 +3858,6 @@ impl<'a> Cx<'a> {
         arg_tys: &[TypeId],
         call_range: &Range<usize>,
     ) -> Option<(TypeId, Option<TypeId>)> {
-        use std::borrow::Cow;
-
         let recv = self.arena.get(recv_ty);
         let (type_id, instantiation): (ItemId, &[TypeId]) = match &recv.kind {
             TypeKind::Primitive(p) => {
@@ -3879,35 +3877,35 @@ impl<'a> Cx<'a> {
         // args (`Array<int>` → `T := int`) so the method's params /
         // return show through with the right type *before* call-site
         // witness collection runs against `arg_tys`.
-        let recv_subst: FxHashMap<Symbol, TypeId> = members
-            .generics
-            .iter()
-            .copied()
-            .zip(instantiation.iter().copied())
-            .collect();
-        let declared_params: Cow<'_, [TypeId]> = if recv_subst.is_empty() {
-            Cow::Borrowed(&sig.params)
+        let recv_subst = if instantiation.is_empty() {
+            None
         } else {
-            sig.params
-                .iter()
-                .map(|p| self.arena.substitute(*p, &recv_subst))
-                .collect()
+            Some(
+                members
+                    .generics
+                    .iter()
+                    .copied()
+                    .zip(instantiation.iter().copied())
+                    .collect::<FxHashMap<_, _>>(),
+            )
         };
         // No declared return → no shape to infer into. Outer caller
         // falls back to `any?` at the Expr::Call default.
-        let sig_return = sig.return_ty?;
-        let declared_return = if recv_subst.is_empty() {
-            sig_return
-        } else {
-            self.arena.substitute(sig_return, &recv_subst)
-        };
-        let erases = sig.return_erases;
-        let generic_syms = sig.generics.clone();
         let mut tbl = InferenceTable::new();
-        for (declared_param, arg) in declared_params.iter().zip(arg_tys.iter()) {
-            self.collect_witnesses(*declared_param, *arg, &mut tbl, call_range);
+        for (declared_param, arg) in sig.params.iter().zip(arg_tys.iter()) {
+            let declared_param = match &recv_subst {
+                Some(subst) => self.arena.substitute(*declared_param, subst),
+                None => *declared_param,
+            };
+            self.collect_witnesses(declared_param, *arg, &mut tbl, call_range);
         }
-        Some(self.materialize_with_erasure(declared_return, &generic_syms, erases, &tbl))
+
+        let sig_return = sig.return_ty?;
+        let declared_return = match &recv_subst {
+            Some(subst) => self.arena.substitute(sig_return, subst),
+            None => sig_return,
+        };
+        Some(self.materialize_with_erasure(declared_return, &sig.generics, sig.return_erases, &tbl))
     }
 
     /// Walk `param_ty` (declared) against `arg_ty` (witness). When
@@ -3987,18 +3985,17 @@ impl<'a> Cx<'a> {
     }
 
     fn visit_decl(&mut self, decl_id: Idx<Decl>) {
-        let decl = self.hir.decls[decl_id].clone();
-        match decl {
-            Decl::Fn(d) => self.visit_fn_decl(&d),
-            Decl::Type(d) => self.visit_type_decl(&d),
+        match &self.hir.decls[decl_id] {
+            Decl::Fn(d) => self.visit_fn_decl(d),
+            Decl::Type(d) => self.visit_type_decl(d),
             Decl::Enum(_) => {}
-            Decl::Var(d) => self.visit_top_var(&d),
-            Decl::Pragma(p) => self.visit_pragma(&p),
+            Decl::Var(d) => self.visit_top_var(d),
+            Decl::Pragma(p) => self.visit_pragma(p),
         }
     }
 
     fn visit_fn_decl(&mut self, d: &FnDecl) {
-        // P12.1: register the fn's generic params into scope so
+        // Register the fn's generic params into scope so
         // `lower_type_ref` mints `GenericParam` for each `T` mention
         // instead of falling back to `any`.
         let owner = GenericOwner::Function(self.hir.idents[d.name].symbol);
@@ -4007,7 +4004,7 @@ impl<'a> Cx<'a> {
         // Bind parameter types into def_types so identifier inference
         // produces real types instead of `any`.
         for p_id in &d.params {
-            let p = self.hir.fn_params[*p_id].clone();
+            let p = &self.hir.fn_params[*p_id];
             let ty =
                 p.ty.map(|t| self.lower_type_ref(t))
                     .unwrap_or_else(|| self.any_nullable());
@@ -4025,10 +4022,10 @@ impl<'a> Cx<'a> {
     }
 
     fn visit_type_decl(&mut self, d: &TypeDecl) {
-        // P12.1: type-level generics are visible in attrs + method
+        // Type-level generics are visible in attrs + method
         // signatures.
         let type_name_sym = self.hir.idents[d.name].symbol;
-        let type_name: SmolStr = SmolStr::from(&self.index.symbols[type_name_sym]);
+        let type_name = &self.index.symbols[type_name_sym];
         // Inheritance-depth check: the runtime caps `extends` chains
         // at MAX_INHERITANCE_DEPTH types (including the leaf). A
         // declaration past that limit fails to build with
@@ -4038,8 +4035,7 @@ impl<'a> Cx<'a> {
         let chain_len = self
             .index
             .supertype_chain_length(ItemId::new(self.module_sym, type_name_sym));
-        if chain_len > crate::index::ProjectIndex::MAX_INHERITANCE_DEPTH {
-            let limit = crate::index::ProjectIndex::MAX_INHERITANCE_DEPTH;
+        if chain_len > ProjectIndex::MAX_INHERITANCE_DEPTH {
             let span = d
                 .supertype
                 .map(|tr| self.hir.type_refs[tr].byte_range.clone())
@@ -4049,21 +4045,22 @@ impl<'a> Cx<'a> {
                 "inheritance-too-deep",
                 format!(
                     "inheritance chain too deep: `{type_name}` is {chain_len} levels deep; \
-                     greycat allows at most {limit}"
+                     greycat allows at most {limit}",
+                    limit = ProjectIndex::MAX_INHERITANCE_DEPTH,
                 ),
                 span,
             );
         }
         let owner = GenericOwner::Type(type_name_sym);
         self.push_generic_scope(&d.generics, owner);
-        // **P19.11** — build the `this` TypeId. For non-generic
+        // Build the `this` TypeId. For non-generic
         // types it's `Named { name }`; for generic types it's
         // `Generic { name, args: [GenericParam(g0), GenericParam(g1), ...] }`.
         // Push it on `this_stack` so `LiteralKind::This` inside
         // method bodies returns the right thing. Done *after* the
         // generic scope is pushed so generics resolve.
         let this_ty = if d.generics.is_empty() {
-            // P35.7 — reuse whatever `register_module_types` minted
+            // Reuse whatever `register_module_types` minted
             // for this decl (a `Type(handle)` when the registry has
             // it, otherwise an `Unresolved` sink). Avoids re-minting
             // and keeps `this` and outside references pointing at
@@ -4073,15 +4070,7 @@ impl<'a> Cx<'a> {
                 self.arena.unresolved(type_name_sym, (span.start, span.end))
             })
         } else {
-            let args: Vec<TypeId> = d
-                .generics
-                .iter()
-                .map(|g| {
-                    let g_sym = self.hir.idents[*g].symbol;
-                    self.arena.generic_param(g_sym)
-                })
-                .collect();
-            // P35.7 — mint the generic `this` against the decl handle
+            // Mint the generic `this` against the decl handle
             // when we have one (so it interns equal to whatever
             // `lower_type_ref*` produces for the same source-level
             // reference). When the registry hasn't seen this decl yet
@@ -4092,7 +4081,17 @@ impl<'a> Cx<'a> {
                 .index
                 .resolve_item(self.decl_registry, Some(self.module_uri), type_name_sym)
             {
-                Some(handle) => self.arena.alloc_generic(handle, args),
+                Some(tpl) => {
+                    let args: Vec<TypeId> = d
+                        .generics
+                        .iter()
+                        .map(|g| {
+                            let g_sym = self.hir.idents[*g].symbol;
+                            self.arena.generic_param(g_sym)
+                        })
+                        .collect();
+                    self.arena.alloc_generic(tpl, args)
+                }
                 None => {
                     let span = self.hir.idents[d.name].byte_range.clone();
                     self.arena.unresolved(type_name_sym, (span.start, span.end))
@@ -4101,12 +4100,11 @@ impl<'a> Cx<'a> {
         };
         self.this_stack.push(this_ty);
         for attr_id in &d.attrs {
-            let a = self.hir.type_attrs[*attr_id].clone();
-            self.visit_type_attr(&a);
+            self.visit_type_attr(&self.hir.type_attrs[*attr_id]);
         }
         for method_id in &d.methods {
-            if let Decl::Fn(fnd) = self.hir.decls[*method_id].clone() {
-                self.visit_fn_decl(&fnd);
+            if let Decl::Fn(fnd) = &self.hir.decls[*method_id] {
+                self.visit_fn_decl(fnd);
             }
         }
         self.this_stack.pop();
@@ -4148,7 +4146,7 @@ impl<'a> Cx<'a> {
     fn visit_top_var(&mut self, d: &VarDeclTop) {
         let declared = d.ty.map(|t| self.lower_type_ref(t));
         let init_ty = d.init.map(|i| self.visit_expr(i));
-        // P35.10 — record the modvar's type in `def_types` keyed by
+        // Record the modvar's type in `def_types` keyed by
         // its binding ident. Mirrors what `Stmt::Var` does for
         // locals; lets capability code (e.g. `receiver_type_at`'s
         // text-based fallback for ERROR-recovery cases) look up a
@@ -4176,17 +4174,16 @@ impl<'a> Cx<'a> {
     }
 
     fn visit_stmt(&mut self, stmt_id: Idx<Stmt>, return_ty: Option<TypeId>) {
-        let stmt = self.hir.stmts[stmt_id].clone();
-        match stmt {
+        match &self.hir.stmts[stmt_id] {
             Stmt::Block(b) => {
                 self.push_narrow();
-                for s in b.stmts {
-                    self.visit_stmt(s, return_ty);
+                for s in &b.stmts {
+                    self.visit_stmt(*s, return_ty);
                 }
                 self.pop_narrow();
             }
             Stmt::Expr(e) => {
-                let _ = self.visit_expr(e);
+                let _ = self.visit_expr(*e);
             }
             Stmt::Var(LocalVar { name, ty, init, .. }) => {
                 let declared = ty.map(|t| self.lower_type_ref(t));
@@ -4194,18 +4191,17 @@ impl<'a> Cx<'a> {
                 // Type-relation diagnostic deferred to
                 // `ProjectAnalysis::validate_type_relations`.
                 let var_ty = declared.or(init_ty).unwrap_or_else(|| self.any_nullable());
-                self.out.def_types.insert(name, var_ty);
+                self.out.def_types.insert(*name, var_ty);
                 // P-erasure taint: a var initialized from an erasing
                 // generic call holds the erased value at runtime even
                 // when annotated with a more specific type (the
-                // annotation is cosmetic — the runtime tag stays erased,
-                // verified against `greycat run`). Carry the runtime
+                // annotation is cosmetic — the runtime tag stays erased). Carry the runtime
                 // shape to the binding so later references flag the
                 // narrowing uses the runtime would throw on.
                 if let Some(i) = init
-                    && let Some(rt) = self.out.expr_runtime_types.get(&i).copied()
+                    && let Some(rt) = self.out.expr_runtime_types.get(i).copied()
                 {
-                    self.out.def_runtime_types.insert(name, rt);
+                    self.out.def_runtime_types.insert(*name, rt);
                 }
             }
             Stmt::Assign(AssignStmt { target, value, .. }) => {
@@ -4214,851 +4210,15 @@ impl<'a> Cx<'a> {
                 // dead — kept for exhaustiveness and any future
                 // grammar shape that may revive it. Narrow logic
                 // lives in `Expr::Binary` (op = "=").
-                let _ = self.visit_expr(target);
-                let value_ty = self.visit_expr(value);
-                self.record_assign_narrow(target, value_ty);
+                let _ = self.visit_expr(*target);
+                let value_ty = self.visit_expr(*value);
+                self.record_assign_narrow(*target, value_ty);
             }
-            Stmt::If(IfStmt {
-                condition,
-                then_branch,
-                else_branch,
-                byte_range,
-            }) => {
-                self.visit_expr(condition);
-                // exhaustiveness: only run from a "head" if (i.e.
-                // not already accounted for as a nested else-if).
-                if !self.chain_member_ifs.contains(&stmt_id) {
-                    self.check_enum_exhaustiveness(stmt_id, byte_range.clone());
-                }
-
-                let CondNarrows {
-                    then_non_null,
-                    else_non_null,
-                    then_typed,
-                    then_member_non_null,
-                    else_member_non_null,
-                    then_member_typed,
-                    else_typed,
-                    else_member_typed,
-                    then_typed_union,
-                    else_typed_union,
-                    mut then_typed_id,
-                    mut else_typed_id,
-                    then_null,
-                    else_null,
-                    then_member_null,
-                    else_member_null,
-                    is_atomic_is,
-                    then_enum_values,
-                    else_enum_values,
-                } = self.derive_cond_narrows(condition);
-
-                // P41.2 / P42.4 — compute the else-side complement
-                // narrow for atomic `is`-conditions. `derive_cond_narrows`
-                // runs in `&self` context (`lower_type_ref` is `&mut self`),
-                // so the complement is computed here in `Stmt::If`
-                // where we have mutable access. Gated on
-                // `is_atomic_is`: atomic for `Expr::Is` (P41) and for
-                // pure `||`-chains of `is`-checks (P42.4); never set
-                // through `&&` (an `&&` else might be either operand
-                // failing — per-ident complements would be unsound).
-                if is_atomic_is {
-                    for (ident, ty_ref) in &then_typed {
-                        let Some(known) = self.lookup_def_type(*ident) else {
-                            continue;
-                        };
-                        let asserted = self.lower_type_ref(*ty_ref);
-                        if let Some(complement) = self.narrow_complement(known, asserted) {
-                            else_typed_id.push((*ident, complement));
-                        }
-                    }
-                    for (ident, ty_ref) in &else_typed {
-                        let Some(known) = self.lookup_def_type(*ident) else {
-                            continue;
-                        };
-                        let asserted = self.lower_type_ref(*ty_ref);
-                        if let Some(complement) = self.narrow_complement(known, asserted) {
-                            then_typed_id.push((*ident, complement));
-                        }
-                    }
-                    // P42.4 — disjunctive complement for
-                    // `(x is T1) || (x is T2)` shape (`then_typed_union`
-                    // carries the merged asserted list). Chain
-                    // `narrow_complement` over each asserted type, so
-                    // `closure(known) \ closure(T1) \ closure(T2)` falls
-                    // out for free via repeated subtraction. Mirror for
-                    // `else_typed_union` (populated by the `!` swap).
-                    for (ident, ty_refs) in &then_typed_union {
-                        if let Some(complement) = self.chain_narrow_complement(*ident, ty_refs) {
-                            else_typed_id.push((*ident, complement));
-                        }
-                    }
-                    for (ident, ty_refs) in &else_typed_union {
-                        if let Some(complement) = self.chain_narrow_complement(*ident, ty_refs) {
-                            then_typed_id.push((*ident, complement));
-                        }
-                    }
-                }
-
-                // P42.5 — `exhaustive-is-check`. When every concrete
-                // runtime case of a binding's known type is covered
-                // by the asserted type(s), the negative side of the
-                // guard is unreachable. Mirrors `non-exhaustive` (for
-                // enum chains); this is its inverse-shape sibling.
-                // Emit at most one warning per condition and mark
-                // `decidable_conditions` so the existing per-`is`
-                // contradiction pass doesn't also fire "is already
-                // of type …" on the same span.
-                if is_atomic_is {
-                    // (known_disp, asserted_disp, is_negated). The
-                    // asserted display is the actionable info — for an
-                    // abstract `known` with a single concrete subtype,
-                    // it names the type the value is guaranteed to be.
-                    let mut hit: Option<(String, String, bool)> = None;
-                    let then_side_pairs: Vec<(Idx<Ident>, Idx<TypeRef>)> = then_typed.clone();
-                    let then_side_unions: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)> =
-                        then_typed_union.clone();
-                    let else_side_pairs: Vec<(Idx<Ident>, Idx<TypeRef>)> = else_typed.clone();
-                    let else_side_unions: Vec<(Idx<Ident>, Vec<Idx<TypeRef>>)> =
-                        else_typed_union.clone();
-                    for (ident, ty_ref) in &then_side_pairs {
-                        if hit.is_some() {
-                            break;
-                        }
-                        let Some(known) = self.lookup_def_type(*ident) else {
-                            continue;
-                        };
-                        let asserted = self.lower_type_ref(*ty_ref);
-                        if self.narrow_is_exhausted(known, asserted) {
-                            let known_disp = self.display(known).to_string();
-                            let asserted_disp = self.display(asserted).to_string();
-                            hit = Some((known_disp, asserted_disp, false));
-                        }
-                    }
-                    for (ident, ty_refs) in &then_side_unions {
-                        if hit.is_some() {
-                            break;
-                        }
-                        let Some(known) = self.lookup_def_type(*ident) else {
-                            continue;
-                        };
-                        let asserted = self.lower_typed_union(ty_refs);
-                        if self.narrow_is_exhausted(known, asserted) {
-                            let known_disp = self.display(known).to_string();
-                            let asserted_disp = self.display(asserted).to_string();
-                            hit = Some((known_disp, asserted_disp, false));
-                        }
-                    }
-                    // Else-side (under `!` swap): exhaustion means the
-                    // *then* branch is unreachable.
-                    for (ident, ty_ref) in &else_side_pairs {
-                        if hit.is_some() {
-                            break;
-                        }
-                        let Some(known) = self.lookup_def_type(*ident) else {
-                            continue;
-                        };
-                        let asserted = self.lower_type_ref(*ty_ref);
-                        if self.narrow_is_exhausted(known, asserted) {
-                            let known_disp = self.display(known).to_string();
-                            let asserted_disp = self.display(asserted).to_string();
-                            hit = Some((known_disp, asserted_disp, true));
-                        }
-                    }
-                    for (ident, ty_refs) in &else_side_unions {
-                        if hit.is_some() {
-                            break;
-                        }
-                        let Some(known) = self.lookup_def_type(*ident) else {
-                            continue;
-                        };
-                        let asserted = self.lower_typed_union(ty_refs);
-                        if self.narrow_is_exhausted(known, asserted) {
-                            let known_disp = self.display(known).to_string();
-                            let asserted_disp = self.display(asserted).to_string();
-                            hit = Some((known_disp, asserted_disp, true));
-                        }
-                    }
-                    if let Some((known_disp, asserted_disp, is_negated)) = hit {
-                        let dead = if is_negated { "then" } else { "else" };
-                        // Only emit when the dead branch is actually
-                        // present in source. When `is_negated = false`,
-                        // the dead branch is `else`; if the user didn't
-                        // write one, there's nothing redundant about the
-                        // type test — they're using it to gate the
-                        // then-body, no implicit reliance on an
-                        // unreachable else. When `is_negated = true`, the
-                        // dead branch is `then`, which the grammar
-                        // requires — always emit.
-                        if is_negated || else_branch.is_some() {
-                            let msg = format!(
-                                "every value of `{known_disp}` matches `{asserted_disp}`: the {dead}-branch is unreachable",
-                            );
-                            let range = self.hir.exprs[condition].byte_range();
-                            self.diag(Severity::Warning, "exhaustive-is-check", msg, range);
-                        }
-                        // Mark decidable regardless of whether we
-                        // surfaced the warning — downstream `unreachable`
-                        // / contradiction passes consume this independently.
-                        // `is_negated = false` means the if-cond is always
-                        // true (then-branch always runs). `is_negated = true`
-                        // means the cond is `!(…always-true…)` → always
-                        // false (else-branch runs).
-                        self.out.decidable_conditions.insert(stmt_id, !is_negated);
-                    }
-                }
-
-                // Decide triviality BEFORE pushing any narrows — the
-                // null-strip and `is`-narrow application below would
-                // shadow the bindings' declared types and make every
-                // null / type check look trivially decidable against
-                // itself.
-                let decidable = self.trivially_decidable(condition);
-                if let Some(b) = decidable {
-                    let range = self.hir.exprs[condition].byte_range();
-                    let msg = if b {
-                        "condition is always true"
-                    } else {
-                        "condition is always false"
-                    };
-                    self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
-                    self.out.decidable_conditions.insert(stmt_id, b);
-                }
-
-                self.push_narrow();
-                for ident in &then_non_null {
-                    if let Some(cur) = self.lookup_def_type(*ident) {
-                        let stripped = self.arena.strip_nullable(cur);
-                        self.write_narrow(*ident, stripped);
-                    }
-                }
-                // Capture each `is`-narrowed binding's *pre-narrow*
-                // declared type first — the contradiction pass needs
-                // to compare the asserted `is`-type against the
-                // binding's known type at the if-condition's eval
-                // site. If we wrote the narrows first, `lookup_def_type`
-                // would return the asserted type itself and every
-                // single `is`-check would falsely look "always true".
-                let mut multi_typed: FxHashMap<Idx<Ident>, (Option<TypeId>, Vec<TypeId>)> =
-                    FxHashMap::default();
-                for (ident, ty_ref) in &then_typed {
-                    let ty = self.lower_type_ref(*ty_ref);
-                    let entry = multi_typed
-                        .entry(*ident)
-                        .or_insert_with(|| (self.lookup_def_type_for_is(*ident), Vec::new()));
-                    entry.1.push(ty);
-                }
-                for (ident, group) in &multi_typed {
-                    for ty in &group.1 {
-                        self.write_narrow(*ident, *ty);
-                    }
-                }
-                for (ident, ty_refs) in &then_typed_union {
-                    let ty = self.lower_typed_union(ty_refs);
-                    self.write_narrow(*ident, ty);
-                }
-                // Pre-lowered narrows (today populated only
-                // via the `!` swap; the `Expr::Is` arm of
-                // `derive_cond_narrows` populates `else_typed_id` in
-                // P41.2).
-                for (ident, ty) in &then_typed_id {
-                    self.write_narrow(*ident, *ty);
-                }
-                // Skip the `is`-contradiction pass when the condition
-                // is already trivially decidable — it would re-emit a
-                // duplicate "always (true|false)" diag.
-                if decidable.is_none() {
-                    self.diagnose_then_typed_contradictions(&multi_typed, condition, stmt_id);
-                }
-                for path in &then_member_non_null {
-                    self.write_member_non_null(path.clone());
-                }
-                for (path, ty_ref) in &then_member_typed {
-                    let ty = self.lower_type_ref(*ty_ref);
-                    self.write_member_typed(path.clone(), ty);
-                }
-                for ident in &then_null {
-                    let null_ty = self.null();
-                    self.write_narrow(*ident, null_ty);
-                }
-                for path in &then_member_null {
-                    let null_ty = self.null();
-                    self.write_member_typed(path.clone(), null_ty);
-                }
-                // Enum-value narrows: each entry constrains a binding
-                // to a set of variants of one enum. `write_enum_value_narrow`
-                // intersects with any outer narrow already on the
-                // stack, so nested guards compose (e.g. inner `c ==
-                // Red` inside outer `c == Red || c == Green` lands at
-                // `{Red}`).
-                for (ident, enum_sym, variants) in &then_enum_values {
-                    self.write_enum_value_narrow(*ident, *enum_sym, variants);
-                }
-                // Inline the then-branch's stmts (instead
-                // of `visit_block`) so the narrow frame we just pushed
-                // captures any assignments inside the branch. The
-                // post-if join then sees those narrows. `visit_block`
-                // would push+pop its own frame, discarding them.
-                for s in &then_branch.stmts {
-                    self.visit_stmt(*s, return_ty);
-                }
-                let then_branch_narrows: FxHashMap<Idx<Ident>, TypeId> =
-                    self.narrows.last().cloned().unwrap_or_default();
-                let then_branch_member_narrows: FxHashSet<String> =
-                    self.member_narrows.last().cloned().unwrap_or_default();
-                self.pop_narrow();
-                let then_terminates = block_terminates(self.hir, &then_branch);
-
-                let (else_terminates, else_branch_narrows, else_branch_member_narrows) =
-                    if let Some(eb) = else_branch {
-                        self.push_narrow();
-                        for ident in &else_non_null {
-                            if let Some(cur) = self.lookup_def_type(*ident) {
-                                let stripped = self.arena.strip_nullable(cur);
-                                self.write_narrow(*ident, stripped);
-                            }
-                        }
-                        for path in &else_member_non_null {
-                            self.write_member_non_null(path.clone());
-                        }
-                        for (ident, ty_ref) in &else_typed {
-                            let ty = self.lower_type_ref(*ty_ref);
-                            self.write_narrow(*ident, ty);
-                        }
-                        for (ident, ty_refs) in &else_typed_union {
-                            let ty = self.lower_typed_union(ty_refs);
-                            self.write_narrow(*ident, ty);
-                        }
-                        // P41.1 — apply pre-lowered else-side narrows.
-                        for (ident, ty) in &else_typed_id {
-                            self.write_narrow(*ident, *ty);
-                        }
-                        for (path, ty_ref) in &else_member_typed {
-                            let ty = self.lower_type_ref(*ty_ref);
-                            self.write_member_typed(path.clone(), ty);
-                        }
-                        for ident in &else_null {
-                            let null_ty = self.null();
-                            self.write_narrow(*ident, null_ty);
-                        }
-                        for path in &else_member_null {
-                            let null_ty = self.null();
-                            self.write_member_typed(path.clone(), null_ty);
-                        }
-                        for (ident, enum_sym, variants) in &else_enum_values {
-                            self.write_enum_value_narrow(*ident, *enum_sym, variants);
-                        }
-                        // Same inline pattern for the else
-                        // branch. `eb` may be a Block or a nested If
-                        // (`else if`); for the Block case we inline,
-                        // for the If case we still call visit_stmt
-                        // (an If handles its own narrows internally).
-                        if let Stmt::Block(eb_block) = &self.hir.stmts[eb] {
-                            let eb_block = eb_block.clone();
-                            for s in &eb_block.stmts {
-                                self.visit_stmt(*s, return_ty);
-                            }
-                        } else {
-                            self.visit_stmt(eb, return_ty);
-                        }
-                        let captured: FxHashMap<Idx<Ident>, TypeId> =
-                            self.narrows.last().cloned().unwrap_or_default();
-                        let captured_members: FxHashSet<String> =
-                            self.member_narrows.last().cloned().unwrap_or_default();
-                        self.pop_narrow();
-                        (stmt_terminates(self.hir, eb), captured, captured_members)
-                    } else {
-                        (false, FxHashMap::default(), FxHashSet::default())
-                    };
-
-                // CFG-aware narrowing — early return / throw etc.
-                // If the then-branch always exits the surrounding flow
-                // (return / throw / break / continue), the post-if
-                // scope inherits the *else* condition's narrowing
-                // (e.g. `if (x == null) { return; } use(x);` — `x` is
-                // non-null after the if). Mirrored for the else side.
-                if then_terminates {
-                    for ident in &else_non_null {
-                        if let Some(cur) = self.lookup_def_type(*ident) {
-                            let stripped = self.arena.strip_nullable(cur);
-                            self.write_narrow(*ident, stripped);
-                        }
-                    }
-                    for path in &else_member_non_null {
-                        self.write_member_non_null(path.clone());
-                    }
-                    for (ident, ty_ref) in &else_typed {
-                        let ty = self.lower_type_ref(*ty_ref);
-                        self.write_narrow(*ident, ty);
-                    }
-                    for (ident, ty_refs) in &else_typed_union {
-                        let ty = self.lower_typed_union(ty_refs);
-                        self.write_narrow(*ident, ty);
-                    }
-                    // Load-bearing for the union-complement
-                    // shape: `if (x is T) { return; } use(x);` lifts
-                    // the complement into the post-if scope.
-                    for (ident, ty) in &else_typed_id {
-                        self.write_narrow(*ident, *ty);
-                    }
-                    for (path, ty_ref) in &else_member_typed {
-                        let ty = self.lower_type_ref(*ty_ref);
-                        self.write_member_typed(path.clone(), ty);
-                    }
-                    for ident in &else_null {
-                        let null_ty = self.null();
-                        self.write_narrow(*ident, null_ty);
-                    }
-                    for path in &else_member_null {
-                        let null_ty = self.null();
-                        self.write_member_typed(path.clone(), null_ty);
-                    }
-                    // Reassignments inside the else block must win
-                    // over the condition-entry narrows above — the
-                    // captured `else_branch_narrows` is the actual
-                    // end-of-else state. Applied last so an else-
-                    // branch `x = node<...>{...}` overrides the
-                    // condition's `else_null` lift for `x`.
-                    if !else_terminates {
-                        for (ident, ty) in &else_branch_narrows {
-                            self.write_narrow(*ident, *ty);
-                        }
-                        for path in &else_branch_member_narrows {
-                            self.write_member_non_null(path.clone());
-                        }
-                    }
-                }
-                if else_terminates {
-                    for ident in &then_non_null {
-                        if let Some(cur) = self.lookup_def_type(*ident) {
-                            let stripped = self.arena.strip_nullable(cur);
-                            self.write_narrow(*ident, stripped);
-                        }
-                    }
-                    for (ident, ty_ref) in &then_typed {
-                        let ty = self.lower_type_ref(*ty_ref);
-                        self.write_narrow(*ident, ty);
-                    }
-                    for (ident, ty_refs) in &then_typed_union {
-                        let ty = self.lower_typed_union(ty_refs);
-                        self.write_narrow(*ident, ty);
-                    }
-                    // `if (!(x is T)) { return; } use(x);` —
-                    // the `!` swap pushes the complement to
-                    // `then_typed_id`, the else-terminates path lifts
-                    // it.
-                    for (ident, ty) in &then_typed_id {
-                        self.write_narrow(*ident, *ty);
-                    }
-                    for path in &then_member_non_null {
-                        self.write_member_non_null(path.clone());
-                    }
-                    for (path, ty_ref) in &then_member_typed {
-                        let ty = self.lower_type_ref(*ty_ref);
-                        self.write_member_typed(path.clone(), ty);
-                    }
-                    for ident in &then_null {
-                        let null_ty = self.null();
-                        self.write_narrow(*ident, null_ty);
-                    }
-                    for path in &then_member_null {
-                        let null_ty = self.null();
-                        self.write_member_typed(path.clone(), null_ty);
-                    }
-                    // Mirror of the then_terminates path: the captured
-                    // then-branch state has reassignments that should
-                    // override the condition-entry narrows.
-                    if !then_terminates {
-                        for (ident, ty) in &then_branch_narrows {
-                            self.write_narrow(*ident, *ty);
-                        }
-                        for path in &then_branch_member_narrows {
-                            self.write_member_non_null(path.clone());
-                        }
-                    }
-                }
-
-                // Post-if assignment-narrow lift. For
-                // each binding that's nullable before the if and
-                // is non-null along *every* path through the if,
-                // narrow the post-if scope to its non-null form.
-                //
-                // Two source paths to consider:
-                // - then path: non-null iff (condition implied non-null
-                //   on then-side, captured in `then_non_null`) OR
-                //   (the then-branch assigned a non-null value to it,
-                //   captured in `then_branch_narrows`) OR
-                //   (the then-branch terminates, in which case this
-                //   path "doesn't reach" the post-if).
-                // - else path (or implicit fall-through when no else):
-                //   non-null iff (condition implied non-null on
-                //   else-side, captured in `else_non_null`) OR
-                //   (else-branch assigned a non-null value, captured
-                //   in `else_branch_narrows`) OR (else terminates).
-                //
-                // The cleanest representation: for each candidate
-                // binding, look up its post-then and post-else
-                // effective type and check if both are non-null.
-                if !then_terminates && !else_terminates {
-                    let mut candidates: FxHashSet<Idx<Ident>> = FxHashSet::default();
-                    candidates.extend(then_branch_narrows.keys().copied());
-                    candidates.extend(else_branch_narrows.keys().copied());
-                    candidates.extend(then_non_null.iter().copied());
-                    candidates.extend(else_non_null.iter().copied());
-                    for ident in candidates {
-                        let pre = match self.lookup_def_type(ident) {
-                            Some(t) => t,
-                            None => continue,
-                        };
-                        if !self.arena.get(pre).nullable {
-                            // Already non-null — nothing to lift.
-                            continue;
-                        }
-                        // Effective type at the end of the then-path.
-                        let then_eff = then_branch_narrows
-                            .get(&ident)
-                            .copied()
-                            .or_else(|| {
-                                if then_non_null.contains(&ident) {
-                                    Some(self.arena.strip_nullable(pre))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(pre);
-                        // Effective type at the end of the else-path
-                        // (or implicit fall-through).
-                        let else_eff = else_branch_narrows
-                            .get(&ident)
-                            .copied()
-                            .or_else(|| {
-                                if else_non_null.contains(&ident) {
-                                    Some(self.arena.strip_nullable(pre))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(pre);
-                        if !self.arena.get(then_eff).nullable && !self.arena.get(else_eff).nullable
-                        {
-                            // Pick the merged narrow. Default: strip
-                            // nullable off `pre` (works when pre is
-                            // `T?` — both paths land at `T`).
-                            //
-                            // Edge case — `pre` was already narrowed
-                            // to the literal `Null` shape by an outer
-                            // guard (e.g. inside `if (u == null) {
-                            // ...; if (u == null) { u = nonNull } ...
-                            // }`). `strip_nullable(Null)` yields a
-                            // dead `Null` kind with `nullable=false`
-                            // — which passes the per-side non-null
-                            // check above but, written as a narrow,
-                            // makes downstream reads see `null`. In
-                            // that case prefer a side's concrete
-                            // narrow when one exists, else fall back
-                            // to the binding's declared type stripped
-                            // of nullability.
-                            let pre_is_null_shape =
-                                matches!(self.arena.get(pre).kind, TypeKind::Null);
-                            let then_is_null_shape =
-                                matches!(self.arena.get(then_eff).kind, TypeKind::Null);
-                            let else_is_null_shape =
-                                matches!(self.arena.get(else_eff).kind, TypeKind::Null);
-                            let merged = if pre_is_null_shape {
-                                if !then_is_null_shape {
-                                    then_eff
-                                } else if !else_is_null_shape {
-                                    else_eff
-                                } else {
-                                    self.out
-                                        .def_types
-                                        .get(&ident)
-                                        .copied()
-                                        .map(|d| self.arena.strip_nullable(d))
-                                        .unwrap_or_else(|| self.arena.strip_nullable(pre))
-                                }
-                            } else {
-                                self.arena.strip_nullable(pre)
-                            };
-                            self.write_narrow(ident, merged);
-                        }
-                    }
-                    // Same lift for member-access paths.
-                    // A path is non-null post-if iff every reaching
-                    // branch made it non-null. Reaching condition:
-                    // (in then_branch_member_narrows OR
-                    //  in then_member_non_null) AND
-                    // (in else_branch_member_narrows OR
-                    //  in else_member_non_null).
-                    // No "no else" implicit fall-through case here:
-                    // we don't track which paths *were* non-null
-                    // outside the if, so we conservatively require
-                    // the else side to either exist and narrow, or
-                    // the condition's else_member side to imply it.
-                    let mut member_candidates: FxHashSet<&String> = FxHashSet::default();
-                    member_candidates.extend(then_branch_member_narrows.iter());
-                    member_candidates.extend(else_branch_member_narrows.iter());
-                    for path in &then_member_non_null {
-                        member_candidates.insert(path);
-                    }
-                    for path in &else_member_non_null {
-                        member_candidates.insert(path);
-                    }
-                    let to_lift: Vec<String> = member_candidates
-                        .iter()
-                        .filter(|&&p| {
-                            let then_ok = then_branch_member_narrows.contains(p)
-                                || then_member_non_null.contains(p);
-                            let else_ok = if else_branch.is_some() {
-                                else_branch_member_narrows.contains(p)
-                                    || else_member_non_null.contains(p)
-                            } else {
-                                // No else branch — fall-through is
-                                // the implicit else. Only path-side
-                                // narrows from the *condition's*
-                                // else side (`x == null`) carry
-                                // through the implicit fall-through.
-                                else_member_non_null.contains(p)
-                            };
-                            then_ok && else_ok
-                        })
-                        .map(|s| (*s).clone())
-                        .collect();
-                    for path in to_lift {
-                        self.write_member_non_null(path);
-                    }
-                }
-            }
-            Stmt::While(WhileStmt {
-                condition, body, ..
-            }) => {
-                self.visit_expr(condition);
-                self.diagnose_decidable_loop_condition(stmt_id, condition, "while");
-                // Apply the condition's truthy narrows to the body so
-                // `while (x != null) { use(x) }` sees `x` as non-null
-                // inside the body, mirroring `if (x != null)`.
-                // Inline the body stmts (instead of `visit_block`) so
-                // the loop's narrow frame is the innermost at body
-                // entry — matches `Stmt::If`'s pattern.
-                let narrows = self.derive_cond_narrows(condition);
-                self.push_narrow();
-                self.apply_then_narrows(&narrows);
-                for s in &body.stmts {
-                    self.visit_stmt(*s, return_ty);
-                }
-                self.pop_narrow();
-                // Post-loop else-narrow lift: if no `break` targets
-                // this loop, the only exit is via cond-false, so the
-                // cond's negation holds at the failing check — which
-                // IS the post-loop binding state, since no code runs
-                // between the failing check and the loop exit.
-                // `apply_else_narrows` writes to the now-innermost
-                // frame (the surrounding scope).
-                if !block_breaks_current_loop(self.hir, &body) {
-                    self.apply_else_narrows(&narrows);
-                }
-            }
-            Stmt::DoWhile(DoWhileStmt {
-                condition, body, ..
-            }) => {
-                // Inline the body's stmts inside a dedicated narrow
-                // frame so reassignments inside the body (`id =
-                // generate();`) survive long enough for the condition
-                // to see them — `visit_block` would push + pop its
-                // own frame and discard them, leaving the cond
-                // staring at the pre-loop narrow.
-                self.push_narrow();
-                for s in &body.stmts {
-                    self.visit_stmt(*s, return_ty);
-                }
-                self.visit_expr(condition);
-                // Body runs once regardless of the condition, so a
-                // decidable `do-while` is informational only — emit
-                // the diagnostic but do NOT record it for the
-                // `unreachable` lint (no dead code to delete).
-                if let Some(b) = self.trivially_decidable(condition) {
-                    let range = self.hir.exprs[condition].byte_range();
-                    let msg = if b {
-                        "do-while condition is always true (infinite loop)"
-                    } else {
-                        "do-while condition is always false (body runs exactly once)"
-                    };
-                    self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
-                }
-                // Capture the cond's narrows before popping the body
-                // frame — `derive_cond_narrows` reads the AST, not
-                // the narrow stack, so the captured `CondNarrows`
-                // outlives the pop unchanged.
-                let narrows = self.derive_cond_narrows(condition);
-                self.pop_narrow();
-                // Post-loop else-narrow lift. Body always runs at
-                // least once, so by the time we're past the loop the
-                // cond *was* evaluated (and was false, since we're
-                // past). No push/apply on the body side — that would
-                // be unsound on iter 1, before the cond is checked.
-                if !block_breaks_current_loop(self.hir, &body) {
-                    self.apply_else_narrows(&narrows);
-                }
-            }
-            Stmt::For(ForStmt {
-                init_name,
-                init_ty,
-                init_value,
-                condition,
-                increment,
-                body,
-                ..
-            }) => {
-                // Bind the C-style for loop's
-                // `init_name` to its declared / inferred type so
-                // uses of the loop var inside `condition` /
-                // `increment` / `body` get a real type instead of
-                // falling back to `any`. Order matters: visit the
-                // init value FIRST (so its type is known), bind
-                // `init_name` to declared-or-inferred, *then*
-                // visit the rest.
-                let init_value_ty = init_value.map(|v| self.visit_expr(v));
-                if let Some(name) = init_name {
-                    let bound_ty = init_ty
-                        .map(|t| self.lower_type_ref(t))
-                        .or(init_value_ty)
-                        .unwrap_or_else(|| self.any_nullable());
-                    self.out.def_types.insert(name, bound_ty);
-                }
-                // Apply the condition's truthy narrows to body and
-                // increment so `for (var p = init; p != null; p = next(p))`
-                // sees `p` as non-null inside both the body and the
-                // increment expression. Increment runs after body
-                // inside the same frame, matching runtime order
-                // (cond → body → incr → cond).
-                let narrows = if let Some(c) = condition {
-                    self.visit_expr(c);
-                    self.diagnose_decidable_loop_condition(stmt_id, c, "for");
-                    self.derive_cond_narrows(c)
-                } else {
-                    CondNarrows::default()
-                };
-                self.push_narrow();
-                self.apply_then_narrows(&narrows);
-                for s in &body.stmts {
-                    self.visit_stmt(*s, return_ty);
-                }
-                if let Some(i) = increment {
-                    let _ = self.visit_expr(i);
-                }
-                self.pop_narrow();
-                // Post-loop else-narrow lift. Skip when there's no
-                // condition (no narrow to derive) or when `break` can
-                // escape (exit may not have been via cond-false).
-                if condition.is_some() && !block_breaks_current_loop(self.hir, &body) {
-                    self.apply_else_narrows(&narrows);
-                }
-            }
-            Stmt::ForIn(ForInStmt {
-                params,
-                iterator,
-                window,
-                body,
-                ..
-            }) => {
-                let range_ty = self.visit_expr(iterator);
-                // Type the slice bounds so `from` / `to` get `expr_types`
-                // entries and the resolver sees their ident uses.
-                if let Some(w) = window {
-                    let _ = self.visit_expr(w);
-                }
-                // Bind each iterator param's def_type from
-                // the iterable's element type. Iterability in
-                // GreyCat is gated by the `@iterable` type-pragma;
-                // in stdlib that covers six native types — Array,
-                // Map, nodeList, nodeIndex, nodeTime, nodeGeo. All
-                // six have stable `WellKnown` decl handles, so the
-                // dispatch is `Some(decl) == self.well_known.<slot>`
-                // identity (same pattern as `WellKnown::is_node_tag`
-                // and the `Expr::Offset` rewrite). Tuple shapes:
-                //   - Array<T>     / nodeList<T>      -> (int,  T)
-                //   - Map<K, V>    / nodeIndex<K, V>  -> (K,    V)
-                //   - nodeTime<T>                     -> (time, T)
-                //   - nodeGeo<T>                      -> (geo,  T)
-                // Strict-null rule for unknown / missing parts:
-                // keys fall back to `any` (non-null — runtime never
-                // yields a null key during iteration); values fall
-                // back to `any?` (could legitimately be nullable).
-                let any_nn = self.any();
-                let any_nl = self.any_nullable();
-                let int_id = self.primitive(Primitive::Int);
-                let time_id = self.primitive(Primitive::Time);
-                let geo_id = self.primitive(Primitive::Geo);
-                // Receiver is nullable iterables propagate through
-                // here too — `for (i, v in arr?)` is valid GreyCat.
-                // Strip the optional before pattern-matching the
-                // kind so the binding logic is the same with or
-                // without the `?` marker.
-                let underlying_ty = if self.arena.get(range_ty).nullable {
-                    let mut t = self.arena.get(range_ty).clone();
-                    t.nullable = false;
-                    self.arena.alloc(t)
-                } else {
-                    range_ty
-                };
-                // Both `Generic { decl, args }` (e.g. `Array<int>`)
-                // and bare `Type(decl)` (e.g. raw `Array` without
-                // args — **P19.15**) carry the same decl handle.
-                // Fold them so the dispatch is one pass with the
-                // args slice empty in the bare case.
-                let decl_and_args: Option<(ItemId, Vec<TypeId>)> =
-                    match &self.arena.get(underlying_ty).kind {
-                        TypeKind::Generic { tpl, args } => Some((*tpl, args.to_vec())),
-                        TypeKind::Type(decl) => Some((*decl, Vec::new())),
-                        _ => None,
-                    };
-                let (key_ty, val_ty) = if let Some((decl, args)) = decl_and_args {
-                    let wk = &self.well_known;
-                    if Some(decl) == wk.array_decl || Some(decl) == wk.node_list_decl {
-                        (int_id, args.first().copied().unwrap_or(any_nl))
-                    } else if Some(decl) == wk.map_decl || Some(decl) == wk.node_index_decl {
-                        (
-                            args.first().copied().unwrap_or(any_nn),
-                            args.get(1).copied().unwrap_or(any_nl),
-                        )
-                    } else if Some(decl) == wk.node_time_decl {
-                        (time_id, args.first().copied().unwrap_or(any_nl))
-                    } else if Some(decl) == wk.node_geo_decl {
-                        (geo_id, args.first().copied().unwrap_or(any_nl))
-                    } else {
-                        // Not a known iterable. A follow-up chunk
-                        // can consult `TypeFlags.iterable` for
-                        // user-tagged `@iterable` decls once a
-                        // per-decl tuple shape is defined.
-                        (any_nn, any_nl)
-                    }
-                } else {
-                    (any_nn, any_nl)
-                };
-                let inferred: Vec<TypeId> = if params.len() == 2 {
-                    vec![key_ty, val_ty]
-                } else {
-                    // Defensive — grammar guarantees `>= 2`, but
-                    // keep slot 0 as the key (non-null) and the
-                    // rest as values (nullable). Old code returned
-                    // `any?` for all slots here, which was wrong
-                    // for slot 0 under strict-null semantics.
-                    let mut v = Vec::with_capacity(params.len());
-                    v.push(key_ty);
-                    for _ in 1..params.len() {
-                        v.push(any_nl);
-                    }
-                    v
-                };
-                for (p, inf_ty) in params.iter().zip(inferred.iter()) {
-                    let bound_ty = match p.ty {
-                        Some(t) => self.lower_type_ref(t),
-                        None => *inf_ty,
-                    };
-                    self.out.def_types.insert(p.name, bound_ty);
-                }
-                self.visit_block(&body, return_ty);
-            }
+            Stmt::If(s) => self.visit_if_stmt(stmt_id, s, return_ty),
+            Stmt::While(s) => self.visit_while_stmt(stmt_id, s, return_ty),
+            Stmt::DoWhile(s) => self.visit_do_while_stmt(stmt_id, s, return_ty),
+            Stmt::For(s) => self.visit_for_stmt(stmt_id, s, return_ty),
+            Stmt::ForIn(s) => self.visit_for_in_stmt(stmt_id, s, return_ty),
             Stmt::Return(r) => {
                 if let Some(v) = r.value {
                     let _ = self.visit_expr(v);
@@ -5076,14 +4236,822 @@ impl<'a> Cx<'a> {
                 catch_block,
                 ..
             }) => {
-                self.visit_block(&try_block, return_ty);
-                self.visit_block(&catch_block, return_ty);
+                self.visit_block(try_block, return_ty);
+                self.visit_block(catch_block, return_ty);
             }
             Stmt::At(AtStmt { expr, block, .. }) => {
-                let _ = self.visit_expr(expr);
-                self.visit_block(&block, return_ty);
+                let _ = self.visit_expr(*expr);
+                self.visit_block(block, return_ty);
             }
         }
+    }
+
+    fn visit_if_stmt(&mut self, stmt_id: Idx<Stmt>, s: &IfStmt, return_ty: Option<TypeId>) {
+        self.visit_expr(s.condition);
+        // exhaustiveness: only run from a "head" if (i.e.
+        // not already accounted for as a nested else-if).
+        if !self.chain_member_ifs.contains(&stmt_id) {
+            self.check_enum_exhaustiveness(stmt_id, s.byte_range.clone());
+        }
+
+        let CondNarrows {
+            then_non_null,
+            else_non_null,
+            then_typed,
+            then_member_non_null,
+            else_member_non_null,
+            then_member_typed,
+            else_typed,
+            else_member_typed,
+            then_typed_union,
+            else_typed_union,
+            mut then_typed_id,
+            mut else_typed_id,
+            then_null,
+            else_null,
+            then_member_null,
+            else_member_null,
+            is_atomic_is,
+            then_enum_values,
+            else_enum_values,
+        } = self.derive_cond_narrows(s.condition);
+
+        // Compute the else-side complement
+        // narrow for atomic `is`-conditions. `derive_cond_narrows`
+        // runs in `&self` context (`lower_type_ref` is `&mut self`),
+        // so the complement is computed here in `Stmt::If`
+        // where we have mutable access. Gated on
+        // `is_atomic_is`: atomic for `Expr::Is` (P41) and for
+        // pure `||`-chains of `is`-checks (P42.4); never set
+        // through `&&` (an `&&` else might be either operand
+        // failing — per-ident complements would be unsound).
+        if is_atomic_is {
+            for (ident, ty_ref) in &then_typed {
+                let Some(known) = self.lookup_def_type(*ident) else {
+                    continue;
+                };
+                let asserted = self.lower_type_ref(*ty_ref);
+                if let Some(complement) = self.narrow_complement(known, asserted) {
+                    else_typed_id.push((*ident, complement));
+                }
+            }
+            for (ident, ty_ref) in &else_typed {
+                let Some(known) = self.lookup_def_type(*ident) else {
+                    continue;
+                };
+                let asserted = self.lower_type_ref(*ty_ref);
+                if let Some(complement) = self.narrow_complement(known, asserted) {
+                    then_typed_id.push((*ident, complement));
+                }
+            }
+            // Disjunctive complement for
+            // `(x is T1) || (x is T2)` shape (`then_typed_union`
+            // carries the merged asserted list). Chain
+            // `narrow_complement` over each asserted type, so
+            // `closure(known) \ closure(T1) \ closure(T2)` falls
+            // out for free via repeated subtraction. Mirror for
+            // `else_typed_union` (populated by the `!` swap).
+            for (ident, ty_refs) in &then_typed_union {
+                if let Some(complement) = self.chain_narrow_complement(*ident, ty_refs) {
+                    else_typed_id.push((*ident, complement));
+                }
+            }
+            for (ident, ty_refs) in &else_typed_union {
+                if let Some(complement) = self.chain_narrow_complement(*ident, ty_refs) {
+                    then_typed_id.push((*ident, complement));
+                }
+            }
+        }
+
+        // `exhaustive-is-check`. When every concrete
+        // runtime case of a binding's known type is covered
+        // by the asserted type(s), the negative side of the
+        // guard is unreachable. Mirrors `non-exhaustive` (for
+        // enum chains); this is its inverse-shape sibling.
+        // Emit at most one warning per condition and mark
+        // `decidable_conditions` so the existing per-`is`
+        // contradiction pass doesn't also fire "is already
+        // of type …" on the same span.
+        if is_atomic_is {
+            // (known_disp, asserted_disp, is_negated). The
+            // asserted display is the actionable info — for an
+            // abstract `known` with a single concrete subtype,
+            // it names the type the value is guaranteed to be.
+            let mut hit: Option<(String, String, bool)> = None;
+            for (ident, ty_ref) in &then_typed {
+                if hit.is_some() {
+                    break;
+                }
+                let Some(known) = self.lookup_def_type(*ident) else {
+                    continue;
+                };
+                let asserted = self.lower_type_ref(*ty_ref);
+                if self.narrow_is_exhausted(known, asserted) {
+                    let known_disp = self.display(known).to_string();
+                    let asserted_disp = self.display(asserted).to_string();
+                    hit = Some((known_disp, asserted_disp, false));
+                }
+            }
+            for (ident, ty_refs) in &then_typed_union {
+                if hit.is_some() {
+                    break;
+                }
+                let Some(known) = self.lookup_def_type(*ident) else {
+                    continue;
+                };
+                let asserted = self.lower_typed_union(ty_refs);
+                if self.narrow_is_exhausted(known, asserted) {
+                    let known_disp = self.display(known).to_string();
+                    let asserted_disp = self.display(asserted).to_string();
+                    hit = Some((known_disp, asserted_disp, false));
+                }
+            }
+            // Else-side (under `!` swap): exhaustion means the
+            // *then* branch is unreachable.
+            for (ident, ty_ref) in &else_typed {
+                if hit.is_some() {
+                    break;
+                }
+                let Some(known) = self.lookup_def_type(*ident) else {
+                    continue;
+                };
+                let asserted = self.lower_type_ref(*ty_ref);
+                if self.narrow_is_exhausted(known, asserted) {
+                    let known_disp = self.display(known).to_string();
+                    let asserted_disp = self.display(asserted).to_string();
+                    hit = Some((known_disp, asserted_disp, true));
+                }
+            }
+            for (ident, ty_refs) in &else_typed_union {
+                if hit.is_some() {
+                    break;
+                }
+                let Some(known) = self.lookup_def_type(*ident) else {
+                    continue;
+                };
+                let asserted = self.lower_typed_union(ty_refs);
+                if self.narrow_is_exhausted(known, asserted) {
+                    let known_disp = self.display(known).to_string();
+                    let asserted_disp = self.display(asserted).to_string();
+                    hit = Some((known_disp, asserted_disp, true));
+                }
+            }
+            if let Some((known_disp, asserted_disp, is_negated)) = hit {
+                let dead = if is_negated { "then" } else { "else" };
+                // Only emit when the dead branch is actually
+                // present in source. When `is_negated = false`,
+                // the dead branch is `else`; if the user didn't
+                // write one, there's nothing redundant about the
+                // type test — they're using it to gate the
+                // then-body, no implicit reliance on an
+                // unreachable else. When `is_negated = true`, the
+                // dead branch is `then`, which the grammar
+                // requires — always emit.
+                if is_negated || s.else_branch.is_some() {
+                    let msg = format!(
+                        "every value of `{known_disp}` matches `{asserted_disp}`: the {dead}-branch is unreachable",
+                    );
+                    let range = self.hir.exprs[s.condition].byte_range();
+                    self.diag(Severity::Warning, "exhaustive-is-check", msg, range);
+                }
+                // Mark decidable regardless of whether we
+                // surfaced the warning — downstream `unreachable`
+                // / contradiction passes consume this independently.
+                // `is_negated = false` means the if-cond is always
+                // true (then-branch always runs). `is_negated = true`
+                // means the cond is `!(…always-true…)` → always
+                // false (else-branch runs).
+                self.out.decidable_conditions.insert(stmt_id, !is_negated);
+            }
+        }
+
+        // Decide triviality BEFORE pushing any narrows — the
+        // null-strip and `is`-narrow application below would
+        // shadow the bindings' declared types and make every
+        // null / type check look trivially decidable against
+        // itself.
+        let decidable = self.trivially_decidable(s.condition);
+        if let Some(b) = decidable {
+            let range = self.hir.exprs[s.condition].byte_range();
+            let msg = if b {
+                "condition is always true"
+            } else {
+                "condition is always false"
+            };
+            self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
+            self.out.decidable_conditions.insert(stmt_id, b);
+        }
+
+        self.push_narrow();
+        for ident in &then_non_null {
+            if let Some(cur) = self.lookup_def_type(*ident) {
+                let stripped = self.arena.strip_nullable(cur);
+                self.write_narrow(*ident, stripped);
+            }
+        }
+        // Capture each `is`-narrowed binding's *pre-narrow*
+        // declared type first — the contradiction pass needs
+        // to compare the asserted `is`-type against the
+        // binding's known type at the if-condition's eval
+        // site. If we wrote the narrows first, `lookup_def_type`
+        // would return the asserted type itself and every
+        // single `is`-check would falsely look "always true".
+        let mut multi_typed: FxHashMap<Idx<Ident>, (Option<TypeId>, Vec<TypeId>)> =
+            FxHashMap::default();
+        for (ident, ty_ref) in &then_typed {
+            let ty = self.lower_type_ref(*ty_ref);
+            let entry = multi_typed
+                .entry(*ident)
+                .or_insert_with(|| (self.lookup_def_type_for_is(*ident), Vec::new()));
+            entry.1.push(ty);
+        }
+        for (ident, group) in &multi_typed {
+            for ty in &group.1 {
+                self.write_narrow(*ident, *ty);
+            }
+        }
+        for (ident, ty_refs) in &then_typed_union {
+            let ty = self.lower_typed_union(ty_refs);
+            self.write_narrow(*ident, ty);
+        }
+        // Pre-lowered narrows (today populated only
+        // via the `!` swap; the `Expr::Is` arm of
+        // `derive_cond_narrows` populates `else_typed_id` in
+        // P41.2).
+        for (ident, ty) in &then_typed_id {
+            self.write_narrow(*ident, *ty);
+        }
+        // Skip the `is`-contradiction pass when the condition
+        // is already trivially decidable — it would re-emit a
+        // duplicate "always (true|false)" diag.
+        if decidable.is_none() {
+            self.diagnose_then_typed_contradictions(&multi_typed, s.condition, stmt_id);
+        }
+        for path in &then_member_non_null {
+            self.write_member_non_null(Cow::Borrowed(path));
+        }
+        for (path, ty_ref) in &then_member_typed {
+            let ty = self.lower_type_ref(*ty_ref);
+            self.write_member_typed(Cow::Borrowed(path), ty);
+        }
+        for ident in &then_null {
+            let null_ty = self.null();
+            self.write_narrow(*ident, null_ty);
+        }
+        for path in &then_member_null {
+            let null_ty = self.null();
+            self.write_member_typed(Cow::Borrowed(path), null_ty);
+        }
+        // Enum-value narrows: each entry constrains a binding
+        // to a set of variants of one enum. `write_enum_value_narrow`
+        // intersects with any outer narrow already on the
+        // stack, so nested guards compose (e.g. inner `c ==
+        // Red` inside outer `c == Red || c == Green` lands at
+        // `{Red}`).
+        for (ident, enum_sym, variants) in &then_enum_values {
+            self.write_enum_value_narrow(*ident, *enum_sym, variants);
+        }
+        // Inline the then-branch's stmts (instead
+        // of `visit_block`) so the narrow frame we just pushed
+        // captures any assignments inside the branch. The
+        // post-if join then sees those narrows. `visit_block`
+        // would push+pop its own frame, discarding them.
+        for s in &s.then_branch.stmts {
+            self.visit_stmt(*s, return_ty);
+        }
+        let then_branch_narrows: FxHashMap<Idx<Ident>, TypeId> =
+            self.narrows.last().cloned().unwrap_or_default();
+        let then_branch_member_narrows: FxHashSet<String> =
+            self.member_narrows.last().cloned().unwrap_or_default();
+        self.pop_narrow();
+        let then_terminates = block_terminates(self.hir, &s.then_branch);
+
+        let (else_terminates, else_branch_narrows, else_branch_member_narrows) =
+            if let Some(eb) = s.else_branch {
+                self.push_narrow();
+                for ident in &else_non_null {
+                    if let Some(cur) = self.lookup_def_type(*ident) {
+                        let stripped = self.arena.strip_nullable(cur);
+                        self.write_narrow(*ident, stripped);
+                    }
+                }
+                for path in &else_member_non_null {
+                    self.write_member_non_null(Cow::Borrowed(path));
+                }
+                for (ident, ty_ref) in &else_typed {
+                    let ty = self.lower_type_ref(*ty_ref);
+                    self.write_narrow(*ident, ty);
+                }
+                for (ident, ty_refs) in &else_typed_union {
+                    let ty = self.lower_typed_union(ty_refs);
+                    self.write_narrow(*ident, ty);
+                }
+                // P41.1 — apply pre-lowered else-side narrows.
+                for (ident, ty) in &else_typed_id {
+                    self.write_narrow(*ident, *ty);
+                }
+                for (path, ty_ref) in &else_member_typed {
+                    let ty = self.lower_type_ref(*ty_ref);
+                    self.write_member_typed(Cow::Borrowed(path), ty);
+                }
+                for ident in &else_null {
+                    let null_ty = self.null();
+                    self.write_narrow(*ident, null_ty);
+                }
+                for path in &else_member_null {
+                    let null_ty = self.null();
+                    self.write_member_typed(Cow::Borrowed(path), null_ty);
+                }
+                for (ident, enum_sym, variants) in &else_enum_values {
+                    self.write_enum_value_narrow(*ident, *enum_sym, variants);
+                }
+                // Same inline pattern for the else
+                // branch. `eb` may be a Block or a nested If
+                // (`else if`); for the Block case we inline,
+                // for the If case we still call visit_stmt
+                // (an If handles its own narrows internally).
+                if let Stmt::Block(eb_block) = &self.hir.stmts[eb] {
+                    for s in &eb_block.stmts {
+                        self.visit_stmt(*s, return_ty);
+                    }
+                } else {
+                    self.visit_stmt(eb, return_ty);
+                }
+                let captured: FxHashMap<Idx<Ident>, TypeId> =
+                    self.narrows.last().cloned().unwrap_or_default();
+                let captured_members: FxHashSet<String> =
+                    self.member_narrows.last().cloned().unwrap_or_default();
+                self.pop_narrow();
+                (stmt_terminates(self.hir, eb), captured, captured_members)
+            } else {
+                (false, FxHashMap::default(), FxHashSet::default())
+            };
+
+        // CFG-aware narrowing — early return / throw etc.
+        // If the then-branch always exits the surrounding flow
+        // (return / throw / break / continue), the post-if
+        // scope inherits the *else* condition's narrowing
+        // (e.g. `if (x == null) { return; } use(x);` — `x` is
+        // non-null after the if). Mirrored for the else side.
+        if then_terminates {
+            for ident in &else_non_null {
+                if let Some(cur) = self.lookup_def_type(*ident) {
+                    let stripped = self.arena.strip_nullable(cur);
+                    self.write_narrow(*ident, stripped);
+                }
+            }
+            for path in &else_member_non_null {
+                self.write_member_non_null(Cow::Borrowed(path));
+            }
+            for (ident, ty_ref) in &else_typed {
+                let ty = self.lower_type_ref(*ty_ref);
+                self.write_narrow(*ident, ty);
+            }
+            for (ident, ty_refs) in &else_typed_union {
+                let ty = self.lower_typed_union(ty_refs);
+                self.write_narrow(*ident, ty);
+            }
+            // Load-bearing for the union-complement
+            // shape: `if (x is T) { return; } use(x);` lifts
+            // the complement into the post-if scope.
+            for (ident, ty) in &else_typed_id {
+                self.write_narrow(*ident, *ty);
+            }
+            for (path, ty_ref) in &else_member_typed {
+                let ty = self.lower_type_ref(*ty_ref);
+                self.write_member_typed(Cow::Borrowed(path), ty);
+            }
+            for ident in &else_null {
+                let null_ty = self.null();
+                self.write_narrow(*ident, null_ty);
+            }
+            for path in &else_member_null {
+                let null_ty = self.null();
+                self.write_member_typed(Cow::Borrowed(path), null_ty);
+            }
+            // Reassignments inside the else block must win
+            // over the condition-entry narrows above — the
+            // captured `else_branch_narrows` is the actual
+            // end-of-else state. Applied last so an else-
+            // branch `x = node<...>{...}` overrides the
+            // condition's `else_null` lift for `x`.
+            if !else_terminates {
+                for (ident, ty) in &else_branch_narrows {
+                    self.write_narrow(*ident, *ty);
+                }
+                for path in &else_branch_member_narrows {
+                    self.write_member_non_null(Cow::Borrowed(path));
+                }
+            }
+        }
+        if else_terminates {
+            for ident in &then_non_null {
+                if let Some(cur) = self.lookup_def_type(*ident) {
+                    let stripped = self.arena.strip_nullable(cur);
+                    self.write_narrow(*ident, stripped);
+                }
+            }
+            for (ident, ty_ref) in &then_typed {
+                let ty = self.lower_type_ref(*ty_ref);
+                self.write_narrow(*ident, ty);
+            }
+            for (ident, ty_refs) in &then_typed_union {
+                let ty = self.lower_typed_union(ty_refs);
+                self.write_narrow(*ident, ty);
+            }
+            // `if (!(x is T)) { return; } use(x);` —
+            // the `!` swap pushes the complement to
+            // `then_typed_id`, the else-terminates path lifts
+            // it.
+            for (ident, ty) in &then_typed_id {
+                self.write_narrow(*ident, *ty);
+            }
+            for path in &then_member_non_null {
+                self.write_member_non_null(Cow::Borrowed(path));
+            }
+            for (path, ty_ref) in &then_member_typed {
+                let ty = self.lower_type_ref(*ty_ref);
+                self.write_member_typed(Cow::Borrowed(path), ty);
+            }
+            for ident in &then_null {
+                let null_ty = self.null();
+                self.write_narrow(*ident, null_ty);
+            }
+            for path in &then_member_null {
+                let null_ty = self.null();
+                self.write_member_typed(Cow::Borrowed(path), null_ty);
+            }
+            // Mirror of the then_terminates path: the captured
+            // then-branch state has reassignments that should
+            // override the condition-entry narrows.
+            if !then_terminates {
+                for (ident, ty) in &then_branch_narrows {
+                    self.write_narrow(*ident, *ty);
+                }
+                for path in &then_branch_member_narrows {
+                    self.write_member_non_null(Cow::Borrowed(path));
+                }
+            }
+        }
+
+        // Post-if assignment-narrow lift. For
+        // each binding that's nullable before the if and
+        // is non-null along *every* path through the if,
+        // narrow the post-if scope to its non-null form.
+        //
+        // Two source paths to consider:
+        // - then path: non-null iff (condition implied non-null
+        //   on then-side, captured in `then_non_null`) OR
+        //   (the then-branch assigned a non-null value to it,
+        //   captured in `then_branch_narrows`) OR
+        //   (the then-branch terminates, in which case this
+        //   path "doesn't reach" the post-if).
+        // - else path (or implicit fall-through when no else):
+        //   non-null iff (condition implied non-null on
+        //   else-side, captured in `else_non_null`) OR
+        //   (else-branch assigned a non-null value, captured
+        //   in `else_branch_narrows`) OR (else terminates).
+        //
+        // The cleanest representation: for each candidate
+        // binding, look up its post-then and post-else
+        // effective type and check if both are non-null.
+        if !then_terminates && !else_terminates {
+            let mut candidates: FxHashSet<Idx<Ident>> = FxHashSet::default();
+            candidates.extend(then_branch_narrows.keys().copied());
+            candidates.extend(else_branch_narrows.keys().copied());
+            candidates.extend(then_non_null.iter().copied());
+            candidates.extend(else_non_null.iter().copied());
+            for ident in candidates {
+                let pre = match self.lookup_def_type(ident) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if !self.arena.get(pre).nullable {
+                    // Already non-null — nothing to lift.
+                    continue;
+                }
+                // Effective type at the end of the then-path.
+                let then_eff = then_branch_narrows
+                    .get(&ident)
+                    .copied()
+                    .or_else(|| {
+                        if then_non_null.contains(&ident) {
+                            Some(self.arena.strip_nullable(pre))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(pre);
+                // Effective type at the end of the else-path
+                // (or implicit fall-through).
+                let else_eff = else_branch_narrows
+                    .get(&ident)
+                    .copied()
+                    .or_else(|| {
+                        if else_non_null.contains(&ident) {
+                            Some(self.arena.strip_nullable(pre))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(pre);
+                if !self.arena.get(then_eff).nullable && !self.arena.get(else_eff).nullable {
+                    // Pick the merged narrow. Default: strip
+                    // nullable off `pre` (works when pre is
+                    // `T?` — both paths land at `T`).
+                    //
+                    // Edge case — `pre` was already narrowed
+                    // to the literal `Null` shape by an outer
+                    // guard (e.g. inside `if (u == null) {
+                    // ...; if (u == null) { u = nonNull } ...
+                    // }`). `strip_nullable(Null)` yields a
+                    // dead `Null` kind with `nullable=false`
+                    // — which passes the per-side non-null
+                    // check above but, written as a narrow,
+                    // makes downstream reads see `null`. In
+                    // that case prefer a side's concrete
+                    // narrow when one exists, else fall back
+                    // to the binding's declared type stripped
+                    // of nullability.
+                    let pre_is_null_shape = matches!(self.arena.get(pre).kind, TypeKind::Null);
+                    let then_is_null_shape =
+                        matches!(self.arena.get(then_eff).kind, TypeKind::Null);
+                    let else_is_null_shape =
+                        matches!(self.arena.get(else_eff).kind, TypeKind::Null);
+                    let merged = if pre_is_null_shape {
+                        if !then_is_null_shape {
+                            then_eff
+                        } else if !else_is_null_shape {
+                            else_eff
+                        } else {
+                            self.out
+                                .def_types
+                                .get(&ident)
+                                .copied()
+                                .map(|d| self.arena.strip_nullable(d))
+                                .unwrap_or_else(|| self.arena.strip_nullable(pre))
+                        }
+                    } else {
+                        self.arena.strip_nullable(pre)
+                    };
+                    self.write_narrow(ident, merged);
+                }
+            }
+            // Same lift for member-access paths.
+            // A path is non-null post-if iff every reaching
+            // branch made it non-null. Reaching condition:
+            // (in then_branch_member_narrows OR
+            //  in then_member_non_null) AND
+            // (in else_branch_member_narrows OR
+            //  in else_member_non_null).
+            // No "no else" implicit fall-through case here:
+            // we don't track which paths *were* non-null
+            // outside the if, so we conservatively require
+            // the else side to either exist and narrow, or
+            // the condition's else_member side to imply it.
+            let mut member_candidates: FxHashSet<&String> = FxHashSet::default();
+            member_candidates.extend(then_branch_member_narrows.iter());
+            member_candidates.extend(else_branch_member_narrows.iter());
+            for path in &then_member_non_null {
+                member_candidates.insert(path);
+            }
+            for path in &else_member_non_null {
+                member_candidates.insert(path);
+            }
+            member_candidates
+                .iter()
+                .filter(|&&p| {
+                    let then_ok =
+                        then_branch_member_narrows.contains(p) || then_member_non_null.contains(p);
+                    let else_ok = if s.else_branch.is_some() {
+                        else_branch_member_narrows.contains(p) || else_member_non_null.contains(p)
+                    } else {
+                        // No else branch — fall-through is
+                        // the implicit else. Only path-side
+                        // narrows from the *condition's*
+                        // else side (`x == null`) carry
+                        // through the implicit fall-through.
+                        else_member_non_null.contains(p)
+                    };
+                    then_ok && else_ok
+                })
+                .for_each(|path| self.write_member_non_null(Cow::Borrowed(path)));
+        }
+    }
+
+    fn visit_while_stmt(&mut self, stmt_id: Idx<Stmt>, s: &WhileStmt, return_ty: Option<TypeId>) {
+        self.visit_expr(s.condition);
+        self.diagnose_decidable_loop_condition(stmt_id, s.condition, "while");
+        // Apply the condition's truthy narrows to the body so
+        // `while (x != null) { use(x) }` sees `x` as non-null
+        // inside the body, mirroring `if (x != null)`.
+        // Inline the body stmts (instead of `visit_block`) so
+        // the loop's narrow frame is the innermost at body
+        // entry — matches `Stmt::If`'s pattern.
+        let narrows = self.derive_cond_narrows(s.condition);
+        self.push_narrow();
+        self.apply_then_narrows(&narrows);
+        for s in &s.body.stmts {
+            self.visit_stmt(*s, return_ty);
+        }
+        self.pop_narrow();
+        // Post-loop else-narrow lift: if no `break` targets
+        // this loop, the only exit is via cond-false, so the
+        // cond's negation holds at the failing check — which
+        // IS the post-loop binding state, since no code runs
+        // between the failing check and the loop exit.
+        // `apply_else_narrows` writes to the now-innermost
+        // frame (the surrounding scope).
+        if !block_breaks_current_loop(self.hir, &s.body) {
+            self.apply_else_narrows(&narrows);
+        }
+    }
+
+    fn visit_do_while_stmt(
+        &mut self,
+        _stmt_id: Idx<Stmt>,
+        s: &DoWhileStmt,
+        return_ty: Option<TypeId>,
+    ) {
+        // Inline the body's stmts inside a dedicated narrow
+        // frame so reassignments inside the body (`id =
+        // generate();`) survive long enough for the condition
+        // to see them — `visit_block` would push + pop its
+        // own frame and discard them, leaving the cond
+        // staring at the pre-loop narrow.
+        self.push_narrow();
+        for s in &s.body.stmts {
+            self.visit_stmt(*s, return_ty);
+        }
+        self.visit_expr(s.condition);
+        // Body runs once regardless of the condition, so a
+        // decidable `do-while` is informational only — emit
+        // the diagnostic but do NOT record it for the
+        // `unreachable` lint (no dead code to delete).
+        if let Some(b) = self.trivially_decidable(s.condition) {
+            let range = self.hir.exprs[s.condition].byte_range();
+            let msg = if b {
+                "do-while condition is always true (infinite loop)"
+            } else {
+                "do-while condition is always false (body runs exactly once)"
+            };
+            self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
+        }
+        // Capture the cond's narrows before popping the body
+        // frame — `derive_cond_narrows` reads the AST, not
+        // the narrow stack, so the captured `CondNarrows`
+        // outlives the pop unchanged.
+        let narrows = self.derive_cond_narrows(s.condition);
+        self.pop_narrow();
+        // Post-loop else-narrow lift. Body always runs at
+        // least once, so by the time we're past the loop the
+        // cond *was* evaluated (and was false, since we're
+        // past). No push/apply on the body side — that would
+        // be unsound on iter 1, before the cond is checked.
+        if !block_breaks_current_loop(self.hir, &s.body) {
+            self.apply_else_narrows(&narrows);
+        }
+    }
+
+    fn visit_for_stmt(&mut self, stmt_id: Idx<Stmt>, s: &ForStmt, return_ty: Option<TypeId>) {
+        // Bind the C-style for loop's
+        // `init_name` to its declared / inferred type so
+        // uses of the loop var inside `condition` /
+        // `increment` / `body` get a real type instead of
+        // falling back to `any`. Order matters: visit the
+        // init value FIRST (so its type is known), bind
+        // `init_name` to declared-or-inferred, *then*
+        // visit the rest.
+        let init_value_ty = s.init_value.map(|v| self.visit_expr(v));
+        if let Some(name) = s.init_name {
+            let bound_ty = s
+                .init_ty
+                .map(|t| self.lower_type_ref(t))
+                .or(init_value_ty)
+                .unwrap_or_else(|| self.any_nullable());
+            self.out.def_types.insert(name, bound_ty);
+        }
+        // Apply the condition's truthy narrows to body and
+        // increment so `for (var p = init; p != null; p = next(p))`
+        // sees `p` as non-null inside both the body and the
+        // increment expression. Increment runs after body
+        // inside the same frame, matching runtime order
+        // (cond → body → incr → cond).
+        let narrows = if let Some(c) = s.condition {
+            self.visit_expr(c);
+            self.diagnose_decidable_loop_condition(stmt_id, c, "for");
+            self.derive_cond_narrows(c)
+        } else {
+            CondNarrows::default()
+        };
+        self.push_narrow();
+        self.apply_then_narrows(&narrows);
+        for s in &s.body.stmts {
+            self.visit_stmt(*s, return_ty);
+        }
+        if let Some(i) = s.increment {
+            let _ = self.visit_expr(i);
+        }
+        self.pop_narrow();
+        // Post-loop else-narrow lift. Skip when there's no
+        // condition (no narrow to derive) or when `break` can
+        // escape (exit may not have been via cond-false).
+        if s.condition.is_some() && !block_breaks_current_loop(self.hir, &s.body) {
+            self.apply_else_narrows(&narrows);
+        }
+    }
+
+    fn visit_for_in_stmt(&mut self, _stmt_id: Idx<Stmt>, s: &ForInStmt, return_ty: Option<TypeId>) {
+        let range_ty = self.visit_expr(s.iterator);
+        // Type the slice bounds so `from` / `to` get `expr_types`
+        // entries and the resolver sees their ident uses.
+        if let Some(w) = s.window {
+            let _ = self.visit_expr(w);
+        }
+        // Bind each iterator param's def_type from
+        // the iterable's element type. Iterability in
+        // GreyCat is gated by the `@iterable` type-pragma;
+        // in stdlib that covers six native types — Array,
+        // Map, nodeList, nodeIndex, nodeTime, nodeGeo. All
+        // six have stable `WellKnown` decl handles, so the
+        // dispatch is `Some(decl) == self.well_known.<slot>`
+        // identity (same pattern as `WellKnown::is_node_tag`
+        // and the `Expr::Offset` rewrite). Tuple shapes:
+        //   - Array<T>     / nodeList<T>      -> (int,  T)
+        //   - Map<K, V>    / nodeIndex<K, V>  -> (K,    V)
+        //   - nodeTime<T>                     -> (time, T)
+        //   - nodeGeo<T>                      -> (geo,  T)
+        // Strict-null rule for unknown / missing parts:
+        // keys fall back to `any` (non-null — runtime never
+        // yields a null key during iteration); values fall
+        // back to `any?` (could legitimately be nullable).
+        let any_nn = self.any();
+        let any_nl = self.any_nullable();
+        let int_id = self.primitive(Primitive::Int);
+        let time_id = self.primitive(Primitive::Time);
+        let geo_id = self.primitive(Primitive::Geo);
+        // Receiver is nullable iterables propagate through
+        // here too — `for (i, v in arr?)` is valid GreyCat.
+        // Strip the optional before pattern-matching the
+        // kind so the binding logic is the same with or
+        // without the `?` marker.
+        let underlying_ty = self.arena.strip_nullable(range_ty);
+        // Both `Generic { tpl, args }` (e.g. `Array<int>`)
+        // and bare `Type(decl)` (e.g. raw `Array` without
+        // args — **P19.15**) carry the same decl handle.
+        // Fold them so the dispatch is one pass with the
+        // args slice empty in the bare case.
+        let decl_and_args: Option<(ItemId, &[TypeId])> = match &self.arena.get(underlying_ty).kind {
+            TypeKind::Generic { tpl, args } => Some((*tpl, args.as_slice())),
+            TypeKind::Type(decl) => Some((*decl, &[])),
+            _ => None,
+        };
+        let (key_ty, val_ty) = if let Some((decl, args)) = decl_and_args {
+            let wk = &self.well_known;
+            if Some(decl) == wk.array_decl || Some(decl) == wk.node_list_decl {
+                (int_id, args.first().copied().unwrap_or(any_nl))
+            } else if Some(decl) == wk.map_decl || Some(decl) == wk.node_index_decl {
+                (
+                    args.first().copied().unwrap_or(any_nn),
+                    args.get(1).copied().unwrap_or(any_nl),
+                )
+            } else if Some(decl) == wk.node_time_decl {
+                (time_id, args.first().copied().unwrap_or(any_nl))
+            } else if Some(decl) == wk.node_geo_decl {
+                (geo_id, args.first().copied().unwrap_or(any_nl))
+            } else {
+                // Not a known iterable. A follow-up chunk
+                // can consult `TypeFlags.iterable` for
+                // user-tagged `@iterable` decls once a
+                // per-decl tuple shape is defined.
+                (any_nn, any_nl)
+            }
+        } else {
+            (any_nn, any_nl)
+        };
+        let inferred: Vec<TypeId> = if s.params.len() == 2 {
+            vec![key_ty, val_ty]
+        } else {
+            // Defensive — grammar guarantees `>= 2`, but
+            // keep slot 0 as the key (non-null) and the
+            // rest as values (nullable). Old code returned
+            // `any?` for all slots here, which was wrong
+            // for slot 0 under strict-null semantics.
+            let mut v = Vec::with_capacity(s.params.len());
+            v.push(key_ty);
+            for _ in 1..s.params.len() {
+                v.push(any_nl);
+            }
+            v
+        };
+        for (p, inf_ty) in s.params.iter().zip(inferred.iter()) {
+            let bound_ty = match p.ty {
+                Some(t) => self.lower_type_ref(t),
+                None => *inf_ty,
+            };
+            self.out.def_types.insert(p.name, bound_ty);
+        }
+        self.visit_block(&s.body, return_ty);
     }
 
     /// Narrowing analyzer for if-conditions.
@@ -5366,7 +5334,6 @@ impl<'a> Cx<'a> {
         out
     }
 
-    // P6.6
     /// Exhaustiveness: if `head_id` is the start of an
     /// `if (x == E::A) { ... } else if (x == E::B) { ... }` chain (no
     /// final `else`), check that every variant of `E` is covered. Emit
@@ -6342,11 +6309,11 @@ impl<'a> Cx<'a> {
                             self.write_narrow(*ident, ty);
                         }
                         for path in member_non_null {
-                            self.write_member_non_null(path);
+                            self.write_member_non_null(Cow::Owned(path));
                         }
                         for (path, ty_ref) in member_typed {
                             let ty = self.lower_type_ref(ty_ref);
-                            self.write_member_typed(path, ty);
+                            self.write_member_typed(Cow::Owned(path), ty);
                         }
                         for ident in &null {
                             let null_ty = self.null();
@@ -6354,7 +6321,7 @@ impl<'a> Cx<'a> {
                         }
                         for path in member_null {
                             let null_ty = self.null();
-                            self.write_member_typed(path, null_ty);
+                            self.write_member_typed(Cow::Owned(path), null_ty);
                         }
                         let rt = self.visit_expr(*right);
                         self.pop_narrow();
@@ -6386,7 +6353,7 @@ impl<'a> Cx<'a> {
                     UnaryOp::Neg | UnaryOp::Pos | UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
                         inner
                     }
-                    // **P19.14** — `*n` deref. For
+                    // `*n` deref. For
                     // `Generic { name: "node", args: [T] }` (and
                     // similar tag shapes) returns `T`; otherwise
                     // returns `inner` so non-node uses still get
@@ -6401,7 +6368,7 @@ impl<'a> Cx<'a> {
                         // enclosing block when the operand is an Ident
                         // bound to a Param/Local.
                         //
-                        // **P20.2** — when the operand is a stable
+                        // When the operand is a stable
                         // member-access path (`x.y`, `this.foo.bar`,
                         // `x->y`), record the path on the
                         // `member_narrows` stack so subsequent reads of
@@ -6424,7 +6391,7 @@ impl<'a> Cx<'a> {
                             Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
                         ) && let Some(path) = self.member_path(*operand)
                         {
-                            self.write_member_non_null(path);
+                            self.write_member_non_null(Cow::Owned(path));
                         }
                         result
                     }

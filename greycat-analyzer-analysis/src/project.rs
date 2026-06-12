@@ -263,7 +263,7 @@ impl ProjectAnalysis {
 
     /// Project-wide well-known std/core decl handles. Capability
     /// handlers that need to dispatch on the std-core `node` /
-    /// `Array` / etc. identity (rather than the SmolStr name)
+    /// `Array` / etc. identity
     /// consume this via `WellKnown::is_node_tag(decl)` etc.
     pub fn well_known(&self) -> &crate::well_known::WellKnown {
         &self.well_known

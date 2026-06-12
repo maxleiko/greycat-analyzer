@@ -6,8 +6,7 @@
 //! [`ProjectIndex::duplicate_modules`] gate enforces it at ingest).
 //! Two `ItemId`s compare equal iff they refer to the same item in the
 //! same module; a user-declared `type node<T>` and the std-core
-//! `node<T>` therefore get distinct identities, closing the soundness
-//! gap where the previous SmolStr-keyed identity collapsed them.
+//! `node<T>` therefore get distinct identities.
 //!
 //! - [`DeclRegistry`] maps `ItemId → Idx<Decl>` so consumers holding
 //!   a type-system handle can navigate back to the source `Decl` in

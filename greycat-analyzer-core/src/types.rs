@@ -1172,23 +1172,15 @@ mod tests {
         assert_eq!(cx.arena.len(), 1);
     }
 
-    // P25.4
-    /// `TypeKind` name fields are `SmolStr`. The arena's intern map
-    /// keys on `Type` (which derives Hash + Eq), so two equivalent
-    /// `Type` values constructed via different name-source paths must
-    /// hash and compare equal. `SmolStr::hash` and `String::hash` both
-    /// delegate to `str::hash`, so generic instantiations minted from
-    /// a `String`-flavoured callsite (`String::from("Array").into()`)
-    /// and from a `SmolStr`-flavoured callsite (`SmolStr::from("Array")`)
-    /// must collapse to the same TypeId.
     #[test]
-    fn typekind_name_dedups_across_smolstr_and_string_paths() {
+    fn typekind_name_dedups() {
         let mut cx = TextCx::default();
-        let arg_string = cx.arena.primitive(Primitive::Int);
-        let array_decl = cx.item("Array");
-        let g_a = cx.arena.alloc_generic(array_decl, vec![arg_string]);
-        let g_b = cx.arena.alloc_generic(array_decl, vec![arg_string]);
-        assert_eq!(g_a, g_b);
+        let int_ty = cx.arena.primitive(Primitive::Int);
+        let array_ty = cx.item("Array");
+        let a = cx.arena.alloc_generic(array_ty, vec![int_ty]);
+        let b = cx.arena.alloc_generic(array_ty, vec![int_ty]);
+        assert_eq!(a, b);
+        assert_eq!(cx.arena.len(), 2);
     }
 
     #[test]
@@ -1198,6 +1190,17 @@ mod tests {
         let q1 = cx.arena.nullable(i);
         let q2 = cx.arena.nullable(q1);
         assert_eq!(q1, q2);
+        assert_eq!(cx.arena.len(), 2);
+    }
+
+    #[test]
+    fn strip_nullable_idempotent() {
+        let mut cx = TextCx::default();
+        let i = cx.arena.primitive(Primitive::Int);
+        let ni = cx.arena.nullable(i);
+        let i2 = cx.arena.strip_nullable(ni);
+        assert_eq!(i, i2);
+        assert_eq!(cx.arena.len(), 2);
     }
 
     #[test]

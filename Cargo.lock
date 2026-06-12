@@ -385,7 +385,6 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "smol_str",
  "wasm-bindgen",
  "web-time",
 ]
