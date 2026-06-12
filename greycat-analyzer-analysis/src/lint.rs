@@ -11,22 +11,194 @@
 //! the LSP code-action layer has concrete edit suggestions to apply
 //! ( placeholder).
 
-use std::ops::Range;
+mod duplicate_decl;
+mod literal_overflow;
+mod modvar_shape;
+mod unused_catch_param;
+mod unused_decl;
+mod unused_generic_param;
+mod unused_local;
+mod unused_param;
 
-use rustc_hash::FxHashMap;
+pub use duplicate_decl::DuplicateDecl;
+pub use literal_overflow::LiteralOverflow;
+pub use modvar_shape::ModVarShape;
+pub use unused_catch_param::UnusedCatchParam;
+pub use unused_decl::UnusedDecl;
+pub use unused_generic_param::UnusedGenericParam;
+pub use unused_local::UnusedLocal;
+pub use unused_param::UnusedParam;
+
+use std::ops::Range;
 
 use greycat_analyzer_core::{ItemId, SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
     BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, PropertyName, Stmt,
-    TypeDecl, UnaryExpr, UnaryOp,
+    UnaryExpr, UnaryOp,
 };
 use greycat_analyzer_hir::{DeclRegistry, Hir};
 
 use crate::analyzer::AnalysisResult;
 use crate::directives::Directives;
-use crate::index::{Namespace, ProjectIndex};
+use crate::index::ProjectIndex;
 use crate::resolver::{Definition, Resolutions};
+
+/// Project-wide registry of every lint rule the analyzer can emit.
+/// Includes both the pure-HIR rules (driven through [`run_lints`]) and
+/// the typed lints driven from the project pipeline (`arrow-on-non-deref`,
+/// the `nullability` family, `infer-return-type`).
+//
+/// When adding a new rule whose intent assumes the code is
+/// syntactically complete (e.g. "this expression has no effect",
+/// "this statement is unreachable in a complete chain"), consult
+/// [`greycat_analyzer_hir::Hir::salvaged_stmts`] before emitting on a
+/// statement id. The set tracks shapes tree-sitter recovered from
+/// inside an `ERROR` wrapper — emitting on them creates noise the user
+/// is already aware of (the parse error is right there). No current
+/// rule needs this skip; the hookpoint is documented here so future
+/// rule authors don't reinvent it.
+pub const LINT_RULES: &[LintRuleInfo] = &[
+    rule(
+        "unused-local",
+        "warn when a `var name = …;` local is bound but never read",
+    ),
+    rule(
+        "unused-param",
+        "warn when a function parameter is never read in its body",
+    ),
+    rule(
+        "unused-decl",
+        "warn when a top-level `private` decl is never referenced",
+    ),
+    rule(
+        "unused-generic-param",
+        "warn when a `type Foo<T>` / `fn foo<T>(...)` declares a generic parameter that is never referenced",
+    ),
+    rule(
+        "duplicate-decl",
+        "error when two top-level decls share a name",
+    ),
+    rule(
+        "modvar-must-be-node-tag",
+        "module variable type must be a node tag (`node` / `nodeTime` / …)",
+    ),
+    rule(
+        "modvar-node-cannot-be-nullable",
+        "module-variable nodes are auto-initialized — drop the trailing `?`",
+    ),
+    rule(
+        "modvar-node-inner-must-be-nullable",
+        "`node<T>` requires a nullable inner type — use `node<T?>`",
+    ),
+    rule(
+        "arrow-on-non-deref",
+        "`->` requires a node-tag or `@deref` receiver",
+    ),
+    rule(
+        "possibly-null",
+        "warn when `.` / `->` / `[…]` is used on a possibly-null receiver",
+    ),
+    rule(
+        "redundant-nullable-access",
+        "warn when `?.` / `?->` / `?[…]` is used on a non-nullable receiver",
+    ),
+    rule(
+        "redundant-non-null-assertion",
+        "warn when `!!` is used on an already-non-nullable expression",
+    ),
+    rule(
+        "redundant-coalesce",
+        "warn when `??` is used on an already-non-nullable left operand",
+    ),
+    rule(
+        "infer-return-type",
+        "hint when a fn's return type can be inferred from its body",
+    ),
+    rule(
+        "unreachable",
+        "hint when a statement is unreachable (after a divergent prior statement, \
+         or the trailing `else` of an exhaustive enum chain)",
+    ),
+    rule(
+        "non-exhaustive",
+        "warn when an `if (x == E::A) … else if (x == E::B) …` chain over an enum \
+         doesn't cover every variant (and has no catch-all final `else`)",
+    ),
+    rule(
+        "decidable-condition",
+        "warn when an `if` / `while` / `do-while` / `for` condition is statically \
+         decidable to `true` or `false` (e.g. `if (x is int && x is float)`, \
+         `while (true) {}`). Suppress with `// gcl-lint-off decidable-condition` \
+         when the always-true / always-false outcome is intentional.",
+    ),
+    rule(
+        "unused-suppression",
+        "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
+    ),
+    rule(
+        "unknown-suppression-rule",
+        "flag a `// gcl-lint-off…` directive that names an unknown rule",
+    ),
+    rule(
+        "empty-suppression",
+        "flag a `// gcl-lint-off…` directive with an empty rule list",
+    ),
+    rule(
+        "unbalanced-fmt-off",
+        "flag a `// gcl-fmt-off` with no matching `gcl-fmt-on`",
+    ),
+    rule(
+        "unbalanced-lint-off",
+        "flag a `// gcl-lint-off …` with no matching `gcl-lint-on`",
+    ),
+    rule(
+        "catch-empty-parens",
+        "error on `catch ()` — drop the empty parens (`catch { … }` is the no-binding form)",
+    ),
+    rule(
+        "unused-catch-param",
+        "warn when `catch (e) { … }` binds `e` but never reads it — auto-fix drops `(e)` so the form becomes `catch { … }`",
+    ),
+    rule(
+        "redundant-semicolon",
+        "error on a stray `;` after a top-level decl body (`fn f() {};`, `type T {};`, `enum E {};`, method) — the runtime rejects it; auto-fix removes the `;`",
+    ),
+    rule(
+        "conflicting-lint-pragma",
+        "flag a `@lint_on(\"…\")` / `@lint_off(\"…\")` pair that names the same rule in the same module \
+         — `@lint_off` wins; the other pragma is dead",
+    ),
+    rule(
+        "lint-pragma-outside-entrypoint",
+        "flag a `@lint_off(\"…\")` / `@lint_on(\"…\")` pragma in a non-entrypoint module — \
+         project-wide lint policy belongs in `project.gcl`; auto-fix (P40.6) moves the pragma there",
+    ),
+    advisory_rule(
+        "no-breakpoint",
+        "warn on `breakpoint;` left in committed code — pauses the GreyCat worker for \
+         debugging; auto-fix deletes the statement. Off by default — enable with \
+         `lint --on=no-breakpoint`.",
+    ),
+    rule(
+        "literal-overflow",
+        "warn when a numeric literal exceeds the representable range of its type \
+         (`int` / `float` / `duration` / `time`) or loses float precision",
+    ),
+];
+
+fn default_rules() -> Vec<Box<dyn LintRule>> {
+    vec![
+        Box::new(UnusedLocal),
+        Box::new(UnusedParam),
+        Box::new(UnusedCatchParam),
+        Box::new(UnusedDecl),
+        Box::new(UnusedGenericParam),
+        Box::new(DuplicateDecl),
+        Box::new(ModVarShape),
+        Box::new(LiteralOverflow),
+    ]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintSeverity {
@@ -203,149 +375,6 @@ const fn advisory_rule(name: &'static str, summary: &'static str) -> LintRuleInf
         default_enabled: false,
     }
 }
-
-/// Project-wide registry of every lint rule the analyzer can emit.
-/// Includes both the pure-HIR rules (driven through [`run_lints`]) and
-/// the typed lints driven from the project pipeline (`arrow-on-non-deref`,
-/// the `nullability` family, `infer-return-type`).
-//
-/// When adding a new rule whose intent assumes the code is
-/// syntactically complete (e.g. "this expression has no effect",
-/// "this statement is unreachable in a complete chain"), consult
-/// [`greycat_analyzer_hir::Hir::salvaged_stmts`] before emitting on a
-/// statement id. The set tracks shapes tree-sitter recovered from
-/// inside an `ERROR` wrapper — emitting on them creates noise the user
-/// is already aware of (the parse error is right there). No current
-/// rule needs this skip; the hookpoint is documented here so future
-/// rule authors don't reinvent it.
-pub const LINT_RULES: &[LintRuleInfo] = &[
-    rule(
-        "unused-local",
-        "warn when a `var name = …;` local is bound but never read",
-    ),
-    rule(
-        "unused-param",
-        "warn when a function parameter is never read in its body",
-    ),
-    rule(
-        "unused-decl",
-        "warn when a top-level `private` decl is never referenced",
-    ),
-    rule(
-        "unused-generic-param",
-        "warn when a `type Foo<T>` / `fn foo<T>(...)` declares a generic parameter that is never referenced",
-    ),
-    rule(
-        "duplicate-decl",
-        "error when two top-level decls share a name",
-    ),
-    rule(
-        "modvar-must-be-node-tag",
-        "module variable type must be a node tag (`node` / `nodeTime` / …)",
-    ),
-    rule(
-        "modvar-node-cannot-be-nullable",
-        "module-variable nodes are auto-initialized — drop the trailing `?`",
-    ),
-    rule(
-        "modvar-node-inner-must-be-nullable",
-        "`node<T>` requires a nullable inner type — use `node<T?>`",
-    ),
-    rule(
-        "arrow-on-non-deref",
-        "`->` requires a node-tag or `@deref` receiver",
-    ),
-    rule(
-        "possibly-null",
-        "warn when `.` / `->` / `[…]` is used on a possibly-null receiver",
-    ),
-    rule(
-        "redundant-nullable-access",
-        "warn when `?.` / `?->` / `?[…]` is used on a non-nullable receiver",
-    ),
-    rule(
-        "redundant-non-null-assertion",
-        "warn when `!!` is used on an already-non-nullable expression",
-    ),
-    rule(
-        "redundant-coalesce",
-        "warn when `??` is used on an already-non-nullable left operand",
-    ),
-    rule(
-        "infer-return-type",
-        "hint when a fn's return type can be inferred from its body",
-    ),
-    rule(
-        "unreachable",
-        "hint when a statement is unreachable (after a divergent prior statement, \
-         or the trailing `else` of an exhaustive enum chain)",
-    ),
-    rule(
-        "non-exhaustive",
-        "warn when an `if (x == E::A) … else if (x == E::B) …` chain over an enum \
-         doesn't cover every variant (and has no catch-all final `else`)",
-    ),
-    rule(
-        "decidable-condition",
-        "warn when an `if` / `while` / `do-while` / `for` condition is statically \
-         decidable to `true` or `false` (e.g. `if (x is int && x is float)`, \
-         `while (true) {}`). Suppress with `// gcl-lint-off decidable-condition` \
-         when the always-true / always-false outcome is intentional.",
-    ),
-    rule(
-        "unused-suppression",
-        "flag a `// gcl-lint-off…` directive whose rule didn't suppress anything",
-    ),
-    rule(
-        "unknown-suppression-rule",
-        "flag a `// gcl-lint-off…` directive that names an unknown rule",
-    ),
-    rule(
-        "empty-suppression",
-        "flag a `// gcl-lint-off…` directive with an empty rule list",
-    ),
-    rule(
-        "unbalanced-fmt-off",
-        "flag a `// gcl-fmt-off` with no matching `gcl-fmt-on`",
-    ),
-    rule(
-        "unbalanced-lint-off",
-        "flag a `// gcl-lint-off …` with no matching `gcl-lint-on`",
-    ),
-    rule(
-        "catch-empty-parens",
-        "error on `catch ()` — drop the empty parens (`catch { … }` is the no-binding form)",
-    ),
-    rule(
-        "unused-catch-param",
-        "warn when `catch (e) { … }` binds `e` but never reads it — auto-fix drops `(e)` so the form becomes `catch { … }`",
-    ),
-    rule(
-        "redundant-semicolon",
-        "error on a stray `;` after a top-level decl body (`fn f() {};`, `type T {};`, `enum E {};`, method) — the runtime rejects it; auto-fix removes the `;`",
-    ),
-    rule(
-        "conflicting-lint-pragma",
-        "flag a `@lint_on(\"…\")` / `@lint_off(\"…\")` pair that names the same rule in the same module \
-         — `@lint_off` wins; the other pragma is dead",
-    ),
-    rule(
-        "lint-pragma-outside-entrypoint",
-        "flag a `@lint_off(\"…\")` / `@lint_on(\"…\")` pragma in a non-entrypoint module — \
-         project-wide lint policy belongs in `project.gcl`; auto-fix (P40.6) moves the pragma there",
-    ),
-    advisory_rule(
-        "no-breakpoint",
-        "warn on `breakpoint;` left in committed code — pauses the GreyCat worker for \
-         debugging; auto-fix deletes the statement. Off by default — enable with \
-         `lint --on=no-breakpoint`.",
-    ),
-    rule(
-        "literal-overflow",
-        "warn when a numeric literal exceeds the representable range of its type \
-         (`int` / `float` / `duration` / `time`) or loses float precision",
-    ),
-];
 
 // Note: `invalid-pragma-arg` is NOT a lint — it's a hard
 // structural error surfaced through `module.analysis.diagnostics`
@@ -605,156 +634,6 @@ pub fn lint_no_breakpoint(
     }
 }
 
-fn default_rules() -> Vec<Box<dyn LintRule>> {
-    vec![
-        Box::new(UnusedLocal),
-        Box::new(UnusedParam),
-        Box::new(UnusedCatchParam),
-        Box::new(UnusedDecl),
-        Box::new(UnusedGenericParam),
-        Box::new(DuplicateDecl),
-        Box::new(ModVarShape),
-        Box::new(LiteralOverflow),
-    ]
-}
-
-// =============================================================================
-// Rule: literal-overflow
-// =============================================================================
-
-/// Warn when a numeric literal exceeded its representable range at
-/// HIR lowering time. Covers `int` / `float` overflow, `float`
-/// precision loss, and `duration` / `time` µs saturation — every
-/// case that previously surfaced as a built-in semantic warning.
-/// Routing through the lint registry lets users `// gcl-lint-off
-/// literal-overflow` site-by-site (which the analyzer's diagnostic
-/// path couldn't honour).
-///
-/// Malformed-shape issues (bad char escape, bad ISO-8601) stay on
-/// the semantic path — those are hard errors, not warnings, and
-/// suppressing them via a lint directive would hide genuine parse
-/// failures.
-pub struct LiteralOverflow;
-
-impl LintRule for LiteralOverflow {
-    fn name(&self) -> &'static str {
-        "literal-overflow"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        use greycat_analyzer_hir::types::{LiteralExpr, LiteralKind, ParseIssue};
-        let mut diags: Vec<LintDiagnostic> = Vec::new();
-        for (_, expr) in cx.hir.exprs.iter() {
-            let Expr::Literal(LiteralExpr {
-                kind,
-                parse_issue: Some(issue),
-                byte_range,
-            }) = expr
-            else {
-                continue;
-            };
-            let message = match (kind, issue) {
-                (LiteralKind::Int(_), ParseIssue::Overflow) => {
-                    "integer literal exceeds `int` range: overflow"
-                }
-                (LiteralKind::Float(_), ParseIssue::PrecisionLoss) => {
-                    "float literal has more significant digits than `float` can represent: \
-                     precision lost"
-                }
-                (LiteralKind::Float(_), ParseIssue::Overflow) => {
-                    "float literal exceeds `float` range: value rounded to infinity"
-                }
-                (LiteralKind::Duration(_), ParseIssue::Overflow) => {
-                    "duration literal exceeds the representable `duration` range (µs): \
-                     value saturated"
-                }
-                (LiteralKind::Time(_), ParseIssue::Overflow) => {
-                    "time literal exceeds the representable `time` range (µs): value saturated"
-                }
-                _ => continue,
-            };
-            diags.push(LintDiagnostic {
-                rule: "literal-overflow",
-                severity: LintSeverity::Warning,
-                message: message.to_string(),
-                byte_range: byte_range.clone(),
-                tag: None,
-            });
-        }
-        for d in diags {
-            cx.emit(d);
-        }
-    }
-}
-
-// =============================================================================
-// Rule: unused-local
-// =============================================================================
-
-/// Warn when a local `var name = …;` is bound but never read.
-pub struct UnusedLocal;
-
-impl LintRule for UnusedLocal {
-    fn name(&self) -> &'static str {
-        "unused-local"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        let Some(module) = cx.hir.module.as_ref() else {
-            return;
-        };
-        for decl_id in &module.decls {
-            match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => check_fn(
-                    cx.hir,
-                    cx.res,
-                    cx.symbols,
-                    fnd,
-                    &mut candidates,
-                    self.name(),
-                ),
-                Decl::Type(td) => {
-                    check_type(cx.hir, cx.res, cx.symbols, td, &mut candidates, self.name())
-                }
-                _ => {}
-            }
-        }
-        for d in candidates {
-            cx.emit(d);
-        }
-    }
-}
-
-fn check_fn(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    fnd: &FnDecl,
-    out: &mut Vec<LintDiagnostic>,
-    rule: &'static str,
-) {
-    let Some(body) = fnd.body else {
-        return;
-    };
-    visit_for_locals(hir, res, symbols, body, out, rule);
-}
-
-fn check_type(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    td: &TypeDecl,
-    out: &mut Vec<LintDiagnostic>,
-    rule: &'static str,
-) {
-    for method_id in &td.methods {
-        if let Decl::Fn(fnd) = &hir.decls[*method_id] {
-            check_fn(hir, res, symbols, fnd, out, rule);
-        }
-    }
-}
-
 fn visit_block_for_locals(
     hir: &Hir,
     res: &Resolutions,
@@ -796,7 +675,7 @@ fn check_unused_local_ident(
     }
 }
 
-fn visit_for_locals(
+pub(super) fn visit_for_locals(
     hir: &Hir,
     res: &Resolutions,
     symbols: &SymbolTable,
@@ -835,479 +714,6 @@ fn visit_for_locals(
         Stmt::At(a) => visit_block_for_locals(hir, res, symbols, &a.block, out, rule),
         _ => {}
     }
-}
-
-// =============================================================================
-// Rule: unused-param
-// =============================================================================
-
-/// Hint when a function parameter is never read in its body. Skips
-/// methods on a type (the param may be required for trait-shape
-/// reasons) and skips parameters whose name starts with `_`.
-pub struct UnusedParam;
-
-impl LintRule for UnusedParam {
-    fn name(&self) -> &'static str {
-        "unused-param"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        let Some(module) = cx.hir.module.as_ref() else {
-            return;
-        };
-        for decl_id in &module.decls {
-            match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => check_fn_params(
-                    cx.hir,
-                    cx.res,
-                    cx.symbols,
-                    fnd,
-                    &mut candidates,
-                    self.name(),
-                ),
-                Decl::Type(td) => {
-                    for method_id in &td.methods {
-                        if let Decl::Fn(fnd) = &cx.hir.decls[*method_id] {
-                            check_fn_params(
-                                cx.hir,
-                                cx.res,
-                                cx.symbols,
-                                fnd,
-                                &mut candidates,
-                                self.name(),
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        for d in candidates {
-            cx.emit(d);
-        }
-    }
-}
-
-/// Warn when a `catch (e)` parameter is bound but never read inside
-/// the catch block. Distinct from [`UnusedParam`] because the auto-fix
-/// is qualitatively different — a fn param can't disappear (it's part
-/// of the signature), but a catch ident has the bare `catch { … }`
-/// form to fall back to. The fix drops `(e)` entirely instead of
-/// renaming to `_e`.
-pub struct UnusedCatchParam;
-
-impl LintRule for UnusedCatchParam {
-    fn name(&self) -> &'static str {
-        "unused-catch-param"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        let Some(module) = cx.hir.module.as_ref() else {
-            return;
-        };
-        for decl_id in &module.decls {
-            match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => {
-                    if let Some(body) = fnd.body {
-                        visit_for_catch_params(
-                            cx.hir,
-                            cx.res,
-                            cx.symbols,
-                            body,
-                            &mut candidates,
-                            self.name(),
-                        );
-                    }
-                }
-                Decl::Type(td) => {
-                    for method_id in &td.methods {
-                        if let Decl::Fn(fnd) = &cx.hir.decls[*method_id]
-                            && let Some(body) = fnd.body
-                        {
-                            visit_for_catch_params(
-                                cx.hir,
-                                cx.res,
-                                cx.symbols,
-                                body,
-                                &mut candidates,
-                                self.name(),
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        for d in candidates {
-            cx.emit(d);
-        }
-    }
-}
-
-fn check_fn_params(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    fnd: &FnDecl,
-    out: &mut Vec<LintDiagnostic>,
-    rule: &'static str,
-) {
-    if fnd.modifiers.native || fnd.body.is_none() {
-        return;
-    }
-    for param_id in &fnd.params {
-        let param = &hir.fn_params[*param_id];
-        let ident: &Ident = &hir.idents[param.name];
-        let name = &symbols[ident.symbol];
-        if name.starts_with('_') {
-            continue;
-        }
-        let used = res.uses.values().any(|d| match d {
-            Definition::Param(name) => *name == param.name,
-            _ => false,
-        });
-        if !used {
-            out.push(LintDiagnostic {
-                rule,
-                severity: LintSeverity::Warning,
-                message: format!("unused parameter `{name}`"),
-                byte_range: ident.byte_range.clone(),
-                tag: None,
-            });
-        }
-    }
-}
-
-/// Walk a fn body looking for `try { … } catch (e) { … }` shapes whose
-/// `e` is never read. The catch param is bound by the resolver as
-/// `Definition::Local(name)` (same as a `var`), so the usage check
-/// mirrors `unused-local`'s — emit under the caller-supplied rule
-/// name (today: `unused-catch-param`).
-fn visit_for_catch_params(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    stmt_id: Idx<Stmt>,
-    out: &mut Vec<LintDiagnostic>,
-    rule: &'static str,
-) {
-    use greycat_analyzer_hir::types::BlockStmt;
-    fn visit_block(
-        hir: &Hir,
-        res: &Resolutions,
-        symbols: &SymbolTable,
-        block: &BlockStmt,
-        out: &mut Vec<LintDiagnostic>,
-        rule: &'static str,
-    ) {
-        for s in &block.stmts {
-            visit_for_catch_params(hir, res, symbols, *s, out, rule);
-        }
-    }
-    let stmt = &hir.stmts[stmt_id];
-    match stmt {
-        Stmt::Block(b) => visit_block(hir, res, symbols, b, out, rule),
-        Stmt::If(i) => {
-            visit_block(hir, res, symbols, &i.then_branch, out, rule);
-            if let Some(eb) = i.else_branch {
-                visit_for_catch_params(hir, res, symbols, eb, out, rule);
-            }
-        }
-        Stmt::While(w) => visit_block(hir, res, symbols, &w.body, out, rule),
-        Stmt::DoWhile(w) => visit_block(hir, res, symbols, &w.body, out, rule),
-        Stmt::For(f) => visit_block(hir, res, symbols, &f.body, out, rule),
-        Stmt::ForIn(f) => visit_block(hir, res, symbols, &f.body, out, rule),
-        Stmt::Try(t) => {
-            visit_block(hir, res, symbols, &t.try_block, out, rule);
-            if let Some(name) = t.error_param {
-                let ident = &hir.idents[name];
-                let ident_name = &symbols[ident.symbol];
-                if !ident_name.starts_with('_') {
-                    let used = res.uses.values().any(|d| match d {
-                        Definition::Local(n) => *n == name,
-                        _ => false,
-                    });
-                    if !used {
-                        out.push(LintDiagnostic {
-                            rule,
-                            severity: LintSeverity::Warning,
-                            message: format!("unused catch parameter `{ident_name}`"),
-                            byte_range: ident.byte_range.clone(),
-                            tag: None,
-                        });
-                    }
-                }
-            }
-            visit_block(hir, res, symbols, &t.catch_block, out, rule);
-        }
-        Stmt::At(a) => visit_block(hir, res, symbols, &a.block, out, rule),
-        _ => {}
-    }
-}
-
-// =============================================================================
-// Rule: unused-generic-param
-// =============================================================================
-
-/// Warn when a `type Foo<T>` / `fn foo<T>(...)` declares a generic
-/// parameter that is never referenced inside its enclosing decl
-/// (attributes, supertype, methods, params, return type, body).
-/// Skips:
-/// - native / abstract decls: the generic may participate in a runtime
-///   shape contract that the body can't see (e.g. `native type Array<T>`).
-/// - names starting with `_`, matching the convention `unused-param`
-///   uses for intentional unused params.
-pub struct UnusedGenericParam;
-
-impl LintRule for UnusedGenericParam {
-    fn name(&self) -> &'static str {
-        "unused-generic-param"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        let Some(module) = cx.hir.module.as_ref() else {
-            return;
-        };
-        for decl_id in &module.decls {
-            match &cx.hir.decls[*decl_id] {
-                Decl::Fn(fnd) => {
-                    check_fn_generics(
-                        cx.hir,
-                        cx.res,
-                        cx.symbols,
-                        fnd,
-                        &mut candidates,
-                        self.name(),
-                    );
-                }
-                Decl::Type(td) => {
-                    check_type_generics(
-                        cx.hir,
-                        cx.res,
-                        cx.symbols,
-                        td,
-                        &mut candidates,
-                        self.name(),
-                    );
-                    // Methods are themselves `Decl::Fn` — their own
-                    // generics (separate from the enclosing type's)
-                    // get checked here too.
-                    for method_id in &td.methods {
-                        if let Decl::Fn(method) = &cx.hir.decls[*method_id] {
-                            check_fn_generics(
-                                cx.hir,
-                                cx.res,
-                                cx.symbols,
-                                method,
-                                &mut candidates,
-                                self.name(),
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        for d in candidates {
-            cx.emit(d);
-        }
-    }
-}
-
-fn check_fn_generics(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    fnd: &FnDecl,
-    out: &mut Vec<LintDiagnostic>,
-    rule: &'static str,
-) {
-    if fnd.modifiers.native {
-        return;
-    }
-    emit_unused_generics(hir, res, symbols, &fnd.generics, out, rule);
-}
-
-fn check_type_generics(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    td: &TypeDecl,
-    out: &mut Vec<LintDiagnostic>,
-    rule: &'static str,
-) {
-    if td.modifiers.native {
-        return;
-    }
-    emit_unused_generics(hir, res, symbols, &td.generics, out, rule);
-}
-
-fn emit_unused_generics(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    generics: &[Idx<Ident>],
-    out: &mut Vec<LintDiagnostic>,
-    rule: &'static str,
-) {
-    for g in generics {
-        let ident: &Ident = &hir.idents[*g];
-        let name = &symbols[ident.symbol];
-        if name.starts_with('_') {
-            continue;
-        }
-        let used = res.uses.values().any(|d| match d {
-            Definition::Generic(name) => *name == *g,
-            _ => false,
-        });
-        if !used {
-            out.push(LintDiagnostic {
-                rule,
-                severity: LintSeverity::Warning,
-                message: format!("unused generic parameter `{name}`"),
-                byte_range: ident.byte_range.clone(),
-                tag: None,
-            });
-        }
-    }
-}
-
-// =============================================================================
-// Rule: unused-decl
-// =============================================================================
-
-// P6.7
-/// Warn when a top-level `fn` / `type` / `enum` / `var` is never
-/// referenced anywhere in the module *and* doesn't carry a runtime-
-/// exposing annotation (`@expose`). The reference count
-/// comes from `Resolutions::references_to`, which the resolver builds
-/// from every `Definition::Decl` use site.
-pub struct UnusedDecl;
-
-impl LintRule for UnusedDecl {
-    fn name(&self) -> &'static str {
-        "unused-decl"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        check_unused_decl(cx.hir, cx.res, cx.symbols, &mut candidates);
-        for d in candidates {
-            cx.emit(d);
-        }
-    }
-}
-
-fn check_unused_decl(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-    out: &mut Vec<LintDiagnostic>,
-) {
-    let Some(module) = hir.module.as_ref() else {
-        return;
-    };
-    for decl_id in &module.decls {
-        let decl = &hir.decls[*decl_id];
-        // Pragmas + native fns don't represent user
-        // code that could be "unused" in a meaningful way.
-        let (name_idx, modifiers, kind) = match decl {
-            Decl::Fn(fnd) => (fnd.name, &fnd.modifiers, "fn"),
-            Decl::Type(td) => (td.name, &td.modifiers, "type"),
-            Decl::Enum(ed) => (ed.name, &ed.modifiers, "enum"),
-            Decl::Var(vd) => (vd.name, &vd.modifiers, "var"),
-            Decl::Pragma(_) => continue,
-        };
-        if modifiers.native {
-            continue;
-        }
-        if !modifiers.private {
-            continue;
-        }
-        if is_exposed(symbols, modifiers) {
-            continue;
-        }
-        let ident = &hir.idents[name_idx];
-        let name = &symbols[ident.symbol];
-        if name.starts_with('_') {
-            continue;
-        }
-        let count = res.references_to.get(decl_id).copied().unwrap_or(0);
-        if count == 0 {
-            out.push(LintDiagnostic {
-                rule: "unused-decl",
-                severity: LintSeverity::Warning,
-                message: format!("unused private {kind} `{name}`"),
-                byte_range: ident.byte_range.clone(),
-                tag: None,
-            });
-        }
-    }
-}
-
-// =============================================================================
-// Rule: duplicate-decl  (P13.6 — declarator.ts residual)
-// =============================================================================
-
-/// Error when two top-level decls share a name in the same module.
-/// Mirrors the TS reference declarator's `Type 'X' is already
-/// declared` / `Identifier 'X' is already declared` checks
-/// (`packages/lang/src/analysis/declarator.ts:130`).
-pub struct DuplicateDecl;
-
-impl LintRule for DuplicateDecl {
-    fn name(&self) -> &'static str {
-        "duplicate-decl"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        let Some(module) = cx.hir.module.as_ref() else {
-            return;
-        };
-        // Bucket by `(symbol, namespace)` — GreyCat lets a type/enum
-        // and a fn/var share an identifier (see `lib/std/core.gcl`'s
-        // `type geo` plus `fn geo(...)`). Collisions only fire when
-        // two decls land in the same namespace.
-        let mut seen: FxHashMap<(greycat_analyzer_core::Symbol, Namespace), ()> =
-            FxHashMap::default();
-        let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        for decl_id in &module.decls {
-            let decl = &cx.hir.decls[*decl_id];
-            let Some(name_id) = decl.name() else {
-                continue;
-            };
-            let Some(ns) = Namespace::of_decl(decl) else {
-                continue;
-            };
-            let ident = &cx.hir.idents[name_id];
-            if seen.insert((ident.symbol, ns), ()).is_some() {
-                let name = &cx.symbols[ident.symbol];
-                candidates.push(LintDiagnostic {
-                    rule: "duplicate-decl",
-                    severity: LintSeverity::Error,
-                    message: format!("identifier `{name}` is already declared"),
-                    byte_range: ident.byte_range.clone(),
-                    tag: None,
-                });
-            }
-        }
-        for d in candidates {
-            cx.emit(d);
-        }
-    }
-}
-
-fn is_exposed(
-    symbols: &greycat_analyzer_core::SymbolTable,
-    modifiers: &greycat_analyzer_hir::types::Modifiers,
-) -> bool {
-    modifiers
-        .annotations
-        .iter()
-        .any(|a| &symbols[a.name.symbol] == "expose")
 }
 
 /// Walk every `Expr::Arrow` and emit an error when the receiver's type
@@ -1463,101 +869,6 @@ fn receiver_head_name(
         TypeKind::Generic { tpl, .. } => Some((symbols[tpl.name].to_string(), Some(*tpl))),
         TypeKind::Primitive(p) => Some((p.name().to_string(), None)),
         _ => None,
-    }
-}
-
-// =============================================================================
-// Rule: modvar-shape  (P19.18 — module variable type constraints)
-// =============================================================================
-//
-// Module variables (`var` at top level) are GreyCat's persistent-store
-// roots and the runtime constrains their type tightly. The TS reference
-// emits three distinct errors (`Module variable type must be one of …`,
-// `Nodes are automatically initialized by GreyCat, they cannot be null`,
-// and the per-node-collection inner-shape rules). We mirror them here
-// as a pure-HIR rule (no typing context needed — the type *ref* spelling
-// is what's constrained).
-
-/// Three sibling sub-rules driven from one HIR walk.
-///
-/// - `modvar-must-be-node-tag` — top-level `var T` must use one of the
-///   node-tag names: `node`, `nodeTime`, `nodeList`, `nodeIndex`, `nodeGeo`.
-/// - `modvar-node-cannot-be-nullable` — the outer node-tag cannot carry
-///   `?` (nodes are auto-initialized). Quickfix: drop the trailing `?`.
-/// - `modvar-node-inner-must-be-nullable` — `node<T>` requires `T?`.
-pub struct ModVarShape;
-
-impl LintRule for ModVarShape {
-    fn name(&self) -> &'static str {
-        "modvar-shape"
-    }
-
-    fn check(&self, cx: &mut LintCx<'_>) {
-        let Some(module) = cx.hir.module.as_ref() else {
-            return;
-        };
-        let mut candidates: Vec<LintDiagnostic> = Vec::new();
-        for decl_id in &module.decls {
-            let Decl::Var(vd) = &cx.hir.decls[*decl_id] else {
-                continue;
-            };
-            let Some(ty_ref) = vd.ty else {
-                continue;
-            };
-            let ty = &cx.hir.type_refs[ty_ref];
-            let head = &cx.symbols[cx.hir.idents[ty.name].symbol];
-            // Syntactic-level lint: rejects everything except the
-            // five node-tag head names. Pure source-level pattern,
-            // no decl handle involved (the lint fires before
-            // signature lowering populates type tables).
-            let is_node_tag_head = matches!(
-                head,
-                "node" | "nodeTime" | "nodeGeo" | "nodeList" | "nodeIndex"
-            );
-            if !is_node_tag_head {
-                candidates.push(LintDiagnostic {
-                    rule: "modvar-must-be-node-tag",
-                    severity: LintSeverity::Error,
-                    message: "module variable type must be one of: \
-                              `node<T?>`, `nodeTime<T>`, `nodeList<T>`, \
-                              `nodeIndex<K, V>`, or `nodeGeo<T>`"
-                        .into(),
-                    byte_range: cx.hir.idents[vd.name].byte_range.clone(),
-                    tag: None,
-                });
-                continue;
-            }
-            if ty.optional {
-                candidates.push(LintDiagnostic {
-                    rule: "modvar-node-cannot-be-nullable",
-                    severity: LintSeverity::Error,
-                    message: "nodes are automatically initialized by GreyCat \
-                              and cannot be null — drop the trailing `?`"
-                        .into(),
-                    byte_range: ty.byte_range.clone(),
-                    tag: None,
-                });
-            }
-            if head == "node"
-                && let Some(inner_ref) = ty.params.first()
-            {
-                let inner = &cx.hir.type_refs[*inner_ref];
-                if !inner.optional {
-                    candidates.push(LintDiagnostic {
-                        rule: "modvar-node-inner-must-be-nullable",
-                        severity: LintSeverity::Error,
-                        message: "`node<T>` requires a nullable inner type — \
-                                  use `node<T?>`"
-                            .into(),
-                        byte_range: inner.byte_range.clone(),
-                        tag: None,
-                    });
-                }
-            }
-        }
-        for d in candidates {
-            cx.emit(d);
-        }
     }
 }
 

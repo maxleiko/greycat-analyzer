@@ -37,17 +37,17 @@ use greycat_analyzer_hir::{DeclRegistry, Hir, lower_module};
 use crate::analyzer::{
     AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into, seed_builtins,
 };
-use crate::directives::Directives;
+use crate::directives::{Directives, parse_directives};
 use crate::display::{ProjectTypeDisplay, display_type, display_type_for_module};
-use crate::index::{FnSignature, ProjectIndex};
+use crate::index::{FnSignature, ProjectIndex, module_name_from_uri};
 use crate::lint::{
-    LintDiagnostic, SURFACED_RULES, lint_arrow_on_non_deref_with_directives,
+    self, LintDiagnostic, SURFACED_RULES, lint_arrow_on_non_deref_with_directives,
     lint_catch_empty_parens, lint_inferred_return_type_with_directives, lint_no_breakpoint,
     lint_non_exhaustive_with_directives, lint_nullability_with_directives,
     lint_redundant_semicolon, lint_surfaced_with_directives, lint_unreachable_with_directives,
     lint_unused_suppressions, run_lints_with_directives,
 };
-use crate::meta_pragmas::LintPragmas;
+use crate::meta_pragmas::{LintPragmas, parse_lint_pragmas};
 use crate::resolver::{Resolutions, resolve_with_index_for};
 use crate::well_known::WellKnown;
 
@@ -236,6 +236,7 @@ impl ProjectAnalysis {
 
     /// Borrow the project-wide type arena — required for any
     /// `TypeId` lookup (`arena.get(id)`, `display(arena, id)`, …).
+    #[inline(always)]
     pub fn arena(&self) -> &TypeArena {
         &self.arena
     }
@@ -243,11 +244,13 @@ impl ProjectAnalysis {
     /// Mutable borrow of the project-wide type arena. Capability
     /// handlers should not mint new types; this is reserved for the
     /// orchestrator and the staged-pipeline body walker.
+    #[inline(always)]
     pub fn arena_mut(&mut self) -> &mut TypeArena {
         &mut self.arena
     }
 
     /// Borrow the project-wide symbol table
+    #[inline(always)]
     pub fn symbols(&self) -> &SymbolTable {
         &self.index.symbols
     }
@@ -257,6 +260,7 @@ impl ProjectAnalysis {
     /// here too: capability handlers thread the registry into
     /// [`display_type`] / [`display_fqn`] so decl-keyed types render
     /// as their source name.
+    #[inline(always)]
     pub fn decl_registry(&self) -> &DeclRegistry {
         &self.decl_registry
     }
@@ -265,7 +269,8 @@ impl ProjectAnalysis {
     /// handlers that need to dispatch on the std-core `node` /
     /// `Array` / etc. identity
     /// consume this via `WellKnown::is_node_tag(decl)` etc.
-    pub fn well_known(&self) -> &crate::well_known::WellKnown {
+    #[inline(always)]
+    pub fn well_known(&self) -> &WellKnown {
         &self.well_known
     }
 
@@ -285,12 +290,14 @@ impl ProjectAnalysis {
 
     /// Resolve a `Symbol` back to its source text through the
     /// project's [`SymbolTable`].
+    #[inline(always)]
     pub fn symbol(&self, sym: &Symbol) -> &str {
         &self.index.symbols[*sym]
     }
 
     /// Resolve an [`ItemId`] to its declared source name through
     /// `id.name → Symbol → SymbolTable`.
+    #[inline(always)]
     pub fn decl_name(&self, id: ItemId) -> &str {
         &self.index.symbols[id.name]
     }
@@ -476,7 +483,7 @@ impl ProjectAnalysis {
             // `(lib, module, name)` triples. Default `"module"`
             // only kicks in for URIs without a recognisable
             // filename, which the recognizer ignores anyway.
-            let module_name = crate::index::module_name_from_uri(&m.uri).unwrap_or("module");
+            let module_name = module_name_from_uri(&m.uri).unwrap_or("module");
             let hir = lower_module(
                 &m.src,
                 &self.index.symbols,
@@ -485,12 +492,11 @@ impl ProjectAnalysis {
                 m.tree.root_node(),
             );
             let lower_took = lower_start.elapsed();
-            let directives = crate::directives::parse_directives(&m.src, m.tree.root_node());
-            // P40.1 + P40.5 — walk `@lint_off` / `@lint_on` annotations.
+            let directives = parse_directives(&m.src, m.tree.root_node());
+            // Walk `@lint_off` / `@lint_on` annotations.
             // Entrypoint: collect rules + validate. Other modules: emit
             // `lint-pragma-outside-entrypoint` and discard the rules.
-            let pragmas =
-                crate::meta_pragmas::parse_lint_pragmas(&m.src, m.tree.root_node(), m.is_entry);
+            let pragmas = parse_lint_pragmas(&m.src, m.tree.root_node(), m.is_entry);
             LoweredModule {
                 uri: m.uri,
                 hir,
@@ -793,7 +799,7 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
         let Some(module) = hir.module.as_ref() else {
             continue;
         };
-        let Some(stem) = crate::index::module_name_from_uri(uri) else {
+        let Some(stem) = module_name_from_uri(uri) else {
             continue;
         };
         let Some(module_sym) = index.symbols.lookup(stem) else {
@@ -833,7 +839,7 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
                 let Some(qual_uri) = index.module_names.get(&qual_sym) else {
                     continue;
                 };
-                let Some(qual_stem) = crate::index::module_name_from_uri(qual_uri) else {
+                let Some(qual_stem) = module_name_from_uri(qual_uri) else {
                     continue;
                 };
                 let parent_module = index.symbols.intern(qual_stem);
@@ -851,7 +857,7 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
                         if index.is_decl_private(cand_uri, decl) {
                             continue;
                         }
-                        let Some(cand_stem) = crate::index::module_name_from_uri(cand_uri) else {
+                        let Some(cand_stem) = module_name_from_uri(cand_uri) else {
                             continue;
                         };
                         let cand_module = index.symbols.intern(cand_stem);
@@ -1030,7 +1036,7 @@ fn lower_module_signatures(
                     // Base<T>` for a generic `Sub<T>` lands as
                     // `Generic { decl: Base, args: [GenericParam(T,
                     // owner=Sub)] }`.
-                    let ty = lower_type_ref_project2(
+                    let ty = lower_type_ref_project(
                         hir,
                         super_tr,
                         arena,
@@ -1047,7 +1053,7 @@ fn lower_module_signatures(
                     let Some(tr) = attr.ty else {
                         continue;
                     };
-                    let ty = lower_type_ref_project2(
+                    let ty = lower_type_ref_project(
                         hir,
                         tr,
                         arena,
@@ -1078,7 +1084,7 @@ fn lower_module_signatures(
                         saved.push((g_sym, prev));
                     }
                     if let Some(ret) = fnd.return_type {
-                        let ty = lower_type_ref_project2(
+                        let ty = lower_type_ref_project(
                             hir,
                             ret,
                             arena,
@@ -1102,7 +1108,7 @@ fn lower_module_signatures(
                     for p_id in &fnd.params {
                         let p = &hir.fn_params[*p_id];
                         let pt = if let Some(tr) = p.ty {
-                            lower_type_ref_project2(
+                            lower_type_ref_project(
                                 hir,
                                 tr,
                                 arena,
@@ -1122,7 +1128,7 @@ fn lower_module_signatures(
                     // mint downstream. Call-typing consumers fall
                     // back to `any?` at their use site.
                     let method_ret_ty = fnd.return_type.map(|ret| {
-                        lower_type_ref_project2(
+                        lower_type_ref_project(
                             hir,
                             ret,
                             arena,
@@ -1188,7 +1194,7 @@ fn lower_module_signatures(
                     generics_in_scope.insert(g_sym, owner);
                     generics.push(g_sym);
                 }
-                let ret_ty = lower_type_ref_project2(
+                let ret_ty = lower_type_ref_project(
                     hir,
                     ret,
                     arena,
@@ -1204,7 +1210,7 @@ fn lower_module_signatures(
                 for p_id in &fnd.params {
                     let p = &hir.fn_params[*p_id];
                     let pt = if let Some(tr) = p.ty {
-                        lower_type_ref_project2(
+                        lower_type_ref_project(
                             hir,
                             tr,
                             arena,
@@ -1247,7 +1253,7 @@ fn lower_module_signatures(
                 };
                 // Vars never declare generics, so no scope needed.
                 let empty: FxHashMap<Symbol, GenericOwner> = FxHashMap::default();
-                let var_ty = lower_type_ref_project2(
+                let var_ty = lower_type_ref_project(
                     hir,
                     tr,
                     arena,
@@ -1264,7 +1270,6 @@ fn lower_module_signatures(
     entry
 }
 
-// P19.14
 /// Index-aware extension of [`is_assignable_to`]
 /// that recognises user-declared inheritance. Adds two cases on top
 /// of the standard relation:
@@ -2277,7 +2282,7 @@ impl ProjectAnalysis {
                 false,
                 &mut new_lints,
             );
-            crate::lint::LintRule::check(&crate::lint::UnusedDecl, &mut cx);
+            lint::LintRule::check(&lint::UnusedDecl, &mut cx);
             module.lints.append(&mut new_lints);
         }
     }
@@ -2328,7 +2333,7 @@ impl ProjectAnalysis {
             let doc = cell.borrow();
             let start = Instant::now();
             // P35.1 — module name from URI for the well-known recogniser.
-            let module_name = crate::index::module_name_from_uri(uri).unwrap_or("module");
+            let module_name = module_name_from_uri(uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
                 &self.index.symbols,
@@ -2338,20 +2343,13 @@ impl ProjectAnalysis {
             );
             lower_took = start.elapsed();
             changed_lib = Some(doc.lib.clone());
-            changed_directives = Some(crate::directives::parse_directives(
-                &doc.text,
-                doc.root_node(),
-            ));
+            changed_directives = Some(parse_directives(&doc.text, doc.root_node()));
             // P40.1 + P40.5 — re-parse the module's `@lint_off` /
             // `@lint_on` pragmas on every invalidate. Pass `is_entrypoint`
             // so the walker emits `lint-pragma-outside-entrypoint` when
             // pragmas show up in non-entrypoint modules.
             let is_entry = manager.entrypoint_uri() == Some(uri);
-            changed_pragmas = Some(crate::meta_pragmas::parse_lint_pragmas(
-                &doc.text,
-                doc.root_node(),
-                is_entry,
-            ));
+            changed_pragmas = Some(parse_lint_pragmas(&doc.text, doc.root_node(), is_entry));
             hir
         });
 
@@ -2394,7 +2392,7 @@ impl ProjectAnalysis {
             }
             let doc = cell.borrow();
             // P35.1 — module name from URI for the well-known recogniser.
-            let module_name = crate::index::module_name_from_uri(other_uri).unwrap_or("module");
+            let module_name = module_name_from_uri(other_uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
                 &self.index.symbols,
@@ -2989,7 +2987,7 @@ fn collect_call_arg_diags_split(
             // round-trip — one less type representation, fewer
             // per-call allocations, no foreign-HIR re-walk.
             let fn_uri = foreign_uri_opt.as_ref().unwrap_or(cur_uri);
-            let declared_raw = lower_type_ref_project2(
+            let declared_raw = lower_type_ref_project(
                 &fn_module.hir,
                 declared_ref,
                 arena,
@@ -3895,7 +3893,7 @@ fn resolve_qualified_chain(
 }
 
 /// Walk one module's HIR and emit every type-relation diagnostic
-// P26.3
+///
 /// Per-module typed-lint runner extracted out of [`ProjectAnalysis::run_typed_lints`]
 /// so the parallel and serial paths share one body and a future
 /// regression doesn't drift between them.
@@ -3904,9 +3902,6 @@ fn resolve_qualified_chain(
 /// `module.directives`. `doc_data` is consulted for the `catch-empty-parens`
 /// lint, which needs the source text + parsed tree (the HIR drops the
 /// empty `()` shape).
-// P27.1 — the cfg gate is gone; the helper is the canonical body
-// for both native (rayon-driven) and wasm (serial fallback) call
-// sites in `run_typed_lints`.
 #[allow(clippy::mutable_key_type, clippy::too_many_arguments)]
 fn run_typed_lints_for_module(
     uri: &Uri,
@@ -3918,7 +3913,7 @@ fn run_typed_lints_for_module(
     enabled_rules: &FxHashSet<String>,
     doc_data: &FxHashMap<Uri, (String, Tree)>,
 ) {
-    // P40.1 + P40.5 — a rule fires if any project-wide opt-in surface
+    // A rule fires if any project-wide opt-in surface
     // (CLI `--on`, entrypoint `@lint_on`) enables it. Module-scope
     // pragmas no longer apply: P40.5 rejects them as
     // `lint-pragma-outside-entrypoint`. So the gate is just the
@@ -3956,7 +3951,7 @@ fn run_typed_lints_for_module(
             bypass,
             &mut module.lints,
         );
-        // P37.7 + P40.1 — advisory, default-off. Runs when any opt-in
+        // Advisory, default-off. Runs when any opt-in
         // surface (CLI `--on=no-breakpoint`, entrypoint `@lint_on(...)`,
         // or this module's own `@lint_on(...)`) has enabled it.
         if no_breakpoint_on {
@@ -4020,8 +4015,8 @@ fn run_typed_lints_for_module(
         lint_unused_suppressions(&mut module.directives, &mut module.lints);
     }
 
-    // P40.1 — final project / module-pragma filter.
-    // P40.1 — the `disabled_rules` / `pragma_disabled_rules` filter
+    // Final project / module-pragma filter.
+    // The `disabled_rules` / `pragma_disabled_rules` filter
     // doesn't live in this function. Subsequent passes
     // (`stage_compute_qualified_refs`) re-emit lints, so the policy
     // filter has to land in one place after every emission settles —
@@ -4029,9 +4024,7 @@ fn run_typed_lints_for_module(
     // of `analyze_staged` and `invalidate`.
 }
 
-/// the analyzer's per-module pass deferred. Reads only — never
-/// mutates `module`. The shared project arena is passed in;
-/// any newly-needed declared-side TypeIds are minted into it
+/// Any newly-needed declared-side TypeIds are minted into it
 /// alongside everything else, which is fine because the arena is
 /// append-only and intern-collapsed.
 fn validate_module_type_relations(
@@ -4105,7 +4098,7 @@ fn validate_module_type_relations(
                     for g in &fnd.generics {
                         generics_in_scope.insert(hir.idents[*g].symbol, own_owner);
                     }
-                    lower_type_ref_project2(
+                    lower_type_ref_project(
                         hir,
                         t,
                         arena,
@@ -4673,7 +4666,7 @@ fn validate_module_type_relations(
 /// the names of the generic params owned by the current type / fn to
 /// their `GenericOwner`, so `T` lowers to `GenericParam(T, owner=…)`
 /// instead of `Named { name: "T" }`.
-fn lower_type_ref_project2(
+fn lower_type_ref_project(
     hir: &Hir,
     type_ref: Idx<TypeRef>,
     arena: &mut TypeArena,
@@ -4718,7 +4711,7 @@ fn lower_type_ref_project2(
                             .params
                             .iter()
                             .map(|p| {
-                                lower_type_ref_project2(
+                                lower_type_ref_project(
                                     hir,
                                     *p,
                                     arena,
@@ -4830,7 +4823,7 @@ fn lower_qualified_type_ref_project(
             .params
             .iter()
             .map(|p| {
-                lower_type_ref_project2(
+                lower_type_ref_project(
                     hir,
                     *p,
                     arena,

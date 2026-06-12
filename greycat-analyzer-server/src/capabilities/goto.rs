@@ -2,12 +2,16 @@
 //! Both single-file and project-aware variants live here, alongside
 //! the `cursor_ident_idx` helper that references_rename also reuses.
 
+use greycat_analyzer_analysis::analyzer::{MemberDef, analyze};
+use greycat_analyzer_analysis::ide;
+use greycat_analyzer_analysis::index::Namespace;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::{Definition, resolve};
 use greycat_analyzer_core::{SourceEncoding, SourceManager, SymbolTable};
 use greycat_analyzer_hir::Hir;
+use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::Decl;
+use greycat_analyzer_hir::types::{Decl, Ident};
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{GotoDefinitionResponse, Location, Position, Uri};
@@ -64,15 +68,14 @@ pub fn goto_definition(
     // P6.3: the property side of `a.b` / `a->b` isn't in `Resolutions`
     // — bindings live in `AnalysisResult::member_uses`. Run the
     // analyzer to consult it before giving up.
-    let (_arena, _decl_registry, analysis) =
-        greycat_analyzer_analysis::analyzer::analyze(&hir, &resolutions, &symbols);
+    let (_arena, _decl_registry, analysis) = analyze(&hir, &resolutions, &symbols);
     let member = analysis.member_lookup(target)?;
     let target_range = match member {
-        greycat_analyzer_analysis::analyzer::MemberDef::Attr(attr_id) => {
+        MemberDef::Attr(attr_id) => {
             let name = hir.type_attrs[attr_id].name;
             hir.idents[name].byte_range.clone()
         }
-        greycat_analyzer_analysis::analyzer::MemberDef::Method(decl_id) => {
+        MemberDef::Method(decl_id) => {
             let name = hir.decls[decl_id].name()?;
             hir.idents[name].byte_range.clone()
         }
@@ -147,7 +150,7 @@ pub fn cross_module_decl_location(
     foreign_uri: &Uri,
     foreign_text: &str,
     foreign_hir: &Hir,
-    decl_id: greycat_analyzer_hir::arena::Idx<Decl>,
+    decl_id: Idx<Decl>,
     encoding: SourceEncoding,
 ) -> Option<Location> {
     let name_id = foreign_hir.decls[decl_id].name()?;
@@ -171,10 +174,9 @@ pub fn cross_module_member_location(
     foreign_uri: &Uri,
     foreign_text: &str,
     foreign_hir: &Hir,
-    member: &greycat_analyzer_analysis::analyzer::MemberDef,
+    member: &MemberDef,
     encoding: SourceEncoding,
 ) -> Option<Location> {
-    use greycat_analyzer_analysis::analyzer::MemberDef;
     let range = match *member {
         MemberDef::Attr(attr_id) => {
             let name_id = foreign_hir.type_attrs[attr_id].name;
@@ -200,8 +202,8 @@ pub fn cursor_ident_idx(
     pos: Position,
     hir: &Hir,
     encoding: SourceEncoding,
-) -> Option<greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>> {
-    greycat_analyzer_analysis::ide::rename::cursor_ident_idx(text, root, pos, hir, encoding)
+) -> Option<Idx<Ident>> {
+    ide::rename::cursor_ident_idx(text, root, pos, hir, encoding)
 }
 
 // P31.1
@@ -447,10 +449,7 @@ pub fn goto_implementation_across_project(
             // Bare-name semantics — the first match wins.
             let Some(declaring_id) = project
                 .index
-                .locate_decl_in_ns(
-                    declaring_sym,
-                    greycat_analyzer_analysis::index::Namespace::Type,
-                )
+                .locate_decl_in_ns(declaring_sym, Namespace::Type)
                 .find(|(u, d)| !project.index.is_decl_private(u, *d))
                 .and_then(|(u, _)| project.index.item_id_for(u, declaring_sym))
             else {
@@ -541,10 +540,7 @@ pub fn goto_declaration_across_project(
         .and_then(|(declaring_sym, method_sym)| {
             let declaring_id = project
                 .index
-                .locate_decl_in_ns(
-                    declaring_sym,
-                    greycat_analyzer_analysis::index::Namespace::Type,
-                )
+                .locate_decl_in_ns(declaring_sym, Namespace::Type)
                 .find(|(u, d)| !project.index.is_decl_private(u, *d))
                 .and_then(|(u, _)| project.index.item_id_for(u, declaring_sym))?;
             project
@@ -645,10 +641,7 @@ fn type_implementations(
     // used everywhere else.
     let target_id = project
         .index
-        .locate_decl_in_ns(
-            target_sym,
-            greycat_analyzer_analysis::index::Namespace::Type,
-        )
+        .locate_decl_in_ns(target_sym, Namespace::Type)
         .find(|(u, d)| !project.index.is_decl_private(u, *d))
         .and_then(|(u, _)| project.index.item_id_for(u, target_sym))?;
     let mut locations = Vec::new();
@@ -747,7 +740,7 @@ fn declaring_type_for_method_cursor(
     }
 
     // Case 2: cursor on a member access bound in the local module.
-    use greycat_analyzer_analysis::analyzer::MemberDef;
+    use MemberDef;
     if let Some(MemberDef::Method(decl_id)) = module.analysis.member_lookup(cursor_idx)
         && let Some(module_root) = module.hir.module.as_ref()
     {
