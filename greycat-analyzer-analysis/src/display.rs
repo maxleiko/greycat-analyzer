@@ -46,8 +46,8 @@ pub fn display_fqn(
                 home_lib(name).unwrap_or_else(|| "core".to_string()),
             )
         }
-        TypeKind::Generic { decl, args } => {
-            let name = &symbols[decl.name];
+        TypeKind::Generic { tpl, args } => {
+            let name = &symbols[tpl.name];
             let parts: Box<[String]> = args
                 .iter()
                 .map(|a| display_fqn(arena, symbols, *a, home_lib))
@@ -169,8 +169,8 @@ fn write_type_qualified(
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Type(d) => write_decl_qualified(f, index, *d)?,
-        TypeKind::Generic { decl, args } => {
-            write_decl_qualified(f, index, *decl)?;
+        TypeKind::Generic { tpl, args } => {
+            write_decl_qualified(f, index, *tpl)?;
             write_args_qualified(f, arena, index, args)?;
         }
         // A type-ref that didn't resolve flows through as opaque
@@ -335,8 +335,8 @@ fn write_type_for_module(
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Type(d) => decl_name(*d, f)?,
-        TypeKind::Generic { decl, args } => {
-            decl_name(*decl, f)?;
+        TypeKind::Generic { tpl, args } => {
+            decl_name(*tpl, f)?;
             f.write_str("<")?;
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
@@ -423,8 +423,8 @@ fn write_type_with_decls(
         TypeKind::Never => f.write_str("never")?,
         TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Type(d) => decl_name(*d, f)?,
-        TypeKind::Generic { decl, args } => {
-            decl_name(*decl, f)?;
+        TypeKind::Generic { tpl, args } => {
+            decl_name(*tpl, f)?;
             f.write_str("<")?;
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {

@@ -208,7 +208,7 @@ const fn advisory_rule(name: &'static str, summary: &'static str) -> LintRuleInf
 /// Includes both the pure-HIR rules (driven through [`run_lints`]) and
 /// the typed lints driven from the project pipeline (`arrow-on-non-deref`,
 /// the `nullability` family, `infer-return-type`).
-// P43.5
+//
 /// When adding a new rule whose intent assumes the code is
 /// syntactically complete (e.g. "this expression has no effect",
 /// "this statement is unreachable in a complete chain"), consult
@@ -1460,7 +1460,7 @@ fn receiver_head_name(
         // `ItemId` directly — the name half indexes into the
         // project's symbol table without going through the registry.
         TypeKind::Type(decl) => Some((symbols[decl.name].to_string(), Some(*decl))),
-        TypeKind::Generic { decl, .. } => Some((symbols[decl.name].to_string(), Some(*decl))),
+        TypeKind::Generic { tpl, .. } => Some((symbols[tpl.name].to_string(), Some(*tpl))),
         TypeKind::Primitive(p) => Some((p.name().to_string(), None)),
         _ => None,
     }

@@ -825,9 +825,9 @@ fn collect_monomorphizations(
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out: Vec<MonoEntry> = Vec::new();
     for (i, ty) in arena.items.iter().enumerate() {
-        if let TypeKind::Generic { decl, args } = &ty.kind {
-            let handle = index.resolve_item(registry, None, decl.name);
-            if handle != Some(*decl) {
+        if let TypeKind::Generic { tpl, args } = &ty.kind {
+            let handle = index.resolve_item(registry, None, tpl.name);
+            if handle != Some(*tpl) {
                 continue;
             }
             let id = TypeId::from_raw(i as u32);

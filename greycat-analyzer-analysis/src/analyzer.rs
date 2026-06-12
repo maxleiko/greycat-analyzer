@@ -40,7 +40,7 @@ use greycat_analyzer_hir::types::{
 };
 use greycat_analyzer_hir::{DeclRegistry, Hir};
 
-use crate::index::ProjectIndex;
+use crate::index::{FnSignature, ProjectIndex};
 use crate::lint::{LintDiagnostic, LintSeverity};
 use crate::resolver::{Definition, Resolutions};
 use crate::well_known::WellKnown;
@@ -587,15 +587,14 @@ pub fn analyze_with_index_into(
     // a richer diagnostic (with candidate modules + FQN quick-fixes);
     // skip them here to avoid a duplicate generic "unresolved name"
     // alongside the helpful one.
-    let unresolved = res.unresolved.clone();
-    for ident_idx in unresolved {
-        if res.ambiguous.contains_key(&ident_idx) {
+    for ident_idx in &res.unresolved {
+        if res.ambiguous.contains_key(ident_idx) {
             continue;
         }
-        if res.private_cross_module.contains_key(&ident_idx) {
+        if res.private_cross_module.contains_key(ident_idx) {
             continue;
         }
-        let ident = &hir.idents[ident_idx];
+        let ident = &hir.idents[*ident_idx];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             "unresolved-name",
@@ -607,9 +606,8 @@ pub fn analyze_with_index_into(
     // Lambda captures — runtime rejects refs to locals/params from
     // enclosing scope with `unresolved identifier`, and segfaults on
     // `this`. Both surface here as `lambda-capture`.
-    let captured = res.captured.clone();
-    for ident_idx in captured {
-        let ident = &hir.idents[ident_idx];
+    for ident_idx in &res.captured {
+        let ident = &hir.idents[*ident_idx];
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             "lambda-capture",
@@ -1764,7 +1762,7 @@ impl<'a> Cx<'a> {
     /// declared without `:` return type produces a Lambda with `ret =
     /// None`, rendered `fn(P)`; with `: R` declared, `ret = Some(R)`,
     /// rendered `fn(P): R`.
-    fn fn_ref_ty_from_sig(&mut self, sig: &crate::index::FnSignature) -> TypeId {
+    fn fn_ref_ty_from_sig(&mut self, sig: &FnSignature) -> TypeId {
         if !sig.generics.is_empty() {
             return self.function_ty();
         }
@@ -2035,16 +2033,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn strip_nullable(&mut self, ty: TypeId) -> TypeId {
-        let t = self.arena.get(ty);
-        if !t.nullable {
-            return ty;
-        }
-        let mut t = t.clone();
-        t.nullable = false;
-        self.arena.alloc(t)
-    }
-
     /// Lift `narrows`'s then-side lists into the current narrow frame.
     /// Used by `Stmt::While` / `Stmt::For` to make loop bodies see the
     /// truthy implication of the loop condition at iteration entry.
@@ -2058,7 +2046,7 @@ impl<'a> Cx<'a> {
     fn apply_then_narrows(&mut self, narrows: &CondNarrows) {
         for ident in &narrows.then_non_null {
             if let Some(cur) = self.lookup_def_type(*ident) {
-                let stripped = self.strip_nullable(cur);
+                let stripped = self.arena.strip_nullable(cur);
                 self.write_narrow(*ident, stripped);
             }
         }
@@ -2102,7 +2090,7 @@ impl<'a> Cx<'a> {
     fn apply_else_narrows(&mut self, narrows: &CondNarrows) {
         for ident in &narrows.else_non_null {
             if let Some(cur) = self.lookup_def_type(*ident) {
-                let stripped = self.strip_nullable(cur);
+                let stripped = self.arena.strip_nullable(cur);
                 self.write_narrow(*ident, stripped);
             }
         }
@@ -2208,7 +2196,7 @@ impl<'a> Cx<'a> {
                 let new_ty = if cur_is_null_shape {
                     value_ty
                 } else {
-                    self.strip_nullable(cur)
+                    self.arena.strip_nullable(cur)
                 };
                 self.write_narrow(def, new_ty);
             }
@@ -2248,7 +2236,7 @@ impl<'a> Cx<'a> {
             let ty = self.arena.get(recv_ty);
             match &ty.kind {
                 TypeKind::Type(d) => (*d, Vec::new()),
-                TypeKind::Generic { decl, args } => (*decl, args.to_vec()),
+                TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
                 _ => return None,
             }
         };
@@ -2336,7 +2324,7 @@ impl<'a> Cx<'a> {
         }
         let type_id: Option<ItemId> = match &ty.kind {
             TypeKind::Type(d) => Some(*d),
-            TypeKind::Generic { decl, .. } => Some(*decl),
+            TypeKind::Generic { tpl, .. } => Some(*tpl),
             // primitives are from `lib/std/core.gcl`, so their `ItemId` is `(core, name)`.
             TypeKind::Primitive(p) => {
                 let core_mod = self.index.symbols.intern("core");
@@ -2371,11 +2359,11 @@ impl<'a> Cx<'a> {
             .get(&recv_id.name)
             .copied()
             .and_then(|id| match &self.hir.decls[id] {
-                Decl::Type(td) => Some(td.clone()),
+                Decl::Type(td) => Some(td),
                 _ => None,
             });
 
-        if let Some(type_decl) = local_type_decl.as_ref() {
+        if let Some(type_decl) = local_type_decl {
             for attr_id in &type_decl.attrs {
                 let attr = &self.hir.type_attrs[*attr_id];
                 if self.hir.idents[attr.name].symbol == prop_sym {
@@ -2396,7 +2384,7 @@ impl<'a> Cx<'a> {
             );
             return;
         }
-        if let Some(type_decl) = local_type_decl.as_ref() {
+        if let Some(type_decl) = local_type_decl {
             for method_id in &type_decl.methods {
                 let Decl::Fn(m) = &self.hir.decls[*method_id] else {
                     continue;
@@ -2505,7 +2493,7 @@ impl<'a> Cx<'a> {
             let recv_ty = self.out.expr_types.get(&recv).copied()?;
             match &self.arena.get(recv_ty).kind {
                 TypeKind::Type(d) => Some(*d),
-                TypeKind::Generic { decl, .. } => Some(*decl),
+                TypeKind::Generic { tpl, .. } => Some(*tpl),
                 TypeKind::Primitive(p) => {
                     let core_mod = self.index.symbols.intern("core");
                     let pname = self.index.symbols.intern(p.name());
@@ -2540,7 +2528,7 @@ impl<'a> Cx<'a> {
             && let Some(enc_ty) = self.this_stack.last().copied()
             && let Some(enc_id) = match &self.arena.get(enc_ty).kind {
                 TypeKind::Type(d) => Some(*d),
-                TypeKind::Generic { decl, .. } => Some(*decl),
+                TypeKind::Generic { tpl, .. } => Some(*tpl),
                 _ => None,
             }
             && let Some(owner_id) = private_owner
@@ -2612,7 +2600,7 @@ impl<'a> Cx<'a> {
                 let recv_ty = self.lower_type_ref(ty_ref);
                 match &self.arena.get(recv_ty).kind {
                     TypeKind::Type(d) => *d,
-                    TypeKind::Generic { decl, .. } => *decl,
+                    TypeKind::Generic { tpl, .. } => *tpl,
                     TypeKind::Primitive(p) => {
                         let core_mod = self.index.symbols.intern("core");
                         let name_sym = self.index.symbols.intern(p.name());
@@ -2875,7 +2863,7 @@ impl<'a> Cx<'a> {
             // Handle-keyed variants already carry the decl's
             // full `(module, name)` identity.
             TypeKind::Type(decl) => (decl, Vec::new()),
-            TypeKind::Generic { decl, args } => (decl, args.into_vec()),
+            TypeKind::Generic { tpl, args } => (tpl, args.into_vec()),
             _ => return None,
         };
         // **P19.14** — chain-walking lookup so methods declared on
@@ -2981,7 +2969,7 @@ impl<'a> Cx<'a> {
             // of the static expr; we have its lowered TypeId.
             let owner_id: Option<ItemId> = match &self.arena.get(recv_ty).kind {
                 TypeKind::Type(d) => Some(*d),
-                TypeKind::Generic { decl, .. } => Some(*decl),
+                TypeKind::Generic { tpl, .. } => Some(*tpl),
                 // P32 — enums are an ItemId-keyed entry too. Their
                 // `TypeKind::Enum.name` is just the bare name Symbol,
                 // so we'd need the home module to mint the ItemId.
@@ -3034,7 +3022,7 @@ impl<'a> Cx<'a> {
     fn method_ref_ty(&mut self, recv_ty: TypeId, method_sym: Symbol) -> TypeId {
         let owner_id: Option<ItemId> = match &self.arena.get(recv_ty).kind {
             TypeKind::Type(d) => Some(*d),
-            TypeKind::Generic { decl, .. } => Some(*decl),
+            TypeKind::Generic { tpl, .. } => Some(*tpl),
             TypeKind::Primitive(p) => {
                 let core_mod = self.index.symbols.intern("core");
                 let name_sym = self.index.symbols.intern(p.name());
@@ -3169,7 +3157,7 @@ impl<'a> Cx<'a> {
             // P35.7 — handle-keyed variants carry the full identity.
             TypeKind::Type(d) => (*d, Vec::new()),
             // P25.7
-            TypeKind::Generic { decl, args } => (*decl, args.to_vec()),
+            TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
             TypeKind::Primitive(p) => {
                 let core_mod = self.index.symbols.intern("core");
                 let name_sym = self.index.symbols.intern(p.name());
@@ -3244,7 +3232,7 @@ impl<'a> Cx<'a> {
 
     // Lower a syntactic TypeRef to a TypeId.
     fn lower_type_ref(&mut self, idx: Idx<TypeRef>) -> TypeId {
-        let tr = self.hir.type_refs[idx].clone();
+        let tr = &self.hir.type_refs[idx];
         // Qualified refs (`b::Foo`) bind to the decl in the named
         // module specifically — bypass the bare-name resolution ladder
         // so a leaf that exists in multiple modules doesn't bind to
@@ -3252,7 +3240,7 @@ impl<'a> Cx<'a> {
         // current module's registry don't apply on the right side of
         // `::`, so the qualified path is much shorter.
         if !tr.qualifier.is_empty() {
-            return self.lower_qualified_type_ref(&tr);
+            return self.lower_qualified_type_ref(tr);
         }
         let name_sym = self.hir.idents[tr.name].symbol;
         let mut base = match &self.index.symbols[name_sym] {
@@ -3402,12 +3390,14 @@ impl<'a> Cx<'a> {
     /// expressions rather than field names. Handle-keyed via
     /// [`WellKnown`], so a user-declared `type Map` doesn't match.
     fn head_decl_is_map(&self, ty: TypeId) -> bool {
-        let decl = match &self.arena.get(ty).kind {
-            TypeKind::Generic { decl, .. } => Some(*decl),
-            TypeKind::Type(decl) => Some(*decl),
-            _ => None,
-        };
-        decl.is_some() && decl == self.well_known.map_decl
+        match self.well_known.map_decl {
+            Some(map_type) => match &self.arena.get(ty).kind {
+                TypeKind::Generic { tpl, .. } => *tpl == map_type,
+                TypeKind::Type(decl) => *decl == map_type,
+                _ => false,
+            },
+            None => false,
+        }
     }
 
     /// Object-expr completeness check: `Foo {}` / `Foo { a: 1 }`
@@ -3449,7 +3439,7 @@ impl<'a> Cx<'a> {
         // same-module name and bailed on any qualifier, so it silently
         // skipped the check for every cross-module / qualified head.)
         let head_id = match &self.arena.get(head_ty).kind {
-            TypeKind::Generic { decl, .. } => *decl,
+            TypeKind::Generic { tpl, .. } => *tpl,
             TypeKind::Type(decl) => *decl,
             // Unresolved / primitive head — no member shape to check.
             _ => return,
@@ -3755,8 +3745,8 @@ impl<'a> Cx<'a> {
                     match &self.hir.decls[decl_id] {
                         Decl::Fn(fnd) if !fnd.generics.is_empty() => (
                             fnd.name,
-                            fnd.generics.clone(),
-                            fnd.params.clone(),
+                            &fnd.generics,
+                            &fnd.params,
                             fnd.return_type,
                             crate::erasure::fn_result_erases(self.hir, fnd),
                         ),
@@ -3764,7 +3754,7 @@ impl<'a> Cx<'a> {
                     };
                 // Lower the declared signature with the fn's generics in scope.
                 self.push_generic_scope(
-                    &fn_generics,
+                    fn_generics,
                     GenericOwner::Function(self.hir.idents[fn_name_idx].symbol),
                 );
                 let declared_params: Vec<TypeId> = fn_params
@@ -3810,18 +3800,15 @@ impl<'a> Cx<'a> {
                 if sig.generics.is_empty() {
                     return None;
                 }
-                let declared_params = sig.params.clone();
                 // No declared return → no shape to infer into. The
                 // outer Expr::Call default (`any?`) is the right answer.
                 let declared_return = sig.return_ty?;
                 let erases = sig.return_erases;
-                let generic_syms = sig.generics.clone();
                 let mut tbl = InferenceTable::new();
-                let pair_count = declared_params.len().min(arg_tys.len());
-                for i in 0..pair_count {
-                    self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, &call_range);
+                for (param, arg) in sig.params.iter().zip(arg_tys.iter()) {
+                    self.collect_witnesses(*param, *arg, &mut tbl, &call_range);
                 }
-                Some(self.materialize_with_erasure(declared_return, &generic_syms, erases, &tbl))
+                Some(self.materialize_with_erasure(declared_return, &sig.generics, erases, &tbl))
             }
             _ => None,
         }
@@ -3871,20 +3858,22 @@ impl<'a> Cx<'a> {
         arg_tys: &[TypeId],
         call_range: &Range<usize>,
     ) -> Option<(TypeId, Option<TypeId>)> {
-        let recv = self.arena.get(recv_ty).clone();
-        let (type_id, instantiation): (ItemId, Vec<TypeId>) = match recv.kind {
+        use std::borrow::Cow;
+
+        let recv = self.arena.get(recv_ty);
+        let (type_id, instantiation): (ItemId, &[TypeId]) = match &recv.kind {
             TypeKind::Primitive(p) => {
                 let core_mod = self.index.symbols.intern("core");
                 let name_sym = self.index.symbols.intern(p.name());
-                (ItemId::new(core_mod, name_sym), Vec::new())
+                (ItemId::new(core_mod, name_sym), &[])
             }
-            TypeKind::Type(decl) => (decl, Vec::new()),
-            TypeKind::Generic { decl, args } => (decl, args.into_vec()),
+            TypeKind::Type(decl) => (*decl, &[]),
+            TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
             _ => return None,
         };
         let method_sym = self.hir.idents[property].symbol;
         let members = self.index.type_members.get(&type_id)?;
-        let sig = members.method_signatures.get(&method_sym)?.clone();
+        let sig = members.method_signatures.get(&method_sym)?;
         // Receiver-side substitution. Maps the type decl's own generic
         // params (`Array<T>.push(x: T)`) to the receiver's concrete
         // args (`Array<int>` → `T := int`) so the method's params /
@@ -3896,8 +3885,8 @@ impl<'a> Cx<'a> {
             .copied()
             .zip(instantiation.iter().copied())
             .collect();
-        let declared_params: Vec<TypeId> = if recv_subst.is_empty() {
-            sig.params.clone()
+        let declared_params: Cow<'_, [TypeId]> = if recv_subst.is_empty() {
+            Cow::Borrowed(&sig.params)
         } else {
             sig.params
                 .iter()
@@ -3915,9 +3904,8 @@ impl<'a> Cx<'a> {
         let erases = sig.return_erases;
         let generic_syms = sig.generics.clone();
         let mut tbl = InferenceTable::new();
-        let pair_count = declared_params.len().min(arg_tys.len());
-        for i in 0..pair_count {
-            self.collect_witnesses(declared_params[i], arg_tys[i], &mut tbl, call_range);
+        for (declared_param, arg) in declared_params.iter().zip(arg_tys.iter()) {
+            self.collect_witnesses(*declared_param, *arg, &mut tbl, call_range);
         }
         Some(self.materialize_with_erasure(declared_return, &generic_syms, erases, &tbl))
     }
@@ -3956,7 +3944,7 @@ impl<'a> Cx<'a> {
             // If the param is `T?`, the witness is whatever the arg
             // strips down to without nullable.
             let witness = if pk.nullable {
-                self.strip_nullable(arg_ty)
+                self.arena.strip_nullable(arg_ty)
             } else {
                 arg_ty
             };
@@ -3981,7 +3969,7 @@ impl<'a> Cx<'a> {
             return;
         }
         let ak = self.arena.get(arg_ty).clone();
-        if let (TypeKind::Generic { decl: pd, args: pa }, TypeKind::Generic { decl: ad, args: aa }) =
+        if let (TypeKind::Generic { tpl: pd, args: pa }, TypeKind::Generic { tpl: ad, args: aa }) =
             (&pk.kind, &ak.kind)
             && pd == ad
             && pa.len() == aa.len()
@@ -4236,8 +4224,8 @@ impl<'a> Cx<'a> {
                 else_branch,
                 byte_range,
             }) => {
-                self.expect_bool(condition, "if condition");
-                // P6.6 exhaustiveness: only run from a "head" if (i.e.
+                self.visit_expr(condition);
+                // exhaustiveness: only run from a "head" if (i.e.
                 // not already accounted for as a nested else-if).
                 if !self.chain_member_ifs.contains(&stmt_id) {
                     self.check_enum_exhaustiveness(stmt_id, byte_range.clone());
@@ -4440,7 +4428,7 @@ impl<'a> Cx<'a> {
                 self.push_narrow();
                 for ident in &then_non_null {
                     if let Some(cur) = self.lookup_def_type(*ident) {
-                        let stripped = self.strip_nullable(cur);
+                        let stripped = self.arena.strip_nullable(cur);
                         self.write_narrow(*ident, stripped);
                     }
                 }
@@ -4469,7 +4457,7 @@ impl<'a> Cx<'a> {
                     let ty = self.lower_typed_union(ty_refs);
                     self.write_narrow(*ident, ty);
                 }
-                // P41.1 — pre-lowered narrows (today populated only
+                // Pre-lowered narrows (today populated only
                 // via the `!` swap; the `Expr::Is` arm of
                 // `derive_cond_narrows` populates `else_typed_id` in
                 // P41.2).
@@ -4506,7 +4494,7 @@ impl<'a> Cx<'a> {
                 for (ident, enum_sym, variants) in &then_enum_values {
                     self.write_enum_value_narrow(*ident, *enum_sym, variants);
                 }
-                // **P19.16** — inline the then-branch's stmts (instead
+                // Inline the then-branch's stmts (instead
                 // of `visit_block`) so the narrow frame we just pushed
                 // captures any assignments inside the branch. The
                 // post-if join then sees those narrows. `visit_block`
@@ -4526,7 +4514,7 @@ impl<'a> Cx<'a> {
                         self.push_narrow();
                         for ident in &else_non_null {
                             if let Some(cur) = self.lookup_def_type(*ident) {
-                                let stripped = self.strip_nullable(cur);
+                                let stripped = self.arena.strip_nullable(cur);
                                 self.write_narrow(*ident, stripped);
                             }
                         }
@@ -4560,7 +4548,7 @@ impl<'a> Cx<'a> {
                         for (ident, enum_sym, variants) in &else_enum_values {
                             self.write_enum_value_narrow(*ident, *enum_sym, variants);
                         }
-                        // P19.16 — same inline pattern for the else
+                        // Same inline pattern for the else
                         // branch. `eb` may be a Block or a nested If
                         // (`else if`); for the Block case we inline,
                         // for the If case we still call visit_stmt
@@ -4583,7 +4571,7 @@ impl<'a> Cx<'a> {
                         (false, FxHashMap::default(), FxHashSet::default())
                     };
 
-                // P13.1 CFG-aware narrowing — early return / throw etc.
+                // CFG-aware narrowing — early return / throw etc.
                 // If the then-branch always exits the surrounding flow
                 // (return / throw / break / continue), the post-if
                 // scope inherits the *else* condition's narrowing
@@ -4592,7 +4580,7 @@ impl<'a> Cx<'a> {
                 if then_terminates {
                     for ident in &else_non_null {
                         if let Some(cur) = self.lookup_def_type(*ident) {
-                            let stripped = self.strip_nullable(cur);
+                            let stripped = self.arena.strip_nullable(cur);
                             self.write_narrow(*ident, stripped);
                         }
                     }
@@ -4607,7 +4595,7 @@ impl<'a> Cx<'a> {
                         let ty = self.lower_typed_union(ty_refs);
                         self.write_narrow(*ident, ty);
                     }
-                    // P41.1 — load-bearing for the union-complement
+                    // Load-bearing for the union-complement
                     // shape: `if (x is T) { return; } use(x);` lifts
                     // the complement into the post-if scope.
                     for (ident, ty) in &else_typed_id {
@@ -4643,7 +4631,7 @@ impl<'a> Cx<'a> {
                 if else_terminates {
                     for ident in &then_non_null {
                         if let Some(cur) = self.lookup_def_type(*ident) {
-                            let stripped = self.strip_nullable(cur);
+                            let stripped = self.arena.strip_nullable(cur);
                             self.write_narrow(*ident, stripped);
                         }
                     }
@@ -4655,7 +4643,7 @@ impl<'a> Cx<'a> {
                         let ty = self.lower_typed_union(ty_refs);
                         self.write_narrow(*ident, ty);
                     }
-                    // P41.1 — `if (!(x is T)) { return; } use(x);` —
+                    // `if (!(x is T)) { return; } use(x);` —
                     // the `!` swap pushes the complement to
                     // `then_typed_id`, the else-terminates path lifts
                     // it.
@@ -4690,7 +4678,7 @@ impl<'a> Cx<'a> {
                     }
                 }
 
-                // **P19.16** — post-if assignment-narrow lift. For
+                // Post-if assignment-narrow lift. For
                 // each binding that's nullable before the if and
                 // is non-null along *every* path through the if,
                 // narrow the post-if scope to its non-null form.
@@ -4732,7 +4720,7 @@ impl<'a> Cx<'a> {
                             .copied()
                             .or_else(|| {
                                 if then_non_null.contains(&ident) {
-                                    Some(self.strip_nullable(pre))
+                                    Some(self.arena.strip_nullable(pre))
                                 } else {
                                     None
                                 }
@@ -4745,7 +4733,7 @@ impl<'a> Cx<'a> {
                             .copied()
                             .or_else(|| {
                                 if else_non_null.contains(&ident) {
-                                    Some(self.strip_nullable(pre))
+                                    Some(self.arena.strip_nullable(pre))
                                 } else {
                                     None
                                 }
@@ -4786,16 +4774,16 @@ impl<'a> Cx<'a> {
                                         .def_types
                                         .get(&ident)
                                         .copied()
-                                        .map(|d| self.strip_nullable(d))
-                                        .unwrap_or_else(|| self.strip_nullable(pre))
+                                        .map(|d| self.arena.strip_nullable(d))
+                                        .unwrap_or_else(|| self.arena.strip_nullable(pre))
                                 }
                             } else {
-                                self.strip_nullable(pre)
+                                self.arena.strip_nullable(pre)
                             };
                             self.write_narrow(ident, merged);
                         }
                     }
-                    // **P19.16** — same lift for member-access paths.
+                    // Same lift for member-access paths.
                     // A path is non-null post-if iff every reaching
                     // branch made it non-null. Reaching condition:
                     // (in then_branch_member_narrows OR
@@ -4844,7 +4832,7 @@ impl<'a> Cx<'a> {
             Stmt::While(WhileStmt {
                 condition, body, ..
             }) => {
-                self.expect_bool(condition, "while condition");
+                self.visit_expr(condition);
                 self.diagnose_decidable_loop_condition(stmt_id, condition, "while");
                 // Apply the condition's truthy narrows to the body so
                 // `while (x != null) { use(x) }` sees `x` as non-null
@@ -4883,7 +4871,7 @@ impl<'a> Cx<'a> {
                 for s in &body.stmts {
                     self.visit_stmt(*s, return_ty);
                 }
-                self.expect_bool(condition, "do-while condition");
+                self.visit_expr(condition);
                 // Body runs once regardless of the condition, so a
                 // decidable `do-while` is informational only — emit
                 // the diagnostic but do NOT record it for the
@@ -4921,7 +4909,7 @@ impl<'a> Cx<'a> {
                 body,
                 ..
             }) => {
-                // **P19.14** — bind the C-style for loop's
+                // Bind the C-style for loop's
                 // `init_name` to its declared / inferred type so
                 // uses of the loop var inside `condition` /
                 // `increment` / `body` get a real type instead of
@@ -4944,7 +4932,7 @@ impl<'a> Cx<'a> {
                 // inside the same frame, matching runtime order
                 // (cond → body → incr → cond).
                 let narrows = if let Some(c) = condition {
-                    self.expect_bool(c, "for condition");
+                    self.visit_expr(c);
                     self.diagnose_decidable_loop_condition(stmt_id, c, "for");
                     self.derive_cond_narrows(c)
                 } else {
@@ -4979,7 +4967,7 @@ impl<'a> Cx<'a> {
                 if let Some(w) = window {
                     let _ = self.visit_expr(w);
                 }
-                // P18.x — bind each iterator param's def_type from
+                // Bind each iterator param's def_type from
                 // the iterable's element type. Iterability in
                 // GreyCat is gated by the `@iterable` type-pragma;
                 // in stdlib that covers six native types — Array,
@@ -5020,7 +5008,7 @@ impl<'a> Cx<'a> {
                 // args slice empty in the bare case.
                 let decl_and_args: Option<(ItemId, Vec<TypeId>)> =
                     match &self.arena.get(underlying_ty).kind {
-                        TypeKind::Generic { decl, args } => Some((*decl, args.to_vec())),
+                        TypeKind::Generic { tpl, args } => Some((*tpl, args.to_vec())),
                         TypeKind::Type(decl) => Some((*decl, Vec::new())),
                         _ => None,
                     };
@@ -5125,7 +5113,7 @@ impl<'a> Cx<'a> {
                     out.then_member_non_null.extend(r.then_member_non_null);
                     out.then_member_typed.extend(l.then_member_typed);
                     out.then_member_typed.extend(r.then_member_typed);
-                    // P41.1 — pre-lowered narrows propagate the same way.
+                    // Pre-lowered narrows propagate the same way.
                     out.then_typed_id.extend(l.then_typed_id);
                     out.then_typed_id.extend(r.then_typed_id);
                     // Enum-value narrows: both subtrees' then-side
@@ -5144,12 +5132,12 @@ impl<'a> Cx<'a> {
                     out.else_non_null.extend(r.else_non_null);
                     out.else_member_non_null.extend(l.else_member_non_null);
                     out.else_member_non_null.extend(r.else_member_non_null);
-                    // P41.1 — pre-lowered else-narrows are sound to
+                    // Pre-lowered else-narrows are sound to
                     // union for `||`: NOT(A || B) ≡ !A AND !B holds
                     // both subtrees' else-side complements.
                     out.else_typed_id.extend(l.else_typed_id);
                     out.else_typed_id.extend(r.else_typed_id);
-                    // P42.4 — a `||` of two pure-`is` subtrees stays
+                    // A `||` of two pure-`is` subtrees stays
                     // "atomic" for the purposes of the else-side
                     // complement: NOT(A || B) ≡ !A AND !B propagates
                     // both atomicity guarantees. Any `&&` underneath
@@ -5210,7 +5198,7 @@ impl<'a> Cx<'a> {
                     out.else_enum_values.extend(r.else_enum_values);
                 }
                 BinOp::Eq | BinOp::Neq => {
-                    // Ident-vs-null path (P6.4).
+                    // Ident-vs-null path
                     if let Some(name_idx) = self.ident_compared_to_null(*left, *right)
                         && let Some(Definition::Param(def) | Definition::Local(def)) =
                             self.res.lookup(name_idx)
@@ -5251,7 +5239,7 @@ impl<'a> Cx<'a> {
                             _ => {}
                         }
                     }
-                    // **P19.16** — member-access path null comparison.
+                    // Member-access path null comparison.
                     // `foo.bar != null` / `null != foo.bar` (and `==`)
                     // narrow the path on the matching side. Skips
                     // shapes that don't root in an Ident / `this` —
@@ -5730,14 +5718,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn expect_bool(&mut self, expr: Idx<Expr>, _label: &'static str) {
-        // Type-only: populate `expr_types` so the validation pass can
-        // re-check against settled types. The "must be `bool`"
-        // diagnostic emission lives in
-        // `ProjectAnalysis::validate_type_relations`.
-        let _ = self.visit_expr(expr);
-    }
-
     fn visit_expr(&mut self, expr_id: Idx<Expr>) -> TypeId {
         let ty = self.infer_expr(expr_id);
         self.record(expr_id, ty);
@@ -5745,9 +5725,9 @@ impl<'a> Cx<'a> {
     }
 
     fn infer_expr(&mut self, expr_id: Idx<Expr>) -> TypeId {
-        let expr = self.hir.exprs[expr_id].clone();
+        let expr = &self.hir.exprs[expr_id];
         match expr {
-            Expr::Ident { name: idx, .. } => match self.res.lookup(idx) {
+            Expr::Ident { name: idx, .. } => match self.res.lookup(*idx) {
                 Some(Definition::Param(def)) | Some(Definition::Local(def)) => {
                     // P-erasure taint: carry a binding's runtime-erased
                     // shape (recorded at its `var x = <erased call>`) to
@@ -5764,7 +5744,7 @@ impl<'a> Cx<'a> {
                         .ty
                         .map(|ty_ref| self.lower_type_ref(ty_ref))
                         .unwrap_or_else(|| self.any_nullable()),
-                    // P23 — bare type / enum references used in value
+                    // Bare type / enum references used in value
                     // position carry the named decl's identity, not
                     // the generic `type` shape. Refine to
                     // `TypeOf(<that decl>)` so generic inference's
@@ -5795,7 +5775,7 @@ impl<'a> Cx<'a> {
                         // In-module fn ref: consult fn_signatures via
                         // the local ItemId so the structural Lambda
                         // carries the real params / declared return.
-                        let fn_sym = self.hir.idents[idx].symbol;
+                        let fn_sym = self.hir.idents[*idx].symbol;
                         let item = ItemId::new(self.module_sym, fn_sym);
                         match self.index.fn_signatures.get(&item).cloned() {
                             Some(sig) => self.fn_ref_ty_from_sig(&sig),
@@ -5807,16 +5787,16 @@ impl<'a> Cx<'a> {
                 Some(Definition::ProjectDecl {
                     uri: ref dec_uri, ..
                 }) => {
-                    // P23 — cross-module bare ident value typing via
-                    // the project signatures index. **P19.10** —
-                    // top-level vars get their declared type from
+                    // Cross-module bare ident value typing via
+                    // the project signatures index.
+                    // Top-level vars get their declared type from
                     // `var_types` (lowered in S7-S11). Without this,
                     // `var groups: nodeIndex<String, node<Group>>`
                     // referenced from another module would fall
                     // through to `index.has_name` (vars are in
                     // `values`) and type as `type`, breaking
                     // for-in iteration over the foreign var.
-                    let sym = self.hir.idents[idx].symbol;
+                    let sym = self.hir.idents[*idx].symbol;
                     let item = self.index.item_id_for(dec_uri, sym);
                     if let Some(var_ty) = item.and_then(|id| self.index.var_types.get(&id)).copied()
                     {
@@ -5825,7 +5805,7 @@ impl<'a> Cx<'a> {
                         .and_then(|id| self.index.fn_signatures.get(&id))
                         .cloned()
                     {
-                        // P38.1 — native + non-native (.gcl) fns with a
+                        // Native + non-native (.gcl) fns with a
                         // declared return live in `fn_signatures`. Mint
                         // a structural Lambda from the pre-lowered
                         // params/return so calls through the ident
@@ -5865,12 +5845,12 @@ impl<'a> Cx<'a> {
                     }
                 }
                 Some(Definition::Project) => {
-                    // **P19.16** — runtime-exposed value-position
+                    // Runtime-exposed value-position
                     // globals (e.g. `Infinity`, `NaN`) carry a fixed
                     // type the runtime owns; without this lookup the
                     // body walker would type them as `any` and float
                     // dispatch downstream would fail.
-                    let sym = self.hir.idents[idx].symbol;
+                    let sym = self.hir.idents[*idx].symbol;
                     self.index
                         .runtime_globals
                         .get(&sym)
@@ -5894,12 +5874,12 @@ impl<'a> Cx<'a> {
                 .copied()
                 .unwrap_or_else(|| self.any_nullable()),
             Expr::String(StringExpr { parts, .. }) => {
-                // P17.5 — visit each `${expr}` interpolation so the
+                // Visit each `${expr}` interpolation so the
                 // analyzer types and binds the inner identifiers
                 // (otherwise locals referenced only inside template
                 // strings would surface as `unused-local` and never
                 // get an `expr_types` entry).
-                for part in &parts {
+                for part in parts {
                     if let greycat_analyzer_hir::types::StringPart::Interp { expr, .. } = part {
                         let _ = self.visit_expr(*expr);
                     }
@@ -5907,11 +5887,7 @@ impl<'a> Cx<'a> {
                 self.primitive(Primitive::String)
             }
             Expr::Tuple(items, _) => {
-                // The grammar's `tuple_expr` is strictly 2-element
-                // (`( left "," right )`), so HIR always has exactly
-                // two items here. Type the literal as `Tuple<X, Y>`
-                // — the compiler's desugar rule (mirrors `[42]` ≡
-                // `Array<int>{42}`).
+                // assert_eq!(items.len(), 2, "Tuple items length must be exactly 2");
                 let x = self.visit_expr(items[0]);
                 let y = self.visit_expr(items[1]);
                 let span = self.hir.exprs[expr_id].byte_range();
@@ -5924,27 +5900,21 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Array(items, _) => {
-                // Visit every element unconditionally so each gets its
-                // `expr_types` entry (and any nested diagnostics still
-                // fire), regardless of whether the array as a whole
-                // qualifies for element-type inference.
-                let elem_types: Vec<TypeId> = items.iter().map(|i| self.visit_expr(*i)).collect();
-
-                // Mimic the GreyCat runtime's "constant-evaluable" trigger
-                // for array-literal element inference: the literal types
-                // as `Array<T>` only when every element has a constant-
-                // evaluable shape (literal, string, null, paren/unary/
-                // binary recursing into the above, nested array, or an
-                // object_expr with a declared type). Idents / calls /
-                // member access / etc. bail to bare `Array`. We *could*
-                // do better ourselves (we have full type inference) but
-                // mimicking the runtime keeps user expectations predictable.
-                // EXCEPT for `[42time - 10s]` and similar binary-over-
-                // typed-literal cases where the runtime has a known
-                // mis-inference (`Array<duration>`); the element type
-                // here comes from `infer_binary`, which correctly returns
-                // `time`, so the analyzer outputs `Array<time>`.
-                let inferred_elem = self.infer_array_element_type(&items, &elem_types);
+                let mut first: Option<TypeId> = None;
+                let mut uniform = true;
+                for &i in items {
+                    let t = self.visit_expr(i);
+                    match first {
+                        None => first = Some(t),
+                        Some(f) => {
+                            if t != f {
+                                uniform = false;
+                            }
+                        }
+                    }
+                }
+                let uniform_elem = if uniform { first } else { None };
+                let inferred_elem = self.infer_array_element_type(items, uniform_elem);
 
                 let span = self.hir.exprs[expr_id].byte_range();
                 let elem = inferred_elem.unwrap_or_else(|| self.any_nullable());
@@ -5957,53 +5927,36 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Object(ObjectExpr { ty, fields, .. }) => {
-                let lowered = ty.map(|t| self.lower_type_ref(t));
+                let obj_ty = self.lower_type_ref(*ty);
                 // For a `Map { k: v }` the keys are value expressions
                 // (typed against `K`), so they must be visited too; for
                 // a classic object the key is a field *name*
                 // (member-resolved by `check_object_required_attrs`),
                 // not a value, so visiting it would mis-type a field
                 // name as a value use.
-                let is_map = lowered.is_some_and(|l| self.head_decl_is_map(l));
-                for f in &fields {
-                    if is_map {
+                let is_map = self.head_decl_is_map(obj_ty);
+                if is_map {
+                    for f in fields {
                         let _ = self.visit_expr(f.name);
+                        let _ = self.visit_expr(f.value);
                     }
-                    let _ = self.visit_expr(f.value);
-                }
-                match (ty, lowered) {
-                    (Some(t), Some(l)) => {
-                        if !is_map {
-                            self.check_object_required_attrs(t, l, &fields);
-                        }
-                        l
+                } else {
+                    for f in fields {
+                        let _ = self.visit_expr(f.value);
                     }
-                    _ => self.any_nullable(),
+                    self.check_object_required_attrs(*ty, obj_ty, fields);
                 }
+                obj_ty
             }
             Expr::PositionalObject(PositionalObjectExpr { ty, fields, .. }) => {
-                for value in &fields {
-                    let _ = self.visit_expr(*value);
+                for f in fields {
+                    let _ = self.visit_expr(*f);
                 }
-                // Construction-shape validation (`Array` / `node` / v7
-                // tuples vs. everything else) lives in the
-                // `collect_object_construction_diags` cross-module pass.
-                // An *empty* positional body is the `Foo {}` default-init
-                // — it still has to satisfy the required-attr check (all
-                // non-nullable attrs missing). A non-empty positional
-                // body on a non-Array/node head is already a construction
-                // error, so the required-attr check would be redundant
-                // noise there.
-                match ty {
-                    Some(t) => {
-                        let l = self.lower_type_ref(t);
-                        if fields.is_empty() {
-                            self.check_object_required_attrs(t, l, &[]);
-                        }
-                        l
-                    }
-                    None => self.any_nullable(),
+                let obj_ty = self.lower_type_ref(*ty);
+                if fields.is_empty() {
+                    self.check_object_required_attrs(*ty, obj_ty, &[]);
                 }
+                obj_ty
             }
             Expr::Member(MemberExpr {
                 receiver,
@@ -6020,7 +5973,7 @@ impl<'a> Cx<'a> {
                 ..
             }) => {
                 let property = property.ident();
-                let recv_ty = self.visit_expr(receiver);
+                let recv_ty = self.visit_expr(*receiver);
                 // P16.5 — `n->field` where `n: node<T>` (or any node-tag
                 // shape: `nodeTime<T>`, `nodeIndex<K, V>`, …) resolves
                 // `field` against the inner type's attrs / methods, not
@@ -6103,7 +6056,7 @@ impl<'a> Cx<'a> {
                     && let Some(p) = path.as_deref()
                     && self.member_path_is_non_null(p)
                 {
-                    self.strip_nullable(result_ty)
+                    self.arena.strip_nullable(result_ty)
                 } else {
                     result_ty
                 }
@@ -6154,8 +6107,8 @@ impl<'a> Cx<'a> {
                 // inline using the project signatures index. (Calls
                 // are routed through `try_member_call_typing` from
                 // the `Expr::Call` branch.)
-                self.bind_qualified_chain_segments(&chain);
-                self.qualified_static_value_type(&chain)
+                self.bind_qualified_chain_segments(chain);
+                self.qualified_static_value_type(chain)
                     .unwrap_or_else(|| self.any_nullable())
             }
             Expr::Offset(OffsetExpr {
@@ -6165,8 +6118,8 @@ impl<'a> Cx<'a> {
                 post_optional,
                 ..
             }) => {
-                let recv_ty = self.visit_expr(receiver);
-                let _ = self.visit_expr(index);
+                let recv_ty = self.visit_expr(*receiver);
+                let _ = self.visit_expr(*index);
                 // **P19.11** — element-type inference for offset
                 // access. `arr[i]` on `Array<T>` / `Set<T>` /
                 // `nodeList<T>` yields `T`; `m[k]` on `Map<K, V>`
@@ -6189,7 +6142,7 @@ impl<'a> Cx<'a> {
                 // *receiver type* unchanged (still iterable in the
                 // same shape). Otherwise it's a single-element
                 // lookup that returns the element type.
-                let index_is_range = matches!(&self.hir.exprs[index], Expr::Range { .. });
+                let index_is_range = matches!(&self.hir.exprs[*index], Expr::Range { .. });
                 let base = if index_is_range {
                     underlying
                 } else {
@@ -6206,8 +6159,8 @@ impl<'a> Cx<'a> {
                     // and isn't fooled by a user-declared
                     // `type Array<T>` in their own module.
                     match &self.arena.get(underlying).kind {
-                        TypeKind::Generic { decl, args }
-                            if Some(*decl) == self.well_known.array_decl && !args.is_empty() =>
+                        TypeKind::Generic { tpl, args }
+                            if Some(*tpl) == self.well_known.array_decl && !args.is_empty() =>
                         {
                             args[0]
                         }
@@ -6236,13 +6189,13 @@ impl<'a> Cx<'a> {
                     && let Some(p) = path.as_deref()
                     && self.member_path_is_non_null(p)
                 {
-                    self.strip_nullable(result_ty)
+                    self.arena.strip_nullable(result_ty)
                 } else {
                     result_ty
                 }
             }
             Expr::Call(CallExpr { callee, args, .. }) => {
-                let callee_ty = self.visit_expr(callee);
+                let callee_ty = self.visit_expr(*callee);
                 let arg_tys: Vec<TypeId> = args.iter().map(|a| self.visit_expr(*a)).collect();
                 let call_range = self.hir.exprs[expr_id].byte_range();
                 // Compute the raw return type via the first call-typing
@@ -6262,7 +6215,7 @@ impl<'a> Cx<'a> {
                 // P12.1: the first path handles generic fns / generic
                 // methods via constraint-based inference.
                 let raw = if let Some((materialized, runtime)) =
-                    self.try_generic_call_inference(callee, &arg_tys, call_range)
+                    self.try_generic_call_inference(*callee, &arg_tys, call_range)
                 {
                     // P-erasure — when the callee erases its generic
                     // container result at runtime, stash the erased shape
@@ -6270,11 +6223,11 @@ impl<'a> Cx<'a> {
                     // so `validate_type_relations` can flag narrowing uses
                     // the runtime would throw on.
                     if let Some(rt) = runtime {
-                        let lifted = self.lift_call_result_for_nullable_receiver(callee, rt);
+                        let lifted = self.lift_call_result_for_nullable_receiver(*callee, rt);
                         self.out.expr_runtime_types.insert(expr_id, lifted);
                     }
                     materialized
-                } else if let Some(ret) = self.try_member_call_typing(callee) {
+                } else if let Some(ret) = self.try_member_call_typing(*callee) {
                     // P23 — inline call-return typing for Member / Arrow /
                     // Static method calls. Pulls the method's lowered
                     // return type from the S7 signatures index and applies
@@ -6297,7 +6250,7 @@ impl<'a> Cx<'a> {
                     // `any?` fallback (lambda has no observable return).
                     // Strip the callee's outer nullable bit so `function?`-
                     // typed callees still produce the underlying ret.
-                    let stripped = self.strip_nullable(callee_ty);
+                    let stripped = self.arena.strip_nullable(callee_ty);
                     let lambda_ret = match &self.arena.get(stripped).kind {
                         TypeKind::Lambda { ret, .. } => Some(*ret),
                         _ => None,
@@ -6307,12 +6260,12 @@ impl<'a> Cx<'a> {
                         None => self.any_nullable(),
                     }
                 };
-                self.lift_call_result_for_nullable_receiver(callee, raw)
+                self.lift_call_result_for_nullable_receiver(*callee, raw)
             }
             Expr::Binary(BinaryExpr {
                 op, left, right, ..
             }) => {
-                let lt = self.visit_expr(left);
+                let lt = self.visit_expr(*left);
                 // P13.2-followup — short-circuit operands narrow the
                 // *other* operand, not just the enclosing `if`. In
                 // `x != null && f(x)`, the right side only runs when
@@ -6343,7 +6296,7 @@ impl<'a> Cx<'a> {
                             is_atomic_is: _,
                             then_enum_values: _,
                             else_enum_values: _,
-                        } = self.derive_cond_narrows(left);
+                        } = self.derive_cond_narrows(*left);
                         let (
                             non_null,
                             typed,
@@ -6376,7 +6329,7 @@ impl<'a> Cx<'a> {
                         self.push_narrow();
                         for ident in &non_null {
                             if let Some(cur) = self.lookup_def_type(*ident) {
-                                let stripped = self.strip_nullable(cur);
+                                let stripped = self.arena.strip_nullable(cur);
                                 self.write_narrow(*ident, stripped);
                             }
                         }
@@ -6403,11 +6356,11 @@ impl<'a> Cx<'a> {
                             let null_ty = self.null();
                             self.write_member_typed(path, null_ty);
                         }
-                        let rt = self.visit_expr(right);
+                        let rt = self.visit_expr(*right);
                         self.pop_narrow();
                         rt
                     }
-                    _ => self.visit_expr(right),
+                    _ => self.visit_expr(*right),
                 };
                 // **P19.16** — GreyCat's `=` parses as a binary
                 // expression (not a Stmt::Assign). When the LHS is
@@ -6416,18 +6369,18 @@ impl<'a> Cx<'a> {
                 // The post-if join logic then lifts narrows that
                 // hold along every path.
                 if matches!(op, BinOp::Other("=")) {
-                    self.check_private_attr_write(left);
-                    self.check_static_attr_write(left);
-                    self.record_assign_narrow(left, rt);
+                    self.check_private_attr_write(*left);
+                    self.check_static_attr_write(*left);
+                    self.record_assign_narrow(*left, rt);
                 } else if matches!(op, BinOp::Other("?=")) {
-                    self.check_private_attr_write(left);
-                    self.check_static_attr_write(left);
-                    self.record_coalesce_assign_narrow(left, rt);
+                    self.check_private_attr_write(*left);
+                    self.check_static_attr_write(*left);
+                    self.record_coalesce_assign_narrow(*left, rt);
                 }
-                self.infer_binary(op, lt, rt)
+                self.infer_binary(*op, lt, rt)
             }
             Expr::Unary(UnaryExpr { op, operand, .. }) => {
-                let inner = self.visit_expr(operand);
+                let inner = self.visit_expr(*operand);
                 match op {
                     UnaryOp::Not => self.primitive(Primitive::Bool),
                     UnaryOp::Neg | UnaryOp::Pos | UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
@@ -6459,17 +6412,17 @@ impl<'a> Cx<'a> {
                         // correctly drops on assignment to the path
                         // (existing `record_assign_narrow` clears it
                         // when the RHS is nullable).
-                        let result = self.strip_nullable(inner);
-                        if let Expr::Ident { name: name_idx, .. } = self.hir.exprs[operand].clone()
+                        let result = self.arena.strip_nullable(inner);
+                        if let Expr::Ident { name: name_idx, .. } = self.hir.exprs[*operand].clone()
                             && let Some(Definition::Param(def) | Definition::Local(def)) =
                                 self.res.lookup(name_idx)
                         {
                             self.write_narrow(def, result);
                         }
                         if matches!(
-                            self.hir.exprs[operand],
+                            self.hir.exprs[*operand],
                             Expr::Member(_) | Expr::Arrow(_) | Expr::Offset(_)
-                        ) && let Some(path) = self.member_path(operand)
+                        ) && let Some(path) = self.member_path(*operand)
                         {
                             self.write_member_non_null(path);
                         }
@@ -6477,7 +6430,7 @@ impl<'a> Cx<'a> {
                     }
                 }
             }
-            Expr::Paren(inner, _) => self.visit_expr(inner),
+            Expr::Paren(inner, _) => self.visit_expr(*inner),
             Expr::Lambda(LambdaExpr {
                 params,
                 return_type,
@@ -6485,7 +6438,7 @@ impl<'a> Cx<'a> {
                 ..
             }) => {
                 let mut param_tys = Vec::with_capacity(params.len());
-                for p in &params {
+                for p in params {
                     let p = self.hir.fn_params[*p].clone();
                     let pt =
                         p.ty.map(|t| self.lower_type_ref(t))
@@ -6493,7 +6446,7 @@ impl<'a> Cx<'a> {
                     param_tys.push(pt);
                 }
                 let declared_ret = return_type.map(|t| self.lower_type_ref(t));
-                self.visit_block(&body, declared_ret);
+                self.visit_block(body, declared_ret);
                 // Lambda body inference mirrors the fn-level
                 // infer-return-type lint — same `return_inference`
                 // helper. When the user didn't annotate, walk the body
@@ -6502,14 +6455,14 @@ impl<'a> Cx<'a> {
                 // `None` (rendered `fn(...)`).
                 let inferred_ret = declared_ret.or_else(|| {
                     let ty = crate::return_inference::inferred_return_from_block(
-                        self.hir, self.out, self.arena, &body,
+                        self.hir, self.out, self.arena, body,
                     )?;
                     crate::return_inference::is_expressible_type_ident(self.arena, ty).then_some(ty)
                 });
                 self.arena.lambda(param_tys, inferred_ret)
             }
             Expr::Is { value, .. } => {
-                let _ = self.visit_expr(value);
+                let _ = self.visit_expr(*value);
                 self.primitive(Primitive::Bool)
             }
             Expr::Range { from, to, .. } => {
@@ -6520,16 +6473,16 @@ impl<'a> Cx<'a> {
                 // range, both of which look at the surrounding
                 // shape, not the range's own type).
                 if let Some(f) = from {
-                    let _ = self.visit_expr(f);
+                    let _ = self.visit_expr(*f);
                 }
                 if let Some(t) = to {
-                    let _ = self.visit_expr(t);
+                    let _ = self.visit_expr(*t);
                 }
                 self.any_nullable()
             }
             Expr::Cast { value, ty, .. } => {
-                let from_ty = self.visit_expr(value);
-                let to_ty = self.lower_type_ref(ty);
+                let from_ty = self.visit_expr(*value);
+                let to_ty = self.lower_type_ref(*ty);
                 // P12.3: validate the cast against the GreyCat `as`
                 // rules. Surfaces invalid casts as a diagnostic; the
                 // resulting expression type is still `to_ty` so
@@ -6584,8 +6537,8 @@ impl<'a> Cx<'a> {
                 // dispatch only (Coalesce / comparisons read the
                 // original `nullable` flag, so we keep `lt` / `rt`
                 // intact at the function entry).
-                let lt_n = self.strip_nullable(lt);
-                let rt_n = self.strip_nullable(rt);
+                let lt_n = self.arena.strip_nullable(lt);
+                let rt_n = self.arena.strip_nullable(rt);
                 let string_t = self.primitive(Primitive::String);
                 let time_t = self.primitive(Primitive::Time);
                 let dur_t = self.primitive(Primitive::Duration);
@@ -6608,8 +6561,8 @@ impl<'a> Cx<'a> {
                 // **P19.14** — `time - time → duration`,
                 // `time - duration → time`,
                 // `duration - duration → duration`.
-                let lt_n = self.strip_nullable(lt);
-                let rt_n = self.strip_nullable(rt);
+                let lt_n = self.arena.strip_nullable(lt);
+                let rt_n = self.arena.strip_nullable(rt);
                 let time_t = self.primitive(Primitive::Time);
                 let dur_t = self.primitive(Primitive::Duration);
                 if lt_n == time_t && rt_n == time_t {
@@ -6628,8 +6581,8 @@ impl<'a> Cx<'a> {
             }
             BinOp::Mul => {
                 // **P19.14** — `duration * int / float → duration`.
-                let lt_n = self.strip_nullable(lt);
-                let rt_n = self.strip_nullable(rt);
+                let lt_n = self.arena.strip_nullable(lt);
+                let rt_n = self.arena.strip_nullable(rt);
                 let dur_t = self.primitive(Primitive::Duration);
                 if (lt_n == dur_t && (rt_n == int || rt_n == float))
                     || ((lt_n == int || lt_n == float) && rt_n == dur_t)
@@ -6661,9 +6614,9 @@ impl<'a> Cx<'a> {
                 // still be null in that case). Same-shape collapse
                 // keeps `T? ?? T → T` clean for the assignability
                 // checker.
-                let lt_stripped = self.strip_nullable(lt);
+                let lt_stripped = self.arena.strip_nullable(lt);
                 let rt_nullable = self.arena.get(rt).nullable;
-                let rt_stripped = self.strip_nullable(rt);
+                let rt_stripped = self.arena.strip_nullable(rt);
                 let merged = if lt_stripped == rt_stripped {
                     lt_stripped
                 } else {
@@ -6699,27 +6652,23 @@ impl<'a> Cx<'a> {
     fn infer_array_element_type(
         &self,
         items: &[Idx<Expr>],
-        elem_types: &[TypeId],
+        uniform_elem: Option<TypeId>,
     ) -> Option<TypeId> {
-        if items.is_empty() {
-            return None;
-        }
+        // `uniform_elem` is `Some(t)` only when the array is non-empty and
+        // every element typed as the same `t`; empty / divergent arrays
+        // arrive as `None` and bail (no widening, mirroring the runtime).
+        let elem = uniform_elem?;
         for &i in items {
             if !self.is_constant_array_element_shape(i) {
                 return None;
             }
         }
-        // No widening: runtime returns bare `Array` when any element
-        // types as `null` (including the all-`null` case) or when
-        // element types diverge.
-        let first = elem_types[0];
-        if matches!(self.arena.get(first).kind, TypeKind::Null) {
+        // Runtime returns bare `Array` when the shared element type is
+        // `null` (covers the all-`null` case).
+        if matches!(self.arena.get(elem).kind, TypeKind::Null) {
             return None;
         }
-        if elem_types.iter().any(|t| *t != first) {
-            return None;
-        }
-        Some(first)
+        Some(elem)
     }
 
     /// Per-element "constant-evaluable" shape check used by the
@@ -6753,8 +6702,7 @@ impl<'a> Cx<'a> {
                 self.is_constant_array_element_shape(b.left)
                     && self.is_constant_array_element_shape(b.right)
             }
-            Expr::Object(obj) => obj.ty.is_some(),
-            Expr::PositionalObject(obj) => obj.ty.is_some(),
+            Expr::Object(_) | Expr::PositionalObject(_) => true,
             _ => false,
         }
     }

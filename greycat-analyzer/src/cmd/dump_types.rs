@@ -35,9 +35,11 @@ use greycat_analyzer_core::{
 };
 use greycat_analyzer_core::{Primitive, TypeArena, TypeId};
 use greycat_analyzer_hir::{
-    DeclRegistry, Hir, arena::Idx, types::{
+    DeclRegistry, Hir,
+    arena::Idx,
+    types::{
         BlockStmt, Decl, Expr, Ident, LiteralKind, Pragma, Stmt, StringPart, TypeRef, UnaryOp,
-    }
+    },
 };
 
 use crate::utils::AnyError;
@@ -507,7 +509,7 @@ fn expr_kind_and_range(hir: &Hir, expr: &Expr) -> Option<(&'static str, std::ops
                 "StringLit"
             }
         }
-        Expr::Tuple(..) => "ArrayExpr",
+        Expr::Tuple(..) => "TupleExpr",
         Expr::Array(..) => "ArrayExpr",
         Expr::Object(_) => "ObjectExpr",
         Expr::PositionalObject(_) => "ObjectExpr",

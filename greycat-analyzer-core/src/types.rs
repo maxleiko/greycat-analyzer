@@ -99,13 +99,13 @@ pub enum TypeKind {
     /// variance / node-tag-dispatch machinery match only the latter
     /// without runtime `args.is_empty()` checks.
     Type(ItemId),
-    /// An instantiation of a generic decl — `Array<int>`, `node<int?>`,
-    /// `Map<String, V>`. `decl` is the generic template's [`ItemId`];
+    /// An instantiation of a generic template — `Array<int>`, `node<int?>`,
+    /// `Map<String, V>`. `tpl` is the generic template's [`ItemId`];
     /// `args` are the per-use-site type arguments and are guaranteed
     /// non-empty by the lowering pass (zero-arg uses of a generic
-    /// decl are an analysis error caught upstream).
+    /// template are an analysis error caught upstream).
     Generic {
-        decl: ItemId,
+        tpl: ItemId,
         /// Cannot be zero-length (ensured by the lowering phase)
         args: SmallVec<[TypeId; 2]>,
     },
@@ -259,6 +259,17 @@ impl TypeArena {
         self.alloc(new_ty)
     }
 
+    /// Makes a copy of `id` with `nullable = false`. Idempotent.
+    pub fn strip_nullable(&mut self, id: TypeId) -> TypeId {
+        let ty = self.get(id);
+        if !ty.nullable {
+            return id;
+        }
+        let mut new_ty = ty.clone();
+        new_ty.nullable = false;
+        self.alloc(new_ty)
+    }
+
     pub fn primitive(&mut self, p: Primitive) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Primitive(p),
@@ -305,9 +316,9 @@ impl TypeArena {
     }
 
     /// Allocates a [`TypeKind::Type`]
-    pub fn alloc_type(&mut self, decl: ItemId) -> TypeId {
+    pub fn alloc_type(&mut self, id: ItemId) -> TypeId {
         self.alloc(Type {
-            kind: TypeKind::Type(decl),
+            kind: TypeKind::Type(id),
             nullable: false,
         })
     }
@@ -316,11 +327,11 @@ impl TypeArena {
     /// Caller guarantees `args` is non-empty:
     /// zero-arg uses of a generic decl are an upstream lowering
     /// error, not a value-shaped concept.
-    pub fn alloc_generic(&mut self, decl: ItemId, args: Vec<TypeId>) -> TypeId {
+    pub fn alloc_generic(&mut self, tpl: ItemId, args: Vec<TypeId>) -> TypeId {
         debug_assert!(!args.is_empty(), "Generic must have non-empty args");
         self.alloc(Type {
             kind: TypeKind::Generic {
-                decl,
+                tpl,
                 args: args.into(),
             },
             nullable: false,
@@ -376,10 +387,10 @@ impl TypeArena {
     /// else, so the type is always a pair. `decl` is the std-core
     /// `Tuple` decl handle the caller has pulled from
     /// `WellKnown::tuple_decl`.
-    pub fn tuple(&mut self, decl: ItemId, x: TypeId, y: TypeId) -> TypeId {
+    pub fn tuple(&mut self, tpl: ItemId, x: TypeId, y: TypeId) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Generic {
-                decl,
+                tpl,
                 args: [x, y].into(),
             },
             nullable: false,
@@ -409,9 +420,9 @@ impl TypeArena {
                 Some(&witness) => witness,
                 None => ty,
             },
-            // `Type(decl)` is non-generic, no params to substitute.
+            // `Type(tpl)` is non-generic, no params to substitute.
             TypeKind::Type(_) => ty,
-            TypeKind::Generic { decl, args } => {
+            TypeKind::Generic { tpl, args } => {
                 let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(*a, subst)).collect();
                 if &new_args == args {
@@ -419,7 +430,7 @@ impl TypeArena {
                 } else {
                     self.alloc(Type {
                         kind: TypeKind::Generic {
-                            decl: *decl,
+                            tpl: *tpl,
                             args: new_args,
                         },
                         nullable: t.nullable,
@@ -468,6 +479,12 @@ impl TypeArena {
             _ => ty,
         }
     }
+
+    // pub fn is_a(&self, ty: TypeId, target: TypeId) -> bool {
+    //     match self.items[ty.0 as usize].kind {
+    //         TypeKind::Type(id)
+    //     }
+    // }
 }
 
 /// Looks up named types.
@@ -642,11 +659,11 @@ pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
         // position: `is_assignable_to(any?, int)` returns true via the
         // top-level `Any` source guard, so `Tuple<any?, any?>` would
         // falsely flow into `Tuple<int, AbstractType>`.
-        TypeKind::Generic { decl: da, args: aa } => match &b.kind {
+        TypeKind::Generic { tpl: da, args: aa } => match &b.kind {
             TypeKind::Any | TypeKind::Unresolved { .. } => {
                 unreachable!("filtered by top-level guards")
             }
-            TypeKind::Generic { decl: db, args: ab } => {
+            TypeKind::Generic { tpl: db, args: ab } => {
                 if da == db
                     && aa.len() == ab.len()
                     && !ab.is_empty()
@@ -821,7 +838,7 @@ impl InferenceTable {
                     ty
                 }
             }
-            TypeKind::Generic { decl, args } => {
+            TypeKind::Generic { tpl, args } => {
                 let new_args: SmallVec<[TypeId; 2]> =
                     args.iter().map(|a| self.substitute(arena, *a)).collect();
                 if &new_args == args {
@@ -829,7 +846,7 @@ impl InferenceTable {
                 } else {
                     arena.alloc(Type {
                         kind: TypeKind::Generic {
-                            decl: *decl,
+                            tpl: *tpl,
                             args: new_args,
                         },
                         nullable: t.nullable,
@@ -1377,10 +1394,10 @@ mod tests {
 
         let resolved = tbl.substitute(&mut cx.arena, arr_t);
         let resolved_kind = &cx.arena.get(resolved).kind;
-        let TypeKind::Generic { decl, args } = resolved_kind else {
+        let TypeKind::Generic { tpl, args } = resolved_kind else {
             panic!("expected Array<int>, got {resolved_kind:?}");
         };
-        assert_eq!(*decl, array_decl);
+        assert_eq!(*tpl, array_decl);
         // P25.7: args is `SmallVec<[TypeId; 2]>` — compare via slices.
         assert_eq!(args.as_slice(), &[int]);
     }
@@ -1410,10 +1427,10 @@ mod tests {
         subst.insert(u_sym, str_t);
 
         let resolved = cx.arena.substitute(map_tu, &subst);
-        let TypeKind::Generic { decl, args } = &cx.arena.get(resolved).kind else {
+        let TypeKind::Generic { tpl, args } = &cx.arena.get(resolved).kind else {
             panic!("expected Map<int, String>");
         };
-        assert_eq!(*decl, map_decl);
+        assert_eq!(*tpl, map_decl);
         // P25.7: args is `SmallVec<[TypeId; 2]>` — compare via slices.
         assert_eq!(args.as_slice(), &[int, str_t]);
 

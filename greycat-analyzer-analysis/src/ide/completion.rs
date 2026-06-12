@@ -2060,7 +2060,7 @@ fn member_completion(
     let inner_head: Option<String> = (|| {
         let (recv_id, recv_args): (ItemId, Vec<TypeId>) = match &arena.get(recv_ty).kind {
             TypeKind::Type(d) => (*d, Vec::new()),
-            TypeKind::Generic { decl, args } => (*decl, args.to_vec()),
+            TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
             _ => return None,
         };
         let members = project.index.type_members.get(&recv_id)?;
@@ -2527,7 +2527,7 @@ fn type_head_name<'a>(
     match &t.kind {
         // P35.7 — handle-keyed variants carry the name in the `ItemId`.
         TypeKind::Type(d) => Some(pa.decl_name(*d)),
-        TypeKind::Generic { decl, .. } => Some(pa.decl_name(*decl)),
+        TypeKind::Generic { tpl, .. } => Some(pa.decl_name(*tpl)),
         TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }

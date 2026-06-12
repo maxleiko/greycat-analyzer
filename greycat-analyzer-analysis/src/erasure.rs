@@ -119,12 +119,8 @@ fn expr_traces_to_erasing_ctor(
         return false;
     }
     match &hir.exprs[expr] {
-        Expr::Object(o) => {
-            o.ty.is_some_and(|tr| type_ref_has_generic_in_arg(hir, tr, generics))
-        }
-        Expr::PositionalObject(o) => {
-            o.ty.is_some_and(|tr| type_ref_has_generic_in_arg(hir, tr, generics))
-        }
+        Expr::Object(o) => type_ref_has_generic_in_arg(hir, o.ty, generics),
+        Expr::PositionalObject(o) => type_ref_has_generic_in_arg(hir, o.ty, generics),
         Expr::Paren(inner, _) => expr_traces_to_erasing_ctor(hir, *inner, body, generics, fuel - 1),
         Expr::Ident { name, .. } => {
             let sym = hir.idents[*name].symbol;

@@ -312,7 +312,7 @@ impl ProjectAnalysis {
         recv_ty: TypeId,
     ) -> Option<FxHashMap<Symbol, TypeId>> {
         let (decl_id, args) = match &self.arena.get(recv_ty).kind {
-            TypeKind::Generic { decl, args } if !args.is_empty() => (*decl, args.clone()),
+            TypeKind::Generic { tpl, args } if !args.is_empty() => (*tpl, args.clone()),
             _ => return None,
         };
         let name_sym = decl_id.name;
@@ -1377,13 +1377,13 @@ pub(crate) fn is_assignable_to_with_index(
         // Node-tag bivariance + node<T> covariance + cross-decl
         // generic supertype walk. Same-decl generics stay invariant
         // (handled by core's same-handle args check).
-        TypeKind::Generic { decl: da, args: aa } => match b_kind {
+        TypeKind::Generic { tpl: da, args: aa } => match b_kind {
             TypeKind::Generic {
-                decl: db,
+                tpl: db,
                 args: ref ab,
             } if da == db && aa.len() == ab.len() && well_known.is_node_tag(da) => true,
             TypeKind::Generic {
-                decl: db,
+                tpl: db,
                 args: ref ab,
             } if da == db
                 && aa.len() == 1
@@ -1500,10 +1500,10 @@ fn walk_substituted_supertype_chain<F>(
 where
     F: FnMut(&mut TypeArena, TypeId) -> bool,
 {
-    let mut current_decl = sub_decl;
+    let mut current_tpl = sub_decl;
     let mut current_args: Vec<TypeId> = sub_args.to_vec();
     for _ in 0..32 {
-        let Some(members) = index.type_members.get(&current_decl) else {
+        let Some(members) = index.type_members.get(&current_tpl) else {
             return false;
         };
         if members.generics.len() != current_args.len() {
@@ -1523,12 +1523,12 @@ where
             return true;
         }
         match arena.get(sup_ty).kind.clone() {
-            TypeKind::Generic { decl, args } => {
-                current_decl = decl;
+            TypeKind::Generic { tpl, args } => {
+                current_tpl = tpl;
                 current_args = args.to_vec();
             }
             TypeKind::Type(d) => {
-                current_decl = d;
+                current_tpl = d;
                 current_args.clear();
             }
             _ => return false,
@@ -1614,7 +1614,7 @@ pub(crate) fn is_castable_with_index(
             TypeKind::Type(td) => {
                 index.is_subtype_of_decl(fd, td) || index.is_subtype_of_decl(td, fd)
             }
-            TypeKind::Generic { decl: td, .. } => {
+            TypeKind::Generic { tpl: td, .. } => {
                 // Upcast (Sub:Type → Sup<args>): walk Sub's chain
                 // looking for a hop whose decl matches Sup; that hop
                 // is already in fully concrete form, so use core's
@@ -1666,7 +1666,7 @@ pub(crate) fn is_castable_with_index(
         // core `is_castable` so args are checked invariantly.
         // `<node-tag> as int` succeeds because the runtime handle is
         // a 64-bit int.
-        TypeKind::Generic { decl: fd, args: fa } => match to_kind {
+        TypeKind::Generic { tpl: fd, args: fa } => match to_kind {
             TypeKind::Type(td) => {
                 if index.is_subtype_of_decl(fd, td) {
                     // Upcast (Sub<args>:Generic → Sup:Type): walk
@@ -1687,7 +1687,7 @@ pub(crate) fn is_castable_with_index(
                 }
             }
             TypeKind::Generic {
-                decl: td,
+                tpl: td,
                 args: ref ta,
             } => {
                 if fd == td {
@@ -1734,7 +1734,7 @@ pub(crate) fn is_castable_with_index(
         // them already (and returned false here, otherwise the
         // early-return would have fired).
         TypeKind::Primitive(Primitive::Int) => match to_kind {
-            TypeKind::Generic { decl: td, .. } if well_known.is_node_tag(td) => true,
+            TypeKind::Generic { tpl: td, .. } if well_known.is_node_tag(td) => true,
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
                 is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
@@ -3106,7 +3106,7 @@ fn collect_object_field_diags_split(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
-    use greycat_analyzer_hir::types::{Expr, ObjectExpr};
+    use greycat_analyzer_hir::types::Expr;
 
     let cur_module = match modules.get(cur_uri) {
         Some(m) => m,
@@ -3115,12 +3115,7 @@ fn collect_object_field_diags_split(
         }
     };
     for (obj_expr_id, expr) in cur_module.hir.exprs.iter() {
-        let Expr::Object(ObjectExpr {
-            ty: Some(_),
-            fields,
-            ..
-        }) = expr
-        else {
+        let Expr::Object(obj_expr) = expr else {
             continue;
         };
         let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() else {
@@ -3133,8 +3128,8 @@ fn collect_object_field_diags_split(
         // not the `type_members` key) and dispatched before the
         // attr-chain guards below, which Map has no entry for.
         let map_kv = match &arena.get(obj_ty).kind {
-            TypeKind::Generic { decl, args }
-                if Some(*decl) == well_known.map_decl && args.len() == 2 =>
+            TypeKind::Generic { tpl, args }
+                if Some(*tpl) == well_known.map_decl && args.len() == 2 =>
             {
                 Some((args[0], args[1]))
             }
@@ -3149,7 +3144,7 @@ fn collect_object_field_diags_split(
                 "map value type `{}`",
                 display_type_for_module(arena, index, decl_registry, val_ty, Some(cur_uri)),
             );
-            for f in fields.iter() {
+            for f in obj_expr.fields.iter() {
                 check_construction_value_against_slot(
                     cur_module,
                     cur_uri,
@@ -3187,7 +3182,7 @@ fn collect_object_field_diags_split(
         // ones (the old `item_id_for(cur_uri, …)` fabricated a same-
         // module ItemId and silently skipped every cross-module head).
         let head_id = match &arena.get(obj_ty).kind {
-            TypeKind::Generic { decl, .. } => *decl,
+            TypeKind::Generic { tpl, .. } => *tpl,
             TypeKind::Type(decl) => *decl,
             _ => continue,
         };
@@ -3225,14 +3220,14 @@ fn collect_object_field_diags_split(
         // type per attr, so the per-field check is a direct lookup
         // — no second-pass substitution needed.
         let mut chain_attrs: FxHashMap<Symbol, (TypeId, bool)> = FxHashMap::default();
-        let mut cur_decl = head_id;
+        let mut cur_tpl = head_id;
         let mut cur_subst = init_subst;
         let mut seen: FxHashSet<ItemId> = FxHashSet::default();
         for _ in 0..32 {
-            if !seen.insert(cur_decl) {
+            if !seen.insert(cur_tpl) {
                 break;
             }
-            let Some(m) = index.type_members.get(&cur_decl) else {
+            let Some(m) = index.type_members.get(&cur_tpl) else {
                 break;
             };
             for (sym, raw_ty) in &m.attr_types {
@@ -3253,14 +3248,14 @@ fn collect_object_field_diags_split(
                 arena.substitute(sup_ty_raw, &cur_subst)
             };
             match arena.get(sup_ty).kind.clone() {
-                TypeKind::Generic { decl, args } => {
-                    let Some(parent_m) = index.type_members.get(&decl) else {
+                TypeKind::Generic { tpl, args } => {
+                    let Some(parent_m) = index.type_members.get(&tpl) else {
                         break;
                     };
                     if parent_m.generics.len() != args.len() {
                         break;
                     }
-                    cur_decl = decl;
+                    cur_tpl = tpl;
                     cur_subst = parent_m
                         .generics
                         .iter()
@@ -3269,13 +3264,13 @@ fn collect_object_field_diags_split(
                         .collect();
                 }
                 TypeKind::Type(decl) => {
-                    cur_decl = decl;
+                    cur_tpl = decl;
                     cur_subst.clear();
                 }
                 _ => break,
             }
         }
-        for f in fields.iter() {
+        for f in obj_expr.fields.iter() {
             // The key is a field name only when it's an ident / quoted
             // string; any other key shape (a `Map` value-key) has no
             // attr to type-check against here.
@@ -3512,7 +3507,7 @@ fn collect_object_construction_diags(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::Severity;
-    use greycat_analyzer_hir::types::{Expr, PositionalObjectExpr};
+    use greycat_analyzer_hir::types::Expr;
 
     let Some(cur_module) = modules.get(cur_uri) else {
         return;
@@ -3521,16 +3516,11 @@ fn collect_object_construction_diags(
         // Only the positional form (`Foo { a, b }`) is this pass's
         // concern — named construction (`Foo { k: v }`, including
         // `Map`) is a different HIR variant and handled elsewhere.
-        let Expr::PositionalObject(PositionalObjectExpr {
-            ty: Some(tr_id),
-            fields,
-            byte_range,
-        }) = expr
-        else {
+        let Expr::PositionalObject(obj_expr) = expr else {
             continue;
         };
         // Empty `T {}` is always a valid default-init.
-        if fields.is_empty() {
+        if obj_expr.fields.is_empty() {
             continue;
         }
         // Dispatch on the already-settled outer type identity.
@@ -3542,19 +3532,19 @@ fn collect_object_construction_diags(
         // as `Primitive(Geo)`, so it carries no head decl and never
         // reaches the `Generic` / `Type` dispatch below.
         if matches!(&arena.get(obj_ty).kind, TypeKind::Primitive(Primitive::Geo)) {
-            if fields.len() != 2 {
+            if obj_expr.fields.len() != 2 {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
                     code: "geo-init-arity",
                     message: "`geo` requires exactly two positional initializers (lat, lng)"
                         .to_string(),
-                    byte_range: byte_range.clone(),
+                    byte_range: obj_expr.byte_range.clone(),
                     category: DiagCategory::TypeRelation,
                 });
             } else {
                 let float_ty = arena.primitive(Primitive::Float);
                 let slot_desc = "element type `float`".to_string();
-                for value in fields.iter() {
+                for value in obj_expr.fields.iter() {
                     check_construction_value_against_slot(
                         cur_module,
                         cur_uri,
@@ -3576,7 +3566,7 @@ fn collect_object_construction_diags(
         // single generic arg, already settled on `obj_ty` (bare `Array`
         // expands to `Array<any?>`, so the check is a no-op there).
         let (head_decl, elem_ty) = match &arena.get(obj_ty).kind {
-            TypeKind::Generic { decl, args } => (*decl, args.first().copied()),
+            TypeKind::Generic { tpl, args } => (*tpl, args.first().copied()),
             TypeKind::Type(decl) => (*decl, None),
             _ => continue,
         };
@@ -3586,7 +3576,7 @@ fn collect_object_construction_diags(
                     "element type `{}`",
                     display_type_for_module(arena, index, decl_registry, elem_ty, Some(cur_uri)),
                 );
-                for value in fields.iter() {
+                for value in obj_expr.fields.iter() {
                     check_construction_value_against_slot(
                         cur_module,
                         cur_uri,
@@ -3605,12 +3595,12 @@ fn collect_object_construction_diags(
             continue;
         }
         if Some(head_decl) == well_known.node_decl {
-            if fields.len() > 1 {
+            if obj_expr.fields.len() > 1 {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
                     code: "node-init-arity",
                     message: "`node` accepts at most one positional initializer".to_string(),
-                    byte_range: byte_range.clone(),
+                    byte_range: obj_expr.byte_range.clone(),
                     category: DiagCategory::TypeRelation,
                 });
             } else if let Some(elem_ty) = elem_ty {
@@ -3618,7 +3608,7 @@ fn collect_object_construction_diags(
                     "element type `{}`",
                     display_type_for_module(arena, index, decl_registry, elem_ty, Some(cur_uri)),
                 );
-                for value in fields.iter() {
+                for value in obj_expr.fields.iter() {
                     check_construction_value_against_slot(
                         cur_module,
                         cur_uri,
@@ -3648,13 +3638,13 @@ fn collect_object_construction_diags(
             || Some(head_decl) == well_known.node_geo_decl
             || Some(head_decl) == well_known.node_index_decl
         {
-            let tr = &cur_module.hir.type_refs[*tr_id];
+            let tr = &cur_module.hir.type_refs[obj_expr.ty];
             let head_name = &index.symbols[cur_module.hir.idents[tr.name].symbol];
             diags.push(SemanticDiagnostic {
                 severity: Severity::Error,
                 code: "node-tag-no-init",
                 message: format!("`{head_name}` does not accept any initializer"),
-                byte_range: byte_range.clone(),
+                byte_range: obj_expr.byte_range.clone(),
                 category: DiagCategory::TypeRelation,
             });
             continue;
@@ -3699,20 +3689,20 @@ fn collect_object_construction_diags(
                 continue;
             }
             matched_v7 = true;
-            if fields.len() != arity {
+            if obj_expr.fields.len() != arity {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
                     code: "fixed-tuple-arity",
                     message: format!(
                         "`{type_name}` requires exactly {arity} positional initializer{plural} (got {got})",
                         plural = if arity == 1 { "" } else { "s" },
-                        got = fields.len(),
+                        got = obj_expr.fields.len(),
                     ),
-                    byte_range: byte_range.clone(),
+                    byte_range: obj_expr.byte_range.clone(),
                     category: DiagCategory::TypeRelation,
                 });
             } else {
-                for value in fields.iter() {
+                for value in obj_expr.fields.iter() {
                     let Some(val_ty) = cur_module.analysis.expr_types.get(value).copied() else {
                         continue;
                     };
@@ -3742,7 +3732,7 @@ fn collect_object_construction_diags(
             continue;
         }
 
-        let tr = &cur_module.hir.type_refs[*tr_id];
+        let tr = &cur_module.hir.type_refs[obj_expr.ty];
         let head_name = &index.symbols[cur_module.hir.idents[tr.name].symbol];
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
@@ -3750,7 +3740,7 @@ fn collect_object_construction_diags(
             message: format!(
                 "`{head_name}` does not accept positional initializers; use named form `{head_name} {{ field: value }}`"
             ),
-            byte_range: byte_range.clone(),
+            byte_range: obj_expr.byte_range.clone(),
             category: DiagCategory::TypeRelation,
         });
     }
@@ -5080,7 +5070,7 @@ fn method_subst_from_receiver(
     };
     let recv = arena.get(receiver_ty);
     let (recv_name, recv_args): (&str, &[TypeId]) = match &recv.kind {
-        TypeKind::Generic { decl, args } => (&index.symbols[decl.name], args.as_slice()),
+        TypeKind::Generic { tpl, args } => (&index.symbols[tpl.name], args.as_slice()),
         _ => return empty(),
     };
     let Some(module) = fn_module.hir.module.as_ref() else {

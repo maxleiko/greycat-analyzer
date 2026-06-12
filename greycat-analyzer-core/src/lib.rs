@@ -27,7 +27,6 @@ mod manager;
 pub mod module_desc;
 pub mod registry;
 pub mod resolver;
-pub mod span;
 mod symbols;
 mod types;
 

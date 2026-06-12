@@ -925,10 +925,6 @@ fn lower_stmt(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stmt
     Some(cx.hir.stmts.alloc(stmt))
 }
 
-// =============================================================================
-// Expressions
-// =============================================================================
-
 fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr>> {
     let kind = node.kind();
     // Comments are named nodes that surface in expression lists
@@ -1266,7 +1262,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
             for child in node.named_children(&mut walk) {
                 match child.kind() {
                     "object_initializers" => {
-                        // P43.4 — positional `Foo { a, b, c }` salvage.
+                        // Positional `Foo { a, b, c }` salvage.
                         let mut fields = Vec::new();
                         for (value_node, _salvaged) in flatten_errors_named_children(child) {
                             if let Some(value) = lower_expr(cx, value_node) {
@@ -1276,7 +1272,7 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                         positional_fields = Some(fields);
                     }
                     "object_fields" => {
-                        // P43.4 — named `Foo { a: x, b: y }` salvage.
+                        // Named `Foo { a: x, b: y }` salvage.
                         let mut fields = Vec::new();
                         for (of, _salvaged) in flatten_errors_named_children(child) {
                             if of.kind() != "object_field" {
@@ -1307,23 +1303,27 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
                     _ => {}
                 }
             }
-            match (named_fields, positional_fields) {
+            match (ty, named_fields, positional_fields) {
                 // Named body wins; neither body falls back to an empty
                 // positional shape (empty `{}` parses as
                 // `object_initializers`).
-                (Some(fields), _) => Expr::Object(ObjectExpr {
+                (Some(ty), Some(fields), _) => Expr::Object(ObjectExpr {
                     ty,
                     fields: fields.into_boxed_slice(),
                     byte_range: node.byte_range(),
                 }),
-                (None, positional) => Expr::PositionalObject(PositionalObjectExpr {
+                (Some(ty), None, positional) => Expr::PositionalObject(PositionalObjectExpr {
                     ty,
                     fields: positional.unwrap_or_default().into_boxed_slice(),
                     byte_range: node.byte_range(),
                 }),
+                _ => Expr::Unsupported {
+                    kind: "anonymous-object",
+                    byte_range: node.byte_range(),
+                },
             }
         }
-        // **P19.15** — `from..to` (and `from..` / `..to`) plus the
+        // `from..to` (and `from..` / `..to`) plus the
         // math-style `]from..to]` / `[from..to[` interval flatten into
         // one HIR shape; bracket inclusivity doesn't affect typing.
         "range_expr" | "interval_expr" => {

@@ -8,7 +8,7 @@ use std::{
 
 use greycat_analyzer_analysis::{analyzer::Severity, lint::LintSeverity, project::ProjectAnalysis};
 use greycat_analyzer_core::{
-    LoadTimings, SourceEncoding, SourceManager, TypeKind,
+    LoadTimings, SourceEncoding, SourceManager,
     diagnostics::{parse_diagnostics, print_compact_diagnostic},
     lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range as LspRange, Uri},
     resolver::FsContext,
@@ -284,23 +284,23 @@ impl Lint {
         analysis.analyze_staged(&mgr);
         let total = total_start.elapsed();
 
-        for tid in analysis.arena.intern.values() {
-            let ty = analysis.arena.get(*tid);
-            if matches!(
-                ty.kind,
-                TypeKind::GenericParam { .. }
-                    | TypeKind::Primitive(_)
-                    | TypeKind::Null
-                    | TypeKind::Any
-                    | TypeKind::Never
-            ) {
-                continue;
-            }
-            let fqn = analysis.display_type(*tid);
-            println!("{fqn} id={tid}");
-            println!("{ty:#?}");
-            println!();
-        }
+        // for tid in analysis.arena.intern.values() {
+        //     let ty = analysis.arena.get(*tid);
+        //     if matches!(
+        //         ty.kind,
+        //         TypeKind::GenericParam { .. }
+        //             | TypeKind::Primitive(_)
+        //             | TypeKind::Null
+        //             | TypeKind::Any
+        //             | TypeKind::Never
+        //     ) {
+        //         continue;
+        //     }
+        //     let fqn = analysis.display_type(*tid);
+        //     println!("{fqn} id={tid}");
+        //     println!("{ty:#?}");
+        //     println!();
+        // }
 
         // Per-uri load-phase timings come from the load report;
         // build an index so the manager.iter() loop below can pick the

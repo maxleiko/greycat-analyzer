@@ -335,7 +335,6 @@ Quick reminders for analyzer work:
 - Native types (`geo`, `time`, `duration`) have no fields — methods only.
 - `Array<T>{}`, not `Array<T>::new()`. No ternary. No `void` keyword.
 - Function-valued expressions (lambdas, `top_level_fn`, `Foo::static_method`) carry their structural signature `TypeKind::Lambda { params, ret }`, displayed as `fn(P0, P1)` or `fn(P0, P1): R`. They're assignable to the opaque `function` slot type via the wrapper rule; values that flow back out of `function`-typed slots stay opaque. **See § "Function values, lambdas, and the opaque `function`" below for the full model — instance-method value refs are a hard error.**
-- Built-in runtime type names (`Array`, `Map`, `Set`, `node`, `nodeTime`, `nodeGeo`, `nodeList`, `nodeIndex`, `function`, `tuple`, `field`, `t2`-`t4`, `t2f`-`t4f`) are seeded into `ProjectIndex::new()` and resolve through `Definition::Project`. They are *not* declared in `.gcl` — they live in the GreyCat runtime.
 
 ### `private` semantics (NOT "hidden")
 

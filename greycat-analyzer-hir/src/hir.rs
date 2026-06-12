@@ -25,7 +25,7 @@ pub struct Hir {
 
 #[cfg(test)]
 mod tests {
-    use crate::{*, types::*};
+    use crate::{types::*, *};
     use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_syntax::parse;
 

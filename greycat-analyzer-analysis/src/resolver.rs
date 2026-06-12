@@ -918,9 +918,9 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
 }
 
 fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
-    let expr = cx.hir.exprs[expr_id].clone();
+    let expr = &cx.hir.exprs[expr_id];
     match expr {
-        Expr::Ident { name, .. } => cx.record_use(name, Position::Value),
+        Expr::Ident { name, .. } => cx.record_use(*name, Position::Value),
         Expr::Literal(_) => {}
         Expr::String(StringExpr { parts, .. }) => {
             // P17.5 — recurse into `${expr}` interpolations so inner
@@ -928,24 +928,19 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             // inside template strings stay `unresolved`).
             for part in parts {
                 if let greycat_analyzer_hir::types::StringPart::Interp { expr, .. } = part {
-                    visit_expr(cx, expr);
+                    visit_expr(cx, *expr);
                 }
             }
         }
         Expr::Tuple(items, _) | Expr::Array(items, _) => {
             for e in items {
-                visit_expr(cx, e);
+                visit_expr(cx, *e);
             }
         }
         Expr::Object(ObjectExpr { ty, fields, .. }) => {
-            // Resolve the head first so `object_head_is_map` can read
-            // its binding.
-            let is_map = if let Some(t) = ty {
-                visit_type_ref(cx, t);
-                cx.object_head_is_map(t)
-            } else {
-                false
-            };
+            // Resolve the head first so `object_head_is_map` can read its binding.
+            visit_type_ref(cx, *ty);
+            let is_map = cx.object_head_is_map(*ty);
             for f in fields {
                 // `Map { k: v }` keys are value expressions (they bind
                 // to locals / params / enum-variants), so resolve them.
@@ -959,15 +954,13 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             }
         }
         Expr::PositionalObject(PositionalObjectExpr { ty, fields, .. }) => {
-            if let Some(t) = ty {
-                visit_type_ref(cx, t);
-            }
+            visit_type_ref(cx, *ty);
             for value in fields {
-                visit_expr(cx, value);
+                visit_expr(cx, *value);
             }
         }
         Expr::Member(MemberExpr { receiver, .. }) | Expr::Arrow(MemberExpr { receiver, .. }) => {
-            visit_expr(cx, receiver);
+            visit_expr(cx, *receiver);
             // The `property` ident is intentionally *not* resolved here —
             // member access binds to a type member, which is type-driven
             // (P2.5).
@@ -991,21 +984,21 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
         Expr::Offset(OffsetExpr {
             receiver, index, ..
         }) => {
-            visit_expr(cx, receiver);
-            visit_expr(cx, index);
+            visit_expr(cx, *receiver);
+            visit_expr(cx, *index);
         }
         Expr::Call(CallExpr { callee, args, .. }) => {
-            visit_expr(cx, callee);
+            visit_expr(cx, *callee);
             for a in args {
-                visit_expr(cx, a);
+                visit_expr(cx, *a);
             }
         }
         Expr::Binary(BinaryExpr { left, right, .. }) => {
-            visit_expr(cx, left);
-            visit_expr(cx, right);
+            visit_expr(cx, *left);
+            visit_expr(cx, *right);
         }
-        Expr::Unary(UnaryExpr { operand, .. }) => visit_expr(cx, operand),
-        Expr::Paren(inner, _) => visit_expr(cx, inner),
+        Expr::Unary(UnaryExpr { operand, .. }) => visit_expr(cx, *operand),
+        Expr::Paren(inner, _) => visit_expr(cx, *inner),
         Expr::Lambda(LambdaExpr {
             params,
             return_type,
@@ -1014,29 +1007,29 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
         }) => {
             cx.push_lambda_scope();
             for param_id in params {
-                let p = cx.hir.fn_params[param_id].clone();
+                let p = cx.hir.fn_params[*param_id].clone();
                 cx.bind_value(p.name, Definition::Param(p.name));
                 if let Some(t) = p.ty {
                     visit_type_ref(cx, t);
                 }
             }
             if let Some(t) = return_type {
-                visit_type_ref(cx, t);
+                visit_type_ref(cx, *t);
             }
             // Lambda params and body share one scope (mirrors fn-decl).
-            visit_block_inline(cx, &body);
+            visit_block_inline(cx, body);
             cx.pop_scope();
         }
         Expr::Is { value, ty, .. } | Expr::Cast { value, ty, .. } => {
-            visit_expr(cx, value);
-            visit_type_ref(cx, ty);
+            visit_expr(cx, *value);
+            visit_type_ref(cx, *ty);
         }
         Expr::Range { from, to, .. } => {
             if let Some(f) = from {
-                visit_expr(cx, f);
+                visit_expr(cx, *f);
             }
             if let Some(t) = to {
-                visit_expr(cx, t);
+                visit_expr(cx, *t);
             }
         }
         Expr::Unsupported { .. } => {
@@ -1051,7 +1044,7 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
             // by design. Detect via the [`ScopeKind::LambdaBody`]
             // marker on the scope stack rather than a parallel counter.
             if cx.scopes.iter().any(|s| s.kind == ScopeKind::LambdaBody) {
-                cx.res.this_in_lambda.push(byte_range);
+                cx.res.this_in_lambda.push(byte_range.clone());
             }
         }
     }

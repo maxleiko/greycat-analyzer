@@ -56,6 +56,7 @@ pub mod lint;
 /// language* pragmas (`@permission`, …) against the lowered HIR.
 pub mod meta_pragmas;
 // P27.1
+pub mod index;
 pub mod parallel;
 /// GreyCat language-pragma contract validation (`@permission`, …).
 /// HIR-based, runs post-lowering with the full `ProjectIndex`.
@@ -68,7 +69,6 @@ pub mod resolver;
 /// "lambda is a top-level fn in a scope" mental model demands one
 /// implementation for both — see `return_inference::inferred_return_from_body`.
 pub mod return_inference;
-pub mod index;
 // P35.1
 pub mod well_known;
 

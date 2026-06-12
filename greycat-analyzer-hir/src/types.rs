@@ -638,7 +638,7 @@ pub enum StringPart {
 /// [`PositionalObjectExpr`] for `Foo { a, b }`.
 #[derive(Debug, Clone)]
 pub struct ObjectExpr {
-    pub ty: Option<Idx<TypeRef>>,
+    pub ty: Idx<TypeRef>,
     pub fields: Box<[ObjectField]>,
     pub byte_range: Span,
 }
@@ -649,7 +649,7 @@ pub struct ObjectExpr {
 /// object-construction validator rejects every other head.
 #[derive(Debug, Clone)]
 pub struct PositionalObjectExpr {
-    pub ty: Option<Idx<TypeRef>>,
+    pub ty: Idx<TypeRef>,
     pub fields: Box<[Idx<Expr>]>,
     pub byte_range: Span,
 }
