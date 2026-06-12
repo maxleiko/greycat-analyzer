@@ -1241,8 +1241,12 @@ impl Backend {
         self.last_analyzer_publish.remove(&uri);
         self.last_analyzer_diags.remove(&uri);
         self.pending_trailing.remove(&uri);
-        // Clear diagnostics on close so the editor's stale list goes away.
-        self.publish_diagnostics(uri, Vec::new(), None)?;
+        // Project members stay analyzed when closed, so their cached
+        // diagnostics stay valid; only orphans (no owning project) get
+        // cleared, since theirs can't outlive the buffer.
+        if self.project_for(&uri).is_none() {
+            self.publish_diagnostics(uri, Vec::new(), None)?;
+        }
         Ok(())
     }
 
@@ -1679,6 +1683,67 @@ mod tests {
         // Unowned URI: no routing.
         let unbound = uri("file:///elsewhere/loose.gcl");
         assert!(b.project_for(&unbound).is_none());
+    }
+
+    /// `did_close` keeps a project member's diagnostics (still in the
+    /// analyzed closure) and clears only an orphan's (nothing backs it
+    /// once the buffer closes). Regression guard for VSCode's
+    /// preview-editor `didClose`-on-navigate wiping the just-left file.
+    #[test]
+    fn did_close_keeps_project_diags_clears_orphan() {
+        let (mut b, rx) = backend();
+        let root = PathBuf::from("/ws/proj");
+        b.projects
+            .insert(root.clone(), Project::new(root.clone(), "proj".into()));
+        let member = uri("file:///ws/proj/main.gcl");
+        b.bind_uri(member.clone(), root.clone());
+        let orphan = uri("file:///elsewhere/loose.gcl");
+
+        // Seed both with a live diagnostic (mimics a prior publish the
+        // editor is already showing).
+        let diag = Diagnostic::new_simple(
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+            "boom".into(),
+        );
+        b.publish_diagnostics(member.clone(), vec![diag.clone()], Some(1))
+            .unwrap();
+        b.publish_diagnostics(orphan.clone(), vec![diag], Some(1))
+            .unwrap();
+
+        let close = |u: Uri| DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri: u },
+        };
+        b.did_close(close(member.clone())).unwrap();
+        b.did_close(close(orphan.clone())).unwrap();
+
+        // Drain once (shared channel) into the latest set per URI.
+        let mut member_latest: Option<Vec<Diagnostic>> = None;
+        let mut orphan_latest: Option<Vec<Diagnostic>> = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Notification(n) = msg
+                && n.method == PublishDiagnostics::METHOD
+            {
+                let p: PublishDiagnosticsParams = serde_json::from_value(n.params).unwrap();
+                if p.uri == member {
+                    member_latest = Some(p.diagnostics);
+                } else if p.uri == orphan {
+                    orphan_latest = Some(p.diagnostics);
+                }
+            }
+        }
+
+        // Member: only the seed publish; `did_close` left it untouched.
+        assert_eq!(
+            member_latest.map(|d| d.len()),
+            Some(1),
+            "closing a project member must keep its diagnostics"
+        );
+        // Orphan: seed publish followed by an empty clear on close.
+        assert_eq!(
+            orphan_latest.map(|d| d.len()),
+            Some(0),
+            "closing an orphan must clear its diagnostics with an empty publish"
+        );
     }
 
     // P32.3
