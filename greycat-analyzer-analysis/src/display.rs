@@ -316,13 +316,17 @@ fn write_type_for_module(
     use greycat_analyzer_core::TypeKind;
     let ty = arena.get(id);
     let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
-        // Qualify iff bare-name lookup from `current_uri` wouldn't
-        // bind to this exact decl — i.e. the bare form would either
-        // miss (None) or bind to a different decl.
-        let needs_qual = match index.resolve_item(decl_registry, current_uri, d.name) {
-            Some(found) => found != d,
-            None => true,
-        };
+        // Builtin primitives are universally in scope, so they always
+        // render bare -- a `core::int` in a diagnostic is just noise.
+        // Qualify any other decl iff bare-name lookup from `current_uri`
+        // wouldn't bind to this exact decl (the bare form would miss or
+        // bind to a different decl).
+        let is_prim = arena.builtins().is_some_and(|b| b.is_primitive(d));
+        let needs_qual = !is_prim
+            && match index.resolve_item(decl_registry, current_uri, d.name) {
+                Some(found) => found != d,
+                None => true,
+            };
         if needs_qual {
             f.write_str(&index.symbols[d.module])?;
             f.write_str("::")?;

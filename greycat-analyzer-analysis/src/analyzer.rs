@@ -27,8 +27,8 @@ use greycat_analyzer_core::lsp_types::Uri;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::{
-    GenericOwner, InferenceTable, ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId,
-    TypeKind, TypeRegistry,
+    Builtins, GenericOwner, InferenceTable, ItemId, Primitive, Symbol, SymbolTable, Type,
+    TypeArena, TypeId, TypeKind, TypeRegistry,
 };
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -420,6 +420,10 @@ pub fn analyze_with_index(
     let well_known = WellKnown::default();
     let module_uri = Uri::from_str("file:///module.gcl").unwrap();
     let mut arena = TypeArena::new();
+    // This wrapper owns a fresh arena but borrows an external index, so
+    // unlike `analyze` it must seed the canonical builtins itself before
+    // any producer mints a `Type(core::X)`.
+    arena.set_builtins(Builtins::compute(&index.symbols));
     // Standalone equivalent of `ProjectIndex::ingest`'s decl
     // registration step — see [`analyze`] for the rationale.
     let mut decl_registry = DeclRegistry::default();
@@ -696,19 +700,11 @@ pub fn analyze_with_index_into(
     out
 }
 
-/// Seed primitive type ids in the arena so cx.{int, bool, ...} are cheap.
-/// Idempotent — `alloc` interns equal types so re-seeding is a no-op
-/// (the project pipeline calls this once per `analyze_with_index_into`,
-/// which all share the same arena).
+/// Pre-intern the lattice sentinels (`null` / `any` / `never`) so the
+/// hot comparison paths hit the intern cache. Primitives are minted on
+/// demand via [`TypeArena::builtin`] -- not seeded here, since
+/// `seed_builtins` can run before `set_builtins`.
 pub(crate) fn seed_builtins(arena: &mut TypeArena) {
-    let _ = arena.primitive(Primitive::Bool);
-    let _ = arena.primitive(Primitive::Int);
-    let _ = arena.primitive(Primitive::Float);
-    let _ = arena.primitive(Primitive::Char);
-    let _ = arena.primitive(Primitive::String);
-    let _ = arena.primitive(Primitive::Time);
-    let _ = arena.primitive(Primitive::Duration);
-    let _ = arena.primitive(Primitive::Geo);
     let _ = arena.null();
     let _ = arena.any();
     let _ = arena.never();
@@ -1036,7 +1032,7 @@ impl TypeRefLowering for CxLowerEnv<'_> {
 impl<'a> Cx<'a> {
     #[inline]
     fn primitive(&mut self, p: Primitive) -> TypeId {
-        self.arena.primitive(p)
+        self.arena.builtin(p)
     }
 
     #[inline]
@@ -1214,9 +1210,7 @@ impl<'a> Cx<'a> {
                 most_specific = Some(cand);
                 break;
             }
-            let all_primitive = tys
-                .iter()
-                .all(|t| matches!(self.arena.get(*t).kind, TypeKind::Primitive(_)));
+            let all_primitive = tys.iter().all(|t| self.arena.is_any_primitive(*t));
 
             let mk_never = |arena: &mut TypeArena, slot: &mut Option<TypeId>| -> TypeId {
                 match *slot {

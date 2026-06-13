@@ -297,7 +297,7 @@ impl ProjectIndex {
         // and they need a typed `TypeId` the body walker can consume.
         for (name, prim) in BUILTIN_RUNTIME_GLOBALS {
             let sym = idx.symbols.intern(name);
-            let ty = arena.primitive(*prim);
+            let ty = arena.builtin(*prim);
             idx.runtime_globals.insert(sym, ty);
         }
         idx

@@ -3553,7 +3553,7 @@ fn collect_object_construction_diags(
                     category: DiagCategory::TypeRelation,
                 });
             } else {
-                let float_ty = arena.primitive(Primitive::Float);
+                let float_ty = arena.builtin(Primitive::Float);
                 let slot_desc = "element type `float`".to_string();
                 for value in obj_expr.fields.iter() {
                     check_construction_value_against_slot(
@@ -4051,7 +4051,7 @@ fn validate_module_type_relations(
 
     let hir = &module.hir;
     let analysis = &module.analysis;
-    let bool_t = arena.primitive(Primitive::Bool);
+    let bool_t = arena.builtin(Primitive::Bool);
 
     let Some(top) = hir.module.as_ref() else {
         return;

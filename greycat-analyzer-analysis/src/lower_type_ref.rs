@@ -115,14 +115,14 @@ pub(crate) fn lower_type_ref_with<E: TypeRefLowering>(
 /// Seeded primitives plus `any` / `null`; `None` for any other name.
 fn primitive_or_special(name: &str, arena: &mut TypeArena) -> Option<TypeId> {
     Some(match name {
-        "bool" => arena.primitive(Primitive::Bool),
-        "int" => arena.primitive(Primitive::Int),
-        "float" => arena.primitive(Primitive::Float),
-        "char" => arena.primitive(Primitive::Char),
-        "String" => arena.primitive(Primitive::String),
-        "time" => arena.primitive(Primitive::Time),
-        "duration" => arena.primitive(Primitive::Duration),
-        "geo" => arena.primitive(Primitive::Geo),
+        "bool" => arena.builtin(Primitive::Bool),
+        "int" => arena.builtin(Primitive::Int),
+        "float" => arena.builtin(Primitive::Float),
+        "char" => arena.builtin(Primitive::Char),
+        "String" => arena.builtin(Primitive::String),
+        "time" => arena.builtin(Primitive::Time),
+        "duration" => arena.builtin(Primitive::Duration),
+        "geo" => arena.builtin(Primitive::Geo),
         "any" => arena.any(),
         "null" => arena.null(),
         _ => return None,

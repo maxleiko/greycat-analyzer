@@ -53,6 +53,21 @@ impl Builtins {
         }
     }
 
+    /// `true` iff `item` is one of the 8 primitive native-core types
+    /// (`bool int float char String time duration geo`). Node tags and
+    /// every other core decl return `false`. Drives the "render bare"
+    /// display rule and primitive-disjointness reasoning.
+    pub fn is_primitive(&self, item: ItemId) -> bool {
+        item == self.bool_
+            || item == self.int
+            || item == self.float
+            || item == self.char_
+            || item == self.string
+            || item == self.time
+            || item == self.duration
+            || item == self.geo
+    }
+
     /// Transitional: map a [`Primitive`] variant to its canonical
     /// well-known `ItemId`. Deleted together with `enum Primitive`
     /// once primitives are represented as `Type(core::X)` everywhere.
@@ -175,6 +190,32 @@ impl TypeArena {
             TypeKind::Type(d) => self.builtins().is_some_and(|b| *d == b.item(p)),
             _ => false,
         }
+    }
+
+    /// Transitional: `true` if `ty` is *any* of the 8 primitives, in
+    /// either representation. Simplifies to the `Type(core::X)` arm once
+    /// `enum Primitive` is gone.
+    pub fn is_any_primitive(&self, ty: TypeId) -> bool {
+        match &self.get(ty).kind {
+            TypeKind::Primitive(_) => true,
+            TypeKind::Type(d) => self.builtins().is_some_and(|b| b.is_primitive(*d)),
+            _ => false,
+        }
+    }
+
+    /// Mint the canonical [`TypeId`] for primitive `p` in the target
+    /// `Type(core::X)` representation. Requires [`Self::set_builtins`]
+    /// to have run -- true on every analysis arena, since
+    /// `ProjectIndex::{new,with_symbols}` sets it at construction.
+    /// Transitional counterpart to [`Self::primitive`]; once producers
+    /// are fully flipped, `primitive` is deleted and this is the only
+    /// primitive minter.
+    pub fn builtin(&mut self, p: Primitive) -> TypeId {
+        let item = self
+            .builtins()
+            .expect("builtin() requires set_builtins")
+            .item(p);
+        self.alloc_type(item)
     }
 
     pub fn null(&mut self) -> TypeId {
