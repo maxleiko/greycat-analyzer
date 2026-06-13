@@ -232,110 +232,46 @@ pub struct NonExhaustiveFinding {
     pub byte_range: Range<usize>,
 }
 
-/// Output of the analyzer for a single module.
+/// Output of semantic analysis for a single module.
 ///
-/// The [`TypeArena`] that backs every `TypeId` in this struct
-/// is owned by [`crate::project::ProjectAnalysis`], not here. Pass it
-/// alongside any `AnalysisResult` you want to inspect — call
-/// [`crate::project::ProjectAnalysis::arena`] to get a borrow.
+/// The backing [`TypeArena`] is owned by
+/// [`crate::project::ProjectAnalysis`].
 #[derive(Debug, Default)]
 pub struct AnalysisResult {
     pub registry: TypeRegistry,
-    /// Per-expression inferred type (subset — entries only for expressions
-    /// the analyzer actually visited).
+    /// Inferred type for analyzed expressions.
     pub expr_types: FxHashMap<Idx<Expr>, TypeId>,
-    /// Per-binding inferred type. Keyed by the *defining* `Idx<Ident>`
-    /// (e.g. the param name in `fn f(x: int)`, the local name in
-    /// `var y: T = …`).
+    /// Inferred type for defining identifiers.
     pub def_types: FxHashMap<Idx<Ident>, TypeId>,
-    /// Module-local map from declared type name to its HIR `TypeDecl`.
-    /// Built when the analyzer walks top-level decls — lets
-    /// member resolution navigate from a receiver's `TypeId` back to
-    /// the declaring node so attr / method idents can be bound.
+    /// Maps declared type names to their defining declaration.
     pub type_decls: FxHashMap<Symbol, Idx<Decl>>,
-    /// Member-access bindings produced by each property ident in
-    /// `a.b` / `a->b` that resolves to a [`TypeAttr`] or to a
-    /// `TypeDecl::methods` entry, keyed by the property `Idx<Ident>`.
-    /// Capabilities consult this in addition to [`Resolutions`] so
-    /// goto-definition / hover work on member access.
+    /// Resolved member references within the current module.
     pub member_uses: FxHashMap<Idx<Ident>, MemberDef>,
-    /// Cross-module member bindings — same keying as `member_uses`
-    /// but the resolved attr / method lives in another module's HIR.
-    ///
-    /// Populated directly by `Cx::resolve_member` against
-    /// [`crate::index::ProjectIndex::type_members`] when the
-    /// receiver's type isn't declared in this module. Pass 3
-    /// (`resolve_cross_module_members`) and the per-module
-    /// `deferred_member_uses` deferral list are gone — S2-S6 build
-    /// the structure index up front, so the body walker resolves
-    /// inline.
+    /// Resolved member references to declarations in other modules.
     pub foreign_member_uses: FxHashMap<Idx<Ident>, ForeignMember>,
-    /// Chain-segment bindings populated by `ProjectAnalysis`
-    /// pass 3.5 for `Expr::QualifiedStatic` shapes. Each segment ident
-    /// (chain[1] = the type, chain[2] = the member when length is 3)
-    /// binds to the foreign top-level decl that declares it. Lets
-    /// hover / goto-def show the right content for each segment of
+    /// Resolved segments of qualified-static references such as
     /// `runtime::Identity::create`.
     pub foreign_decl_uses: FxHashMap<Idx<Ident>, ForeignDecl>,
-    /// Object-expression field-name binding. Each `name` ident in
-    /// `Foo { name: value }` that resolves against the constructed
-    /// type's attr chain (including inherited attrs) is recorded here.
-    /// Keyed by the field-name `Idx<Ident>`. Lets IDE features
-    /// (hover, goto-def, rename) treat object-construction sites the
-    /// same way they treat `a.b` member access — the field name is a
-    /// reference to a `TypeAttr`, just at a constructor position.
+    /// Resolved field names in object construction expressions such as
+    /// `Foo { name: value }`.
     pub object_field_uses: FxHashMap<Idx<Ident>, ObjectFieldBinding>,
     pub diagnostics: Vec<SemanticDiagnostic>,
-    /// Head if-stmt ids of enum-eq chains that
-    /// exhaustively cover every variant of the dispatched-on enum.
-    /// Consumed by the `unreachable` lint to flag the trailing
-    /// `else` arm of such a chain as dead code, and to treat the
-    /// chain as effectively divergent for fall-through-deadness
-    /// analysis when every arm body diverges.
+    /// Head statements of enum-equality chains proven exhaustive.
     pub exhaustive_enum_chains: FxHashSet<Idx<Stmt>>,
-    /// Non-exhaustive enum-eq chains detected in pass 2. The
-    /// `non-exhaustive` lint reads this and emits a real
-    /// [`crate::lint::LintDiagnostic`] (rule-keyed, suppressible via
-    /// `// gcl-lint-off…`). Unlike historical structural diagnostics
-    /// (which lacked a rule code), this flow integrates with the
-    /// shared directive / quickfix machinery.
+    /// Non-exhaustive enum-equality chain findings.
     pub non_exhaustive_findings: Vec<NonExhaustiveFinding>,
-    /// Lints surfaced by the typed analyzer rather than by a pure-HIR
-    /// rule. Each entry is a fully-formed [`LintDiagnostic`] — rule
-    /// code + severity + message all baked in at the site. The
-    /// project-level typed-lint runner pipes each entry through
-    /// `emit_typed` so `// gcl-lint-off …` directives can suppress
-    /// them uniformly with every other rule.
-    ///
-    /// Use this when the analyzer needs to *speak as* a lint and the
-    /// finding has no structured payload a quickfix needs. When a
-    /// quickfix needs structured data (see `non_exhaustive_findings`),
-    /// keep a typed Vec instead. The current users:
-    ///
-    /// - `decidable-condition` — the 6 "condition is always true / false"
-    ///   emit sites on `if` / `while` / `for` / `do-while` and the
-    ///   `is`-narrow contradiction / triviality checks.
+    /// Lint diagnostics emitted directly by semantic analysis.
     pub surfaced_lints: Vec<LintDiagnostic>,
-    /// Conditional statements (`if` / `while` / `do_while` / `for`)
-    /// whose condition is statically decidable to a constant truth
-    /// value. The key is the statement id; the value is the decided
-    /// outcome (`true` = always taken, `false` = never taken). Drives
-    /// the `unreachable` lint's dead-branch flagging and the
-    /// matching quickfix (delete or unwrap to the live branch).
+    /// Statements whose condition can be reduced to a constant boolean.
     pub decidable_conditions: FxHashMap<Idx<Stmt>, bool>,
-    /// Runtime-erased type for expressions whose analyzer-materialized
-    /// type is more specific than what the GreyCat runtime produces —
-    /// i.e. results of generic fns that erase their `T`-bearing container
-    /// return (see [`crate::erasure`]). `expr_types` keeps the
-    /// materialized type (IDE / inference / future-compiler); this side
-    /// table holds the erased shape so the `generic-erasure` diagnostic
-    /// can ask "would the runtime accept this where it's used?" and hover
-    /// can show both. Only diverging exprs get an entry.
+    /// Runtime-erased type for expressions whose analyzed type is more
+    /// specific than the type produced at runtime.
+    ///
+    /// For example, a generic call may infer `Array<User>` while the
+    /// runtime only produces `Array<any>`.
     pub expr_runtime_types: FxHashMap<Idx<Expr>, TypeId>,
-    /// Taint propagation of [`Self::expr_runtime_types`] onto bindings:
-    /// `var x = <erased call>` records `x`'s erased type here (keyed by
-    /// the defining `Idx<Ident>`, like `def_types`) so later references
-    /// to `x` carry the erasure to the use site.
+    /// Runtime-erased types propagated onto bindings so later uses
+    /// inherit the same runtime view.
     pub def_runtime_types: FxHashMap<Idx<Ident>, TypeId>,
 }
 
