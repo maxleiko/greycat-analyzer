@@ -52,6 +52,22 @@ impl Builtins {
             node_geo: mk("nodeGeo"),
         }
     }
+
+    /// Transitional: map a [`Primitive`] variant to its canonical
+    /// well-known `ItemId`. Deleted together with `enum Primitive`
+    /// once primitives are represented as `Type(core::X)` everywhere.
+    pub fn item(&self, p: Primitive) -> ItemId {
+        match p {
+            Primitive::Bool => self.bool_,
+            Primitive::Int => self.int,
+            Primitive::Float => self.float,
+            Primitive::Char => self.char_,
+            Primitive::String => self.string,
+            Primitive::Time => self.time,
+            Primitive::Duration => self.duration,
+            Primitive::Geo => self.geo,
+        }
+    }
 }
 
 /// Append-only interning arena for `Type`. Two equal `Type` values get
@@ -144,6 +160,21 @@ impl TypeArena {
             kind: TypeKind::Primitive(p),
             nullable: false,
         })
+    }
+
+    /// Transitional bridge: `true` if `ty` is the `p` primitive in
+    /// EITHER representation -- the legacy `Primitive(p)` or the target
+    /// `Type(core::p)`. The `Type` arm only fires when [`Self::builtins`]
+    /// is set; a bare arena recognizes the legacy form only. Lets the
+    /// cast / construction rules stay correct while producers are flipped
+    /// from one representation to the other. Deleted together with
+    /// `enum Primitive` once the flip is complete.
+    pub fn ty_is_prim(&self, ty: TypeId, p: Primitive) -> bool {
+        match &self.get(ty).kind {
+            TypeKind::Primitive(q) => *q == p,
+            TypeKind::Type(d) => self.builtins().is_some_and(|b| *d == b.item(p)),
+            _ => false,
+        }
     }
 
     pub fn null(&mut self) -> TypeId {
@@ -676,6 +707,18 @@ impl TypeArena {
         }
         if matches!(to_t.kind, TypeKind::Unresolved { .. } | TypeKind::Any)
             || matches!(from_t.kind, TypeKind::Unresolved { .. } | TypeKind::Any)
+        {
+            return true;
+        }
+
+        // Transitional: primitive widening casts (`int<->float`,
+        // `char as {String,int}`) for the `Type(core::X)` representation.
+        // The `Primitive(_)` match arms below still cover the legacy
+        // form; both fold into this block once `enum Primitive` is gone.
+        if (self.ty_is_prim(from, Primitive::Int) && self.ty_is_prim(to, Primitive::Float))
+            || (self.ty_is_prim(from, Primitive::Float) && self.ty_is_prim(to, Primitive::Int))
+            || (self.ty_is_prim(from, Primitive::Char)
+                && (self.ty_is_prim(to, Primitive::String) || self.ty_is_prim(to, Primitive::Int)))
         {
             return true;
         }

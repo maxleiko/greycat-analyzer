@@ -1572,6 +1572,19 @@ pub(crate) fn is_castable_with_index(
     // substitutes, which allocates fresh `Generic` nodes).
     let from_kind = arena.get(from).kind.clone();
     let to_kind = arena.get(to).kind.clone();
+    // Transitional: node-tag <-> int cast bivariance, for either int
+    // representation (`Primitive(Int)` or `Type(core::int)`). The
+    // `Primitive(Int)` match arms below still cover the legacy form;
+    // both fold into this block once `enum Primitive` is gone.
+    let from_node_tag =
+        matches!(&from_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
+    let to_node_tag =
+        matches!(&to_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
+    if (from_node_tag && arena.ty_is_prim(to, Primitive::Int))
+        || (arena.ty_is_prim(from, Primitive::Int) && to_node_tag)
+    {
+        return true;
+    }
     // Exhaustive nested match. Same rationale as the assignability
     // wrapper: no `_ => false` so future `TypeKind` variants can't
     // silently slip past inheritance / node-tag rules. Union arms
@@ -2793,8 +2806,7 @@ fn is_slot_assignable(
     if from_t.nullable && !to_t.nullable {
         return false;
     }
-    matches!(from_t.kind, TypeKind::Primitive(Primitive::Int))
-        && matches!(to_t.kind, TypeKind::Primitive(Primitive::Float))
+    arena.ty_is_prim(from, Primitive::Int) && arena.ty_is_prim(to, Primitive::Float)
 }
 
 /// Check one supplied construction value against an expected slot type,
@@ -3530,7 +3542,7 @@ fn collect_object_construction_diags(
         // coerces to float, `geo { 1, 2 }` ≡ `geo { 1.0, 2.0 }`). Typed
         // as `Primitive(Geo)`, so it carries no head decl and never
         // reaches the `Generic` / `Type` dispatch below.
-        if matches!(&arena.get(obj_ty).kind, TypeKind::Primitive(Primitive::Geo)) {
+        if arena.ty_is_prim(obj_ty, Primitive::Geo) {
             if obj_expr.fields.len() != 2 {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
@@ -3705,10 +3717,7 @@ fn collect_object_construction_diags(
                     let Some(val_ty) = cur_module.analysis.expr_types.get(value).copied() else {
                         continue;
                     };
-                    let ok = matches!(
-                        &arena.get(val_ty).kind,
-                        TypeKind::Primitive(p) if accepted.contains(p),
-                    );
+                    let ok = accepted.iter().any(|p| arena.ty_is_prim(val_ty, *p));
                     if !ok {
                         let accepted_msg = accepted
                             .iter()
