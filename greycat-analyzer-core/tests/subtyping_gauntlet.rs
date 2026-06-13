@@ -23,7 +23,7 @@ use greycat_analyzer_core::{Builtins, ItemId, SymbolTable, TypeArena};
 
 fn arena() -> TypeArena {
     let mut a = TypeArena::new();
-    // Primitives are `Type(core::X)`, minted via `a.builtin(|b| b.int)`,
+    // Primitives are `Type(core::X)`, minted via `a.builtin(Builtins::INT)`,
     // so the arena needs its canonical builtin identities set. The
     // symbol table is throwaway -- `Builtins` stores `Copy` `ItemId`s.
     a.set_builtins(Builtins::compute(&SymbolTable::new()));
@@ -48,7 +48,7 @@ fn synth_decl(name: &str) -> ItemId {
 #[test]
 fn rt_int_to_int_allowed() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     assert!(a.is_assignable_to(i, i));
 }
 
@@ -57,32 +57,32 @@ fn rt_int_to_float_rejected() {
     // Runtime: `var i: int = 1; take(i)` against `take(_: float)` is
     // REJECTED. TS reference says allowed; we follow the runtime.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
-    let f = a.builtin(|b| b.float);
+    let i = a.builtin(Builtins::INT);
+    let f = a.builtin(Builtins::FLOAT);
     assert!(!a.is_assignable_to(i, f));
 }
 
 #[test]
 fn rt_float_to_int_rejected() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
-    let f = a.builtin(|b| b.float);
+    let i = a.builtin(Builtins::INT);
+    let f = a.builtin(Builtins::FLOAT);
     assert!(!a.is_assignable_to(f, i));
 }
 
 #[test]
 fn rt_char_to_int_rejected() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
-    let c = a.builtin(|b| b.char_);
+    let i = a.builtin(Builtins::INT);
+    let c = a.builtin(Builtins::CHAR);
     assert!(!a.is_assignable_to(c, i));
 }
 
 #[test]
 fn rt_string_to_char_rejected() {
     let mut a = arena();
-    let s = a.builtin(|b| b.string);
-    let c = a.builtin(|b| b.char_);
+    let s = a.builtin(Builtins::STRING);
+    let c = a.builtin(Builtins::CHAR);
     assert!(!a.is_assignable_to(s, c));
 }
 
@@ -95,7 +95,7 @@ fn rt_int_to_any_allowed() {
     // Runtime: `var i: int = 1; take(i)` against `take(_: any)` is
     // ALLOWED.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let any = a.any();
     assert!(a.is_assignable_to(i, any));
 }
@@ -113,7 +113,7 @@ fn rt_any_to_int_allowed() {
     // `is_assignable_to` is a compile-time relation, so `any → T`
     // must pass — `any` is *both* top and bottom in the lattice.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let any = a.any();
     assert!(a.is_assignable_to(any, i));
 }
@@ -121,7 +121,7 @@ fn rt_any_to_int_allowed() {
 #[test]
 fn rt_string_to_any_allowed() {
     let mut a = arena();
-    let s = a.builtin(|b| b.string);
+    let s = a.builtin(Builtins::STRING);
     let any = a.any();
     assert!(a.is_assignable_to(s, any));
 }
@@ -135,7 +135,7 @@ fn rt_int_to_nullable_int_allowed() {
     // Runtime: `var i: int = 1; take(i)` against `take(_: int?)` is
     // ALLOWED.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let i_q = a.nullable(i);
     assert!(a.is_assignable_to(i, i_q));
 }
@@ -145,7 +145,7 @@ fn rt_nullable_int_to_int_rejected_when_null() {
     // Runtime: `take(null)` for `take(_: int)` is REJECTED at the
     // dynamic call site. Statically, `int?` does not flow to `int`.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let i_q = a.nullable(i);
     assert!(!a.is_assignable_to(i_q, i));
 }
@@ -153,7 +153,7 @@ fn rt_nullable_int_to_int_rejected_when_null() {
 #[test]
 fn rt_null_to_nullable_allowed() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let i_q = a.nullable(i);
     let n = a.null();
     assert!(a.is_assignable_to(n, i_q));
@@ -167,7 +167,7 @@ fn rt_null_to_nullable_allowed() {
 #[test]
 fn rt_array_int_to_array_int_allowed() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     assert!(a.is_assignable_to(arr_i, arr_i));
 }
@@ -177,8 +177,8 @@ fn rt_array_int_to_array_float_rejected() {
     // Runtime: `var v: Array<int> = [1]; take(v)` against
     // `take(_: Array<float>)` is REJECTED.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
-    let f = a.builtin(|b| b.float);
+    let i = a.builtin(Builtins::INT);
+    let f = a.builtin(Builtins::FLOAT);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_f = a.alloc_generic(synth_decl("Array"), vec![f]);
     assert!(!a.is_assignable_to(arr_i, arr_f));
@@ -193,7 +193,7 @@ fn rt_array_int_to_array_nullable_int_rejected() {
     // `is_assignable_to` strictly compares TypeIds, which matches the
     // runtime here. (Marked separately so the rule is documented.)
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let i_q = a.nullable(i);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_iq = a.alloc_generic(synth_decl("Array"), vec![i_q]);
@@ -207,8 +207,8 @@ fn rt_array_int_to_array_nullable_int_rejected() {
 #[test]
 fn rt_tuple_identity_allowed() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
-    let s = a.builtin(|b| b.string);
+    let i = a.builtin(Builtins::INT);
+    let s = a.builtin(Builtins::STRING);
     let t1 = a.tuple(synth_decl("Tuple"), i, s);
     let t2 = a.tuple(synth_decl("Tuple"), i, s);
     assert!(a.is_assignable_to(t1, t2));
@@ -217,9 +217,9 @@ fn rt_tuple_identity_allowed() {
 #[test]
 fn rt_tuple_element_mismatch_rejected() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
-    let s = a.builtin(|b| b.string);
-    let f = a.builtin(|b| b.float);
+    let i = a.builtin(Builtins::INT);
+    let s = a.builtin(Builtins::STRING);
+    let f = a.builtin(Builtins::FLOAT);
     let t1 = a.tuple(synth_decl("Tuple"), i, s);
     let t2 = a.tuple(synth_decl("Tuple"), f, s);
     assert!(!a.is_assignable_to(t1, t2));
@@ -243,7 +243,7 @@ fn rt_tuple_element_mismatch_rejected() {
 #[test]
 fn rt_tuple_concrete_to_all_any_target_allowed() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let foo = a.alloc_type(synth_decl("Foo"));
     let any_q = a.any_nullable();
     let concrete = a.tuple(synth_decl("Tuple"), i, foo);
@@ -254,7 +254,7 @@ fn rt_tuple_concrete_to_all_any_target_allowed() {
 #[test]
 fn rt_tuple_all_any_source_to_concrete_rejected() {
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let foo = a.alloc_type(synth_decl("Foo"));
     let any_q = a.any_nullable();
     let concrete = a.tuple(synth_decl("Tuple"), i, foo);
@@ -267,7 +267,7 @@ fn rt_array_all_any_source_to_concrete_rejected() {
     // Same rule on a single-arg generic — `Array<any?>` does not
     // flow into `Array<int>`. Runtime mirror of the Tuple probe.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let any_q = a.any_nullable();
     let arr_concrete = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_raw = a.alloc_generic(synth_decl("Array"), vec![any_q]);
@@ -290,16 +290,16 @@ fn rt_array_all_any_source_to_concrete_rejected() {
 #[test]
 fn rt_cast_string_to_int_rejected() {
     let mut a = arena();
-    let s = a.builtin(|b| b.string);
-    let i = a.builtin(|b| b.int);
+    let s = a.builtin(Builtins::STRING);
+    let i = a.builtin(Builtins::INT);
     assert!(!a.is_castable(s, i));
 }
 
 #[test]
 fn rt_cast_char_to_int_allowed() {
     let mut a = arena();
-    let c = a.builtin(|b| b.char_);
-    let i = a.builtin(|b| b.int);
+    let c = a.builtin(Builtins::CHAR);
+    let i = a.builtin(Builtins::INT);
     assert!(a.is_castable(c, i));
 }
 
@@ -358,7 +358,7 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
     // relaxation must not leak. `Array<int>` ↔ `Array<int?>` remain
     // invariant per the runtime.
     let mut a = arena();
-    let i = a.builtin(|b| b.int);
+    let i = a.builtin(Builtins::INT);
     let i_q = a.nullable(i);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_iq = a.alloc_generic(synth_decl("Array"), vec![i_q]);

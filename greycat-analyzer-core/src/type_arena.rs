@@ -40,6 +40,11 @@ impl Builtins {
     pub const BOOL: BuiltinSelector = |b| b.bool_;
     pub const INT: BuiltinSelector = |b| b.int;
     pub const FLOAT: BuiltinSelector = |b| b.float;
+    pub const CHAR: BuiltinSelector = |b| b.char_;
+    pub const STRING: BuiltinSelector = |b| b.string;
+    pub const TIME: BuiltinSelector = |b| b.time;
+    pub const DURATION: BuiltinSelector = |b| b.duration;
+    pub const GEO: BuiltinSelector = |b| b.geo;
 
     /// Intern the `core` module symbol and each native-type name against
     /// `symbols`, composing the `(core, name)` handles. Idempotent.
@@ -165,7 +170,7 @@ impl TypeArena {
     }
 
     /// Mint the canonical [`TypeId`] for a builtin native-core type,
-    /// selected from [`Builtins`] (e.g. `arena.builtin(|b| b.int)`).
+    /// selected from [`Builtins`] (e.g. `arena.builtin(Builtins::INT)`).
     /// Requires [`Self::set_builtins`] to have run -- true on every
     /// analysis arena, since `ProjectIndex::{new,with_symbols}` sets it
     /// at construction.
@@ -175,7 +180,7 @@ impl TypeArena {
     }
 
     /// `true` if `ty` is the specific builtin selected from [`Builtins`]
-    /// (e.g. `arena.is_builtin(ty, |b| b.int)`). `false` on a bare arena
+    /// (e.g. `arena.is_builtin(ty, Builtins::INT)`). `false` on a bare arena
     /// or when `ty` isn't that `Type(core::X)` decl.
     pub fn is_builtin(&self, ty: TypeId, select: impl FnOnce(&Builtins) -> ItemId) -> bool {
         match &self.get(ty).kind {
@@ -706,10 +711,10 @@ impl TypeArena {
         // Primitive widening casts: `int<->float`, `char as {String,int}`.
         // Every primitive is a `Type(core::X)` decl, so these are the only
         // same-arena cast relaxations beyond identity / inheritance.
-        if (self.is_builtin(from, Builtins::INT) && self.is_builtin(to, |b| b.float))
-            || (self.is_builtin(from, |b| b.float) && self.is_builtin(to, Builtins::INT))
-            || (self.is_builtin(from, |b| b.char_)
-                && (self.is_builtin(to, |b| b.string) || self.is_builtin(to, Builtins::INT)))
+        if (self.is_builtin(from, Builtins::INT) && self.is_builtin(to, Builtins::FLOAT))
+            || (self.is_builtin(from, Builtins::FLOAT) && self.is_builtin(to, Builtins::INT))
+            || (self.is_builtin(from, Builtins::CHAR)
+                && (self.is_builtin(to, Builtins::STRING) || self.is_builtin(to, Builtins::INT)))
         {
             return true;
         }

@@ -4663,9 +4663,9 @@ impl<'a> Cx<'a> {
         // back to `any?` (could legitimately be nullable).
         let any_nn = self.any();
         let any_nl = self.any_nullable();
-        let int_id = self.primitive(|b| b.int);
-        let time_id = self.primitive(|b| b.time);
-        let geo_id = self.primitive(|b| b.geo);
+        let int_id = self.primitive(Builtins::INT);
+        let time_id = self.primitive(Builtins::TIME);
+        let geo_id = self.primitive(Builtins::GEO);
         // Receiver is nullable iterables propagate through
         // here too — `for (i, v in arr?)` is valid GreyCat.
         // Strip the optional before pattern-matching the
@@ -5503,12 +5503,12 @@ impl<'a> Cx<'a> {
                 Some(Definition::Generic(_)) | None => self.any_nullable(),
             },
             Expr::Literal(LiteralExpr { kind, .. }) => match kind {
-                LiteralKind::Bool(_) => self.primitive(|b| b.bool_),
-                LiteralKind::Int(_) => self.primitive(|b| b.int),
-                LiteralKind::Float(_) => self.primitive(|b| b.float),
-                LiteralKind::Char(_) => self.primitive(|b| b.char_),
-                LiteralKind::Duration(_) => self.primitive(|b| b.duration),
-                LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.primitive(|b| b.time),
+                LiteralKind::Bool(_) => self.primitive(Builtins::BOOL),
+                LiteralKind::Int(_) => self.primitive(Builtins::INT),
+                LiteralKind::Float(_) => self.primitive(Builtins::FLOAT),
+                LiteralKind::Char(_) => self.primitive(Builtins::CHAR),
+                LiteralKind::Duration(_) => self.primitive(Builtins::DURATION),
+                LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.primitive(Builtins::TIME),
             },
             Expr::Null { .. } => self.null(),
             Expr::This { .. } => self
@@ -5527,7 +5527,7 @@ impl<'a> Cx<'a> {
                         let _ = self.visit_expr(*expr);
                     }
                 }
-                self.primitive(|b| b.string)
+                self.primitive(Builtins::STRING)
             }
             Expr::Tuple(items, _) => {
                 // assert_eq!(items.len(), 2, "Tuple items length must be exactly 2");
@@ -6025,7 +6025,7 @@ impl<'a> Cx<'a> {
             Expr::Unary(UnaryExpr { op, operand, .. }) => {
                 let inner = self.visit_expr(*operand);
                 match op {
-                    UnaryOp::Not => self.primitive(|b| b.bool_),
+                    UnaryOp::Not => self.primitive(Builtins::BOOL),
                     UnaryOp::Neg | UnaryOp::Pos | UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
                         inner
                     }
@@ -6106,7 +6106,7 @@ impl<'a> Cx<'a> {
             }
             Expr::Is { value, .. } => {
                 let _ = self.visit_expr(*value);
-                self.primitive(|b| b.bool_)
+                self.primitive(Builtins::BOOL)
             }
             Expr::Range { from, to, .. } => {
                 // **P19.15** — visit both endpoints so their
@@ -6163,9 +6163,9 @@ impl<'a> Cx<'a> {
     }
 
     fn infer_binary(&mut self, op: BinOp, lt: TypeId, rt: TypeId) -> TypeId {
-        let int = self.primitive(|b| b.int);
-        let float = self.primitive(|b| b.float);
-        let bool_t = self.primitive(|b| b.bool_);
+        let int = self.primitive(Builtins::INT);
+        let float = self.primitive(Builtins::FLOAT);
+        let bool_t = self.primitive(Builtins::BOOL);
 
         match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => bool_t,
@@ -6182,9 +6182,9 @@ impl<'a> Cx<'a> {
                 // intact at the function entry).
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let string_t = self.primitive(|b| b.string);
-                let time_t = self.primitive(|b| b.time);
-                let dur_t = self.primitive(|b| b.duration);
+                let string_t = self.primitive(Builtins::STRING);
+                let time_t = self.primitive(Builtins::TIME);
+                let dur_t = self.primitive(Builtins::DURATION);
                 if lt_n == string_t || rt_n == string_t {
                     string_t
                 } else if (lt_n == time_t && rt_n == dur_t) || (lt_n == dur_t && rt_n == time_t) {
@@ -6206,8 +6206,8 @@ impl<'a> Cx<'a> {
                 // `duration - duration → duration`.
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let time_t = self.primitive(|b| b.time);
-                let dur_t = self.primitive(|b| b.duration);
+                let time_t = self.primitive(Builtins::TIME);
+                let dur_t = self.primitive(Builtins::DURATION);
                 if lt_n == time_t && rt_n == time_t {
                     dur_t
                 } else if lt_n == time_t && rt_n == dur_t {
@@ -6226,7 +6226,7 @@ impl<'a> Cx<'a> {
                 // **P19.14** — `duration * int / float → duration`.
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let dur_t = self.primitive(|b| b.duration);
+                let dur_t = self.primitive(Builtins::DURATION);
                 if (lt_n == dur_t && (rt_n == int || rt_n == float))
                     || ((lt_n == int || lt_n == float) && rt_n == dur_t)
                 {

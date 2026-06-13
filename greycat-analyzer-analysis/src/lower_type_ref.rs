@@ -8,7 +8,7 @@
 use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{GenericOwner, Symbol, TypeArena, TypeId};
+use greycat_analyzer_core::{Builtins, GenericOwner, Symbol, TypeArena, TypeId};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Decl, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir};
@@ -115,14 +115,14 @@ pub(crate) fn lower_type_ref_with<E: TypeRefLowering>(
 /// Seeded primitives plus `any` / `null`; `None` for any other name.
 fn primitive_or_special(name: &str, arena: &mut TypeArena) -> Option<TypeId> {
     Some(match name {
-        "bool" => arena.builtin(|b| b.bool_),
-        "int" => arena.builtin(|b| b.int),
-        "float" => arena.builtin(|b| b.float),
-        "char" => arena.builtin(|b| b.char_),
-        "String" => arena.builtin(|b| b.string),
-        "time" => arena.builtin(|b| b.time),
-        "duration" => arena.builtin(|b| b.duration),
-        "geo" => arena.builtin(|b| b.geo),
+        "bool" => arena.builtin(Builtins::BOOL),
+        "int" => arena.builtin(Builtins::INT),
+        "float" => arena.builtin(Builtins::FLOAT),
+        "char" => arena.builtin(Builtins::CHAR),
+        "String" => arena.builtin(Builtins::STRING),
+        "time" => arena.builtin(Builtins::TIME),
+        "duration" => arena.builtin(Builtins::DURATION),
+        "geo" => arena.builtin(Builtins::GEO),
         "any" => arena.any(),
         "null" => arena.null(),
         _ => return None,

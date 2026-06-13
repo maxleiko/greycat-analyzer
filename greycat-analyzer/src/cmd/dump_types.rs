@@ -30,10 +30,10 @@ use greycat_analyzer_analysis::{
     project::{ModuleAnalysis, ProjectAnalysis},
     resolver::{Definition, Resolutions},
 };
+use greycat_analyzer_core::{Builtins, TypeArena, TypeId};
 use greycat_analyzer_core::{
     Document, SourceManager, SymbolTable, lsp_types::Uri, resolver::FsContext,
 };
-use greycat_analyzer_core::{TypeArena, TypeId};
 use greycat_analyzer_hir::{
     DeclRegistry, Hir,
     arena::Idx,
@@ -645,14 +645,14 @@ fn lower_type_ref_local(
     let tr = &hir.type_refs[idx];
     let name_sym = hir.idents[tr.name].symbol;
     let mut base = match &symbols[name_sym] {
-        "bool" => arena.builtin(|b| b.bool_),
-        "int" => arena.builtin(|b| b.int),
-        "float" => arena.builtin(|b| b.float),
-        "char" => arena.builtin(|b| b.char_),
-        "String" => arena.builtin(|b| b.string),
-        "time" => arena.builtin(|b| b.time),
-        "duration" => arena.builtin(|b| b.duration),
-        "geo" => arena.builtin(|b| b.geo),
+        "bool" => arena.builtin(Builtins::BOOL),
+        "int" => arena.builtin(Builtins::INT),
+        "float" => arena.builtin(Builtins::FLOAT),
+        "char" => arena.builtin(Builtins::CHAR),
+        "String" => arena.builtin(Builtins::STRING),
+        "time" => arena.builtin(Builtins::TIME),
+        "duration" => arena.builtin(Builtins::DURATION),
+        "geo" => arena.builtin(Builtins::GEO),
         "any" => arena.any(),
         "null" => arena.null(),
         _ => {

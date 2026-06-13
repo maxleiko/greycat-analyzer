@@ -28,8 +28,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    BuiltinSelector, GenericOwner, ItemId, SourceManager, Symbol, SymbolTable, TypeArena, TypeId,
-    TypeKind,
+    BuiltinSelector, Builtins, GenericOwner, ItemId, SourceManager, Symbol, SymbolTable, TypeArena,
+    TypeId, TypeKind,
 };
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir, lower_module};
@@ -1573,8 +1573,8 @@ pub(crate) fn is_castable_with_index(
         matches!(&from_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
     let to_node_tag =
         matches!(&to_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
-    if (from_node_tag && arena.is_builtin(to, |b| b.int))
-        || (arena.is_builtin(from, |b| b.int) && to_node_tag)
+    if (from_node_tag && arena.is_builtin(to, Builtins::INT))
+        || (arena.is_builtin(from, Builtins::INT) && to_node_tag)
     {
         return true;
     }
@@ -2773,7 +2773,7 @@ fn is_slot_assignable(
     if from_t.nullable && !to_t.nullable {
         return false;
     }
-    arena.is_builtin(from, |b| b.int) && arena.is_builtin(to, |b| b.float)
+    arena.is_builtin(from, Builtins::INT) && arena.is_builtin(to, Builtins::FLOAT)
 }
 
 /// Check one supplied construction value against an expected slot type,
@@ -3509,7 +3509,7 @@ fn collect_object_construction_diags(
         // coerces to float, `geo { 1, 2 }` ≡ `geo { 1.0, 2.0 }`). Checked
         // here, before the fixed-tuple / generic positional dispatch
         // below, since `geo` has its own arity rule.
-        if arena.is_builtin(obj_ty, |b| b.geo) {
+        if arena.is_builtin(obj_ty, Builtins::GEO) {
             if obj_expr.fields.len() != 2 {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
@@ -3520,7 +3520,7 @@ fn collect_object_construction_diags(
                     category: DiagCategory::TypeRelation,
                 });
             } else {
-                let float_ty = arena.builtin(|b| b.float);
+                let float_ty = arena.builtin(Builtins::FLOAT);
                 let slot_desc = "element type `float`".to_string();
                 for value in obj_expr.fields.iter() {
                     check_construction_value_against_slot(
@@ -3642,28 +3642,33 @@ fn collect_object_construction_diags(
         // the membership check, the name feeds the diagnostic message.
         type Accepted = &'static [(BuiltinSelector, &'static str)];
         let fixed_tuples: [(Option<ItemId>, usize, Accepted, &str); 7] = [
-            (well_known.t2_decl, 2, &[(|b| b.int, "int")], "t2"),
+            (well_known.t2_decl, 2, &[(Builtins::INT, "int")], "t2"),
             (
                 well_known.t2f_decl,
                 2,
-                &[(|b| b.float, "float"), (|b| b.int, "int")],
+                &[(Builtins::FLOAT, "float"), (Builtins::INT, "int")],
                 "t2f",
             ),
-            (well_known.t3_decl, 3, &[(|b| b.int, "int")], "t3"),
+            (well_known.t3_decl, 3, &[(Builtins::INT, "int")], "t3"),
             (
                 well_known.t3f_decl,
                 3,
-                &[(|b| b.float, "float"), (|b| b.int, "int")],
+                &[(Builtins::FLOAT, "float"), (Builtins::INT, "int")],
                 "t3f",
             ),
-            (well_known.t4_decl, 4, &[(|b| b.int, "int")], "t4"),
+            (well_known.t4_decl, 4, &[(Builtins::INT, "int")], "t4"),
             (
                 well_known.t4f_decl,
                 4,
-                &[(|b| b.float, "float"), (|b| b.int, "int")],
+                &[(Builtins::FLOAT, "float"), (Builtins::INT, "int")],
                 "t4f",
             ),
-            (well_known.str_decl, 1, &[(|b| b.string, "String")], "str"),
+            (
+                well_known.str_decl,
+                1,
+                &[(Builtins::STRING, "String")],
+                "str",
+            ),
         ];
         let mut matched_v7 = false;
         for &(slot, arity, accepted, type_name) in &fixed_tuples {
@@ -4024,7 +4029,7 @@ fn validate_module_type_relations(
 
     let hir = &module.hir;
     let analysis = &module.analysis;
-    let bool_t = arena.builtin(|b| b.bool_);
+    let bool_t = arena.builtin(Builtins::BOOL);
 
     let Some(top) = hir.module.as_ref() else {
         return;
