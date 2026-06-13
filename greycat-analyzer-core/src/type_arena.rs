@@ -349,12 +349,6 @@ impl TypeArena {
         }
     }
 
-    // pub fn is_a(&self, ty: TypeId, target: TypeId) -> bool {
-    //     match self.items[ty.0 as usize].kind {
-    //         TypeKind::Type(id)
-    //     }
-    // }
-
     /// `true` iff a value of `from` is assignable to a slot expecting `to`.
     /// The relation handles primitive widening (int → float), nullability
     /// (T → T?), top/bottom (anything → any, never → anything), and shape
@@ -449,7 +443,7 @@ impl TypeArena {
                 TypeKind::Any | TypeKind::Unresolved { .. } => {
                     unreachable!("filtered by top-level guards")
                 }
-                TypeKind::Primitive(pb) => primitive_assignable(*pa, *pb),
+                TypeKind::Primitive(pb) => pa == pb,
                 TypeKind::Union { alts } => {
                     alts.iter().any(|alt| self.is_assignable_to(from, *alt))
                 }
@@ -641,6 +635,7 @@ impl TypeArena {
             },
         }
     }
+
     /// `true` iff `from` can be casted to `to` via the GreyCat `as` operator.
     ///
     /// Mirrors the TS reference's `isCastable` (`packages/lang/src/analysis/
@@ -722,7 +717,7 @@ impl TypeArena {
             // Enum source: castable to `int` (runtime representation) or
             // anything assignable from the same enum.
             TypeKind::Enum { .. } => {
-                if is_int_target(to_t) {
+                if matches!(to_t.kind, TypeKind::Primitive(Primitive::Int)) {
                     return true;
                 }
                 self.is_assignable_to_strip_source_nullable(from, to)
@@ -796,6 +791,7 @@ impl TypeArena {
             | TypeKind::Lambda { .. } => self.is_assignable_to_strip_source_nullable(from, to),
         }
     }
+
     /// flag were stripped. Used by `is_castable`'s fall-back: a cast is
     /// permitted to coerce `T?` to a non-nullable target — the runtime
     /// decides at execution time whether the actual value can land there.
@@ -877,7 +873,7 @@ impl TypeArena {
                 TypeKind::Any | TypeKind::Unresolved { .. } => {
                     unreachable!("filtered by guards above")
                 }
-                TypeKind::Primitive(pb) => primitive_assignable(*pa, *pb),
+                TypeKind::Primitive(pb) => pa == pb,
                 TypeKind::Null
                 | TypeKind::Never
                 | TypeKind::Type(_)
@@ -897,21 +893,4 @@ impl TypeArena {
             | TypeKind::Union { .. } => false,
         }
     }
-}
-
-fn is_int_target(t: &Type) -> bool {
-    matches!(t.kind, TypeKind::Primitive(Primitive::Int))
-}
-
-fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
-    // GreyCat's runtime rejects every primitive-to-primitive
-    // widening at parameter / variable binding (verified via
-    // `greycat run`: `var i: int = 1; take(i)` against `take(_: float)`
-    // is rejected as "argument of type 'int' is not assignable to
-    // parameter '_' of type 'float'"). Literals can lower to a
-    // matching primitive at use site (`var f: float = 1` is fine
-    // because `1` lowers to `float` in that position) but bindings
-    // do not widen. Even `int → float`, the canonical TS-reference
-    // widening, fails. Mirror the runtime: identity only.
-    from == to
 }
