@@ -30,10 +30,10 @@ use greycat_analyzer_analysis::{
     project::{ModuleAnalysis, ProjectAnalysis},
     resolver::{Definition, Resolutions},
 };
-use greycat_analyzer_core::{Builtins, TypeArena, TypeId};
 use greycat_analyzer_core::{
     Document, SourceManager, SymbolTable, lsp_types::Uri, resolver::FsContext,
 };
+use greycat_analyzer_core::{TypeArena, TypeId};
 use greycat_analyzer_hir::{
     DeclRegistry, Hir,
     arena::Idx,
@@ -431,7 +431,7 @@ fn collect_type_records(
     // 2. Per-type-ref records (`TypeIdent` in TS).
     for (idx, _) in hir.type_refs.iter() {
         let tref = &hir.type_refs[idx];
-        let ty = lower_type_ref_local(hir, symbols, idx, &mut arena, index, decl_registry);
+        let ty = lower_type_ref_local(hir, idx, &mut arena, index, decl_registry);
         push_type_record(
             out,
             &file,
@@ -636,7 +636,6 @@ fn collect_expr_descendants(
 /// Local copy of `analysis::index::lower_type_ref` (private upstream).
 fn lower_type_ref_local(
     hir: &Hir,
-    symbols: &SymbolTable,
     idx: Idx<TypeRef>,
     arena: &mut TypeArena,
     index: &ProjectIndex,
@@ -644,36 +643,33 @@ fn lower_type_ref_local(
 ) -> TypeId {
     let tr = &hir.type_refs[idx];
     let name_sym = hir.idents[tr.name].symbol;
-    let mut base = match &symbols[name_sym] {
-        "bool" => arena.builtin(Builtins::BOOL),
-        "int" => arena.builtin(Builtins::INT),
-        "float" => arena.builtin(Builtins::FLOAT),
-        "char" => arena.builtin(Builtins::CHAR),
-        "String" => arena.builtin(Builtins::STRING),
-        "time" => arena.builtin(Builtins::TIME),
-        "duration" => arena.builtin(Builtins::DURATION),
-        "geo" => arena.builtin(Builtins::GEO),
-        "any" => arena.any(),
-        "null" => arena.null(),
-        _ => {
-            // Resolve the decl handle once — drives both branches below.
-            let handle = index.resolve_item(decl_registry, None, name_sym);
-            if !tr.params.is_empty() {
-                let args: Vec<TypeId> = tr
-                    .params
-                    .iter()
-                    .map(|p| lower_type_ref_local(hir, symbols, *p, arena, index, decl_registry))
-                    .collect();
-                match handle {
-                    Some(h) => arena.alloc_generic(h, args),
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            } else {
-                match handle {
-                    Some(h) => arena.alloc_type(h),
-                    None => arena.unresolved(name_sym, (tr.byte_range.start, tr.byte_range.end)),
-                }
-            }
+    let span = (tr.byte_range.start, tr.byte_range.end);
+    // Resolve through the normal path: primitives are `core::X` decls and
+    // resolve like anything else. `any` / `null` resolve too but mint the
+    // lattice variants rather than `Type(core::X)`.
+    let resolved = index.resolve_item(decl_registry, None, name_sym);
+    let (is_any, is_null) = match (resolved, arena.builtins()) {
+        (Some(h), Some(b)) => (h == b.any, h == b.null),
+        _ => (false, false),
+    };
+    let mut base = if is_any {
+        arena.any()
+    } else if is_null {
+        arena.null()
+    } else if !tr.params.is_empty() {
+        let args: Vec<TypeId> = tr
+            .params
+            .iter()
+            .map(|p| lower_type_ref_local(hir, *p, arena, index, decl_registry))
+            .collect();
+        match resolved {
+            Some(h) => arena.alloc_generic(h, args),
+            None => arena.unresolved(name_sym, span),
+        }
+    } else {
+        match resolved {
+            Some(h) => arena.alloc_type(h),
+            None => arena.unresolved(name_sym, span),
         }
     };
     if tr.optional {

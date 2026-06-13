@@ -8,7 +8,7 @@
 use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{Builtins, GenericOwner, Symbol, TypeArena, TypeId};
+use greycat_analyzer_core::{GenericOwner, Symbol, TypeArena, TypeId};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Decl, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir};
@@ -103,35 +103,18 @@ pub(crate) fn lower_type_ref_with<E: TypeRefLowering>(
         lower_qualified_base(env, arena, &tr)
     } else {
         let name = env.hir().idents[tr.name].symbol;
-        let builtin = primitive_or_special(&env.index().symbols[name], arena);
-        match builtin {
-            Some(b) => b,
-            None => lower_bare_name(env, arena, &tr, idx, name),
-        }
+        lower_bare_name(env, arena, &tr, idx, name)
     };
     wrap_marker(arena, base, &tr)
 }
 
-/// Seeded primitives plus `any` / `null`; `None` for any other name.
-fn primitive_or_special(name: &str, arena: &mut TypeArena) -> Option<TypeId> {
-    Some(match name {
-        "bool" => arena.builtin(Builtins::BOOL),
-        "int" => arena.builtin(Builtins::INT),
-        "float" => arena.builtin(Builtins::FLOAT),
-        "char" => arena.builtin(Builtins::CHAR),
-        "String" => arena.builtin(Builtins::STRING),
-        "time" => arena.builtin(Builtins::TIME),
-        "duration" => arena.builtin(Builtins::DURATION),
-        "geo" => arena.builtin(Builtins::GEO),
-        "any" => arena.any(),
-        "null" => arena.null(),
-        _ => return None,
-    })
-}
-
-/// Non-primitive bare name: generic instantiation, generic param,
-/// raw-form generic, local/registered type, enum, concrete handle, or
-/// `Unresolved`. `resolved` is the shared decl handle for this name.
+/// Lower a bare (unqualified) type name through GreyCat's normal name
+/// resolution. Primitives are `Type(core::X)` decls and resolve like any
+/// other; `any` / `null` map to the [`TypeKind::Any`] / [`TypeKind::Null`]
+/// variants (they carry lattice semantics, not nominal identity). Falls
+/// through generic instantiation, generic param, raw-form generic, local /
+/// registered type, and enum before the plain decl handle, else
+/// `Unresolved`.
 fn lower_bare_name<E: TypeRefLowering>(
     env: &mut E,
     arena: &mut TypeArena,
@@ -172,6 +155,18 @@ fn lower_bare_name<E: TypeRefLowering>(
         return enum_id;
     }
     if let Some(handle) = resolved {
+        // `any` / `null` resolve to `core::any` / `core::null`, but they
+        // mint the lattice variants rather than `Type(core::X)` -- the
+        // variants encode top / proven-only-null, which nominal identity
+        // can't. (`wrap_marker` still applies the `?` suffix on top.)
+        if let Some((any, null)) = arena.builtins().map(|b| (b.any, b.null)) {
+            if handle == any {
+                return arena.any();
+            }
+            if handle == null {
+                return arena.null();
+            }
+        }
         return arena.alloc_type(handle);
     }
     arena.unresolved(name, span)
