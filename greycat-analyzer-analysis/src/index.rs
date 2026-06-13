@@ -81,6 +81,11 @@ pub struct ProjectIndex {
     ///
     /// Owns canonical storage for every name the analyzer looks up across modules.
     pub symbols: SymbolTable,
+    /// Canonical `core::X` identities, computed from `symbols` in
+    /// [`Self::with_symbols`]. Lets `resolve_item` bind the always-available
+    /// core type names (the 8 primitives + `any` / `null`) even when std
+    /// isn't loaded. `None` only on a bare `default()` index.
+    pub builtins: Option<Builtins>,
     /// Set of public top-level declared type/enum names.
     pub type_names: FxHashSet<Symbol>,
     /// Set of public top-level declared variable names.
@@ -288,7 +293,9 @@ impl ProjectIndex {
             ..Self::default()
         };
         seed_builtin_names(&mut idx.symbols, &mut idx.type_names);
-        arena.set_builtins(Builtins::compute(&idx.symbols));
+        let builtins = Builtins::compute(&idx.symbols);
+        idx.builtins = Some(builtins);
+        arena.set_builtins(builtins);
         // Runtime-exposed value-position globals
         // (`Infinity`, `NaN`). Registered here (not in
         // `seed_builtin_names`) because they're values, not types,
@@ -876,34 +883,39 @@ impl ProjectIndex {
         from_uri: Option<&Uri>,
         name: Symbol,
     ) -> Option<ItemId> {
-        // Type-namespace only: this mints an [`ItemId`], so a
-        // same-named `Fn` / `Var` decl must never be returned.
-        //
-        // Two-pass: same-module candidates first (unfiltered — private
-        // is visible from within its own module), then cross-module
-        // non-private candidates (private gets filtered to mirror the
-        // resolver's `is_decl_private` rule in `record_use`).
+        let is_valid = |uri: &Uri| {
+            self.item_id_for(uri, name)
+                .filter(|item| decl_registry.lookup(*item).is_some())
+        };
+
+        // Same-module pass.
         if let Some(cur) = from_uri {
             for (uri, _) in self.locate_decl_in_ns(name, Namespace::Type) {
                 if uri == cur
-                    && let Some(item) = self.item_id_for(uri, name)
-                    && decl_registry.lookup(item).is_some()
+                    && let Some(item) = is_valid(uri)
                 {
                     return Some(item);
                 }
             }
         }
+
+        // Cross-module pass.
         for (uri, decl) in self.locate_decl_in_ns(name, Namespace::Type) {
             if self.is_decl_private(uri, decl) {
                 continue;
             }
-            if let Some(item) = self.item_id_for(uri, name)
-                && decl_registry.lookup(item).is_some()
-            {
+
+            if let Some(item) = is_valid(uri) {
                 return Some(item);
             }
         }
-        None
+
+        // Core builtins are always-available type names: the 8 primitives
+        // + `any` / `null` resolve to their canonical `core::X` handle even
+        // with no `core.gcl` loaded (no backing decl, so members stay empty
+        // until std loads -- but the identity is correct). A loaded decl
+        // wins above, carrying full member info.
+        self.builtins.and_then(|b| b.by_name(name))
     }
 
     /// `Symbol`-keyed location index. Caller must have

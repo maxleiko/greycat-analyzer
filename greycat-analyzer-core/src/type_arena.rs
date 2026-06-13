@@ -29,6 +29,8 @@ pub struct Builtins {
     pub time: ItemId,
     pub duration: ItemId,
     pub geo: ItemId,
+    pub any: ItemId,
+    pub null: ItemId,
     pub node: ItemId,
     pub node_time: ItemId,
     pub node_index: ItemId,
@@ -46,6 +48,28 @@ impl Builtins {
     pub const DURATION: BuiltinSelector = |b| b.duration;
     pub const GEO: BuiltinSelector = |b| b.geo;
 
+    /// The canonical `core::X` handle for an always-available core type
+    /// name -- the 8 primitives plus `any` / `null`. `None` for anything
+    /// else (incl. node tags, which resolve only when std is loaded). Lets
+    /// the resolver bind these names without a loaded `core.gcl`, so a
+    /// no-std project still types `int` as `Type(core::int)`.
+    pub fn by_name(&self, name: Symbol) -> Option<ItemId> {
+        [
+            self.bool_,
+            self.int,
+            self.float,
+            self.char_,
+            self.string,
+            self.time,
+            self.duration,
+            self.geo,
+            self.any,
+            self.null,
+        ]
+        .into_iter()
+        .find(|item| item.name == name)
+    }
+
     /// Intern the `core` module symbol and each native-type name against
     /// `symbols`, composing the `(core, name)` handles. Idempotent.
     pub fn compute(symbols: &SymbolTable) -> Self {
@@ -60,6 +84,8 @@ impl Builtins {
             time: mk("time"),
             duration: mk("duration"),
             geo: mk("geo"),
+            any: mk("any"),
+            null: mk("null"),
             node: mk("node"),
             node_time: mk("nodeTime"),
             node_index: mk("nodeIndex"),
