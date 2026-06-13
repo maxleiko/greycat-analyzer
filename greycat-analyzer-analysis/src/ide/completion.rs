@@ -2528,7 +2528,6 @@ fn type_head_name<'a>(
         // P35.7 — handle-keyed variants carry the name in the `ItemId`.
         TypeKind::Type(d) => Some(pa.decl_name(*d)),
         TypeKind::Generic { tpl, .. } => Some(pa.decl_name(*tpl)),
-        TypeKind::Primitive(p) => Some(p.name()),
         _ => None,
     }
 }

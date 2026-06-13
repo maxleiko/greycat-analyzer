@@ -232,7 +232,6 @@ pub fn is_expressible_type_ident(arena: &TypeArena, ty: TypeId) -> bool {
     match &t.kind {
         TypeKind::Null
         | TypeKind::Any
-        | TypeKind::Primitive(_)
         | TypeKind::Type(_)
         | TypeKind::Enum { .. }
         | TypeKind::GenericParam { .. } => true,

@@ -836,10 +836,10 @@ fn emit_typed(
 }
 
 /// Extract the head name of `recv_ty` for `arrow-on-non-deref` dispatch.
-/// Strips top-level nullability and reduces `Type` / `Generic` /
-/// `Primitive` to their canonical name. Returns `None` for shapes the
-/// lint conservatively skips (any / never / null / lambda / tuple /
-/// anonymous / union / enum / generic-param).
+/// Strips top-level nullability and reduces `Type` / `Generic` to their
+/// canonical name. Returns `None` for shapes the lint conservatively
+/// skips (any / never / null / lambda / tuple / anonymous / union / enum
+/// / generic-param).
 fn receiver_head_name(
     arena: &TypeArena,
     _decl_registry: &DeclRegistry,
@@ -853,7 +853,6 @@ fn receiver_head_name(
         // project's symbol table without going through the registry.
         TypeKind::Type(decl) => Some((symbols[decl.name].to_string(), Some(*decl))),
         TypeKind::Generic { tpl, .. } => Some((symbols[tpl.name].to_string(), Some(*tpl))),
-        TypeKind::Primitive(p) => Some((p.name().to_string(), None)),
         _ => None,
     }
 }

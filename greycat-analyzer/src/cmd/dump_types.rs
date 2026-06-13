@@ -33,7 +33,7 @@ use greycat_analyzer_analysis::{
 use greycat_analyzer_core::{
     Document, SourceManager, SymbolTable, lsp_types::Uri, resolver::FsContext,
 };
-use greycat_analyzer_core::{Primitive, TypeArena, TypeId};
+use greycat_analyzer_core::{TypeArena, TypeId};
 use greycat_analyzer_hir::{
     DeclRegistry, Hir,
     arena::Idx,
@@ -645,14 +645,14 @@ fn lower_type_ref_local(
     let tr = &hir.type_refs[idx];
     let name_sym = hir.idents[tr.name].symbol;
     let mut base = match &symbols[name_sym] {
-        "bool" => arena.builtin(Primitive::Bool),
-        "int" => arena.builtin(Primitive::Int),
-        "float" => arena.builtin(Primitive::Float),
-        "char" => arena.builtin(Primitive::Char),
-        "String" => arena.builtin(Primitive::String),
-        "time" => arena.builtin(Primitive::Time),
-        "duration" => arena.builtin(Primitive::Duration),
-        "geo" => arena.builtin(Primitive::Geo),
+        "bool" => arena.builtin(|b| b.bool_),
+        "int" => arena.builtin(|b| b.int),
+        "float" => arena.builtin(|b| b.float),
+        "char" => arena.builtin(|b| b.char_),
+        "String" => arena.builtin(|b| b.string),
+        "time" => arena.builtin(|b| b.time),
+        "duration" => arena.builtin(|b| b.duration),
+        "geo" => arena.builtin(|b| b.geo),
         "any" => arena.any(),
         "null" => arena.null(),
         _ => {

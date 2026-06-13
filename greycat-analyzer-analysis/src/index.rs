@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    Builtins, ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
+    BuiltinSelector, Builtins, ItemId, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
 };
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, Expr, TypeAttr};
@@ -13,10 +13,10 @@ use crate::well_known::WellKnown;
 /// Runtime-exposed value-position globals. The runtime
 /// makes these names available at value position with a fixed type;
 /// they have no `.gcl` declaration, so the resolver/analyzer must seed
-/// them. `(name, primitive)` pairs — extend as new runtime globals are
-/// confirmed against `greycat run`.
-pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, Primitive)] =
-    &[("Infinity", Primitive::Float), ("NaN", Primitive::Float)];
+/// them. `(name, Builtins selector)` pairs — extend as new runtime
+/// globals are confirmed against `greycat run`.
+pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, BuiltinSelector)] =
+    &[("Infinity", Builtins::FLOAT), ("NaN", Builtins::FLOAT)];
 
 /// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
 /// declaration whose `extends` chain reaches a 5th level with
@@ -271,11 +271,9 @@ pub struct ExposureSite {
 
 impl ProjectIndex {
     /// Construct an empty index with builtin type / runtime-global
-    /// names seeded into the symbol table. The shared `TypeArena`
-    /// receives the primitive / global TypeIds — primitives only need
-    /// interning so subsequent `arena.primitive(p)` calls return the
-    /// canonical IDs, and runtime globals (`Infinity`, `NaN`) need a
-    /// concrete `TypeId` so the body walker can consume them.
+    /// names seeded into the symbol table, and the arena's canonical
+    /// [`Builtins`] identities set. Runtime globals (`Infinity`, `NaN`)
+    /// also get a concrete `TypeId` so the body walker can consume them.
     pub fn new(arena: &mut TypeArena) -> Self {
         Self::with_symbols(SymbolTable::new(), arena)
     }
@@ -295,9 +293,9 @@ impl ProjectIndex {
         // (`Infinity`, `NaN`). Registered here (not in
         // `seed_builtin_names`) because they're values, not types,
         // and they need a typed `TypeId` the body walker can consume.
-        for (name, prim) in BUILTIN_RUNTIME_GLOBALS {
+        for (name, sel) in BUILTIN_RUNTIME_GLOBALS {
             let sym = idx.symbols.intern(name);
-            let ty = arena.builtin(*prim);
+            let ty = arena.builtin(*sel);
             idx.runtime_globals.insert(sym, ty);
         }
         idx

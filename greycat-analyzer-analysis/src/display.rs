@@ -38,7 +38,6 @@ pub fn display_fqn(
         TypeKind::Null => "null".to_string(),
         TypeKind::Any => "core::any".to_string(),
         TypeKind::Never => "core::never".to_string(),
-        TypeKind::Primitive(p) => format!("core::{}", p.name()),
         TypeKind::Type(d) => {
             let name = &symbols[d.name];
             format!(
@@ -167,7 +166,6 @@ fn write_type_qualified(
         TypeKind::Null => f.write_str("null")?,
         TypeKind::Any => f.write_str("any")?,
         TypeKind::Never => f.write_str("never")?,
-        TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Type(d) => write_decl_qualified(f, index, *d)?,
         TypeKind::Generic { tpl, args } => {
             write_decl_qualified(f, index, *tpl)?;
@@ -337,7 +335,6 @@ fn write_type_for_module(
         TypeKind::Null => f.write_str("null")?,
         TypeKind::Any => f.write_str("any")?,
         TypeKind::Never => f.write_str("never")?,
-        TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Type(d) => decl_name(*d, f)?,
         TypeKind::Generic { tpl, args } => {
             decl_name(*tpl, f)?;
@@ -425,7 +422,6 @@ fn write_type_with_decls(
         TypeKind::Null => f.write_str("null")?,
         TypeKind::Any => f.write_str("any")?,
         TypeKind::Never => f.write_str("never")?,
-        TypeKind::Primitive(p) => f.write_str(p.name())?,
         TypeKind::Type(d) => decl_name(*d, f)?,
         TypeKind::Generic { tpl, args } => {
             decl_name(*tpl, f)?;

@@ -33,11 +33,10 @@ use greycat_analyzer_core::ItemId;
 /// only if every consumer that read it has migrated.
 #[derive(Debug, Default, Clone)]
 pub struct WellKnown {
-    // Primitive-shaped natives. The analyzer also has
-    // `TypeKind::Primitive` for the same conceptual things; the decl
-    // identities let cross-module references know they're talking
-    // about the std-core decl specifically, not an unrelated user-
-    // defined type that happens to share the name.
+    // Primitive-shaped natives. Primitives ARE these decls
+    // (`Type(core::X)`), so the identities let cross-module references
+    // know they're talking about the std-core decl specifically, not an
+    // unrelated user-defined type that happens to share the name.
     pub bool_decl: Option<ItemId>,
     pub char_decl: Option<ItemId>,
     pub int_decl: Option<ItemId>,

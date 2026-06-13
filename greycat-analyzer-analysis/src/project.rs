@@ -28,7 +28,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    GenericOwner, ItemId, Primitive, SourceManager, Symbol, SymbolTable, TypeArena, TypeId,
+    BuiltinSelector, GenericOwner, ItemId, SourceManager, Symbol, SymbolTable, TypeArena, TypeId,
     TypeKind,
 };
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
@@ -1337,7 +1337,6 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Any
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
@@ -1373,7 +1372,6 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Any
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
             | TypeKind::GenericParam { .. }
@@ -1421,7 +1419,6 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Any
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
             | TypeKind::Type(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
@@ -1446,7 +1443,6 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::Any
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
             | TypeKind::Type(_)
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
@@ -1455,29 +1451,27 @@ pub(crate) fn is_assignable_to_with_index(
             | TypeKind::TypeOf(_) => false,
         },
 
-        // Primitive / Enum / GenericParam: the wrapper adds no
-        // inheritance-aware rules beyond what core already covers.
-        // Only the target-Union retry is meaningful (a single alt
-        // might match via the wrapper's extensions even when core
-        // rejected the whole union).
-        TypeKind::Primitive(_) | TypeKind::Enum { .. } | TypeKind::GenericParam { .. } => {
-            match b_kind {
-                TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                    is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
-                }),
-                TypeKind::Null
-                | TypeKind::Any
-                | TypeKind::Never
-                | TypeKind::Unresolved { .. }
-                | TypeKind::Primitive(_)
-                | TypeKind::Type(_)
-                | TypeKind::Generic { .. }
-                | TypeKind::Lambda { .. }
-                | TypeKind::Enum { .. }
-                | TypeKind::GenericParam { .. }
-                | TypeKind::TypeOf(_) => false,
-            }
-        }
+        // Enum / GenericParam: the wrapper adds no inheritance-aware
+        // rules beyond what core already covers. Only the target-Union
+        // retry is meaningful (a single alt might match via the
+        // wrapper's extensions even when core rejected the whole union).
+        // Primitives are `Type(core::X)` and flow through the `Type(sub)`
+        // arm above (identity + target-Union retry, no supertypes).
+        TypeKind::Enum { .. } | TypeKind::GenericParam { .. } => match b_kind {
+            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
+            }),
+            TypeKind::Null
+            | TypeKind::Any
+            | TypeKind::Never
+            | TypeKind::Unresolved { .. }
+            | TypeKind::Type(_)
+            | TypeKind::Generic { .. }
+            | TypeKind::Lambda { .. }
+            | TypeKind::Enum { .. }
+            | TypeKind::GenericParam { .. }
+            | TypeKind::TypeOf(_) => false,
+        },
     }
 }
 
@@ -1572,16 +1566,15 @@ pub(crate) fn is_castable_with_index(
     // substitutes, which allocates fresh `Generic` nodes).
     let from_kind = arena.get(from).kind.clone();
     let to_kind = arena.get(to).kind.clone();
-    // Transitional: node-tag <-> int cast bivariance, for either int
-    // representation (`Primitive(Int)` or `Type(core::int)`). The
-    // `Primitive(Int)` match arms below still cover the legacy form;
-    // both fold into this block once `enum Primitive` is gone.
+    // Node-tag <-> int cast bivariance. `int` is `Type(core::int)`, so
+    // this is the single place the rule lives -- neither side's structural
+    // arm below sees it.
     let from_node_tag =
         matches!(&from_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
     let to_node_tag =
         matches!(&to_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
-    if (from_node_tag && arena.ty_is_prim(to, Primitive::Int))
-        || (arena.ty_is_prim(from, Primitive::Int) && to_node_tag)
+    if (from_node_tag && arena.is_builtin(to, |b| b.int))
+        || (arena.is_builtin(from, |b| b.int) && to_node_tag)
     {
         return true;
     }
@@ -1616,7 +1609,6 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::Any
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
             | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
@@ -1670,7 +1662,6 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::Any
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
             | TypeKind::GenericParam { .. }
@@ -1733,7 +1724,6 @@ pub(crate) fn is_castable_with_index(
                     false
                 }
             }
-            TypeKind::Primitive(Primitive::Int) if well_known.is_node_tag(fd) => true,
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
                 is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
             }),
@@ -1741,29 +1731,6 @@ pub(crate) fn is_castable_with_index(
             | TypeKind::Any
             | TypeKind::Never
             | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-
-        // Source Primitive(Int): inverse `int as <node-tag>` rule.
-        // Other primitives have no wrapper-side rules — core handled
-        // them already (and returned false here, otherwise the
-        // early-return would have fired).
-        TypeKind::Primitive(Primitive::Int) => match to_kind {
-            TypeKind::Generic { tpl: td, .. } if well_known.is_node_tag(td) => true,
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
-            TypeKind::Null
-            | TypeKind::Any
-            | TypeKind::Never
-            | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
             | TypeKind::Lambda { .. }
             | TypeKind::Enum { .. }
             | TypeKind::GenericParam { .. }
@@ -1772,26 +1739,26 @@ pub(crate) fn is_castable_with_index(
 
         // Other source kinds: wrapper adds no rules beyond core; only
         // the target-Union retry might matter (an alt could pick up
-        // a wrapper rule even when the whole union didn't).
-        TypeKind::Primitive(_)
-        | TypeKind::Lambda { .. }
-        | TypeKind::Enum { .. }
-        | TypeKind::GenericParam { .. } => match to_kind {
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
-            TypeKind::Null
-            | TypeKind::Any
-            | TypeKind::Never
-            | TypeKind::Unresolved { .. }
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
+        // a wrapper rule even when the whole union didn't). The node-tag
+        // <-> int cast bivariance (for primitive `Type(core::int)`) is
+        // handled by the top-level block at the head of this function.
+        TypeKind::Lambda { .. } | TypeKind::Enum { .. } | TypeKind::GenericParam { .. } => {
+            match to_kind {
+                TypeKind::Union { alts } => alts.into_iter().any(|alt| {
+                    is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
+                }),
+                TypeKind::Null
+                | TypeKind::Any
+                | TypeKind::Never
+                | TypeKind::Unresolved { .. }
+                | TypeKind::Type(_)
+                | TypeKind::Generic { .. }
+                | TypeKind::Lambda { .. }
+                | TypeKind::Enum { .. }
+                | TypeKind::GenericParam { .. }
+                | TypeKind::TypeOf(_) => false,
+            }
+        }
     }
 }
 
@@ -2806,7 +2773,7 @@ fn is_slot_assignable(
     if from_t.nullable && !to_t.nullable {
         return false;
     }
-    arena.ty_is_prim(from, Primitive::Int) && arena.ty_is_prim(to, Primitive::Float)
+    arena.is_builtin(from, |b| b.int) && arena.is_builtin(to, |b| b.float)
 }
 
 /// Check one supplied construction value against an expected slot type,
@@ -3539,10 +3506,10 @@ fn collect_object_construction_diags(
             continue;
         };
         // `geo { lat, lng }` — exactly two int/float components (int
-        // coerces to float, `geo { 1, 2 }` ≡ `geo { 1.0, 2.0 }`). Typed
-        // as `Primitive(Geo)`, so it carries no head decl and never
-        // reaches the `Generic` / `Type` dispatch below.
-        if arena.ty_is_prim(obj_ty, Primitive::Geo) {
+        // coerces to float, `geo { 1, 2 }` ≡ `geo { 1.0, 2.0 }`). Checked
+        // here, before the fixed-tuple / generic positional dispatch
+        // below, since `geo` has its own arity rule.
+        if arena.is_builtin(obj_ty, |b| b.geo) {
             if obj_expr.fields.len() != 2 {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
@@ -3553,7 +3520,7 @@ fn collect_object_construction_diags(
                     category: DiagCategory::TypeRelation,
                 });
             } else {
-                let float_ty = arena.builtin(Primitive::Float);
+                let float_ty = arena.builtin(|b| b.float);
                 let slot_desc = "element type `float`".to_string();
                 for value in obj_expr.fields.iter() {
                     check_construction_value_against_slot(
@@ -3670,29 +3637,33 @@ fn collect_object_construction_diags(
         // (runtime coerces `int → float` — verified against
         // `greycat run` v7.8); the int variants stay strict (runtime
         // rejects `float → int` even for literals).
-        let fixed_tuples: [(Option<ItemId>, usize, &[Primitive], &str); 7] = [
-            (well_known.t2_decl, 2, &[Primitive::Int], "t2"),
+        // Each accepted element is a `(Builtins selector, display name)`
+        // pair: the selector resolves the canonical `Type(core::X)` for
+        // the membership check, the name feeds the diagnostic message.
+        type Accepted = &'static [(BuiltinSelector, &'static str)];
+        let fixed_tuples: [(Option<ItemId>, usize, Accepted, &str); 7] = [
+            (well_known.t2_decl, 2, &[(|b| b.int, "int")], "t2"),
             (
                 well_known.t2f_decl,
                 2,
-                &[Primitive::Float, Primitive::Int],
+                &[(|b| b.float, "float"), (|b| b.int, "int")],
                 "t2f",
             ),
-            (well_known.t3_decl, 3, &[Primitive::Int], "t3"),
+            (well_known.t3_decl, 3, &[(|b| b.int, "int")], "t3"),
             (
                 well_known.t3f_decl,
                 3,
-                &[Primitive::Float, Primitive::Int],
+                &[(|b| b.float, "float"), (|b| b.int, "int")],
                 "t3f",
             ),
-            (well_known.t4_decl, 4, &[Primitive::Int], "t4"),
+            (well_known.t4_decl, 4, &[(|b| b.int, "int")], "t4"),
             (
                 well_known.t4f_decl,
                 4,
-                &[Primitive::Float, Primitive::Int],
+                &[(|b| b.float, "float"), (|b| b.int, "int")],
                 "t4f",
             ),
-            (well_known.str_decl, 1, &[Primitive::String], "str"),
+            (well_known.str_decl, 1, &[(|b| b.string, "String")], "str"),
         ];
         let mut matched_v7 = false;
         for &(slot, arity, accepted, type_name) in &fixed_tuples {
@@ -3717,11 +3688,13 @@ fn collect_object_construction_diags(
                     let Some(val_ty) = cur_module.analysis.expr_types.get(value).copied() else {
                         continue;
                     };
-                    let ok = accepted.iter().any(|p| arena.ty_is_prim(val_ty, *p));
+                    let ok = accepted
+                        .iter()
+                        .any(|(sel, _)| arena.is_builtin(val_ty, *sel));
                     if !ok {
                         let accepted_msg = accepted
                             .iter()
-                            .map(|p| format!("`{}`", p.name()))
+                            .map(|(_, name)| format!("`{name}`"))
                             .collect::<Vec<_>>()
                             .join(" or ");
                         diags.push(SemanticDiagnostic {
@@ -4051,7 +4024,7 @@ fn validate_module_type_relations(
 
     let hir = &module.hir;
     let analysis = &module.analysis;
-    let bool_t = arena.builtin(Primitive::Bool);
+    let bool_t = arena.builtin(|b| b.bool_);
 
     let Some(top) = hir.module.as_ref() else {
         return;

@@ -284,24 +284,6 @@ impl Lint {
         analysis.analyze_staged(&mgr);
         let total = total_start.elapsed();
 
-        // for tid in analysis.arena.intern.values() {
-        //     let ty = analysis.arena.get(*tid);
-        //     if matches!(
-        //         ty.kind,
-        //         TypeKind::GenericParam { .. }
-        //             | TypeKind::Primitive(_)
-        //             | TypeKind::Null
-        //             | TypeKind::Any
-        //             | TypeKind::Never
-        //     ) {
-        //         continue;
-        //     }
-        //     let fqn = analysis.display_type(*tid);
-        //     println!("{fqn} id={tid}");
-        //     println!("{ty:#?}");
-        //     println!();
-        // }
-
         // Per-uri load-phase timings come from the load report;
         // build an index so the manager.iter() loop below can pick the
         // matching read / parse durations per file.

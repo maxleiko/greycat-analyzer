@@ -27,8 +27,8 @@ use greycat_analyzer_core::lsp_types::Uri;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::{
-    Builtins, GenericOwner, InferenceTable, ItemId, Primitive, Symbol, SymbolTable, Type,
-    TypeArena, TypeId, TypeKind, TypeRegistry,
+    Builtins, GenericOwner, InferenceTable, ItemId, Symbol, SymbolTable, Type, TypeArena, TypeId,
+    TypeKind, TypeRegistry,
 };
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -1031,8 +1031,8 @@ impl TypeRefLowering for CxLowerEnv<'_> {
 
 impl<'a> Cx<'a> {
     #[inline]
-    fn primitive(&mut self, p: Primitive) -> TypeId {
-        self.arena.builtin(p)
+    fn primitive(&mut self, select: impl FnOnce(&Builtins) -> ItemId) -> TypeId {
+        self.arena.builtin(select)
     }
 
     #[inline]
@@ -1195,8 +1195,8 @@ impl<'a> Cx<'a> {
             // information to compare them (e.g. user types with
             // inheritance, not yet wired into the subtyping relation).
             // Only claim "contradiction" when every type in the group
-            // is a primitive, where `primitive_assignable` is a total
-            // identity relation and disjointness is provable.
+            // is a primitive (`is_any_primitive`), where assignability is
+            // pure decl identity and disjointness is therefore provable.
             let mut most_specific: Option<TypeId> = None;
             'outer: for &cand in tys {
                 for &other in tys {
@@ -2308,12 +2308,6 @@ impl<'a> Cx<'a> {
         let type_id: Option<ItemId> = match &ty.kind {
             TypeKind::Type(d) => Some(*d),
             TypeKind::Generic { tpl, .. } => Some(*tpl),
-            // primitives are from `lib/std/core.gcl`, so their `ItemId` is `(core, name)`.
-            TypeKind::Primitive(p) => {
-                let core_mod = self.index.symbols.intern("core");
-                let name_sym = self.index.symbols.intern(p.name());
-                Some(ItemId::new(core_mod, name_sym))
-            }
             // `Any` / `Unresolved` / `GenericParam` / `Lambda` / `Null`
             // / `Never` / `Union` — receivers where we either can't
             // know the member set (any is the escape hatch by design,
@@ -2477,11 +2471,6 @@ impl<'a> Cx<'a> {
             match &self.arena.get(recv_ty).kind {
                 TypeKind::Type(d) => Some(*d),
                 TypeKind::Generic { tpl, .. } => Some(*tpl),
-                TypeKind::Primitive(p) => {
-                    let core_mod = self.index.symbols.intern("core");
-                    let pname = self.index.symbols.intern(p.name());
-                    Some(ItemId::new(core_mod, pname))
-                }
                 _ => None,
             }
         })();
@@ -2584,11 +2573,6 @@ impl<'a> Cx<'a> {
                 match &self.arena.get(recv_ty).kind {
                     TypeKind::Type(d) => *d,
                     TypeKind::Generic { tpl, .. } => *tpl,
-                    TypeKind::Primitive(p) => {
-                        let core_mod = self.index.symbols.intern("core");
-                        let name_sym = self.index.symbols.intern(p.name());
-                        ItemId::new(core_mod, name_sym)
-                    }
                     _ => return None,
                 }
             } else {
@@ -2835,11 +2819,6 @@ impl<'a> Cx<'a> {
         };
         let recv = self.arena.get(lookup_ty).clone();
         let (type_id, instantiation): (ItemId, Vec<TypeId>) = match recv.kind {
-            TypeKind::Primitive(p) => {
-                let core_mod = self.index.symbols.intern("core");
-                let name_sym = self.index.symbols.intern(p.name());
-                (ItemId::new(core_mod, name_sym), Vec::new())
-            }
             // Handle-keyed variants already carry the decl's
             // full `(module, name)` identity.
             TypeKind::Type(decl) => (decl, Vec::new()),
@@ -2961,12 +2940,6 @@ impl<'a> Cx<'a> {
                 TypeKind::Enum { .. } => None,
                 // **P19.14** — primitives carry static methods /
                 // attrs in stdlib (`time::max`, `int::max`, etc.);
-                // map them to the std-core ItemId.
-                TypeKind::Primitive(p) => {
-                    let core_mod = self.index.symbols.intern("core");
-                    let name_sym = self.index.symbols.intern(p.name());
-                    Some(ItemId::new(core_mod, name_sym))
-                }
                 _ => None,
             };
             if let Some(id) = owner_id
@@ -3003,11 +2976,6 @@ impl<'a> Cx<'a> {
         let owner_id: Option<ItemId> = match &self.arena.get(recv_ty).kind {
             TypeKind::Type(d) => Some(*d),
             TypeKind::Generic { tpl, .. } => Some(*tpl),
-            TypeKind::Primitive(p) => {
-                let core_mod = self.index.symbols.intern("core");
-                let name_sym = self.index.symbols.intern(p.name());
-                Some(ItemId::new(core_mod, name_sym))
-            }
             _ => None,
         };
         let sig_opt = owner_id
@@ -3137,11 +3105,6 @@ impl<'a> Cx<'a> {
             // Handle-keyed variants carry the full identity.
             TypeKind::Type(d) => (*d, &[]),
             TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
-            TypeKind::Primitive(p) => {
-                let core_mod = self.index.symbols.intern("core");
-                let name_sym = self.index.symbols.intern(p.name());
-                (ItemId::new(core_mod, name_sym), &[])
-            }
             _ => return None,
         };
         // Build the substitution map *before* mutably borrowing the
@@ -3587,11 +3550,6 @@ impl<'a> Cx<'a> {
     ) -> Option<(TypeId, Option<TypeId>)> {
         let recv = self.arena.get(recv_ty);
         let (type_id, instantiation): (ItemId, &[TypeId]) = match &recv.kind {
-            TypeKind::Primitive(p) => {
-                let core_mod = self.index.symbols.intern("core");
-                let name_sym = self.index.symbols.intern(p.name());
-                (ItemId::new(core_mod, name_sym), &[])
-            }
             TypeKind::Type(decl) => (*decl, &[]),
             TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
             _ => return None,
@@ -4705,9 +4663,9 @@ impl<'a> Cx<'a> {
         // back to `any?` (could legitimately be nullable).
         let any_nn = self.any();
         let any_nl = self.any_nullable();
-        let int_id = self.primitive(Primitive::Int);
-        let time_id = self.primitive(Primitive::Time);
-        let geo_id = self.primitive(Primitive::Geo);
+        let int_id = self.primitive(|b| b.int);
+        let time_id = self.primitive(|b| b.time);
+        let geo_id = self.primitive(|b| b.geo);
         // Receiver is nullable iterables propagate through
         // here too — `for (i, v in arr?)` is valid GreyCat.
         // Strip the optional before pattern-matching the
@@ -5545,12 +5503,12 @@ impl<'a> Cx<'a> {
                 Some(Definition::Generic(_)) | None => self.any_nullable(),
             },
             Expr::Literal(LiteralExpr { kind, .. }) => match kind {
-                LiteralKind::Bool(_) => self.primitive(Primitive::Bool),
-                LiteralKind::Int(_) => self.primitive(Primitive::Int),
-                LiteralKind::Float(_) => self.primitive(Primitive::Float),
-                LiteralKind::Char(_) => self.primitive(Primitive::Char),
-                LiteralKind::Duration(_) => self.primitive(Primitive::Duration),
-                LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.primitive(Primitive::Time),
+                LiteralKind::Bool(_) => self.primitive(|b| b.bool_),
+                LiteralKind::Int(_) => self.primitive(|b| b.int),
+                LiteralKind::Float(_) => self.primitive(|b| b.float),
+                LiteralKind::Char(_) => self.primitive(|b| b.char_),
+                LiteralKind::Duration(_) => self.primitive(|b| b.duration),
+                LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.primitive(|b| b.time),
             },
             Expr::Null { .. } => self.null(),
             Expr::This { .. } => self
@@ -5569,7 +5527,7 @@ impl<'a> Cx<'a> {
                         let _ = self.visit_expr(*expr);
                     }
                 }
-                self.primitive(Primitive::String)
+                self.primitive(|b| b.string)
             }
             Expr::Tuple(items, _) => {
                 // assert_eq!(items.len(), 2, "Tuple items length must be exactly 2");
@@ -6067,7 +6025,7 @@ impl<'a> Cx<'a> {
             Expr::Unary(UnaryExpr { op, operand, .. }) => {
                 let inner = self.visit_expr(*operand);
                 match op {
-                    UnaryOp::Not => self.primitive(Primitive::Bool),
+                    UnaryOp::Not => self.primitive(|b| b.bool_),
                     UnaryOp::Neg | UnaryOp::Pos | UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
                         inner
                     }
@@ -6148,7 +6106,7 @@ impl<'a> Cx<'a> {
             }
             Expr::Is { value, .. } => {
                 let _ = self.visit_expr(*value);
-                self.primitive(Primitive::Bool)
+                self.primitive(|b| b.bool_)
             }
             Expr::Range { from, to, .. } => {
                 // **P19.15** — visit both endpoints so their
@@ -6205,9 +6163,9 @@ impl<'a> Cx<'a> {
     }
 
     fn infer_binary(&mut self, op: BinOp, lt: TypeId, rt: TypeId) -> TypeId {
-        let int = self.primitive(Primitive::Int);
-        let float = self.primitive(Primitive::Float);
-        let bool_t = self.primitive(Primitive::Bool);
+        let int = self.primitive(|b| b.int);
+        let float = self.primitive(|b| b.float);
+        let bool_t = self.primitive(|b| b.bool_);
 
         match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => bool_t,
@@ -6224,9 +6182,9 @@ impl<'a> Cx<'a> {
                 // intact at the function entry).
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let string_t = self.primitive(Primitive::String);
-                let time_t = self.primitive(Primitive::Time);
-                let dur_t = self.primitive(Primitive::Duration);
+                let string_t = self.primitive(|b| b.string);
+                let time_t = self.primitive(|b| b.time);
+                let dur_t = self.primitive(|b| b.duration);
                 if lt_n == string_t || rt_n == string_t {
                     string_t
                 } else if (lt_n == time_t && rt_n == dur_t) || (lt_n == dur_t && rt_n == time_t) {
@@ -6248,8 +6206,8 @@ impl<'a> Cx<'a> {
                 // `duration - duration → duration`.
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let time_t = self.primitive(Primitive::Time);
-                let dur_t = self.primitive(Primitive::Duration);
+                let time_t = self.primitive(|b| b.time);
+                let dur_t = self.primitive(|b| b.duration);
                 if lt_n == time_t && rt_n == time_t {
                     dur_t
                 } else if lt_n == time_t && rt_n == dur_t {
@@ -6268,7 +6226,7 @@ impl<'a> Cx<'a> {
                 // **P19.14** — `duration * int / float → duration`.
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let dur_t = self.primitive(Primitive::Duration);
+                let dur_t = self.primitive(|b| b.duration);
                 if (lt_n == dur_t && (rt_n == int || rt_n == float))
                     || ((lt_n == int || lt_n == float) && rt_n == dur_t)
                 {

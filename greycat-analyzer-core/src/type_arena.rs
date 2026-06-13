@@ -5,7 +5,13 @@
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use crate::{ItemId, Primitive, Symbol, SymbolTable, Type, TypeId, TypeKind};
+use crate::{ItemId, Symbol, SymbolTable, Type, TypeId, TypeKind};
+
+/// A selector picking one canonical [`ItemId`] out of [`Builtins`] --
+/// the storable fn-pointer form used by builtin lookup tables (e.g.
+/// `BUILTIN_RUNTIME_GLOBALS`). [`TypeArena::builtin`] / [`TypeArena::is_builtin`]
+/// take the more general `impl FnOnce` so closures are accepted too.
+pub type BuiltinSelector = fn(&Builtins) -> ItemId;
 
 /// Canonical `ItemId` per well-known native-core type (declared in
 /// `lib/std/core.gcl`). A primitive `int` is `Type(ItemId(core, int))`;
@@ -31,6 +37,10 @@ pub struct Builtins {
 }
 
 impl Builtins {
+    pub const BOOL: BuiltinSelector = |b| b.bool_;
+    pub const INT: BuiltinSelector = |b| b.int;
+    pub const FLOAT: BuiltinSelector = |b| b.float;
+
     /// Intern the `core` module symbol and each native-type name against
     /// `symbols`, composing the `(core, name)` handles. Idempotent.
     pub fn compute(symbols: &SymbolTable) -> Self {
@@ -66,22 +76,6 @@ impl Builtins {
             || item == self.time
             || item == self.duration
             || item == self.geo
-    }
-
-    /// Transitional: map a [`Primitive`] variant to its canonical
-    /// well-known `ItemId`. Deleted together with `enum Primitive`
-    /// once primitives are represented as `Type(core::X)` everywhere.
-    pub fn item(&self, p: Primitive) -> ItemId {
-        match p {
-            Primitive::Bool => self.bool_,
-            Primitive::Int => self.int,
-            Primitive::Float => self.float,
-            Primitive::Char => self.char_,
-            Primitive::String => self.string,
-            Primitive::Time => self.time,
-            Primitive::Duration => self.duration,
-            Primitive::Geo => self.geo,
-        }
     }
 }
 
@@ -170,52 +164,32 @@ impl TypeArena {
         self.alloc(new_ty)
     }
 
-    pub fn primitive(&mut self, p: Primitive) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Primitive(p),
-            nullable: false,
-        })
+    /// Mint the canonical [`TypeId`] for a builtin native-core type,
+    /// selected from [`Builtins`] (e.g. `arena.builtin(|b| b.int)`).
+    /// Requires [`Self::set_builtins`] to have run -- true on every
+    /// analysis arena, since `ProjectIndex::{new,with_symbols}` sets it
+    /// at construction.
+    pub fn builtin(&mut self, select: impl FnOnce(&Builtins) -> ItemId) -> TypeId {
+        let item = select(self.builtins().expect("builtin() requires set_builtins"));
+        self.alloc_type(item)
     }
 
-    /// Transitional bridge: `true` if `ty` is the `p` primitive in
-    /// EITHER representation -- the legacy `Primitive(p)` or the target
-    /// `Type(core::p)`. The `Type` arm only fires when [`Self::builtins`]
-    /// is set; a bare arena recognizes the legacy form only. Lets the
-    /// cast / construction rules stay correct while producers are flipped
-    /// from one representation to the other. Deleted together with
-    /// `enum Primitive` once the flip is complete.
-    pub fn ty_is_prim(&self, ty: TypeId, p: Primitive) -> bool {
+    /// `true` if `ty` is the specific builtin selected from [`Builtins`]
+    /// (e.g. `arena.is_builtin(ty, |b| b.int)`). `false` on a bare arena
+    /// or when `ty` isn't that `Type(core::X)` decl.
+    pub fn is_builtin(&self, ty: TypeId, select: impl FnOnce(&Builtins) -> ItemId) -> bool {
         match &self.get(ty).kind {
-            TypeKind::Primitive(q) => *q == p,
-            TypeKind::Type(d) => self.builtins().is_some_and(|b| *d == b.item(p)),
+            TypeKind::Type(d) => self.builtins().is_some_and(|b| *d == select(b)),
             _ => false,
         }
     }
 
-    /// Transitional: `true` if `ty` is *any* of the 8 primitives, in
-    /// either representation. Simplifies to the `Type(core::X)` arm once
-    /// `enum Primitive` is gone.
+    /// `true` if `ty` is any of the 8 primitive native-core types.
     pub fn is_any_primitive(&self, ty: TypeId) -> bool {
         match &self.get(ty).kind {
-            TypeKind::Primitive(_) => true,
             TypeKind::Type(d) => self.builtins().is_some_and(|b| b.is_primitive(*d)),
             _ => false,
         }
-    }
-
-    /// Mint the canonical [`TypeId`] for primitive `p` in the target
-    /// `Type(core::X)` representation. Requires [`Self::set_builtins`]
-    /// to have run -- true on every analysis arena, since
-    /// `ProjectIndex::{new,with_symbols}` sets it at construction.
-    /// Transitional counterpart to [`Self::primitive`]; once producers
-    /// are fully flipped, `primitive` is deleted and this is the only
-    /// primitive minter.
-    pub fn builtin(&mut self, p: Primitive) -> TypeId {
-        let item = self
-            .builtins()
-            .expect("builtin() requires set_builtins")
-            .item(p);
-        self.alloc_type(item)
     }
 
     pub fn null(&mut self) -> TypeId {
@@ -347,9 +321,8 @@ impl TypeArena {
     /// route witnesses through an `InferenceTable`.
     ///
     /// Recurses through `Generic`, `Tuple`, `Lambda`, `Anonymous`, and
-    /// `Union` shapes. Non-substitutable kinds (`Type`, `Primitive`,
-    /// `Null`, `Any`, `Never`, `Enum`, `Unresolved`) return `ty`
-    /// unchanged.
+    /// `Union` shapes. Non-substitutable kinds (`Type`, `Null`, `Any`,
+    /// `Never`, `Enum`, `Unresolved`) return `ty` unchanged.
     pub fn substitute(&mut self, ty: TypeId, subst: &FxHashMap<Symbol, TypeId>) -> TypeId {
         if subst.is_empty() {
             return ty;
@@ -511,26 +484,10 @@ impl TypeArena {
             // each alt, which uses `any()`.
             TypeKind::Union { alts } => alts.iter().all(|alt| self.is_assignable_to(*alt, to)),
 
-            TypeKind::Primitive(pa) => match &b.kind {
-                TypeKind::Any | TypeKind::Unresolved { .. } => {
-                    unreachable!("filtered by top-level guards")
-                }
-                TypeKind::Primitive(pb) => pa == pb,
-                TypeKind::Union { alts } => {
-                    alts.iter().any(|alt| self.is_assignable_to(from, *alt))
-                }
-                TypeKind::Null
-                | TypeKind::Never
-                | TypeKind::Type(_)
-                | TypeKind::Generic { .. }
-                | TypeKind::Lambda { .. }
-                | TypeKind::Enum { .. }
-                | TypeKind::GenericParam { .. }
-                | TypeKind::TypeOf(_) => false,
-            },
-
             // Decl identity via `ItemId`. Cross-module references
             // to the same decl share the same `(module, name)` pair.
+            // The 8 primitives are `Type(core::X)` decls, so primitive
+            // identity (`int == int`, `int != float`) flows through here.
             // Supertype-chain assignability lives in
             // `is_assignable_to_with_index`.
             TypeKind::Type(da) => match &b.kind {
@@ -543,7 +500,6 @@ impl TypeArena {
                 }
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
                 | TypeKind::Enum { .. }
@@ -590,7 +546,6 @@ impl TypeArena {
                 }
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Type(_)
                 | TypeKind::Lambda { .. }
                 | TypeKind::Enum { .. }
@@ -631,7 +586,6 @@ impl TypeArena {
                 }
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Type(_)
                 | TypeKind::Generic { .. }
                 | TypeKind::Enum { .. }
@@ -649,7 +603,6 @@ impl TypeArena {
                 }
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Type(_)
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
@@ -672,7 +625,6 @@ impl TypeArena {
                 }
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Type(_)
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
@@ -698,7 +650,6 @@ impl TypeArena {
                 }
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Type(_)
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
@@ -752,14 +703,13 @@ impl TypeArena {
             return true;
         }
 
-        // Transitional: primitive widening casts (`int<->float`,
-        // `char as {String,int}`) for the `Type(core::X)` representation.
-        // The `Primitive(_)` match arms below still cover the legacy
-        // form; both fold into this block once `enum Primitive` is gone.
-        if (self.ty_is_prim(from, Primitive::Int) && self.ty_is_prim(to, Primitive::Float))
-            || (self.ty_is_prim(from, Primitive::Float) && self.ty_is_prim(to, Primitive::Int))
-            || (self.ty_is_prim(from, Primitive::Char)
-                && (self.ty_is_prim(to, Primitive::String) || self.ty_is_prim(to, Primitive::Int)))
+        // Primitive widening casts: `int<->float`, `char as {String,int}`.
+        // Every primitive is a `Type(core::X)` decl, so these are the only
+        // same-arena cast relaxations beyond identity / inheritance.
+        if (self.is_builtin(from, Builtins::INT) && self.is_builtin(to, |b| b.float))
+            || (self.is_builtin(from, |b| b.float) && self.is_builtin(to, Builtins::INT))
+            || (self.is_builtin(from, |b| b.char_)
+                && (self.is_builtin(to, |b| b.string) || self.is_builtin(to, Builtins::INT)))
         {
             return true;
         }
@@ -801,73 +751,18 @@ impl TypeArena {
             // Enum source: castable to `int` (runtime representation) or
             // anything assignable from the same enum.
             TypeKind::Enum { .. } => {
-                if matches!(to_t.kind, TypeKind::Primitive(Primitive::Int)) {
+                if self.is_builtin(to, Builtins::INT) {
                     return true;
                 }
                 self.is_assignable_to_strip_source_nullable(from, to)
             }
 
-            // Primitive source: cast-specific widening rules layered on
-            // top of `int as <node-tag>` (handled in
-            // `is_castable_with_index`), then assignability fall-back.
-            TypeKind::Primitive(p) => match p {
-                Primitive::Int => match &to_t.kind {
-                    TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
-                        unreachable!("filtered by top-level guards")
-                    }
-                    TypeKind::Primitive(Primitive::Float) => true,
-                    TypeKind::Null
-                    | TypeKind::Never
-                    | TypeKind::Primitive(_)
-                    | TypeKind::Type(_)
-                    | TypeKind::Generic { .. }
-                    | TypeKind::Lambda { .. }
-                    | TypeKind::Enum { .. }
-                    | TypeKind::Union { .. }
-                    | TypeKind::TypeOf(_) => self.is_assignable_to_strip_source_nullable(from, to),
-                },
-                Primitive::Float => match &to_t.kind {
-                    TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
-                        unreachable!("filtered by top-level guards")
-                    }
-                    TypeKind::Primitive(Primitive::Int) => true,
-                    TypeKind::Null
-                    | TypeKind::Never
-                    | TypeKind::Primitive(_)
-                    | TypeKind::Type(_)
-                    | TypeKind::Generic { .. }
-                    | TypeKind::Lambda { .. }
-                    | TypeKind::Enum { .. }
-                    | TypeKind::Union { .. }
-                    | TypeKind::TypeOf(_) => self.is_assignable_to_strip_source_nullable(from, to),
-                },
-                Primitive::Char => match &to_t.kind {
-                    TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
-                        unreachable!("filtered by top-level guards")
-                    }
-                    TypeKind::Primitive(Primitive::String | Primitive::Int) => true,
-                    TypeKind::Null
-                    | TypeKind::Never
-                    | TypeKind::Primitive(_)
-                    | TypeKind::Type(_)
-                    | TypeKind::Generic { .. }
-                    | TypeKind::Lambda { .. }
-                    | TypeKind::Enum { .. }
-                    | TypeKind::Union { .. }
-                    | TypeKind::TypeOf(_) => self.is_assignable_to_strip_source_nullable(from, to),
-                },
-                Primitive::Bool
-                | Primitive::String
-                | Primitive::Time
-                | Primitive::Duration
-                | Primitive::Geo => self.is_assignable_to_strip_source_nullable(from, to),
-            },
-
-            // Everything else (Null source, Never source, Type, Generic,
-            // Lambda) defers to the assignability fall-back. Node-tag
+            // Everything else (Null, Never, Type, Generic, Lambda) defers
+            // to the assignability fall-back. Primitives are `Type(core::X)`
+            // and reach here too: their `int<->float` / `char as ..` widening
+            // was already accepted by the top-level block above. Node-tag
             // bivariance / `<node-tag> as int` rules live in
-            // `is_castable_with_index`. `TypeOf` is handled by its own
-            // arm above.
+            // `is_castable_with_index`. `TypeOf` is handled by its own arm.
             TypeKind::Null
             | TypeKind::Never
             | TypeKind::Type(_)
@@ -911,8 +806,9 @@ impl TypeArena {
         {
             return true;
         }
-        // Exhaustive nested match. Same-head identity shapes (Type, Enum)
-        // and primitive widening are accepted; everything else rejects.
+        // Exhaustive nested match. Same-head identity shapes (Type --
+        // which includes the 8 primitives -- and Enum) are accepted;
+        // everything else rejects.
         // Generic / Lambda / Union / GenericParam fall to `false` here —
         // they're rare in the `as`-position fallthrough and would need
         // their own cast-side variance / structural rules to handle
@@ -930,7 +826,6 @@ impl TypeArena {
                 TypeKind::Type(db) => da == db,
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
                 | TypeKind::Enum { .. }
@@ -945,25 +840,9 @@ impl TypeArena {
                 TypeKind::Enum { name: nb, .. } => na == nb,
                 TypeKind::Null
                 | TypeKind::Never
-                | TypeKind::Primitive(_)
                 | TypeKind::Type(_)
                 | TypeKind::Generic { .. }
                 | TypeKind::Lambda { .. }
-                | TypeKind::GenericParam { .. }
-                | TypeKind::Union { .. }
-                | TypeKind::TypeOf(_) => false,
-            },
-            TypeKind::Primitive(pa) => match &to_t.kind {
-                TypeKind::Any | TypeKind::Unresolved { .. } => {
-                    unreachable!("filtered by guards above")
-                }
-                TypeKind::Primitive(pb) => pa == pb,
-                TypeKind::Null
-                | TypeKind::Never
-                | TypeKind::Type(_)
-                | TypeKind::Generic { .. }
-                | TypeKind::Lambda { .. }
-                | TypeKind::Enum { .. }
                 | TypeKind::GenericParam { .. }
                 | TypeKind::Union { .. }
                 | TypeKind::TypeOf(_) => false,
