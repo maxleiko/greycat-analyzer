@@ -2,7 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
+    Builtins, ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
 };
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{Annotation, Decl, Expr, TypeAttr};
@@ -147,42 +147,6 @@ pub struct ProjectIndex {
     ///
     /// Useful for "did stdlib load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
-    /// Canonical `ItemId`s for the 8 native-core primitives, set in
-    /// `with_symbols`. `None` only on a `default()`-constructed index;
-    /// every real index goes through `with_symbols`.
-    builtins: Option<Builtins>,
-}
-
-/// Canonical `ItemId` per native-core primitive. A primitive `int` is
-/// `Type(ItemId(core, int))`; this holds those handles. Std-free: an
-/// `ItemId` is two interned symbols, valid with or without std loaded.
-#[derive(Debug, Clone, Copy)]
-pub struct Builtins {
-    pub bool_: ItemId,
-    pub int: ItemId,
-    pub float: ItemId,
-    pub char_: ItemId,
-    pub string: ItemId,
-    pub time: ItemId,
-    pub duration: ItemId,
-    pub geo: ItemId,
-}
-
-impl Builtins {
-    fn compute(symbols: &SymbolTable) -> Self {
-        let core = symbols.intern("core");
-        let mk = |name: &str| ItemId::new(core, symbols.intern(name));
-        Self {
-            bool_: mk("bool"),
-            int: mk("int"),
-            float: mk("float"),
-            char_: mk("char"),
-            string: mk("String"),
-            time: mk("time"),
-            duration: mk("duration"),
-            geo: mk("geo"),
-        }
-    }
 }
 
 /// Pre-lowered top-level fn signature; `return_ty` is a `TypeId` in the shared arena and may be
@@ -326,7 +290,7 @@ impl ProjectIndex {
             ..Self::default()
         };
         seed_builtin_names(&mut idx.symbols, &mut idx.type_names);
-        idx.builtins = Some(Builtins::compute(&idx.symbols));
+        arena.set_builtins(Builtins::compute(&idx.symbols));
         // Runtime-exposed value-position globals
         // (`Infinity`, `NaN`). Registered here (not in
         // `seed_builtin_names`) because they're values, not types,
@@ -345,15 +309,6 @@ impl ProjectIndex {
     /// borrow.
     pub fn symbol(&self, name: &str) -> Option<Symbol> {
         self.symbols.lookup(name)
-    }
-
-    /// Canonical primitive `ItemId`s (see [`Builtins`]). Panics only on
-    /// a `default()`-constructed index; all real indices go through
-    /// `new` / `with_symbols`.
-    pub fn builtins(&self) -> &Builtins {
-        self.builtins
-            .as_ref()
-            .expect("ProjectIndex::builtins on a default-constructed index")
     }
 
     /// Build an [`ItemId`] for `(uri, name)`. Returns `None` if `uri`
