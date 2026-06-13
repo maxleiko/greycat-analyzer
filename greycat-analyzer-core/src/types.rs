@@ -230,279 +230,6 @@ impl TypeRegistry {
     }
 }
 
-/// `true` iff a value of `from` is assignable to a slot expecting `to`.
-/// The relation handles primitive widening (int → float), nullability
-/// (T → T?), top/bottom (anything → any, never → anything), and shape
-/// matches for generics / tuples / lambdas. User-declared generics are
-/// invariant in their parameters (TS reference behavior).
-///
-/// The body is structured as an **exhaustive** match on `&a.kind` with
-/// each arm an **exhaustive** sub-match on `&b.kind`. A wildcard
-/// `_ => false` would be more compact but would silently absorb any
-/// future `TypeKind` variant (the bug pattern that produced the
-/// `Union → supertype` false negative — see analysis-crate's
-/// `is_assignable_to_with_index` git history). Adding a new variant
-/// now breaks the build in every relevant arm, forcing a conscious
-/// decision about how that shape relates to every other shape.
-///
-/// Inheritance-aware extension (cross-module supertype chains, node-tag
-/// bivariance) lives one layer up in
-/// `greycat_analyzer_analysis::project::is_assignable_to_with_index`.
-pub fn is_assignable_to(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
-    if from == to {
-        return true;
-    }
-    let a = arena.get(from);
-    let b = arena.get(to);
-
-    // Top-level guards. Run before the kind-pair match so the match
-    // doesn't have to repeat `Null | Any | Never | Unresolved` rules
-    // in every source / target arm. After these, the match can
-    // assume: source ≠ Any|Never|Null|Unresolved, target ≠ Any|Unresolved.
-    // (Target Null / target Never can still reach the match — they're
-    // legitimate "from doesn't fit there" cases handled per source-kind.)
-
-    // Null source: `null` flows into anything nullable.
-    if matches!(a.kind, TypeKind::Null) {
-        return b.nullable;
-    }
-    // Never source: bottom type, flows everywhere.
-    if matches!(a.kind, TypeKind::Never) {
-        return true;
-    }
-    // Any target: top type, absorbs everything.
-    if matches!(b.kind, TypeKind::Any) {
-        return true;
-    }
-    // **P20.1** — `any` is *also* the bottom type. The GreyCat
-    // compiler accepts `any → T` for any `T` (it compiles cleanly
-    // and defers the type check to runtime assignment / call time);
-    // the static analyzer must match. Source nullability is ignored:
-    // `any?` → `T` also passes.
-    if matches!(a.kind, TypeKind::Any) {
-        return true;
-    }
-    // P35.3 — `Unresolved` behaves like `any` on either side so a
-    // single unresolved name doesn't fan out into a cascade of
-    // false-positive type-relation diagnostics.
-    if matches!(a.kind, TypeKind::Unresolved { .. })
-        || matches!(b.kind, TypeKind::Unresolved { .. })
-    {
-        return true;
-    }
-    // A non-nullable target rejects a nullable source: `T → T?` is
-    // fine, `T? → T` is not.
-    if a.nullable && !b.nullable {
-        return false;
-    }
-
-    // P7.3 (REMOVED): there is no `node<T> → T` auto-deref subtype
-    // rule. The runtime rejects `var x: T = some_node<T>();` — the
-    // arrow operator (`*n` / `n->m()`) is the *syntactic* desugar for
-    // `n.resolve().m()`, dispatched by the `@deref("resolve")`
-    // annotation on the receiver's type decl.
-
-    // Exhaustive nested match. Source-kind outer, target-kind inner.
-    // The `Any | Unresolved` target arm and the `Null | Any | Never |
-    // Unresolved` source arms are `unreachable!()` — caught by the
-    // guards above. A future TypeKind variant breaks every outer arm
-    // (forcing a source-side decision) AND every inner arm (forcing
-    // a target-side decision per existing source). Cross-kind
-    // rejections are spelled out explicitly per source arm.
-    match &a.kind {
-        TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => {
-            unreachable!("filtered by top-level guards")
-        }
-
-        // Union source: every alt must assign to the target. Target
-        // can itself be a Union — recursive `is_assignable_to` re-
-        // enters the (non-Union-source, Union-target) arm below for
-        // each alt, which uses `any()`.
-        TypeKind::Union { alts } => alts.iter().all(|alt| is_assignable_to(arena, *alt, to)),
-
-        TypeKind::Primitive(pa) => match &b.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => {
-                unreachable!("filtered by top-level guards")
-            }
-            TypeKind::Primitive(pb) => primitive_assignable(*pa, *pb),
-            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-
-        // Decl identity via `ItemId`. Cross-module references
-        // to the same decl share the same `(module, name)` pair.
-        // Supertype-chain assignability lives in
-        // `is_assignable_to_with_index`.
-        TypeKind::Type(da) => match &b.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => {
-                unreachable!("filtered by top-level guards")
-            }
-            TypeKind::Type(db) => da == db,
-            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-
-        // Generic args are invariant
-        // (matches the runtime, not the TS checker). The "all-any
-        // wildcard" rule is *target-only* and asymmetric: `Foo<any?,
-        // any?>` as a TARGET accepts any same-decl instantiation
-        // (raw-form acceptance), but as a SOURCE does NOT flow into a
-        // concrete `Foo<int, T>` — the runtime rejects with
-        // `argument of type 'Foo' is not assignable to parameter of
-        // type 'Foo<int, T>'`. Node-tag bivariance lives in
-        // `is_assignable_to_with_index`.
-        //
-        // Invariance compares args by TypeId — arena interning
-        // collapses structural equality to identity, so two
-        // structurally-equal generic args mint the same `TypeId`.
-        // A bidirectional `is_assignable_to(x, y) && is_assignable_to(y, x)`
-        // fallback would leak P20.1's any-as-bottom rule into the arg
-        // position: `is_assignable_to(any?, int)` returns true via the
-        // top-level `Any` source guard, so `Tuple<any?, any?>` would
-        // falsely flow into `Tuple<int, AbstractType>`.
-        TypeKind::Generic { tpl: da, args: aa } => match &b.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => {
-                unreachable!("filtered by top-level guards")
-            }
-            TypeKind::Generic { tpl: db, args: ab } => {
-                if da == db
-                    && aa.len() == ab.len()
-                    && !ab.is_empty()
-                    && ab
-                        .iter()
-                        .all(|y| matches!(arena.get(*y).kind, TypeKind::Any))
-                {
-                    return true;
-                }
-                da == db && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| *x == *y)
-            }
-            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-
-        // Lambda: contravariant in params, covariant in return.
-        TypeKind::Lambda {
-            params: aparams,
-            ret: aret,
-        } => match &b.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => {
-                unreachable!("filtered by top-level guards")
-            }
-            TypeKind::Lambda {
-                params: bparams,
-                ret: bret,
-            } => {
-                aparams.len() == bparams.len()
-                    && aparams
-                        .iter()
-                        .zip(bparams.as_ref())
-                        .all(|(p_a, p_b)| is_assignable_to(arena, *p_b, *p_a))
-                    && match (aret, bret) {
-                        // Both known: covariant return.
-                        (Some(a), Some(b)) => is_assignable_to(arena, *a, *b),
-                        // Source returns, target discards: fine (slot ignores the value).
-                        (Some(_), None) => true,
-                        // Target wants a return, source produces none: not assignable.
-                        (None, Some(_)) => false,
-                        // Neither side observes a return: identity.
-                        (None, None) => true,
-                    }
-            }
-            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-
-        TypeKind::Enum { name: na, .. } => match &b.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => {
-                unreachable!("filtered by top-level guards")
-            }
-            TypeKind::Enum { name: nb, .. } => na == nb,
-            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-
-        // A generic param `T` (inside a `fn<T>(...)` body) is
-        // an opaque type; without an `InferenceTable` witness it
-        // doesn't assign to anything concrete except via the top-
-        // level `Any`/`Unresolved` guards. Identity is handled by
-        // the `from == to` early-return at the top of the function.
-        // Target Union still gets the per-alt `any()` retry.
-        TypeKind::GenericParam { .. } => match &b.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => {
-                unreachable!("filtered by top-level guards")
-            }
-            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-
-        // P-typeof — `TypeOf(X)` is a *type-literal value*, modelled
-        // as a distinct kind from its inner. Identity is by inner-
-        // TypeId; equality short-circuits via the `from == to`
-        // top-of-function check. Cross-kind targets reject. The
-        // analyzer-side `is_assignable_to_with_index` adds the
-        // `TypeOf(X) → Type(core::type)` widening so stdlib functions
-        // typed `(t: type)` still accept type-literal arguments.
-        TypeKind::TypeOf(_) => match &b.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => {
-                unreachable!("filtered by top-level guards")
-            }
-            TypeKind::TypeOf(_) => false, // identity is the `from == to` early-return above
-            TypeKind::Union { alts } => alts.iter().any(|alt| is_assignable_to(arena, from, *alt)),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. } => false,
-        },
-    }
-}
-
 /// Per-call constraint table that records "type-parameter `T` was
 /// witnessed at type `…`" pairs as the analyzer walks a generic call
 /// site. After all arguments have been visited, [`InferenceTable::solve`]
@@ -584,280 +311,6 @@ impl InferenceTable {
     }
 }
 
-/// `true` iff `from` can be casted to `to` via the GreyCat `as` operator.
-///
-/// Mirrors the TS reference's `isCastable` (`packages/lang/src/analysis/
-/// utils.ts:360`). Cast rules are asymmetric to assignability — `int as
-/// nodeTime` is allowed even though `int` doesn't assign-flow into
-/// `nodeTime`. Implements (deeper node-tag rules):
-/// - `any → any` always.
-/// - Nullables: `T?` casts the same as `T`.
-/// - `int ↔ {int, float, node{,Time,List,Index,Geo}}`.
-/// - `float ↔ {int, float}`.
-/// - `node{,Time,List,Index,Geo} ↔ {self, int}`.
-/// - `String ↔ String`.
-/// - `char ↔ {char, String, int}`.
-/// - `bool ↔ bool`.
-/// - Enums → `int`.
-/// - Anything else falls through to "same head name OR `from` assignable
-///   to `to` (no inheritance check yet — that lands when supertype
-///   chains thread through the analyzer)".
-pub fn is_castable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
-    // trivial cast to itself is valid
-    if from == to {
-        return true;
-    }
-
-    let from_t = arena.get(from);
-    let to_t = arena.get(to);
-
-    // Top-level guards: same shape as `is_assignable_to`'s guards
-    // (top/bottom type absorption, unresolved-as-any) plus two
-    // cast-specific rules: a `GenericParam` target always passes
-    // (runtime decides at instantiation time, P19.14), and `Any`
-    // target absorbs only non-null sources (`null as any` rejects).
-    if matches!(to_t.kind, TypeKind::Any) && !from_t.nullable {
-        return true;
-    }
-    if matches!(to_t.kind, TypeKind::GenericParam { .. }) {
-        return true;
-    }
-    if matches!(to_t.kind, TypeKind::Unresolved { .. } | TypeKind::Any)
-        || matches!(from_t.kind, TypeKind::Unresolved { .. } | TypeKind::Any)
-    {
-        return true;
-    }
-
-    // Exhaustive nested match. Same rationale as `is_assignable_to`:
-    // a `_ =>` fall-through would silently absorb future TypeKind
-    // variants. Cast-specific rules layered on top of an
-    // assignability fall-back (`is_assignable_to_strip_source_nullable`)
-    // for same-head identity / primitive widening shapes. The
-    // fall-back fires per source-kind where no cast-specific rule
-    // applies — spelled out explicitly per arm.
-    match &from_t.kind {
-        TypeKind::Any | TypeKind::Unresolved { .. } => unreachable!("filtered by top-level guards"),
-
-        // `T as Foo` (where `T` is a generic param)
-        // is allowed: the runtime decides at instantiation time.
-        TypeKind::GenericParam { .. } => true,
-
-        // P-typeof — type-literal value. The runtime treats `as` as
-        // dropped (per the `runtime drops as casts entirely` rule),
-        // so cast strictness mirrors assignability: identity through
-        // the `from == to` short-circuit at the top of
-        // `is_assignable_to`, plus the assignability fall-back below.
-        TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
-
-        // Union source: cast iff ANY alt is castable to target.
-        // `as` is a runtime-checked downcast — `(A | B) as A` is
-        // accepted because the value MIGHT be `A`; if it turns out to
-        // be `B` at runtime, the cast panics, which is the documented
-        // behavior of `as`. Requiring `.all()` instead would reject
-        // the canonical narrow-back-after-?? pattern (kopr's
-        // `var x = lhs.get() ?? rhs.get(); ... x as node<L>`).
-        // Assignability uses `.all()` for the same shape because
-        // assignment is total — no runtime check stands behind it.
-        TypeKind::Union { alts } => alts.iter().any(|alt| is_castable(arena, *alt, to)),
-
-        // Enum source: castable to `int` (runtime representation) or
-        // anything assignable from the same enum.
-        TypeKind::Enum { .. } => {
-            if is_int_target(to_t) {
-                return true;
-            }
-            is_assignable_to_strip_source_nullable(arena, from, to)
-        }
-
-        // Primitive source: cast-specific widening rules layered on
-        // top of `int as <node-tag>` (handled in
-        // `is_castable_with_index`), then assignability fall-back.
-        TypeKind::Primitive(p) => match p {
-            Primitive::Int => match &to_t.kind {
-                TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
-                    unreachable!("filtered by top-level guards")
-                }
-                TypeKind::Primitive(Primitive::Float) => true,
-                TypeKind::Null
-                | TypeKind::Never
-                | TypeKind::Primitive(_)
-                | TypeKind::Type(_)
-                | TypeKind::Generic { .. }
-                | TypeKind::Lambda { .. }
-                | TypeKind::Enum { .. }
-                | TypeKind::Union { .. }
-                | TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
-            },
-            Primitive::Float => match &to_t.kind {
-                TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
-                    unreachable!("filtered by top-level guards")
-                }
-                TypeKind::Primitive(Primitive::Int) => true,
-                TypeKind::Null
-                | TypeKind::Never
-                | TypeKind::Primitive(_)
-                | TypeKind::Type(_)
-                | TypeKind::Generic { .. }
-                | TypeKind::Lambda { .. }
-                | TypeKind::Enum { .. }
-                | TypeKind::Union { .. }
-                | TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
-            },
-            Primitive::Char => match &to_t.kind {
-                TypeKind::Any | TypeKind::Unresolved { .. } | TypeKind::GenericParam { .. } => {
-                    unreachable!("filtered by top-level guards")
-                }
-                TypeKind::Primitive(Primitive::String | Primitive::Int) => true,
-                TypeKind::Null
-                | TypeKind::Never
-                | TypeKind::Primitive(_)
-                | TypeKind::Type(_)
-                | TypeKind::Generic { .. }
-                | TypeKind::Lambda { .. }
-                | TypeKind::Enum { .. }
-                | TypeKind::Union { .. }
-                | TypeKind::TypeOf(_) => is_assignable_to_strip_source_nullable(arena, from, to),
-            },
-            Primitive::Bool
-            | Primitive::String
-            | Primitive::Time
-            | Primitive::Duration
-            | Primitive::Geo => is_assignable_to_strip_source_nullable(arena, from, to),
-        },
-
-        // Everything else (Null source, Never source, Type, Generic,
-        // Lambda) defers to the assignability fall-back. Node-tag
-        // bivariance / `<node-tag> as int` rules live in
-        // `is_castable_with_index`. `TypeOf` is handled by its own
-        // arm above.
-        TypeKind::Null
-        | TypeKind::Never
-        | TypeKind::Type(_)
-        | TypeKind::Generic { .. }
-        | TypeKind::Lambda { .. } => is_assignable_to_strip_source_nullable(arena, from, to),
-    }
-}
-
-/// Same as `is_assignable_to` but treats the source as if its nullable
-/// flag were stripped. Used by `is_castable`'s fall-back: a cast is
-/// permitted to coerce `T?` to a non-nullable target — the runtime
-/// decides at execution time whether the actual value can land there.
-///
-/// When the source isn't nullable, delegates straight to
-/// `is_assignable_to`. When it is, we re-do the cheap kind-based
-/// dispatch inline (the arena is `&`, not `&mut`, so we can't intern a
-/// stripped clone and recurse). The inline match is **exhaustive** for
-/// the same reason as `is_assignable_to`: a `_ => false` would silently
-/// absorb future variants.
-fn is_assignable_to_strip_source_nullable(arena: &TypeArena, from: TypeId, to: TypeId) -> bool {
-    let from_t = arena.get(from);
-    if !from_t.nullable {
-        return is_assignable_to(arena, from, to);
-    }
-    // Top-level guards mirror `is_assignable_to`'s — minus the
-    // `a.nullable && !b.nullable` bail we're explicitly trying to skip.
-    let to_t = arena.get(to);
-    if matches!(from_t.kind, TypeKind::Null) {
-        return to_t.nullable;
-    }
-    if matches!(from_t.kind, TypeKind::Never) {
-        return true;
-    }
-    if matches!(to_t.kind, TypeKind::Any) {
-        return true;
-    }
-    if matches!(from_t.kind, TypeKind::Any) {
-        return true;
-    }
-    if matches!(from_t.kind, TypeKind::Unresolved { .. })
-        || matches!(to_t.kind, TypeKind::Unresolved { .. })
-    {
-        return true;
-    }
-    // Exhaustive nested match. Same-head identity shapes (Type, Enum)
-    // and primitive widening are accepted; everything else rejects.
-    // Generic / Lambda / Union / GenericParam fall to `false` here —
-    // they're rare in the `as`-position fallthrough and would need
-    // their own cast-side variance / structural rules to handle
-    // correctly. (If we ever lift those, this match is the one place
-    // to teach.)
-    match &from_t.kind {
-        TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => {
-            unreachable!("filtered by guards above")
-        }
-
-        TypeKind::Type(da) => match &to_t.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => unreachable!("filtered by guards above"),
-            TypeKind::Type(db) => da == db,
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::Union { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-        TypeKind::Enum { name: na, .. } => match &to_t.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => unreachable!("filtered by guards above"),
-            TypeKind::Enum { name: nb, .. } => na == nb,
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Primitive(_)
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::Union { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-        TypeKind::Primitive(pa) => match &to_t.kind {
-            TypeKind::Any | TypeKind::Unresolved { .. } => unreachable!("filtered by guards above"),
-            TypeKind::Primitive(pb) => primitive_assignable(*pa, *pb),
-            TypeKind::Null
-            | TypeKind::Never
-            | TypeKind::Type(_)
-            | TypeKind::Generic { .. }
-            | TypeKind::Lambda { .. }
-            | TypeKind::Enum { .. }
-            | TypeKind::GenericParam { .. }
-            | TypeKind::Union { .. }
-            | TypeKind::TypeOf(_) => false,
-        },
-        // P-typeof — source nullability stripped. `TypeOf(X) → TypeOf(Y)`
-        // is identity through `from == to`; nothing else accepts.
-        TypeKind::TypeOf(_) => false,
-        TypeKind::Generic { .. }
-        | TypeKind::Lambda { .. }
-        | TypeKind::GenericParam { .. }
-        | TypeKind::Union { .. } => false,
-    }
-}
-
-fn is_int_target(t: &Type) -> bool {
-    matches!(t.kind, TypeKind::Primitive(Primitive::Int))
-}
-
-fn primitive_assignable(from: Primitive, to: Primitive) -> bool {
-    // GreyCat's runtime rejects every primitive-to-primitive
-    // widening at parameter / variable binding (verified via
-    // `greycat run`: `var i: int = 1; take(i)` against `take(_: float)`
-    // is rejected as "argument of type 'int' is not assignable to
-    // parameter '_' of type 'float'"). Literals can lower to a
-    // matching primitive at use site (`var f: float = 1` is fine
-    // because `1` lowers to `float` in that position) but bindings
-    // do not widen. Even `int → float`, the canonical TS-reference
-    // widening, fails. Mirror the runtime: identity only.
-    from == to
-}
-
-// Type display (decl-name aware) lives in the analysis crate —
-// see `greycat_analyzer_analysis::project::display_type` for the
-// `TypeWithDecls` wrapper, `greycat_analyzer_analysis::display_fqn`
-// for fully-qualified rendering. Core does not own a `SymbolTable`
-// and therefore cannot resolve `ItemId` halves back to source text.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,14 +383,14 @@ mod tests {
         let f = cx.arena.primitive(Primitive::Float);
         let s = cx.arena.primitive(Primitive::String);
         let c = cx.arena.primitive(Primitive::Char);
-        assert!(!is_assignable_to(&cx.arena, i, f));
-        assert!(!is_assignable_to(&cx.arena, f, i));
-        assert!(!is_assignable_to(&cx.arena, c, i));
-        assert!(!is_assignable_to(&cx.arena, i, c));
-        assert!(!is_assignable_to(&cx.arena, c, s));
-        assert!(!is_assignable_to(&cx.arena, s, c));
-        assert!(is_assignable_to(&cx.arena, i, i));
-        assert!(is_assignable_to(&cx.arena, f, f));
+        assert!(!cx.arena.is_assignable_to(i, f));
+        assert!(!cx.arena.is_assignable_to(f, i));
+        assert!(!cx.arena.is_assignable_to(c, i));
+        assert!(!cx.arena.is_assignable_to(i, c));
+        assert!(!cx.arena.is_assignable_to(c, s));
+        assert!(!cx.arena.is_assignable_to(s, c));
+        assert!(cx.arena.is_assignable_to(i, i));
+        assert!(cx.arena.is_assignable_to(f, f));
     }
 
     #[test]
@@ -946,8 +399,8 @@ mod tests {
         let null = cx.arena.null();
         let int = cx.arena.primitive(Primitive::Int);
         let int_q = cx.arena.nullable(int);
-        assert!(is_assignable_to(&cx.arena, null, int_q));
-        assert!(!is_assignable_to(&cx.arena, null, int));
+        assert!(cx.arena.is_assignable_to(null, int_q));
+        assert!(!cx.arena.is_assignable_to(null, int));
     }
 
     #[test]
@@ -955,8 +408,8 @@ mod tests {
         let mut cx = TextCx::default();
         let int = cx.arena.primitive(Primitive::Int);
         let int_q = cx.arena.nullable(int);
-        assert!(is_assignable_to(&cx.arena, int, int_q));
-        assert!(!is_assignable_to(&cx.arena, int_q, int));
+        assert!(cx.arena.is_assignable_to(int, int_q));
+        assert!(!cx.arena.is_assignable_to(int_q, int));
     }
 
     #[test]
@@ -965,8 +418,8 @@ mod tests {
         let int = cx.arena.primitive(Primitive::Int);
         let any = cx.arena.any();
         let never = cx.arena.never();
-        assert!(is_assignable_to(&cx.arena, int, any));
-        assert!(is_assignable_to(&cx.arena, never, int));
+        assert!(cx.arena.is_assignable_to(int, any));
+        assert!(cx.arena.is_assignable_to(never, int));
     }
 
     #[test]
@@ -982,9 +435,9 @@ mod tests {
         // widens to `float`, `Array<int>` is **not** assignable to
         // `Array<float>` (the runtime rejects this — we trust the
         // runtime as the oracle). The reverse is also rejected.
-        assert!(!is_assignable_to(&cx.arena, arr_int, arr_float));
-        assert!(!is_assignable_to(&cx.arena, arr_float, arr_int));
-        assert!(is_assignable_to(&cx.arena, arr_int, arr_int));
+        assert!(!cx.arena.is_assignable_to(arr_int, arr_float));
+        assert!(!cx.arena.is_assignable_to(arr_float, arr_int));
+        assert!(cx.arena.is_assignable_to(arr_int, arr_int));
     }
 
     #[test]
@@ -998,7 +451,7 @@ mod tests {
         // Different generic names with the same args still mismatch.
         // Inheritance-aware assignability (`type Child<T> extends
         // Parent<T>`) is a later phase.
-        assert!(!is_assignable_to(&cx.arena, arr_int, set_int));
+        assert!(!cx.arena.is_assignable_to(arr_int, set_int));
     }
 
     #[test]
@@ -1016,8 +469,8 @@ mod tests {
         //   * f2 → f1: param needs `any → int` ✓ (P20.1), return needs `any → int` ✓.
         let f1 = cx.arena.lambda(vec![any], Some(int));
         let f2 = cx.arena.lambda(vec![int], Some(any));
-        assert!(is_assignable_to(&cx.arena, f1, f2));
-        assert!(is_assignable_to(&cx.arena, f2, f1));
+        assert!(cx.arena.is_assignable_to(f1, f2));
+        assert!(cx.arena.is_assignable_to(f2, f1));
     }
 
     #[test]
@@ -1028,8 +481,8 @@ mod tests {
         // bidirectionality from P20.1 — no slot count, no relation.
         let f1 = cx.arena.lambda(vec![int], Some(int));
         let f2 = cx.arena.lambda(vec![int, int], Some(int));
-        assert!(!is_assignable_to(&cx.arena, f1, f2));
-        assert!(!is_assignable_to(&cx.arena, f2, f1));
+        assert!(!cx.arena.is_assignable_to(f1, f2));
+        assert!(!cx.arena.is_assignable_to(f2, f1));
     }
 
     #[test]
@@ -1043,10 +496,10 @@ mod tests {
             },
             nullable: false,
         });
-        assert!(is_assignable_to(&cx.arena, int, union));
-        assert!(is_assignable_to(&cx.arena, str_t, union));
+        assert!(cx.arena.is_assignable_to(int, union));
+        assert!(cx.arena.is_assignable_to(str_t, union));
         let bool_t = cx.arena.primitive(Primitive::Bool);
-        assert!(!is_assignable_to(&cx.arena, bool_t, union));
+        assert!(!cx.arena.is_assignable_to(bool_t, union));
     }
 
     #[test]
@@ -1090,8 +543,8 @@ mod tests {
         let person = cx.arena.alloc_type(person_decl);
         let node_decl = cx.item("node");
         let node_person = cx.arena.alloc_generic(node_decl, vec![person]);
-        assert!(!is_assignable_to(&cx.arena, node_person, person));
-        assert!(!is_assignable_to(&cx.arena, person, node_person));
+        assert!(!cx.arena.is_assignable_to(node_person, person));
+        assert!(!cx.arena.is_assignable_to(person, node_person));
     }
 
     #[test]

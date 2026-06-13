@@ -28,7 +28,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::{
     GenericOwner, InferenceTable, ItemId, Primitive, Symbol, SymbolTable, Type, TypeArena, TypeId,
-    TypeKind, TypeRegistry, is_assignable_to,
+    TypeKind, TypeRegistry,
 };
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::types::{
@@ -1207,7 +1207,7 @@ impl<'a> Cx<'a> {
                     if cand == other {
                         continue;
                     }
-                    if !is_assignable_to(self.arena, cand, other) {
+                    if !self.arena.is_assignable_to(cand, other) {
                         continue 'outer;
                     }
                 }

@@ -19,9 +19,7 @@
 //! ```
 //! against the live stdlib. Tests below assert the runtime outcome.
 
-use greycat_analyzer_core::{
-    ItemId, Primitive, SymbolTable, TypeArena, is_assignable_to, is_castable,
-};
+use greycat_analyzer_core::{ItemId, Primitive, SymbolTable, TypeArena};
 
 fn arena() -> TypeArena {
     TypeArena::new()
@@ -46,7 +44,7 @@ fn synth_decl(name: &str) -> ItemId {
 fn rt_int_to_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
-    assert!(is_assignable_to(&a, i, i));
+    assert!(a.is_assignable_to(i, i));
 }
 
 #[test]
@@ -56,7 +54,7 @@ fn rt_int_to_float_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let f = a.primitive(Primitive::Float);
-    assert!(!is_assignable_to(&a, i, f));
+    assert!(!a.is_assignable_to(i, f));
 }
 
 #[test]
@@ -64,7 +62,7 @@ fn rt_float_to_int_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let f = a.primitive(Primitive::Float);
-    assert!(!is_assignable_to(&a, f, i));
+    assert!(!a.is_assignable_to(f, i));
 }
 
 #[test]
@@ -72,7 +70,7 @@ fn rt_char_to_int_rejected() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let c = a.primitive(Primitive::Char);
-    assert!(!is_assignable_to(&a, c, i));
+    assert!(!a.is_assignable_to(c, i));
 }
 
 #[test]
@@ -80,7 +78,7 @@ fn rt_string_to_char_rejected() {
     let mut a = arena();
     let s = a.primitive(Primitive::String);
     let c = a.primitive(Primitive::Char);
-    assert!(!is_assignable_to(&a, s, c));
+    assert!(!a.is_assignable_to(s, c));
 }
 
 // =============================================================================
@@ -94,7 +92,7 @@ fn rt_int_to_any_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let any = a.any();
-    assert!(is_assignable_to(&a, i, any));
+    assert!(a.is_assignable_to(i, any));
 }
 
 #[test]
@@ -112,7 +110,7 @@ fn rt_any_to_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let any = a.any();
-    assert!(is_assignable_to(&a, any, i));
+    assert!(a.is_assignable_to(any, i));
 }
 
 #[test]
@@ -120,7 +118,7 @@ fn rt_string_to_any_allowed() {
     let mut a = arena();
     let s = a.primitive(Primitive::String);
     let any = a.any();
-    assert!(is_assignable_to(&a, s, any));
+    assert!(a.is_assignable_to(s, any));
 }
 
 // =============================================================================
@@ -134,7 +132,7 @@ fn rt_int_to_nullable_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    assert!(is_assignable_to(&a, i, i_q));
+    assert!(a.is_assignable_to(i, i_q));
 }
 
 #[test]
@@ -144,7 +142,7 @@ fn rt_nullable_int_to_int_rejected_when_null() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
-    assert!(!is_assignable_to(&a, i_q, i));
+    assert!(!a.is_assignable_to(i_q, i));
 }
 
 #[test]
@@ -153,8 +151,8 @@ fn rt_null_to_nullable_allowed() {
     let i = a.primitive(Primitive::Int);
     let i_q = a.nullable(i);
     let n = a.null();
-    assert!(is_assignable_to(&a, n, i_q));
-    assert!(!is_assignable_to(&a, n, i));
+    assert!(a.is_assignable_to(n, i_q));
+    assert!(!a.is_assignable_to(n, i));
 }
 
 // =============================================================================
@@ -166,7 +164,7 @@ fn rt_array_int_to_array_int_allowed() {
     let mut a = arena();
     let i = a.primitive(Primitive::Int);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
-    assert!(is_assignable_to(&a, arr_i, arr_i));
+    assert!(a.is_assignable_to(arr_i, arr_i));
 }
 
 #[test]
@@ -178,8 +176,8 @@ fn rt_array_int_to_array_float_rejected() {
     let f = a.primitive(Primitive::Float);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_f = a.alloc_generic(synth_decl("Array"), vec![f]);
-    assert!(!is_assignable_to(&a, arr_i, arr_f));
-    assert!(!is_assignable_to(&a, arr_f, arr_i));
+    assert!(!a.is_assignable_to(arr_i, arr_f));
+    assert!(!a.is_assignable_to(arr_f, arr_i));
 }
 
 #[test]
@@ -194,7 +192,7 @@ fn rt_array_int_to_array_nullable_int_rejected() {
     let i_q = a.nullable(i);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_iq = a.alloc_generic(synth_decl("Array"), vec![i_q]);
-    assert!(!is_assignable_to(&a, arr_i, arr_iq));
+    assert!(!a.is_assignable_to(arr_i, arr_iq));
 }
 
 // =============================================================================
@@ -208,7 +206,7 @@ fn rt_tuple_identity_allowed() {
     let s = a.primitive(Primitive::String);
     let t1 = a.tuple(synth_decl("Tuple"), i, s);
     let t2 = a.tuple(synth_decl("Tuple"), i, s);
-    assert!(is_assignable_to(&a, t1, t2));
+    assert!(a.is_assignable_to(t1, t2));
 }
 
 #[test]
@@ -219,7 +217,7 @@ fn rt_tuple_element_mismatch_rejected() {
     let f = a.primitive(Primitive::Float);
     let t1 = a.tuple(synth_decl("Tuple"), i, s);
     let t2 = a.tuple(synth_decl("Tuple"), f, s);
-    assert!(!is_assignable_to(&a, t1, t2));
+    assert!(!a.is_assignable_to(t1, t2));
 }
 
 // Asymmetric wildcard direction. The runtime accepts
@@ -245,7 +243,7 @@ fn rt_tuple_concrete_to_all_any_target_allowed() {
     let any_q = a.any_nullable();
     let concrete = a.tuple(synth_decl("Tuple"), i, foo);
     let raw = a.tuple(synth_decl("Tuple"), any_q, any_q);
-    assert!(is_assignable_to(&a, concrete, raw));
+    assert!(a.is_assignable_to(concrete, raw));
 }
 
 #[test]
@@ -256,7 +254,7 @@ fn rt_tuple_all_any_source_to_concrete_rejected() {
     let any_q = a.any_nullable();
     let concrete = a.tuple(synth_decl("Tuple"), i, foo);
     let raw = a.tuple(synth_decl("Tuple"), any_q, any_q);
-    assert!(!is_assignable_to(&a, raw, concrete));
+    assert!(!a.is_assignable_to(raw, concrete));
 }
 
 #[test]
@@ -268,8 +266,8 @@ fn rt_array_all_any_source_to_concrete_rejected() {
     let any_q = a.any_nullable();
     let arr_concrete = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_raw = a.alloc_generic(synth_decl("Array"), vec![any_q]);
-    assert!(is_assignable_to(&a, arr_concrete, arr_raw));
-    assert!(!is_assignable_to(&a, arr_raw, arr_concrete));
+    assert!(a.is_assignable_to(arr_concrete, arr_raw));
+    assert!(!a.is_assignable_to(arr_raw, arr_concrete));
 }
 
 // =============================================================================
@@ -289,7 +287,7 @@ fn rt_cast_string_to_int_rejected() {
     let mut a = arena();
     let s = a.primitive(Primitive::String);
     let i = a.primitive(Primitive::Int);
-    assert!(!is_castable(&a, s, i));
+    assert!(!a.is_castable(s, i));
 }
 
 #[test]
@@ -297,7 +295,7 @@ fn rt_cast_char_to_int_allowed() {
     let mut a = arena();
     let c = a.primitive(Primitive::Char);
     let i = a.primitive(Primitive::Int);
-    assert!(is_castable(&a, c, i));
+    assert!(a.is_castable(c, i));
 }
 
 // =============================================================================
@@ -318,8 +316,8 @@ fn rt_generic_param_substitution_through_inference_table() {
     let t2 = a.generic_param(t_sym);
     let u = a.generic_param(u_sym);
     assert_eq!(t1, t2, "interning should collapse identical GenericParams");
-    assert!(is_assignable_to(&a, t1, t2));
-    assert!(!is_assignable_to(&a, t1, u));
+    assert!(a.is_assignable_to(t1, t2));
+    assert!(!a.is_assignable_to(t1, u));
 }
 
 // =============================================================================
@@ -359,8 +357,8 @@ fn rt_array_int_to_array_nullable_int_still_rejected() {
     let i_q = a.nullable(i);
     let arr_i = a.alloc_generic(synth_decl("Array"), vec![i]);
     let arr_iq = a.alloc_generic(synth_decl("Array"), vec![i_q]);
-    assert!(!is_assignable_to(&a, arr_i, arr_iq));
-    assert!(!is_assignable_to(&a, arr_iq, arr_i));
+    assert!(!a.is_assignable_to(arr_i, arr_iq));
+    assert!(!a.is_assignable_to(arr_iq, arr_i));
 }
 
 // =============================================================================
@@ -427,7 +425,7 @@ fn rt_cast_nullable_decl_to_non_nullable_decl() {
     let mut a = arena();
     let foo = a.alloc_type(synth_decl("Foo"));
     let foo_q = a.nullable(foo);
-    assert!(is_castable(&a, foo_q, foo));
+    assert!(a.is_castable(foo_q, foo));
 }
 
 #[test]
@@ -449,7 +447,7 @@ fn rt_cast_nullable_enum_shape_to_non_nullable_enum_shape() {
         nullable: false,
     });
     let enum_q = a.nullable(enum_id);
-    assert!(is_castable(&a, enum_q, enum_id));
+    assert!(a.is_castable(enum_q, enum_id));
 }
 
 #[test]
@@ -460,5 +458,5 @@ fn rt_cast_non_nullable_decl_to_self_still_works() {
     // must still pass.
     let mut a = arena();
     let foo = a.alloc_type(synth_decl("FooSelf"));
-    assert!(is_castable(&a, foo, foo));
+    assert!(a.is_castable(foo, foo));
 }

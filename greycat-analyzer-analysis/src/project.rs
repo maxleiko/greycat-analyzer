@@ -29,7 +29,7 @@ use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
     GenericOwner, ItemId, Primitive, SourceManager, Symbol, SymbolTable, TypeArena, TypeId,
-    TypeKind, is_assignable_to, is_castable,
+    TypeKind,
 };
 use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir, lower_module};
@@ -1291,7 +1291,7 @@ pub(crate) fn is_assignable_to_with_index(
     from: TypeId,
     to: TypeId,
 ) -> bool {
-    if is_assignable_to(arena, from, to) {
+    if arena.is_assignable_to(from, to) {
         return true;
     }
     let a_nullable = arena.get(from).nullable;
@@ -1363,7 +1363,7 @@ pub(crate) fn is_assignable_to_with_index(
             // fully concrete.
             TypeKind::Generic { .. } => {
                 walk_substituted_supertype_chain(index, arena, sub, &[], |arena, hop| {
-                    is_assignable_to(arena, hop, to)
+                    arena.is_assignable_to(hop, to)
                 })
             }
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
@@ -1411,7 +1411,7 @@ pub(crate) fn is_assignable_to_with_index(
             // `Quantizer<Array<int>>`.
             TypeKind::Generic { .. } => {
                 walk_substituted_supertype_chain(index, arena, da, &aa, |arena, hop| {
-                    is_assignable_to(arena, hop, to)
+                    arena.is_assignable_to(hop, to)
                 })
             }
             TypeKind::Union { alts } => alts.into_iter().any(|alt| {
@@ -1564,7 +1564,7 @@ pub(crate) fn is_castable_with_index(
     from: TypeId,
     to: TypeId,
 ) -> bool {
-    if is_castable(arena, from, to) {
+    if arena.is_castable(from, to) {
         return true;
     }
     // Clone kinds upfront so the immutable arena borrow ends before
@@ -1627,7 +1627,7 @@ pub(crate) fn is_castable_with_index(
                 // `is_castable` per-hop.
                 if index.is_subtype_of_decl(fd, td) {
                     walk_substituted_supertype_chain(index, arena, fd, &[], |arena, hop| {
-                        is_castable(arena, hop, to)
+                        arena.is_castable(hop, to)
                     })
                 } else if index.is_subtype_of_decl(td, fd) {
                     // Downcast (Sup → Sub<args>): walk Sub (the more-
@@ -1644,7 +1644,7 @@ pub(crate) fn is_castable_with_index(
                         arena,
                         td,
                         &to_decl_args,
-                        |arena, hop| is_castable(arena, hop, from),
+                        |arena, hop| arena.is_castable(hop, from),
                     )
                 } else {
                     false
@@ -1679,14 +1679,14 @@ pub(crate) fn is_castable_with_index(
                     // Sub's chain with its args; hop matching Sup
                     // (non-generic) is the destination.
                     walk_substituted_supertype_chain(index, arena, fd, &fa, |arena, hop| {
-                        is_castable(arena, hop, to)
+                        arena.is_castable(hop, to)
                     })
                 } else if index.is_subtype_of_decl(td, fd) {
                     // Downcast: target is non-generic but its decl is
                     // a subtype of source's decl. Walk target's chain
                     // (no args), per-hop check against source.
                     walk_substituted_supertype_chain(index, arena, td, &[], |arena, hop| {
-                        is_castable(arena, hop, from)
+                        arena.is_castable(hop, from)
                     })
                 } else {
                     false
@@ -1706,7 +1706,7 @@ pub(crate) fn is_castable_with_index(
                 } else if index.is_subtype_of_decl(fd, td) {
                     // Upcast: walk source's chain with source's args.
                     walk_substituted_supertype_chain(index, arena, fd, &fa, |arena, hop| {
-                        is_castable(arena, hop, to)
+                        arena.is_castable(hop, to)
                     })
                 } else if index.is_subtype_of_decl(td, fd) {
                     // Downcast: walk target's chain with target's args,
@@ -1714,7 +1714,7 @@ pub(crate) fn is_castable_with_index(
                     // invariantly by core's `is_castable`.
                     let ta_owned = ta.to_vec();
                     walk_substituted_supertype_chain(index, arena, td, &ta_owned, |arena, hop| {
-                        is_castable(arena, hop, from)
+                        arena.is_castable(hop, from)
                     })
                 } else {
                     false
@@ -4641,7 +4641,7 @@ fn validate_module_type_relations(
         let Some(ty) = analysis.expr_types.get(&expr_id).copied() else {
             return;
         };
-        if is_assignable_to(arena, ty, bool_t) {
+        if arena.is_assignable_to(ty, bool_t) {
             return;
         }
         let got = display_type(arena, decl_registry, &index.symbols, ty);
