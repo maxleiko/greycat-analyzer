@@ -255,6 +255,21 @@ pub fn goto_definition_across_project(
         encoding,
     )?;
 
+    // Same-module member (`a.b` / `a.method()`): the binding lives in the
+    // real project's `member_uses`, not `Resolutions`. The cross-module
+    // `foreign_member_lookup` below only covers foreign members.
+    if let Some(member) = module.analysis.member_lookup(cursor_idx) {
+        let name = match member {
+            MemberDef::Attr(attr_id) => module.hir.type_attrs[attr_id].name,
+            MemberDef::Method(decl_id) => module.hir.decls[decl_id].name()?,
+        };
+        let range = module.hir.idents[name].byte_range.clone();
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: cursor_uri.clone(),
+            range: byte_range_to_lsp(&doc.text, &range, encoding),
+        }));
+    }
+
     if let Some(Definition::ProjectDecl {
         uri: foreign_uri,
         decl,
