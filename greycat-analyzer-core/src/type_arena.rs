@@ -36,12 +36,23 @@ pub struct Builtins {
     /// above, which a nominal `Type(core::X)` can't encode.
     pub any_key: ItemKey,
     pub null_key: ItemKey,
+    /// Stable-core decl identities the analyzer dispatches on by `ItemKey`
+    /// (always seeded, std loaded or not): `Array` / `Map` literal typing,
+    /// `Tuple` desugaring, and the `type` / `field` / `function` sentinels.
+    /// Node-tag identity derives from the `node*` slots above via
+    /// [`TypeArena::is_node_tag`].
+    pub array_key: ItemKey,
+    pub map_key: ItemKey,
+    pub tuple_key: ItemKey,
+    pub type_key: ItemKey,
+    pub field_key: ItemKey,
+    pub function_key: ItemKey,
 }
 
 impl Builtins {
     /// The always-available core type names: the 8 primitives, the 5
     /// `node` tags, and `any` / `null`. Their `core::X` identity holds
-    /// with or without `core.gcl` loaded, so `resolve_item` (type
+    /// with or without `core.gcl` loaded, so `resolve_type` (type
     /// lowering) and `has_name` (the resolver's known-name fallback) both
     /// recognise them in a std-free project.
     const CORE_TYPE_NAMES: [&'static str; 15] = [
@@ -65,6 +76,26 @@ impl Builtins {
     /// `true` iff `name` is one of [`Self::CORE_TYPE_NAMES`].
     pub fn is_core_type_name(name: &str) -> bool {
         Self::CORE_TYPE_NAMES.contains(&name)
+    }
+
+    /// The 5 core node-tag decls and their generic arity (from
+    /// `lib/std/core.gcl`): `node` / `nodeTime` / `nodeList` / `nodeGeo`
+    /// are arity 1, `nodeIndex<K, V>` is arity 2. Lets a bare node tag
+    /// raw-form (`node` == `node<any?>`) even without `core.gcl` loaded.
+    pub const NODE_TAGS: [(&'static str, usize); 5] = [
+        ("node", 1),
+        ("nodeTime", 1),
+        ("nodeIndex", 2),
+        ("nodeList", 1),
+        ("nodeGeo", 1),
+    ];
+
+    /// Raw-form arity of a bare node-tag `name`; `None` if not a node tag.
+    pub fn node_tag_arity(name: &str) -> Option<usize> {
+        Self::NODE_TAGS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, a)| *a)
     }
 }
 
@@ -126,6 +157,12 @@ impl TypeArena {
         let core = symbols.intern("core");
         let any_key = ItemKey::new(core, symbols.intern("any"));
         let null_key = ItemKey::new(core, symbols.intern("null"));
+        let array_key = ItemKey::new(core, symbols.intern("Array"));
+        let map_key = ItemKey::new(core, symbols.intern("Map"));
+        let tuple_key = ItemKey::new(core, symbols.intern("Tuple"));
+        let type_key = ItemKey::new(core, symbols.intern("type"));
+        let field_key = ItemKey::new(core, symbols.intern("field"));
+        let function_key = ItemKey::new(core, symbols.intern("function"));
         let mut alloc_type = |name: &str| {
             let id = TypeId(items.len() as u32);
             let ty = Type {
@@ -142,6 +179,12 @@ impl TypeArena {
             never: never_id,
             any_key,
             null_key,
+            array_key,
+            map_key,
+            tuple_key,
+            type_key,
+            field_key,
+            function_key,
             bool_: alloc_type("bool"),
             int: alloc_type("int"),
             float: alloc_type("float"),
@@ -161,6 +204,47 @@ impl TypeArena {
             intern,
             builtins,
         }
+    }
+
+    /// `true` iff the always-seeded `node*` slot holds `Type(key)`. The
+    /// node-tag identity primitive — derives the decl key from the slot so
+    /// node tags need no separate `ItemKey` field (and it holds with or
+    /// without `core.gcl` loaded).
+    fn node_slot_is(&self, slot: TypeId, key: ItemKey) -> bool {
+        matches!(self.get(slot).kind, TypeKind::Type(k) if k == key)
+    }
+
+    /// `true` iff `key` is one of the 5 core node-tag decls.
+    pub fn is_node_tag(&self, key: ItemKey) -> bool {
+        let b = &self.builtins;
+        [b.node, b.node_time, b.node_index, b.node_list, b.node_geo]
+            .iter()
+            .any(|&slot| self.node_slot_is(slot, key))
+    }
+
+    /// `true` iff `key` is specifically the base `core::node` decl.
+    pub fn is_node(&self, key: ItemKey) -> bool {
+        self.node_slot_is(self.builtins.node, key)
+    }
+
+    /// `true` iff `key` is `core::nodeTime`.
+    pub fn is_node_time(&self, key: ItemKey) -> bool {
+        self.node_slot_is(self.builtins.node_time, key)
+    }
+
+    /// `true` iff `key` is `core::nodeIndex`.
+    pub fn is_node_index(&self, key: ItemKey) -> bool {
+        self.node_slot_is(self.builtins.node_index, key)
+    }
+
+    /// `true` iff `key` is `core::nodeList`.
+    pub fn is_node_list(&self, key: ItemKey) -> bool {
+        self.node_slot_is(self.builtins.node_list, key)
+    }
+
+    /// `true` iff `key` is `core::nodeGeo`.
+    pub fn is_node_geo(&self, key: ItemKey) -> bool {
+        self.node_slot_is(self.builtins.node_geo, key)
     }
 
     /// Allocates a [`Type`] or yield the [`TypeId`] if already interned.

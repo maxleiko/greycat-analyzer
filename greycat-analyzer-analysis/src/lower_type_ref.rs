@@ -8,7 +8,7 @@
 use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{GenericOwner, Symbol, TypeArena, TypeId};
+use greycat_analyzer_core::{Builtins, GenericOwner, Symbol, TypeArena, TypeId};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::hir::{Decl, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir};
@@ -85,6 +85,11 @@ pub(crate) fn generic_arity_for(
         if arity > 0 {
             return Some(arity);
         }
+    }
+    // Bare node-tag raw-form arity even without `core.gcl` loaded
+    // (`node` == `node<any?>`, `nodeIndex` == `nodeIndex<any?, any?>`).
+    if let Some(a) = Builtins::node_tag_arity(&index.symbols[name]) {
+        return Some(a);
     }
     None
 }

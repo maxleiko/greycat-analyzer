@@ -1012,8 +1012,6 @@ fn visit_type_ref(cx: &mut ResolverCx, ty_id: Idx<TypeRef>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::well_known::WellKnown;
-
     use super::*;
     use greycat_analyzer_core::{SymbolTable, TypeArena};
     use greycat_analyzer_hir::hir::{Decl, Expr};
@@ -1276,7 +1274,6 @@ fn f(p: Foo): Foo { return p; }
         let symbols = SymbolTable::default();
         let mut arena = TypeArena::new(&symbols);
         let mut decl_registry = DeclRegistry::default();
-        let mut well_known = WellKnown::default();
         let mut idx = ProjectIndex::new(symbols, &arena);
 
         let other_src = "type Helper {}\n";
@@ -1284,13 +1281,7 @@ fn f(p: Foo): Foo { return p; }
         let other_hir = lower_module(other_src, &idx.symbols, "a", "p", other_tree.root_node());
 
         let other_uri = Uri::from_str("file:///proj/a.gcl").unwrap();
-        idx.ingest(
-            &other_uri,
-            &other_hir,
-            &mut arena,
-            &mut decl_registry,
-            &mut well_known,
-        );
+        idx.ingest(&other_uri, &other_hir, &mut arena, &mut decl_registry);
 
         let user_src = "fn use_helper(h: Helper) {}\n";
         let user_tree = parse(user_src);

@@ -569,7 +569,6 @@ fn type_matches_expected(
     };
     crate::project::is_assignable_to_with_index(
         &project.index,
-        project.well_known(),
         project.decl_registry(),
         arena,
         cand,
@@ -2044,7 +2043,6 @@ fn member_completion(
 
     let module = project.module(uri)?;
     let arena = project.arena();
-    let well_known = project.well_known();
     let recv_ty = receiver_type_at(text, root, module, project.symbols(), recv_end)?;
     let name = type_head_name(project, arena, recv_ty)?;
 
@@ -2056,7 +2054,6 @@ fn member_completion(
     // `crate::project::populate_deref_caches` once signature lowering
     // settles), substitute the receiver's instantiation, and pull the
     // head name of the resulting type.
-    let _ = well_known;
     let inner_head: Option<String> = (|| {
         let (recv_id, recv_args): (ItemKey, &[TypeId]) = match &arena.get(recv_ty).kind {
             TypeKind::Type(d) => (*d, &[]),

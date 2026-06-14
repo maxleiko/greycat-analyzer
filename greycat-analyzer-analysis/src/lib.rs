@@ -72,6 +72,5 @@ pub mod resolver;
 /// "lambda is a top-level fn in a scope" mental model demands one
 /// implementation for both — see `return_inference::inferred_return_from_body`.
 pub mod return_inference;
-pub mod well_known;
 
 pub use display::display_fqn;

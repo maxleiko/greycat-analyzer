@@ -44,7 +44,6 @@ use crate::index::{FnSignature, Namespace, ProjectIndex};
 use crate::lint::{LintDiagnostic, LintSeverity};
 use crate::lower_type_ref::{self, TypeRefLowering};
 use crate::resolver::{Definition, Resolutions};
-use crate::well_known::WellKnown;
 
 /// Recover a *field-name* symbol from a named object field's key
 /// expression. The grammar lowers `object_field.name` as a full
@@ -368,7 +367,6 @@ pub fn analyze_with_index_into(
     hir: &Hir,
     res: &Resolutions,
     index: &ProjectIndex,
-    well_known: &WellKnown,
     decl_registry: &DeclRegistry,
     module_uri: &Uri,
     arena: &mut TypeArena,
@@ -390,7 +388,6 @@ pub fn analyze_with_index_into(
         module_sym,
         arena,
         index,
-        well_known,
         decl_registry,
         narrows: Vec::new(),
         member_narrows: Vec::new(),
@@ -791,14 +788,6 @@ struct Cx<'a> {
     /// index it just rebuilt. Used by `lower_type_ref` to recognize
     /// type names that aren't declared in this module.
     index: &'a ProjectIndex,
-    /// Project-wide well-known std/core decl handles. Per-file
-    /// callers pass a default-constructed (all-`None`) instance; the
-    /// project pipeline passes its populated `&self.well_known`.
-    /// Consumed by `function_ty()` / `type_ty()` / `field_ty()` which
-    /// mint `arena.alloc_type(well_known.X_decl)` when the slot is
-    /// populated, falling back to `arena.unresolved(...)` when std
-    /// hasn't loaded.
-    well_known: &'a WellKnown,
     /// Project-wide decl handle registry. Used by sites that resolve
     /// foreign types — they look up `decl_registry.lookup(uri, idx)`
     /// and mint `arena.alloc_type(handle)`. Per-file callers pass an
@@ -1300,7 +1289,6 @@ impl<'a> Cx<'a> {
             };
             if crate::project::is_assignable_to_with_index(
                 self.index,
-                self.well_known,
                 self.decl_registry,
                 self.arena,
                 alt_non_null,
@@ -1476,7 +1464,6 @@ impl<'a> Cx<'a> {
                         };
                         crate::project::is_assignable_to_with_index(
                             self.index,
-                            self.well_known,
                             self.decl_registry,
                             self.arena,
                             alt_non_null,
@@ -1578,41 +1565,19 @@ impl<'a> Cx<'a> {
     }
 
     // P35.4
-    /// Mint a [`TypeKind::Type`] for a well-known std/core native
-    /// type when its slot is populated. Falls back to `any` when
-    /// the slot is `None` (std not loaded, or pipeline running over
-    /// a project without `std/core` yet). The fallback is already
-    /// advertised to the user by the P33 `missing-std` diagnostic;
-    /// suppressing cascading type errors here keeps the rest of the
-    /// analysis usable.
+    /// Mint a [`TypeKind::Type`] for a std/core native runtime
+    /// sentinel (`function` / `type` / `field`). The `arena.builtins`
+    /// keys are always seeded, so these resolve to the canonical
+    /// `core::X` identity with or without `core.gcl` loaded.
     ///
-    /// Each well-known slot has its own thin wrapper
-    /// (`function_ty`, `type_ty`, `field_ty`, …) so call sites read
-    /// at a glance which std/core type they're minting and the
-    /// borrow checker sees the slot read happen before the
-    /// `&mut self` arena allocation.
+    /// Each has its own thin wrapper (`function_ty`, `type_ty`,
+    /// `field_ty`, …) so call sites read at a glance which std/core
+    /// type they're minting.
     fn function_ty(&mut self) -> TypeId {
-        match self.well_known.function_decl {
-            Some(d) => self.arena.alloc_type(d),
-            // P35.8 — when std isn't loaded, the runtime sentinel
-            // names (`function` / `type` / `field`) have no decl
-            // handle. Mint `Unresolved` so display still renders the
-            // name verbatim and assignability behaves like `any?`
-            // (no cascading diagnostics).
-            None => {
-                let name = self.index.symbols.intern("function");
-                self.arena.unresolved(name, (0, 0))
-            }
-        }
+        self.arena.alloc_type(self.arena.builtins.function_key)
     }
     fn type_ty(&mut self) -> TypeId {
-        match self.well_known.type_decl {
-            Some(d) => self.arena.alloc_type(d),
-            None => {
-                let name = self.index.symbols.intern("type");
-                self.arena.unresolved(name, (0, 0))
-            }
-        }
+        self.arena.alloc_type(self.arena.builtins.type_key)
     }
     /// Mint the structural `TypeKind::Lambda` for a value-position
     /// reference to a top-level fn or `static` method. Generic fns
@@ -1632,13 +1597,7 @@ impl<'a> Cx<'a> {
         self.arena.lambda(sig.params.clone(), sig.return_ty)
     }
     fn field_ty(&mut self) -> TypeId {
-        match self.well_known.field_decl {
-            Some(d) => self.arena.alloc_type(d),
-            None => {
-                let name = self.index.symbols.intern("field");
-                self.arena.unresolved(name, (0, 0))
-            }
-        }
+        self.arena.alloc_type(self.arena.builtins.field_key)
     }
     fn record(&mut self, expr: Idx<Expr>, ty: TypeId) {
         self.out.expr_types.insert(expr, ty);
@@ -1703,7 +1662,6 @@ impl<'a> Cx<'a> {
     fn is_assignable(&mut self, from: TypeId, to: TypeId) -> bool {
         crate::project::is_assignable_to_with_index(
             self.index,
-            self.well_known,
             self.decl_registry,
             self.arena,
             from,
@@ -3038,15 +2996,13 @@ impl<'a> Cx<'a> {
     /// `true` when `ty`'s head decl is the std-core `Map` — the one
     /// named-construction head whose `{ k: v }` entries are key/value
     /// expressions rather than field names. Handle-keyed via
-    /// [`WellKnown`], so a user-declared `type Map` doesn't match.
+    /// `arena.builtins.map_key`, so a user-declared `type Map` doesn't match.
     fn head_decl_is_map(&self, ty: TypeId) -> bool {
-        match self.well_known.map_decl {
-            Some(map_type) => match &self.arena.get(ty).kind {
-                TypeKind::Generic { tpl, .. } => *tpl == map_type,
-                TypeKind::Type(decl) => *decl == map_type,
-                _ => false,
-            },
-            None => false,
+        let map_type = self.arena.builtins.map_key;
+        match &self.arena.get(ty).kind {
+            TypeKind::Generic { tpl, .. } => *tpl == map_type,
+            TypeKind::Type(decl) => *decl == map_type,
+            _ => false,
         }
     }
 
@@ -4538,10 +4494,10 @@ impl<'a> Cx<'a> {
         // GreyCat is gated by the `@iterable` type-pragma;
         // in stdlib that covers six native types — Array,
         // Map, nodeList, nodeIndex, nodeTime, nodeGeo. All
-        // six have stable `WellKnown` decl handles, so the
-        // dispatch is `Some(decl) == self.well_known.<slot>`
-        // identity (same pattern as `WellKnown::is_node_tag`
-        // and the `Expr::Offset` rewrite). Tuple shapes:
+        // six have stable `arena.builtins` decl handles, so the
+        // dispatch is decl-handle identity (same pattern as
+        // `TypeArena::is_node_tag` and the `Expr::Offset`
+        // rewrite). Tuple shapes:
         //   - Array<T>     / nodeList<T>      -> (int,  T)
         //   - Map<K, V>    / nodeIndex<K, V>  -> (K,    V)
         //   - nodeTime<T>                     -> (time, T)
@@ -4573,17 +4529,16 @@ impl<'a> Cx<'a> {
             _ => None,
         };
         let (key_ty, val_ty) = if let Some((decl, args)) = decl_and_args {
-            let wk = &self.well_known;
-            if Some(decl) == wk.array_decl || Some(decl) == wk.node_list_decl {
+            if decl == self.arena.builtins.array_key || self.arena.is_node_list(decl) {
                 (int_id, args.first().copied().unwrap_or(any_nl))
-            } else if Some(decl) == wk.map_decl || Some(decl) == wk.node_index_decl {
+            } else if decl == self.arena.builtins.map_key || self.arena.is_node_index(decl) {
                 (
                     args.first().copied().unwrap_or(any_nn),
                     args.get(1).copied().unwrap_or(any_nl),
                 )
-            } else if Some(decl) == wk.node_time_decl {
+            } else if self.arena.is_node_time(decl) {
                 (time_id, args.first().copied().unwrap_or(any_nl))
-            } else if Some(decl) == wk.node_geo_decl {
+            } else if self.arena.is_node_geo(decl) {
                 (geo_id, args.first().copied().unwrap_or(any_nl))
             } else {
                 // Not a known iterable. A follow-up chunk
@@ -5423,14 +5378,7 @@ impl<'a> Cx<'a> {
                 // assert_eq!(items.len(), 2, "Tuple items length must be exactly 2");
                 let x = self.visit_expr(items[0]);
                 let y = self.visit_expr(items[1]);
-                let span = self.hir.exprs[expr_id].byte_range();
-                match self.well_known.tuple_decl {
-                    Some(decl) => self.arena.tuple(decl, x, y),
-                    None => {
-                        let name = self.index.symbols.intern("Tuple");
-                        self.arena.unresolved(name, (span.start, span.end))
-                    }
-                }
+                self.arena.tuple(self.arena.builtins.tuple_key, x, y)
             }
             Expr::Array(items, _) => {
                 let mut first: Option<TypeId> = None;
@@ -5449,15 +5397,9 @@ impl<'a> Cx<'a> {
                 let uniform_elem = if uniform { first } else { None };
                 let inferred_elem = self.infer_array_element_type(items, uniform_elem);
 
-                let span = self.hir.exprs[expr_id].byte_range();
                 let elem = inferred_elem.unwrap_or_else(|| self.any_nullable());
-                match self.well_known.array_decl {
-                    Some(decl) => self.arena.alloc_generic(decl, vec![elem]),
-                    None => {
-                        let name = self.index.symbols.intern("Array");
-                        self.arena.unresolved(name, (span.start, span.end))
-                    }
-                }
+                self.arena
+                    .alloc_generic(self.arena.builtins.array_key, vec![elem])
             }
             Expr::Object(ObjectExpr { ty, fields, .. }) => {
                 let obj_ty = self.lower_type_ref(*ty);
@@ -5685,15 +5627,15 @@ impl<'a> Cx<'a> {
                     // `nodeIndex[k]`, etc. with "Offset access is
                     // only allowed on instances of type 'Array'".
                     // Compare the generic's decl-handle against
-                    // `WellKnown::array_decl` rather than
+                    // `arena.builtins.array_key` rather than
                     // string-matching its printable name: handle
                     // equality is the canonical identity check for
-                    // std-core decls (see `WellKnown::is_node_tag`)
+                    // std-core decls (see `TypeArena::is_node_tag`)
                     // and isn't fooled by a user-declared
                     // `type Array<T>` in their own module.
                     match &self.arena.get(underlying).kind {
                         TypeKind::Generic { tpl, args }
-                            if Some(*tpl) == self.well_known.array_decl && !args.is_empty() =>
+                            if *tpl == self.arena.builtins.array_key && !args.is_empty() =>
                         {
                             args[0]
                         }
@@ -6032,7 +5974,6 @@ impl<'a> Cx<'a> {
                 // source of truth for what's allowed.
                 if !crate::project::is_castable_with_index(
                     self.index,
-                    self.well_known,
                     self.decl_registry,
                     self.arena,
                     from_ty,
@@ -6259,9 +6200,6 @@ mod tests {
         index: &ProjectIndex,
     ) -> (DeclRegistry, AnalysisResult) {
         use std::str::FromStr;
-        // Per-file callers default-construct an empty
-        // `WellKnown`; see [`analyze`] for the rationale.
-        let well_known = WellKnown::default();
         let module_uri = Uri::from_str("file:///module.gcl").unwrap();
         // Standalone equivalent of `ProjectIndex::ingest`'s decl
         // registration step — see [`analyze`] for the rationale.
@@ -6278,15 +6216,7 @@ mod tests {
                 }
             }
         }
-        let out = analyze_with_index_into(
-            hir,
-            res,
-            index,
-            &well_known,
-            &decl_registry,
-            &module_uri,
-            arena,
-        );
+        let out = analyze_with_index_into(hir, res, index, &decl_registry, &module_uri, arena);
         (decl_registry, out)
     }
 

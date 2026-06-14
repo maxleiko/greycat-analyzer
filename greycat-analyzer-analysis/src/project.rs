@@ -28,7 +28,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    GenericOwner, ItemKey, SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
+    Builtins, GenericOwner, ItemKey, SourceManager, Symbol, SymbolTable, TypeArena, TypeId,
+    TypeKind,
 };
 use greycat_analyzer_hir::hir::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir, lower_module};
@@ -47,7 +48,6 @@ use crate::lint::{
 use crate::lower_type_ref::{self, TypeRefLowering};
 use crate::meta_pragmas::{LintPragmas, parse_lint_pragmas};
 use crate::resolver::Resolutions;
-use crate::well_known::WellKnown;
 
 /// Per-document outputs of the analyzer pipeline. Held by
 /// [`ProjectAnalysis`] so LSP / CLI consumers can pull diagnostics
@@ -122,12 +122,6 @@ pub struct ProjectAnalysis {
     /// Project-wide registry of resolved `(Uri, Idx<Decl>)` →
     /// [`TypeDeclId`]. Issued during signature lowering.
     pub decl_registry: DeclRegistry,
-    /// Stable handles for the std/core native types the analyzer
-    /// special-cases (node-tag auto-deref, runtime sentinels,
-    /// collections). Populated during signature lowering. Slots stay
-    /// `None` until the corresponding decl flows through the pipeline
-    /// (or forever, when std isn't loaded).
-    pub well_known: WellKnown,
     /// When `true`, lint suppressions (`// gcl-lint-off …`)
     /// are still recorded but never silence emissions. Drives the CLI's
     /// `--no-suppressions` flag.
@@ -230,7 +224,6 @@ impl ProjectAnalysis {
             index,
             arena,
             decl_registry: DeclRegistry::new(),
-            well_known: WellKnown::new(),
             bypass_suppressions: false,
             enabled_rules: FxHashSet::default(),
             disabled_rules: FxHashSet::default(),
@@ -268,15 +261,6 @@ impl ProjectAnalysis {
     #[inline(always)]
     pub fn decl_registry(&self) -> &DeclRegistry {
         &self.decl_registry
-    }
-
-    /// Project-wide well-known std/core decl handles. Capability
-    /// handlers that need to dispatch on the std-core `node` /
-    /// `Array` / etc. identity
-    /// consume this via `WellKnown::is_node_tag(decl)` etc.
-    #[inline(always)]
-    pub fn well_known(&self) -> &WellKnown {
-        &self.well_known
     }
 
     /// Project-aware type display. Renders the type with a
@@ -483,11 +467,10 @@ impl ProjectAnalysis {
         // module + parse its directives. No shared mutable state.
         let mut lowered = crate::parallel::par_map(docs, |m| {
             let lower_start = Instant::now();
-            // Pass the real module name (filename minus
-            // `.gcl`) so the well-known recognizer can match
-            // `(lib, module, name)` triples. Default `"module"`
-            // only kicks in for URIs without a recognisable
-            // filename, which the recognizer ignores anyway.
+            // Pass the real module name (filename minus `.gcl`) so
+            // the HIR carries the module identity that `ingest` keys
+            // decls by. Default `"module"` only kicks in for URIs
+            // without a recognisable filename.
             let module_name = module_name_from_uri(&m.uri).unwrap_or("module");
             let hir = lower_module(
                 &m.src,
@@ -516,11 +499,10 @@ impl ProjectAnalysis {
         // mutates `self.index.symbols` etc., which is `!Send` on
         // purpose — it owns interner state that's amortised across
         // the whole project. `ingest` also mints decl handles into
-        // `self.decl_registry`, records well-known runtime slots,
-        // and allocates enum TypeIds into the shared arena —
-        // folded in so every decl-registration step happens in one
-        // place rather than spread across `stage_lower` +
-        // `stage_lower_signatures`.
+        // `self.decl_registry` and allocates enum TypeIds into the
+        // shared arena — folded in so every decl-registration step
+        // happens in one place rather than spread across
+        // `stage_lower` + `stage_lower_signatures`.
         //
         // Order matters: `ProjectIndex::ingest` is first-wins for
         // module-name claims (later files with the same stem land in
@@ -538,13 +520,8 @@ impl ProjectAnalysis {
                 .then_with(|| a.uri.as_str().cmp(b.uri.as_str()))
         });
         for m in &lowered {
-            self.index.ingest(
-                &m.uri,
-                &m.hir,
-                &mut self.arena,
-                &mut self.decl_registry,
-                &mut self.well_known,
-            );
+            self.index
+                .ingest(&m.uri, &m.hir, &mut self.arena, &mut self.decl_registry);
         }
         lowered
     }
@@ -568,10 +545,10 @@ impl ProjectAnalysis {
     /// being walked resolve to `GenericParam(T, owner=Type(name))`.
     fn stage_lower_signatures(&mut self, lowered: &[LoweredModule]) {
         let pairs: Vec<(&Uri, &Hir)> = lowered.iter().map(|m| (&m.uri, &m.hir)).collect();
-        // `decl_registry` + `well_known` slot
-        // recording happen during [`ProjectIndex::ingest`] now, so
-        // the signature-lowering pass below sees a fully-populated
-        // registry from its first call. (Previously this stage owned
+        // `decl_registry` recording happens during
+        // [`ProjectIndex::ingest`] now, so the signature-lowering pass
+        // below sees a fully-populated registry from its first call.
+        // (Previously this stage owned
         // a redundant decl pre-pass; the architectural rework folded
         // it into ingest so every decl-registration step lives in
         // one place and `enum_types` is populated before any method
@@ -819,27 +796,8 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
             };
             let parent_ref = &hir.type_refs[super_tr];
             let parent_name = hir.idents[parent_ref.name].symbol;
-            // Primitives can never be a user type's supertype — skip
-            // so the chain walker's lookup doesn't spend a probe on a
-            // name guaranteed to miss.
-            if matches!(
-                &index.symbols[parent_name],
-                "bool"
-                    | "int"
-                    | "float"
-                    | "char"
-                    | "String"
-                    | "time"
-                    | "duration"
-                    | "geo"
-                    | "any"
-                    | "null"
-            ) {
-                continue;
-            }
             let parent_id = if let Some(last) = parent_ref.qualifier.last() {
-                // Qualified `mod::Super` — the qualifier's last
-                // segment names the owning module.
+                // Qualified `mod::Super`: the qualifier's last segment names the owning module.
                 let qual_sym = hir.idents[*last].symbol;
                 let Some(qual_uri) = index.module_names.get(&qual_sym) else {
                     continue;
@@ -1289,7 +1247,6 @@ fn lower_module_signatures(
 /// every primitive / nullable / lambda / tuple rule still fires.
 pub(crate) fn is_assignable_to_with_index(
     index: &ProjectIndex,
-    well_known: &crate::well_known::WellKnown,
     _decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     from: TypeId,
@@ -1324,19 +1281,19 @@ pub(crate) fn is_assignable_to_with_index(
         // nullability; Never/Any/Unresolved as top/bottom rules).
         TypeKind::Null | TypeKind::Any | TypeKind::Never | TypeKind::Unresolved { .. } => false,
 
-        TypeKind::Union { alts } => alts.into_iter().all(|alt| {
-            is_assignable_to_with_index(index, well_known, _decl_registry, arena, alt, to)
-        }),
+        TypeKind::Union { alts } => alts
+            .into_iter()
+            .all(|alt| is_assignable_to_with_index(index, _decl_registry, arena, alt, to)),
 
         // P-typeof — type-literal source. Accepts `Type(core::type)`
         // as a widening target so stdlib functions typed `(t: type)`
         // continue to accept arguments now typed as `TypeOf(X)`.
         // Identity TypeOf → TypeOf is handled by the core fast path.
         TypeKind::TypeOf(_) => match b_kind {
-            TypeKind::Type(d) => well_known.type_decl == Some(d),
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Type(d) => d == arena.builtins.type_key,
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_assignable_to_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1369,9 +1326,9 @@ pub(crate) fn is_assignable_to_with_index(
                     arena.is_assignable_to(hop, to)
                 })
             }
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_assignable_to_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1389,20 +1346,16 @@ pub(crate) fn is_assignable_to_with_index(
             TypeKind::Generic {
                 tpl: db,
                 args: ref ab,
-            } if da == db && aa.len() == ab.len() && well_known.is_node_tag(da) => true,
+            } if da == db && aa.len() == ab.len() && arena.is_node_tag(da) => true,
             TypeKind::Generic {
                 tpl: db,
                 args: ref ab,
-            } if da == db
-                && aa.len() == 1
-                && ab.len() == 1
-                && well_known.node_decl.is_some_and(|nd| nd == da) =>
-            {
+            } if da == db && aa.len() == 1 && ab.len() == 1 && arena.is_node(da) => {
                 // node<Sub> -> node<Super> when Sub extends Super.
                 // Recurse so a chain like node<DeepSub> ->
                 // node<MidSub> -> node<Super> works in one hop.
                 let (a0, b0) = (aa[0], ab[0]);
-                is_assignable_to_with_index(index, well_known, _decl_registry, arena, a0, b0)
+                is_assignable_to_with_index(index, _decl_registry, arena, a0, b0)
             }
             // Cross-decl generic source: walk `da`'s pre-lowered
             // supertype_ty chain, substituting `aa` for `da`'s own
@@ -1416,9 +1369,9 @@ pub(crate) fn is_assignable_to_with_index(
                     arena.is_assignable_to(hop, to)
                 })
             }
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_assignable_to_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1439,10 +1392,10 @@ pub(crate) fn is_assignable_to_with_index(
         // carries no signature, so admitting it into a typed slot
         // would be unsound.
         TypeKind::Lambda { .. } => match b_kind {
-            TypeKind::Type(d) if Some(d) == well_known.function_decl => true,
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Type(d) if d == arena.builtins.function_key => true,
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_assignable_to_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1462,9 +1415,9 @@ pub(crate) fn is_assignable_to_with_index(
         // Primitives are `Type(core::X)` and flow through the `Type(sub)`
         // arm above (identity + target-Union retry, no supertypes).
         TypeKind::Enum { .. } | TypeKind::GenericParam { .. } => match b_kind {
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_assignable_to_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_assignable_to_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1544,7 +1497,7 @@ where
 /// Index-aware extension of [`is_castable`].
 /// Adds the symmetric node-tag-handle / int cast rules — handles are
 /// 64-bit ints at runtime, so `nodeTime<T> as int` and `int as
-/// nodeTime<T>` both succeed. Dispatch via `WellKnown::is_node_tag
+/// nodeTime<T>` both succeed. Dispatch via `TypeArena::is_node_tag
 /// (decl)` so a user-declared `type node<T>` (which has its own
 /// handle) doesn't accidentally pick up these rules.
 ///
@@ -1556,7 +1509,6 @@ where
 /// net, so generic-arg strictness here matches assignability's.
 pub(crate) fn is_castable_with_index(
     index: &ProjectIndex,
-    well_known: &crate::well_known::WellKnown,
     _decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     from: TypeId,
@@ -1574,9 +1526,8 @@ pub(crate) fn is_castable_with_index(
     // this is the single place the rule lives -- neither side's structural
     // arm below sees it.
     let from_node_tag =
-        matches!(&from_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
-    let to_node_tag =
-        matches!(&to_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
+        matches!(&from_kind, TypeKind::Generic { tpl, .. } if arena.is_node_tag(*tpl));
+    let to_node_tag = matches!(&to_kind, TypeKind::Generic { tpl, .. } if arena.is_node_tag(*tpl));
     if (from == arena.builtins.int && to_node_tag) || (from_node_tag && to == arena.builtins.int) {
         return true;
     }
@@ -1596,17 +1547,17 @@ pub(crate) fn is_castable_with_index(
         // would silently undo core's fix.
         TypeKind::Union { alts } => alts
             .into_iter()
-            .any(|alt| is_castable_with_index(index, well_known, _decl_registry, arena, alt, to)),
+            .any(|alt| is_castable_with_index(index, _decl_registry, arena, alt, to)),
 
         // P-typeof — `as` is dropped at runtime; the analyzer mirrors
         // assignability for cast strictness, so accept the widening
         // `TypeOf(X) → Type(core::type)` for the same reason. Other
         // targets reject (identity goes through the early-return).
         TypeKind::TypeOf(_) => match to_kind {
-            TypeKind::Type(d) => well_known.type_decl == Some(d),
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Type(d) => d == arena.builtins.type_key,
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1657,9 +1608,9 @@ pub(crate) fn is_castable_with_index(
                     false
                 }
             }
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1708,7 +1659,7 @@ pub(crate) fn is_castable_with_index(
                     // Wrapper-side relaxation: node-tag bivariance —
                     // mirrors `is_assignable_to_with_index` so the two
                     // layers agree on what's allowed for tag args.
-                    fa.len() == ta.len() && well_known.is_node_tag(fd)
+                    fa.len() == ta.len() && arena.is_node_tag(fd)
                 } else if index.is_subtype_of_decl(fd, td) {
                     // Upcast: walk source's chain with source's args.
                     walk_substituted_supertype_chain(index, arena, fd, &fa, |arena, hop| {
@@ -1726,9 +1677,9 @@ pub(crate) fn is_castable_with_index(
                     false
                 }
             }
-            TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
-            }),
+            TypeKind::Union { alts } => alts
+                .into_iter()
+                .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1746,9 +1697,9 @@ pub(crate) fn is_castable_with_index(
         // handled by the top-level block at the head of this function.
         TypeKind::Lambda { .. } | TypeKind::Enum { .. } | TypeKind::GenericParam { .. } => {
             match to_kind {
-                TypeKind::Union { alts } => alts.into_iter().any(|alt| {
-                    is_castable_with_index(index, well_known, _decl_registry, arena, from, alt)
-                }),
+                TypeKind::Union { alts } => alts
+                    .into_iter()
+                    .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
                 TypeKind::Null
                 | TypeKind::Any
                 | TypeKind::Never
@@ -1818,7 +1769,7 @@ impl ProjectAnalysis {
         // The std-core `Map` identity lets the resolver treat
         // `Map { k: v }` keys as value expressions. `Copy`, so the
         // parallel pass-A closure captures it by value.
-        let map_decl = self.well_known.map_decl;
+        let map_decl = Some(self.arena.builtins.map_key);
 
         // Split the per-module pass into two phases:
         //
@@ -1905,7 +1856,6 @@ impl ProjectAnalysis {
                 &p.hir,
                 &p.resolutions,
                 &self.index,
-                &self.well_known,
                 &self.decl_registry,
                 &p.uri,
                 &mut self.arena,
@@ -2073,7 +2023,6 @@ impl ProjectAnalysis {
         // module borrows.
         let arena_mut = &mut self.arena;
         let index = &self.index;
-        let well_known = &self.well_known;
         let decl_registry = &self.decl_registry;
         for (cur_uri, cur_module) in &self.modules {
             if !in_scope(cur_uri) {
@@ -2084,7 +2033,6 @@ impl ProjectAnalysis {
                 cur_module,
                 cur_uri,
                 index,
-                well_known,
                 decl_registry,
                 arena_mut,
                 &mut diags,
@@ -2097,7 +2045,6 @@ impl ProjectAnalysis {
             collect_call_arg_diags_split(
                 &self.modules,
                 index,
-                well_known,
                 decl_registry,
                 cur_uri,
                 arena_mut,
@@ -2106,7 +2053,6 @@ impl ProjectAnalysis {
             collect_object_field_diags_split(
                 &self.modules,
                 index,
-                well_known,
                 decl_registry,
                 cur_uri,
                 arena_mut,
@@ -2118,7 +2064,6 @@ impl ProjectAnalysis {
                 &self.modules,
                 arena_mut,
                 index,
-                well_known,
                 decl_registry,
                 cur_uri,
                 &mut diags,
@@ -2315,7 +2260,8 @@ impl ProjectAnalysis {
         let changed_hir = manager.get(uri).map(|cell| {
             let doc = cell.borrow();
             let start = Instant::now();
-            // P35.1 — module name from URI for the well-known recogniser.
+            // P35.1 — module name from URI for the module identity
+            // that `ingest` keys decls by.
             let module_name = module_name_from_uri(uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
@@ -2345,25 +2291,13 @@ impl ProjectAnalysis {
         let preserved_symbols = std::mem::take(&mut self.index.symbols);
         let mut new_index = ProjectIndex::new(preserved_symbols, &self.arena);
         if let Some(hir) = &changed_hir {
-            new_index.ingest(
-                uri,
-                hir,
-                &mut self.arena,
-                &mut self.decl_registry,
-                &mut self.well_known,
-            );
+            new_index.ingest(uri, hir, &mut self.arena, &mut self.decl_registry);
         }
         for (other_uri, ma) in &self.modules {
             if other_uri == uri {
                 continue;
             }
-            new_index.ingest(
-                other_uri,
-                &ma.hir,
-                &mut self.arena,
-                &mut self.decl_registry,
-                &mut self.well_known,
-            );
+            new_index.ingest(other_uri, &ma.hir, &mut self.arena, &mut self.decl_registry);
         }
         // For docs that are in the manager but not yet in the cache,
         // lower them so the index sees their decls. Per-module analysis
@@ -2374,7 +2308,8 @@ impl ProjectAnalysis {
                 continue;
             }
             let doc = cell.borrow();
-            // P35.1 — module name from URI for the well-known recogniser.
+            // P35.1 — module name from URI for the module identity
+            // that `ingest` keys decls by.
             let module_name = module_name_from_uri(other_uri).unwrap_or("module");
             let hir = lower_module(
                 &doc.text,
@@ -2383,13 +2318,7 @@ impl ProjectAnalysis {
                 &doc.lib,
                 doc.root_node(),
             );
-            new_index.ingest(
-                other_uri,
-                &hir,
-                &mut self.arena,
-                &mut self.decl_registry,
-                &mut self.well_known,
-            );
+            new_index.ingest(other_uri, &hir, &mut self.arena, &mut self.decl_registry);
             other_lowered.push((other_uri.clone(), hir, doc.lib.clone(), Duration::ZERO));
         }
         self.index = new_index;
@@ -2432,16 +2361,15 @@ impl ProjectAnalysis {
             ..ModuleTimings::default()
         };
         let t0 = Instant::now();
-        let resolutions = self
-            .index
-            .resolutions(&hir, Some(uri), self.well_known.map_decl);
+        let resolutions =
+            self.index
+                .resolutions(&hir, Some(uri), Some(self.arena.builtins.map_key));
         timings.resolve = t0.elapsed();
         let t1 = Instant::now();
         let mut analysis = analyze_with_index_into(
             &hir,
             &resolutions,
             &self.index,
-            &self.well_known,
             &self.decl_registry,
             uri,
             &mut self.arena,
@@ -2621,7 +2549,6 @@ fn lambda_call_arg_diags(
     cur_module: &ModuleAnalysis,
     cur_uri: &Uri,
     index: &ProjectIndex,
-    well_known: &crate::well_known::WellKnown,
     decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     call: &greycat_analyzer_hir::hir::CallExpr,
@@ -2661,14 +2588,7 @@ fn lambda_call_arg_diags(
             Some(t) => t,
             None => continue,
         };
-        if !is_assignable_to_with_index(
-            index,
-            well_known,
-            decl_registry,
-            arena,
-            arg_ty,
-            declared_ty,
-        ) {
+        if !is_assignable_to_with_index(index, decl_registry, arena, arg_ty, declared_ty) {
             let r = cur_module.hir.exprs[call.args[i]].byte_range();
             diags.push(SemanticDiagnostic {
                 severity: Severity::Error,
@@ -2762,13 +2682,12 @@ fn push_generic_erasure_diag(
 /// coerce.
 fn is_slot_assignable(
     index: &ProjectIndex,
-    well_known: &WellKnown,
     decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     from: TypeId,
     to: TypeId,
 ) -> bool {
-    if is_assignable_to_with_index(index, well_known, decl_registry, arena, from, to) {
+    if is_assignable_to_with_index(index, decl_registry, arena, from, to) {
         return true;
     }
     let from_t = arena.get(from);
@@ -2792,7 +2711,6 @@ fn check_construction_value_against_slot(
     cur_module: &ModuleAnalysis,
     cur_uri: &Uri,
     index: &ProjectIndex,
-    well_known: &WellKnown,
     decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     value_expr: Idx<Expr>,
@@ -2806,14 +2724,7 @@ fn check_construction_value_against_slot(
     let Some(value_ty) = cur_module.analysis.expr_types.get(&value_expr).copied() else {
         return;
     };
-    if !is_slot_assignable(
-        index,
-        well_known,
-        decl_registry,
-        arena,
-        value_ty,
-        expected_ty,
-    ) {
+    if !is_slot_assignable(index, decl_registry, arena, value_ty, expected_ty) {
         let r = cur_module.hir.exprs[value_expr].byte_range();
         diags.push(SemanticDiagnostic {
             severity: Severity::Error,
@@ -2830,14 +2741,7 @@ fn check_construction_value_against_slot(
         .expr_runtime_types
         .get(&value_expr)
         .copied()
-        && !is_slot_assignable(
-            index,
-            well_known,
-            decl_registry,
-            arena,
-            runtime_ty,
-            expected_ty,
-        )
+        && !is_slot_assignable(index, decl_registry, arena, runtime_ty, expected_ty)
     {
         let r = cur_module.hir.exprs[value_expr].byte_range();
         push_generic_erasure_diag(
@@ -2857,7 +2761,6 @@ fn check_construction_value_against_slot(
 fn collect_call_arg_diags_split(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
-    well_known: &crate::well_known::WellKnown,
     decl_registry: &DeclRegistry,
     cur_uri: &Uri,
     arena: &mut TypeArena,
@@ -2887,7 +2790,6 @@ fn collect_call_arg_diags_split(
                 cur_module,
                 cur_uri,
                 index,
-                well_known,
                 decl_registry,
                 arena,
                 call,
@@ -2989,14 +2891,7 @@ fn collect_call_arg_diags_split(
                 Some(t) => t,
                 None => continue,
             };
-            if !is_assignable_to_with_index(
-                index,
-                well_known,
-                decl_registry,
-                arena,
-                arg_ty,
-                declared_ty,
-            ) {
+            if !is_assignable_to_with_index(index, decl_registry, arena, arg_ty, declared_ty) {
                 let p_name = &index.symbols[fn_module.hir.idents[p.name].symbol];
                 let r = cur_module.hir.exprs[call.args[i]].byte_range();
                 diags.push(SemanticDiagnostic {
@@ -3030,7 +2925,6 @@ fn collect_call_arg_diags_split(
                 .copied()
                 && !is_assignable_to_with_index(
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     runtime_ty,
@@ -3081,7 +2975,6 @@ fn collect_call_arg_diags_split(
 fn collect_object_field_diags_split(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     index: &ProjectIndex,
-    well_known: &WellKnown,
     decl_registry: &DeclRegistry,
     cur_uri: &Uri,
     arena: &mut TypeArena,
@@ -3111,7 +3004,7 @@ fn collect_object_field_diags_split(
         // attr-chain guards below, which Map has no entry for.
         let map_kv = match &arena.get(obj_ty).kind {
             TypeKind::Generic { tpl, args }
-                if Some(*tpl) == well_known.map_decl && args.len() == 2 =>
+                if *tpl == arena.builtins.map_key && args.len() == 2 =>
             {
                 Some((args[0], args[1]))
             }
@@ -3131,7 +3024,6 @@ fn collect_object_field_diags_split(
                     cur_module,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     f.name,
@@ -3144,7 +3036,6 @@ fn collect_object_field_diags_split(
                     cur_module,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     f.value,
@@ -3270,14 +3161,7 @@ fn collect_object_field_diags_split(
             let Some(value_ty) = cur_module.analysis.expr_types.get(&f.value).copied() else {
                 continue;
             };
-            if !is_assignable_to_with_index(
-                index,
-                well_known,
-                decl_registry,
-                arena,
-                value_ty,
-                declared_ty,
-            ) {
+            if !is_assignable_to_with_index(index, decl_registry, arena, value_ty, declared_ty) {
                 let attr_name = &index.symbols[attr_sym];
                 let r = cur_module.hir.exprs[f.value].byte_range();
                 diags.push(SemanticDiagnostic {
@@ -3299,7 +3183,6 @@ fn collect_object_field_diags_split(
                 .copied()
                 && !is_assignable_to_with_index(
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     runtime_ty,
@@ -3475,7 +3358,7 @@ fn collect_static_type_args_diags(
 /// Every other type — user-declared types, `Map`, `Tuple`, `Buffer`,
 /// the other node-tag family members — must use the named form
 /// (`T { field: value }`). Positional usage is rejected by the
-/// runtime. The check runs here because it needs `WellKnown`
+/// runtime. The check runs here because it needs the `arena.builtins`
 /// identities for `node` and `Array`, which `parse_diagnostics`
 /// doesn't see.
 #[allow(clippy::mutable_key_type, clippy::too_many_arguments)]
@@ -3483,7 +3366,6 @@ fn collect_object_construction_diags(
     modules: &FxHashMap<Uri, ModuleAnalysis>,
     arena: &mut TypeArena,
     index: &ProjectIndex,
-    well_known: &WellKnown,
     decl_registry: &DeclRegistry,
     cur_uri: &Uri,
     diags: &mut Vec<SemanticDiagnostic>,
@@ -3530,7 +3412,6 @@ fn collect_object_construction_diags(
                         cur_module,
                         cur_uri,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         *value,
@@ -3551,7 +3432,7 @@ fn collect_object_construction_diags(
             TypeKind::Type(decl) => (*decl, None),
             _ => continue,
         };
-        if Some(head_decl) == well_known.array_decl {
+        if head_decl == arena.builtins.array_key {
             if let Some(elem_ty) = elem_ty {
                 let slot_desc = format!(
                     "element type `{}`",
@@ -3562,7 +3443,6 @@ fn collect_object_construction_diags(
                         cur_module,
                         cur_uri,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         *value,
@@ -3575,7 +3455,7 @@ fn collect_object_construction_diags(
             }
             continue;
         }
-        if Some(head_decl) == well_known.node_decl {
+        if arena.is_node(head_decl) {
             if obj_expr.fields.len() > 1 {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
@@ -3594,7 +3474,6 @@ fn collect_object_construction_diags(
                         cur_module,
                         cur_uri,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         *value,
@@ -3614,10 +3493,10 @@ fn collect_object_construction_diags(
         // and `Array` (any arity), any content here is a runtime error,
         // and it's neither positional nor named — so we flag it directly
         // instead of falling through to the "use named form" suggestion.
-        if Some(head_decl) == well_known.node_list_decl
-            || Some(head_decl) == well_known.node_time_decl
-            || Some(head_decl) == well_known.node_geo_decl
-            || Some(head_decl) == well_known.node_index_decl
+        if arena.is_node_list(head_decl)
+            || arena.is_node_time(head_decl)
+            || arena.is_node_geo(head_decl)
+            || arena.is_node_index(head_decl)
         {
             let tr = &cur_module.hir.type_refs[obj_expr.ty];
             let head_name = &index.symbols[cur_module.hir.idents[tr.name].symbol];
@@ -3644,30 +3523,32 @@ fn collect_object_construction_diags(
         // pair: the selector resolves the canonical `Type(core::X)` for
         // the membership check, the name feeds the diagnostic message.
         type Accepted<'a> = &'a [(TypeId, &'static str)];
+        let resolve_tuple =
+            |name: &str| index.resolve_type(decl_registry, None, index.symbols.intern(name));
         let fixed_tuples: [(Option<ItemKey>, usize, Accepted, &str); 7] = [
-            (well_known.t2_decl, 2, &[(arena.builtins.int, "int")], "t2"),
+            (resolve_tuple("t2"), 2, &[(arena.builtins.int, "int")], "t2"),
             (
-                well_known.t2f_decl,
+                resolve_tuple("t2f"),
                 2,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t2f",
             ),
-            (well_known.t3_decl, 3, &[(arena.builtins.int, "int")], "t3"),
+            (resolve_tuple("t3"), 3, &[(arena.builtins.int, "int")], "t3"),
             (
-                well_known.t3f_decl,
+                resolve_tuple("t3f"),
                 3,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t3f",
             ),
-            (well_known.t4_decl, 4, &[(arena.builtins.int, "int")], "t4"),
+            (resolve_tuple("t4"), 4, &[(arena.builtins.int, "int")], "t4"),
             (
-                well_known.t4f_decl,
+                resolve_tuple("t4f"),
                 4,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t4f",
             ),
             (
-                well_known.str_decl,
+                resolve_tuple("str"),
                 1,
                 &[(arena.builtins.string, "String")],
                 "str",
@@ -4022,7 +3903,6 @@ fn validate_module_type_relations(
     module: &ModuleAnalysis,
     cur_uri: &Uri,
     index: &ProjectIndex,
-    well_known: &WellKnown,
     decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     diags: &mut Vec<SemanticDiagnostic>,
@@ -4044,7 +3924,6 @@ fn validate_module_type_relations(
             analysis,
             cur_uri,
             index,
-            well_known,
             decl_registry,
             arena,
             arena.builtins.bool_,
@@ -4064,7 +3943,6 @@ fn validate_module_type_relations(
         analysis: &AnalysisResult,
         cur_uri: &Uri,
         index: &ProjectIndex,
-        well_known: &WellKnown,
         decl_registry: &DeclRegistry,
         arena: &mut TypeArena,
         bool_t: TypeId,
@@ -4104,7 +3982,6 @@ fn validate_module_type_relations(
                         analysis,
                         cur_uri,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         bool_t,
@@ -4132,7 +4009,6 @@ fn validate_module_type_relations(
                         check_assign(
                             analysis,
                             index,
-                            well_known,
                             decl_registry,
                             arena,
                             init,
@@ -4160,7 +4036,6 @@ fn validate_module_type_relations(
                         analysis,
                         cur_uri,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         bool_t,
@@ -4186,7 +4061,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         init,
@@ -4208,7 +4082,6 @@ fn validate_module_type_relations(
         analysis: &AnalysisResult,
         cur_uri: &Uri,
         index: &ProjectIndex,
-        well_known: &WellKnown,
         decl_registry: &DeclRegistry,
         arena: &mut TypeArena,
         bool_t: TypeId,
@@ -4222,7 +4095,6 @@ fn validate_module_type_relations(
                 analysis,
                 cur_uri,
                 index,
-                well_known,
                 decl_registry,
                 arena,
                 bool_t,
@@ -4239,7 +4111,6 @@ fn validate_module_type_relations(
         analysis: &AnalysisResult,
         cur_uri: &Uri,
         index: &ProjectIndex,
-        well_known: &WellKnown,
         decl_registry: &DeclRegistry,
         arena: &mut TypeArena,
         bool_t: TypeId,
@@ -4257,7 +4128,6 @@ fn validate_module_type_relations(
                 analysis,
                 cur_uri,
                 index,
-                well_known,
                 decl_registry,
                 arena,
                 bool_t,
@@ -4282,7 +4152,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         *init_id,
@@ -4304,7 +4173,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         *value,
@@ -4338,7 +4206,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4352,7 +4219,6 @@ fn validate_module_type_relations(
                         analysis,
                         cur_uri,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         bool_t,
@@ -4381,7 +4247,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4409,7 +4274,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4439,7 +4303,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4454,7 +4317,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4473,7 +4335,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4486,7 +4347,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4501,7 +4361,6 @@ fn validate_module_type_relations(
                     analysis,
                     cur_uri,
                     index,
-                    well_known,
                     decl_registry,
                     arena,
                     bool_t,
@@ -4517,7 +4376,6 @@ fn validate_module_type_relations(
                     check_assign(
                         analysis,
                         index,
-                        well_known,
                         decl_registry,
                         arena,
                         v,
@@ -4534,22 +4392,8 @@ fn validate_module_type_relations(
                     // double-fire with `check_assign`'s type-mismatch.
                     if let Some(runtime_ty) = analysis.expr_runtime_types.get(&v).copied()
                         && let Some(value_ty) = analysis.expr_types.get(&v).copied()
-                        && is_assignable_to_with_index(
-                            index,
-                            well_known,
-                            decl_registry,
-                            arena,
-                            value_ty,
-                            rt,
-                        )
-                        && !is_assignable_to_with_index(
-                            index,
-                            well_known,
-                            decl_registry,
-                            arena,
-                            runtime_ty,
-                            rt,
-                        )
+                        && is_assignable_to_with_index(index, decl_registry, arena, value_ty, rt)
+                        && !is_assignable_to_with_index(index, decl_registry, arena, runtime_ty, rt)
                     {
                         let want =
                             display_type(arena, decl_registry, &index.symbols, rt).to_string();
@@ -4579,7 +4423,6 @@ fn validate_module_type_relations(
     fn check_assign(
         analysis: &AnalysisResult,
         index: &ProjectIndex,
-        well_known: &WellKnown,
         decl_registry: &DeclRegistry,
         arena: &mut TypeArena,
         value_id: Idx<Expr>,
@@ -4592,14 +4435,7 @@ fn validate_module_type_relations(
         let Some(value_ty) = analysis.expr_types.get(&value_id).copied() else {
             return;
         };
-        if is_assignable_to_with_index(
-            index,
-            well_known,
-            decl_registry,
-            arena,
-            value_ty,
-            declared_ty,
-        ) {
+        if is_assignable_to_with_index(index, decl_registry, arena, value_ty, declared_ty) {
             return;
         }
         let got = display_type(arena, decl_registry, &index.symbols, value_ty);
@@ -4677,13 +4513,19 @@ impl TypeRefLowering for SigLowerEnv<'_> {
     }
     fn generic_arity_for(&self, name: Symbol) -> Option<usize> {
         // Signature lowering's arity check requires the decl already be
-        // in `decl_registry` (via `resolve_item`), unlike the body
+        // in `decl_registry` (via `resolve_type`), unlike the body
         // walk's index-walking `generic_arity_for`.
-        self.index
+        if let Some(n) = self
+            .index
             .resolve_type(self.decl_registry, self.current_uri, name)
             .and_then(|item| self.index.type_members.get(&item))
             .map(|m| m.generics.len())
             .filter(|n| *n > 0)
+        {
+            return Some(n);
+        }
+        // Bare node-tag raw-form arity even without `core.gcl` loaded.
+        Builtins::node_tag_arity(&self.index.symbols[name])
     }
 }
 
