@@ -82,7 +82,7 @@ impl Builtins {
     /// `lib/std/core.gcl`): `node` / `nodeTime` / `nodeList` / `nodeGeo`
     /// are arity 1, `nodeIndex<K, V>` is arity 2. Lets a bare node tag
     /// raw-form (`node` == `node<any?>`) even without `core.gcl` loaded.
-    pub const NODE_TAGS: [(&'static str, usize); 5] = [
+    const NODE_TAGS: [(&'static str, usize); 5] = [
         ("node", 1),
         ("nodeTime", 1),
         ("nodeIndex", 2),
@@ -784,17 +784,18 @@ impl TypeArena {
             return true;
         }
 
-        // Primitive widening casts: `int<->float`, `char as {String,int}`.
-        // Every primitive is a `Type(core::X)` decl, so these are the only
-        // same-arena cast relaxations beyond identity / inheritance.
-        let int_to_int =
-            |from: TypeId, to: TypeId| from == self.builtins.int && to == self.builtins.int;
-        let float_to_float =
-            |from: TypeId, to: TypeId| from == self.builtins.float && to == self.builtins.float;
-        let char_to_string_or_int = |from: TypeId, to: TypeId| {
-            from == self.builtins.char_ && (to == self.builtins.string || to == self.builtins.int)
-        };
-        if int_to_int(from, to) || float_to_float(from, to) || char_to_string_or_int(from, to) {
+        // Primitive conversion casts. Runtime-verified 2026-06-15 via
+        // `greycat run` (`type::of(x as T) == T`): only `int <-> float` and
+        // `char as int` genuinely convert. Every other primitive `as` pair
+        // either throws "casting X to Y is not allowed" or no-ops (keeps the
+        // source type) -- both rejected here.
+        let int_to_float =
+            |from: TypeId, to: TypeId| from == self.builtins.int && to == self.builtins.float;
+        let float_to_int =
+            |from: TypeId, to: TypeId| from == self.builtins.float && to == self.builtins.int;
+        let char_to_int =
+            |from: TypeId, to: TypeId| from == self.builtins.char_ && to == self.builtins.int;
+        if int_to_float(from, to) || float_to_int(from, to) || char_to_int(from, to) {
             return true;
         }
 

@@ -376,6 +376,31 @@ mod tests {
     }
 
     #[test]
+    fn primitive_conversion_casts() {
+        // `as` casts that genuinely convert at runtime -- verified via
+        // `greycat run` (`type::of(x as T) == T`): only `int <-> float`
+        // and `char as int`. Every other primitive `as` pair the runtime
+        // rejects or no-ops (keeps the source type), so the analyzer
+        // rejects it too. Distinct from assignability, which widens none
+        // of them (see `primitives_do_not_cross_widen`).
+        let cx = TextCx::default();
+        let i = cx.arena.builtins.int;
+        let f = cx.arena.builtins.float;
+        let s = cx.arena.builtins.string;
+        let c = cx.arena.builtins.char_;
+        assert!(cx.arena.is_castable(i, f), "int as float");
+        assert!(cx.arena.is_castable(f, i), "float as int");
+        assert!(cx.arena.is_castable(c, i), "char as int");
+        assert!(
+            !cx.arena.is_castable(c, s),
+            "char as String is a runtime no-op"
+        );
+        assert!(!cx.arena.is_castable(i, c), "int as char is not allowed");
+        assert!(!cx.arena.is_castable(s, i), "String as int is not allowed");
+        assert!(!cx.arena.is_castable(c, f), "char as float is not allowed");
+    }
+
+    #[test]
     fn null_flows_into_nullable_only() {
         let mut cx = TextCx::default();
         let null = cx.arena.null();
