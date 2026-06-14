@@ -12,14 +12,14 @@
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use greycat_analyzer_core::{SourceEncoding, SymbolTable};
+use greycat_analyzer_core::{SourceEncoding, SymbolTable, TypeArena};
+use greycat_analyzer_hir::hir::Decl;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::Decl;
 use greycat_analyzer_syntax::cst::walk_named;
 use greycat_analyzer_syntax::tree_sitter;
 
-use crate::index::BUILTIN_RUNTIME_GLOBALS;
-use crate::resolver::{Definition, resolve};
+use crate::index::ProjectIndex;
+use crate::resolver::Definition;
 
 /// Token-type table — the LSP server registers `SemanticTokenType`
 /// equivalents at the wire boundary; the wasm bridge exposes these
@@ -69,7 +69,9 @@ pub fn semantic_tokens(
 ) -> SemanticTokens {
     let symbols = SymbolTable::new();
     let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir, &symbols);
+    let arena = TypeArena::new(&symbols);
+    let index = ProjectIndex::new(symbols, &arena);
+    let resolutions = index.resolutions(&hir, None, None);
 
     let line_starts = compute_line_starts(text);
     let mut events: Vec<SemanticTokenEvent> = Vec::new();
@@ -119,7 +121,7 @@ pub fn semantic_tokens(
                 }
                 if text
                     .get(n.byte_range())
-                    .is_some_and(|s| BUILTIN_RUNTIME_GLOBALS.iter().any(|(name, _)| *name == s))
+                    .is_some_and(|s| s == "Infinity" || s == "NaN")
                 {
                     push(&mut events, TOK_KEYWORD);
                     return true;

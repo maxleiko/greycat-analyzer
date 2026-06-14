@@ -13,7 +13,7 @@ use greycat_analyzer_core::conv::byte_to_position;
 use greycat_analyzer_core::{SourceEncoding, SymbolTable, TypeId};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{BlockStmt, Decl, Stmt};
+use greycat_analyzer_hir::hir::{BlockStmt, Decl, Stmt};
 
 use crate::analyzer::AnalysisResult;
 use crate::conv::position_to_byte;
@@ -212,7 +212,7 @@ fn emit_call_arg_hints(
         Stmt::Block(b) => {
             emit_call_arg_hints_block(hir, symbols, resolutions, b, want, text, encoding, out)
         }
-        Stmt::Expr(e) | Stmt::Var(greycat_analyzer_hir::types::LocalVar { init: Some(e), .. }) => {
+        Stmt::Expr(e) | Stmt::Var(greycat_analyzer_hir::hir::LocalVar { init: Some(e), .. }) => {
             emit_call_arg_hints_expr(hir, symbols, resolutions, *e, want, text, encoding, out);
         }
         Stmt::Return(r) => {
@@ -402,13 +402,13 @@ fn emit_call_arg_hints_expr(
     hir: &Hir,
     symbols: &SymbolTable,
     resolutions: &Resolutions,
-    expr_id: Idx<greycat_analyzer_hir::types::Expr>,
+    expr_id: Idx<greycat_analyzer_hir::hir::Expr>,
     want: (usize, usize),
     text: &str,
     encoding: SourceEncoding,
     out: &mut Vec<InlayHint>,
 ) {
-    use greycat_analyzer_hir::types::{CallExpr, Expr};
+    use greycat_analyzer_hir::hir::{CallExpr, Expr};
     match &hir.exprs[expr_id] {
         Expr::Call(CallExpr { callee, args, .. }) => {
             emit_call_arg_hints_expr(

@@ -1,4 +1,4 @@
-use greycat_analyzer_hir::types::Expr;
+use greycat_analyzer_hir::hir::Expr;
 
 use super::{LintCx, LintDiagnostic, LintRule, LintSeverity};
 
@@ -22,7 +22,7 @@ impl LintRule for LiteralOverflow {
     }
 
     fn check(&self, cx: &mut LintCx<'_>) {
-        use greycat_analyzer_hir::types::{LiteralExpr, LiteralKind, ParseIssue};
+        use greycat_analyzer_hir::hir::{LiteralExpr, LiteralKind, ParseIssue};
         let mut diags: Vec<LintDiagnostic> = Vec::new();
         for (_, expr) in cx.hir.exprs.iter() {
             let Expr::Literal(LiteralExpr {

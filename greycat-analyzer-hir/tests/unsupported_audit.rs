@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::Expr;
+use greycat_analyzer_hir::hir::Expr;
 use greycat_analyzer_syntax::parse;
 
 #[test]

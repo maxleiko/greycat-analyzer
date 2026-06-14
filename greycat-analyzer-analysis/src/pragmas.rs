@@ -28,7 +28,7 @@
 mod permission;
 
 use greycat_analyzer_hir::Hir;
-use greycat_analyzer_hir::types::{Annotation, AnnotationArgKind, Decl, Modifiers};
+use greycat_analyzer_hir::hir::{Annotation, AnnotationArgKind, Decl, Modifiers};
 
 use crate::analyzer::{SemanticDiagnostic, Severity};
 use crate::index::ProjectIndex;

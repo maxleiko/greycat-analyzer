@@ -14,9 +14,9 @@ use wasm_bindgen::prelude::*;
 
 use greycat_analyzer_core::lsp_types::{Position, Uri};
 use greycat_analyzer_core::{
-    ItemId, SourceEncoding, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
+    ItemKey, SourceEncoding, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
 };
-use greycat_analyzer_hir::types::Decl;
+use greycat_analyzer_hir::hir::Decl;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1584,7 +1584,7 @@ fn expr_completion(
                     md.decls
                         .iter()
                         .filter_map(|d| m.hir.decls[*d].name())
-                        .map(|n| project.symbols()[m.hir.idents[n].symbol].to_string())
+                        .map(|n| m.hir.ident_symbol(n, project.symbols()).to_string())
                         .collect()
                 })
                 .unwrap_or_default()
@@ -1592,7 +1592,7 @@ fn expr_completion(
         .unwrap_or_default();
 
     for (name_sym, locs) in &project.index.decl_locations {
-        let name = project.index.symbols.resolve(name_sym);
+        let name = project.symbol(name_sym);
         if in_module.contains(name) {
             continue;
         }
@@ -1616,7 +1616,7 @@ fn expr_completion(
         });
     }
     for name_sym in project.index.var_names.iter() {
-        let name = project.index.symbols.resolve(name_sym);
+        let name = project.symbol(name_sym);
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
@@ -1632,7 +1632,7 @@ fn expr_completion(
         });
     }
     for (name_sym, _) in project.index.runtime_globals.iter() {
-        let name = project.index.symbols.resolve(name_sym);
+        let name = project.symbol(name_sym);
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
@@ -1648,7 +1648,7 @@ fn expr_completion(
         });
     }
     for name_sym in project.index.fn_names.iter() {
-        let name = project.index.symbols.resolve(name_sym);
+        let name = project.symbol(name_sym);
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
@@ -1664,7 +1664,7 @@ fn expr_completion(
         });
     }
     for name_sym in project.index.module_names.keys() {
-        let name = project.index.symbols.resolve(name_sym);
+        let name = project.symbol(name_sym);
         if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
@@ -2058,9 +2058,9 @@ fn member_completion(
     // head name of the resulting type.
     let _ = well_known;
     let inner_head: Option<String> = (|| {
-        let (recv_id, recv_args): (ItemId, Vec<TypeId>) = match &arena.get(recv_ty).kind {
-            TypeKind::Type(d) => (*d, Vec::new()),
-            TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
+        let (recv_id, recv_args): (ItemKey, &[TypeId]) = match &arena.get(recv_ty).kind {
+            TypeKind::Type(d) => (*d, &[]),
+            TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
             _ => return None,
         };
         let members = project.index.type_members.get(&recv_id)?;
@@ -2285,7 +2285,7 @@ fn receiver_type_at(
     // Stage 2: ident already lowered into the HIR — resolver path.
     if let Some((ident_idx, _)) = module.hir.idents.iter().find(|(_, i)| i.byte_range == r) {
         use crate::resolver::Definition;
-        use greycat_analyzer_hir::types::Decl;
+        use greycat_analyzer_hir::hir::Decl;
         if let Some(def) = module.resolutions.lookup(ident_idx) {
             // P35.10 — `Definition::Decl(decl_id)` for a top-level
             // `var` resolves through the modvar's binding ident, now
@@ -2336,7 +2336,7 @@ fn lookup_name_type_at(
     cursor_byte: usize,
     name: &str,
 ) -> Option<TypeId> {
-    use greycat_analyzer_hir::types::Decl as HD;
+    use greycat_analyzer_hir::hir::Decl as HD;
     let module = hir.module.as_ref()?;
     // P35.10 — first pass: top-level `Decl::Var`. Module-level vars
     // are visible from *anywhere* in the module body (unlike fn / type
@@ -2392,7 +2392,7 @@ fn lookup_name_type_in_fn(
     symbols: &SymbolTable,
     analysis: &crate::analyzer::AnalysisResult,
     cursor_byte: usize,
-    fnd: &greycat_analyzer_hir::types::FnDecl,
+    fnd: &greycat_analyzer_hir::hir::FnDecl,
     name: &str,
 ) -> Option<TypeId> {
     for p_id in &fnd.params {
@@ -2412,10 +2412,10 @@ fn lookup_name_type_in_block(
     symbols: &SymbolTable,
     analysis: &crate::analyzer::AnalysisResult,
     cursor_byte: usize,
-    block: &greycat_analyzer_hir::types::BlockStmt,
+    block: &greycat_analyzer_hir::hir::BlockStmt,
     name: &str,
 ) -> Option<TypeId> {
-    use greycat_analyzer_hir::types::Stmt as HS;
+    use greycat_analyzer_hir::hir::Stmt as HS;
     if !(block.byte_range.start <= cursor_byte && cursor_byte <= block.byte_range.end) {
         return None;
     }
@@ -2442,10 +2442,10 @@ fn lookup_name_type_in_stmt(
     symbols: &SymbolTable,
     analysis: &crate::analyzer::AnalysisResult,
     cursor_byte: usize,
-    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Stmt>,
+    stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::hir::Stmt>,
     name: &str,
 ) -> Option<TypeId> {
-    use greycat_analyzer_hir::types::Stmt as HS;
+    use greycat_analyzer_hir::hir::Stmt as HS;
     match &hir.stmts[stmt_id] {
         HS::Block(b) => lookup_name_type_in_block(hir, symbols, analysis, cursor_byte, b, name),
         HS::If(s) => {
@@ -2525,18 +2525,18 @@ fn type_head_name<'a>(
     use greycat_analyzer_core::TypeKind;
     let t = arena.get(id);
     match &t.kind {
-        // P35.7 — handle-keyed variants carry the name in the `ItemId`.
+        // P35.7 — handle-keyed variants carry the name in the `ItemKey`.
         TypeKind::Type(d) => Some(pa.decl_name(*d)),
         TypeKind::Generic { tpl, .. } => Some(pa.decl_name(*tpl)),
         _ => None,
     }
 }
 
-/// Resolve a bare type name to its project [`ItemId`], preferring a
+/// Resolve a bare type name to its project [`ItemKey`], preferring a
 /// declaration in `uri`'s own module and falling back to the project
 /// decl table (a `@library` / `@include` type). `None` when the name
 /// isn't a type the project index knows.
-fn type_item_id_by_name(project: &ProjectAnalysis, uri: &Uri, name_sym: Symbol) -> Option<ItemId> {
+fn type_item_id_by_name(project: &ProjectAnalysis, uri: &Uri, name_sym: Symbol) -> Option<ItemKey> {
     if let Some(id) = project.index.item_id_for(uri, name_sym)
         && project.index.type_members.contains_key(&id)
     {
@@ -2553,15 +2553,15 @@ fn type_item_id_by_name(project: &ProjectAnalysis, uri: &Uri, name_sym: Symbol) 
 /// `type_members` index — the same supertype edges the analyzer's
 /// inherited-member resolution follows — calling `visit(depth, hir, td)`
 /// for each level, subtype (`depth == 0`) before supertype. Foreign /
-/// qualified supertypes are followed: the `supertype: ItemId` edge
+/// qualified supertypes are followed: the `supertype: ItemKey` edge
 /// carries no provenance. Cycle-guarded; a level whose home HIR can't
 /// be fetched is skipped, not fatal.
-fn walk_supertype_chain<F>(project: &ProjectAnalysis, start: ItemId, mut visit: F)
+fn walk_supertype_chain<F>(project: &ProjectAnalysis, start: ItemKey, mut visit: F)
 where
-    F: FnMut(usize, &greycat_analyzer_hir::Hir, &greycat_analyzer_hir::types::TypeDecl),
+    F: FnMut(usize, &greycat_analyzer_hir::Hir, &greycat_analyzer_hir::hir::TypeDecl),
 {
     let mut cur = Some(start);
-    let mut seen: FxHashSet<ItemId> = FxHashSet::default();
+    let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
     let mut depth = 0usize;
     while let Some(item) = cur {
         if !seen.insert(item) {
@@ -2590,7 +2590,7 @@ where
 fn collect_type_members(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    td: &greycat_analyzer_hir::types::TypeDecl,
+    td: &greycat_analyzer_hir::hir::TypeDecl,
     prefix_lower: &str,
     emitted: &mut FxHashSet<String>,
     items: &mut Vec<CompletionItem>,
@@ -3108,7 +3108,7 @@ fn type_position_completion(
     }
     // Project-level type / enum decls.
     for (name_sym, locs) in &project.index.decl_locations {
-        let name = project.index.symbols.resolve(name_sym);
+        let name = project.symbol(name_sym);
         if let Some(d) = locs.first()
             && let Some(m) = project.module(&d.uri)
         {
@@ -3129,7 +3129,7 @@ fn type_position_completion(
     // Module names — type slots can read `module::Foo`, so module
     // names are valid here as the leading segment.
     for name_sym in project.index.module_names.keys() {
-        let name = project.index.symbols.resolve(name_sym);
+        let name = project.symbol(name_sym);
         push(&mut items, &mut seen, name, CompletionItemKind::Module);
     }
 
@@ -3243,7 +3243,7 @@ fn supplied_field_names(
 fn emit_attrs(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    td: &greycat_analyzer_hir::types::TypeDecl,
+    td: &greycat_analyzer_hir::hir::TypeDecl,
     prefix_lower: &str,
     supplied: &FxHashSet<String>,
     emitted: &mut FxHashSet<String>,

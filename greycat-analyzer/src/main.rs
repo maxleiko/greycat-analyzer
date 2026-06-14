@@ -27,14 +27,6 @@ enum Command {
     Server(LangServer),
     /// Print the tree-sitter CST s-expression for a `.gcl` file (debug).
     Cst(Cst),
-    // P18.1
-    /// Dump per-expression byte ranges and inferred type display strings as JSONL.
-    #[clap(name = "dump-types")]
-    DumpTypes(DumpTypes),
-    // P18.1
-    /// Dump per-ident-use byte ranges and decl pointers as JSONL.
-    #[clap(name = "dump-resolutions")]
-    DumpResolutions(DumpResolutions),
     /// Print the full HIR view of a project (debug). Use `--json` for
     /// machine-readable output; default is Rust Debug pretty-print.
     Hir(HirCmd),
@@ -59,8 +51,6 @@ fn main() -> Result<ExitCode, AnyError> {
         Command::Fmt(cmd) => cmd.run(),
         Command::Server(cmd) => cmd.run().map(|_| ExitCode::SUCCESS),
         Command::Cst(cmd) => cmd.run().map(|_| ExitCode::SUCCESS),
-        Command::DumpTypes(cmd) => cmd.run(),
-        Command::DumpResolutions(cmd) => cmd.run(),
         Command::Hir(cmd) => cmd.run(),
     }
 }

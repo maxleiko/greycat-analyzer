@@ -28,15 +28,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use greycat_analyzer_core::TypeRegistry;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{
-    BuiltinSelector, Builtins, GenericOwner, ItemId, SourceManager, Symbol, SymbolTable, TypeArena,
-    TypeId, TypeKind,
+    GenericOwner, ItemKey, SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
 };
-use greycat_analyzer_hir::types::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
+use greycat_analyzer_hir::hir::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir, lower_module};
 
-use crate::analyzer::{
-    AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into, seed_builtins,
-};
+use crate::analyzer::{AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into};
 use crate::directives::{Directives, parse_directives};
 use crate::display::{ProjectTypeDisplay, display_type, display_type_for_module};
 use crate::index::{FnSignature, ProjectIndex, module_name_from_uri};
@@ -49,7 +46,7 @@ use crate::lint::{
 };
 use crate::lower_type_ref::{self, TypeRefLowering};
 use crate::meta_pragmas::{LintPragmas, parse_lint_pragmas};
-use crate::resolver::{Resolutions, resolve_with_index_for};
+use crate::resolver::Resolutions;
 use crate::well_known::WellKnown;
 
 /// Per-document outputs of the analyzer pipeline. Held by
@@ -114,7 +111,7 @@ impl ModuleTimings {
 /// comparable — no `mint_type_shape`/`read_type_shape` translation
 /// needed. Callers that previously wrote `module.analysis.types`
 /// should call [`Self::arena`] / [`Self::arena_mut`] instead.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProjectAnalysis {
     pub index: ProjectIndex,
     /// Project-wide type arena. Populated alongside every
@@ -190,23 +187,23 @@ struct ModuleSigCache {
     name_set_hash: u64,
     /// `(type_id, attr_sym, ty)` — attr name stays bare Symbol
     /// (per-type-internal).
-    attrs: Vec<(ItemId, Symbol, TypeId)>,
+    attrs: Vec<(ItemKey, Symbol, TypeId)>,
     /// `(type_id, method_sym, ty)`.
-    methods: Vec<(ItemId, Symbol, TypeId)>,
+    methods: Vec<(ItemKey, Symbol, TypeId)>,
     /// `(type_id, method_sym, FnSignature)` — full signature for
     /// methods that declare their own generic params (`<T, …>`).
     /// Lets cross-module / static / instance / arrow method calls
     /// run the same witness-based generic inference the bare-Ident
     /// path uses today (see [`crate::analyzer::Cx::try_generic_call_inference`]).
-    method_sigs: Vec<(ItemId, Symbol, FnSignature)>,
+    method_sigs: Vec<(ItemKey, Symbol, FnSignature)>,
     /// `(fn_id, signature)`.
-    fns: Vec<(ItemId, FnSignature)>,
+    fns: Vec<(ItemKey, FnSignature)>,
     /// `(var_id, ty)`. Top-level `var` declared types.
     /// Lowered alongside the other signatures in
     /// [`lower_module_signatures`] so the analyzer's bare-Ident path
     /// can type a cross-module `Definition::ProjectDecl` pointing at
     /// a var.
-    vars: Vec<(ItemId, TypeId)>,
+    vars: Vec<(ItemKey, TypeId)>,
     /// `(type_id, supertype_ty)`. Pre-lowered direct supertype shape
     /// (e.g. `Generic { decl: Base, args: [int] }` for
     /// `Sub extends Base<int>`). Populated alongside the other
@@ -214,19 +211,26 @@ struct ModuleSigCache {
     /// instantiated parent TypeId into `TypeMembers::supertype_ty`
     /// — used by `is_assignable_to_with_index` to walk the chain with
     /// real generic args, not just decl identity.
-    supertypes: Vec<(ItemId, TypeId)>,
+    supertypes: Vec<(ItemKey, TypeId)>,
+}
+
+impl Default for ProjectAnalysis {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProjectAnalysis {
     pub fn new() -> Self {
-        let mut arena = TypeArena::new();
-        seed_builtins(&mut arena);
-        let index = ProjectIndex::new(&mut arena);
+        let symbols = SymbolTable::new();
+        let arena = TypeArena::new(&symbols);
+        let index = ProjectIndex::new(symbols, &arena);
         Self {
             index,
             arena,
             decl_registry: DeclRegistry::new(),
-            well_known: crate::well_known::WellKnown::new(),
+            well_known: WellKnown::new(),
             bypass_suppressions: false,
             enabled_rules: FxHashSet::default(),
             disabled_rules: FxHashSet::default(),
@@ -296,10 +300,10 @@ impl ProjectAnalysis {
         &self.index.symbols[*sym]
     }
 
-    /// Resolve an [`ItemId`] to its declared source name through
+    /// Resolve an [`ItemKey`] to its declared source name through
     /// `id.name → Symbol → SymbolTable`.
     #[inline(always)]
-    pub fn decl_name(&self, id: ItemId) -> &str {
+    pub fn decl_name(&self, id: ItemKey) -> &str {
         &self.index.symbols[id.name]
     }
 
@@ -320,7 +324,7 @@ impl ProjectAnalysis {
         recv_ty: TypeId,
     ) -> Option<FxHashMap<Symbol, TypeId>> {
         let (decl_id, args) = match &self.arena.get(recv_ty).kind {
-            TypeKind::Generic { tpl, args } if !args.is_empty() => (*tpl, args.clone()),
+            TypeKind::Generic { tpl, args } if !args.is_empty() => (*tpl, args.as_slice()),
             _ => return None,
         };
         let name_sym = decl_id.name;
@@ -425,9 +429,9 @@ impl ProjectAnalysis {
     /// idempotent (the arena interns them on the second insert).
     fn reset_state(&mut self) {
         self.modules.clear();
-        self.arena = TypeArena::new();
-        seed_builtins(&mut self.arena);
-        self.index = ProjectIndex::new(&mut self.arena);
+        self.arena = TypeArena::new(&self.index.symbols);
+        let index = std::mem::take(&mut self.index);
+        self.index = ProjectIndex::new(index.symbols, &self.arena);
         // Cached `TypeId`s reference the old arena, which
         // we just replaced. Drop the cache so the next
         // `lower_signatures_into` rebuilds against the fresh arena.
@@ -763,7 +767,7 @@ fn lower_signatures_into(
     }
 
     // Post-pass: resolve each type's `supertype` field from its
-    // source `extends` TypeRef to the parent's `ItemId`. Deferred to
+    // source `extends` TypeRef to the parent's `ItemKey`. Deferred to
     // here because at ingest time the parent module may not have
     // been ingested yet (and ingest order is not topological).
     link_supertypes(index, lowered);
@@ -781,7 +785,7 @@ fn lower_signatures_into(
 
 /// Walks every type decl across the project and patches each
 /// [`TypeMembers::supertype`] field with the parent's resolved
-/// [`ItemId`]. Same-module supertypes are looked up directly; bare-
+/// [`ItemKey`]. Same-module supertypes are looked up directly; bare-
 /// name cross-module supertypes filter `decl_locations` for the Type
 /// namespace, skipping private decls (matches GreyCat's bare-name
 /// visibility rule); qualified `mod::Super` supertypes route through
@@ -790,12 +794,12 @@ fn lower_signatures_into(
 #[allow(clippy::mutable_key_type)]
 fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
     use crate::index::Namespace;
-    use greycat_analyzer_hir::types::Decl;
+    use greycat_analyzer_hir::hir::Decl;
 
     // Two-pass to dodge the `&mut index` + `&index` aliasing the
     // resolution helper would otherwise need: first collect every
     // (self_id, parent_id) pair, then apply.
-    let mut links: Vec<(ItemId, ItemId)> = Vec::new();
+    let mut links: Vec<(ItemKey, ItemKey)> = Vec::new();
     for (uri, hir) in lowered {
         let Some(module) = hir.module.as_ref() else {
             continue;
@@ -844,16 +848,16 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
                     continue;
                 };
                 let parent_module = index.symbols.intern(qual_stem);
-                ItemId::new(parent_module, parent_name)
+                ItemKey::new(parent_module, parent_name)
             } else {
                 // Bare `Super` — same-module wins first, then cross-
                 // module via the resolver's name-set (filtered to
                 // non-private Type-namespace candidates).
-                let local = ItemId::new(module_sym, parent_name);
+                let local = ItemKey::new(module_sym, parent_name);
                 if index.type_members.contains_key(&local) {
                     local
                 } else {
-                    let mut hit: Option<ItemId> = None;
+                    let mut hit: Option<ItemKey> = None;
                     for (cand_uri, decl) in index.locate_decl_in_ns(parent_name, Namespace::Type) {
                         if index.is_decl_private(cand_uri, decl) {
                             continue;
@@ -862,14 +866,14 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
                             continue;
                         };
                         let cand_module = index.symbols.intern(cand_stem);
-                        hit = Some(ItemId::new(cand_module, parent_name));
+                        hit = Some(ItemKey::new(cand_module, parent_name));
                         break;
                     }
                     let Some(found) = hit else { continue };
                     found
                 }
             };
-            let self_id = ItemId::new(module_sym, hir.idents[td.name].symbol);
+            let self_id = ItemKey::new(module_sym, hir.idents[td.name].symbol);
             links.push((self_id, parent_id));
         }
     }
@@ -901,11 +905,11 @@ fn link_supertypes(index: &mut ProjectIndex, lowered: &[(&Uri, &Hir)]) {
 fn populate_subtype_indices(index: &mut ProjectIndex) {
     use rustc_hash::FxHashSet;
 
-    // Snapshot every type ItemId we'll need to compute closures for.
-    let all_types: Vec<ItemId> = index.type_members.keys().copied().collect();
+    // Snapshot every type ItemKey we'll need to compute closures for.
+    let all_types: Vec<ItemKey> = index.type_members.keys().copied().collect();
 
     // Step 1: invert supertype to direct-child.
-    let mut children: FxHashMap<ItemId, Vec<ItemId>> = FxHashMap::default();
+    let mut children: FxHashMap<ItemKey, Vec<ItemKey>> = FxHashMap::default();
     for (id, members) in &index.type_members {
         if let Some(parent) = members.supertype {
             children.entry(parent).or_default().push(*id);
@@ -915,10 +919,10 @@ fn populate_subtype_indices(index: &mut ProjectIndex) {
     // Step 2: memoized closure build. Recursive helper; `memo` is
     // shared across roots so sibling subtrees don't redo work.
     fn build(
-        id: ItemId,
-        children: &FxHashMap<ItemId, Vec<ItemId>>,
-        is_abstract: &FxHashSet<ItemId>,
-        memo: &mut FxHashMap<ItemId, Box<[ItemId]>>,
+        id: ItemKey,
+        children: &FxHashMap<ItemKey, Vec<ItemKey>>,
+        is_abstract: &FxHashSet<ItemKey>,
+        memo: &mut FxHashMap<ItemKey, Box<[ItemKey]>>,
     ) {
         if memo.contains_key(&id) {
             return;
@@ -927,7 +931,7 @@ fn populate_subtype_indices(index: &mut ProjectIndex) {
         // `supertype` (shouldn't occur, but corrupt fixtures or
         // half-loaded projects could otherwise loop here).
         memo.insert(id, Box::default());
-        let mut set: FxHashSet<ItemId> = FxHashSet::default();
+        let mut set: FxHashSet<ItemKey> = FxHashSet::default();
         if !is_abstract.contains(&id) {
             set.insert(id);
         }
@@ -939,12 +943,12 @@ fn populate_subtype_indices(index: &mut ProjectIndex) {
                 }
             }
         }
-        let mut sorted: Vec<ItemId> = set.into_iter().collect();
+        let mut sorted: Vec<ItemKey> = set.into_iter().collect();
         sorted.sort();
         memo.insert(id, sorted.into_boxed_slice());
     }
 
-    let mut closure: FxHashMap<ItemId, Box<[ItemId]>> = FxHashMap::default();
+    let mut closure: FxHashMap<ItemKey, Box<[ItemKey]>> = FxHashMap::default();
     for id in &all_types {
         build(*id, &children, &index.is_abstract, &mut closure);
     }
@@ -954,12 +958,12 @@ fn populate_subtype_indices(index: &mut ProjectIndex) {
     // deterministically across re-lowers. `Symbol::Ord` is u32-order
     // (intern-timing dependent), so resolve back through the symbol
     // table for stable string-order comparison.
-    let mut abstract_ids: Vec<ItemId> = index.is_abstract.iter().copied().collect();
+    let mut abstract_ids: Vec<ItemKey> = index.is_abstract.iter().copied().collect();
     abstract_ids.sort_by(|a, b| {
         (&index.symbols[a.module], &index.symbols[a.name])
             .cmp(&(&index.symbols[b.module], &index.symbols[b.name]))
     });
-    let mut reverse: FxHashMap<Box<[ItemId]>, ItemId> = FxHashMap::default();
+    let mut reverse: FxHashMap<Box<[ItemKey]>, ItemKey> = FxHashMap::default();
     for id in abstract_ids {
         if let Some(c) = closure.get(&id) {
             reverse.entry(c.clone()).or_insert(id);
@@ -975,9 +979,9 @@ fn populate_deref_caches(index: &mut ProjectIndex) {
     // Two-pass: build a snapshot of (type_id → ret_ty) pairs from
     // `type_flags`, then write back. Avoids holding `&type_members`
     // + `&mut type_members` borrows simultaneously. With `type_flags`
-    // now keyed by `ItemId`, each entry maps 1:1 to its type_members
+    // now keyed by `ItemKey`, each entry maps 1:1 to its type_members
     // entry — no name-match scan needed.
-    let mut resolutions: FxHashMap<ItemId, TypeId> = FxHashMap::default();
+    let mut resolutions: FxHashMap<ItemKey, TypeId> = FxHashMap::default();
     for (type_id, flags) in &index.type_flags {
         let Some(method_name) = flags.deref else {
             continue;
@@ -1493,7 +1497,7 @@ pub(crate) fn is_assignable_to_with_index(
 fn walk_substituted_supertype_chain<F>(
     index: &ProjectIndex,
     arena: &mut TypeArena,
-    sub_decl: ItemId,
+    sub_decl: ItemKey,
     sub_args: &[TypeId],
     mut on_hop: F,
 ) -> bool
@@ -1573,9 +1577,7 @@ pub(crate) fn is_castable_with_index(
         matches!(&from_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
     let to_node_tag =
         matches!(&to_kind, TypeKind::Generic { tpl, .. } if well_known.is_node_tag(*tpl));
-    if (from_node_tag && arena.is_builtin(to, Builtins::INT))
-        || (arena.is_builtin(from, Builtins::INT) && to_node_tag)
-    {
+    if (from == arena.builtins.int && to_node_tag) || (from_node_tag && to == arena.builtins.int) {
         return true;
     }
     // Exhaustive nested match. Same rationale as the assignability
@@ -1640,7 +1642,7 @@ pub(crate) fn is_castable_with_index(
                     // hop matching Sup. Source is non-generic, so the
                     // hop must equal `from` for the cast to make sense.
                     // Defer to core via `is_castable(hop, from)`.
-                    let to_decl_args = match arena.get(to).kind.clone() {
+                    let to_decl_args = match &arena.get(to).kind {
                         TypeKind::Generic { args, .. } => args.to_vec(),
                         _ => return false,
                     };
@@ -1855,7 +1857,7 @@ impl ProjectAnalysis {
                           }|
          -> PassAOut {
             let t0 = Instant::now();
-            let resolutions = resolve_with_index_for(&hir, index, &uri, map_decl);
+            let resolutions = self.index.resolutions(&hir, Some(&uri), map_decl);
             let resolve_took = t0.elapsed();
             let t2 = Instant::now();
             // Seed `lints` with the directive parser's own diagnostics
@@ -2341,7 +2343,7 @@ impl ProjectAnalysis {
         // inside `sig_cache`) remain valid; only the per-module
         // index data gets wiped.
         let preserved_symbols = std::mem::take(&mut self.index.symbols);
-        let mut new_index = ProjectIndex::with_symbols(preserved_symbols, &mut self.arena);
+        let mut new_index = ProjectIndex::new(preserved_symbols, &self.arena);
         if let Some(hir) = &changed_hir {
             new_index.ingest(
                 uri,
@@ -2430,7 +2432,9 @@ impl ProjectAnalysis {
             ..ModuleTimings::default()
         };
         let t0 = Instant::now();
-        let resolutions = resolve_with_index_for(&hir, &self.index, uri, self.well_known.map_decl);
+        let resolutions = self
+            .index
+            .resolutions(&hir, Some(uri), self.well_known.map_decl);
         timings.resolve = t0.elapsed();
         let t1 = Instant::now();
         let mut analysis = analyze_with_index_into(
@@ -2620,7 +2624,7 @@ fn lambda_call_arg_diags(
     well_known: &crate::well_known::WellKnown,
     decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
-    call: &greycat_analyzer_hir::types::CallExpr,
+    call: &greycat_analyzer_hir::hir::CallExpr,
     diags: &mut Vec<crate::analyzer::SemanticDiagnostic>,
 ) {
     use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
@@ -2773,7 +2777,7 @@ fn is_slot_assignable(
     if from_t.nullable && !to_t.nullable {
         return false;
     }
-    arena.is_builtin(from, Builtins::INT) && arena.is_builtin(to, Builtins::FLOAT)
+    from == arena.builtins.int && to == arena.builtins.float
 }
 
 /// Check one supplied construction value against an expected slot type,
@@ -2860,7 +2864,7 @@ fn collect_call_arg_diags_split(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
 
     let cur_module = match modules.get(cur_uri) {
         Some(m) => m,
@@ -3084,7 +3088,7 @@ fn collect_object_field_diags_split(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
 
     let cur_module = match modules.get(cur_uri) {
         Some(m) => m,
@@ -3158,7 +3162,7 @@ fn collect_object_field_diags_split(
         // decl from the settled object type — provenance-blind, so
         // foreign / qualified heads check identically to same-module
         // ones (the old `item_id_for(cur_uri, …)` fabricated a same-
-        // module ItemId and silently skipped every cross-module head).
+        // module ItemKey and silently skipped every cross-module head).
         let head_id = match &arena.get(obj_ty).kind {
             TypeKind::Generic { tpl, .. } => *tpl,
             TypeKind::Type(decl) => *decl,
@@ -3200,7 +3204,7 @@ fn collect_object_field_diags_split(
         let mut chain_attrs: FxHashMap<Symbol, (TypeId, bool)> = FxHashMap::default();
         let mut cur_tpl = head_id;
         let mut cur_subst = init_subst;
-        let mut seen: FxHashSet<ItemId> = FxHashSet::default();
+        let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
         for _ in 0..32 {
             if !seen.insert(cur_tpl) {
                 break;
@@ -3348,7 +3352,7 @@ fn collect_instance_method_value_ref_diags(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{DiagCategory, MemberDef, SemanticDiagnostic, Severity};
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
     use rustc_hash::FxHashSet;
 
     let Some(cur_module) = modules.get(cur_uri) else {
@@ -3427,7 +3431,7 @@ fn collect_static_type_args_diags(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
 
     let Some(cur_module) = modules.get(cur_uri) else {
         return;
@@ -3485,7 +3489,7 @@ fn collect_object_construction_diags(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::Severity;
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
 
     let Some(cur_module) = modules.get(cur_uri) else {
         return;
@@ -3509,7 +3513,7 @@ fn collect_object_construction_diags(
         // coerces to float, `geo { 1, 2 }` ≡ `geo { 1.0, 2.0 }`). Checked
         // here, before the fixed-tuple / generic positional dispatch
         // below, since `geo` has its own arity rule.
-        if arena.is_builtin(obj_ty, Builtins::GEO) {
+        if obj_ty == arena.builtins.geo {
             if obj_expr.fields.len() != 2 {
                 diags.push(SemanticDiagnostic {
                     severity: Severity::Error,
@@ -3520,7 +3524,6 @@ fn collect_object_construction_diags(
                     category: DiagCategory::TypeRelation,
                 });
             } else {
-                let float_ty = arena.builtin(Builtins::FLOAT);
                 let slot_desc = "element type `float`".to_string();
                 for value in obj_expr.fields.iter() {
                     check_construction_value_against_slot(
@@ -3531,7 +3534,7 @@ fn collect_object_construction_diags(
                         decl_registry,
                         arena,
                         *value,
-                        float_ty,
+                        arena.builtins.float,
                         "element-type-mismatch",
                         &slot_desc,
                         diags,
@@ -3640,33 +3643,33 @@ fn collect_object_construction_diags(
         // Each accepted element is a `(Builtins selector, display name)`
         // pair: the selector resolves the canonical `Type(core::X)` for
         // the membership check, the name feeds the diagnostic message.
-        type Accepted = &'static [(BuiltinSelector, &'static str)];
-        let fixed_tuples: [(Option<ItemId>, usize, Accepted, &str); 7] = [
-            (well_known.t2_decl, 2, &[(Builtins::INT, "int")], "t2"),
+        type Accepted<'a> = &'a [(TypeId, &'static str)];
+        let fixed_tuples: [(Option<ItemKey>, usize, Accepted, &str); 7] = [
+            (well_known.t2_decl, 2, &[(arena.builtins.int, "int")], "t2"),
             (
                 well_known.t2f_decl,
                 2,
-                &[(Builtins::FLOAT, "float"), (Builtins::INT, "int")],
+                &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t2f",
             ),
-            (well_known.t3_decl, 3, &[(Builtins::INT, "int")], "t3"),
+            (well_known.t3_decl, 3, &[(arena.builtins.int, "int")], "t3"),
             (
                 well_known.t3f_decl,
                 3,
-                &[(Builtins::FLOAT, "float"), (Builtins::INT, "int")],
+                &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t3f",
             ),
-            (well_known.t4_decl, 4, &[(Builtins::INT, "int")], "t4"),
+            (well_known.t4_decl, 4, &[(arena.builtins.int, "int")], "t4"),
             (
                 well_known.t4f_decl,
                 4,
-                &[(Builtins::FLOAT, "float"), (Builtins::INT, "int")],
+                &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t4f",
             ),
             (
                 well_known.str_decl,
                 1,
-                &[(Builtins::STRING, "String")],
+                &[(arena.builtins.string, "String")],
                 "str",
             ),
         ];
@@ -3695,7 +3698,7 @@ fn collect_object_construction_diags(
                     };
                     let ok = accepted
                         .iter()
-                        .any(|(sel, _)| arena.is_builtin(val_ty, *sel));
+                        .any(|(expected_ty, _)| val_ty == *expected_ty);
                     if !ok {
                         let accepted_msg = accepted
                             .iter()
@@ -4025,11 +4028,10 @@ fn validate_module_type_relations(
     diags: &mut Vec<SemanticDiagnostic>,
 ) {
     use crate::analyzer::{SemanticDiagnostic, Severity};
-    use greycat_analyzer_hir::types::Decl;
+    use greycat_analyzer_hir::hir::Decl;
 
     let hir = &module.hir;
     let analysis = &module.analysis;
-    let bool_t = arena.builtin(Builtins::BOOL);
 
     let Some(top) = hir.module.as_ref() else {
         return;
@@ -4045,7 +4047,7 @@ fn validate_module_type_relations(
             well_known,
             decl_registry,
             arena,
-            bool_t,
+            arena.builtins.bool_,
             &hir.decls[*d_id],
             &no_outer_generics,
             diags,
@@ -4245,7 +4247,7 @@ fn validate_module_type_relations(
         return_ty: Option<TypeId>,
         diags: &mut Vec<SemanticDiagnostic>,
     ) {
-        use greycat_analyzer_hir::types::{
+        use greycat_analyzer_hir::hir::{
             AssignStmt, AtStmt, DoWhileStmt, ForInStmt, ForStmt, IfStmt, LocalVar, Stmt, TryStmt,
             WhileStmt,
         };
@@ -4678,7 +4680,7 @@ impl TypeRefLowering for SigLowerEnv<'_> {
         // in `decl_registry` (via `resolve_item`), unlike the body
         // walk's index-walking `generic_arity_for`.
         self.index
-            .resolve_item(self.decl_registry, self.current_uri, name)
+            .resolve_type(self.decl_registry, self.current_uri, name)
             .and_then(|item| self.index.type_members.get(&item))
             .map(|m| m.generics.len())
             .filter(|n| *n > 0)
@@ -4797,9 +4799,9 @@ fn method_subst_from_receiver(
     cur_module: &ModuleAnalysis,
     fn_module: &ModuleAnalysis,
     index: &ProjectIndex,
-    callee_expr: &greycat_analyzer_hir::types::Expr,
+    callee_expr: &greycat_analyzer_hir::hir::Expr,
 ) -> (GenericsInScope, MethodSubst) {
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
     let empty = || (GenericsInScope::default(), MethodSubst::default());
     let receiver_expr_id = match callee_expr {
         Expr::Member(m) | Expr::Arrow(m) => m.receiver,
@@ -4821,7 +4823,7 @@ fn method_subst_from_receiver(
     let Some(module) = fn_module.hir.module.as_ref() else {
         return empty();
     };
-    let mut owner_td: Option<&greycat_analyzer_hir::types::TypeDecl> = None;
+    let mut owner_td: Option<&greycat_analyzer_hir::hir::TypeDecl> = None;
     for d_id in &module.decls {
         if let Decl::Type(td) = &fn_module.hir.decls[*d_id]
             && &index.symbols[fn_module.hir.idents[td.name].symbol] == recv_name
@@ -5188,11 +5190,11 @@ mod tests {
     /// Collect a closure's concrete leaves as `&str` names so assertions
     /// don't depend on Symbol identity (which changes per `SymbolTable`).
     /// Tests place every type in `/proj/main.gcl` (module `main`), so
-    /// the lookup is a direct ItemId construction.
+    /// the lookup is a direct ItemKey construction.
     fn closure_names<'a>(pa: &'a ProjectAnalysis, root: &str) -> Vec<&'a str> {
         let root_sym = sym(pa, root);
         let main_mod = pa.index.symbols.intern("main");
-        let root_id = ItemId::new(main_mod, root_sym);
+        let root_id = ItemKey::new(main_mod, root_sym);
         pa.index
             .subtype_closure
             .get(&root_id)
@@ -5302,7 +5304,7 @@ mod tests {
         );
         let pa = ProjectAnalysis::analyze(&mgr);
         let main_mod = pa.index.symbols.intern("main");
-        let bird_id = ItemId::new(main_mod, sym(&pa, "Bird"));
+        let bird_id = ItemKey::new(main_mod, sym(&pa, "Bird"));
         let bird_closure = pa
             .index
             .subtype_closure
@@ -5347,7 +5349,7 @@ mod tests {
         let collect_sorted = |pa: &ProjectAnalysis, name: &str| -> Vec<String> {
             let s = sym(pa, name);
             let main_mod = pa.index.symbols.intern("main");
-            let id = ItemId::new(main_mod, s);
+            let id = ItemKey::new(main_mod, s);
             let mut names: Vec<String> = pa
                 .index
                 .subtype_closure
@@ -5368,8 +5370,8 @@ mod tests {
         // The reverse index hits in both projects via each project's
         // own (canonical) closure key — the within-project byte
         // stability is what matters at narrow-time.
-        let bird_id_a = ItemId::new(pa_a.index.symbols.intern("main"), sym(&pa_a, "Bird"));
-        let bird_id_b = ItemId::new(pa_b.index.symbols.intern("main"), sym(&pa_b, "Bird"));
+        let bird_id_a = ItemKey::new(pa_a.index.symbols.intern("main"), sym(&pa_a, "Bird"));
+        let bird_id_b = ItemKey::new(pa_b.index.symbols.intern("main"), sym(&pa_b, "Bird"));
         assert!(
             pa_a.index
                 .abstract_by_closure_set
@@ -5404,7 +5406,7 @@ mod tests {
         // `CatLike` sorts alphabetically before `Felidae`, so it wins
         // the reverse-index slot.
         let main_mod = pa.index.symbols.intern("main");
-        let catlike_id = ItemId::new(main_mod, sym(&pa, "CatLike"));
+        let catlike_id = ItemKey::new(main_mod, sym(&pa, "CatLike"));
         let cl = pa.index.subtype_closure.get(&catlike_id).unwrap();
         let winner = pa
             .index
@@ -5435,14 +5437,14 @@ mod tests {
         );
         let pa = ProjectAnalysis::analyze(&mgr);
         let main_mod = pa.index.symbols.intern("main");
-        let id = |n: &str| ItemId::new(main_mod, sym(&pa, n));
+        let id = |n: &str| ItemKey::new(main_mod, sym(&pa, n));
         assert!(pa.index.is_abstract.contains(&id("Animal")));
         assert!(pa.index.is_abstract.contains(&id("Bird")));
         assert!(!pa.index.is_abstract.contains(&id("Cat")));
     }
 
     /// `DeclRegistry::record` is idempotent: re-recording the same
-    /// `ItemId` refreshes the cached `Idx<Decl>` without bloating the
+    /// `ItemKey` refreshes the cached `Idx<Decl>` without bloating the
     /// map.
     #[test]
     fn decl_registry_record_is_idempotent() {
@@ -5450,7 +5452,7 @@ mod tests {
         let mut r = DeclRegistry::new();
         let decl = Idx::<Decl>::from_raw(0u32);
         let symbols = SymbolTable::new();
-        let item = ItemId::new(symbols.intern("m"), symbols.intern("Foo"));
+        let item = ItemKey::new(symbols.intern("m"), symbols.intern("Foo"));
         r.record(item, decl);
         r.record(item, decl);
         assert_eq!(r.lookup(item), Some(decl));

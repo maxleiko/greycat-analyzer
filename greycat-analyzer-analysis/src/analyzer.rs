@@ -27,15 +27,15 @@ use greycat_analyzer_core::lsp_types::Uri;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::{
-    Builtins, GenericOwner, InferenceTable, ItemId, Symbol, SymbolTable, Type, TypeArena, TypeId,
-    TypeKind, TypeRegistry,
+    GenericOwner, InferenceTable, ItemKey, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
+    TypeRegistry,
 };
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{
+use greycat_analyzer_hir::hir::{
     AssignStmt, AtStmt, BinOp, BinaryExpr, BlockStmt, CallExpr, Decl, DoWhileStmt, Expr, FnDecl,
     ForInStmt, ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr,
-    ObjectExpr, ObjectField, OffsetExpr, ParseIssue, PositionalObjectExpr, Pragma, StaticExpr,
-    Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp, VarDeclTop,
+    ModVarDecl, ObjectExpr, ObjectField, OffsetExpr, ParseIssue, PositionalObjectExpr, Pragma,
+    StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp,
     WhileStmt,
 };
 use greycat_analyzer_hir::{DeclRegistry, Hir};
@@ -308,14 +308,14 @@ pub struct ForeignDecl {
 /// Object-expression field-name binding. `declaring_type` names the
 /// type that actually declares the attr — which may be a supertype
 /// of the constructed type, since attrs can be inherited across
-/// module boundaries. The `ItemId` carries both the home module
+/// module boundaries. The `ItemKey` carries both the home module
 /// symbol (mapped to a `Uri` via `ProjectIndex::module_names`) and
 /// the type's leaf name, so IDE consumers can render `module::Type`
 /// provenance without re-walking the supertype graph. `attr` is the
 /// `TypeAttr` index into the home module's HIR.
 #[derive(Debug, Clone, Copy)]
 pub struct ObjectFieldBinding {
-    pub declaring_type: ItemId,
+    pub declaring_type: ItemKey,
     pub attr: Idx<TypeAttr>,
 }
 
@@ -352,105 +352,6 @@ impl AnalysisResult {
     }
 }
 
-/// Run the analyzer with no cross-module project context. Falls back
-/// to an empty [`ProjectIndex`]; cross-module type names lower to
-/// `any` and cross-module member access can't bind. Used by per-file
-/// capabilities and unit tests.
-///
-/// Allocates a fresh [`TypeArena`] and [`DeclRegistry`] internally
-/// and returns them alongside the analysis — callers that need to
-/// render decl-keyed types (anything routing through
-/// `display_type` / `display_fqn`) consume the returned registry.
-pub fn analyze(
-    hir: &Hir,
-    res: &Resolutions,
-    symbols: &SymbolTable,
-) -> (TypeArena, DeclRegistry, AnalysisResult) {
-    use std::str::FromStr;
-    let mut arena = TypeArena::new();
-    let index = ProjectIndex::with_symbols(symbols.clone(), &mut arena);
-    // Per-file callers don't have a populated `WellKnown`;
-    // pass a default (all-`None`) instance. The migrated sentinel
-    // sites fall back to `arena.any()` for any slot still `None`.
-    let well_known = WellKnown::default();
-    let module_uri = Uri::from_str("file:///module.gcl").unwrap();
-    // Pre-mint a decl handle for every `Decl::Type` / `Decl::Enum`
-    // in this module so `register_module_types` and `lower_type_ref`
-    // can route every local type ref through the handle-keyed shape
-    // — same path the project pipeline uses. Per-file tests don't
-    // run `ProjectAnalysis`, so this is the standalone equivalent
-    // of `ProjectIndex::ingest`'s decl-registration step.
-    let mut decl_registry = DeclRegistry::default();
-    if let Some(module) = hir.module.as_ref() {
-        for d_id in &module.decls {
-            let name = match &hir.decls[*d_id] {
-                Decl::Type(td) => hir.idents[td.name].symbol,
-                Decl::Enum(ed) => hir.idents[ed.name].symbol,
-                _ => continue,
-            };
-            if let Some(item) = index.item_id_for(&module_uri, name) {
-                decl_registry.record(item, *d_id);
-            }
-        }
-    }
-    let out = analyze_with_index_into(
-        hir,
-        res,
-        &index,
-        &well_known,
-        &decl_registry,
-        &module_uri,
-        &mut arena,
-    );
-    (arena, decl_registry, out)
-}
-
-/// Convenience wrapper that allocates a private arena and decl
-/// registry. Same caveat as [`analyze`]: both are returned to the
-/// caller alongside the result so any [`TypeId`] / [`ItemId`] in
-/// the result can still be looked up.
-pub fn analyze_with_index(
-    hir: &Hir,
-    res: &Resolutions,
-    index: &ProjectIndex,
-) -> (TypeArena, DeclRegistry, AnalysisResult) {
-    use std::str::FromStr;
-    // P35.4 — per-file callers default-construct an empty
-    // `WellKnown`; see [`analyze`] for the rationale.
-    let well_known = WellKnown::default();
-    let module_uri = Uri::from_str("file:///module.gcl").unwrap();
-    let mut arena = TypeArena::new();
-    // This wrapper owns a fresh arena but borrows an external index, so
-    // unlike `analyze` it must seed the canonical builtins itself before
-    // any producer mints a `Type(core::X)`.
-    arena.set_builtins(Builtins::compute(&index.symbols));
-    // Standalone equivalent of `ProjectIndex::ingest`'s decl
-    // registration step — see [`analyze`] for the rationale.
-    let mut decl_registry = DeclRegistry::default();
-    if let Some(module) = hir.module.as_ref() {
-        for d_id in &module.decls {
-            let name = match &hir.decls[*d_id] {
-                Decl::Type(td) => hir.idents[td.name].symbol,
-                Decl::Enum(ed) => hir.idents[ed.name].symbol,
-                _ => continue,
-            };
-            if let Some(item) = index.item_id_for(&module_uri, name) {
-                decl_registry.record(item, *d_id);
-            }
-        }
-    }
-    let out = analyze_with_index_into(
-        hir,
-        res,
-        index,
-        &well_known,
-        &decl_registry,
-        &module_uri,
-        &mut arena,
-    );
-    (arena, decl_registry, out)
-}
-
 /// Run the analyzer with a shared project index *and* a caller-owned
 /// arena. The arena is shared across every module the project
 /// pipeline analyzes so cross-module `TypeId`s point into the same
@@ -473,7 +374,6 @@ pub fn analyze_with_index_into(
     arena: &mut TypeArena,
 ) -> AnalysisResult {
     let mut out = AnalysisResult::default();
-    seed_builtins(arena);
     register_module_types(hir, arena, &mut out, index, decl_registry, module_uri);
 
     let Some(module) = hir.module.as_ref() else {
@@ -700,16 +600,6 @@ pub fn analyze_with_index_into(
     out
 }
 
-/// Pre-intern the lattice sentinels (`null` / `any` / `never`) so the
-/// hot comparison paths hit the intern cache. Primitives are minted on
-/// demand via [`TypeArena::builtin`] -- not seeded here, since
-/// `seed_builtins` can run before `set_builtins`.
-pub(crate) fn seed_builtins(arena: &mut TypeArena) {
-    let _ = arena.null();
-    let _ = arena.any();
-    let _ = arena.never();
-}
-
 /// Build a TypeRegistry from the module's user declarations. Each
 /// `type Foo {}` becomes a Named("Foo") TypeId; later phases can
 /// elaborate the type's attribute list separately.
@@ -888,7 +778,7 @@ struct Cx<'a> {
     module_uri: &'a Uri,
     /// Symbol for the module currently being analyzed — i.e.
     /// `module_name_from_uri(module_uri)` interned. Lets the body
-    /// walker mint `ItemId { module: self.module_sym, name }` for
+    /// walker mint `ItemKey { module: self.module_sym, name }` for
     /// any same-module type lookup without going through
     /// `index.item_id_for`.
     module_sym: Symbol,
@@ -1030,11 +920,6 @@ impl TypeRefLowering for CxLowerEnv<'_> {
 }
 
 impl<'a> Cx<'a> {
-    #[inline]
-    fn primitive(&mut self, select: impl FnOnce(&Builtins) -> ItemId) -> TypeId {
-        self.arena.builtin(select)
-    }
-
     #[inline]
     fn any_nullable(&mut self) -> TypeId {
         self.arena.any_nullable()
@@ -1210,7 +1095,7 @@ impl<'a> Cx<'a> {
                 most_specific = Some(cand);
                 break;
             }
-            let all_primitive = tys.iter().all(|t| self.arena.is_any_primitive(*t));
+            let all_primitive = tys.iter().all(|t| self.arena.is_builtin(*t));
 
             let mk_never = |arena: &mut TypeArena, slot: &mut Option<TypeId>| -> TypeId {
                 match *slot {
@@ -1463,7 +1348,11 @@ impl<'a> Cx<'a> {
     ///   half-loaded project).
     /// - the subtraction leaves zero leaves (exhausted; P42.5 owns
     ///   the diagnostic).
-    fn narrow_complement_abstract(&mut self, sup_decl: ItemId, asserted: TypeId) -> Option<TypeId> {
+    fn narrow_complement_abstract(
+        &mut self,
+        sup_decl: ItemKey,
+        asserted: TypeId,
+    ) -> Option<TypeId> {
         if !self.index.is_abstract.contains(&sup_decl) {
             return None;
         }
@@ -1471,7 +1360,7 @@ impl<'a> Cx<'a> {
         let asserted_decl = match &asserted_ty.kind {
             TypeKind::Type(d) => *d,
             // P42.6 — generic-root asserts. The closure index is
-            // keyed by bare `ItemId`, doesn't carry type args; a
+            // keyed by bare `ItemKey`, doesn't carry type args; a
             // `TypeKind::Generic` assertion is the same chain-walker
             // gap from the asserted side.
             _ => return None,
@@ -1485,8 +1374,8 @@ impl<'a> Cx<'a> {
             .cloned()
             .unwrap_or_default();
 
-        // Linear merge over two sorted `ItemId` lists.
-        let mut diff: Vec<ItemId> = Vec::with_capacity(sup_closure.len());
+        // Linear merge over two sorted `ItemKey` lists.
+        let mut diff: Vec<ItemKey> = Vec::with_capacity(sup_closure.len());
         let mut j = 0usize;
         for &s in sup_closure.iter() {
             while j < asserted_closure.len() && asserted_closure[j] < s {
@@ -1511,7 +1400,7 @@ impl<'a> Cx<'a> {
         // explicit union. Applies only to TypeIds manufactured here
         // (user-written unions in source are preserved verbatim
         // elsewhere).
-        let diff_slice: Box<[ItemId]> = diff.clone().into_boxed_slice();
+        let diff_slice: Box<[ItemKey]> = diff.clone().into_boxed_slice();
         if let Some(&abstract_id) = self.index.abstract_by_closure_set.get(&diff_slice) {
             return Some(self.arena.alloc_type(abstract_id));
         }
@@ -1606,7 +1495,7 @@ impl<'a> Cx<'a> {
                 if sup_closure.is_empty() {
                     return false;
                 }
-                let mut asserted_set: FxHashSet<ItemId> = FxHashSet::default();
+                let mut asserted_set: FxHashSet<ItemKey> = FxHashSet::default();
                 for a_alt in &asserted_alts {
                     let a_ty = self.arena.get(*a_alt);
                     let TypeKind::Type(ad) = &a_ty.kind else {
@@ -2215,11 +2104,11 @@ impl<'a> Cx<'a> {
         // shapes carry a discoverable type name:
         //   - `Type(decl)`           — non-generic concrete decl.
         //   - `Generic { decl, args }` — handle-keyed generic.
-        let (type_id, instantiation): (ItemId, Vec<TypeId>) = {
+        let (type_id, instantiation): (ItemKey, &[TypeId]) = {
             let ty = self.arena.get(recv_ty);
             match &ty.kind {
-                TypeKind::Type(d) => (*d, Vec::new()),
-                TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
+                TypeKind::Type(d) => (*d, &[]),
+                TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
                 _ => return None,
             }
         };
@@ -2305,7 +2194,7 @@ impl<'a> Cx<'a> {
             }
             return;
         }
-        let type_id: Option<ItemId> = match &ty.kind {
+        let type_id: Option<ItemKey> = match &ty.kind {
             TypeKind::Type(d) => Some(*d),
             TypeKind::Generic { tpl, .. } => Some(*tpl),
             // `Any` / `Unresolved` / `GenericParam` / `Lambda` / `Null`
@@ -2329,7 +2218,7 @@ impl<'a> Cx<'a> {
         //
         // `out.type_decls` is per-module so it's keyed by the local
         // name `Symbol`; only the cross-module `type_members` map
-        // needs the full `ItemId`.
+        // needs the full `ItemKey`.
         let local_type_decl = self
             .out
             .type_decls
@@ -2459,7 +2348,7 @@ impl<'a> Cx<'a> {
             })
             .is_some_and(|attr_id| self.hir.type_attrs[attr_id].modifiers.private);
         // Foreign attr — chain-walk `private_attrs` from the receiver's
-        // ItemId. The cross-module decl's HIR isn't directly reachable
+        // ItemKey. The cross-module decl's HIR isn't directly reachable
         // from here; the per-type `private_attrs` set is the bridge.
         let recv_id = (|| {
             let recv = match &self.hir.exprs[lhs] {
@@ -2475,7 +2364,7 @@ impl<'a> Cx<'a> {
             }
         })();
         let prop_sym = self.hir.idents[property].symbol;
-        let private_owner: Option<ItemId> = recv_id.and_then(|id| {
+        let private_owner: Option<ItemKey> = recv_id.and_then(|id| {
             let (owner_id, members) = self.index.walk_chain_for_private_attr(id, prop_sym)?;
             members
                 .private_attrs
@@ -2533,7 +2422,7 @@ impl<'a> Cx<'a> {
     /// covers static-shape LHS (`Expr::Static` / `Expr::QualifiedStatic`).
     fn check_static_attr_write(&mut self, lhs: Idx<Expr>) {
         // Extract the property ident and (for the foreign-attr path)
-        // enough info to recover the owner `ItemId`. `Expr::Static`
+        // enough info to recover the owner `ItemKey`. `Expr::Static`
         // carries a `TypeRef` we have to lower; `Expr::QualifiedStatic`
         // with a 3-segment chain carries the owner directly as
         // `module::Type` in the first two segments.
@@ -2557,18 +2446,18 @@ impl<'a> Cx<'a> {
             })
             .is_some_and(|attr_id| self.hir.type_attrs[attr_id].modifiers.static_);
         // Cross-module attr — consult the project index's `static_attrs`
-        // set for the receiver's `ItemId`. Two shapes feed the lookup:
+        // set for the receiver's `ItemKey`. Two shapes feed the lookup:
         //  - `Expr::Static`: lower the receiver `TypeRef` to a `TypeId`,
-        //    then map to `ItemId` the same way `static_value_type` does.
+        //    then map to `ItemKey` the same way `static_value_type` does.
         //  - `Expr::QualifiedStatic` (chain==3): the first two segments
-        //    are `module::Type` — build the `ItemId` directly.
+        //    are `module::Type` — build the `ItemKey` directly.
         let is_static_foreign = (|| {
             let foreign = self.out.foreign_member_uses.get(&property)?;
             if !matches!(foreign.member, MemberDef::Attr(_)) {
                 return None;
             }
             let prop_sym = self.hir.idents[property].symbol;
-            let owner_id: ItemId = if let Some(ty_ref) = owner_via_typeref {
+            let owner_id: ItemKey = if let Some(ty_ref) = owner_via_typeref {
                 let recv_ty = self.lower_type_ref(ty_ref);
                 match &self.arena.get(recv_ty).kind {
                     TypeKind::Type(d) => *d,
@@ -2581,7 +2470,7 @@ impl<'a> Cx<'a> {
                 };
                 let module_sym = self.hir.idents[chain[0]].symbol;
                 let type_sym = self.hir.idents[chain[1]].symbol;
-                ItemId::new(module_sym, type_sym)
+                ItemKey::new(module_sym, type_sym)
             };
             let members = self.index.type_members.get(&owner_id)?;
             members.static_attrs.contains(&prop_sym).then_some(())
@@ -2735,7 +2624,7 @@ impl<'a> Cx<'a> {
         }
         let fn_sym = self.hir.idents[name_idx].symbol;
         // Cross-module — the resolver already picked the specific
-        // module that owns this fn, so we can construct the ItemId
+        // module that owns this fn, so we can construct the ItemKey
         // directly without re-walking the candidate set.
         if let Definition::ProjectDecl {
             uri: ref dec_uri, ..
@@ -2774,9 +2663,9 @@ impl<'a> Cx<'a> {
         match chain.len() {
             2 => {
                 // `module::fn(...)` — `(chain[0], chain[1])` is the
-                // fn's full `ItemId` since module symbols are
+                // fn's full `ItemKey` since module symbols are
                 // project-wide unique.
-                let fn_id = ItemId::new(
+                let fn_id = ItemKey::new(
                     self.hir.idents[chain[0]].symbol,
                     self.hir.idents[chain[1]].symbol,
                 );
@@ -2786,10 +2675,10 @@ impl<'a> Cx<'a> {
             3 => {
                 // `module::Type::method` — chain[0] is the module
                 // symbol, chain[1] the type name, chain[2] the method
-                // name. The receiver's `ItemId` is just the (module,
+                // name. The receiver's `ItemKey` is just the (module,
                 // type) pair since module symbols are unique project-
                 // wide.
-                let recv_id = ItemId::new(
+                let recv_id = ItemKey::new(
                     self.hir.idents[chain[0]].symbol,
                     self.hir.idents[chain[1]].symbol,
                 );
@@ -2818,14 +2707,14 @@ impl<'a> Cx<'a> {
             recv_ty
         };
         let recv = self.arena.get(lookup_ty).clone();
-        let (type_id, instantiation): (ItemId, Vec<TypeId>) = match recv.kind {
+        let (type_id, instantiation): (ItemKey, &[TypeId]) = match &recv.kind {
             // Handle-keyed variants already carry the decl's
             // full `(module, name)` identity.
-            TypeKind::Type(decl) => (decl, Vec::new()),
-            TypeKind::Generic { tpl, args } => (tpl, args.into_vec()),
+            TypeKind::Type(decl) => (*decl, &[]),
+            TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
             _ => return None,
         };
-        // **P19.14** — chain-walking lookup so methods declared on
+        // Chain-walking lookup so methods declared on
         // a parent type resolve through a `Sub` receiver.
         let property_sym = self.hir.idents[property].symbol;
         let ret_ty = self.index.type_method_return_chain(type_id, property_sym)?;
@@ -2865,10 +2754,10 @@ impl<'a> Cx<'a> {
             },
         );
         if chain.len() == 3 {
-            // Resolve the (uri, member) pair. The receiver's `ItemId`
+            // Resolve the (uri, member) pair. The receiver's `ItemKey`
             // is (chain[0]=module, chain[1]=type) directly — module
             // symbols are project-wide unique.
-            let type_id = ItemId::new(
+            let type_id = ItemKey::new(
                 self.hir.idents[chain[0]].symbol,
                 self.hir.idents[chain[1]].symbol,
             );
@@ -2926,12 +2815,12 @@ impl<'a> Cx<'a> {
             // Cross-module attr — consult `static_attrs` for the
             // receiver's type. The receiver is the `Type::` part
             // of the static expr; we have its lowered TypeId.
-            let owner_id: Option<ItemId> = match &self.arena.get(recv_ty).kind {
+            let owner_id: Option<ItemKey> = match &self.arena.get(recv_ty).kind {
                 TypeKind::Type(d) => Some(*d),
                 TypeKind::Generic { tpl, .. } => Some(*tpl),
-                // P32 — enums are an ItemId-keyed entry too. Their
+                // P32 — enums are an ItemKey-keyed entry too. Their
                 // `TypeKind::Enum.name` is just the bare name Symbol,
-                // so we'd need the home module to mint the ItemId.
+                // so we'd need the home module to mint the ItemKey.
                 // Static-attr access doesn't apply to enums (their
                 // members are variants, not attrs), so this branch
                 // shouldn't fire for `Enum`-shaped receivers in
@@ -2973,7 +2862,7 @@ impl<'a> Cx<'a> {
     /// the `instance-method-value-ref` diagnostic in the validation
     /// phase — the type minted here doesn't affect that walk).
     fn method_ref_ty(&mut self, recv_ty: TypeId, method_sym: Symbol) -> TypeId {
-        let owner_id: Option<ItemId> = match &self.arena.get(recv_ty).kind {
+        let owner_id: Option<ItemKey> = match &self.arena.get(recv_ty).kind {
             TypeKind::Type(d) => Some(*d),
             TypeKind::Generic { tpl, .. } => Some(*tpl),
             _ => None,
@@ -3003,10 +2892,10 @@ impl<'a> Cx<'a> {
     fn qualified_static_value_type(&mut self, chain: &[Idx<Ident>]) -> Option<TypeId> {
         match chain.len() {
             2 => {
-                // `module::name` — module symbol + item name → `ItemId`.
+                // `module::name` — module symbol + item name → `ItemKey`.
                 let module_sym = self.hir.idents[chain[0]].symbol;
                 let name_sym = self.hir.idents[chain[1]].symbol;
-                let item = ItemId::new(module_sym, name_sym);
+                let item = ItemKey::new(module_sym, name_sym);
                 if let Some(sig) = self.index.fn_signatures.get(&item) {
                     Some(self.fn_ref_ty_from_sig(sig))
                 } else if self.index.fn_names.contains(&name_sym) {
@@ -3032,10 +2921,10 @@ impl<'a> Cx<'a> {
             }
             3 => {
                 // `module::Type::member` — module symbol + type name
-                // → receiver's `ItemId`.
+                // → receiver's `ItemKey`.
                 let module_sym = self.hir.idents[chain[0]].symbol;
                 let type_sym = self.hir.idents[chain[1]].symbol;
-                let type_id = ItemId::new(module_sym, type_sym);
+                let type_id = ItemKey::new(module_sym, type_sym);
                 let member_sym = self.hir.idents[chain[2]].symbol;
                 // Enum variant: `module::Foo::a` types as `Foo` (the
                 // enum), matching the analyzer's `Static` enum-variant
@@ -3101,7 +2990,7 @@ impl<'a> Cx<'a> {
         // Attr — extract receiver shape (need owned name + args because
         // the arena entry borrow has to drop before we re-borrow as
         // mutable for `substitute`).
-        let (type_id, instantiation): (ItemId, &[TypeId]) = match &self.arena.get(recv_ty).kind {
+        let (type_id, instantiation): (ItemKey, &[TypeId]) = match &self.arena.get(recv_ty).kind {
             // Handle-keyed variants carry the full identity.
             TypeKind::Type(d) => (*d, &[]),
             TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
@@ -3237,8 +3126,8 @@ impl<'a> Cx<'a> {
         // `object_field_uses` binding below can point at the right
         // declaring type (inherited attrs live on a supertype, which
         // may be in a different module).
-        let mut declarers: FxHashMap<Symbol, (ItemId, Idx<TypeAttr>)> = FxHashMap::default();
-        let mut seen: FxHashSet<ItemId> = FxHashSet::default();
+        let mut declarers: FxHashMap<Symbol, (ItemKey, Idx<TypeAttr>)> = FxHashMap::default();
+        let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
         let mut cursor = Some(head_id);
         let mut hops = 0usize;
         while let Some(cur_id) = cursor {
@@ -3407,7 +3296,7 @@ impl<'a> Cx<'a> {
                 let module_sym = self.hir.idents[chain[0]].symbol;
                 let type_sym = self.hir.idents[chain[1]].symbol;
                 let property = chain[2];
-                let type_id_item = ItemId::new(module_sym, type_sym);
+                let type_id_item = ItemKey::new(module_sym, type_sym);
                 let recv_ty = self.arena.alloc_type(type_id_item);
                 return self.run_method_generic_inference(recv_ty, property, arg_tys, &call_range);
             }
@@ -3549,7 +3438,7 @@ impl<'a> Cx<'a> {
         call_range: &Range<usize>,
     ) -> Option<(TypeId, Option<TypeId>)> {
         let recv = self.arena.get(recv_ty);
-        let (type_id, instantiation): (ItemId, &[TypeId]) = match &recv.kind {
+        let (type_id, instantiation): (ItemKey, &[TypeId]) = match &recv.kind {
             TypeKind::Type(decl) => (*decl, &[]),
             TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
             _ => return None,
@@ -3674,7 +3563,7 @@ impl<'a> Cx<'a> {
             Decl::Fn(d) => self.visit_fn_decl(d),
             Decl::Type(d) => self.visit_type_decl(d),
             Decl::Enum(_) => {}
-            Decl::Var(d) => self.visit_top_var(d),
+            Decl::Var(d) => self.visit_modvar(d),
             Decl::Pragma(p) => self.visit_pragma(p),
         }
     }
@@ -3719,7 +3608,7 @@ impl<'a> Cx<'a> {
         // problem before they hit `greycat build`.
         let chain_len = self
             .index
-            .supertype_chain_length(ItemId::new(self.module_sym, type_name_sym));
+            .supertype_chain_length(ItemKey::new(self.module_sym, type_name_sym));
         if chain_len > ProjectIndex::MAX_INHERITANCE_DEPTH {
             let span = d
                 .supertype
@@ -3764,7 +3653,7 @@ impl<'a> Cx<'a> {
             // stay quiet rather than cascade.
             match self
                 .index
-                .resolve_item(self.decl_registry, Some(self.module_uri), type_name_sym)
+                .resolve_type(self.decl_registry, Some(self.module_uri), type_name_sym)
             {
                 Some(tpl) => {
                     let args: Vec<TypeId> = d
@@ -3819,7 +3708,7 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn visit_top_var(&mut self, d: &VarDeclTop) {
+    fn visit_modvar(&mut self, d: &ModVarDecl) {
         let declared = d.ty.map(|t| self.lower_type_ref(t));
         let init_ty = d.init.map(|i| self.visit_expr(i));
         // Record the modvar's type in `def_types` keyed by
@@ -4663,9 +4552,9 @@ impl<'a> Cx<'a> {
         // back to `any?` (could legitimately be nullable).
         let any_nn = self.any();
         let any_nl = self.any_nullable();
-        let int_id = self.primitive(Builtins::INT);
-        let time_id = self.primitive(Builtins::TIME);
-        let geo_id = self.primitive(Builtins::GEO);
+        let int_id = self.arena.builtins.int;
+        let time_id = self.arena.builtins.time;
+        let geo_id = self.arena.builtins.geo;
         // Receiver is nullable iterables propagate through
         // here too — `for (i, v in arr?)` is valid GreyCat.
         // Strip the optional before pattern-matching the
@@ -4677,7 +4566,8 @@ impl<'a> Cx<'a> {
         // args — **P19.15**) carry the same decl handle.
         // Fold them so the dispatch is one pass with the
         // args slice empty in the bare case.
-        let decl_and_args: Option<(ItemId, &[TypeId])> = match &self.arena.get(underlying_ty).kind {
+        let decl_and_args: Option<(ItemKey, &[TypeId])> = match &self.arena.get(underlying_ty).kind
+        {
             TypeKind::Generic { tpl, args } => Some((*tpl, args.as_slice())),
             TypeKind::Type(decl) => Some((*decl, &[])),
             _ => None,
@@ -5033,7 +4923,7 @@ impl<'a> Cx<'a> {
         // Resolve the enum through the project index
         let Some(enum_id) = self
             .index
-            .resolve_item(self.decl_registry, Some(self.module_uri), chain.enum_name)
+            .resolve_type(self.decl_registry, Some(self.module_uri), chain.enum_name)
             .and_then(|item| self.index.enum_types.get(&item).copied())
         else {
             return;
@@ -5400,12 +5290,12 @@ impl<'a> Cx<'a> {
                         let name_sym = self.hir.idents[td.name].symbol;
                         let inner = self
                             .arena
-                            .alloc_type(ItemId::new(self.module_sym, name_sym));
+                            .alloc_type(ItemKey::new(self.module_sym, name_sym));
                         self.arena.type_of(inner)
                     }
                     Decl::Enum(ed) => {
                         let name_sym = self.hir.idents[ed.name].symbol;
-                        let item = ItemId::new(self.module_sym, name_sym);
+                        let item = ItemKey::new(self.module_sym, name_sym);
                         let inner = self
                             .index
                             .enum_types
@@ -5416,10 +5306,10 @@ impl<'a> Cx<'a> {
                     }
                     Decl::Fn(_) => {
                         // In-module fn ref: consult fn_signatures via
-                        // the local ItemId so the structural Lambda
+                        // the local ItemKey so the structural Lambda
                         // carries the real params / declared return.
                         let fn_sym = self.hir.idents[*idx].symbol;
-                        let item = ItemId::new(self.module_sym, fn_sym);
+                        let item = ItemKey::new(self.module_sym, fn_sym);
                         match self.index.fn_signatures.get(&item).cloned() {
                             Some(sig) => self.fn_ref_ty_from_sig(&sig),
                             None => self.function_ty(),
@@ -5503,12 +5393,12 @@ impl<'a> Cx<'a> {
                 Some(Definition::Generic(_)) | None => self.any_nullable(),
             },
             Expr::Literal(LiteralExpr { kind, .. }) => match kind {
-                LiteralKind::Bool(_) => self.primitive(Builtins::BOOL),
-                LiteralKind::Int(_) => self.primitive(Builtins::INT),
-                LiteralKind::Float(_) => self.primitive(Builtins::FLOAT),
-                LiteralKind::Char(_) => self.primitive(Builtins::CHAR),
-                LiteralKind::Duration(_) => self.primitive(Builtins::DURATION),
-                LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.primitive(Builtins::TIME),
+                LiteralKind::Bool(_) => self.arena.builtins.bool_,
+                LiteralKind::Int(_) => self.arena.builtins.int,
+                LiteralKind::Float(_) => self.arena.builtins.float,
+                LiteralKind::Char(_) => self.arena.builtins.char_,
+                LiteralKind::Duration(_) => self.arena.builtins.duration,
+                LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.arena.builtins.time,
             },
             Expr::Null { .. } => self.null(),
             Expr::This { .. } => self
@@ -5523,11 +5413,11 @@ impl<'a> Cx<'a> {
                 // strings would surface as `unused-local` and never
                 // get an `expr_types` entry).
                 for part in parts {
-                    if let greycat_analyzer_hir::types::StringPart::Interp { expr, .. } = part {
+                    if let greycat_analyzer_hir::hir::StringPart::Interp { expr, .. } = part {
                         let _ = self.visit_expr(*expr);
                     }
                 }
-                self.primitive(Builtins::STRING)
+                self.arena.builtins.string
             }
             Expr::Tuple(items, _) => {
                 // assert_eq!(items.len(), 2, "Tuple items length must be exactly 2");
@@ -6025,7 +5915,7 @@ impl<'a> Cx<'a> {
             Expr::Unary(UnaryExpr { op, operand, .. }) => {
                 let inner = self.visit_expr(*operand);
                 match op {
-                    UnaryOp::Not => self.primitive(Builtins::BOOL),
+                    UnaryOp::Not => self.arena.builtins.bool_,
                     UnaryOp::Neg | UnaryOp::Pos | UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
                         inner
                     }
@@ -6106,7 +5996,7 @@ impl<'a> Cx<'a> {
             }
             Expr::Is { value, .. } => {
                 let _ = self.visit_expr(*value);
-                self.primitive(Builtins::BOOL)
+                self.arena.builtins.bool_
             }
             Expr::Range { from, to, .. } => {
                 // **P19.15** — visit both endpoints so their
@@ -6163,9 +6053,9 @@ impl<'a> Cx<'a> {
     }
 
     fn infer_binary(&mut self, op: BinOp, lt: TypeId, rt: TypeId) -> TypeId {
-        let int = self.primitive(Builtins::INT);
-        let float = self.primitive(Builtins::FLOAT);
-        let bool_t = self.primitive(Builtins::BOOL);
+        let int = self.arena.builtins.int;
+        let float = self.arena.builtins.float;
+        let bool_t = self.arena.builtins.bool_;
 
         match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => bool_t,
@@ -6182,9 +6072,9 @@ impl<'a> Cx<'a> {
                 // intact at the function entry).
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let string_t = self.primitive(Builtins::STRING);
-                let time_t = self.primitive(Builtins::TIME);
-                let dur_t = self.primitive(Builtins::DURATION);
+                let string_t = self.arena.builtins.string;
+                let time_t = self.arena.builtins.time;
+                let dur_t = self.arena.builtins.duration;
                 if lt_n == string_t || rt_n == string_t {
                     string_t
                 } else if (lt_n == time_t && rt_n == dur_t) || (lt_n == dur_t && rt_n == time_t) {
@@ -6206,8 +6096,8 @@ impl<'a> Cx<'a> {
                 // `duration - duration → duration`.
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let time_t = self.primitive(Builtins::TIME);
-                let dur_t = self.primitive(Builtins::DURATION);
+                let time_t = self.arena.builtins.time;
+                let dur_t = self.arena.builtins.duration;
                 if lt_n == time_t && rt_n == time_t {
                     dur_t
                 } else if lt_n == time_t && rt_n == dur_t {
@@ -6226,7 +6116,7 @@ impl<'a> Cx<'a> {
                 // **P19.14** — `duration * int / float → duration`.
                 let lt_n = self.arena.strip_nullable(lt);
                 let rt_n = self.arena.strip_nullable(rt);
-                let dur_t = self.primitive(Builtins::DURATION);
+                let dur_t = self.arena.builtins.duration;
                 if (lt_n == dur_t && (rt_n == int || rt_n == float))
                     || ((lt_n == int || lt_n == float) && rt_n == dur_t)
                 {
@@ -6354,17 +6244,60 @@ impl<'a> Cx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::resolve;
     use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
+
+    /// Convenience wrapper that allocates a private arena and decl
+    /// registry. Same caveat as [`analyze`]: both are returned to the
+    /// caller alongside the result so any [`TypeId`] / [`ItemKey`] in
+    /// the result can still be looked up.
+    pub fn analyze_with_index(
+        hir: &Hir,
+        res: &Resolutions,
+        arena: &mut TypeArena,
+        index: &ProjectIndex,
+    ) -> (DeclRegistry, AnalysisResult) {
+        use std::str::FromStr;
+        // Per-file callers default-construct an empty
+        // `WellKnown`; see [`analyze`] for the rationale.
+        let well_known = WellKnown::default();
+        let module_uri = Uri::from_str("file:///module.gcl").unwrap();
+        // Standalone equivalent of `ProjectIndex::ingest`'s decl
+        // registration step — see [`analyze`] for the rationale.
+        let mut decl_registry = DeclRegistry::default();
+        if let Some(module) = hir.module.as_ref() {
+            for d_id in &module.decls {
+                let name = match &hir.decls[*d_id] {
+                    Decl::Type(td) => hir.idents[td.name].symbol,
+                    Decl::Enum(ed) => hir.idents[ed.name].symbol,
+                    _ => continue,
+                };
+                if let Some(item) = index.item_id_for(&module_uri, name) {
+                    decl_registry.record(item, *d_id);
+                }
+            }
+        }
+        let out = analyze_with_index_into(
+            hir,
+            res,
+            index,
+            &well_known,
+            &decl_registry,
+            &module_uri,
+            arena,
+        );
+        (decl_registry, out)
+    }
 
     fn analyze_src(src: &str) -> (TypeArena, AnalysisResult) {
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir, &symbols);
-        let (arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
+        let mut arena = TypeArena::new(&symbols);
+        let index = ProjectIndex::new(symbols, &arena);
+        let res = index.resolutions(&hir, None, None);
+        let (_decl_registry, analysis) = analyze_with_index(&hir, &res, &mut arena, &index);
         (arena, analysis)
     }
 
@@ -6604,15 +6537,17 @@ fn first(p: Point): int { return p.x; }
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir, &symbols);
-        let (_arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
+        let mut arena = TypeArena::new(&symbols);
+        let index = ProjectIndex::new(symbols, &arena);
+        let res = index.resolutions(&hir, None, None);
+        let (_decl_registry, analysis) = analyze_with_index(&hir, &res, &mut arena, &index);
 
         // Find the property ident `x` inside `p.x` — the second `x`
         // ident in the source (the first is the attr decl name).
         let x_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| &symbols[i.symbol] == "x")
+            .filter(|(_, i)| &index.symbols[i.symbol] == "x")
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(x_uses.len(), 2, "expected attr decl + member use");
@@ -6640,13 +6575,15 @@ fn read(b: Box): int { return b->inner; }
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir, &symbols);
-        let (_arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
+        let mut arena = TypeArena::new(&symbols);
+        let index = ProjectIndex::new(symbols, &arena);
+        let res = index.resolutions(&hir, None, None);
+        let (_decl_registry, analysis) = analyze_with_index(&hir, &res, &mut arena, &index);
 
         let inner_uses: Vec<_> = hir
             .idents
             .iter()
-            .filter(|(_, i)| &symbols[i.symbol] == "inner")
+            .filter(|(_, i)| &index.symbols[i.symbol] == "inner")
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(inner_uses.len(), 2);
@@ -7118,13 +7055,15 @@ fn f(p: Point): int { return p.bogus; }
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir, &symbols);
-        let (_arena, _decl_registry, analysis) = analyze(&hir, &res, &symbols);
+        let mut arena = TypeArena::new(&symbols);
+        let index = ProjectIndex::new(symbols, &arena);
+        let res = index.resolutions(&hir, None, None);
+        let (_decl_registry, analysis) = analyze_with_index(&hir, &res, &mut arena, &index);
 
         let bogus = hir
             .idents
             .iter()
-            .find(|(_, i)| &symbols[i.symbol] == "bogus")
+            .find(|(_, i)| &index.symbols[i.symbol] == "bogus")
             .map(|(idx, _)| idx)
             .expect("bogus ident exists");
         assert!(analysis.member_lookup(bogus).is_none());

@@ -4,7 +4,7 @@
 //! the LSP wire shape so the legacy `capabilities::hover_with_project`
 //! callers (server.rs) keep their signature.
 
-use greycat_analyzer_analysis::ide::hover::{Hover as IdeHover, hover_with_project as hover_inner};
+use greycat_analyzer_analysis::ide::hover::{Hover as IdeHover, hover_with_project as ide_hover};
 use greycat_analyzer_analysis::ide::types::{Position as IdePosition, Range as IdeRange};
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::{SourceEncoding, SourceManager};
@@ -14,7 +14,6 @@ use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Range
 #[allow(clippy::too_many_arguments)]
 pub fn hover_with_project(
     text: &str,
-    lib: &str,
     root: tree_sitter::Node<'_>,
     pos: Position,
     uri: &Uri,
@@ -22,7 +21,7 @@ pub fn hover_with_project(
     manager: &SourceManager,
     encoding: SourceEncoding,
 ) -> Option<Hover> {
-    hover_inner(text, lib, root, pos, uri, project, manager, encoding).map(to_lsp)
+    ide_hover(text, root, pos, uri, project, manager, encoding).map(to_lsp)
 }
 
 fn to_lsp(h: IdeHover) -> Hover {

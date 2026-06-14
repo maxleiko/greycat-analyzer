@@ -1,7 +1,7 @@
 use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::{
     Hir,
-    types::{Decl, FnDecl},
+    hir::{Decl, FnDecl},
 };
 
 use crate::resolver::{Definition, Resolutions};

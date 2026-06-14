@@ -97,7 +97,6 @@ impl TestProject {
         let doc = self.doc();
         capabilities::hover_with_project(
             &doc.text,
-            &doc.lib,
             doc.root_node(),
             pos,
             &self.uri,

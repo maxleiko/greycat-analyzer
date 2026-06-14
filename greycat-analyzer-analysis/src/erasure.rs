@@ -37,7 +37,7 @@
 use greycat_analyzer_core::Symbol;
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Expr, FnDecl, Stmt, TypeRef};
+use greycat_analyzer_hir::hir::{Expr, FnDecl, Stmt, TypeRef};
 
 /// Var-trace recursion budget — guards against pathological
 /// self-referential `var x = x;` chains while comfortably covering the
@@ -98,7 +98,7 @@ fn type_ref_has_generic_in_arg(hir: &Hir, ty: Idx<TypeRef>, generics: &[Symbol])
 /// `true` iff `ty` or any nested arg names one of `generics`.
 fn type_ref_mentions_generic(hir: &Hir, ty: Idx<TypeRef>, generics: &[Symbol]) -> bool {
     let tr = &hir.type_refs[ty];
-    if tr.qualifier.is_empty() && generics.contains(&hir.idents[tr.name].symbol) {
+    if tr.is_bare() && generics.contains(&hir.idents[tr.name].symbol) {
         return true;
     }
     tr.params
@@ -271,7 +271,7 @@ mod tests {
     use super::*;
     use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_hir::lower_module;
-    use greycat_analyzer_hir::types::Decl;
+    use greycat_analyzer_hir::hir::Decl;
     use greycat_analyzer_syntax::parse;
 
     /// Classify the first top-level `fn` decl in `src`.

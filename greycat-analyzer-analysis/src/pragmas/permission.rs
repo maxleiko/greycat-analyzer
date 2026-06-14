@@ -21,7 +21,7 @@
 //! (`@permission(42)`) is a hard error. Both are handled generically by
 //! the driver's [`super::ArgSig::Variadic`] (`min: 1`) check.
 
-use greycat_analyzer_hir::types::AnnotationArgKind;
+use greycat_analyzer_hir::hir::AnnotationArgKind;
 
 use super::{ArgSig, ArgType, Contract, PragmaCtx, PragmaUse, Site, SiteRule};
 use crate::analyzer::{SemanticDiagnostic, Severity};

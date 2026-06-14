@@ -6,7 +6,7 @@
 //! as a pure-HIR rule (no typing context needed — the type *ref* spelling
 //! is what's constrained).
 
-use greycat_analyzer_hir::types::Decl;
+use greycat_analyzer_hir::hir::Decl;
 
 use super::{LintCx, LintDiagnostic, LintRule, LintSeverity};
 

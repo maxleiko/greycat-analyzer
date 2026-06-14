@@ -268,7 +268,6 @@ fn hover_with_project_renders_cross_module_provenance() {
     // Cursor on the `Point` use site in main.gcl (param type, line 0 col 12).
     let h = capabilities::hover_with_project(
         &user_doc.text,
-        &user_doc.lib,
         user_doc.root_node(),
         pos(0, 12),
         &user_uri,
@@ -526,7 +525,6 @@ fn hover_works_on_static_expr_segments() {
     // Cursor on `Identity` (col 23 — between I and d).
     let h_ident = capabilities::hover_with_project(
         &doc.text,
-        &doc.lib,
         doc.root_node(),
         pos(0, 23),
         &user_uri,
@@ -541,7 +539,6 @@ fn hover_works_on_static_expr_segments() {
     // Cursor on `create` (col 35 — somewhere in the property).
     let h_method = capabilities::hover_with_project(
         &doc.text,
-        &doc.lib,
         doc.root_node(),
         pos(0, 35),
         &user_uri,
@@ -1993,7 +1990,6 @@ fn hover_on_static_method_renders_signature() {
     // Cursor on `create` (col 32 — within "Identity::create").
     let h = capabilities::hover_with_project(
         &doc.text,
-        &doc.lib,
         doc.root_node(),
         pos(0, 32),
         &user_uri,
@@ -2042,7 +2038,6 @@ fn hover_on_chain_type_segment_renders_foreign_type() {
     // Cursor on `Identity` segment (col 32 — within "runtime::Identity::create").
     let h = capabilities::hover_with_project(
         &doc.text,
-        &doc.lib,
         doc.root_node(),
         pos(0, 32),
         &user_uri,
@@ -2091,7 +2086,6 @@ fn hover_on_chain_member_segment_renders_foreign_method() {
     // Cursor on `create` segment (col 41 — within "runtime::Identity::create").
     let h = capabilities::hover_with_project(
         &doc.text,
-        &doc.lib,
         doc.root_node(),
         pos(0, 41),
         &user_uri,
@@ -3425,7 +3419,6 @@ fn hover_arrow_on_node_tag_resolves_inner_member() {
     // Cursor on `name` of `n->name` (line 5 col 13).
     let hover = capabilities::hover_with_project(
         &doc.text,
-        "project",
         doc.root_node(),
         pos(5, 13),
         &user_uri,
@@ -4240,7 +4233,6 @@ fn hover_on_generic_method_substitutes_receiver_instantiation() {
     // Cursor on `add` in `arr.add(42)` (line 2 col 9).
     let hover = capabilities::hover_with_project(
         &doc.text,
-        "project",
         doc.root_node(),
         pos(2, 9),
         &user_uri,
@@ -4292,7 +4284,6 @@ fn hover_on_generic_method_substitutes_multiple_generics() {
     // Cursor on `set` in `m.set(...)` (line 2 col 7).
     let hover = capabilities::hover_with_project(
         &doc.text,
-        "project",
         doc.root_node(),
         pos(2, 7),
         &user_uri,
@@ -4340,7 +4331,6 @@ fn hover_on_nullable_generic_return_substitutes() {
     // Cursor on `last` (line 2 col 9).
     let hover = capabilities::hover_with_project(
         &doc.text,
-        "project",
         doc.root_node(),
         pos(2, 9),
         &user_uri,
@@ -4439,7 +4429,6 @@ fn hover_on_free_function_no_subst_applied() {
     // Cursor on `helper` at call site (line 1 col 14).
     let hover = capabilities::hover_with_project(
         &doc.text,
-        "project",
         doc.root_node(),
         pos(1, 14),
         &user_uri,
@@ -4590,7 +4579,6 @@ fn hover_inside_if_error_recovery_resolves_member_type() {
     // `sim` ident on line 3 occupies cols 10..13. Cursor at col 11.
     let hover = capabilities::hover_with_project(
         &doc.text,
-        &doc.lib,
         doc.root_node(),
         pos(3, 11),
         &uri,

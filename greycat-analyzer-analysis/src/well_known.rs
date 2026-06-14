@@ -1,24 +1,24 @@
 //! Project-wide stable handles for resolved type decls and the
 //! "well-known" std/core slots the analyzer dispatches against.
 //!
-//! Decl identity is the [`ItemId`] `(module_sym, name_sym)` pair —
+//! Decl identity is the [`ItemKey`] `(module_sym, name_sym)` pair —
 //! globally unique per project because module names are unique (the
 //! [`ProjectIndex::duplicate_modules`] gate enforces it at ingest).
-//! Two `ItemId`s compare equal iff they refer to the same item in the
+//! Two `ItemKey`s compare equal iff they refer to the same item in the
 //! same module; a user-declared `type node<T>` and the std-core
 //! `node<T>` therefore get distinct identities.
 //!
-//! - [`DeclRegistry`] maps `ItemId → Idx<Decl>` so consumers holding
+//! - [`DeclRegistry`] maps `ItemKey → Idx<Decl>` so consumers holding
 //!   a type-system handle can navigate back to the source `Decl` in
 //!   the owning module's HIR. Refreshed on every ingest so the cached
 //!   `Idx<Decl>` stays valid against the current HIR.
-//! - [`WellKnown`] holds one `Option<ItemId>` slot per native type the
+//! - [`WellKnown`] holds one `Option<ItemKey>` slot per native type the
 //!   analyzer special-cases (`node`, `Array`, `function`, etc.).
 //!   Populated as decls flow through ingest; a `Decl::Type` whose
 //!   `(module.lib, module.name, decl_name)` matches
 //!   `("std", "core", N)` stashes its identity into slot `N`.
 
-use greycat_analyzer_core::ItemId;
+use greycat_analyzer_core::ItemKey;
 
 /// Well-known std/core type decl identities. Each slot is `Some` once
 /// the corresponding `Decl::Type` has been seen during ingest;
@@ -37,46 +37,46 @@ pub struct WellKnown {
     // (`Type(core::X)`), so the identities let cross-module references
     // know they're talking about the std-core decl specifically, not an
     // unrelated user-defined type that happens to share the name.
-    pub bool_decl: Option<ItemId>,
-    pub char_decl: Option<ItemId>,
-    pub int_decl: Option<ItemId>,
-    pub float_decl: Option<ItemId>,
-    pub string_decl: Option<ItemId>,
-    pub time_decl: Option<ItemId>,
-    pub duration_decl: Option<ItemId>,
-    pub geo_decl: Option<ItemId>,
+    pub bool_decl: Option<ItemKey>,
+    pub char_decl: Option<ItemKey>,
+    pub int_decl: Option<ItemKey>,
+    pub float_decl: Option<ItemKey>,
+    pub string_decl: Option<ItemKey>,
+    pub time_decl: Option<ItemKey>,
+    pub duration_decl: Option<ItemKey>,
+    pub geo_decl: Option<ItemKey>,
 
     // Top / bottom equivalents — `any` and `null` are also declared
     // as `native type` in std/core.
-    pub any_decl: Option<ItemId>,
-    pub null_decl: Option<ItemId>,
+    pub any_decl: Option<ItemKey>,
+    pub null_decl: Option<ItemKey>,
 
     // Runtime sentinels — `type`, `field`, `function`. The
     // `function_ty()` / `type_ty()` / `field_ty()` minter sites in
     // [`crate::analyzer`] read from these identities.
-    pub type_decl: Option<ItemId>,
-    pub field_decl: Option<ItemId>,
-    pub function_decl: Option<ItemId>,
+    pub type_decl: Option<ItemKey>,
+    pub field_decl: Option<ItemKey>,
+    pub function_decl: Option<ItemKey>,
 
     // Node-tag generics — the auto-deref family.
     // [`Self::is_node_tag`] is the comparison primitive.
-    pub node_decl: Option<ItemId>,
-    pub node_time_decl: Option<ItemId>,
-    pub node_index_decl: Option<ItemId>,
-    pub node_list_decl: Option<ItemId>,
-    pub node_geo_decl: Option<ItemId>,
+    pub node_decl: Option<ItemKey>,
+    pub node_time_decl: Option<ItemKey>,
+    pub node_index_decl: Option<ItemKey>,
+    pub node_list_decl: Option<ItemKey>,
+    pub node_geo_decl: Option<ItemKey>,
 
     // Common generic collections.
-    pub array_decl: Option<ItemId>,
-    pub map_decl: Option<ItemId>,
-    pub buffer_decl: Option<ItemId>,
-    pub table_decl: Option<ItemId>,
-    pub tensor_decl: Option<ItemId>,
+    pub array_decl: Option<ItemKey>,
+    pub map_decl: Option<ItemKey>,
+    pub buffer_decl: Option<ItemKey>,
+    pub table_decl: Option<ItemKey>,
+    pub tensor_decl: Option<ItemKey>,
     /// `Tuple<T, U>` from `lib/std/core.gcl`. `(x, y)` tuple-literal
     /// syntax desugars to `Tuple<T, U>{x, y}` per the compiler, so
     /// the analyzer's `Expr::Tuple` typing mints
     /// `Generic(tuple_decl, [T, U])` when this slot is populated.
-    pub tuple_decl: Option<ItemId>,
+    pub tuple_decl: Option<ItemKey>,
 
     // v7 fixed-shape tuple natives. Present only when the loaded
     // stdlib is v7 — the v8 stdlib removed them.
@@ -85,13 +85,13 @@ pub struct WellKnown {
     // every element typed as the corresponding primitive (`int` for
     // the int-suffix decls, `float` for the `f`-suffix ones,
     // `String` for `str`).
-    pub t2_decl: Option<ItemId>,
-    pub t2f_decl: Option<ItemId>,
-    pub t3_decl: Option<ItemId>,
-    pub t3f_decl: Option<ItemId>,
-    pub t4_decl: Option<ItemId>,
-    pub t4f_decl: Option<ItemId>,
-    pub str_decl: Option<ItemId>,
+    pub t2_decl: Option<ItemKey>,
+    pub t2f_decl: Option<ItemKey>,
+    pub t3_decl: Option<ItemKey>,
+    pub t3f_decl: Option<ItemKey>,
+    pub t4_decl: Option<ItemKey>,
+    pub t4f_decl: Option<ItemKey>,
+    pub str_decl: Option<ItemKey>,
 }
 
 impl WellKnown {
@@ -104,7 +104,7 @@ impl WellKnown {
     /// Direct replacement for the SmolStr-keyed predicate this
     /// crate used to expose — handle-keyed, so a user-declared
     /// `type node<T>` is not mistaken for the std-core tag.
-    pub fn is_node_tag(&self, id: ItemId) -> bool {
+    pub fn is_node_tag(&self, id: ItemKey) -> bool {
         Some(id) == self.node_decl
             || Some(id) == self.node_time_decl
             || Some(id) == self.node_index_decl
@@ -115,7 +115,7 @@ impl WellKnown {
     /// Stash `id` into the slot matching `name` when `(lib, module)`
     /// is `("std", "core")`. No-op otherwise — a user-defined `node`
     /// in their own module doesn't flow into the well-known slots.
-    pub fn record(&mut self, lib: &str, module: &str, name: &str, id: ItemId) {
+    pub fn record(&mut self, lib: &str, module: &str, name: &str, id: ItemKey) {
         if lib != "std" || module != "core" {
             return;
         }

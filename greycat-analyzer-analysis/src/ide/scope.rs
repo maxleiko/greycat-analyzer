@@ -14,7 +14,7 @@
 
 use greycat_analyzer_core::{Symbol, SymbolTable};
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{BlockStmt, Decl, Ident, Stmt};
+use greycat_analyzer_hir::hir::{BlockStmt, Decl, Ident, Stmt};
 use rustc_hash::FxHashSet;
 
 use crate::conv::stmt_byte_range;
@@ -151,7 +151,7 @@ fn walk(
 fn collect_fn_scope(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    fnd: &greycat_analyzer_hir::types::FnDecl,
+    fnd: &greycat_analyzer_hir::hir::FnDecl,
     cursor_byte: usize,
     emit: &mut dyn FnMut(ScopeName),
 ) {

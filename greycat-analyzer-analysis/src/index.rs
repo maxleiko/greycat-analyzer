@@ -1,22 +1,13 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{
-    BuiltinSelector, Builtins, ItemId, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
-};
+use greycat_analyzer_core::{ItemKey, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Annotation, Decl, Expr, TypeAttr};
+use greycat_analyzer_hir::hir::{Annotation, Decl, Expr, TypeAttr};
 use greycat_analyzer_hir::{DeclRegistry, Hir};
 
+use crate::resolver::{self, Resolutions, ResolverCx};
 use crate::well_known::WellKnown;
-
-/// Runtime-exposed value-position globals. The runtime
-/// makes these names available at value position with a fixed type;
-/// they have no `.gcl` declaration, so the resolver/analyzer must seed
-/// them. `(name, Builtins selector)` pairs — extend as new runtime
-/// globals are confirmed against `greycat run`.
-pub const BUILTIN_RUNTIME_GLOBALS: &[(&str, BuiltinSelector)] =
-    &[("Infinity", Builtins::FLOAT), ("NaN", Builtins::FLOAT)];
 
 /// Hard cap on supertype-chain depth. The GreyCat runtime rejects any
 /// declaration whose `extends` chain reaches a 5th level with
@@ -81,11 +72,6 @@ pub struct ProjectIndex {
     ///
     /// Owns canonical storage for every name the analyzer looks up across modules.
     pub symbols: SymbolTable,
-    /// Canonical `core::X` identities, computed from `symbols` in
-    /// [`Self::with_symbols`]. Lets `resolve_item` bind the always-available
-    /// core type names (the 8 primitives + `any` / `null`) even when std
-    /// isn't loaded. `None` only on a bare `default()` index.
-    pub builtins: Option<Builtins>,
     /// Set of public top-level declared type/enum names.
     pub type_names: FxHashSet<Symbol>,
     /// Set of public top-level declared variable names.
@@ -105,7 +91,7 @@ pub struct ProjectIndex {
     /// Lets lints ask "is this name part of the runtime API?".
     pub exposed: FxHashMap<Symbol, Vec<ExposureSite>>,
     /// Per-type flag bits from `@iterable` / `@deref` / `@primitive` annotations, keyed by declared type name.
-    pub type_flags: FxHashMap<ItemId, TypeFlags>,
+    pub type_flags: FxHashMap<ItemKey, TypeFlags>,
     /// Per-module `@permission("name")` pragmas for capability checks.
     pub module_permissions: FxHashMap<Uri, FxHashSet<Symbol>>,
     /// Module-name -> URI
@@ -116,38 +102,38 @@ pub struct ProjectIndex {
     ///
     /// Overlaid with a `duplicate-module-name` diagnostic.
     pub duplicate_modules: FxHashMap<Uri, (Symbol, Uri)>,
-    /// Cross-module structure index keyed by `ItemId`
+    /// Cross-module structure index keyed by `ItemKey`
     ///
     /// Maps each type to its home URI and attr/method name -> HIR index.
-    pub type_members: FxHashMap<ItemId, TypeMembers>,
-    /// Pre-lowered top-level fn signatures keyed by `ItemId`
+    pub type_members: FxHashMap<ItemKey, TypeMembers>,
+    /// Pre-lowered top-level fn signatures keyed by `ItemKey`
     ///
     /// `return_ty` is already in the shared arena for call-site substitution.
-    pub fn_signatures: FxHashMap<ItemId, FnSignature>,
+    pub fn_signatures: FxHashMap<ItemKey, FnSignature>,
     /// Enum types pre-registered in the shared arena
     ///
     /// Lets the analyzer type `module::Enum::variant` as the correct enum rather than `any`.
-    pub enum_types: FxHashMap<ItemId, TypeId>,
-    /// Pre-lowered top-level `var` declared types keyed by `ItemId`
+    pub enum_types: FxHashMap<ItemKey, TypeId>,
+    /// Pre-lowered top-level `var` declared types keyed by `ItemKey`
     ///
     /// Enables inline typing of cross-module var references at body-walk time.
-    pub var_types: FxHashMap<ItemId, TypeId>,
+    pub var_types: FxHashMap<ItemKey, TypeId>,
     /// Runtime-only globals (`Infinity`, `NaN`, `-Infinity`) and their declared types
     ///
     /// Seeded by `seed_builtin_names`.
     pub runtime_globals: FxHashMap<Symbol, TypeId>,
-    /// `ItemId`s of `abstract`-modifier types
+    /// `ItemKey`s of `abstract`-modifier types
     ///
     /// Consulted by the sealed-hierarchy narrowing pass.
-    pub is_abstract: FxHashSet<ItemId>,
+    pub is_abstract: FxHashSet<ItemKey>,
     /// Per-type sorted closure of concrete leaves reachable through `extends`
     ///
     /// Built by `populate_subtype_indices`.
-    pub subtype_closure: FxHashMap<ItemId, Box<[ItemId]>>,
-    /// Reverse index: closure-set -> abstract ancestor `ItemId`
+    pub subtype_closure: FxHashMap<ItemKey, Box<[ItemKey]>>,
+    /// Reverse index: closure-set -> abstract ancestor `ItemKey`
     ///
     /// Lets `narrow_complement` collapse unions back to the abstract type.
-    pub abstract_by_closure_set: FxHashMap<Box<[ItemId]>, ItemId>,
+    pub abstract_by_closure_set: FxHashMap<Box<[ItemKey]>, ItemKey>,
     /// Total modules ingested
     ///
     /// Useful for "did stdlib load?" smoke checks at the LSP boundary.
@@ -225,10 +211,10 @@ pub struct TypeMembers {
     ///
     /// Lets the LSP declaration handler walk the supertype chain without fetching foreign HIR.
     pub abstract_methods: FxHashSet<Symbol>,
-    /// Direct supertype `ItemId`
+    /// Direct supertype `ItemKey`
     ///
     /// Drives inheritance lookup and `Type(Sub)` -> `Type(Super)` assignability.
-    pub supertype: Option<ItemId>,
+    pub supertype: Option<ItemKey>,
     /// Instantiated supertype `TypeId` in the shared arena (e.g. `Generic { decl: Base, args: [int] }`);
     /// enables generic-arg-substituted assignability chain walks.
     pub supertype_ty: Option<TypeId>,
@@ -275,35 +261,19 @@ pub struct ExposureSite {
 }
 
 impl ProjectIndex {
-    /// Construct an empty index with builtin type / runtime-global
-    /// names seeded into the symbol table, and the arena's canonical
-    /// [`Builtins`] identities set. Runtime globals (`Infinity`, `NaN`)
-    /// also get a concrete `TypeId` so the body walker can consume them.
-    pub fn new(arena: &mut TypeArena) -> Self {
-        Self::with_symbols(SymbolTable::new(), arena)
-    }
-
     /// Construct a fresh index that reuses an existing
     /// [`SymbolTable`]. Lets `ProjectAnalysis::invalidate` rebuild
     /// the per-module index without invalidating the `Symbol`s held
     /// elsewhere (notably the per-stage signature cache).
-    pub fn with_symbols(symbols: SymbolTable, arena: &mut TypeArena) -> Self {
+    pub fn new(symbols: SymbolTable, arena: &TypeArena) -> Self {
         let mut idx = Self {
             symbols,
             ..Self::default()
         };
-        seed_builtin_names(&mut idx.symbols, &mut idx.type_names);
-        let builtins = Builtins::compute(&idx.symbols);
-        idx.builtins = Some(builtins);
-        arena.set_builtins(builtins);
         // Runtime-exposed value-position globals
-        // (`Infinity`, `NaN`). Registered here (not in
-        // `seed_builtin_names`) because they're values, not types,
-        // and they need a typed `TypeId` the body walker can consume.
-        for (name, sel) in BUILTIN_RUNTIME_GLOBALS {
+        for name in ["Infinity", "NaN"] {
             let sym = idx.symbols.intern(name);
-            let ty = arena.builtin(*sel);
-            idx.runtime_globals.insert(sym, ty);
+            idx.runtime_globals.insert(sym, arena.builtins.float);
         }
         idx
     }
@@ -316,14 +286,14 @@ impl ProjectIndex {
         self.symbols.lookup(name)
     }
 
-    /// Build an [`ItemId`] for `(uri, name)`. Returns `None` if `uri`
+    /// Build an [`ItemKey`] for `(uri, name)`. Returns `None` if `uri`
     /// doesn't have a recognisable module-name stem. Cheap (one
     /// `module_name_from_uri` call + one symbol intern). Use this
     /// anywhere you have a URI and an item-name symbol and need the
     /// composed identity for `decl_registry` / `type_members` / etc.
-    pub fn item_id_for(&self, uri: &Uri, name: Symbol) -> Option<ItemId> {
+    pub fn item_id_for(&self, uri: &Uri, name: Symbol) -> Option<ItemKey> {
         let module_sym = self.symbols.intern(module_name_from_uri(uri)?);
-        Some(ItemId::new(module_sym, name))
+        Some(ItemKey::new(module_sym, name))
     }
 
     /// Walk the supertype chain starting at `type_name`,
@@ -335,7 +305,7 @@ impl ProjectIndex {
     /// type itself. Returns 0 when `type_id` is unknown. Stops
     /// counting at [`MAX_SUPERTYPE_CHAIN_DEPTH`] + 1 — the caller only
     /// needs to distinguish "within limit" from "exceeds limit".
-    pub fn supertype_chain_length(&self, type_id: ItemId) -> usize {
+    pub fn supertype_chain_length(&self, type_id: ItemKey) -> usize {
         let mut cur = type_id;
         let mut len: usize = 0;
         for _ in 0..=MAX_SUPERTYPE_CHAIN_DEPTH {
@@ -360,7 +330,7 @@ impl ProjectIndex {
     /// Bounded at [`MAX_SUPERTYPE_CHAIN_DEPTH`] hops to match the
     /// runtime's inheritance-depth ceiling and defend against accidental
     /// cycles in in-progress source.
-    fn walk_member_chain<P>(&self, type_id: ItemId, pred: P) -> Option<&TypeMembers>
+    fn walk_member_chain<P>(&self, type_id: ItemKey, pred: P) -> Option<&TypeMembers>
     where
         P: FnMut(&TypeMembers) -> bool,
     {
@@ -369,14 +339,14 @@ impl ProjectIndex {
     }
 
     /// Same walk as [`walk_member_chain`] but also returns the
-    /// `ItemId` of the level where the predicate matched. Callers that
+    /// `ItemKey` of the level where the predicate matched. Callers that
     /// need to know *which* type in the chain owns the member (e.g.
     /// to compare against an enclosing-type identity) use this.
     fn walk_member_chain_with_id<P>(
         &self,
-        type_id: ItemId,
+        type_id: ItemKey,
         mut pred: P,
-    ) -> Option<(ItemId, &TypeMembers)>
+    ) -> Option<(ItemKey, &TypeMembers)>
     where
         P: FnMut(&TypeMembers) -> bool,
     {
@@ -396,7 +366,7 @@ impl ProjectIndex {
     /// [`MAX_SUPERTYPE_CHAIN_DEPTH`] like the other chain walks.
     /// Used by `check_private_attr_write` to allow writes from
     /// non-static methods of subtypes that inherit a private attr.
-    pub fn type_is_descendant_or_self(&self, child: ItemId, ancestor: ItemId) -> bool {
+    pub fn type_is_descendant_or_self(&self, child: ItemKey, ancestor: ItemKey) -> bool {
         let mut cur = child;
         for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
             if cur == ancestor {
@@ -419,7 +389,7 @@ impl ProjectIndex {
     /// goto-def points at the right module.
     pub fn type_attr_id_chain(
         &self,
-        type_id: ItemId,
+        type_id: ItemKey,
         attr_name: Symbol,
     ) -> Option<(Uri, Idx<TypeAttr>)> {
         let members = self.walk_member_chain(type_id, |m| m.attrs.contains_key(&attr_name))?;
@@ -431,23 +401,23 @@ impl ProjectIndex {
 
     /// Find the entry in `type_id`'s supertype chain that owns
     /// `attr_name` (the first hop that has the attr in `attrs`).
-    /// Returns the owning level's `ItemId` alongside the members so
+    /// Returns the owning level's `ItemKey` alongside the members so
     /// callers can identify *which* type declared the attr — needed
     /// by `check_private_attr_write` to compare against the enclosing
     /// method's owner. `private` is sourced from the declaration,
     /// not the use site.
     pub fn walk_chain_for_private_attr(
         &self,
-        type_id: ItemId,
+        type_id: ItemKey,
         attr_name: Symbol,
-    ) -> Option<(ItemId, &TypeMembers)> {
+    ) -> Option<(ItemKey, &TypeMembers)> {
         self.walk_member_chain_with_id(type_id, |m| m.attrs.contains_key(&attr_name))
     }
 
     /// Method's HIR index, walking the supertype chain.
     pub fn type_method_id_chain(
         &self,
-        type_id: ItemId,
+        type_id: ItemKey,
         method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
         let members = self.walk_member_chain(type_id, |m| m.methods.contains_key(&method_name))?;
@@ -465,7 +435,7 @@ impl ProjectIndex {
     /// method of the same name.
     pub fn type_instance_method_id_chain(
         &self,
-        type_id: ItemId,
+        type_id: ItemKey,
         method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
         let members = self.walk_member_chain(type_id, |m| {
@@ -486,7 +456,7 @@ impl ProjectIndex {
     /// `textDocument/implementation`.
     pub fn find_abstract_ancestor_method(
         &self,
-        type_id: ItemId,
+        type_id: ItemKey,
         method_name: Symbol,
     ) -> Option<(Uri, Idx<Decl>)> {
         let start_members = self.type_members.get(&type_id)?;
@@ -507,13 +477,17 @@ impl ProjectIndex {
     /// `TypeId` lives in the project arena and may reference
     /// `GenericParam(T, owner=parent_type)` if the attr is declared
     /// on a generic parent.
-    pub fn type_attr_ty_chain(&self, type_id: ItemId, attr_name: Symbol) -> Option<TypeId> {
+    pub fn type_attr_ty_chain(&self, type_id: ItemKey, attr_name: Symbol) -> Option<TypeId> {
         let members = self.walk_member_chain(type_id, |m| m.attr_types.contains_key(&attr_name))?;
         members.attr_types.get(&attr_name).copied()
     }
 
     /// Pre-lowered method return type, walking the supertype chain.
-    pub fn type_method_return_chain(&self, type_id: ItemId, method_name: Symbol) -> Option<TypeId> {
+    pub fn type_method_return_chain(
+        &self,
+        type_id: ItemKey,
+        method_name: Symbol,
+    ) -> Option<TypeId> {
         let members =
             self.walk_member_chain(type_id, |m| m.method_returns.contains_key(&method_name))?;
         members.method_returns.get(&method_name).copied()
@@ -521,7 +495,7 @@ impl ProjectIndex {
 
     /// `true` iff `sub` is `sup` or any of its transitive supertypes
     /// is `sup`. Bounded at 32 hops.
-    pub fn is_subtype_of(&self, sub: ItemId, sup: ItemId) -> bool {
+    pub fn is_subtype_of(&self, sub: ItemKey, sup: ItemKey) -> bool {
         if sub == sup {
             return true;
         }
@@ -542,9 +516,9 @@ impl ProjectIndex {
     }
 
     // Kept as a thin alias for symmetry with the chain
-    // walkers above. `is_subtype_of` now takes `ItemId` directly so
+    // walkers above. `is_subtype_of` now takes `ItemKey` directly so
     // the wrapper is purely cosmetic; consumers can call either.
-    pub fn is_subtype_of_decl(&self, sub: ItemId, sup: ItemId) -> bool {
+    pub fn is_subtype_of_decl(&self, sub: ItemKey, sup: ItemKey) -> bool {
         self.is_subtype_of(sub, sup)
     }
     /// `true` iff the decl at `(uri, decl_id)` was ingested with the
@@ -557,7 +531,7 @@ impl ProjectIndex {
 
     /// Walk a HIR module's top-level decls and register everything
     /// that's a type-name (type / enum) or a native function. Records
-    /// every encountered decl into `decl_registry` (`ItemId →
+    /// every encountered decl into `decl_registry` (`ItemKey →
     /// Idx<Decl>` map) and well-known `(lib, module, name)` slots,
     /// allocates the enum's
     /// `TypeKind::Enum` shape into the shared [`TypeArena`], and
@@ -630,7 +604,7 @@ impl ProjectIndex {
                     // recording. Folded in from the former standalone
                     // pre-pass in `stage_lower_signatures` so the
                     // project has a single decl-registration point.
-                    let item = ItemId::new(module_sym, name_sym);
+                    let item = ItemKey::new(module_sym, name_sym);
                     decl_registry.record(item, *decl_id);
                     well_known.record(
                         &self.symbols[module.lib],
@@ -650,7 +624,7 @@ impl ProjectIndex {
                     // Populate the member shape index. Keyed
                     // by `(module, name)` so two same-named types in
                     // different modules coexist unambiguously. The
-                    // first ingested decl for a given `ItemId` wins
+                    // first ingested decl for a given `ItemKey` wins
                     // (re-ingest is a no-op). Private types ARE
                     // included — `private` in GreyCat gates only
                     // cross-module *bare-name* resolution (handled
@@ -669,14 +643,14 @@ impl ProjectIndex {
                             .collect();
                         // Best-guess supertype linkage at ingest:
                         // unqualified `extends Super` is *probably*
-                        // same-module, so mint the same-module ItemId
+                        // same-module, so mint the same-module ItemKey
                         // immediately. The `link_supertypes` post-
                         // pass refines for cross-module unqualified
                         // and qualified cases. Skips primitives —
                         // they never form a TypeMembers entry.
                         let supertype_guess = td.supertype.and_then(|tr| {
                             let parent_ref = &hir.type_refs[tr];
-                            if !parent_ref.qualifier.is_empty() {
+                            if parent_ref.is_qualified() {
                                 return None;
                             }
                             let parent_sym = hir.idents[parent_ref.name].symbol;
@@ -695,7 +669,7 @@ impl ProjectIndex {
                             ) {
                                 return None;
                             }
-                            Some(ItemId::new(module_sym, parent_sym))
+                            Some(ItemKey::new(module_sym, parent_sym))
                         });
                         let mut m = TypeMembers {
                             home_uri: uri.clone(),
@@ -767,7 +741,7 @@ impl ProjectIndex {
                     // Project-wide decl handle (enums get one too — the
                     // resolver / lowering paths route foreign enum refs
                     // through `Type(handle)` for some shapes).
-                    let enum_item = ItemId::new(module_sym, name_sym);
+                    let enum_item = ItemKey::new(module_sym, name_sym);
                     decl_registry.record(enum_item, *decl_id);
                     // Alloc the canonical `TypeKind::Enum` into the
                     // shared arena and publish to `enum_types`
@@ -874,18 +848,18 @@ impl ProjectIndex {
         self.modules_ingested += 1;
     }
 
-    /// Resolves a name to its item id via the project's decl table and registry.
+    /// Resolves a type by name honoring the GreyCat resolving logic of GreyCat.
     ///
-    /// This honors the resolving logic of GreyCat. Local first, then cross-module.
-    pub fn resolve_item(
+    /// Local first, then cross-module.
+    pub fn resolve_type(
         &self,
         decl_registry: &DeclRegistry,
         from_uri: Option<&Uri>,
         name: Symbol,
-    ) -> Option<ItemId> {
+    ) -> Option<ItemKey> {
         let is_valid = |uri: &Uri| {
             self.item_id_for(uri, name)
-                .filter(|item| decl_registry.lookup(*item).is_some())
+                .filter(|key| decl_registry.lookup(*key).is_some())
         };
 
         // Same-module pass.
@@ -915,7 +889,26 @@ impl ProjectIndex {
         // with no `core.gcl` loaded (no backing decl, so members stay empty
         // until std loads -- but the identity is correct). A loaded decl
         // wins above, carrying full member info.
-        self.builtins.and_then(|b| b.by_name(name))
+        let core = self.symbols.intern("core");
+        let mk_item = |name: &str| ItemKey::new(core, self.symbols.intern(name));
+        match &self.symbols[name] {
+            "bool" => Some(mk_item("bool")),
+            "int" => Some(mk_item("int")),
+            "float" => Some(mk_item("float")),
+            "char" => Some(mk_item("char")),
+            "time" => Some(mk_item("time")),
+            "duration" => Some(mk_item("duration")),
+            "String" => Some(mk_item("String")),
+            "geo" => Some(mk_item("geo")),
+            "node" => Some(mk_item("node")),
+            "nodeList" => Some(mk_item("nodeList")),
+            "nodeIndex" => Some(mk_item("nodeIndex")),
+            "nodeGeo" => Some(mk_item("nodeGeo")),
+            "nodeTime" => Some(mk_item("nodeTime")),
+            "any" => Some(mk_item("any")),
+            "null" => Some(mk_item("null")),
+            _ => None,
+        }
     }
 
     /// `Symbol`-keyed location index. Caller must have
@@ -971,6 +964,25 @@ impl ProjectIndex {
             || self.fn_names.contains(&name)
             || self.var_names.contains(&name)
     }
+
+    pub fn resolutions(&self, hir: &Hir, current_uri: Option<&Uri>, map_item_key: Option<ItemKey>) -> Resolutions {
+        let mut cx = ResolverCx::new(hir, self, current_uri, map_item_key);
+
+        let Some(module) = hir.module.as_ref() else {
+            return cx.res;
+        };
+
+        // Two-pass at module scope so forward references between top-level
+        // decls work (TS reference does the same).
+        for decl_id in &module.decls {
+            resolver::seed_module_decl(&mut cx, *decl_id);
+        }
+        for decl_id in &module.decls {
+            resolver::visit_decl(&mut cx, *decl_id);
+        }
+
+        cx.res
+    }
 }
 
 /// Extract the module name from a URI (filename without
@@ -982,26 +994,6 @@ pub fn module_name_from_uri(uri: &Uri) -> Option<&str> {
     let last = stripped.rsplit(['/', '\\']).next()?;
     let stem = last.strip_suffix(".gcl").unwrap_or(last);
     if stem.is_empty() { None } else { Some(stem) }
-}
-
-/// Names the analyzer treats as known without an `.gcl` declaration in
-/// scope: the GreyCat primitives. Seeded straight into the project's
-/// [`SymbolTable`] + `type_names` set so the resolver's "is this a
-/// known type?" fallback and `lower_type_ref*`'s primitive minting
-/// paths both recognise them. No `TypeArena` writes — `seed_builtins`
-/// (in `project.rs`) is the canonical seed for primitive TypeIds.
-///
-/// Runtime-implemented types (collections, node tags,
-/// `function` / `type` / `field` markers) are no longer seeded here:
-/// they all have `native type` decls in `lib/std/core.gcl` and land
-/// in `type_names` through the normal stdlib ingest path.
-fn seed_builtin_names(symbols: &mut SymbolTable, type_names: &mut FxHashSet<Symbol>) {
-    for &name in &[
-        "bool", "int", "float", "char", "String", "time", "duration", "geo", "any", "null",
-    ] {
-        let sym = symbols.intern(name);
-        type_names.insert(sym);
-    }
 }
 
 /// Read `@iterable` / `@deref` / `@primitive` annotations on a
@@ -1041,10 +1033,11 @@ mod tests {
     /// index itself. Returned by-value so each test owns an
     /// independent copy.
     fn fresh_index() -> (TypeArena, DeclRegistry, WellKnown, ProjectIndex) {
-        let mut arena = TypeArena::new();
+        let symbols = SymbolTable::new();
+        let arena = TypeArena::new(&symbols);
         let decl_registry = DeclRegistry::default();
         let well_known = WellKnown::default();
-        let idx = ProjectIndex::new(&mut arena);
+        let idx = ProjectIndex::new(symbols, &arena);
         (arena, decl_registry, well_known, idx)
     }
 
@@ -1180,7 +1173,7 @@ fn helper(): int { return 1; }
             assert_eq!(idx.symbols.resolve(&sym), n);
         }
 
-        // Direct ItemId-keyed field access — `m.gcl` → module `m`.
+        // Direct ItemKey-keyed field access — `m.gcl` → module `m`.
         let bag_id = idx
             .item_id_for(&uri("/proj/m.gcl"), idx.symbol("Bag").unwrap())
             .expect("Bag item id");
@@ -1218,7 +1211,7 @@ fn helper(): int { return 1; }
         // freshly-built name table — independent of whatever ingest
         // chose to mint into `idx_arena`.
         let mut registry = DeclRegistry::new();
-        let mut arena = TypeArena::new();
+        let mut arena = TypeArena::new(&idx.symbols);
         let module = hir.module.as_ref().unwrap();
         let mut animal = None;
         let mut cat = None;

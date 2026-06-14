@@ -49,17 +49,17 @@ impl std::fmt::Display for TypeId {
 /// Replaces name-only keying on every per-item project map
 /// (`type_members`, `fn_signatures`, `enum_types`, `var_types`,
 /// `type_flags`, …) so two same-named items in different modules
-/// (`foo::Load` and `bar::Load`) coexist unambiguously. Two `ItemId`s
+/// (`foo::Load` and `bar::Load`) coexist unambiguously. Two `ItemKey`s
 /// compare equal iff they refer to the same item in the same module —
 /// one register-sized compare, since both fields are `Copy` u32
 /// newtypes under the hood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ItemId {
+pub struct ItemKey {
     pub module: Symbol,
     pub name: Symbol,
 }
 
-impl ItemId {
+impl ItemKey {
     pub const fn new(module: Symbol, name: Symbol) -> Self {
         Self { module, name }
     }
@@ -81,16 +81,16 @@ pub struct Type {
 pub enum TypeKind {
     /// `null`-only type. Convertible to any nullable.
     Null,
-    /// `any` — top type. Anything non-nullable is assignable to it.
+    /// Top type. Anything non-nullable is assignable to it.
     Any,
-    /// `never` — bottom type. Used for unreachable code.
+    /// Bottom type. Used for unreachable code.
     Never,
     /// A resolved non-generic type — user-defined `type Foo {...}` or
     /// a non-generic native type from `std/core` (the 8 primitives
     /// `int float String bool char time duration geo` are exactly the
-    /// native-core decls keyed here as `Type(core::X)`). The decl's [`ItemId`]
+    /// native-core decls keyed here as `Type(core::X)`). The decl's [`ItemKey`]
     /// `(module, name)` is the identity; cross-module references to
-    /// the same decl share the same `ItemId`, so equality is two
+    /// the same decl share the same `ItemKey`, so equality is two
     /// register-sized symbol compares.
     ///
     /// Distinct from [`TypeKind::Generic`] with empty args.
@@ -98,14 +98,14 @@ pub enum TypeKind {
     /// concepts — separating them by variant lets the substitution /
     /// variance / node-tag-dispatch machinery match only the latter
     /// without runtime `args.is_empty()` checks.
-    Type(ItemId),
+    Type(ItemKey),
     /// An instantiation of a generic template — `Array<int>`, `node<int?>`,
-    /// `Map<String, V>`. `tpl` is the generic template's [`ItemId`];
+    /// `Map<String, V>`. `tpl` is the generic template's [`ItemKey`];
     /// `args` are the per-use-site type arguments and are guaranteed
     /// non-empty by the lowering pass (zero-arg uses of a generic
     /// template are an analysis error caught upstream).
     Generic {
-        tpl: ItemId,
+        tpl: ItemKey,
         /// Cannot be zero-length (ensured by the lowering phase)
         args: SmallVec<[TypeId; 2]>,
     },
@@ -177,8 +177,7 @@ pub enum GenericOwner {
 /// Looks up named types.
 #[derive(Debug, Default)]
 pub struct TypeRegistry {
-    /// Maps `Symbol` (an interned type name) → `TypeId` in the
-    /// shared arena.
+    /// Maps `Symbol` (an interned type name) → `TypeId` in the shared arena.
     named: FxHashMap<Symbol, TypeId>,
 }
 
@@ -187,10 +186,12 @@ impl TypeRegistry {
         Self::default()
     }
 
+    #[inline]
     pub fn register(&mut self, name: Symbol, id: TypeId) {
         self.named.insert(name, id);
     }
 
+    #[inline]
     pub fn lookup(&self, name: Symbol) -> Option<TypeId> {
         self.named.get(&name).copied()
     }
@@ -287,7 +288,6 @@ impl InferenceTable {
 mod tests {
     use super::*;
     use crate::SymbolTable;
-    use crate::type_arena::Builtins;
 
     struct TextCx {
         arena: TypeArena,
@@ -297,37 +297,26 @@ mod tests {
     impl Default for TextCx {
         fn default() -> Self {
             let symbols = SymbolTable::new();
-            let mut arena = TypeArena::new();
-            arena.set_builtins(Builtins::compute(&symbols));
+            let arena = TypeArena::new(&symbols);
             Self { arena, symbols }
         }
     }
 
     impl TextCx {
-        /// Mint a synthetic [`ItemId`] for tests — every test module
+        /// Mint a synthetic [`ItemKey`] for tests — every test module
         /// shares the same fake module symbol `"test_mod"`, so two
         /// items with the same `name` collapse to the same identity.
-        fn item(&self, name: &str) -> ItemId {
-            ItemId::new(self.symbols.intern("test_mod"), self.symbols.intern(name))
+        fn item(&self, name: &str) -> ItemKey {
+            ItemKey::new(self.symbols.intern("test_mod"), self.symbols.intern(name))
         }
-    }
-
-    #[test]
-    fn intern_collapses_equal_types() {
-        let mut cx = TextCx::default();
-        let i1 = cx.arena.builtin(Builtins::INT);
-        let i2 = cx.arena.builtin(Builtins::INT);
-        assert_eq!(i1, i2);
-        assert_eq!(cx.arena.len(), 1);
     }
 
     #[test]
     fn typekind_name_dedups() {
         let mut cx = TextCx::default();
-        let int_ty = cx.arena.builtin(Builtins::INT);
         let array_ty = cx.item("Array");
-        let a = cx.arena.alloc_generic(array_ty, vec![int_ty]);
-        let b = cx.arena.alloc_generic(array_ty, vec![int_ty]);
+        let a = cx.arena.alloc_generic(array_ty, vec![cx.arena.builtins.int]);
+        let b = cx.arena.alloc_generic(array_ty, vec![cx.arena.builtins.int]);
         assert_eq!(a, b);
         assert_eq!(cx.arena.len(), 2);
     }
@@ -335,8 +324,7 @@ mod tests {
     #[test]
     fn nullable_idempotent() {
         let mut cx = TextCx::default();
-        let i = cx.arena.builtin(Builtins::INT);
-        let q1 = cx.arena.nullable(i);
+        let q1 = cx.arena.nullable(cx.arena.builtins.int);
         let q2 = cx.arena.nullable(q1);
         assert_eq!(q1, q2);
         assert_eq!(cx.arena.len(), 2);
@@ -345,25 +333,19 @@ mod tests {
     #[test]
     fn strip_nullable_idempotent() {
         let mut cx = TextCx::default();
-        let i = cx.arena.builtin(Builtins::INT);
-        let ni = cx.arena.nullable(i);
+        let ni = cx.arena.nullable(cx.arena.builtins.int);
         let i2 = cx.arena.strip_nullable(ni);
-        assert_eq!(i, i2);
+        assert_eq!(cx.arena.builtins.int, i2);
         assert_eq!(cx.arena.len(), 2);
     }
 
     #[test]
     fn primitives_do_not_cross_widen() {
-        // P12.4: the GreyCat runtime rejects every primitive-to-primitive
-        // widening at parameter / binding sites — including `int → float`,
-        // which the TS reference checker permits. Verified live via
-        // `greycat run`: `var i: int = 1; take(i)` against
-        // `take(_: float)` is rejected. Identity is the only flow.
-        let mut cx = TextCx::default();
-        let i = cx.arena.builtin(Builtins::INT);
-        let f = cx.arena.builtin(Builtins::FLOAT);
-        let s = cx.arena.builtin(Builtins::STRING);
-        let c = cx.arena.builtin(Builtins::CHAR);
+        let cx = TextCx::default();
+        let i = cx.arena.builtins.int;
+        let f = cx.arena.builtins.float;
+        let s = cx.arena.builtins.string;
+        let c = cx.arena.builtins.char_;
         assert!(!cx.arena.is_assignable_to(i, f));
         assert!(!cx.arena.is_assignable_to(f, i));
         assert!(!cx.arena.is_assignable_to(c, i));
@@ -378,7 +360,7 @@ mod tests {
     fn null_flows_into_nullable_only() {
         let mut cx = TextCx::default();
         let null = cx.arena.null();
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         let int_q = cx.arena.nullable(int);
         assert!(cx.arena.is_assignable_to(null, int_q));
         assert!(!cx.arena.is_assignable_to(null, int));
@@ -387,7 +369,7 @@ mod tests {
     #[test]
     fn nullable_does_not_silently_narrow() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         let int_q = cx.arena.nullable(int);
         assert!(cx.arena.is_assignable_to(int, int_q));
         assert!(!cx.arena.is_assignable_to(int_q, int));
@@ -396,7 +378,7 @@ mod tests {
     #[test]
     fn any_top_never_bottom() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         let any = cx.arena.any();
         let never = cx.arena.never();
         assert!(cx.arena.is_assignable_to(int, any));
@@ -406,8 +388,8 @@ mod tests {
     #[test]
     fn generic_invariant_in_args() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
-        let float = cx.arena.builtin(Builtins::FLOAT);
+        let int = cx.arena.builtins.int;
+        let float = cx.arena.builtins.float;
         let array_decl = cx.item("Array");
         let arr_int = cx.arena.alloc_generic(array_decl, vec![int]);
         let arr_float = cx.arena.alloc_generic(array_decl, vec![float]);
@@ -424,7 +406,7 @@ mod tests {
     #[test]
     fn generic_name_mismatch_stays_unassignable() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         let array_decl = cx.item("Array");
         let set_decl = cx.item("Set");
         let arr_int = cx.arena.alloc_generic(array_decl, vec![int]);
@@ -438,7 +420,7 @@ mod tests {
     #[test]
     fn lambda_with_any_slot_is_symmetric() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         let any = cx.arena.any();
         // After P20.1, `any` is interchangeable with any other type
         // (both top *and* bottom in the lattice — mirrors the runtime
@@ -457,7 +439,7 @@ mod tests {
     #[test]
     fn lambda_arity_mismatch_rejected() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         // Arity mismatch is hard-rejected regardless of the `any`
         // bidirectionality from P20.1 — no slot count, no relation.
         let f1 = cx.arena.lambda(vec![int], Some(int));
@@ -469,8 +451,8 @@ mod tests {
     #[test]
     fn union_member_flows_in() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
-        let str_t = cx.arena.builtin(Builtins::STRING);
+        let int = cx.arena.builtins.int;
+        let str_t = cx.arena.builtins.string;
         let union = cx.arena.alloc(Type {
             kind: TypeKind::Union {
                 alts: Box::new([int, str_t]),
@@ -479,7 +461,7 @@ mod tests {
         });
         assert!(cx.arena.is_assignable_to(int, union));
         assert!(cx.arena.is_assignable_to(str_t, union));
-        let bool_t = cx.arena.builtin(Builtins::BOOL);
+        let bool_t = cx.arena.builtins.bool_;
         assert!(!cx.arena.is_assignable_to(bool_t, union));
     }
 
@@ -533,7 +515,7 @@ mod tests {
         let mut cx = TextCx::default();
         let t_sym = cx.symbols.intern("T");
         // let foo_sym = cx.symbols.intern("Foo");
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         let t_param = cx.arena.alloc(Type {
             kind: TypeKind::GenericParam(t_sym),
             nullable: false,
@@ -560,8 +542,8 @@ mod tests {
         let t_sym = cx.symbols.intern("T");
         let u_sym = cx.symbols.intern("U");
         // let foo_sym = cx.symbols.intern("Foo");
-        let int = cx.arena.builtin(Builtins::INT);
-        let str_t = cx.arena.builtin(Builtins::STRING);
+        let int = cx.arena.builtins.int;
+        let str_t = cx.arena.builtins.string;
         let t_param = cx.arena.alloc(Type {
             kind: TypeKind::GenericParam(t_sym),
             nullable: false,
@@ -603,7 +585,7 @@ mod tests {
     #[test]
     fn arena_substitute_no_op_on_empty_subst() {
         let mut cx = TextCx::default();
-        let int = cx.arena.builtin(Builtins::INT);
+        let int = cx.arena.builtins.int;
         let array_decl = cx.item("Array");
         let arr = cx.arena.alloc_generic(array_decl, vec![int]);
         let empty: FxHashMap<Symbol, TypeId> = FxHashMap::default();

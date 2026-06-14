@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{GenericOwner, Symbol, TypeArena, TypeId};
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, TypeRef};
+use greycat_analyzer_hir::hir::{Decl, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir};
 
 use crate::index::{Namespace, ProjectIndex};
@@ -99,7 +99,7 @@ pub(crate) fn lower_type_ref_with<E: TypeRefLowering>(
     // Clone so the `env` borrow is released before any `&mut env` call
     // (the static-generic sink) further down the ladder.
     let tr = env.hir().type_refs[idx].clone();
-    let base = if !tr.qualifier.is_empty() {
+    let base = if tr.is_qualified() {
         lower_qualified_base(env, arena, &tr)
     } else {
         let name = env.hir().idents[tr.name].symbol;
@@ -125,7 +125,7 @@ fn lower_bare_name<E: TypeRefLowering>(
     let span = (tr.byte_range.start, tr.byte_range.end);
     let resolved = env
         .index()
-        .resolve_item(env.decl_registry(), env.current_uri(), name);
+        .resolve_type(env.decl_registry(), env.current_uri(), name);
 
     if !tr.params.is_empty() {
         let args = lower_params(env, arena, &tr.params);
@@ -155,19 +155,17 @@ fn lower_bare_name<E: TypeRefLowering>(
         return enum_id;
     }
     if let Some(handle) = resolved {
-        // `any` / `null` resolve to `core::any` / `core::null`, but they
-        // mint the lattice variants rather than `Type(core::X)` -- the
-        // variants encode top / proven-only-null, which nominal identity
-        // can't. (`wrap_marker` still applies the `?` suffix on top.)
-        if let Some((any, null)) = arena.builtins().map(|b| (b.any, b.null)) {
-            if handle == any {
-                return arena.any();
-            }
-            if handle == null {
-                return arena.null();
-            }
+        let ty = arena.alloc_type(handle);
+        // `any` / `null` resolve to `core::any` / `core::null`, but mint the
+        // lattice variants -- they encode top / proven-only-null, which the
+        // nominal `Type(core::X)` can't. `wrap_marker` still adds `?` on top.
+        if ty == arena.builtins.any {
+            return arena.any();
         }
-        return arena.alloc_type(handle);
+        if ty == arena.builtins.null {
+            return arena.null();
+        }
+        return ty;
     }
     arena.unresolved(name, span)
 }

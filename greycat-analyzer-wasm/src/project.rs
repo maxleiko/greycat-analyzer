@@ -177,7 +177,6 @@ impl Project {
         let pos = Position { line, character };
         Ok(hover_with_project(
             &doc.text,
-            &doc.lib,
             doc.root_node(),
             pos,
             &uri,

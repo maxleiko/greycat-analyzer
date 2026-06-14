@@ -24,7 +24,7 @@ use std::ops::Range;
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{BlockStmt, IfStmt, Stmt, TryStmt};
+use greycat_analyzer_hir::hir::{BlockStmt, IfStmt, Stmt, TryStmt};
 
 use crate::analyzer::AnalysisResult;
 
@@ -173,7 +173,7 @@ mod tests {
     use super::*;
     use greycat_analyzer_core::SymbolTable;
     use greycat_analyzer_hir::lower_module;
-    use greycat_analyzer_hir::types::{Decl, FnDecl};
+    use greycat_analyzer_hir::hir::{Decl, FnDecl};
     use greycat_analyzer_syntax::parse;
 
     fn lower(src: &str) -> (Hir, SymbolTable) {

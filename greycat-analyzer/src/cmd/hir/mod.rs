@@ -29,10 +29,10 @@ use greycat_analyzer_analysis::resolver::Definition;
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::resolver::FsContext;
 use greycat_analyzer_core::{
-    Document, ItemId, SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
+    Document, ItemKey, SourceManager, Symbol, SymbolTable, TypeArena, TypeId, TypeKind,
 };
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, FnDecl, TypeDecl};
+use greycat_analyzer_hir::hir::{Decl, FnDecl, TypeDecl};
 use greycat_analyzer_hir::{DeclRegistry, Hir as HirArenas};
 
 use crate::utils::AnyError;
@@ -273,14 +273,14 @@ fn build_module_buffers(
             Decl::Type(td) => {
                 let name = hir.idents[td.name].symbol;
                 // Top-level type FQN.
-                if let Some(handle) = index.resolve_item(registry, None, name) {
+                if let Some(handle) = index.resolve_type(registry, None, name) {
                     let mut tmp_arena = arena.clone();
                     let id = tmp_arena.alloc_type(handle);
                     let s = fqn_for(&tmp_arena, symbols, index, id);
                     buf.type_fqns.insert(decl_raw, s);
                 }
                 // Extends chain — instantiated parent shape.
-                if let Some(item) = index.resolve_item(registry, None, name)
+                if let Some(item) = index.resolve_type(registry, None, name)
                     && let Some(members) = index.type_members.get(&item)
                     && let Some(parent_ty) = members.supertype_ty
                 {
@@ -400,7 +400,7 @@ fn pre_lowered_attr_ty(
     type_name: Symbol,
     attr_name: &str,
 ) -> Option<TypeId> {
-    let item = index.resolve_item(registry, None, type_name)?;
+    let item = index.resolve_type(registry, None, type_name)?;
     let members = index.type_members.get(&item)?;
     let attr_sym = index.symbols.lookup(attr_name)?;
     members.attr_types.get(&attr_sym).copied()
@@ -486,7 +486,7 @@ fn build_module_view<'a>(
                         _ => placeholder_fn(*m),
                     })
                     .collect();
-                let item = index.resolve_item(registry, None, name);
+                let item = index.resolve_type(registry, None, name);
                 types.push(TypeView {
                     name: &symbols[name],
                     id: decl_raw,
@@ -620,7 +620,7 @@ fn build_extends_chain<'a>(
     // only the name ident), so we fall back to a content match — fine
     // for a debug dump and avoids threading another key through.
     let sub_name = hir.idents[td.name].symbol;
-    let sub_item = index.resolve_item(registry, None, sub_name);
+    let sub_item = index.resolve_type(registry, None, sub_name);
     let first_instantiated: Option<Cow<'a, str>> = buf
         .extends_fqns
         .values()
@@ -745,7 +745,7 @@ fn placeholder_fn<'a>(decl_idx: Idx<Decl>) -> FnView<'a> {
 
 fn build_modifiers<'a>(
     symbols: &'a SymbolTable,
-    m: &'a greycat_analyzer_hir::types::Modifiers,
+    m: &'a greycat_analyzer_hir::hir::Modifiers,
 ) -> ModifiersView<'a> {
     ModifiersView {
         private: m.private,
@@ -763,8 +763,8 @@ fn build_modifiers<'a>(
     }
 }
 
-fn render_arg(symbols: &SymbolTable, arg: &greycat_analyzer_hir::types::AnnotationArg) -> String {
-    use greycat_analyzer_hir::types::AnnotationArgKind as A;
+fn render_arg(symbols: &SymbolTable, arg: &greycat_analyzer_hir::hir::AnnotationArg) -> String {
+    use greycat_analyzer_hir::hir::AnnotationArgKind as A;
     match &arg.kind {
         A::Int(v) => v.to_string(),
         A::Float(v) => v.to_string(),
@@ -795,7 +795,7 @@ fn safe_slice(text: &str, start: usize, end: usize) -> &str {
 
 /// Linear-scan the arena for the canonical (non-nullable)
 /// `TypeKind::Type(item)` entry.
-fn find_type_id_for_item(arena: &TypeArena, item: ItemId) -> Option<u32> {
+fn find_type_id_for_item(arena: &TypeArena, item: ItemKey) -> Option<u32> {
     arena.items.iter().enumerate().find_map(|(i, ty)| {
         if matches!(&ty.kind, TypeKind::Type(d) if *d == item) && !ty.nullable {
             Some(i as u32)
@@ -826,7 +826,7 @@ fn collect_monomorphizations(
     let mut out: Vec<MonoEntry> = Vec::new();
     for (i, ty) in arena.items.iter().enumerate() {
         if let TypeKind::Generic { tpl, args } = &ty.kind {
-            let handle = index.resolve_item(registry, None, tpl.name);
+            let handle = index.resolve_type(registry, None, tpl.name);
             if handle != Some(*tpl) {
                 continue;
             }

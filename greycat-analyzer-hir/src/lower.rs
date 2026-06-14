@@ -9,7 +9,7 @@ use greycat_analyzer_syntax::{cst, tree_sitter};
 
 use crate::Hir;
 use crate::arena::Idx;
-use crate::types::*;
+use crate::hir::*;
 
 pub struct LowerCtx<'src, 'symbols> {
     pub hir: Hir,
@@ -70,37 +70,6 @@ impl<'src, 'symbols> LowerCtx<'src, 'symbols> {
     }
 }
 
-// P43.1
-/// Yield named children of `node`, flattening one level into any
-/// `ERROR` child so its grandchildren appear in place. Each item is
-/// `(child, salvaged_from_error)`: `true` when the child came from an
-/// `ERROR` wrapper (e.g. `if (c.sim.)` → `(block (ERROR (member_expr
-/// ...)))`). Depth-bounded — an `ERROR` nested inside an `ERROR` stays
-/// opaque.
-fn flatten_errors_named_children<'a>(
-    node: tree_sitter::Node<'a>,
-) -> Vec<(tree_sitter::Node<'a>, bool)> {
-    // Collect into a Vec — tree_sitter cursors are hostile to nested
-    // iteration. Child lists here are short.
-    let mut out: Vec<(tree_sitter::Node<'a>, bool)> = Vec::new();
-    let mut cur1 = node.walk();
-    for c in node.named_children(&mut cur1) {
-        if c.kind() == "ERROR" {
-            let mut cur2 = c.walk();
-            for g in c.named_children(&mut cur2) {
-                if g.kind() == "ERROR" {
-                    // Bounded descent: ERROR-in-ERROR stays opaque.
-                    continue;
-                }
-                out.push((g, true));
-            }
-        } else {
-            out.push((c, false));
-        }
-    }
-    out
-}
-
 pub fn lower_module(
     source: &str,
     symbols: &SymbolTable,
@@ -146,7 +115,7 @@ fn lower_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Decl
             Some(cx.hir.decls.alloc(Decl::Enum(ed)))
         }
         "modvar" => {
-            let v = lower_top_var(cx, node)?;
+            let v = lower_modvar(cx, node)?;
             Some(cx.hir.decls.alloc(Decl::Var(v)))
         }
         "mod_pragma" => {
@@ -530,7 +499,7 @@ fn lower_enum_decl(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Enu
     })
 }
 
-fn lower_top_var(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<VarDeclTop> {
+fn lower_modvar(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<ModVarDecl> {
     let name_node = node.child_by_field_name("name")?;
     let name = cx.alloc_ident(name_node);
     let mut modifiers = lower_modifiers(cx, node.child_by_field_name("modifiers"));
@@ -551,7 +520,7 @@ fn lower_top_var(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<VarDe
             i.child_by_field_name("expr")
                 .and_then(|e| lower_expr(cx, e))
         });
-    Some(VarDeclTop {
+    Some(ModVarDecl {
         name,
         modifiers,
         ty,
@@ -595,10 +564,7 @@ fn lower_block(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Stm
 /// Like [`lower_block`] but returns the [`BlockStmt`] directly without
 /// allocating into the `stmts` arena. Body-bearing statements
 /// (`If::then_branch`, `While::body`, …) embed it inline.
-fn lower_block_inline(
-    cx: &mut LowerCtx,
-    node: tree_sitter::Node<'_>,
-) -> Option<crate::types::BlockStmt> {
+fn lower_block_inline(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<BlockStmt> {
     if node.kind() != "block" {
         return None;
     }
@@ -622,7 +588,7 @@ fn lower_block_inline(
         stmts.push(s_id);
     }
     salvage_incomplete_members_in_block(cx, node, &mut stmts);
-    Some(crate::types::BlockStmt {
+    Some(BlockStmt {
         stmts: stmts.into_boxed_slice(),
         byte_range: node.byte_range(),
     })
@@ -1345,6 +1311,36 @@ fn lower_expr(cx: &mut LowerCtx, node: tree_sitter::Node<'_>) -> Option<Idx<Expr
         },
     };
     Some(cx.hir.exprs.alloc(expr))
+}
+
+/// Yield named children of `node`, flattening one level into any
+/// `ERROR` child so its grandchildren appear in place. Each item is
+/// `(child, salvaged_from_error)`: `true` when the child came from an
+/// `ERROR` wrapper (e.g. `if (c.sim.)` → `(block (ERROR (member_expr
+/// ...)))`). Depth-bounded — an `ERROR` nested inside an `ERROR` stays
+/// opaque.
+fn flatten_errors_named_children<'a>(
+    node: tree_sitter::Node<'a>,
+) -> Vec<(tree_sitter::Node<'a>, bool)> {
+    // Collect into a Vec — tree_sitter cursors are hostile to nested
+    // iteration. Child lists here are short.
+    let mut out: Vec<(tree_sitter::Node<'a>, bool)> = Vec::new();
+    let mut cur1 = node.walk();
+    for c in node.named_children(&mut cur1) {
+        if c.kind() == "ERROR" {
+            let mut cur2 = c.walk();
+            for g in c.named_children(&mut cur2) {
+                if g.kind() == "ERROR" {
+                    // Bounded descent: ERROR-in-ERROR stays opaque.
+                    continue;
+                }
+                out.push((g, true));
+            }
+        } else {
+            out.push((c, false));
+        }
+    }
+    out
 }
 
 /// Classify a `number` CST node by its typed suffix and parse its

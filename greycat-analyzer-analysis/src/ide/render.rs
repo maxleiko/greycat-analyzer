@@ -17,7 +17,7 @@ use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{Symbol, SymbolTable, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Annotation, AnnotationArgKind, Decl, FnDecl, TypeDecl, TypeRef};
+use greycat_analyzer_hir::hir::{Annotation, AnnotationArgKind, Decl, FnDecl, TypeDecl, TypeRef};
 use rustc_hash::FxHashMap;
 
 use crate::project::ProjectAnalysis;
@@ -343,7 +343,7 @@ pub fn render_type_ref_with_subst(
     let tr = &hir.type_refs[type_ref];
     let typeof_prefix = if tr.typeof_marker { "typeof " } else { "" };
     if let Some(ctx) = ctx
-        && tr.qualifier.is_empty()
+        && tr.is_bare()
         && tr.params.is_empty()
         && let Some(&subst_ty) = ctx.subst.get(&hir.idents[tr.name].symbol)
     {

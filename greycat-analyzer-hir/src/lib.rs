@@ -3,9 +3,8 @@
 
 pub mod arena;
 mod decl;
-mod hir;
+pub mod hir;
 pub mod lower;
-pub mod types;
 
 pub use decl::DeclRegistry;
 pub use hir::Hir;

@@ -24,7 +24,7 @@
 //! - [`TypeArena`] — interns [`Type`]s to `Copy` [`TypeId`]s and owns the
 //!   subtyping / castability relations and the canonical [`Builtins`]
 //!   identities.
-//! - [`ItemId`] / [`Symbol`] / [`SymbolTable`] — interned decl + name
+//! - [`ItemKey`] / [`Symbol`] / [`SymbolTable`] — interned decl + name
 //!   identities shared project-wide.
 //! - [`TypeRegistry`], [`InferenceTable`] — per-module type lookup and the
 //!   inference foundation.

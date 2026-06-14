@@ -2,16 +2,16 @@
 //! Both single-file and project-aware variants live here, alongside
 //! the `cursor_ident_idx` helper that references_rename also reuses.
 
-use greycat_analyzer_analysis::analyzer::{MemberDef, analyze};
+use greycat_analyzer_analysis::analyzer::MemberDef;
 use greycat_analyzer_analysis::ide;
 use greycat_analyzer_analysis::index::Namespace;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
-use greycat_analyzer_analysis::resolver::{Definition, resolve};
+use greycat_analyzer_analysis::resolver::Definition;
 use greycat_analyzer_core::{SourceEncoding, SourceManager, SymbolTable};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
+use greycat_analyzer_hir::hir::{Decl, Ident};
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Ident};
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 use lsp_types::{GotoDefinitionResponse, Location, Position, Uri};
@@ -32,16 +32,18 @@ pub fn goto_definition(
         return None;
     }
 
-    let symbols = SymbolTable::new();
-    let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir, &symbols);
+    let project = ProjectAnalysis::default();
+    let hir = lower_module(text, &project.index.symbols, "module", lib, root);
+    let resolutions = project.index.resolutions(&hir, None, None);
 
     // Find which Idx<Ident> this CST node corresponds to.
     let ident_text = text.get(node.byte_range())?;
     let target = hir
         .idents
         .iter()
-        .find(|(_, i)| i.byte_range == node.byte_range() && &symbols[i.symbol] == ident_text)?
+        .find(|(_, i)| {
+            i.byte_range == node.byte_range() && &project.index.symbols[i.symbol] == ident_text
+        })?
         .0;
 
     if let Some(def) = resolutions.lookup(target) {
@@ -53,7 +55,7 @@ pub fn goto_definition(
             Definition::Local(name) | Definition::Param(name) | Definition::Generic(name) => {
                 hir.idents[name].byte_range.clone()
             }
-            // P11.2 records the cross-module decl pointer here, but
+            // Records the cross-module decl pointer here, but
             // resolving it to a `Location` requires reading the foreign
             // module's text — that's P11.3. For now fall through so
             // the member-access lookup below still runs.
@@ -65,11 +67,11 @@ pub fn goto_definition(
         }));
     }
 
-    // P6.3: the property side of `a.b` / `a->b` isn't in `Resolutions`
+    // The property side of `a.b` / `a->b` isn't in `Resolutions`
     // — bindings live in `AnalysisResult::member_uses`. Run the
     // analyzer to consult it before giving up.
-    let (_arena, _decl_registry, analysis) = analyze(&hir, &resolutions, &symbols);
-    let member = analysis.member_lookup(target)?;
+    let m = project.module(uri)?;
+    let member = m.analysis.member_lookup(target)?;
     let target_range = match member {
         MemberDef::Attr(attr_id) => {
             let name = hir.type_attrs[attr_id].name;

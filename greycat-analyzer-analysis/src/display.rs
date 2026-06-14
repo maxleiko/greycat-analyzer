@@ -2,11 +2,11 @@
 //!
 //! Lives in the analysis crate because rendering decl-keyed types
 //! needs the project's [`SymbolTable`] to recover the source name
-//! from the `ItemId`'s `name` symbol. The bare core [`TypeArena`]
+//! from the `ItemKey`'s `name` symbol. The bare core [`TypeArena`]
 //! does not own a symbol table — see `greycat_analyzer_core::types`
 //! for the rationale.
 
-use greycat_analyzer_core::{ItemId, SymbolTable, TypeArena, TypeId, TypeKind, lsp_types::Uri};
+use greycat_analyzer_core::{ItemKey, SymbolTable, TypeArena, TypeId, TypeKind, lsp_types::Uri};
 use greycat_analyzer_hir::DeclRegistry;
 
 use crate::{index::ProjectIndex, project::ProjectAnalysis};
@@ -313,18 +313,11 @@ fn write_type_for_module(
 ) -> std::fmt::Result {
     use greycat_analyzer_core::TypeKind;
     let ty = arena.get(id);
-    let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
-        // Builtin primitives are universally in scope, so they always
-        // render bare -- a `core::int` in a diagnostic is just noise.
-        // Qualify any other decl iff bare-name lookup from `current_uri`
-        // wouldn't bind to this exact decl (the bare form would miss or
-        // bind to a different decl).
-        let is_prim = arena.builtins().is_some_and(|b| b.is_primitive(d));
-        let needs_qual = !is_prim
-            && match index.resolve_item(decl_registry, current_uri, d.name) {
-                Some(found) => found != d,
-                None => true,
-            };
+    let decl_name = |d: ItemKey, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
+        let needs_qual = match index.resolve_type(decl_registry, current_uri, d.name) {
+            Some(found) => found != d,
+            None => true,
+        };
         if needs_qual {
             f.write_str(&index.symbols[d.module])?;
             f.write_str("::")?;
@@ -415,7 +408,7 @@ fn write_type_with_decls(
 ) -> std::fmt::Result {
     use greycat_analyzer_core::TypeKind;
     let ty = arena.get(id);
-    let decl_name = |d: ItemId, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
+    let decl_name = |d: ItemKey, f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
         f.write_str(&symbols[d.name])
     };
     match &ty.kind {
@@ -483,7 +476,7 @@ fn write_type_with_decls(
 fn write_decl_qualified(
     f: &mut std::fmt::Formatter<'_>,
     index: &ProjectIndex,
-    decl: ItemId,
+    decl: ItemKey,
 ) -> std::fmt::Result {
     // Two same-named items in different modules → render with the
     // `module::` qualifier; otherwise the bare name is unambiguous.

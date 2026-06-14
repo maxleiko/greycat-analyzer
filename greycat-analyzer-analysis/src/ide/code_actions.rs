@@ -8,7 +8,7 @@ use wasm_bindgen::prelude::*;
 
 use greycat_analyzer_core::lsp_types::Uri;
 use greycat_analyzer_core::{SourceEncoding, SymbolTable};
-use greycat_analyzer_hir::types::Decl;
+use greycat_analyzer_hir::hir::Decl;
 use greycat_analyzer_syntax::tree_sitter;
 
 use crate::conv::{position_to_byte, ranges_overlap};

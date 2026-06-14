@@ -11,7 +11,7 @@ pub use greycat_analyzer_core::conv::{
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::Stmt;
+use greycat_analyzer_hir::hir::Stmt;
 
 pub fn stmt_byte_range(hir: &Hir, stmt_id: Idx<Stmt>) -> Range<usize> {
     use Stmt as HS;

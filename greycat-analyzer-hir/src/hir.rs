@@ -1,10 +1,12 @@
 use rustc_hash::FxHashSet;
 
 use crate::arena::{Arena, Idx};
-use crate::types::*;
+use std::ops::Range;
+
+use greycat_analyzer_core::{Symbol, SymbolTable};
 
 /// Per-source-file HIR. Holds typed arenas plus the top-level [`Module`]
-/// (set by [`lower::lower_module`]).
+/// (set by [`crate::lower::lower_module`]).
 #[derive(Debug, Default)]
 pub struct Hir {
     pub module: Option<Module>,
@@ -16,323 +18,822 @@ pub struct Hir {
     pub type_refs: Arena<TypeRef>,
     pub type_attrs: Arena<TypeAttr>,
     pub enum_fields: Arena<EnumField>,
-    // P43.2
-    /// Statement ids salvaged from inside a CST `ERROR` wrapper by
-    /// [`lower::flatten_errors_named_children`]. Consumers that assume
-    /// complete code skip these. Empty for well-formed sources.
+    /// Statement ids salvaged from inside a CST `ERROR` wrapper.
+    /// Consumers that assume complete code skip these. Empty for well-formed sources.
     pub salvaged_stmts: FxHashSet<Idx<Stmt>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::{types::*, *};
-    use greycat_analyzer_core::SymbolTable;
-    use greycat_analyzer_syntax::parse;
-
-    #[test]
-    fn lowers_simple_function() {
-        let src = "fn greet(name: String): String { return name; }\n";
-        let tree = parse(src);
-        let s = SymbolTable::default();
-        let hir = lower_module(src, &s, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().expect("module produced");
-        assert_eq!(module.decls.len(), 1);
-
-        let decl = &hir.decls[module.decls[0]];
-        let Decl::Fn(fnd) = decl else {
-            panic!("expected fn decl, got {decl:?}");
-        };
-        assert_eq!(&s[hir.idents[fnd.name].symbol], "greet");
-        assert_eq!(fnd.params.len(), 1);
-        let param = &hir.fn_params[fnd.params[0]];
-        assert_eq!(&s[hir.idents[param.name].symbol], "name");
-        assert!(fnd.return_type.is_some());
-        assert!(fnd.body.is_some());
+impl Hir {
+    #[inline]
+    pub fn ident_symbol<'symbols>(&self, id: Idx<Ident>, symbols: &'symbols SymbolTable) -> &'symbols str {
+        &symbols[self.idents[id].symbol]
     }
-
-    #[test]
-    fn lowers_type_decl_with_attrs_and_methods() {
-        let src = r#"
-type Point {
-    x: int;
-    y: int;
-    fn distance(): float { return 0; }
 }
-"#;
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        assert_eq!(module.decls.len(), 1);
-        let Decl::Type(td) = &hir.decls[module.decls[0]] else {
-            panic!("expected type decl");
-        };
-        assert_eq!(&symbols[hir.idents[td.name].symbol], "Point");
-        assert_eq!(td.attrs.len(), 2);
-        assert_eq!(td.methods.len(), 1);
-        assert_eq!(
-            &symbols[hir.idents[hir.type_attrs[td.attrs[0]].name].symbol],
-            "x"
-        );
-    }
 
-    #[test]
-    fn lowers_enum_decl() {
-        let src = "enum Color { Red, Green, Blue }\n";
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        let Decl::Enum(ed) = &hir.decls[module.decls[0]] else {
-            panic!("expected enum");
-        };
-        assert_eq!(ed.fields.len(), 3);
-        let names: Vec<&str> = ed
-            .fields
-            .iter()
-            .map(|f| &symbols[hir.idents[hir.enum_fields[*f].name].symbol])
-            .collect();
-        assert_eq!(names, vec!["Red", "Green", "Blue"]);
-    }
+// TODO: refactor to `Span { start: u32, end: u32 }`
+pub type Span = Range<usize>;
 
-    #[test]
-    fn lowers_module_pragmas() {
-        let src = "@library(\"std\", \"1.0\");\n@expose;\n";
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        let pragma_names: Vec<&str> = module
-            .decls
-            .iter()
-            .filter_map(|d| match &hir.decls[*d] {
-                Decl::Pragma(p) => Some(&symbols[hir.idents[p.name].symbol]),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(pragma_names, vec!["library", "expose"]);
-    }
-
-    #[test]
-    fn lowers_expressions_inside_body() {
-        let src = "fn calc(): int { return 1 + 2 * 3; }\n";
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        let Decl::Fn(fnd) = &hir.decls[module.decls[0]] else {
-            panic!()
-        };
-        let body = fnd.body.unwrap();
-        let Stmt::Block(block) = &hir.stmts[body] else {
-            panic!()
-        };
-        assert_eq!(block.stmts.len(), 1);
-        let Stmt::Return(ReturnStmt {
-            value: Some(ret), ..
-        }) = &hir.stmts[block.stmts[0]]
-        else {
-            panic!()
-        };
-        let Expr::Binary(top) = &hir.exprs[*ret] else {
-            panic!()
-        };
-        assert!(matches!(top.op, BinOp::Add));
-        let Expr::Binary(rhs) = &hir.exprs[top.right] else {
-            panic!()
-        };
-        assert!(matches!(rhs.op, BinOp::Mul));
-    }
-
-    #[test]
-    fn object_expr_named_fields_lower_their_values() {
-        // Named-object (`object_fields`) value exprs must be lowered.
-        let src = r#"
-type Foo { name: String; age: int; }
-fn build(n: String, a: int): Foo {
-    return Foo { name: n, age: a };
+/// Top-level module. All `Idx<…>` handles index into the arenas held
+/// by [`crate::Hir`].
+#[derive(Debug, Clone)]
+pub struct Module {
+    pub name: Symbol,
+    pub lib: Symbol,
+    pub decls: Box<[Idx<Decl>]>,
+    pub byte_range: Span,
 }
-"#;
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
-            panic!("expected fn decl")
-        };
-        let body = fnd.body.unwrap();
-        let Stmt::Block(block) = &hir.stmts[body] else {
-            panic!("expected block")
-        };
-        let Stmt::Return(ReturnStmt {
-            value: Some(ret), ..
-        }) = &hir.stmts[block.stmts[0]]
-        else {
-            panic!("expected return")
-        };
-        let Expr::Object(obj) = &hir.exprs[*ret] else {
-            panic!("expected object expr, got {:?}", &hir.exprs[*ret])
-        };
-        assert_eq!(obj.fields.len(), 2, "named fields must be lowered");
-        // The name slot is a full `Expr`; a classic field is the
-        // bare-ident key (`name`).
-        let Expr::Ident { name: key_use, .. } = &hir.exprs[obj.fields[0].name] else {
-            panic!("expected ident key for field name")
-        };
-        assert_eq!(&symbols[hir.idents[*key_use].symbol], "name");
-        let Expr::Ident { name: name_use, .. } = &hir.exprs[obj.fields[0].value] else {
-            panic!("expected ident use for value")
-        };
-        assert_eq!(&symbols[hir.idents[*name_use].symbol], "n");
-    }
 
-    /// `if (c.sim.)` parses as a well-formed nested `member_expr` with
-    /// a missing property. `salvage_incomplete_members_in_block` lifts
-    /// the receiver as `Stmt::Expr` salvage so the analyzer types it and
-    /// IDE capabilities work on the receiver.
-    #[test]
-    fn block_lowering_salvages_incomplete_member_receiver() {
-        let src = "type Ctx { sim: int; }\nfn test(c: Ctx) {\n    if (c.sim.)\n}\n";
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        let fn_decl = module
-            .decls
-            .iter()
-            .find_map(|d| match &hir.decls[*d] {
-                Decl::Fn(fnd) => Some(fnd),
-                _ => None,
-            })
-            .expect("fn_decl lowered");
-        let body = fn_decl.body.expect("fn body lowered");
-        let Stmt::Block(block) = &hir.stmts[body] else {
-            panic!("body is a block");
-        };
-        // Exactly one salvaged Stmt::Expr wrapping a `Member(c, sim)`
-        // receiver, tagged salvaged so lints skip it.
-        let salvaged_members: Vec<_> = block
-            .stmts
-            .iter()
-            .filter(|s| match &hir.stmts[**s] {
-                Stmt::Expr(e) => matches!(&hir.exprs[*e], Expr::Member(_)),
-                _ => false,
-            })
-            .collect();
-        assert_eq!(
-            salvaged_members.len(),
-            1,
-            "exactly one salvaged member-receiver stmt expected, got: {:?}",
-            block.stmts
-        );
-        assert!(
-            hir.salvaged_stmts.contains(salvaged_members[0]),
-            "salvaged stmt id must be tagged in Hir::salvaged_stmts"
-        );
-    }
-
-    // P43.3
-    /// Well-formed sources never populate `salvaged_stmts` — the
-    /// marker fires only when tree-sitter actually recovered something
-    /// from an `ERROR` wrapper.
-    #[test]
-    fn salvaged_stmts_empty_on_well_formed_source() {
-        let src = "fn f() { var x = 1; var y = x + 2; return y; }\n";
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        assert!(
-            hir.salvaged_stmts.is_empty(),
-            "well-formed source must not populate salvaged_stmts; got {:?}",
-            hir.salvaged_stmts
-        );
-    }
-
-    #[test]
-    fn object_expr_positional_initializers_lower_each_value() {
-        // Positional form `node<T> { val }` — each child is a bare
-        // `_expr`, lowered as a positional field.
-        let src = r#"
-type Group { name: String; }
-fn make(g: Group) {
-    var n = node<Group> { g };
+#[derive(Debug, Clone)]
+pub struct Ident {
+    pub symbol: Symbol,
+    pub byte_range: Span,
 }
-"#;
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
-            panic!("expected fn decl")
-        };
-        let body = fnd.body.unwrap();
-        let Stmt::Block(block) = &hir.stmts[body] else {
-            panic!("expected block")
-        };
-        let Stmt::Var(var) = &hir.stmts[block.stmts[0]] else {
-            panic!("expected var stmt")
-        };
-        let init_expr = var.init.expect("initializer present");
-        let Expr::PositionalObject(obj) = &hir.exprs[init_expr] else {
-            panic!("expected positional object expr")
-        };
-        assert_eq!(obj.fields.len(), 1, "single positional value");
-        // Positional fields are bare value exprs — no name slot.
-        let Expr::Ident { name: used, .. } = &hir.exprs[obj.fields[0]] else {
-            panic!("expected ident use")
-        };
-        assert_eq!(&symbols[hir.idents[*used].symbol], "g");
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Modifiers {
+    pub private: bool,
+    pub static_: bool,
+    pub abstract_: bool,
+    pub native: bool,
+    /// Annotations on this decl (`@expose("renamed")`, `@tag("mcp")`,
+    /// `@max_count(100)`, …). See [`AnnotationArg`] for the per-arg shape.
+    pub annotations: Box<[Annotation]>,
+}
+
+/// Decl annotation — `@<name>(<args>...)`. Name and string-literal
+/// args are interned through the project's
+/// [`SymbolTable`](crate::Symbol). Annotation strings are literal —
+/// no interpolation.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    /// Annotation name as an [`Ident`] — interned symbol plus the
+    /// name token's span (lets the pragma validator point a diagnostic
+    /// at the name itself).
+    pub name: Ident,
+    pub args: Box<[AnnotationArg]>,
+}
+
+impl Annotation {
+    /// String-typed args only, in source order.
+    pub fn arg_strings(&self) -> impl Iterator<Item = Symbol> + '_ {
+        self.args.iter().filter_map(|a| match a.kind {
+            AnnotationArgKind::String(s) => Some(s),
+            _ => None,
+        })
     }
 
-    /// Comments are named nodes that show up as children of expression
-    /// lists; they must NOT lower to phantom elements. `Foo { /* c */ }`
-    /// stays an empty positional body, and `[1, /* c */ 2]` stays a
-    /// two-element array — not three.
-    #[test]
-    fn comments_are_not_lowered_as_expressions() {
-        let src = r#"
-type Foo {}
-fn main() {
-    var _a = Foo { /* nClusters + 2 */ };
-    var _b = [1, /* skip me */ 2];
+    /// First string-typed arg, if any.
+    pub fn first_string_arg(&self) -> Option<Symbol> {
+        self.arg_strings().next()
+    }
 }
-"#;
-        let tree = parse(src);
-        let symbols = SymbolTable::default();
-        let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let module = hir.module.as_ref().unwrap();
-        let Decl::Fn(fnd) = &hir.decls[module.decls[1]] else {
-            panic!("expected fn decl")
-        };
-        let Stmt::Block(block) = &hir.stmts[fnd.body.unwrap()] else {
-            panic!("expected block")
-        };
-        // `Foo { /* c */ }` — empty positional body, no phantom field.
-        let Stmt::Var(a) = &hir.stmts[block.stmts[0]] else {
-            panic!("expected var _a")
-        };
-        let Expr::PositionalObject(obj) = &hir.exprs[a.init.unwrap()] else {
-            panic!("expected positional object")
-        };
-        assert!(
-            obj.fields.is_empty(),
-            "comment must not become a field: {:?}",
-            obj.fields
-        );
-        // `[1, /* c */ 2]` — two elements, comment skipped.
-        let Stmt::Var(b) = &hir.stmts[block.stmts[1]] else {
-            panic!("expected var _b")
-        };
-        let Expr::Array(items, _) = &hir.exprs[b.init.unwrap()] else {
-            panic!("expected array")
-        };
-        assert_eq!(items.len(), 2, "comment must not become an element");
-        // And no `Unsupported` leaked into the arena anywhere.
-        assert!(
-            !hir.exprs
-                .iter()
-                .any(|(_, e)| matches!(e, Expr::Unsupported { .. })),
-            "no phantom Unsupported expr should be minted from comments"
-        );
+
+// Equality ignores the name's source span — identity is name symbol
+// + args.
+impl PartialEq for Annotation {
+    fn eq(&self, other: &Self) -> bool {
+        self.name.symbol == other.name.symbol && self.args == other.args
+    }
+}
+
+impl Eq for Annotation {}
+
+/// A single annotation argument: its compile-time value
+/// ([`AnnotationArgKind`]) plus its source [`Span`]. Equality and
+/// hashing ignore `span` — identity is the value.
+#[derive(Debug, Clone)]
+pub struct AnnotationArg {
+    pub kind: AnnotationArgKind,
+    pub span: Span,
+}
+
+impl PartialEq for AnnotationArg {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
+}
+
+impl Eq for AnnotationArg {}
+
+impl std::hash::Hash for AnnotationArg {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.kind.hash(h);
+    }
+}
+
+/// Compile-time-constant value of an [`AnnotationArg`]. Pragmas
+/// accept only primitive literals, `null`, and path-shaped references
+/// to types or enum variants (`Foo`, `mod::Foo`,
+/// `DurationUnit::milliseconds`). Anything else becomes
+/// [`AnnotationArgKind::Invalid`] (hard `invalid-pragma-arg` error).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnnotationArgKind {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Char(char),
+    /// Interned through the project's `SymbolTable`.
+    String(Symbol),
+    /// Microseconds (GreyCat's canonical `duration` unit).
+    Duration(i64),
+    /// Microseconds since the Unix epoch.
+    Time(i64),
+    /// Microseconds since the Unix epoch — variant preserved so the
+    /// consumer can distinguish `@since("2024-01-01T00:00:00Z")` from
+    /// a raw numeric `time`.
+    Iso8601(i64),
+    /// The `null` literal.
+    Null,
+    /// Path expression — `Foo`, `mod::Foo`, `Foo::bar`,
+    /// `mod::Foo::bar`. `chain` segments are the parsed identifiers in
+    /// source order; the validator resolves them to a type decl or
+    /// enum variant. Unresolved → hard `invalid-pragma-arg` error.
+    Path {
+        chain: Box<[Symbol]>,
+    },
+    /// Structurally-non-constant argument (call, arithmetic, array /
+    /// object literal, instance member-access, …). Hard error.
+    Invalid,
+}
+
+impl Eq for AnnotationArgKind {}
+
+impl std::hash::Hash for AnnotationArgKind {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        // Discriminant + payload bits; Float hashes via bit pattern.
+        std::mem::discriminant(self).hash(h);
+        match self {
+            AnnotationArgKind::Int(v)
+            | AnnotationArgKind::Duration(v)
+            | AnnotationArgKind::Time(v)
+            | AnnotationArgKind::Iso8601(v) => v.hash(h),
+            AnnotationArgKind::Float(f) => f.to_bits().hash(h),
+            AnnotationArgKind::Bool(b) => b.hash(h),
+            AnnotationArgKind::Char(c) => c.hash(h),
+            AnnotationArgKind::String(s) => s.hash(h),
+            AnnotationArgKind::Null | AnnotationArgKind::Invalid => {}
+            AnnotationArgKind::Path { chain } => chain.hash(h),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Decl {
+    Fn(FnDecl),
+    Type(TypeDecl),
+    Enum(EnumDecl),
+    Var(ModVarDecl),
+    Pragma(Pragma),
+}
+
+impl Decl {
+    pub fn name(&self) -> Option<Idx<Ident>> {
+        match self {
+            Decl::Fn(d) => Some(d.name),
+            Decl::Type(d) => Some(d.name),
+            Decl::Enum(d) => Some(d.name),
+            Decl::Var(d) => Some(d.name),
+            Decl::Pragma(p) => Some(p.name),
+        }
+    }
+    pub fn byte_range(&self) -> &Span {
+        match self {
+            Decl::Fn(d) => &d.byte_range,
+            Decl::Type(d) => &d.byte_range,
+            Decl::Enum(d) => &d.byte_range,
+            Decl::Var(d) => &d.byte_range,
+            Decl::Pragma(p) => &p.byte_range,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FnDecl {
+    pub name: Idx<Ident>,
+    pub modifiers: Modifiers,
+    pub generics: Box<[Idx<Ident>]>,
+    pub params: Box<[Idx<FnParam>]>,
+    pub return_type: Option<Idx<TypeRef>>,
+    pub body: Option<Idx<Stmt>>,
+    pub doc: Option<String>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct FnParam {
+    pub name: Idx<Ident>,
+    pub ty: Option<Idx<TypeRef>>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeDecl {
+    pub name: Idx<Ident>,
+    pub modifiers: Modifiers,
+    pub generics: Box<[Idx<Ident>]>,
+    pub supertype: Option<Idx<TypeRef>>,
+    pub attrs: Box<[Idx<TypeAttr>]>,
+    /// Methods declared on the type. Each entry is a `Decl::Fn`.
+    pub methods: Box<[Idx<Decl>]>,
+    pub doc: Option<String>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeAttr {
+    pub name: Idx<Ident>,
+    pub modifiers: Modifiers,
+    pub ty: Option<Idx<TypeRef>>,
+    pub init: Option<Idx<Expr>>,
+    pub doc: Option<String>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: Idx<Ident>,
+    pub modifiers: Modifiers,
+    pub fields: Box<[Idx<EnumField>]>,
+    pub doc: Option<String>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumField {
+    pub name: Idx<Ident>,
+    pub value: Option<Idx<Expr>>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModVarDecl {
+    pub name: Idx<Ident>,
+    pub modifiers: Modifiers,
+    pub ty: Option<Idx<TypeRef>>,
+    pub init: Option<Idx<Expr>>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pragma {
+    pub name: Idx<Ident>,
+    pub args: Box<[Idx<Expr>]>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Stmt {
+    Expr(Idx<Expr>),
+    Block(BlockStmt),
+    Var(LocalVar),
+    Assign(AssignStmt),
+    If(IfStmt),
+    While(WhileStmt),
+    DoWhile(DoWhileStmt),
+    For(ForStmt),
+    ForIn(ForInStmt),
+    Return(ReturnStmt),
+    Break(BreakStmt),
+    Continue(ContinueStmt),
+    Breakpoint(BreakpointStmt),
+    Throw(ThrowStmt),
+    Try(TryStmt),
+    At(AtStmt),
+}
+
+/// `return [expr];`. `byte_range` covers the whole stmt (keyword
+/// through `;`), so lints can anchor on the keyword even for a bare
+/// `return;`.
+#[derive(Debug, Clone)]
+pub struct ReturnStmt {
+    pub value: Option<Idx<Expr>>,
+    pub byte_range: Span,
+}
+
+/// `throw expr;`. `byte_range` covers the whole stmt.
+#[derive(Debug, Clone)]
+pub struct ThrowStmt {
+    pub value: Idx<Expr>,
+    pub byte_range: Span,
+}
+
+/// `break;` — keyword-only stmt.
+#[derive(Debug, Clone)]
+pub struct BreakStmt {
+    pub byte_range: Span,
+}
+
+/// `continue;` — keyword-only stmt.
+#[derive(Debug, Clone)]
+pub struct ContinueStmt {
+    pub byte_range: Span,
+}
+
+/// `breakpoint;` — keyword-only stmt.
+#[derive(Debug, Clone)]
+pub struct BreakpointStmt {
+    pub byte_range: Span,
+}
+
+/// `{ … }` block. `byte_range` is the curly-brace span (covers an
+/// empty body, unlike "first stmt..last stmt").
+#[derive(Debug, Clone)]
+pub struct BlockStmt {
+    pub stmts: Box<[Idx<Stmt>]>,
+    pub byte_range: Span,
+}
+
+/// Local `var name: T = init;` inside a function body.
+#[derive(Debug, Clone)]
+pub struct LocalVar {
+    pub name: Idx<Ident>,
+    pub ty: Option<Idx<TypeRef>>,
+    pub init: Option<Idx<Expr>>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignStmt {
+    pub target: Idx<Expr>,
+    pub op: AssignOp,
+    pub value: Idx<Expr>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignOp {
+    Eq,
+    AddEq,
+    SubEq,
+    MulEq,
+    DivEq,
+    ModEq,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfStmt {
+    pub condition: Idx<Expr>,
+    /// `if (cond) { … }` body. Always a block per grammar, held inline.
+    pub then_branch: BlockStmt,
+    /// `else` branch — an `else { … }` block or a nested `if` for
+    /// else-if chains, hence `Idx<Stmt>` rather than `BlockStmt`.
+    pub else_branch: Option<Idx<Stmt>>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct WhileStmt {
+    pub condition: Idx<Expr>,
+    pub body: BlockStmt,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct DoWhileStmt {
+    pub body: BlockStmt,
+    pub condition: Idx<Expr>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForStmt {
+    pub init_name: Option<Idx<Ident>>,
+    pub init_ty: Option<Idx<TypeRef>>,
+    pub init_value: Option<Idx<Expr>>,
+    pub condition: Option<Idx<Expr>>,
+    pub increment: Option<Idx<Expr>>,
+    pub body: BlockStmt,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForInStmt {
+    /// Binders introduced by this for-in. `params.len() >= 2` (grammar
+    /// `sepBy2`) — typically `(index, value)` or `(key, value)`.
+    pub params: Box<[ForInParam]>,
+    /// The iterable expression. Its type drives the binders' element
+    /// types.
+    pub iterator: Idx<Expr>,
+    /// Optional `[from..to]` slice window (an [`Expr::Range`]); `None`
+    /// for a full iteration.
+    pub window: Option<Idx<Expr>>,
+    /// The for-in `?` token (`for (.. in iter?)`): `Some` spans the `?`
+    /// token, `None` means no token. Without it a nullable iterator
+    /// fires `possibly-null`.
+    pub nullable_iter: Option<Span>,
+    pub body: BlockStmt,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForInParam {
+    pub name: Idx<Ident>,
+    pub ty: Option<Idx<TypeRef>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TryStmt {
+    pub try_block: BlockStmt,
+    pub error_param: Option<Idx<Ident>>,
+    pub catch_block: BlockStmt,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct AtStmt {
+    pub expr: Idx<Expr>,
+    pub block: BlockStmt,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Expr {
+    /// A bare-ident expression. `byte_range` mirrors the underlying
+    /// `Ident` arena entry's span.
+    Ident {
+        name: Idx<Ident>,
+        byte_range: Span,
+    },
+    /// Literal value — numeric, char, bool, duration, time, iso8601.
+    /// Each carries its parsed value (see [`LiteralKind`]).
+    Literal(LiteralExpr),
+    /// `null` keyword literal.
+    Null {
+        byte_range: Span,
+    },
+    /// `this` keyword reference. Types as the enclosing `TypeDecl`'s
+    /// self type.
+    This {
+        byte_range: Span,
+    },
+    String(StringExpr),
+    Tuple(Box<[Idx<Expr>]>, Span),
+    Array(Box<[Idx<Expr>]>, Span),
+    Object(ObjectExpr),
+    PositionalObject(PositionalObjectExpr),
+    Member(MemberExpr),
+    Arrow(MemberExpr), // `n->name` — same shape, different access semantics
+    Static(StaticExpr),
+    /// Chained `module::Type::method` (or longer). [`StaticExpr`] only
+    /// models `Type::name`; chains lower to this flat segment list
+    /// instead. `chain.len() >= 2`.
+    QualifiedStatic {
+        chain: Box<[Idx<Ident>]>,
+        byte_range: Span,
+    },
+    Offset(OffsetExpr),
+    Call(CallExpr),
+    Binary(BinaryExpr),
+    Unary(UnaryExpr),
+    Paren(Idx<Expr>, Span),
+    Lambda(LambdaExpr),
+    /// `from..to` (or `from..` / `..to`) range and the math-style
+    /// `]from..to]` / `[from..to[` interval — both flatten here since
+    /// bracket inclusivity doesn't affect typing. Used as an
+    /// `Expr::Offset` index (slice) or a for-in iterator-range clause.
+    Range {
+        from: Option<Idx<Expr>>,
+        to: Option<Idx<Expr>>,
+        byte_range: Span,
+    },
+    /// `value is Type` — runtime type guard, evaluates to `bool`.
+    /// Narrows `value` in the matching branch of an `if` condition.
+    Is {
+        value: Idx<Expr>,
+        ty: Idx<TypeRef>,
+        byte_range: Span,
+    },
+    /// `value as Type` — type ascription / cast, evaluates to `Type`.
+    Cast {
+        value: Idx<Expr>,
+        ty: Idx<TypeRef>,
+        byte_range: Span,
+    },
+    /// Not-yet-lowered shape. Keeps the byte range so downstream passes
+    /// can skip it.
+    Unsupported {
+        kind: &'static str,
+        byte_range: Span,
+    },
+}
+
+impl Expr {
+    pub fn byte_range(&self) -> Span {
+        match self {
+            Expr::Ident { byte_range, .. } => byte_range.clone(),
+            Expr::Literal(l) => l.byte_range.clone(),
+            Expr::Null { byte_range } => byte_range.clone(),
+            Expr::This { byte_range } => byte_range.clone(),
+            Expr::String(s) => s.byte_range.clone(),
+            Expr::Tuple(_, r) | Expr::Array(_, r) | Expr::Paren(_, r) => r.clone(),
+            Expr::Object(o) => o.byte_range.clone(),
+            Expr::PositionalObject(o) => o.byte_range.clone(),
+            Expr::Member(m) | Expr::Arrow(m) => m.byte_range.clone(),
+            Expr::Static(s) => s.byte_range.clone(),
+            Expr::QualifiedStatic { byte_range, .. } => byte_range.clone(),
+            Expr::Offset(o) => o.byte_range.clone(),
+            Expr::Call(c) => c.byte_range.clone(),
+            Expr::Binary(b) => b.byte_range.clone(),
+            Expr::Unary(u) => u.byte_range.clone(),
+            Expr::Lambda(l) => l.byte_range.clone(),
+            Expr::Is { byte_range, .. } | Expr::Cast { byte_range, .. } => byte_range.clone(),
+            Expr::Range { byte_range, .. } => byte_range.clone(),
+            Expr::Unsupported { byte_range, .. } => byte_range.clone(),
+        }
+    }
+
+    // pub fn is_pathy(&self) -> bool {
+    //     matches!(self, Expr::Member(_) | Expr::Array(_, _) | Expr::Static(_) | Expr::Ident { .. } | Expr::Typ)
+    // }
+}
+
+#[derive(Debug, Clone)]
+pub struct LiteralExpr {
+    pub kind: LiteralKind,
+    /// Source-side parse anomaly (overflow, precision loss, …). `kind`
+    /// still carries a best-effort value; the analyzer reads this field
+    /// to emit warnings / errors.
+    pub parse_issue: Option<ParseIssue>,
+    pub byte_range: Span,
+}
+
+/// Typed literal value, parsed once at lowering. `null` / `this` are
+/// keyword tokens, not literals — see [`Expr::Null`] / [`Expr::This`].
+/// On a parse failure the variant still commits to a best-effort value
+/// and the failure is reported via [`LiteralExpr::parse_issue`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LiteralKind {
+    Int(i64),
+    Float(f64),
+    Char(char),
+    Bool(bool),
+    /// Duration in microseconds (GreyCat's canonical `duration` unit).
+    /// Sub-µs suffixes (`ns`, `nanosecond`) truncate toward zero.
+    Duration(i64),
+    /// Time in microseconds since the Unix epoch.
+    Time(i64),
+    /// ISO-8601 time literal, parsed to µs-since-epoch. Kept distinct
+    /// from [`Self::Time`] so the analyzer can run ISO-specific
+    /// diagnostics.
+    Iso8601(i64),
+}
+
+/// Parse anomaly recorded at lowering time. The analyzer emits the
+/// user-facing diagnostic from this tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseIssue {
+    /// Numeric exceeded its kind's representable range (`Int` → i64,
+    /// `Duration` / `Time` / `Iso8601` → i64 µs after scaling). The
+    /// value is saturated.
+    Overflow,
+    /// Float has more significant decimal digits than f64 can hold.
+    /// The value is the nearest f64.
+    PrecisionLoss,
+    /// Unrecognised char escape, malformed ISO-8601 shape, etc. The
+    /// value is a placeholder (`'\0'`, `0` µs, …).
+    Malformed,
+    /// Unknown suffix. The value is fine, but the suffix in unknown (eg. `2year`, `3foo`)
+    Suffix,
+}
+
+#[derive(Debug, Clone)]
+pub struct StringExpr {
+    // P17.5
+    /// Text fragments and `${expr}` interpolations in source order. A
+    /// non-template string is a single [`StringPart::Lit`]; templates
+    /// alternate `Lit` / `Interp`. Each part keeps its own byte range.
+    pub parts: Box<[StringPart]>,
+    pub byte_range: Span,
+}
+
+impl StringExpr {
+    /// Concatenated raw fragments — interpolation parts skipped.
+    pub fn raw_value(&self) -> String {
+        let mut out = String::new();
+        for p in &self.parts {
+            if let StringPart::Lit { text, .. } = p {
+                out.push_str(text);
+            }
+        }
+        out
+    }
+
+    /// `true` iff at least one part is a `${expr}` interpolation.
+    pub fn has_interpolation(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, StringPart::Interp { .. }))
+    }
+}
+
+// P17.5
+/// One piece of a [`StringExpr`].
+#[derive(Debug, Clone)]
+pub enum StringPart {
+    /// Raw text between (or around) interpolations. `byte_range`
+    /// covers just the fragment — not the `"` quotes or `${...}`
+    /// markers.
+    Lit { text: String, byte_range: Span },
+    /// A `${expr}` interpolation. `byte_range` covers the whole
+    /// `${expr}`.
+    Interp { expr: Idx<Expr>, byte_range: Span },
+}
+
+/// Named object construction — `Foo { field: value }` (grammar's
+/// `object_fields`). `Map { k: v }` keys are arbitrary value
+/// expressions; the head type makes that distinction downstream. See
+/// [`PositionalObjectExpr`] for `Foo { a, b }`.
+#[derive(Debug, Clone)]
+pub struct ObjectExpr {
+    pub ty: Idx<TypeRef>,
+    pub fields: Box<[ObjectField]>,
+    pub byte_range: Span,
+}
+
+/// Positional object construction — `Foo { a, b }` (grammar's
+/// `object_initializers`). Only `Array` (any arity), `node` (≤ 1),
+/// and the v7 fixed-shape tuples accept this form; the
+/// object-construction validator rejects every other head.
+#[derive(Debug, Clone)]
+pub struct PositionalObjectExpr {
+    pub ty: Idx<TypeRef>,
+    pub fields: Box<[Idx<Expr>]>,
+    pub byte_range: Span,
+}
+
+/// One `name: value` entry of an [`ObjectExpr`]. `name` is a full
+/// expr (grammar's `object_field` is `name:_expr ":" value:_expr`):
+/// an `Expr::Ident` / `Expr::String` attr name for a classic object,
+/// an arbitrary key expr for a `Map`. Consumers decode the attr
+/// symbol from the key at resolution time.
+#[derive(Debug, Clone)]
+pub struct ObjectField {
+    pub name: Idx<Expr>,
+    pub value: Idx<Expr>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberExpr {
+    pub receiver: Idx<Expr>,
+    pub property: PropertyName,
+    /// `a?.b` / `a?->b` — optional-chaining. When `a: T?` the chain is
+    /// null if `a` is null; when `a: T` it's a no-op.
+    pub opt_chaining: Option<Span>,
+    /// `a.b?` / `a->b?` — lifts the result to nullable regardless of
+    /// the declared field type.
+    pub post_optional: Option<Span>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticExpr {
+    pub ty: Idx<TypeRef>,
+    pub property: PropertyName,
+    pub byte_range: Span,
+}
+
+/// Property name in a `member_expr` / `arrow_expr` / `static_expr`.
+/// Both variants resolve to the same field/method — use
+/// [`PropertyName::ident`] unless the syntactic form matters
+/// (diagnostics, formatter round-trips).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyName {
+    /// `a.b`, `a->b`, `T::b` — bareword identifier property.
+    Ident(Idx<Ident>),
+    /// `a."b.c"`, `a->"b.c"`, `T::"b.c"` — string-literal property.
+    /// `Ident.symbol` is the *decoded* name (no quotes);
+    /// `Ident.byte_range` covers the whole `"..."` literal.
+    String(Idx<Ident>),
+}
+
+impl PropertyName {
+    /// The interned ident carrying the property name's text + span.
+    #[inline]
+    pub fn ident(self) -> Idx<Ident> {
+        match self {
+            PropertyName::Ident(i) | PropertyName::String(i) => i,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetExpr {
+    pub receiver: Idx<Expr>,
+    pub index: Idx<Expr>,
+    /// `a?[i]` — null-safe index. When `a: T?` the result lifts to
+    /// nullable; when `a: T` it's a no-op.
+    pub pre_optional: Option<Span>,
+    /// `a[i]?` — lifts the result to nullable regardless.
+    pub post_optional: Option<Span>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallExpr {
+    pub callee: Idx<Expr>,
+    pub args: Box<[Idx<Expr>]>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct BinaryExpr {
+    pub op: BinOp,
+    pub left: Idx<Expr>,
+    pub right: Idx<Expr>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Neq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Coalesce, // ??
+    /// Recognized but uncategorized operator. Carries the verbatim text.
+    Other(&'static str),
+}
+
+#[derive(Debug, Clone)]
+pub struct UnaryExpr {
+    pub op: UnaryOp,
+    pub operand: Idx<Expr>,
+    pub byte_range: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    /// `+x` — identity, returns the operand type unchanged.
+    Pos,
+    Not,
+    BitNot,
+    /// `++x` / `x++` — increment. Returns the operand type (int / float).
+    Inc,
+    /// `--x` / `x--` — decrement. Returns the operand type (int / float).
+    Dec,
+    // P6.4
+    /// `!!x` — non-null assertion (narrowing).
+    NonNullAssert,
+    /// `*n` — node deref. Returns the inner `T` of a `node<T>` /
+    /// `nodeTime<T>` / similar receiver, non-null (the dot form
+    /// `n.resolve()` returns `T?`).
+    Deref,
+}
+
+#[derive(Debug, Clone)]
+pub struct LambdaExpr {
+    pub params: Box<[Idx<FnParam>]>,
+    pub return_type: Option<Idx<TypeRef>>,
+    pub body: BlockStmt,
+    pub byte_range: Span,
+}
+
+/// A syntactic type reference, modelling the grammar's `type_ident`:
+/// `(ident "::")* ident <generics>? "?"?`.
+#[derive(Debug, Clone)]
+pub struct TypeRef {
+    /// Module-qualifier segments before the leaf name.
+    /// `Foo` → `[]`; `b::Foo` → `[b]`; `a::b::Foo` → `[a, b]`.
+    pub qualifier: Box<[Idx<Ident>]>,
+    /// Leaf decl name (the final `field("name", $.ident)` segment).
+    pub name: Idx<Ident>,
+    /// Generic args (`Map<K, V>` → `[K, V]`). Empty for non-generic.
+    pub params: Box<[Idx<TypeRef>]>,
+    pub optional: bool,
+    /// `true` for a leading `typeof` keyword — the reference is a
+    /// *type literal* (the value IS a type). The grammar admits the
+    /// keyword in two positions (inside `type_ident` and on the
+    /// `fn_param` side); lowering collapses both onto this flag.
+    pub typeof_marker: bool,
+    pub byte_range: Span,
+}
+
+impl TypeRef {
+    /// `true` iff this ref carries a module path prefix (the inverse of `is_bare()`).
+    #[inline]
+    pub fn is_qualified(&self) -> bool {
+        !self.qualifier.is_empty()
+    }
+
+    /// `true` iff this ref has no path prefix (the inverse of `is_qualified()`).
+    #[inline]
+    pub fn is_bare(&self) -> bool {
+        self.qualifier.is_empty()
     }
 }

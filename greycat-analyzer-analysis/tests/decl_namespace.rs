@@ -20,7 +20,7 @@ use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::Definition;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_hir::types::{Decl, Expr};
+use greycat_analyzer_hir::hir::{Decl, Expr};
 use std::str::FromStr;
 
 fn add(mgr: &mut SourceManager, path: &str, src: &str) -> Uri {
@@ -183,9 +183,9 @@ fn cross_module_type_and_fn_no_ambiguous_and_resolve_correctly() {
         .hir
         .type_refs
         .iter()
-        .find_map(|(_, ty)| {
-            if ty.qualifier.is_empty() && pa.symbol(&m.hir.idents[ty.name].symbol) == "geo" {
-                m.resolutions.lookup(ty.name)
+        .find_map(|(_, tr)| {
+            if tr.is_bare() && pa.symbol(&m.hir.idents[tr.name].symbol) == "geo" {
+                m.resolutions.lookup(tr.name)
             } else {
                 None
             }

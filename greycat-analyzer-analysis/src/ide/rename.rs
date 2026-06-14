@@ -19,7 +19,7 @@ use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::lsp_types::{Position, Uri};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{Decl, Ident, TypeAttr};
+use greycat_analyzer_hir::hir::{Decl, Ident, TypeAttr};
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 

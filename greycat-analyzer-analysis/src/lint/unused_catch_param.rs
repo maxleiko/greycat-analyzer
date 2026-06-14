@@ -2,7 +2,7 @@ use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::{
     Hir,
     arena::Idx,
-    types::{Decl, Stmt},
+    hir::{Decl, Stmt},
 };
 
 use crate::resolver::{Definition, Resolutions};
@@ -79,7 +79,7 @@ fn visit_for_catch_params(
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
-    use greycat_analyzer_hir::types::BlockStmt;
+    use greycat_analyzer_hir::hir::BlockStmt;
     fn visit_block(
         hir: &Hir,
         res: &Resolutions,

@@ -8,7 +8,7 @@ use wasm_bindgen::prelude::*;
 
 use greycat_analyzer_core::{SourceEncoding, SymbolTable};
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::Decl;
+use greycat_analyzer_hir::hir::Decl;
 use greycat_analyzer_syntax::tree_sitter;
 
 use crate::ide::types::Range;

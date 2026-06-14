@@ -1,113 +1,36 @@
 //! [`TypeArena`] — the append-only interning pool for [`Type`]s — and
-//! [`Builtins`], the canonical [`ItemId`]s for the native-core well-known
+//! [`Builtins`], the canonical [`ItemKey`]s for the native-core well-known
 //! types the subtyping rules reason about.
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use crate::{ItemId, Symbol, SymbolTable, Type, TypeId, TypeKind};
+use crate::{ItemKey, Symbol, SymbolTable, Type, TypeId, TypeKind};
 
-/// A selector picking one canonical [`ItemId`] out of [`Builtins`] --
-/// the storable fn-pointer form used by builtin lookup tables (e.g.
-/// `BUILTIN_RUNTIME_GLOBALS`). [`TypeArena::builtin`] / [`TypeArena::is_builtin`]
-/// take the more general `impl FnOnce` so closures are accepted too.
-pub type BuiltinSelector = fn(&Builtins) -> ItemId;
-
-/// Canonical `ItemId` per well-known native-core type (declared in
-/// `lib/std/core.gcl`). A primitive `int` is `Type(ItemId(core, int))`;
-/// a node tag `node<T>` is `Generic { tpl: ItemId(core, node), .. }`.
+/// Canonical `ItemKey` per well-known native-core type (declared in
+/// `lib/std/core.gcl`). A primitive `int` is `Type(ItemKey(core, int))`;
+/// a node tag `node<T>` is `Generic { tpl: ItemKey(core, node), .. }`.
 ///
-/// Std-free: an `ItemId` is two interned symbols, so these identities are
+/// Std-free: an `ItemKey` is two interned symbols, so these identities are
 /// valid whether or not the stdlib is loaded.
 #[derive(Debug, Clone, Copy)]
 pub struct Builtins {
-    pub bool_: ItemId,
-    pub int: ItemId,
-    pub float: ItemId,
-    pub char_: ItemId,
-    pub string: ItemId,
-    pub time: ItemId,
-    pub duration: ItemId,
-    pub geo: ItemId,
-    pub any: ItemId,
-    pub null: ItemId,
-    pub node: ItemId,
-    pub node_time: ItemId,
-    pub node_index: ItemId,
-    pub node_list: ItemId,
-    pub node_geo: ItemId,
-}
-
-impl Builtins {
-    pub const BOOL: BuiltinSelector = |b| b.bool_;
-    pub const INT: BuiltinSelector = |b| b.int;
-    pub const FLOAT: BuiltinSelector = |b| b.float;
-    pub const CHAR: BuiltinSelector = |b| b.char_;
-    pub const STRING: BuiltinSelector = |b| b.string;
-    pub const TIME: BuiltinSelector = |b| b.time;
-    pub const DURATION: BuiltinSelector = |b| b.duration;
-    pub const GEO: BuiltinSelector = |b| b.geo;
-
-    /// The canonical `core::X` handle for an always-available core type
-    /// name -- the 8 primitives plus `any` / `null`. `None` for anything
-    /// else (incl. node tags, which resolve only when std is loaded). Lets
-    /// the resolver bind these names without a loaded `core.gcl`, so a
-    /// no-std project still types `int` as `Type(core::int)`.
-    pub fn by_name(&self, name: Symbol) -> Option<ItemId> {
-        [
-            self.bool_,
-            self.int,
-            self.float,
-            self.char_,
-            self.string,
-            self.time,
-            self.duration,
-            self.geo,
-            self.any,
-            self.null,
-        ]
-        .into_iter()
-        .find(|item| item.name == name)
-    }
-
-    /// Intern the `core` module symbol and each native-type name against
-    /// `symbols`, composing the `(core, name)` handles. Idempotent.
-    pub fn compute(symbols: &SymbolTable) -> Self {
-        let core = symbols.intern("core");
-        let mk = |name: &str| ItemId::new(core, symbols.intern(name));
-        Self {
-            bool_: mk("bool"),
-            int: mk("int"),
-            float: mk("float"),
-            char_: mk("char"),
-            string: mk("String"),
-            time: mk("time"),
-            duration: mk("duration"),
-            geo: mk("geo"),
-            any: mk("any"),
-            null: mk("null"),
-            node: mk("node"),
-            node_time: mk("nodeTime"),
-            node_index: mk("nodeIndex"),
-            node_list: mk("nodeList"),
-            node_geo: mk("nodeGeo"),
-        }
-    }
-
-    /// `true` iff `item` is one of the 8 primitive native-core types
-    /// (`bool int float char String time duration geo`). Node tags and
-    /// every other core decl return `false`. Drives the "render bare"
-    /// display rule and primitive-disjointness reasoning.
-    pub fn is_primitive(&self, item: ItemId) -> bool {
-        item == self.bool_
-            || item == self.int
-            || item == self.float
-            || item == self.char_
-            || item == self.string
-            || item == self.time
-            || item == self.duration
-            || item == self.geo
-    }
+    pub bool_: TypeId,
+    pub int: TypeId,
+    pub float: TypeId,
+    pub char_: TypeId,
+    pub string: TypeId,
+    pub time: TypeId,
+    pub duration: TypeId,
+    pub geo: TypeId,
+    pub any: TypeId,
+    pub null: TypeId,
+    pub never: TypeId,
+    pub node: TypeId,
+    pub node_time: TypeId,
+    pub node_index: TypeId,
+    pub node_list: TypeId,
+    pub node_geo: TypeId,
 }
 
 /// Append-only interning arena for `Type`. Two equal `Type` values get
@@ -115,38 +38,94 @@ impl Builtins {
 /// comparison.
 ///
 /// The arena does **not** itself store decl names — `TypeKind::Type` /
-/// `TypeKind::Generic` carry an [`ItemId`] `(module_sym, name_sym)`
+/// `TypeKind::Generic` carry an [`ItemKey`] `(module_sym, name_sym)`
 /// pair. Rendering them to a printable string needs the project's
 /// [`SymbolTable`] to resolve the symbols back to text; see
 /// `greycat_analyzer_analysis::project::display_type` and
 /// `greycat_analyzer_analysis::display_fqn`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct TypeArena {
     pub items: Vec<Type>,
     pub intern: FxHashMap<Type, TypeId>,
-    /// Canonical well-known type identities (see [`Builtins`]), set once
-    /// via [`Self::set_builtins`] when the project symbol table is known.
-    /// `None` on a bare arena (the primitive cast rules then no-op).
-    builtins: Option<Builtins>,
+    pub builtins: Builtins,
 }
 
 impl TypeArena {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(symbols: &SymbolTable) -> Self {
+        let mut items = Vec::with_capacity(128);
+        let mut intern = FxHashMap::with_capacity_and_hasher(128, Default::default());
+
+        let any_id = {
+            let id = TypeId(0);
+            let ty = Type {
+                kind: TypeKind::Any,
+                nullable: false,
+            };
+            items.push(ty.clone());
+            intern.insert(ty, id);
+            id
+        };
+
+        let null_id = {
+            let id = TypeId(1);
+            let ty = Type {
+                kind: TypeKind::Null,
+                nullable: true,
+            };
+            items.push(ty.clone());
+            intern.insert(ty, id);
+            id
+        };
+
+        let never_id = {
+            let id = TypeId(3);
+            let ty = Type {
+                kind: TypeKind::Never,
+                nullable: false,
+            };
+            items.push(ty.clone());
+            intern.insert(ty, id);
+            id
+        };
+
+        let core = symbols.intern("core");
+        let item = |name: &str| ItemKey::new(core, symbols.intern(name));
+        let mut alloc_type = |name: &str| {
+            let id = TypeId(items.len() as u32);
+            let ty = Type {
+                kind: TypeKind::Type(item(name)),
+                nullable: false,
+            };
+            items.push(ty.clone());
+            intern.insert(ty, id);
+            id
+        };
+        let builtins = Builtins {
+            any: any_id,
+            null: null_id,
+            never: never_id,
+            bool_: alloc_type("bool"),
+            int: alloc_type("int"),
+            float: alloc_type("float"),
+            char_: alloc_type("char"),
+            string: alloc_type("String"),
+            time: alloc_type("time"),
+            duration: alloc_type("duration"),
+            geo: alloc_type("geo"),
+            node: alloc_type("node"),
+            node_time: alloc_type("nodeTime"),
+            node_index: alloc_type("nodeIndex"),
+            node_list: alloc_type("nodeList"),
+            node_geo: alloc_type("nodeGeo"),
+        };
+        Self {
+            items,
+            intern,
+            builtins,
+        }
     }
 
-    /// Record the project's canonical well-known type identities. Called
-    /// once the symbol table is known (`ProjectIndex::with_symbols`).
-    pub fn set_builtins(&mut self, builtins: Builtins) {
-        self.builtins = Some(builtins);
-    }
-
-    /// The canonical well-known type identities, or `None` on a bare
-    /// arena that never had them set.
-    pub fn builtins(&self) -> Option<&Builtins> {
-        self.builtins.as_ref()
-    }
-
+    /// Allocates a [`Type`] or yield the [`TypeId`] if already interned.
     pub fn alloc(&mut self, ty: Type) -> TypeId {
         if let Some(&id) = self.intern.get(&ty) {
             return id;
@@ -195,34 +174,7 @@ impl TypeArena {
         self.alloc(new_ty)
     }
 
-    /// Mint the canonical [`TypeId`] for a builtin native-core type,
-    /// selected from [`Builtins`] (e.g. `arena.builtin(Builtins::INT)`).
-    /// Requires [`Self::set_builtins`] to have run -- true on every
-    /// analysis arena, since `ProjectIndex::{new,with_symbols}` sets it
-    /// at construction.
-    pub fn builtin(&mut self, select: impl FnOnce(&Builtins) -> ItemId) -> TypeId {
-        let item = select(self.builtins().expect("builtin() requires set_builtins"));
-        self.alloc_type(item)
-    }
-
-    /// `true` if `ty` is the specific builtin selected from [`Builtins`]
-    /// (e.g. `arena.is_builtin(ty, Builtins::INT)`). `false` on a bare arena
-    /// or when `ty` isn't that `Type(core::X)` decl.
-    pub fn is_builtin(&self, ty: TypeId, select: impl FnOnce(&Builtins) -> ItemId) -> bool {
-        match &self.get(ty).kind {
-            TypeKind::Type(d) => self.builtins().is_some_and(|b| *d == select(b)),
-            _ => false,
-        }
-    }
-
-    /// `true` if `ty` is any of the 8 primitive native-core types.
-    pub fn is_any_primitive(&self, ty: TypeId) -> bool {
-        match &self.get(ty).kind {
-            TypeKind::Type(d) => self.builtins().is_some_and(|b| b.is_primitive(*d)),
-            _ => false,
-        }
-    }
-
+    /// Allocates a [`TypeKind::Null`] or yield the [`TypeId`] if already interned.
     pub fn null(&mut self) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Null,
@@ -245,7 +197,7 @@ impl TypeArena {
         })
     }
 
-    /// Allocates a [`TypeKind::Any`]
+    /// Allocates a [`TypeKind::Any`] or yield the [`TypeId`] if already interned.
     pub fn any_nullable(&mut self) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Any,
@@ -253,7 +205,7 @@ impl TypeArena {
         })
     }
 
-    /// Allocates a [`TypeKind::Never`]
+    /// Allocates a [`TypeKind::Never`] or yield the [`TypeId`] if already interned.
     pub fn never(&mut self) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Never,
@@ -261,19 +213,19 @@ impl TypeArena {
         })
     }
 
-    /// Allocates a [`TypeKind::Type`]
-    pub fn alloc_type(&mut self, id: ItemId) -> TypeId {
+    /// Allocates a [`TypeKind::Type`] or yield the [`TypeId`] if already interned.
+    pub fn alloc_type(&mut self, id: ItemKey) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Type(id),
             nullable: false,
         })
     }
 
-    /// Allocates a [`TypeKind::Generic`].
+    /// Allocates a [`TypeKind::Generic`] or yield the [`TypeId`] if already interned.
     /// Caller guarantees `args` is non-empty:
     /// zero-arg uses of a generic decl are an upstream lowering
     /// error, not a value-shaped concept.
-    pub fn alloc_generic(&mut self, tpl: ItemId, args: Vec<TypeId>) -> TypeId {
+    pub fn alloc_generic(&mut self, tpl: ItemKey, args: Vec<TypeId>) -> TypeId {
         debug_assert!(!args.is_empty(), "Generic must have non-empty args");
         self.alloc(Type {
             kind: TypeKind::Generic {
@@ -333,7 +285,7 @@ impl TypeArena {
     /// else, so the type is always a pair. `decl` is the std-core
     /// `Tuple` decl handle the caller has pulled from
     /// `WellKnown::tuple_decl`.
-    pub fn tuple(&mut self, tpl: ItemId, x: TypeId, y: TypeId) -> TypeId {
+    pub fn tuple(&mut self, tpl: ItemKey, x: TypeId, y: TypeId) -> TypeId {
         self.alloc(Type {
             kind: TypeKind::Generic {
                 tpl,
@@ -341,6 +293,20 @@ impl TypeArena {
             },
             nullable: false,
         })
+    }
+
+    pub fn is_builtin(&self, ty: TypeId) -> bool {
+        ty == self.builtins.bool_
+            || ty == self.builtins.char_
+            || ty == self.builtins.duration
+            || ty == self.builtins.float
+            || ty == self.builtins.geo
+            || ty == self.builtins.int
+            || ty == self.builtins.node
+            || ty == self.builtins.node_geo
+            || ty == self.builtins.node_index
+            || ty == self.builtins.node_list
+            || ty == self.builtins.node_time
     }
 
     /// Substitute `TypeParam` occurrences inside `ty`
@@ -469,7 +435,7 @@ impl TypeArena {
         if matches!(b.kind, TypeKind::Any) {
             return true;
         }
-        // **P20.1** — `any` is *also* the bottom type. The GreyCat
+        // `any` is *also* the bottom type. The GreyCat
         // compiler accepts `any → T` for any `T` (it compiles cleanly
         // and defers the type check to runtime assignment / call time);
         // the static analyzer must match. Source nullability is ignored:
@@ -477,7 +443,7 @@ impl TypeArena {
         if matches!(a.kind, TypeKind::Any) {
             return true;
         }
-        // P35.3 — `Unresolved` behaves like `any` on either side so a
+        // `Unresolved` behaves like `any` on either side so a
         // single unresolved name doesn't fan out into a cascade of
         // false-positive type-relation diagnostics.
         if matches!(a.kind, TypeKind::Unresolved { .. })
@@ -490,12 +456,6 @@ impl TypeArena {
         if a.nullable && !b.nullable {
             return false;
         }
-
-        // P7.3 (REMOVED): there is no `node<T> → T` auto-deref subtype
-        // rule. The runtime rejects `var x: T = some_node<T>();` — the
-        // arrow operator (`*n` / `n->m()`) is the *syntactic* desugar for
-        // `n.resolve().m()`, dispatched by the `@deref("resolve")`
-        // annotation on the receiver's type decl.
 
         // Exhaustive nested match. Source-kind outer, target-kind inner.
         // The `Any | Unresolved` target arm and the `Null | Any | Never |
@@ -515,7 +475,7 @@ impl TypeArena {
             // each alt, which uses `any()`.
             TypeKind::Union { alts } => alts.iter().all(|alt| self.is_assignable_to(*alt, to)),
 
-            // Decl identity via `ItemId`. Cross-module references
+            // Decl identity via `ItemKey`. Cross-module references
             // to the same decl share the same `(module, name)` pair.
             // The 8 primitives are `Type(core::X)` decls, so primitive
             // identity (`int == int`, `int != float`) flows through here.
@@ -691,23 +651,6 @@ impl TypeArena {
     }
 
     /// `true` iff `from` can be casted to `to` via the GreyCat `as` operator.
-    ///
-    /// Mirrors the TS reference's `isCastable` (`packages/lang/src/analysis/
-    /// utils.ts:360`). Cast rules are asymmetric to assignability — `int as
-    /// nodeTime` is allowed even though `int` doesn't assign-flow into
-    /// `nodeTime`. Implements (deeper node-tag rules):
-    /// - `any → any` always.
-    /// - Nullables: `T?` casts the same as `T`.
-    /// - `int ↔ {int, float, node{,Time,List,Index,Geo}}`.
-    /// - `float ↔ {int, float}`.
-    /// - `node{,Time,List,Index,Geo} ↔ {self, int}`.
-    /// - `String ↔ String`.
-    /// - `char ↔ {char, String, int}`.
-    /// - `bool ↔ bool`.
-    /// - Enums → `int`.
-    /// - Anything else falls through to "same head name OR `from` assignable
-    ///   to `to` (no inheritance check yet — that lands when supertype
-    ///   chains thread through the analyzer)".
     pub fn is_castable(&self, from: TypeId, to: TypeId) -> bool {
         // trivial cast to itself is valid
         if from == to {
@@ -737,11 +680,14 @@ impl TypeArena {
         // Primitive widening casts: `int<->float`, `char as {String,int}`.
         // Every primitive is a `Type(core::X)` decl, so these are the only
         // same-arena cast relaxations beyond identity / inheritance.
-        if (self.is_builtin(from, Builtins::INT) && self.is_builtin(to, Builtins::FLOAT))
-            || (self.is_builtin(from, Builtins::FLOAT) && self.is_builtin(to, Builtins::INT))
-            || (self.is_builtin(from, Builtins::CHAR)
-                && (self.is_builtin(to, Builtins::STRING) || self.is_builtin(to, Builtins::INT)))
-        {
+        let int_to_int =
+            |from: TypeId, to: TypeId| from == self.builtins.int && to == self.builtins.int;
+        let float_to_float =
+            |from: TypeId, to: TypeId| from == self.builtins.float && to == self.builtins.float;
+        let char_to_string_or_int = |from: TypeId, to: TypeId| {
+            from == self.builtins.char_ && (to == self.builtins.string || to == self.builtins.int)
+        };
+        if int_to_int(from, to) || float_to_float(from, to) || char_to_string_or_int(from, to) {
             return true;
         }
 
@@ -782,7 +728,7 @@ impl TypeArena {
             // Enum source: castable to `int` (runtime representation) or
             // anything assignable from the same enum.
             TypeKind::Enum { .. } => {
-                if self.is_builtin(to, Builtins::INT) {
+                if to == self.builtins.int {
                     return true;
                 }
                 self.is_assignable_to_strip_source_nullable(from, to)
@@ -802,7 +748,7 @@ impl TypeArena {
         }
     }
 
-    /// flag were stripped. Used by `is_castable`'s fall-back: a cast is
+    /// Used by `is_castable`'s fall-back: a cast is
     /// permitted to coerce `T?` to a non-nullable target — the runtime
     /// decides at execution time whether the actual value can land there.
     ///

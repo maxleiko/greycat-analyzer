@@ -18,7 +18,7 @@ use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_analysis::resolver::Definition;
 use greycat_analyzer_core::SourceManager;
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_hir::types::{Decl, Expr};
+use greycat_analyzer_hir::hir::{Decl, Expr};
 use std::str::FromStr;
 
 fn add(mgr: &mut SourceManager, path: &str, src: &str) -> Uri {

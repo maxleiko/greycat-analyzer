@@ -31,14 +31,14 @@
 use rustc_hash::FxHashMap;
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{ItemId, Symbol, SymbolTable, TypeArena};
+use greycat_analyzer_core::{ItemKey, Symbol};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{
+use greycat_analyzer_hir::hir::{
     AssignStmt, AtStmt, BinaryExpr, CallExpr, Decl, DoWhileStmt, Expr, FnDecl, ForInStmt, ForStmt,
-    Ident, IfStmt, LambdaExpr, LocalVar, MemberExpr, ObjectExpr, OffsetExpr, PositionalObjectExpr,
-    Pragma, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, VarDeclTop,
-    WhileStmt,
+    Ident, IfStmt, LambdaExpr, LocalVar, MemberExpr, ModVarDecl, ObjectExpr, OffsetExpr,
+    PositionalObjectExpr, Pragma, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef,
+    UnaryExpr, WhileStmt,
 };
 
 use crate::index::{Namespace, ProjectIndex};
@@ -133,10 +133,9 @@ pub struct Resolutions {
     /// `unused-decl` lint rule check at-a-glance whether a decl is
     /// never used outside its own declaration.
     pub references_to: FxHashMap<Idx<Decl>, usize>,
-    // P2.5 — surface as "unresolved name" diagnostics.
+    // Surface as "unresolved name" diagnostics.
     /// Idents the resolver couldn't bind.
     pub unresolved: Vec<Idx<Ident>>,
-    // P38.4
     /// Idents that matched a name exported publicly by ≥2 distinct
     /// modules (with no local hit to resolve them). The runtime
     /// reports plain "unresolved function: <name>" on this shape; we
@@ -159,7 +158,7 @@ pub struct Resolutions {
     pub captured: Vec<Idx<Ident>>,
     /// `this` byte ranges inside lambda bodies. The runtime segfaults
     /// on this shape today; we forbid it at analyze time.
-    pub this_in_lambda: Vec<greycat_analyzer_hir::types::Span>,
+    pub this_in_lambda: Vec<greycat_analyzer_hir::hir::Span>,
     /// Idents that re-bind a name already declared as a `Local` or
     /// `Param` in the *same* lexical scope. The runtime rejects this
     /// shape with `already declared var` / `already declared param`;
@@ -202,7 +201,7 @@ impl Scope {
     }
 }
 
-struct Cx<'a> {
+pub(crate) struct ResolverCx<'a> {
     hir: &'a Hir,
     // Module-scope bindings split by visibility. Both tiers are
     // consulted in the same step of `record_use` — module-local decls
@@ -249,16 +248,16 @@ struct Cx<'a> {
     /// locals / params / enum-variants) while classic object field
     /// names stay member-driven (not value uses). `None` for per-file
     /// callers / projects without std.
-    map_decl: Option<ItemId>,
-    res: Resolutions,
+    map_item_key: Option<ItemKey>,
+    pub res: Resolutions,
 }
 
-impl<'a> Cx<'a> {
-    fn new(
+impl<'a> ResolverCx<'a> {
+    pub fn new(
         hir: &'a Hir,
         index: &'a ProjectIndex,
         current_uri: Option<&'a Uri>,
-        map_decl: Option<ItemId>,
+        map_item_key: Option<ItemKey>,
     ) -> Self {
         Self {
             hir,
@@ -271,7 +270,7 @@ impl<'a> Cx<'a> {
             scopes: Vec::new(),
             index,
             current_uri,
-            map_decl,
+            map_item_key,
             res: Resolutions::default(),
         }
     }
@@ -279,12 +278,12 @@ impl<'a> Cx<'a> {
     /// `true` when the object-literal head `type_ref` resolves to the
     /// std-core `Map`. Consults the just-recorded resolution of the
     /// head's leaf ident (so cross-module `Map` is recognised) and
-    /// compares its `ItemId` against [`Self::map_decl`]. A
+    /// compares its `ItemKey` against [`Self::map_decl`]. A
     /// user-declared `type Map` resolves to a `Definition::Decl` in the
-    /// current module, whose `ItemId` differs from the std slot — so it
+    /// current module, whose `ItemKey` differs from the std slot — so it
     /// is correctly *not* treated as the runtime `Map`.
     fn object_head_is_map(&self, ty: Idx<TypeRef>) -> bool {
-        let Some(map_decl) = self.map_decl else {
+        let Some(map_decl) = self.map_item_key else {
             return false;
         };
         let tr = &self.hir.type_refs[ty];
@@ -570,71 +569,7 @@ impl<'a> Cx<'a> {
     }
 }
 
-/// Run name resolution against `hir` with no cross-module context — the
-/// fallback index is just [`ProjectIndex::new`], which knows the
-/// language primitives but no user-declared decls and no runtime
-/// types (those come through the stdlib `.gcl` ingest). Per-file
-/// callers (tests, per-request capabilities) use this; the project
-/// pipeline uses [`resolve_with_index_for`] so cross-module names
-/// also resolve and the current module's own entries are excluded
-/// from the global public-lookup tier.
-pub fn resolve(hir: &Hir, symbols: &SymbolTable) -> Resolutions {
-    let mut arena = TypeArena::new();
-    let index = ProjectIndex::with_symbols(symbols.clone(), &mut arena);
-    resolve_inner(hir, &index, None, None)
-}
-
-// P6.2
-/// Run name resolution against `hir`, falling back to `index` for names
-/// that aren't satisfied by any local scope. Project-pipeline callers
-/// should prefer [`resolve_with_index_for`] so the current module's
-/// own decls can be filtered out of the global-public lookup; this
-/// shim survives for callers that don't have a URI handy.
-pub fn resolve_with_index(hir: &Hir, index: &ProjectIndex) -> Resolutions {
-    resolve_inner(hir, index, None, None)
-}
-
-// P38.3
-/// Run name resolution with both cross-module context and the
-/// current module's URI. The URI lets the global-public lookup at
-/// step 2 of `record_use` skip entries declared in the current
-/// module, so same-module private decls fall through to the
-/// last-resort step 3 instead of accidentally binding to themselves
-/// via `ProjectDecl`.
-pub fn resolve_with_index_for(
-    hir: &Hir,
-    index: &ProjectIndex,
-    current_uri: &Uri,
-    map_decl: Option<ItemId>,
-) -> Resolutions {
-    resolve_inner(hir, index, Some(current_uri), map_decl)
-}
-
-fn resolve_inner(
-    hir: &Hir,
-    index: &ProjectIndex,
-    current_uri: Option<&Uri>,
-    map_decl: Option<ItemId>,
-) -> Resolutions {
-    let mut cx = Cx::new(hir, index, current_uri, map_decl);
-
-    let Some(module) = hir.module.as_ref() else {
-        return cx.res;
-    };
-
-    // Two-pass at module scope so forward references between top-level
-    // decls work (TS reference does the same).
-    for decl_id in &module.decls {
-        seed_module_decl(&mut cx, *decl_id);
-    }
-    for decl_id in &module.decls {
-        visit_decl(&mut cx, *decl_id);
-    }
-
-    cx.res
-}
-
-fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
+pub(crate) fn seed_module_decl(cx: &mut ResolverCx, decl_id: Idx<Decl>) {
     let decl = &cx.hir.decls[decl_id];
     let Some(name_id) = decl.name() else {
         return;
@@ -643,7 +578,7 @@ fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
         return;
     };
     let name_sym = cx.hir.idents[name_id].symbol;
-    // P38.3 — route on visibility, then on namespace. Public decls
+    // Route on visibility, then on namespace. Public decls
     // join the first-tier lookup namespace alongside nested scopes;
     // private decls go to the last-resort fallback table. See the
     // order doctrine in `record_use`. Three namespaces (type, fn,
@@ -657,7 +592,6 @@ fn seed_module_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
     table.insert(name_sym, Definition::Decl(decl_id));
 }
 
-// P38.3
 /// Returns `true` iff the decl carries the `private` modifier.
 /// Pragmas have no visibility concept; they're treated as public so
 /// they continue to participate in normal name resolution (unchanged
@@ -672,7 +606,7 @@ fn decl_is_private(decl: &Decl) -> bool {
     }
 }
 
-fn visit_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
+pub(crate) fn visit_decl(cx: &mut ResolverCx, decl_id: Idx<Decl>) {
     let decl = cx.hir.decls[decl_id].clone();
     match decl {
         Decl::Fn(d) => visit_fn_decl(cx, &d),
@@ -682,12 +616,12 @@ fn visit_decl(cx: &mut Cx, decl_id: Idx<Decl>) {
             // declaration site — field initializers (if present in
             // future) would visit here.
         }
-        Decl::Var(d) => visit_top_var(cx, &d),
+        Decl::Var(d) => visit_modvar(cx, &d),
         Decl::Pragma(p) => visit_pragma(cx, &p),
     }
 }
 
-fn visit_fn_decl(cx: &mut Cx, d: &FnDecl) {
+fn visit_fn_decl(cx: &mut ResolverCx, d: &FnDecl) {
     cx.push_scope();
     // Generic params first so type-refs in param / return position can
     // see them.
@@ -718,7 +652,7 @@ fn visit_fn_decl(cx: &mut Cx, d: &FnDecl) {
     cx.pop_scope();
 }
 
-fn visit_type_decl(cx: &mut Cx, d: &TypeDecl) {
+fn visit_type_decl(cx: &mut ResolverCx, d: &TypeDecl) {
     cx.push_scope();
     // Generic params visible inside attribute types and method bodies.
     for g in &d.generics {
@@ -743,7 +677,7 @@ fn visit_type_decl(cx: &mut Cx, d: &TypeDecl) {
     cx.pop_scope();
 }
 
-fn visit_type_attr(cx: &mut Cx, a: &TypeAttr) {
+fn visit_type_attr(cx: &mut ResolverCx, a: &TypeAttr) {
     if let Some(ty) = a.ty {
         visit_type_ref(cx, ty);
     }
@@ -752,7 +686,7 @@ fn visit_type_attr(cx: &mut Cx, a: &TypeAttr) {
     }
 }
 
-fn visit_top_var(cx: &mut Cx, d: &VarDeclTop) {
+fn visit_modvar(cx: &mut ResolverCx, d: &ModVarDecl) {
     if let Some(ty) = d.ty {
         visit_type_ref(cx, ty);
     }
@@ -761,7 +695,7 @@ fn visit_top_var(cx: &mut Cx, d: &VarDeclTop) {
     }
 }
 
-fn visit_pragma(cx: &mut Cx, p: &Pragma) {
+fn visit_pragma(cx: &mut ResolverCx, p: &Pragma) {
     for arg in &p.args {
         visit_expr(cx, *arg);
     }
@@ -771,7 +705,7 @@ fn visit_pragma(cx: &mut Cx, p: &Pragma) {
 /// (`If::then_branch`, `While::body`, `Try::try_block`, …) hold the
 /// `BlockStmt` directly post-refactor — calling [`visit_stmt`] on
 /// `Idx<Stmt>` no longer works for those bodies.
-fn visit_block(cx: &mut Cx, block: &greycat_analyzer_hir::types::BlockStmt) {
+fn visit_block(cx: &mut ResolverCx, block: &greycat_analyzer_hir::hir::BlockStmt) {
     cx.push_scope();
     visit_block_inline(cx, block);
     cx.pop_scope();
@@ -781,13 +715,13 @@ fn visit_block(cx: &mut Cx, block: &greycat_analyzer_hir::types::BlockStmt) {
 /// Used by `visit_fn_decl` / `Expr::Lambda` so the params and the
 /// immediate body block share one scope — matching the runtime, which
 /// rejects `fn foo(x) { var x = …; }` as `already declared var`.
-fn visit_block_inline(cx: &mut Cx, block: &greycat_analyzer_hir::types::BlockStmt) {
+fn visit_block_inline(cx: &mut ResolverCx, block: &greycat_analyzer_hir::hir::BlockStmt) {
     for s in &block.stmts {
         visit_stmt(cx, *s);
     }
 }
 
-fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
+fn visit_stmt(cx: &mut ResolverCx, stmt_id: Idx<Stmt>) {
     let stmt = cx.hir.stmts[stmt_id].clone();
     match stmt {
         Stmt::Block(b) => visit_block(cx, &b),
@@ -917,17 +851,17 @@ fn visit_stmt(cx: &mut Cx, stmt_id: Idx<Stmt>) {
     }
 }
 
-fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
+fn visit_expr(cx: &mut ResolverCx, expr_id: Idx<Expr>) {
     let expr = &cx.hir.exprs[expr_id];
     match expr {
         Expr::Ident { name, .. } => cx.record_use(*name, Position::Value),
         Expr::Literal(_) => {}
         Expr::String(StringExpr { parts, .. }) => {
-            // P17.5 — recurse into `${expr}` interpolations so inner
+            // Recurse into `${expr}` interpolations so inner
             // idents are bound (otherwise variables referenced only
             // inside template strings stay `unresolved`).
             for part in parts {
-                if let greycat_analyzer_hir::types::StringPart::Interp { expr, .. } = part {
+                if let greycat_analyzer_hir::hir::StringPart::Interp { expr, .. } = part {
                     visit_expr(cx, *expr);
                 }
             }
@@ -1050,13 +984,13 @@ fn visit_expr(cx: &mut Cx, expr_id: Idx<Expr>) {
     }
 }
 
-fn visit_type_ref(cx: &mut Cx, ty_id: Idx<TypeRef>) {
-    let ty = cx.hir.type_refs[ty_id].clone();
-    if ty.qualifier.is_empty() {
+fn visit_type_ref(cx: &mut ResolverCx, ty_id: Idx<TypeRef>) {
+    let tr = cx.hir.type_refs[ty_id].clone();
+    if tr.is_bare() {
         // Bare reference: full bare-name resolution, including the
         // `ambiguous-symbol` collapse when ≥2 modules export the leaf.
         // Type-position — only type/enum decls participate.
-        cx.record_use(ty.name, Position::Type);
+        cx.record_use(tr.name, Position::Type);
     } else {
         // Qualified reference (`b::Foo`, `a::b::Foo`, …): the user has
         // already disambiguated. Bind each qualifier segment as a
@@ -1066,12 +1000,12 @@ fn visit_type_ref(cx: &mut Cx, ty_id: Idx<TypeRef>) {
         // a leaf the user explicitly qualified. Qualifier segments
         // are module names; `has_module` catches them at the tail of
         // `record_use`.
-        for q in ty.qualifier.iter() {
+        for q in tr.qualifier.iter() {
             cx.record_use(*q, Position::Type);
         }
-        cx.bind_qualified_type_leaf(&ty);
+        cx.bind_qualified_type_leaf(&tr);
     }
-    for p in ty.params {
+    for p in tr.params {
         visit_type_ref(cx, p);
     }
 }
@@ -1081,17 +1015,19 @@ mod tests {
     use crate::well_known::WellKnown;
 
     use super::*;
-    use greycat_analyzer_core::SymbolTable;
-    use greycat_analyzer_hir::types::{Decl, Expr};
+    use greycat_analyzer_core::{SymbolTable, TypeArena};
+    use greycat_analyzer_hir::hir::{Decl, Expr};
     use greycat_analyzer_hir::{DeclRegistry, lower_module};
     use greycat_analyzer_syntax::parse;
 
-    fn analyze(src: &str) -> (Hir, Resolutions, SymbolTable) {
+    fn analyze(src: &str) -> (Hir, Resolutions, ProjectIndex) {
         let tree = parse(src);
         let s = SymbolTable::default();
         let hir = lower_module(src, &s, "mod", "project", tree.root_node());
-        let res = resolve(&hir, &s);
-        (hir, res, s)
+        let arena = TypeArena::new(&s);
+        let index = ProjectIndex::new(s, &arena);
+        let res = index.resolutions(&hir, None, None);
+        (hir, res, index)
     }
 
     #[test]
@@ -1103,8 +1039,8 @@ mod tests {
         // Uses a local `Wrap` rather than the runtime `Map` so the
         // per-file resolver (no stdlib ingest) recognises the head.
         let src = "type T { paths: Wrap<String, Inner>?; }\ntype Inner {}\ntype Wrap<K, V> {}\n";
-        let (hir, res, s) = analyze(src);
-        let inner_sym = s.lookup("Inner").expect("Inner interned");
+        let (hir, res, idx) = analyze(src);
+        let inner_sym = idx.symbols.lookup("Inner").expect("Inner interned");
         let inner_uses: Vec<_> = hir
             .idents
             .iter()
@@ -1123,8 +1059,8 @@ mod tests {
     #[test]
     fn param_use_resolves_to_param() {
         let src = "fn id(x: int): int { return x; }\n";
-        let (hir, res, s) = analyze(src);
-        let x_sym = s.lookup("x").expect("x interned");
+        let (hir, res, idx) = analyze(src);
+        let x_sym = idx.symbols.lookup("x").expect("x interned");
 
         // Find the use of `x` inside the body.
         let x_uses: Vec<_> = hir
@@ -1147,8 +1083,8 @@ mod tests {
 fn caller(): int { return helper(); }
 fn helper(): int { return 1; }
 "#;
-        let (hir, res, s) = analyze(src);
-        let helper_sym = s.lookup("helper").expect("helper interned");
+        let (hir, res, idx) = analyze(src);
+        let helper_sym = idx.symbols.lookup("helper").expect("helper interned");
         // The Ident for the use of `helper` in caller's body.
         let helper_uses: Vec<_> = hir
             .idents
@@ -1184,8 +1120,8 @@ fn f(x: int): int {
     return x;
 }
 "#;
-        let (hir, res, s) = analyze(src);
-        let x_sym = s.lookup("x").expect("x interned");
+        let (hir, res, idx) = analyze(src);
+        let x_sym = idx.symbols.lookup("x").expect("x interned");
         assert_eq!(
             res.rebound.len(),
             1,
@@ -1243,8 +1179,8 @@ fn f(x: int): int {
     return x;
 }
 "#;
-        let (hir, res, s) = analyze(src);
-        let x_sym = s.lookup("x").expect("x interned");
+        let (hir, res, idx) = analyze(src);
+        let x_sym = idx.symbols.lookup("x").expect("x interned");
         assert!(
             res.rebound.is_empty(),
             "nested-scope shadow should not record a rebind: {:?}",
@@ -1272,9 +1208,9 @@ fn f(x: int): int {
 type Foo {}
 fn f(p: Foo): Foo { return p; }
 "#;
-        let (hir, res, s) = analyze(src);
-        let foo_sym = s.lookup("Foo").expect("Foo interned");
-        let p_sym = s.lookup("p").expect("p interned");
+        let (hir, res, idx) = analyze(src);
+        let foo_sym = idx.symbols.lookup("Foo").expect("Foo interned");
+        let p_sym = idx.symbols.lookup("p").expect("p interned");
         let foo_uses: Vec<_> = hir
             .idents
             .iter()
@@ -1311,8 +1247,8 @@ fn f(p: Foo): Foo { return p; }
     #[test]
     fn generic_param_resolves_to_generic_definition() {
         let src = "fn id<T>(x: T): T { return x; }\n";
-        let (hir, res, s) = analyze(src);
-        let t_sym = s.lookup("T").expect("T interned");
+        let (hir, res, idx) = analyze(src);
+        let t_sym = idx.symbols.lookup("T").expect("T interned");
         let t_uses: Vec<_> = hir
             .idents
             .iter()
@@ -1337,10 +1273,11 @@ fn f(p: Foo): Foo { return p; }
         // refers to `Helper` — without a ProjectIndex it'd be
         // unresolved; with one ingested from A it binds to ProjectDecl
         // carrying A's URI + the Helper decl id (P11.2).
-        let mut arena = TypeArena::new();
+        let symbols = SymbolTable::default();
+        let mut arena = TypeArena::new(&symbols);
         let mut decl_registry = DeclRegistry::default();
         let mut well_known = WellKnown::default();
-        let mut idx = ProjectIndex::new(&mut arena);
+        let mut idx = ProjectIndex::new(symbols, &arena);
 
         let other_src = "type Helper {}\n";
         let other_tree = parse(other_src);
@@ -1358,7 +1295,7 @@ fn f(p: Foo): Foo { return p; }
         let user_src = "fn use_helper(h: Helper) {}\n";
         let user_tree = parse(user_src);
         let user_hir = lower_module(user_src, &idx.symbols, "b", "p", user_tree.root_node());
-        let res = resolve_with_index(&user_hir, &idx);
+        let res = idx.resolutions(&user_hir, None, None);
         let helper_sym = idx.symbols.lookup("Helper").expect("Helper interned");
 
         let helper_uses: Vec<_> = user_hir
@@ -1388,9 +1325,9 @@ fn f(p: Foo): Foo { return p; }
         // ingest) can still recognise the iterator's type — runtime
         // types like `Array` only land in scope through stdlib.
         let src = "type Xs {}\nfn f(xs: Xs) { for (i, x in xs) { var s = i + x; } }\n";
-        let (hir, res, s) = analyze(src);
+        let (hir, res, idx) = analyze(src);
         for name in ["i", "x"] {
-            let needle_sym = s.lookup(name).expect("name interned");
+            let needle_sym = idx.symbols.lookup(name).expect("name interned");
             let uses: Vec<_> = hir
                 .idents
                 .iter()
@@ -1419,8 +1356,8 @@ fn f(p: Foo): Foo { return p; }
     #[test]
     fn catch_param_binds_in_catch_block() {
         let src = "fn f() { try { } catch (ex) { throw ex; } }\n";
-        let (hir, res, s) = analyze(src);
-        let ex_sym = s.lookup("ex").expect("ex interned");
+        let (hir, res, idx) = analyze(src);
+        let ex_sym = idx.symbols.lookup("ex").expect("ex interned");
         let ex_uses: Vec<_> = hir
             .idents
             .iter()

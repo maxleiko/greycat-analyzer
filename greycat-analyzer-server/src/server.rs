@@ -411,7 +411,6 @@ fn hover_handler(server: &Backend, params: HoverParams) -> Option<Hover> {
     let doc = cell.borrow();
     capabilities::hover_with_project(
         &doc.text,
-        &doc.lib,
         doc.root_node(),
         pos,
         &uri,

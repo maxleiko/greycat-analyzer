@@ -24,7 +24,7 @@
 use greycat_analyzer_core::{Type, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::Stmt;
+use greycat_analyzer_hir::hir::Stmt;
 
 use crate::analyzer::AnalysisResult;
 
@@ -74,7 +74,7 @@ pub fn inferred_return_from_block(
     hir: &Hir,
     analysis: &AnalysisResult,
     arena: &TypeArena,
-    body: &greycat_analyzer_hir::types::BlockStmt,
+    body: &greycat_analyzer_hir::hir::BlockStmt,
 ) -> Option<TypeId> {
     let mut seen: Option<TypeId> = None;
     if collect_returns_in_block(hir, analysis, arena, &body.stmts, &mut seen).is_err() {

@@ -42,7 +42,7 @@ pub fn prepare_rename(
 pub fn resolve_rename_target(
     project: &ProjectAnalysis,
     cursor_uri: &Uri,
-    cursor_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::types::Ident>,
+    cursor_idx: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::hir::Ident>,
 ) -> Option<RenameTarget> {
     rename::resolve_target(project, cursor_uri, cursor_idx)
 }

@@ -25,9 +25,9 @@ pub use unused_param::UnusedParam;
 
 use std::ops::Range;
 
-use greycat_analyzer_core::{ItemId, SymbolTable, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_core::{ItemKey, SymbolTable, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::types::{
+use greycat_analyzer_hir::hir::{
     BinOp, BinaryExpr, Decl, Expr, FnDecl, Ident, MemberExpr, OffsetExpr, PropertyName, Stmt,
     UnaryExpr, UnaryOp,
 };
@@ -624,7 +624,7 @@ fn visit_block_for_locals(
     hir: &Hir,
     res: &Resolutions,
     symbols: &SymbolTable,
-    block: &greycat_analyzer_hir::types::BlockStmt,
+    block: &greycat_analyzer_hir::hir::BlockStmt,
     out: &mut Vec<LintDiagnostic>,
     rule: &'static str,
 ) {
@@ -845,11 +845,11 @@ fn receiver_head_name(
     _decl_registry: &DeclRegistry,
     symbols: &SymbolTable,
     ty: TypeId,
-) -> Option<(String, Option<ItemId>)> {
+) -> Option<(String, Option<ItemKey>)> {
     let t = arena.get(ty);
     match &t.kind {
         // `TypeKind::Type(item)` / `Generic` carry their decl's
-        // `ItemId` directly — the name half indexes into the
+        // `ItemKey` directly — the name half indexes into the
         // project's symbol table without going through the registry.
         TypeKind::Type(decl) => Some((symbols[decl.name].to_string(), Some(*decl))),
         TypeKind::Generic { tpl, .. } => Some((symbols[tpl.name].to_string(), Some(*tpl))),
@@ -1568,7 +1568,7 @@ fn collect_dead_in_fn(
 fn collect_dead_in_block(
     hir: &Hir,
     analysis: &AnalysisResult,
-    block: &greycat_analyzer_hir::types::BlockStmt,
+    block: &greycat_analyzer_hir::hir::BlockStmt,
     out: &mut Vec<std::ops::Range<usize>>,
 ) {
     // Pass 1: any statement that follows a divergent sibling becomes
@@ -1730,7 +1730,6 @@ fn stmt_byte_range(hir: &Hir, stmt_id: Idx<Stmt>) -> std::ops::Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::resolve;
     use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
 
@@ -1738,8 +1737,10 @@ mod tests {
         let tree = parse(src);
         let symbols = SymbolTable::default();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
-        let res = resolve(&hir, &symbols);
-        run_lints(&hir, &res, &symbols)
+        let arena = TypeArena::new(&symbols);
+        let index = ProjectIndex::new(symbols, &arena);
+        let res = index.resolutions(&hir, None, None);
+        run_lints(&hir, &res, &index.symbols)
     }
 
     #[test]

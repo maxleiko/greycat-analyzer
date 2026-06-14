@@ -4,7 +4,7 @@
 
 use greycat_analyzer_core::SymbolTable;
 use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Expr, Stmt, UnaryExpr, UnaryOp};
+use greycat_analyzer_hir::hir::{Decl, Expr, Stmt, UnaryExpr, UnaryOp};
 use greycat_analyzer_syntax::parse;
 
 fn first_stmt_unary_op(src: &str) -> UnaryOp {

@@ -17,8 +17,7 @@ use wasm_bindgen::prelude::*;
 use greycat_analyzer_core::lsp_types::{Position, Uri};
 use greycat_analyzer_core::{SourceEncoding, SourceManager, SymbolTable, TypeArena, TypeId};
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::lower_module;
-use greycat_analyzer_hir::types::{Decl, Expr, Ident, Stmt, TypeAttr};
+use greycat_analyzer_hir::hir::{Decl, Expr, Ident, Stmt, TypeAttr};
 use greycat_analyzer_hir::{DeclRegistry, Hir};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset};
 use greycat_analyzer_syntax::tree_sitter;
@@ -31,7 +30,7 @@ use crate::ide::render::{
 };
 use crate::ide::types::Range as IdeRange;
 use crate::project::ProjectAnalysis;
-use crate::resolver::{Definition, Resolutions, resolve};
+use crate::resolver::{Definition, Resolutions};
 
 /// IDE-shape hover result: markdown body + the source byte-range the
 /// hover applies to, already projected into `(line, character)`
@@ -57,7 +56,6 @@ pub struct Hover {
 #[allow(clippy::too_many_arguments)]
 pub fn hover_with_project(
     text: &str,
-    lib: &str,
     root: tree_sitter::Node<'_>,
     pos: Position,
     uri: &Uri,
@@ -209,8 +207,7 @@ pub fn hover_with_project(
         }
         return None;
     }
-    // Cache miss — fall back to in-module-only hover.
-    hover_inner(text, lib, root, pos, encoding)
+    None
 }
 
 #[derive(Copy, Clone)]
@@ -218,113 +215,6 @@ struct HoverProjectCtx<'a> {
     project: &'a ProjectAnalysis,
     #[allow(dead_code)] // reserved for future cross-module hover content
     manager: &'a SourceManager,
-}
-
-fn hover_inner(
-    text: &str,
-    lib: &str,
-    root: tree_sitter::Node<'_>,
-    pos: Position,
-    encoding: SourceEncoding,
-) -> Option<Hover> {
-    let byte = position_to_byte(text, pos, encoding);
-    let node = node_at_offset(root, byte)?;
-    if !node.is_named() {
-        return None;
-    }
-
-    let symbols = SymbolTable::new();
-    let hir = lower_module(text, &symbols, "module", lib, root);
-    let resolutions = resolve(&hir, &symbols);
-    let (arena, decl_registry, analysis) = crate::analyzer::analyze(&hir, &resolutions, &symbols);
-
-    // --- Layer 1: ident-based hover (params / locals / decls / builtins).
-    if node.kind() == "ident"
-        && let Some((ident_idx, ident)) = hir
-            .idents
-            .iter()
-            .find(|(_, i)| i.byte_range == node.byte_range())
-    {
-        if let Some(markdown) = ident_hover_markdown(
-            &hir,
-            &symbols,
-            &resolutions,
-            &analysis,
-            &arena,
-            &decl_registry,
-            ident_idx,
-            ident,
-            None,
-        ) {
-            return Some(hover_from_markdown(
-                markdown,
-                ident.byte_range.clone(),
-                text,
-                encoding,
-            ));
-        }
-        // Decl-defining ident (e.g. cursor on the `helper` in `fn helper()`).
-        if let Some(module) = hir.module.as_ref() {
-            for decl_id in &module.decls {
-                let decl = &hir.decls[*decl_id];
-                if let Some(name_id) = decl.name()
-                    && hir.idents[name_id].byte_range == node.byte_range()
-                {
-                    let markdown = render_decl_hover_markdown(&hir, &symbols, decl, None, None);
-                    return Some(hover_from_markdown(
-                        markdown,
-                        hir.idents[name_id].byte_range.clone(),
-                        text,
-                        encoding,
-                    ));
-                }
-            }
-        }
-        // Local binder declarator — mirror of the cached path's branch.
-        if let Some(markdown) = local_binder_hover_inmodule(
-            &hir,
-            &symbols,
-            &arena,
-            &decl_registry,
-            &analysis,
-            ident_idx,
-        ) {
-            return Some(hover_from_markdown(
-                markdown,
-                ident.byte_range.clone(),
-                text,
-                encoding,
-            ));
-        }
-    }
-
-    // --- Layer 2: non-ident expression hover.
-    let target_range = node.byte_range();
-    for ancestor in ancestors(node) {
-        let r = ancestor.byte_range();
-        if r.start > target_range.start || r.end < target_range.end {
-            break;
-        }
-        if let Some((expr_id, expr)) = hir
-            .exprs
-            .iter()
-            .filter(|(_, e)| !matches!(e, Expr::Ident { .. }))
-            .find(|(_, e)| {
-                let er = e.byte_range();
-                !er.is_empty() && er == r
-            })
-            && let Some(ty) = analysis.expr_types.get(&expr_id)
-        {
-            let label = format!(
-                "{}: {}",
-                short_expr_label(&hir, &symbols, expr),
-                crate::display::display_type(&arena, &decl_registry, &symbols, *ty),
-            );
-            return Some(hover_from_markdown(wrap_code(&label), r, text, encoding));
-        }
-    }
-
-    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -343,7 +233,7 @@ fn ident_hover_markdown(
     // Object-expression field name (`name` in `Foo { name: value }`).
     // Recorded by the analyzer against the declaring attr — which
     // may live on a *supertype* whose home module is a different
-    // file. The binding carries the declaring type's `ItemId`, so the
+    // file. The binding carries the declaring type's `ItemKey`, so the
     // provenance footer points at the chain origin (`module::Type`)
     // rather than just the file: hovering an inherited field on a
     // `Derived { ... }` call site reveals it came from `Base`.
@@ -683,26 +573,6 @@ fn local_binder_hover(
         prefix,
         name_str,
         project.display_type(ty),
-    )))
-}
-
-fn local_binder_hover_inmodule(
-    hir: &Hir,
-    symbols: &SymbolTable,
-    arena: &TypeArena,
-    decl_registry: &DeclRegistry,
-    analysis: &AnalysisResult,
-    ident_idx: Idx<Ident>,
-) -> Option<String> {
-    let (name, has_var_keyword) = local_binder_for(hir, ident_idx)?;
-    let ty = analysis.def_types.get(&name).copied()?;
-    let prefix = if has_var_keyword { "var " } else { "" };
-    let name_str = &symbols[hir.idents[name].symbol];
-    Some(wrap_code(&format!(
-        "{}{}: {}",
-        prefix,
-        name_str,
-        crate::display::display_type(arena, decl_registry, symbols, ty),
     )))
 }
 

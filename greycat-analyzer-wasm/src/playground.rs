@@ -219,7 +219,7 @@ struct HirCounts {
 fn ident_text(
     hir: &Hir,
     symbols: &SymbolTable,
-    idx: Idx<greycat_analyzer_hir::types::Ident>,
+    idx: Idx<greycat_analyzer_hir::hir::Ident>,
 ) -> String {
     symbols[hir.idents[idx].symbol].to_string()
 }
@@ -227,7 +227,7 @@ fn ident_text(
 fn type_ref_node(
     hir: &Hir,
     symbols: &SymbolTable,
-    idx: Idx<greycat_analyzer_hir::types::TypeRef>,
+    idx: Idx<greycat_analyzer_hir::hir::TypeRef>,
 ) -> HirNode {
     let tr = &hir.type_refs[idx];
     let mut children = Vec::new();
@@ -254,9 +254,9 @@ fn type_ref_node(
 fn expr_node(
     hir: &Hir,
     symbols: &SymbolTable,
-    idx: Idx<greycat_analyzer_hir::types::Expr>,
+    idx: Idx<greycat_analyzer_hir::hir::Expr>,
 ) -> HirNode {
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
     let e = &hir.exprs[idx];
     let range: ByteRange = e.byte_range().into();
     let (kind, label, children) = match e {
@@ -271,7 +271,7 @@ fn expr_node(
         Expr::String(s) => {
             let mut kids = Vec::new();
             for part in &s.parts {
-                if let greycat_analyzer_hir::types::StringPart::Interp { expr, byte_range } = part {
+                if let greycat_analyzer_hir::hir::StringPart::Interp { expr, byte_range } = part {
                     kids.push(HirNode {
                         kind: "expr:string-interp".into(),
                         label: None,
@@ -444,7 +444,7 @@ fn expr_node(
 fn block_node(
     hir: &Hir,
     symbols: &SymbolTable,
-    block: &greycat_analyzer_hir::types::BlockStmt,
+    block: &greycat_analyzer_hir::hir::BlockStmt,
 ) -> HirNode {
     HirNode {
         kind: "stmt:block".into(),
@@ -461,9 +461,9 @@ fn block_node(
 fn stmt_node(
     hir: &Hir,
     symbols: &SymbolTable,
-    idx: Idx<greycat_analyzer_hir::types::Stmt>,
+    idx: Idx<greycat_analyzer_hir::hir::Stmt>,
 ) -> HirNode {
-    use greycat_analyzer_hir::types::Stmt;
+    use greycat_analyzer_hir::hir::Stmt;
     let s = &hir.stmts[idx];
     match s {
         Stmt::Block(b) => block_node(hir, symbols, b),
@@ -638,9 +638,9 @@ fn stmt_node(
 fn decl_node(
     hir: &Hir,
     symbols: &SymbolTable,
-    idx: Idx<greycat_analyzer_hir::types::Decl>,
+    idx: Idx<greycat_analyzer_hir::hir::Decl>,
 ) -> HirNode {
-    use greycat_analyzer_hir::types::Decl;
+    use greycat_analyzer_hir::hir::Decl;
     let d = &hir.decls[idx];
     let range: ByteRange = d.byte_range().clone().into();
     let name = d.name().map(|n| ident_text(hir, symbols, n));
@@ -786,7 +786,7 @@ fn full_hir(hir: &Hir, symbols: &SymbolTable) -> HirRoot {
     let module = hir
         .module
         .clone()
-        .unwrap_or_else(|| greycat_analyzer_hir::types::Module {
+        .unwrap_or_else(|| greycat_analyzer_hir::hir::Module {
             // `Module.name` / `.lib` are interned `Symbol`s; intern the
             // placeholders rather than building from `&str`.
             name: symbols.intern("<empty>"),

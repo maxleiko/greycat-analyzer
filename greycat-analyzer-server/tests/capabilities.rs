@@ -953,7 +953,7 @@ fn enum_variant_access_types_as_enum_in_every_form() {
     let pa = ProjectAnalysis::analyze(&mgr);
     let module = pa.module(&uri).expect("module cached");
 
-    use greycat_analyzer_hir::types::Expr;
+    use greycat_analyzer_hir::hir::Expr;
     let mut static_count = 0usize;
     for (idx, expr) in module.hir.exprs.iter() {
         let is_static = matches!(expr, Expr::Static(_) | Expr::QualifiedStatic { .. });

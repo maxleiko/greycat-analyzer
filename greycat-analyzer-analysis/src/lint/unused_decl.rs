@@ -1,5 +1,5 @@
 use greycat_analyzer_core::SymbolTable;
-use greycat_analyzer_hir::{Hir, types::Decl};
+use greycat_analyzer_hir::{Hir, hir::Decl};
 
 use crate::resolver::Resolutions;
 
@@ -75,7 +75,7 @@ fn check_unused_decl(
 
 fn is_exposed(
     symbols: &greycat_analyzer_core::SymbolTable,
-    modifiers: &greycat_analyzer_hir::types::Modifiers,
+    modifiers: &greycat_analyzer_hir::hir::Modifiers,
 ) -> bool {
     modifiers
         .annotations
