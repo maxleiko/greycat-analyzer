@@ -315,8 +315,12 @@ mod tests {
     fn typekind_name_dedups() {
         let mut cx = TextCx::default();
         let array_ty = cx.item("Array");
-        let a = cx.arena.alloc_generic(array_ty, vec![cx.arena.builtins.int]);
-        let b = cx.arena.alloc_generic(array_ty, vec![cx.arena.builtins.int]);
+        let a = cx
+            .arena
+            .alloc_generic(array_ty, vec![cx.arena.builtins.int]);
+        let b = cx
+            .arena
+            .alloc_generic(array_ty, vec![cx.arena.builtins.int]);
         assert_eq!(a, b);
         assert_eq!(cx.arena.len(), 2);
     }

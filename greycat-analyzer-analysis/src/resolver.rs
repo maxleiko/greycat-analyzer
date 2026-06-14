@@ -901,7 +901,7 @@ fn visit_expr(cx: &mut ResolverCx, expr_id: Idx<Expr>) {
         }
         Expr::Static(s) => visit_type_ref(cx, s.ty),
         Expr::QualifiedStatic { chain, .. } => {
-            // P15.8 — bind the leftmost segment as a regular use
+            // Bind the leftmost segment as a regular use
             // (typically a module name or a type name). Subsequent
             // segments are members and bind via type-driven resolution
             // in the analyzer / pass 3.5, not here.
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn forward_ref_to_type_in_nested_generic_param() {
-        // P14.9 regression: `type T { paths: Wrap<String, Inner>?; }`
+        // Regression: `type T { paths: Wrap<String, Inner>?; }`
         // followed by `type Inner {}` and `type Wrap<K, V> {}` — the
         // forward reference to `Inner` in the second generic-param
         // slot should resolve via the two-pass module-scope seed.
@@ -1313,7 +1313,6 @@ fn f(p: Foo): Foo { return p; }
         assert!(res.unresolved.is_empty());
     }
 
-    // P17.2
     /// `for (i, x in xs) { ... i ... x ... }` should bind both
     /// `i` and `x` as locals in the body. Was silently dropping the
     /// entire `for_in_stmt` because lowering misread the iterator
@@ -1346,7 +1345,6 @@ fn f(p: Foo): Foo { return p; }
         );
     }
 
-    // P17.3
     /// `try { ... } catch (ex) { ... ex ... }` should bind
     /// `ex` as a Local in the catch block. Was silently unresolved
     /// because lowering asked for a `name` sub-field on `_catch_param`,
@@ -1376,14 +1374,4 @@ fn f(p: Foo): Foo { return p; }
         );
         assert!(res.unresolved.is_empty(), "no idents should be unresolved");
     }
-
-    // P35.8 removed `project_index_fallback_keeps_unit_project_for_runtime_types`:
-    // the previous behavior seeded runtime-type names (`Array`, `Map`,
-    // `node`, …) into `type_names` without an `.gcl` decl, so the
-    // resolver answered `Definition::Project` for them in unit tests
-    // that skipped stdlib ingest. After the seeding list was deleted,
-    // those names only become known when stdlib is loaded — the
-    // `ProjectDecl` answer is then richer than `Project`. Coverage
-    // for the cross-module fallback lives in
-    // `project_index_fallback_resolves_cross_module_name`.
 }

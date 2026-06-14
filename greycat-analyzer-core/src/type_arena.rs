@@ -31,6 +31,41 @@ pub struct Builtins {
     pub node_index: TypeId,
     pub node_list: TypeId,
     pub node_geo: TypeId,
+    /// The `core::any` / `core::null` decl keys. Source `any` / `null`
+    /// resolve to these decls but lower to the `any` / `null` *variants*
+    /// above, which a nominal `Type(core::X)` can't encode.
+    pub any_key: ItemKey,
+    pub null_key: ItemKey,
+}
+
+impl Builtins {
+    /// The always-available core type names: the 8 primitives, the 5
+    /// `node` tags, and `any` / `null`. Their `core::X` identity holds
+    /// with or without `core.gcl` loaded, so `resolve_item` (type
+    /// lowering) and `has_name` (the resolver's known-name fallback) both
+    /// recognise them in a std-free project.
+    const CORE_TYPE_NAMES: [&'static str; 15] = [
+        "bool",
+        "int",
+        "float",
+        "char",
+        "time",
+        "duration",
+        "String",
+        "geo",
+        "node",
+        "nodeList",
+        "nodeIndex",
+        "nodeGeo",
+        "nodeTime",
+        "any",
+        "null",
+    ];
+
+    /// `true` iff `name` is one of [`Self::CORE_TYPE_NAMES`].
+    pub fn is_core_type_name(name: &str) -> bool {
+        Self::CORE_TYPE_NAMES.contains(&name)
+    }
 }
 
 /// Append-only interning arena for `Type`. Two equal `Type` values get
@@ -56,7 +91,7 @@ impl TypeArena {
         let mut intern = FxHashMap::with_capacity_and_hasher(128, Default::default());
 
         let any_id = {
-            let id = TypeId(0);
+            let id = TypeId(items.len() as u32);
             let ty = Type {
                 kind: TypeKind::Any,
                 nullable: false,
@@ -67,7 +102,7 @@ impl TypeArena {
         };
 
         let null_id = {
-            let id = TypeId(1);
+            let id = TypeId(items.len() as u32);
             let ty = Type {
                 kind: TypeKind::Null,
                 nullable: true,
@@ -78,7 +113,7 @@ impl TypeArena {
         };
 
         let never_id = {
-            let id = TypeId(3);
+            let id = TypeId(items.len() as u32);
             let ty = Type {
                 kind: TypeKind::Never,
                 nullable: false,
@@ -89,11 +124,12 @@ impl TypeArena {
         };
 
         let core = symbols.intern("core");
-        let item = |name: &str| ItemKey::new(core, symbols.intern(name));
+        let any_key = ItemKey::new(core, symbols.intern("any"));
+        let null_key = ItemKey::new(core, symbols.intern("null"));
         let mut alloc_type = |name: &str| {
             let id = TypeId(items.len() as u32);
             let ty = Type {
-                kind: TypeKind::Type(item(name)),
+                kind: TypeKind::Type(ItemKey::new(core, symbols.intern(name))),
                 nullable: false,
             };
             items.push(ty.clone());
@@ -104,6 +140,8 @@ impl TypeArena {
             any: any_id,
             null: null_id,
             never: never_id,
+            any_key,
+            null_key,
             bool_: alloc_type("bool"),
             int: alloc_type("int"),
             float: alloc_type("float"),
@@ -174,27 +212,15 @@ impl TypeArena {
         self.alloc(new_ty)
     }
 
-    /// Allocates a [`TypeKind::Null`] or yield the [`TypeId`] if already interned.
+    /// Yields the [`TypeId`] of the `null` type.
     pub fn null(&mut self) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Null,
-            nullable: true,
-        })
+        self.builtins.null
     }
 
-    /// Strict (non-nullable) `any`. Top of all *non-null* values.
-    /// `null → any` is a type error under GreyCat's strict
-    /// null-checking — only `any_nullable` accepts null.
-    ///
-    /// Most callers in the analyzer want
-    /// [`Self::any_nullable`]; reach for this only when the
-    /// surface syntax was `any` *without* a `?` and you need to
-    /// preserve that non-null guarantee through the type system.
+    /// Yields the [`TypeId`] of the `any` type.
+    /// This is **not** nullable.
     pub fn any(&mut self) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Any,
-            nullable: false,
-        })
+        self.builtins.any
     }
 
     /// Allocates a [`TypeKind::Any`] or yield the [`TypeId`] if already interned.
@@ -205,12 +231,9 @@ impl TypeArena {
         })
     }
 
-    /// Allocates a [`TypeKind::Never`] or yield the [`TypeId`] if already interned.
+    /// Yields the [`TypeId`] of the `never` type.
     pub fn never(&mut self) -> TypeId {
-        self.alloc(Type {
-            kind: TypeKind::Never,
-            nullable: false,
-        })
+        self.builtins.never
     }
 
     /// Allocates a [`TypeKind::Type`] or yield the [`TypeId`] if already interned.

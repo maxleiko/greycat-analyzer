@@ -155,17 +155,16 @@ fn lower_bare_name<E: TypeRefLowering>(
         return enum_id;
     }
     if let Some(handle) = resolved {
-        let ty = arena.alloc_type(handle);
-        // `any` / `null` resolve to `core::any` / `core::null`, but mint the
-        // lattice variants -- they encode top / proven-only-null, which the
-        // nominal `Type(core::X)` can't. `wrap_marker` still adds `?` on top.
-        if ty == arena.builtins.any {
+        // `any` / `null` resolve to the `core::any` / `core::null` decls but
+        // mint the lattice variants (top / proven-only-null), which a
+        // nominal `Type(core::X)` can't encode. `wrap_marker` adds `?` on top.
+        if handle == arena.builtins.any_key {
             return arena.any();
         }
-        if ty == arena.builtins.null {
+        if handle == arena.builtins.null_key {
             return arena.null();
         }
-        return ty;
+        return arena.alloc_type(handle);
     }
     arena.unresolved(name, span)
 }

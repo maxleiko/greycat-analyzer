@@ -270,8 +270,8 @@ fn find_local_var_init(hir: &Hir, stmt: Idx<Stmt>, sym: Symbol) -> Option<Idx<Ex
 mod tests {
     use super::*;
     use greycat_analyzer_core::SymbolTable;
-    use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_hir::hir::Decl;
+    use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
 
     /// Classify the first top-level `fn` decl in `src`.

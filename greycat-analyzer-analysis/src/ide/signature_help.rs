@@ -9,8 +9,8 @@ use wasm_bindgen::prelude::*;
 
 use greycat_analyzer_core::lsp_types::Position;
 use greycat_analyzer_core::{SourceEncoding, SymbolTable};
-use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::hir::Decl;
+use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_syntax::cst::node_at_offset;
 use greycat_analyzer_syntax::tree_sitter;
 

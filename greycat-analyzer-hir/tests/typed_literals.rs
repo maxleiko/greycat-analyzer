@@ -2,8 +2,8 @@
 //! [`LiteralKind`] variants instead of bare `Number`.
 
 use greycat_analyzer_core::SymbolTable;
-use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_hir::hir::{Decl, Expr, LiteralExpr, LiteralKind, Stmt};
+use greycat_analyzer_hir::lower_module;
 use greycat_analyzer_syntax::parse;
 
 fn first_var_init_kind(src: &str, idx: usize) -> LiteralKind {

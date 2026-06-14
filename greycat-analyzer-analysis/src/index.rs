@@ -1,7 +1,9 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use greycat_analyzer_core::lsp_types::Uri;
-use greycat_analyzer_core::{ItemKey, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind};
+use greycat_analyzer_core::{
+    Builtins, ItemKey, Symbol, SymbolTable, Type, TypeArena, TypeId, TypeKind,
+};
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::hir::{Annotation, Decl, Expr, TypeAttr};
 use greycat_analyzer_hir::{DeclRegistry, Hir};
@@ -884,31 +886,16 @@ impl ProjectIndex {
             }
         }
 
-        // Core builtins are always-available type names: the 8 primitives
-        // + `any` / `null` resolve to their canonical `core::X` handle even
-        // with no `core.gcl` loaded (no backing decl, so members stay empty
-        // until std loads -- but the identity is correct). A loaded decl
-        // wins above, carrying full member info.
-        let core = self.symbols.intern("core");
-        let mk_item = |name: &str| ItemKey::new(core, self.symbols.intern(name));
-        match &self.symbols[name] {
-            "bool" => Some(mk_item("bool")),
-            "int" => Some(mk_item("int")),
-            "float" => Some(mk_item("float")),
-            "char" => Some(mk_item("char")),
-            "time" => Some(mk_item("time")),
-            "duration" => Some(mk_item("duration")),
-            "String" => Some(mk_item("String")),
-            "geo" => Some(mk_item("geo")),
-            "node" => Some(mk_item("node")),
-            "nodeList" => Some(mk_item("nodeList")),
-            "nodeIndex" => Some(mk_item("nodeIndex")),
-            "nodeGeo" => Some(mk_item("nodeGeo")),
-            "nodeTime" => Some(mk_item("nodeTime")),
-            "any" => Some(mk_item("any")),
-            "null" => Some(mk_item("null")),
-            _ => None,
+        // Core builtins are always-available type names: the 8 primitives,
+        // the 5 `node` tags, and `any` / `null` resolve to their canonical
+        // `core::X` handle even with no `core.gcl` loaded (no backing decl,
+        // so members stay empty until std loads -- but the identity is
+        // correct). A loaded decl wins above, carrying full member info.
+        if Builtins::is_core_type_name(&self.symbols[name]) {
+            let core = self.symbols.intern("core");
+            return Some(ItemKey::new(core, name));
         }
+        None
     }
 
     /// `Symbol`-keyed location index. Caller must have
@@ -957,15 +944,24 @@ impl ProjectIndex {
     }
 
     /// `true` iff `name` resolves against any name the project knows:
-    /// a registered type / enum, a function, or a variable.
-    /// Resolver uses this as the post-local-scope fallback.
+    /// a registered type / enum, a function, a variable, or an
+    /// always-available core type name ([`Builtins::CORE_TYPE_NAMES`]) so a
+    /// std-free project still treats primitives / node tags / `any` /
+    /// `null` as known (mirrors `resolve_item`). Resolver uses this as the
+    /// post-local-scope fallback.
     pub fn has_name(&self, name: Symbol) -> bool {
         self.type_names.contains(&name)
             || self.fn_names.contains(&name)
             || self.var_names.contains(&name)
+            || Builtins::is_core_type_name(&self.symbols[name])
     }
 
-    pub fn resolutions(&self, hir: &Hir, current_uri: Option<&Uri>, map_item_key: Option<ItemKey>) -> Resolutions {
+    pub fn resolutions(
+        &self,
+        hir: &Hir,
+        current_uri: Option<&Uri>,
+        map_item_key: Option<ItemKey>,
+    ) -> Resolutions {
         let mut cx = ResolverCx::new(hir, self, current_uri, map_item_key);
 
         let Some(module) = hir.module.as_ref() else {

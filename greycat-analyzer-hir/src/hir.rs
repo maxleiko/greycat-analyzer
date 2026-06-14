@@ -25,7 +25,11 @@ pub struct Hir {
 
 impl Hir {
     #[inline]
-    pub fn ident_symbol<'symbols>(&self, id: Idx<Ident>, symbols: &'symbols SymbolTable) -> &'symbols str {
+    pub fn ident_symbol<'symbols>(
+        &self,
+        id: Idx<Ident>,
+        symbols: &'symbols SymbolTable,
+    ) -> &'symbols str {
         &symbols[self.idents[id].symbol]
     }
 }

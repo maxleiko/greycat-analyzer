@@ -172,8 +172,8 @@ pub fn dead_else_range_for_exhaustive_chain(hir: &Hir, head_id: Idx<Stmt>) -> Op
 mod tests {
     use super::*;
     use greycat_analyzer_core::SymbolTable;
-    use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_hir::hir::{Decl, FnDecl};
+    use greycat_analyzer_hir::lower_module;
     use greycat_analyzer_syntax::parse;
 
     fn lower(src: &str) -> (Hir, SymbolTable) {
