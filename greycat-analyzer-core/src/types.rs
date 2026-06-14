@@ -315,6 +315,7 @@ mod tests {
     fn typekind_name_dedups() {
         let mut cx = TextCx::default();
         let array_ty = cx.item("Array");
+        let base = cx.arena.len();
         let a = cx
             .arena
             .alloc_generic(array_ty, vec![cx.arena.builtins.int]);
@@ -322,25 +323,39 @@ mod tests {
             .arena
             .alloc_generic(array_ty, vec![cx.arena.builtins.int]);
         assert_eq!(a, b);
-        assert_eq!(cx.arena.len(), 2);
+        assert_eq!(
+            cx.arena.len(),
+            base + 1,
+            "interning the same generic twice adds one entry"
+        );
     }
 
     #[test]
     fn nullable_idempotent() {
         let mut cx = TextCx::default();
+        let base = cx.arena.len();
         let q1 = cx.arena.nullable(cx.arena.builtins.int);
         let q2 = cx.arena.nullable(q1);
         assert_eq!(q1, q2);
-        assert_eq!(cx.arena.len(), 2);
+        assert_eq!(
+            cx.arena.len(),
+            base + 1,
+            "nullable adds one entry, then is idempotent"
+        );
     }
 
     #[test]
     fn strip_nullable_idempotent() {
         let mut cx = TextCx::default();
+        let base = cx.arena.len();
         let ni = cx.arena.nullable(cx.arena.builtins.int);
         let i2 = cx.arena.strip_nullable(ni);
         assert_eq!(cx.arena.builtins.int, i2);
-        assert_eq!(cx.arena.len(), 2);
+        assert_eq!(
+            cx.arena.len(),
+            base + 1,
+            "only the nullable variant is added; strip reuses the builtin"
+        );
     }
 
     #[test]
