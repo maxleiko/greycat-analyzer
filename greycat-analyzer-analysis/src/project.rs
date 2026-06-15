@@ -2060,6 +2060,7 @@ impl ProjectAnalysis {
             );
             collect_instance_method_value_ref_diags(&self.modules, cur_uri, &mut diags);
             collect_static_type_args_diags(&self.modules, cur_uri, &mut diags);
+            collect_generic_arity_diags(cur_module, index, &mut diags);
             collect_object_construction_diags(
                 &self.modules,
                 arena_mut,
@@ -3341,6 +3342,54 @@ fn collect_static_type_args_diags(
             code: "static-type-args",
             message: "generic type arguments are not allowed on a static access".to_string(),
             byte_range: name_end..close,
+            category: DiagCategory::TypeRelation,
+        });
+    }
+}
+
+/// Flag a generic type reference instantiated with the wrong number of
+/// type arguments — `nodeTime<int, float>` (nodeTime takes 1), `Map<int>`
+/// (Map takes 2), `Box<int, float>` (a user `Box<T>` takes 1). The
+/// runtime rejects these with "<T> defines N generic params while M
+/// detected". A bare reference with no args (`Map`, `node`) is the
+/// all-`any?` default and stays valid; only a non-empty, wrong-count
+/// argument list is flagged. Heads whose arity isn't a known generic
+/// (non-generic types, generic params in scope, unresolved names) are
+/// left alone — the arity oracle only speaks for generic decls.
+fn collect_generic_arity_diags(
+    cur_module: &ModuleAnalysis,
+    index: &ProjectIndex,
+    diags: &mut Vec<SemanticDiagnostic>,
+) {
+    use crate::analyzer::{DiagCategory, SemanticDiagnostic, Severity};
+    use crate::lower_type_ref::generic_arity_for;
+
+    for (_idx, tr) in cur_module.hir.type_refs.iter() {
+        if tr.params.is_empty() {
+            continue;
+        }
+        let name = cur_module.hir.idents[tr.name].symbol;
+        let Some(expected) = generic_arity_for(
+            name,
+            &cur_module.hir,
+            &cur_module.analysis.type_decls,
+            index,
+        ) else {
+            continue;
+        };
+        let got = tr.params.len();
+        if got == expected {
+            continue;
+        }
+        let head = &index.symbols[name];
+        diags.push(SemanticDiagnostic {
+            severity: Severity::Error,
+            code: "generic-arity-mismatch",
+            message: format!(
+                "`{head}` expects {expected} generic argument{}, but got {got}",
+                if expected == 1 { "" } else { "s" },
+            ),
+            byte_range: tr.byte_range.clone(),
             category: DiagCategory::TypeRelation,
         });
     }
