@@ -89,6 +89,8 @@ inherits = "release"
 strip = false
 lto = false
 opt-level = 1
+codegen-units = 256
+incremental = true
 
 [profile.profiling]
 inherits = "release"
