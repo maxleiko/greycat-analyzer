@@ -3383,8 +3383,40 @@ fn collect_object_construction_diags(
         let Expr::PositionalObject(obj_expr) = expr else {
             continue;
         };
-        // Empty `T {}` is always a valid default-init.
+        // Empty `T {}` is a valid default-init for every head EXCEPT a
+        // `node<T>` whose element type is non-nullable: the runtime
+        // rejects `node<int> {}` with "non nullable node requires an
+        // initial value". A nullable element (`node<int?> {}`) defaults
+        // to null and stays valid.
         if obj_expr.fields.is_empty() {
+            if let Some(obj_ty) = cur_module.analysis.expr_types.get(&obj_expr_id).copied() {
+                let node_elem = match &arena.get(obj_ty).kind {
+                    TypeKind::Generic { tpl, args } => Some((*tpl, args.first().copied())),
+                    _ => None,
+                };
+                if let Some((tpl, Some(elem_ty))) = node_elem
+                    && arena.is_node(tpl)
+                    && !arena.get(elem_ty).nullable
+                {
+                    let elem_disp = display_type_for_module(
+                        arena,
+                        index,
+                        decl_registry,
+                        elem_ty,
+                        Some(cur_uri),
+                    );
+                    diags.push(SemanticDiagnostic {
+                        severity: Severity::Error,
+                        code: "node-init-required",
+                        message: format!(
+                            "`node<{elem_disp}>` requires an initial value \
+                             (`{elem_disp}` is not nullable)"
+                        ),
+                        byte_range: obj_expr.byte_range.clone(),
+                        category: DiagCategory::TypeRelation,
+                    });
+                }
+            }
             continue;
         }
         // Dispatch on the already-settled outer type identity.

@@ -74,6 +74,7 @@ fn codes(pa: &ProjectAnalysis, uri: &Uri) -> Vec<&'static str> {
                 d.code,
                 "positional-object-init"
                     | "node-init-arity"
+                    | "node-init-required"
                     | "node-tag-no-init"
                     | "fixed-tuple-arity"
                     | "fixed-tuple-element-type"
@@ -181,6 +182,26 @@ fn node_more_than_one_positional_rejected() {
     let (uri, pa) = analyze("fn main() { var _ = node { 1, 2 }; }\n");
     let cs = codes(&pa, &uri);
     assert_eq!(cs, vec!["node-init-arity"]);
+}
+
+#[test]
+fn empty_node_non_nullable_inner_requires_initial_value() {
+    // Runtime: `node<int> {}` -> "non nullable node requires an initial
+    // value". The default-init shortcut must not let it through.
+    let (uri, pa) = analyze("fn main() { var _ = node<int> {}; }\n");
+    let cs = codes(&pa, &uri);
+    assert_eq!(cs, vec!["node-init-required"]);
+}
+
+#[test]
+fn empty_node_nullable_inner_is_ok() {
+    // `node<int?> {}` defaults to null — valid, no diagnostic.
+    let (uri, pa) = analyze("fn main() { var _ = node<int?> {}; }\n");
+    let cs = codes(&pa, &uri);
+    assert!(
+        cs.is_empty(),
+        "nullable inner allows empty init, got: {cs:?}"
+    );
 }
 
 #[test]
