@@ -2083,15 +2083,6 @@ fn member_completion(
 
     let mut items: Vec<CompletionItem> = Vec::new();
 
-    // Substitution context for receiver-instantiation rendering. When
-    // the receiver is `Array<String>`, build `{T → String}` so each
-    // method completion item's `detail` shows `value: String` instead
-    // of `value: T`.
-    let recv_subst = project.method_subst_from_receiver_ty(recv_ty);
-    let recv_ctx = recv_subst
-        .as_ref()
-        .map(|subst| RenderCtx { project, subst });
-
     // For `->` on a node-tag receiver, skip the tag's own members
     // entirely — those are reachable via `.` only. The analyzer's
     // `arrow_deref_receiver` mirrors this dispatch.
@@ -2107,23 +2098,50 @@ fn member_completion(
             .lookup(name)
             .and_then(|s| type_item_id_by_name(project, uri, s));
         if let Some(start_id) = start_id {
+            let recv_args: Vec<TypeId> = match &arena.get(recv_ty).kind {
+                TypeKind::Generic { args, .. } => args.to_vec(),
+                _ => Vec::new(),
+            };
+            // Each level carries its accumulated generic substitution via
+            // the shared `supertype_levels` walk (same resolution as
+            // member-access typing + object construction), so an inherited
+            // attr `node: node<T>` on `Parent<int>` renders `node<int>`,
+            // not the raw `node<T>`. Read-only path: substitute against a
+            // clone so the shared arena stays untouched.
+            let mut working_arena = arena.clone();
+            let levels = project
+                .index
+                .supertype_levels(&mut working_arena, start_id, &recv_args);
             let symbols = project.symbols();
             let mut emitted: FxHashSet<String> = FxHashSet::default();
-            walk_supertype_chain(project, start_id, |depth, hir, td| {
-                // The receiver's own type renders methods with the
-                // receiver's instantiation; ancestors render in declared
-                // form (their generic params aren't the receiver's).
-                let ctx = if depth == 0 { recv_ctx.as_ref() } else { None };
+            for (level, subst) in &levels {
+                let Some(members) = project.index.type_members.get(level) else {
+                    continue;
+                };
+                let Some(fmod) = project.module(&members.home_uri) else {
+                    continue;
+                };
+                let Some(decl_id) = fmod.analysis.type_decls.get(&level.name).copied() else {
+                    continue;
+                };
+                let Decl::Type(td) = &fmod.hir.decls[decl_id] else {
+                    continue;
+                };
+                let ctx = if subst.is_empty() {
+                    None
+                } else {
+                    Some(RenderCtx { project, subst })
+                };
                 collect_type_members(
-                    hir,
+                    &fmod.hir,
                     symbols,
                     td,
                     &prefix_lower,
                     &mut emitted,
                     &mut items,
-                    ctx,
+                    ctx.as_ref(),
                 );
-            });
+            }
         }
     }
 

@@ -2956,33 +2956,50 @@ impl<'a> Cx<'a> {
         // Attr — extract receiver shape (need owned name + args because
         // the arena entry borrow has to drop before we re-borrow as
         // mutable for `substitute`).
-        let (type_id, instantiation): (ItemKey, &[TypeId]) = match &self.arena.get(recv_ty).kind {
+        // Own the args (Copy `TypeId`s) so the immutable arena borrow
+        // drops before `substituted_attr_ty_chain` re-borrows `&mut self`.
+        let (type_id, instantiation): (ItemKey, Vec<TypeId>) = match &self.arena.get(recv_ty).kind {
             // Handle-keyed variants carry the full identity.
-            TypeKind::Type(d) => (*d, &[]),
-            TypeKind::Generic { tpl, args } => (*tpl, args.as_slice()),
+            TypeKind::Type(d) => (*d, Vec::new()),
+            TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
             _ => return None,
         };
-        // Build the substitution map *before* mutably borrowing the
-        // arena (substitute) — `members` borrows `self.index`.
-        // Chain-walking lookup so attrs declared on a
-        // parent type (`type Sub extends Super { ... }`) resolve
-        // when accessed through a `Sub` receiver.
+        // Chain-walking lookup so attrs declared on a parent type
+        // (`type Sub extends Super { ... }`) resolve when accessed
+        // through a `Sub` receiver, substituting the type parameter at
+        // each `extends Base<X>` hop.
         let property_sym = self.hir.idents[property].symbol;
-        let (attr_ty, subst) = {
-            let attr_ty = self.index.type_attr_ty_chain(type_id, property_sym)?;
-            // Generic substitution is driven by the *receiver type*'s
-            // own generic params, not the parent's — `node<Foo<int>>`
-            // accessing a `Foo`-declared attr substitutes `T → int`.
-            let members = self.index.type_members.get(&type_id)?;
-            let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
-            for (i, gp_sym) in members.generics.iter().enumerate() {
-                if let Some(arg) = instantiation.get(i) {
-                    subst.insert(*gp_sym, *arg);
-                }
+        self.substituted_attr_ty_chain(type_id, &instantiation, property_sym)
+    }
+
+    /// Resolve an attribute's declared type through the supertype chain,
+    /// substituting each hop's generic arguments via the shared
+    /// [`ProjectIndex::supertype_levels`] walk. Stops at the first level
+    /// that declares `attr_name`, so an attr inherited from `extends
+    /// Box<int>` resolves `T` to `int` even when the receiver type is
+    /// itself non-generic.
+    fn substituted_attr_ty_chain(
+        &mut self,
+        type_id: ItemKey,
+        instantiation: &[TypeId],
+        attr_name: Symbol,
+    ) -> Option<TypeId> {
+        let index = self.index;
+        let levels = index.supertype_levels(self.arena, type_id, instantiation);
+        for (level, subst) in &levels {
+            if let Some(raw_ty) = index
+                .type_members
+                .get(level)
+                .and_then(|m| m.attr_types.get(&attr_name).copied())
+            {
+                return Some(if subst.is_empty() {
+                    raw_ty
+                } else {
+                    self.arena.substitute(raw_ty, subst)
+                });
             }
-            (attr_ty, subst)
-        };
-        Some(self.arena.substitute(attr_ty, &subst))
+        }
+        None
     }
 
     // Lower a syntactic TypeRef to a TypeId.

@@ -273,7 +273,8 @@ fn ident_hover_markdown(
     if let Some(member) = analysis.member_lookup(ident_idx) {
         let subst_owner = project.and_then(|ctx| {
             let recv_ty = receiver_ty_for_property(hir, analysis, ident_idx)?;
-            ctx.project.method_subst_from_receiver_ty(recv_ty)
+            ctx.project
+                .member_subst_from_receiver_ty(recv_ty, ident.symbol)
         });
         let render_ctx = project
             .zip(subst_owner.as_ref())
@@ -298,8 +299,10 @@ fn ident_hover_markdown(
         && let Some(fmod) = ctx.project.module(&foreign.uri)
     {
         let provenance = module_label_for_uri(&foreign.uri);
-        let subst_owner = receiver_ty_for_property(hir, analysis, ident_idx)
-            .and_then(|recv_ty| ctx.project.method_subst_from_receiver_ty(recv_ty));
+        let subst_owner = receiver_ty_for_property(hir, analysis, ident_idx).and_then(|recv_ty| {
+            ctx.project
+                .member_subst_from_receiver_ty(recv_ty, ident.symbol)
+        });
         let render_ctx = subst_owner.as_ref().map(|subst| RenderCtx {
             project: ctx.project,
             subst,

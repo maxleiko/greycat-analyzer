@@ -328,6 +328,77 @@ impl ProjectIndex {
     /// without depending on the private constant.
     pub const MAX_INHERITANCE_DEPTH: usize = MAX_SUPERTYPE_CHAIN_DEPTH;
 
+    /// Walk the `extends` chain from `start` instantiated with
+    /// `start_args`, returning each level paired with the substitution
+    /// map binding *that level's* generic params to concrete types. Seeds
+    /// from `start_args`, then threads each `extends Base<X>` hop's args
+    /// through the running map — so a member inherited from a generic
+    /// supertype substitutes correctly even across non-generic
+    /// intermediate types (`Concrete extends SomeType extends Parent<int>`
+    /// resolves `Parent`'s `T` to `int`). Single source of truth for
+    /// inherited-generic substitution: member-access typing, object
+    /// construction, and completion all consume it. Bounded + cycle-safe.
+    pub(crate) fn supertype_levels(
+        &self,
+        arena: &mut TypeArena,
+        start: ItemKey,
+        start_args: &[TypeId],
+    ) -> Vec<(ItemKey, FxHashMap<Symbol, TypeId>)> {
+        let mut out: Vec<(ItemKey, FxHashMap<Symbol, TypeId>)> = Vec::new();
+        let mut cur_tpl = start;
+        let mut cur_subst: FxHashMap<Symbol, TypeId> = match self.type_members.get(&cur_tpl) {
+            Some(m) => m
+                .generics
+                .iter()
+                .copied()
+                .zip(start_args.iter().copied())
+                .collect(),
+            None => return out,
+        };
+        let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
+        for _ in 0..MAX_SUPERTYPE_CHAIN_DEPTH {
+            if !seen.insert(cur_tpl) {
+                break;
+            }
+            out.push((cur_tpl, cur_subst.clone()));
+            let Some(sup_ty_raw) = self.type_members.get(&cur_tpl).and_then(|m| m.supertype_ty)
+            else {
+                break;
+            };
+            // Resolve the parent instantiation's args through this level's
+            // subst before reading them (a generic intermediate like
+            // `Mid<T> extends Base<T>` needs `T` mapped first).
+            let sup_ty = if cur_subst.is_empty() {
+                sup_ty_raw
+            } else {
+                arena.substitute(sup_ty_raw, &cur_subst)
+            };
+            match arena.get(sup_ty).kind.clone() {
+                TypeKind::Generic { tpl, args } => {
+                    let Some(parent_m) = self.type_members.get(&tpl) else {
+                        break;
+                    };
+                    if parent_m.generics.len() != args.len() {
+                        break;
+                    }
+                    cur_subst = parent_m
+                        .generics
+                        .iter()
+                        .copied()
+                        .zip(args.iter().copied())
+                        .collect();
+                    cur_tpl = tpl;
+                }
+                TypeKind::Type(decl) => {
+                    cur_tpl = decl;
+                    cur_subst.clear();
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
     /// Bounded at [`MAX_SUPERTYPE_CHAIN_DEPTH`] hops to match the
     /// runtime's inheritance-depth ceiling and defend against accidental
     /// cycles in in-progress source.

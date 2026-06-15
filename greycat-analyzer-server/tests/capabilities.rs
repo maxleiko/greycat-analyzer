@@ -479,6 +479,81 @@ fn main() {
 }
 
 #[test]
+fn completion_inherited_attr_from_generic_supertype_substitutes() {
+    // `IntBox extends Box<int>` inheriting `v: T` — completion on an
+    // `IntBox` receiver must render `v` as `: int`, substituting `T :=
+    // int` through the supertype chain, not the raw `: T`.
+    let src = "\
+type Box<T> {
+    v: T;
+}
+type IntBox extends Box<int> {}
+
+fn main() {
+    var b = IntBox {};
+    b.;
+}
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "b.;");
+    let cursor = Position {
+        line: cursor.line,
+        character: cursor.character + 2, // skip "b."
+    };
+    let list = test_project
+        .completion(cursor)
+        .expect("completion list at b.|");
+    let v = list
+        .items
+        .iter()
+        .find(|c| c.label == "v")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected inherited `v` in completion items, got {:?}",
+                list.items.iter().map(|c| &c.label).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        v.detail.as_deref(),
+        Some(": int"),
+        "inherited `v` must substitute `T := int`, not render `: T`"
+    );
+}
+
+#[test]
+fn hover_on_inherited_attr_from_generic_supertype_substitutes() {
+    // `IntBox extends Box<int>` inheriting `v: T` — hover on `b.v` must
+    // render `v: int`, substituting `T := int` through the supertype
+    // chain (same resolution as completion / member typing), not `v: T`.
+    let src = "\
+type Box<T> {
+    v: T;
+}
+type IntBox extends Box<int> {}
+
+fn main() {
+    var b = IntBox {};
+    println(b.v);
+}
+";
+    let test_project = TestProject::single_file(src);
+    let cursor = position_of(src, "v)"); // the `v` in `b.v`
+    let h = test_project.hover(cursor).expect("hover present");
+    let HoverContents::Markup(content) = h.contents else {
+        panic!("expected markup contents")
+    };
+    let v = &content.value;
+    assert!(
+        v.contains(": int"),
+        "inherited `v` hover must substitute `T := int`, got {v}"
+    );
+    assert!(
+        !v.contains(": T"),
+        "inherited `v` hover must not render raw `: T`, got {v}"
+    );
+}
+
+#[test]
 fn hover_on_unknown_object_field_skips_object_field_path() {
     let src = "\
 type Reader {

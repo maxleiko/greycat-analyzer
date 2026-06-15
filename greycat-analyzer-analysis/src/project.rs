@@ -297,40 +297,43 @@ impl ProjectAnalysis {
     /// i.e. there are no generic params to substitute.
     ///
     /// Looks up the receiver's owning HIR `TypeDecl` through
-    /// [`ProjectIndex::locate_decl_in_ns`] to read the generic param
-    /// symbols, then zips them with the receiver's concrete args. Used
-    /// by capability handlers to render method signatures with the
-    /// receiver's instantiation substituted (so hover / completion on
-    /// `arr.add(...)` where `arr: Array<String>` shows
-    /// `fn add(value: String): null`, not `fn add(value: T): null`).
-    pub fn method_subst_from_receiver_ty(
+    /// [`ProjectIndex::supertype_levels`] from the receiver, then returns
+    /// the substitution map for the nearest level that declares
+    /// `member_name`. Walking the `extends` chain (rather than reading the
+    /// receiver's own params only) is what lets a member inherited from a
+    /// generic supertype (`Derived extends Base<int>`) render with the
+    /// declaring level's params substituted — hover on `d.value` where
+    /// `value: T` lives on `Base` shows `value: int`, not `value: T`.
+    /// `None` when the receiver isn't a generic instantiation or the
+    /// declaring level carries no substitution. Clones the arena
+    /// (read-only path), matching completion.
+    pub fn member_subst_from_receiver_ty(
         &self,
         recv_ty: TypeId,
+        member_name: Symbol,
     ) -> Option<FxHashMap<Symbol, TypeId>> {
-        let (decl_id, args) = match &self.arena.get(recv_ty).kind {
-            TypeKind::Generic { tpl, args } if !args.is_empty() => (*tpl, args.as_slice()),
+        // The receiver may be a bare `Type(IntBox)` whose generic
+        // instantiation lives on its `extends Box<int>` supertype, not in
+        // its own args — so seed `supertype_levels` from either shape and
+        // let the walk pick up `T := int` at the declaring level.
+        let (tpl, args) = match &self.arena.get(recv_ty).kind {
+            TypeKind::Generic { tpl, args } => (*tpl, args.to_vec()),
+            TypeKind::Type(tpl) => (*tpl, Vec::new()),
             _ => return None,
         };
-        let name_sym = decl_id.name;
-        let (foreign_uri, foreign_decl_id) = self
-            .index
-            .locate_decl_in_ns(name_sym, crate::index::Namespace::Type)
-            .next()?;
-        let fmod = self.module(foreign_uri)?;
-        let Decl::Type(td) = &fmod.hir.decls[foreign_decl_id] else {
-            return None;
-        };
-        let mut subst: FxHashMap<Symbol, TypeId> = FxHashMap::default();
-        for (i, gen_idx) in td.generics.iter().enumerate() {
-            let gen_sym = fmod.hir.idents[*gen_idx].symbol;
-            if let Some(arg_id) = args.get(i).copied() {
-                subst.insert(gen_sym, arg_id);
+        let mut working = self.arena.clone();
+        let levels = self.index.supertype_levels(&mut working, tpl, &args);
+        for (level, subst) in levels {
+            let Some(members) = self.index.type_members.get(&level) else {
+                continue;
+            };
+            if members.attr_types.contains_key(&member_name)
+                || members.methods.contains_key(&member_name)
+            {
+                return (!subst.is_empty()).then_some(subst);
             }
         }
-        if subst.is_empty() {
-            return None;
-        }
-        Some(subst)
+        None
     }
 
     /// One-pass build over every document currently in `manager`.
@@ -3065,85 +3068,36 @@ fn collect_object_field_diags_split(
         let Some(head_members) = index.type_members.get(&head_id) else {
             continue;
         };
-        // Build substitution from the object expr's own settled TypeId.
-        // Non-generic head ⇒ empty subst (a no-op). Arity mismatch ⇒
-        // skip the whole expr; the head's lowering pass already flagged
-        // it elsewhere and substituting with the wrong shape would
-        // surface noise.
-        let init_subst: FxHashMap<Symbol, TypeId> = match &arena.get(obj_ty).kind {
+        // Args the head is instantiated with. Non-generic head ⇒ no
+        // args. Arity mismatch ⇒ skip the whole expr (flagged by
+        // `collect_generic_arity_diags`; substituting the wrong shape
+        // here would surface noise).
+        let head_args: Vec<TypeId> = match &arena.get(obj_ty).kind {
             TypeKind::Generic { args, .. } if args.len() == head_members.generics.len() => {
-                head_members
-                    .generics
-                    .iter()
-                    .copied()
-                    .zip(args.iter().copied())
-                    .collect()
+                args.to_vec()
             }
-            TypeKind::Type(_) if head_members.generics.is_empty() => FxHashMap::default(),
+            TypeKind::Type(_) if head_members.generics.is_empty() => Vec::new(),
             _ => continue,
         };
-        // Walk the chain Sub → Base<int> → Base<int>'s parent …,
-        // accumulating each level's subst so an attr inherited from
-        // a generic parent (`val: T` on `Base<T>`) gets `T`
-        // substituted with the concrete arg the child instantiates
-        // (`Sub extends Base<int>` → `val: int`). Mirrors the
-        // [`walk_substituted_supertype_chain`] flow used by
-        // assignability; we can't share that helper here because
-        // we need each hop's attr table, not just the final
-        // assignability result.
-        //
-        // `chain_attrs` stores the *already-substituted* declared
-        // type per attr, so the per-field check is a direct lookup
-        // — no second-pass substitution needed.
+        // Resolve each attr's declared type through the supertype chain,
+        // substituting per hop, so an attr inherited from a generic
+        // parent (`val: T` on `Base<T>`) gets `T` resolved to the
+        // concrete arg the child instantiates (`Sub extends Base<int>` →
+        // `val: int`). First-declared wins, so a subtype shadows its
+        // parent's same-named attr.
         let mut chain_attrs: FxHashMap<Symbol, (TypeId, bool)> = FxHashMap::default();
-        let mut cur_tpl = head_id;
-        let mut cur_subst = init_subst;
-        let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
-        for _ in 0..32 {
-            if !seen.insert(cur_tpl) {
-                break;
-            }
-            let Some(m) = index.type_members.get(&cur_tpl) else {
-                break;
+        for (level, subst) in index.supertype_levels(arena, head_id, &head_args) {
+            let Some(m) = index.type_members.get(&level) else {
+                continue;
             };
             for (sym, raw_ty) in &m.attr_types {
-                let ty = if cur_subst.is_empty() {
+                let ty = if subst.is_empty() {
                     *raw_ty
                 } else {
-                    arena.substitute(*raw_ty, &cur_subst)
+                    arena.substitute(*raw_ty, &subst)
                 };
                 let is_static = m.static_attrs.contains(sym);
                 chain_attrs.entry(*sym).or_insert((ty, is_static));
-            }
-            let Some(sup_ty_raw) = m.supertype_ty else {
-                break;
-            };
-            let sup_ty = if cur_subst.is_empty() {
-                sup_ty_raw
-            } else {
-                arena.substitute(sup_ty_raw, &cur_subst)
-            };
-            match arena.get(sup_ty).kind.clone() {
-                TypeKind::Generic { tpl, args } => {
-                    let Some(parent_m) = index.type_members.get(&tpl) else {
-                        break;
-                    };
-                    if parent_m.generics.len() != args.len() {
-                        break;
-                    }
-                    cur_tpl = tpl;
-                    cur_subst = parent_m
-                        .generics
-                        .iter()
-                        .copied()
-                        .zip(args.iter().copied())
-                        .collect();
-                }
-                TypeKind::Type(decl) => {
-                    cur_tpl = decl;
-                    cur_subst.clear();
-                }
-                _ => break,
             }
         }
         for f in obj_expr.fields.iter() {
