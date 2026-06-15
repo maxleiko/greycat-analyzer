@@ -11,7 +11,9 @@
 //!   "condition is always false".
 //! - `x != null` / `x == null` on a non-nullable binding emit
 //!   always-true / always-false.
-//! - Boolean literal conditions (`if (true)` / `if (false)`).
+//! - Boolean literal conditions (`if (true)` / `if (false)` / `!(true)`)
+//!   are provably decidable but written by the author, so they are
+//!   *suppressed* — only type-derived decidability warns.
 
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceManager;
@@ -282,7 +284,9 @@ fn main(x: int?) {
 }
 
 #[test]
-fn literal_true_condition_always_true() {
+fn literal_true_condition_does_not_warn() {
+    // A written `true` is provably decidable but reveals nothing the
+    // author didn't type — the warning is suppressed.
     let src = "\
 fn main() {
     if (true) {
@@ -293,15 +297,16 @@ fn main() {
     let (uri, pa) = analyze(src);
     let diags = diag_messages(&pa, &uri);
     let always_true: Vec<&String> = diags.iter().filter(|m| m.contains("always true")).collect();
-    assert_eq!(
-        always_true.len(),
-        1,
-        "expected one always-true diag, got: {diags:?}"
+    assert!(
+        always_true.is_empty(),
+        "literal `true` must not warn, got: {diags:?}"
     );
 }
 
 #[test]
-fn literal_false_condition_always_false() {
+fn literal_false_condition_does_not_warn() {
+    // `if (false)` is suppressed too; the dead body is still covered by
+    // the separate `unreachable` lint via `decidable_conditions`.
     let src = "\
 fn main() {
     if (false) {
@@ -315,16 +320,16 @@ fn main() {
         .iter()
         .filter(|m| m.contains("always false"))
         .collect();
-    assert_eq!(
-        always_false.len(),
-        1,
-        "expected one always-false diag, got: {diags:?}"
+    assert!(
+        always_false.is_empty(),
+        "literal `false` must not warn, got: {diags:?}"
     );
 }
 
 #[test]
-fn composition_not_inverts_decidable() {
-    // `!(true)` is always false; `!(false)` is always true.
+fn negated_literal_does_not_warn() {
+    // `!(true)` / `!(false)` reduce to a written constant through `!` and
+    // `( )`, so they are suppressed as well.
     let src = "\
 fn main() {
     if (!(true)) {
@@ -337,20 +342,13 @@ fn main() {
 ";
     let (uri, pa) = analyze(src);
     let diags = diag_messages(&pa, &uri);
-    let always_false: Vec<&String> = diags
+    let decidable: Vec<&String> = diags
         .iter()
-        .filter(|m| m.contains("always false"))
+        .filter(|m| m.contains("always false") || m.contains("always true"))
         .collect();
-    let always_true: Vec<&String> = diags.iter().filter(|m| m.contains("always true")).collect();
-    assert_eq!(
-        always_false.len(),
-        1,
-        "expected one always-false from !(true), got: {diags:?}"
-    );
-    assert_eq!(
-        always_true.len(),
-        1,
-        "expected one always-true from !(false), got: {diags:?}"
+    assert!(
+        decidable.is_empty(),
+        "negated literal must not warn, got: {diags:?}"
     );
 }
 

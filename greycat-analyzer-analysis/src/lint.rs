@@ -3003,13 +3003,33 @@ fn f(): int {
     }
 
     #[test]
-    fn while_loop_does_not_make_post_loop_dead() {
-        // Conservative on loops: even though the body returns, the
-        // post-while statement is reachable (loop may not execute).
+    fn infinite_while_true_makes_post_loop_dead() {
+        // `while (true)` with no break never exits, so the post-while
+        // statement is unreachable.
         let diags = project_lints(
             r#"
 fn f(): int {
     while (true) {
+        return 1;
+    }
+    return 0;
+}
+"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "unreachable"),
+            "post-while-true should be dead: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_literal_while_does_not_make_post_loop_dead() {
+        // Conservative on real loops: a non-literal condition may be
+        // false on entry, so the post-while statement is reachable.
+        let diags = project_lints(
+            r#"
+fn f(x: bool): int {
+    while (x) {
         return 1;
     }
     return 0;

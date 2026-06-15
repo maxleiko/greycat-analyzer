@@ -9,12 +9,13 @@
 //! ([`crate::lint`]'s `unreachable` rule) consumes this primitive
 //! to flag statements that follow a divergent sibling.
 //!
-//! **Conservative on loops.** `while` / `for` / `for-in` / `do-while`
-//! never count as divergent: we don't const-fold conditions, so we
-//! can't prove the loop body executes at all (much less that every
-//! exit path diverges). `do-while` *does* execute the body once but
-//! we still skip it for v1 — the win is small and the false-positive
-//! risk on early-return-in-do-while is real.
+//! **Conservative on loops, with one exception.** Loops with a
+//! non-literal condition stay non-divergent: we don't const-fold, so we
+//! can't prove the body runs or that every exit diverges. The lone
+//! exception is the unconditional infinite loop — `while (true)` and a
+//! `for (var i = ...; true; ...)` with a literal-`true` condition — which
+//! diverges when no `break` targets it. `do-while` / `for-in` stay
+//! conservative.
 //!
 //! **Conservative on functions.** Bare expression statements never
 //! diverge — even when the call is to a function whose body always
@@ -24,7 +25,7 @@ use std::ops::Range;
 
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::hir::{BlockStmt, IfStmt, Stmt, TryStmt};
+use greycat_analyzer_hir::hir::{AtStmt, BlockStmt, Expr, IfStmt, LiteralKind, Stmt, TryStmt};
 
 use crate::analyzer::AnalysisResult;
 
@@ -43,8 +44,21 @@ pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
         // block diverges (the at-stmt itself is otherwise straight-
         // through).
         Stmt::At(a) => block_diverges(hir, &a.block),
-        // Loops never diverge from the analyzer's POV — see module docs.
-        Stmt::While(_) | Stmt::DoWhile(_) | Stmt::For(_) | Stmt::ForIn(_) => false,
+        // Narrow infinite-loop rule: a `while (true)` or a C-style
+        // `for (var i = ...; true; ...)` with a literal-`true` condition
+        // and no `break` targeting it can never fall through. Any other
+        // loop stays conservative (`false`) — we don't const-fold
+        // non-literal conditions, and a break makes the exit reachable.
+        // (GreyCat's `for` requires all three clauses; there is no
+        // `for (;;)`.)
+        Stmt::While(w) => {
+            is_true_literal(hir, w.condition) && !block_breaks_current_loop(hir, &w.body)
+        }
+        Stmt::For(f) => {
+            f.condition.is_some_and(|c| is_true_literal(hir, c))
+                && !block_breaks_current_loop(hir, &f.body)
+        }
+        Stmt::DoWhile(_) | Stmt::ForIn(_) => false,
         // Pure straight-line statements. `breakpoint` is intentionally
         // here because it pauses the worker for debugging, then execution
         // resumes from the next statement. Treating it as divergent
@@ -100,6 +114,59 @@ fn if_diverges(hir: &Hir, i: &IfStmt) -> bool {
 
 fn try_diverges(hir: &Hir, t: &TryStmt) -> bool {
     block_diverges(hir, &t.try_block) && block_diverges(hir, &t.catch_block)
+}
+
+/// `true` iff `expr_id` is the literal `true`.
+fn is_true_literal(hir: &Hir, expr_id: Idx<Expr>) -> bool {
+    matches!(
+        &hir.exprs[expr_id],
+        Expr::Literal(l) if l.kind == LiteralKind::Bool(true)
+    )
+}
+
+/// `true` if `block` contains a `Stmt::Break` whose target is the
+/// enclosing loop — i.e. not enclosed in a nested loop. GreyCat's
+/// `break` carries no labels (`Stmt::Break` is a unit variant per
+/// `greycat-analyzer-hir`), so a break inside a nested `while` / `for` /
+/// `do-while` / `for-in` unambiguously targets that inner loop; we stop
+/// walking at those. Used by the infinite-loop divergence rule above and
+/// by the post-loop else-narrow lift in the analyzer.
+pub(crate) fn block_breaks_current_loop(hir: &Hir, block: &BlockStmt) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|s| stmt_breaks_current_loop(hir, *s))
+}
+
+fn stmt_breaks_current_loop(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
+    match &hir.stmts[stmt_id] {
+        Stmt::Break(_) => true,
+        Stmt::While(_) | Stmt::For(_) | Stmt::DoWhile(_) | Stmt::ForIn(_) => false,
+        Stmt::Block(b) => block_breaks_current_loop(hir, b),
+        Stmt::If(IfStmt {
+            then_branch,
+            else_branch,
+            ..
+        }) => {
+            block_breaks_current_loop(hir, then_branch)
+                || else_branch.is_some_and(|eb| stmt_breaks_current_loop(hir, eb))
+        }
+        Stmt::Try(TryStmt {
+            try_block,
+            catch_block,
+            ..
+        }) => {
+            block_breaks_current_loop(hir, try_block) || block_breaks_current_loop(hir, catch_block)
+        }
+        Stmt::At(AtStmt { block, .. }) => block_breaks_current_loop(hir, block),
+        Stmt::Expr(_)
+        | Stmt::Var(_)
+        | Stmt::Assign(_)
+        | Stmt::Return(_)
+        | Stmt::Continue(_)
+        | Stmt::Breakpoint(_)
+        | Stmt::Throw(_) => false,
+    }
 }
 
 /// `true` iff every reachable arm body in the if-chain rooted at
@@ -287,8 +354,52 @@ mod tests {
     }
 
     #[test]
-    fn while_never_diverges_even_with_diverging_body() {
-        let (hir, symbols) = lower("fn f() { while (true) { return; } }");
+    fn while_true_without_break_diverges() {
+        let (hir, symbols) = lower("fn f() { while (true) { var _ = 0; } }");
+        let body = fn_body(&hir, &symbols, "f");
+        assert!(block_diverges(&hir, &body));
+    }
+
+    #[test]
+    fn while_true_with_break_does_not_diverge() {
+        let (hir, symbols) = lower("fn f() { while (true) { if (g()) { break; } } }");
+        let body = fn_body(&hir, &symbols, "f");
+        assert!(!block_diverges(&hir, &body));
+    }
+
+    #[test]
+    fn while_true_with_break_in_nested_loop_still_diverges() {
+        // The inner `break` targets the inner loop, not the `while (true)`.
+        let (hir, symbols) =
+            lower("fn f() { while (true) { while (g()) { if (g()) { break; } } } }");
+        let body = fn_body(&hir, &symbols, "f");
+        assert!(block_diverges(&hir, &body));
+    }
+
+    #[test]
+    fn while_non_literal_condition_does_not_diverge() {
+        let (hir, symbols) = lower("fn f() { while (g()) { var _ = 0; } }");
+        let body = fn_body(&hir, &symbols, "f");
+        assert!(!block_diverges(&hir, &body));
+    }
+
+    #[test]
+    fn for_with_literal_true_condition_without_break_diverges() {
+        let (hir, symbols) = lower("fn f() { for (var i = 0; true; i = i + 1) { var _ = 0; } }");
+        let body = fn_body(&hir, &symbols, "f");
+        assert!(block_diverges(&hir, &body));
+    }
+
+    #[test]
+    fn for_with_non_literal_condition_does_not_diverge() {
+        let (hir, symbols) = lower("fn f() { for (var i = 0; i < 10; i = i + 1) { var _ = 0; } }");
+        let body = fn_body(&hir, &symbols, "f");
+        assert!(!block_diverges(&hir, &body));
+    }
+
+    #[test]
+    fn do_while_true_stays_conservative() {
+        let (hir, symbols) = lower("fn f() { do { var _ = 0; } while (true); }");
         let body = fn_body(&hir, &symbols, "f");
         assert!(!block_diverges(&hir, &body));
     }

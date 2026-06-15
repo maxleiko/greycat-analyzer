@@ -148,6 +148,86 @@ fn make(x: bool): int? {
 }
 
 #[test]
+fn infinite_while_true_with_inner_return_is_ok() {
+    // The end of the body is genuinely unreachable: the only exit is the
+    // inner `return`. The narrow infinite-loop rule must see this.
+    let src = "\
+fn ready(): bool { return true; }
+fn poll(): int {
+    while (true) {
+        if (ready()) {
+            return 1;
+        }
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    assert_eq!(
+        missing_return_count(&pa, &uri),
+        0,
+        "`while (true)` with no break never falls through",
+    );
+}
+
+#[test]
+fn literal_true_for_with_inner_return_is_ok() {
+    let src = "\
+fn forever(): int {
+    for (var i = 0; true; i = i + 1) {
+        return 2;
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    assert_eq!(
+        missing_return_count(&pa, &uri),
+        0,
+        "a `for` with a literal-true condition and no break never falls through",
+    );
+}
+
+#[test]
+fn while_true_with_break_is_flagged() {
+    // A `break` makes the loop exit reachable, so control can fall off
+    // the end — stays conservative, stays flagged.
+    let src = "\
+fn ready(): bool { return true; }
+fn breaks(): int {
+    while (true) {
+        if (ready()) {
+            break;
+        }
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    assert_eq!(
+        missing_return_count(&pa, &uri),
+        1,
+        "a break targeting the loop makes the end reachable",
+    );
+}
+
+#[test]
+fn while_with_non_literal_condition_is_flagged() {
+    // We don't const-fold non-literal conditions, so the loop may not
+    // run at all and the end is reachable.
+    let src = "\
+fn cond(x: bool): int {
+    while (x) {
+        return 3;
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    assert_eq!(
+        missing_return_count(&pa, &uri),
+        1,
+        "a non-literal loop condition stays conservative (reachable end)",
+    );
+}
+
+#[test]
 fn non_nullable_method_with_reachable_end_is_flagged() {
     let src = "\
 type Box {

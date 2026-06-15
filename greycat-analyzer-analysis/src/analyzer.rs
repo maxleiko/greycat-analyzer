@@ -43,6 +43,7 @@ use greycat_analyzer_hir::{DeclRegistry, Hir};
 use crate::index::{FnSignature, Namespace, ProjectIndex};
 use crate::lint::{LintDiagnostic, LintSeverity};
 use crate::lower_type_ref::{self, TypeRefLowering};
+use crate::reachability::block_breaks_current_loop;
 use crate::resolver::{Definition, Resolutions};
 
 /// Recover a *field-name* symbol from a named object field's key
@@ -99,53 +100,6 @@ fn stmt_terminates(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
 /// trip just to re-pattern-match.
 fn block_terminates(hir: &Hir, block: &BlockStmt) -> bool {
     block.stmts.last().is_some_and(|s| stmt_terminates(hir, *s))
-}
-
-/// `true` if `block` contains a `Stmt::Break` whose target is the
-/// enclosing loop — i.e. not enclosed in a nested loop. GreyCat's
-/// `break` carries no labels (`Stmt::Break` is a unit variant per
-/// `greycat-analyzer-hir`), so a break inside a nested `while` /
-/// `for` / `do-while` / `for-in` unambiguously targets that inner
-/// loop; we stop walking at those. Used by the post-loop else-narrow
-/// lift in `Stmt::While` / `Stmt::For` / `Stmt::DoWhile` to gate the
-/// lift: if `break` can escape, exit wasn't necessarily via cond-
-/// false and the cond's negation may not hold post-loop.
-fn block_breaks_current_loop(hir: &Hir, block: &BlockStmt) -> bool {
-    block
-        .stmts
-        .iter()
-        .any(|s| stmt_breaks_current_loop(hir, *s))
-}
-
-fn stmt_breaks_current_loop(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
-    match &hir.stmts[stmt_id] {
-        Stmt::Break(_) => true,
-        Stmt::While(_) | Stmt::For(_) | Stmt::DoWhile(_) | Stmt::ForIn(_) => false,
-        Stmt::Block(b) => block_breaks_current_loop(hir, b),
-        Stmt::If(IfStmt {
-            then_branch,
-            else_branch,
-            ..
-        }) => {
-            block_breaks_current_loop(hir, then_branch)
-                || else_branch.is_some_and(|eb| stmt_breaks_current_loop(hir, eb))
-        }
-        Stmt::Try(TryStmt {
-            try_block,
-            catch_block,
-            ..
-        }) => {
-            block_breaks_current_loop(hir, try_block) || block_breaks_current_loop(hir, catch_block)
-        }
-        Stmt::At(AtStmt { block, .. }) => block_breaks_current_loop(hir, block),
-        Stmt::Expr(_)
-        | Stmt::Var(_)
-        | Stmt::Assign(_)
-        | Stmt::Return(_)
-        | Stmt::Continue(_)
-        | Stmt::Breakpoint(_)
-        | Stmt::Throw(_) => false,
-    }
 }
 
 /// Severity sketch for analyzer diagnostics. Maps onto `lsp_types::DiagnosticSeverity`
@@ -945,17 +899,43 @@ impl<'a> Cx<'a> {
         let Some(b) = self.trivially_decidable(condition) else {
             return;
         };
-        let range = self.hir.exprs[condition].byte_range();
-        let msg = if b {
-            format!("{kind} condition is always true (infinite loop)")
-        } else {
-            format!("{kind} condition is always false (body never runs)")
-        };
-        self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
+        // A written bool constant (`while (true)`) is provably decidable
+        // but reveals nothing the author didn't type — skip the warning.
+        if !self.condition_is_bool_literal(condition) {
+            let range = self.hir.exprs[condition].byte_range();
+            let msg = if b {
+                format!("{kind} condition is always true")
+            } else {
+                format!("{kind} condition is always false")
+            };
+            self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
+        }
         // Only record always-false: the `unreachable` lint only
         // flags dead bodies. Always-true loops are intentional.
         if !b {
             self.out.decidable_conditions.insert(stmt_id, b);
+        }
+    }
+
+    /// `true` when the condition is a written boolean constant (modulo
+    /// `( )` and `!`). Such a condition is provably decidable yet carries
+    /// no information the author didn't type, so the `decidable-condition`
+    /// warning is suppressed for it. Type-derived decidability (`x != null`
+    /// on a non-nullable `x`, `is`-contradictions) does not bottom out in a
+    /// literal and still warns.
+    fn condition_is_bool_literal(&self, cond_id: Idx<Expr>) -> bool {
+        match &self.hir.exprs[cond_id] {
+            Expr::Literal(LiteralExpr {
+                kind: LiteralKind::Bool(_),
+                ..
+            }) => true,
+            Expr::Paren(inner, _) => self.condition_is_bool_literal(*inner),
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::Not,
+                operand,
+                ..
+            }) => self.condition_is_bool_literal(*operand),
+            _ => false,
         }
     }
 
@@ -3981,13 +3961,15 @@ impl<'a> Cx<'a> {
         // itself.
         let decidable = self.trivially_decidable(s.condition);
         if let Some(b) = decidable {
-            let range = self.hir.exprs[s.condition].byte_range();
-            let msg = if b {
-                "condition is always true"
-            } else {
-                "condition is always false"
-            };
-            self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
+            if !self.condition_is_bool_literal(s.condition) {
+                let range = self.hir.exprs[s.condition].byte_range();
+                let msg = if b {
+                    "condition is always true"
+                } else {
+                    "condition is always false"
+                };
+                self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
+            }
             self.out.decidable_conditions.insert(stmt_id, b);
         }
 
@@ -4453,12 +4435,14 @@ impl<'a> Cx<'a> {
         // decidable `do-while` is informational only — emit
         // the diagnostic but do NOT record it for the
         // `unreachable` lint (no dead code to delete).
-        if let Some(b) = self.trivially_decidable(s.condition) {
+        if let Some(b) = self.trivially_decidable(s.condition)
+            && !self.condition_is_bool_literal(s.condition)
+        {
             let range = self.hir.exprs[s.condition].byte_range();
             let msg = if b {
-                "do-while condition is always true (infinite loop)"
+                "do-while condition is always true"
             } else {
-                "do-while condition is always false (body runs exactly once)"
+                "do-while condition is always false"
             };
             self.surface_lint("decidable-condition", LintSeverity::Warning, msg, range);
         }
