@@ -433,6 +433,13 @@ pub fn analyze_with_index_into(
             continue;
         }
         let ident = &hir.idents[*ident_idx];
+        // An empty symbol only comes from a MISSING token, which already
+        // carries its own `missing-token` parse diagnostic. `unresolved
+        // name `` ` is noise (e.g. the anonymous-object head, flagged
+        // separately as `anonymous-object`).
+        if index.symbols[ident.symbol].is_empty() {
+            continue;
+        }
         out.diagnostics.push(SemanticDiagnostic::structural(
             Severity::Error,
             "unresolved-name",
@@ -1640,6 +1647,25 @@ impl<'a> Cx<'a> {
             message.into(),
             range,
         ));
+    }
+
+    /// GreyCat has no anonymous objects — the type before `{` is
+    /// mandatory. A missing head parses as an empty-symbol `TypeRef`;
+    /// flag it over the whole object span and return whether it was
+    /// anonymous (so callers skip head-dependent checks). Returns `true`
+    /// when the head was anonymous.
+    fn check_anonymous_object_head(&mut self, ty: Idx<TypeRef>, range: Range<usize>) -> bool {
+        let name = self.hir.type_refs[ty].name;
+        if !self.index.symbols[self.hir.idents[name].symbol].is_empty() {
+            return false;
+        }
+        self.diag(
+            Severity::Error,
+            "anonymous-object",
+            "anonymous objects are not supported; specify a type before `{`",
+            range,
+        );
+        true
     }
 
     fn ident_text(&self, idx: Idx<Ident>) -> &str {
@@ -5403,7 +5429,12 @@ impl<'a> Cx<'a> {
                 self.arena
                     .alloc_generic(self.arena.builtins.array_key, vec![elem])
             }
-            Expr::Object(ObjectExpr { ty, fields, .. }) => {
+            Expr::Object(ObjectExpr {
+                ty,
+                fields,
+                byte_range,
+            }) => {
+                let anonymous = self.check_anonymous_object_head(*ty, byte_range.clone());
                 let obj_ty = self.lower_type_ref(*ty);
                 // For a `Map { k: v }` the keys are value expressions
                 // (typed against `K`), so they must be visited too; for
@@ -5421,16 +5452,23 @@ impl<'a> Cx<'a> {
                     for f in fields {
                         let _ = self.visit_expr(f.value);
                     }
-                    self.check_object_required_attrs(*ty, obj_ty, fields);
+                    if !anonymous {
+                        self.check_object_required_attrs(*ty, obj_ty, fields);
+                    }
                 }
                 obj_ty
             }
-            Expr::PositionalObject(PositionalObjectExpr { ty, fields, .. }) => {
+            Expr::PositionalObject(PositionalObjectExpr {
+                ty,
+                fields,
+                byte_range,
+            }) => {
+                let anonymous = self.check_anonymous_object_head(*ty, byte_range.clone());
                 for f in fields {
                     let _ = self.visit_expr(*f);
                 }
                 let obj_ty = self.lower_type_ref(*ty);
-                if fields.is_empty() {
+                if fields.is_empty() && !anonymous {
                     self.check_object_required_attrs(*ty, obj_ty, &[]);
                 }
                 obj_ty
