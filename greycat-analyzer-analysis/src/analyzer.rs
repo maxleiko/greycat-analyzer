@@ -4344,6 +4344,22 @@ impl<'a> Cx<'a> {
                         self.arena.strip_nullable(pre)
                     };
                     self.write_narrow(ident, merged);
+                } else if then_branch_narrows.contains_key(&ident)
+                    || else_branch_narrows.contains_key(&ident)
+                {
+                    // A reaching branch reassigned this binding but the
+                    // join is still nullable, so the non-null lift above
+                    // didn't fire. Write the nullable join anyway: a
+                    // stale pre-if narrow (e.g. an outer guard left it at
+                    // `null`) must not survive the reassignment. The
+                    // carrier is the concrete (non-`Null`) side; skip
+                    // when both paths are the dead `Null` shape.
+                    let then_null_shape = matches!(self.arena.get(then_eff).kind, TypeKind::Null);
+                    let carrier = if then_null_shape { else_eff } else { then_eff };
+                    if !matches!(self.arena.get(carrier).kind, TypeKind::Null) {
+                        let merged = self.arena.nullable(carrier);
+                        self.write_narrow(ident, merged);
+                    }
                 }
             }
             // Same lift for member-access paths.
