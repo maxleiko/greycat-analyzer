@@ -3989,6 +3989,37 @@ fn validate_module_type_relations(
                         return_ty,
                         diags,
                     );
+                    // The runtime never validates the return type and
+                    // implicitly returns `null` when control falls off
+                    // the end of a body. Enforce the signature contract:
+                    // a reachable end-of-body implicitly returns `null`,
+                    // so flag it when `null` doesn't satisfy the declared
+                    // return type. Nullable returns accept the implicit
+                    // null and are fine even with a fall-through path.
+                    if let (Some(ret_ty), Some(ret_tref)) = (return_ty, fnd.return_type) {
+                        let null_ty = arena.null();
+                        if !is_assignable_to_with_index(
+                            index,
+                            decl_registry,
+                            arena,
+                            null_ty,
+                            ret_ty,
+                        ) && !crate::reachability::stmt_diverges_with_analysis(
+                            hir, analysis, body,
+                        ) {
+                            diags.push(SemanticDiagnostic {
+                                severity: Severity::Error,
+                                code: "missing-return",
+                                message: format!(
+                                    "function may reach the end of its body without \
+                                     returning a value of type `{}`",
+                                    display_type(arena, decl_registry, &index.symbols, ret_ty),
+                                ),
+                                byte_range: hir.type_refs[ret_tref].byte_range.clone(),
+                                category: DiagCategory::TypeRelation,
+                            });
+                        }
+                    }
                 }
             }
             Decl::Type(td) => {
@@ -4410,8 +4441,29 @@ fn validate_module_type_relations(
                     }
                 }
             }
-            Stmt::Return(_)
-            | Stmt::Expr(_)
+            Stmt::Return(r) => {
+                // Bare `return;` is `return null;`. The runtime throws
+                // "wrong return type ... null found while none nullable
+                // expected" when the path runs; surface the same
+                // `type-mismatch` the valued path emits for `return null;`.
+                if let Some(rt) = return_ty {
+                    let null_ty = arena.null();
+                    if !is_assignable_to_with_index(index, decl_registry, arena, null_ty, rt) {
+                        diags.push(SemanticDiagnostic {
+                            severity: Severity::Error,
+                            code: "type-mismatch",
+                            message: format!(
+                                "return value of type `null` is not assignable to \
+                                 declared return type `{}`",
+                                display_type(arena, decl_registry, &index.symbols, rt),
+                            ),
+                            byte_range: r.byte_range.clone(),
+                            category: DiagCategory::TypeRelation,
+                        });
+                    }
+                }
+            }
+            Stmt::Expr(_)
             | Stmt::Break(_)
             | Stmt::Continue(_)
             | Stmt::Breakpoint(_)
