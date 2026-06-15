@@ -2868,6 +2868,8 @@ impl<'a> Cx<'a> {
                     // P-typeof — same rule for `module::TypeName`.
                     let inner = self.arena.alloc_type(item);
                     Some(self.arena.type_of(inner))
+                } else if let Some(var_ty) = self.index.var_types.get(&item).copied() {
+                    Some(var_ty)
                 } else if self.index.has_name(name_sym) {
                     // Runtime-internal type the user can't author —
                     // keep the unrefined `type` shape so existing
