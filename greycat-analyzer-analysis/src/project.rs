@@ -1343,20 +1343,22 @@ pub(crate) fn is_assignable_to_with_index(
         // generic supertype walk. Same-decl generics stay invariant
         // (handled by core's same-handle args check).
         TypeKind::Generic { tpl: da, args: aa } => match b_kind {
+            // Node-tag family is covariant in its arguments: `node<Sub>`
+            // -> `node<Super>`, `nodeIndex<K, Sub>` -> `nodeIndex<K,
+            // Super>`. Core already settled the invariant (equal-arg)
+            // case above; here we additionally admit per-argument
+            // subtyping AND reject incompatible args (`nodeIndex<int,
+            // float>` -> `nodeIndex<int, String>`). The runtime erases
+            // these args and never validates `var` annotations, so the
+            // analyzer is the only guard. Recursion makes a chain like
+            // `node<DeepSub>` -> `node<Super>` resolve in one hop.
             TypeKind::Generic {
                 tpl: db,
                 args: ref ab,
-            } if da == db && aa.len() == ab.len() && arena.is_node_tag(da) => true,
-            TypeKind::Generic {
-                tpl: db,
-                args: ref ab,
-            } if da == db && aa.len() == 1 && ab.len() == 1 && arena.is_node(da) => {
-                // node<Sub> -> node<Super> when Sub extends Super.
-                // Recurse so a chain like node<DeepSub> ->
-                // node<MidSub> -> node<Super> works in one hop.
-                let (a0, b0) = (aa[0], ab[0]);
-                is_assignable_to_with_index(index, _decl_registry, arena, a0, b0)
-            }
+            } if da == db && aa.len() == ab.len() && arena.is_node_tag(da) => aa
+                .iter()
+                .zip(ab.iter())
+                .all(|(&x, &y)| is_assignable_to_with_index(index, _decl_registry, arena, x, y)),
             // Cross-decl generic source: walk `da`'s pre-lowered
             // supertype_ty chain, substituting `aa` for `da`'s own
             // `GenericParam` slots at each hop, then check the
