@@ -1527,13 +1527,20 @@ pub(crate) fn is_castable_with_index(
     // substitutes, which allocates fresh `Generic` nodes).
     let from_kind = arena.get(from).kind.clone();
     let to_kind = arena.get(to).kind.clone();
-    // Node-tag <-> int cast bivariance. `int` is `Type(core::int)`, so
-    // this is the single place the rule lives -- neither side's structural
-    // arm below sees it.
+    // Node-tag <-> int cast. Every node handle is a u64 at runtime, so any
+    // node type casts to int (and int back to a node handle). `int` is
+    // `Type(core::int)`, so this is the single place the rule lives --
+    // neither side's structural arm below sees it. Compared by core kind so
+    // nullability on either side is irrelevant (`node? as int?`,
+    // `nodeTime? as int?`), matching the primitive-conversion nullability
+    // rule in core `is_castable`. Runtime-verified 2026-06-15.
+    let int_kind = arena.get(arena.builtins.int).kind.clone();
+    let from_int = from_kind == int_kind;
+    let to_int = to_kind == int_kind;
     let from_node_tag =
         matches!(&from_kind, TypeKind::Generic { tpl, .. } if arena.is_node_tag(*tpl));
     let to_node_tag = matches!(&to_kind, TypeKind::Generic { tpl, .. } if arena.is_node_tag(*tpl));
-    if (from == arena.builtins.int && to_node_tag) || (from_node_tag && to == arena.builtins.int) {
+    if (from_int && to_node_tag) || (from_node_tag && to_int) {
         return true;
     }
     // Exhaustive nested match. Same rationale as the assignability

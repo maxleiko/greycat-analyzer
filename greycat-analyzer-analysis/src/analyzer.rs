@@ -6458,6 +6458,44 @@ fn f(i: int): nodeTime { return i as nodeTime; }
     }
 
     #[test]
+    fn cast_nullable_node_to_int_is_allowed() {
+        // Every node handle is a u64 at runtime, so `node<int> as int` and
+        // its nullability variants are valid (`node<int>? as int?` -> int,
+        // verified via `greycat run`).
+        let src = r#"
+fn a(n: node<int>): int { return n as int; }
+fn b(n: node<int>?): int? { return n as int?; }
+fn c(n: nodeTime?): int? { return n as int?; }
+"#;
+        let r = analyze_src_only(src);
+        assert!(
+            r.diagnostics
+                .iter()
+                .all(|d| !d.message.contains("cannot cast")),
+            "did not expect cast diagnostic, got: {:?}",
+            r.diagnostics,
+        );
+    }
+
+    #[test]
+    fn cast_nullable_primitive_conversion_is_allowed() {
+        // `int? as float?` is allowed: the `int <-> float` conversion is
+        // runtime-checked through nullability (`null as float?` -> null,
+        // `42 as float?` -> 42.0, verified via `greycat run`).
+        let src = r#"
+fn nn(x: int?): float? { return x as float?; }
+"#;
+        let r = analyze_src_only(src);
+        assert!(
+            r.diagnostics
+                .iter()
+                .all(|d| !d.message.contains("cannot cast")),
+            "did not expect cast diagnostic, got: {:?}",
+            r.diagnostics,
+        );
+    }
+
+    #[test]
     fn generic_call_inference_substitutes_return_type() {
         // P12.1: `id<T>(x: T): T` called with `id(1)` should produce
         // an `int`-typed call expression, not `any`.

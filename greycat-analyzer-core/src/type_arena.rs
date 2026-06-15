@@ -789,12 +789,23 @@ impl TypeArena {
         // `char as int` genuinely convert. Every other primitive `as` pair
         // either throws "casting X to Y is not allowed" or no-ops (keeps the
         // source type) -- both rejected here.
-        let int_to_float =
-            |from: TypeId, to: TypeId| from == self.builtins.int && to == self.builtins.float;
-        let float_to_int =
-            |from: TypeId, to: TypeId| from == self.builtins.float && to == self.builtins.int;
-        let char_to_int =
-            |from: TypeId, to: TypeId| from == self.builtins.char_ && to == self.builtins.int;
+        //
+        // Compared by core kind so nullability on either side is irrelevant:
+        // `int? as float?`, `int as float?`, and `int? as float` all reduce
+        // to the `int <-> float` core check. `as` is runtime-checked, so a
+        // null source landing in a non-null target is the runtime's call --
+        // same as the nullable-source fall-back below (`null as float?`
+        // yields `null`; `42 as float?` yields `42.0`).
+        let core_eq = |a: TypeId, b: TypeId| self.get(a).kind == self.get(b).kind;
+        let int_to_float = |from: TypeId, to: TypeId| {
+            core_eq(from, self.builtins.int) && core_eq(to, self.builtins.float)
+        };
+        let float_to_int = |from: TypeId, to: TypeId| {
+            core_eq(from, self.builtins.float) && core_eq(to, self.builtins.int)
+        };
+        let char_to_int = |from: TypeId, to: TypeId| {
+            core_eq(from, self.builtins.char_) && core_eq(to, self.builtins.int)
+        };
         if int_to_float(from, to) || float_to_int(from, to) || char_to_int(from, to) {
             return true;
         }

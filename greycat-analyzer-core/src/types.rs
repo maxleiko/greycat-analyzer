@@ -401,6 +401,37 @@ mod tests {
     }
 
     #[test]
+    fn primitive_conversion_casts_ignore_nullability() {
+        // A convertible primitive pair stays castable through every
+        // nullability combo -- `as` is runtime-checked, so a null source
+        // landing in a non-null target is the runtime's call. Verified via
+        // `greycat run`: `null as float?` -> null, `42 as float?` -> 42.0.
+        let mut cx = TextCx::default();
+        let i = cx.arena.builtins.int;
+        let f = cx.arena.builtins.float;
+        let c = cx.arena.builtins.char_;
+        let s = cx.arena.builtins.string;
+        let iq = cx.arena.nullable(i);
+        let fq = cx.arena.nullable(f);
+        let cq = cx.arena.nullable(c);
+        let sq = cx.arena.nullable(s);
+        assert!(cx.arena.is_castable(iq, fq), "int? as float?");
+        assert!(cx.arena.is_castable(i, fq), "int as float?");
+        assert!(cx.arena.is_castable(iq, f), "int? as float");
+        assert!(cx.arena.is_castable(fq, iq), "float? as int?");
+        assert!(cx.arena.is_castable(cq, iq), "char? as int?");
+        // Non-convertible pairs stay rejected regardless of nullability.
+        assert!(
+            !cx.arena.is_castable(iq, cq),
+            "int? as char? still rejected"
+        );
+        assert!(
+            !cx.arena.is_castable(sq, iq),
+            "String? as int? still rejected"
+        );
+    }
+
+    #[test]
     fn null_flows_into_nullable_only() {
         let mut cx = TextCx::default();
         let null = cx.arena.null();
