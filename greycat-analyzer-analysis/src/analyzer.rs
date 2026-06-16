@@ -34,8 +34,8 @@ use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::hir::{
     AssignStmt, AtStmt, BinOp, BinaryExpr, BlockStmt, CallExpr, Decl, DoWhileStmt, Expr, FnDecl,
     ForInStmt, ForStmt, Ident, IfStmt, LambdaExpr, LiteralExpr, LiteralKind, LocalVar, MemberExpr,
-    ModVarDecl, ObjectExpr, ObjectField, OffsetExpr, ParseIssue, PositionalObjectExpr, Pragma,
-    StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp,
+    ModVarDecl, NodeTag, ObjectExpr, ObjectField, OffsetExpr, ParseIssue, PositionalObjectExpr,
+    Pragma, StaticExpr, Stmt, StringExpr, TryStmt, TypeAttr, TypeDecl, TypeRef, UnaryExpr, UnaryOp,
     WhileStmt,
 };
 use greycat_analyzer_hir::{DeclRegistry, Hir};
@@ -5244,6 +5244,24 @@ impl<'a> Cx<'a> {
         ty
     }
 
+    /// Type of a node-tag literal (`42_node`). The handle's element type
+    /// is erased, so it mints the same `node<any?>` / `nodeIndex<any?, any?>`
+    /// canonical form a bare `node` annotation lowers to.
+    fn node_literal_ty(&mut self, tag: NodeTag) -> TypeId {
+        let (bare, arity) = match tag {
+            NodeTag::Node => (self.arena.builtins.node, 1),
+            NodeTag::NodeTime => (self.arena.builtins.node_time, 1),
+            NodeTag::NodeIndex => (self.arena.builtins.node_index, 2),
+            NodeTag::NodeList => (self.arena.builtins.node_list, 1),
+            NodeTag::NodeGeo => (self.arena.builtins.node_geo, 1),
+        };
+        let TypeKind::Type(key) = self.arena.get(bare).kind else {
+            return bare;
+        };
+        let any_q = self.arena.any_nullable();
+        self.arena.alloc_generic(key, vec![any_q; arity])
+    }
+
     fn infer_expr(&mut self, expr_id: Idx<Expr>) -> TypeId {
         let expr = &self.hir.exprs[expr_id];
         match expr {
@@ -5386,6 +5404,7 @@ impl<'a> Cx<'a> {
                 LiteralKind::Char(_) => self.arena.builtins.char_,
                 LiteralKind::Duration(_) => self.arena.builtins.duration,
                 LiteralKind::Time(_) | LiteralKind::Iso8601(_) => self.arena.builtins.time,
+                LiteralKind::Node { tag, .. } => self.node_literal_ty(*tag),
             },
             Expr::Null { .. } => self.null(),
             Expr::This { .. } => self

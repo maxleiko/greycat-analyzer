@@ -1,0 +1,68 @@
+---
+source: greycat-analyzer-syntax/tests/snapshot.rs
+assertion_line: 134
+expression: "fn f() {\n  var a = 42_node;\n  var b = 7nodeIndex;\n  var c = 99_nodeGeo;\n  var d = 3nodeTime;\n  var e = 5_nodeList;\n}\n"
+---
+(module
+  (fn_decl
+    name: (ident 'f')
+    params: (fn_params '()')
+    body: (block
+      (var_decl
+        name: (ident 'a')
+        (initializer
+          expr: (number
+            (number_suffixed
+              (number_int '42_')
+              (number_suffix 'node')
+            )
+          )
+        )
+      )
+      (var_decl
+        name: (ident 'b')
+        (initializer
+          expr: (number
+            (number_suffixed
+              (number_int '7')
+              (number_suffix 'nodeIndex')
+            )
+          )
+        )
+      )
+      (var_decl
+        name: (ident 'c')
+        (initializer
+          expr: (number
+            (number_suffixed
+              (number_int '99_')
+              (number_suffix 'nodeGeo')
+            )
+          )
+        )
+      )
+      (var_decl
+        name: (ident 'd')
+        (initializer
+          expr: (number
+            (number_suffixed
+              (number_int '3')
+              (number_suffix 'nodeTime')
+            )
+          )
+        )
+      )
+      (var_decl
+        name: (ident 'e')
+        (initializer
+          expr: (number
+            (number_suffixed
+              (number_int '5_')
+              (number_suffix 'nodeList')
+            )
+          )
+        )
+      )
+    )
+  )
+)

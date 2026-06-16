@@ -580,6 +580,22 @@ pub enum LiteralKind {
     /// from [`Self::Time`] so the analyzer can run ISO-specific
     /// diagnostics.
     Iso8601(i64),
+    /// Node-tag literal (`42_node`, `42nodeTime`, ...). `value` is the
+    /// node handle; `tag` selects which `node*` builtin it types as.
+    Node {
+        tag: NodeTag,
+        value: i64,
+    },
+}
+
+/// Which `node*` builtin a [`LiteralKind::Node`] literal denotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeTag {
+    Node,
+    NodeTime,
+    NodeIndex,
+    NodeList,
+    NodeGeo,
 }
 
 /// Parse anomaly recorded at lowering time. The analyzer emits the

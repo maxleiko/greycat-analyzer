@@ -59,6 +59,42 @@ fn float_suffix_lowers_to_float_kind() {
 }
 
 #[test]
+fn node_suffixes_lower_to_node_kind() {
+    use greycat_analyzer_hir::hir::NodeTag;
+    let cases = [
+        ("42_node", NodeTag::Node),
+        ("42_nodeTime", NodeTag::NodeTime),
+        ("42_nodeIndex", NodeTag::NodeIndex),
+        ("42_nodeList", NodeTag::NodeList),
+        ("42_nodeGeo", NodeTag::NodeGeo),
+    ];
+    for (lit, want) in cases {
+        let src = format!("fn f() {{\n    var n = {lit};\n}}\n");
+        let kind = first_var_init_kind(&src, 0);
+        assert!(
+            matches!(kind, LiteralKind::Node { tag, value: 42 } if tag == want),
+            "{lit} lowered to {kind:?}, expected node {want:?} handle 42",
+        );
+    }
+}
+
+#[test]
+fn node_suffix_without_underscore_lowers_identically() {
+    use greycat_analyzer_hir::hir::NodeTag;
+    let kind = first_var_init_kind("fn f() {\n    var n = 7node;\n}\n", 0);
+    assert!(
+        matches!(
+            kind,
+            LiteralKind::Node {
+                tag: NodeTag::Node,
+                value: 7
+            }
+        ),
+        "got {kind:?}",
+    );
+}
+
+#[test]
 fn map_two_generic_params_lower_both() {
     // Regression: `Map<K, V>` had only `K` captured (P14.9 fix).
     let src = "type T { paths: Map<String, Inner>?; }\ntype Inner {}\n";

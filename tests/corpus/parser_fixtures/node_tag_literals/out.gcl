@@ -1,0 +1,7 @@
+fn f() {
+    var a = 42_node;
+    var b = 7nodeIndex;
+    var c = 99_nodeGeo;
+    var d = 3nodeTime;
+    var e = 5_nodeList;
+}

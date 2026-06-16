@@ -279,6 +279,7 @@ fn lit_to_annotation_arg(kind: LiteralKind) -> AnnotationArgKind {
         LiteralKind::Duration(v) => AnnotationArgKind::Duration(v),
         LiteralKind::Time(v) => AnnotationArgKind::Time(v),
         LiteralKind::Iso8601(v) => AnnotationArgKind::Iso8601(v),
+        LiteralKind::Node { value, .. } => AnnotationArgKind::Int(value),
     }
 }
 
@@ -1391,6 +1392,11 @@ fn classify_and_parse_number(
             let (f, issue) = parse_float_sat(body);
             (LiteralKind::Float(if negate { -f } else { f }), issue)
         }
+        Some("node") => node_literal(NodeTag::Node, body, to_signed),
+        Some("nodeTime") => node_literal(NodeTag::NodeTime, body, to_signed),
+        Some("nodeIndex") => node_literal(NodeTag::NodeIndex, body, to_signed),
+        Some("nodeList") => node_literal(NodeTag::NodeList, body, to_signed),
+        Some("nodeGeo") => node_literal(NodeTag::NodeGeo, body, to_signed),
         suffix => {
             if looks_like_float(body) {
                 let (f, issue) = parse_float_sat(body);
@@ -1410,6 +1416,19 @@ fn classify_and_parse_number(
             }
         }
     }
+}
+
+/// Build a [`LiteralKind::Node`] from an integer body, sharing the
+/// `Int` magnitude path so the node handle saturates / negates the same
+/// way. `to_signed` carries the sign from an outer unary minus.
+fn node_literal(
+    tag: NodeTag,
+    body: &str,
+    to_signed: fn(u64, Option<ParseIssue>) -> (i64, Option<ParseIssue>),
+) -> (LiteralKind, Option<ParseIssue>) {
+    let (m, issue) = parse_integer_magnitude_sat(body);
+    let (value, issue) = to_signed(m, issue);
+    (LiteralKind::Node { tag, value }, issue)
 }
 
 /// Recover a `number` node's body text (digits without suffix) and
