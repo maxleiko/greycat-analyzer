@@ -8,7 +8,7 @@ use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::module_desc::parse_module_desc;
 use greycat_analyzer_core::path_to_uri;
 use greycat_analyzer_core::registry::RegistryFetcher;
-use greycat_analyzer_core::resolver::{FsContext, global_std_dir};
+use greycat_analyzer_core::resolver::{Context, FsContext, global_std_dir};
 use greycat_analyzer_core::{
     Document, SourceManager, StdResolution,
     diagnostics::{
@@ -95,10 +95,14 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn new(root: PathBuf, tag: String) -> Self {
+    /// Build a project whose loader shares `ctx` with the owning
+    /// [`Backend`], so the manager's recursive `@library` / `@include`
+    /// walk and the Backend's own entrypoint / discovery checks resolve
+    /// paths through the same filesystem view (real or mocked).
+    pub fn new(root: PathBuf, tag: String, ctx: Arc<dyn Context>) -> Self {
         Self {
             root,
-            manager: SourceManager::new(),
+            manager: SourceManager::with_context(ctx),
             analysis: ProjectAnalysis::new(),
             tag,
             std_resolution: StdResolution::default(),
@@ -256,6 +260,14 @@ pub struct Backend {
     /// when the home couldn't be resolved (then std lives only under a
     /// project's local `lib/std`, already covered by the project watch).
     pub greycat_home: Option<PathBuf>,
+    /// Filesystem view shared with every [`Project`]'s loader. Real
+    /// [`FsContext`] in production; an in-memory mock in tests. Every
+    /// path check on the request-dispatch path (entrypoint
+    /// canonicalization, project discovery) goes through this so
+    /// dispatch and loading agree on what exists. The OS-watcher
+    /// subsystem stays on the real filesystem — it only runs against a
+    /// live `notify` watch, which no in-memory context can drive.
+    pub ctx: Arc<dyn Context>,
 }
 
 impl Backend {
@@ -793,7 +805,7 @@ impl Backend {
             self.workspace_roots.push(ws_root.clone());
         }
         let project_file = ws_root.join("project.gcl");
-        if !project_file.is_file() {
+        if !self.ctx.is_file(&project_file) {
             debug!(
                 "no project.gcl in workspace {} — skipping recursive load",
                 ws_root.display()
@@ -802,7 +814,7 @@ impl Backend {
         }
         let project_root = ws_root.clone();
         let tag = compute_project_tag(&project_root, &self.workspace_roots);
-        let mut project = Project::new(project_root.clone(), tag.clone());
+        let mut project = Project::new(project_root.clone(), tag.clone(), self.ctx.clone());
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
@@ -898,7 +910,7 @@ impl Backend {
         if self.orphans.get(uri).is_some() {
             return DocOwner::Orphan;
         }
-        let owner = find_owning_project_root(uri, &self.workspace_roots);
+        let owner = find_owning_project_root(uri, &self.workspace_roots, self.ctx.as_ref());
         match owner {
             Some(root) => {
                 if !self.projects.contains_key(&root) {
@@ -914,9 +926,10 @@ impl Backend {
                     // analysed bucket. Matches pre-P32 behaviour for
                     // clients that didn't supply `workspace_folders`.
                     let r = PathBuf::new();
-                    self.projects
-                        .entry(r.clone())
-                        .or_insert_with(|| Project::new(r.clone(), SINGLE_FILE_LOG_TAG.into()));
+                    let ctx = self.ctx.clone();
+                    self.projects.entry(r.clone()).or_insert_with(|| {
+                        Project::new(r.clone(), SINGLE_FILE_LOG_TAG.into(), ctx)
+                    });
                     self.bind_uri(uri.clone(), r.clone());
                     DocOwner::Project(r)
                 } else {
@@ -937,7 +950,7 @@ impl Backend {
     fn spawn_lazy_project(&mut self, root: &Path) {
         let project_file = root.join("project.gcl");
         let tag = compute_project_tag(root, &self.workspace_roots);
-        let mut project = Project::new(root.to_path_buf(), tag.clone());
+        let mut project = Project::new(root.to_path_buf(), tag.clone(), self.ctx.clone());
         let load_start = Instant::now();
         let report = project.manager.load_project(&project_file);
         let load_took = load_start.elapsed();
@@ -1047,13 +1060,16 @@ impl Backend {
             return false;
         };
         let entrypoint = project.root.join("project.gcl");
-        let Ok(canonical) = entrypoint.canonicalize() else {
+        let Ok(canonical) = self.ctx.canonicalize(&entrypoint) else {
             return false;
         };
         let Some(path) = uri_to_path(uri) else {
             return false;
         };
-        path.canonicalize().map(|p| p == canonical).unwrap_or(false)
+        self.ctx
+            .canonicalize(&path)
+            .map(|p| p == canonical)
+            .unwrap_or(false)
     }
 
     /// Re-walk a project's `@library` / `@include` closure against the
@@ -1448,7 +1464,8 @@ impl Backend {
                 .map(|o| o.to_vec())
                 .unwrap_or_default();
             if owners.is_empty()
-                && let Some(root) = find_owning_project_root(uri, &self.workspace_roots)
+                && let Some(root) =
+                    find_owning_project_root(uri, &self.workspace_roots, self.ctx.as_ref())
             {
                 owners.push(root);
             }
@@ -1550,7 +1567,11 @@ pub(crate) fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 ///
 /// The walk *includes* the workspace folder itself — if a project.gcl
 /// sits exactly at the workspace folder root, that wins.
-pub(crate) fn find_owning_project_root(uri: &Uri, workspace_roots: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn find_owning_project_root(
+    uri: &Uri,
+    workspace_roots: &[PathBuf],
+    ctx: &dyn Context,
+) -> Option<PathBuf> {
     let path = uri_to_path(uri)?;
     let start_dir = path.parent()?.to_path_buf();
     // Find the workspace folder that contains the URI. Multiple
@@ -1563,7 +1584,7 @@ pub(crate) fn find_owning_project_root(uri: &Uri, workspace_roots: &[PathBuf]) -
         .clone();
     let mut cur = start_dir;
     loop {
-        if cur.join("project.gcl").is_file() {
+        if ctx.is_file(&cur.join("project.gcl")) {
             return Some(cur);
         }
         if cur == ws_root {
@@ -1619,24 +1640,45 @@ pub(crate) fn publish_diagnostics(
 mod tests {
     use super::*;
     use crossbeam_channel::{Receiver, unbounded};
-    use std::str::FromStr;
+    use std::{
+        io::{Error, ErrorKind},
+        str::FromStr,
+        sync::Mutex,
+    };
 
     fn uri(s: &str) -> Uri {
         Uri::from_str(s).unwrap()
+    }
+
+    /// Real-filesystem context for routing/watcher unit tests that set
+    /// up actual temp dirs. The empty greycat-home is fine — none of
+    /// these tests cross into `lib/std`.
+    fn test_fs_ctx() -> Arc<dyn Context> {
+        Arc::new(FsContext::with_greycat_home(PathBuf::new()))
     }
 
     /// Test backend bundled with the receiving end of its publish
     /// channel — the receiver MUST outlive every `publish_*` call,
     /// otherwise `Sender::send` errors out.
     fn backend() -> (Backend, Receiver<Message>) {
+        backend_with(test_fs_ctx(), Vec::new())
+    }
+
+    /// `backend()` with an explicit filesystem context + workspace
+    /// roots, for hermetic tests that drive the project-discovery /
+    /// entrypoint-reload path through an in-memory [`Context`].
+    fn backend_with(
+        ctx: Arc<dyn Context>,
+        workspace_roots: Vec<PathBuf>,
+    ) -> (Backend, Receiver<Message>) {
         let (tx, rx) = unbounded();
         (
             Backend {
                 client: tx,
                 projects: FxHashMap::default(),
                 uri_owner: FxHashMap::default(),
-                orphans: SourceManager::new(),
-                workspace_roots: Vec::new(),
+                orphans: SourceManager::with_context(ctx.clone()),
+                workspace_roots,
                 lint_libs: false,
                 registry: None,
                 encoding: SourceEncoding::UTF8,
@@ -1654,9 +1696,202 @@ mod tests {
                 pending_fs_events: FxHashSet::default(),
                 fs_flush_deadline: None,
                 greycat_home: None,
+                ctx,
             },
             rx,
         )
+    }
+
+    /// In-memory [`Context`] for hermetic Backend tests — lets the
+    /// project-discovery + entrypoint-reload path run without touching
+    /// disk. `canonicalize` / `is_file` fall back to the trait defaults
+    /// (identity / read-backed), which are correct here.
+    #[derive(Default)]
+    struct MemContext {
+        files: Mutex<FxHashMap<PathBuf, String>>,
+        dirs: Mutex<FxHashSet<PathBuf>>,
+        greycat_home: PathBuf,
+    }
+
+    impl MemContext {
+        fn add_file(&self, path: PathBuf, content: &str) {
+            for ancestor in path.ancestors().skip(1) {
+                self.dirs.lock().unwrap().insert(ancestor.to_path_buf());
+            }
+            self.files.lock().unwrap().insert(path, content.to_string());
+        }
+    }
+
+    impl Context for MemContext {
+        fn read(&self, path: &Path) -> std::io::Result<String> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::new(ErrorKind::NotFound, path.display().to_string()))
+        }
+
+        fn iter_gcl(&self, dir: &Path) -> Vec<PathBuf> {
+            let mut out: Vec<PathBuf> = self
+                .files
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|p| p.starts_with(dir))
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gcl"))
+                .cloned()
+                .collect();
+            out.sort();
+            out
+        }
+
+        fn is_dir(&self, path: &Path) -> bool {
+            self.dirs.lock().unwrap().contains(path)
+        }
+
+        fn greycat_home(&self) -> &Path {
+            &self.greycat_home
+        }
+    }
+
+    /// Drain every pending publish and return the most recent
+    /// diagnostic set for `target`.
+    fn latest_diags_for(rx: &Receiver<Message>, target: &Uri) -> Option<Vec<Diagnostic>> {
+        let mut latest = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Notification(n) = msg
+                && n.method == PublishDiagnostics::METHOD
+            {
+                let p: PublishDiagnosticsParams = serde_json::from_value(n.params).unwrap();
+                if &p.uri == target {
+                    latest = Some(p.diagnostics);
+                }
+            }
+        }
+        latest
+    }
+
+    /// Removing an `@include` from `project.gcl` must re-walk the
+    /// closure, evict the included module, and surface the now-unknown
+    /// type it declared — driven end-to-end through `did_open` +
+    /// `did_change` on an in-memory filesystem.
+    #[test]
+    fn removing_include_makes_entrypoint_type_unresolved() {
+        let ctx = MemContext::default();
+        ctx.add_file(
+            PathBuf::from("/proj/project.gcl"),
+            "@include(\"src\");\n\nfn foo(_: Foo) {}\n",
+        );
+        ctx.add_file(PathBuf::from("/proj/src/other.gcl"), "type Foo {}\n");
+        let ctx: Arc<dyn Context> = Arc::new(ctx);
+
+        let (mut b, rx) = backend_with(ctx, vec![PathBuf::from("/proj")]);
+        let entry = uri("file:///proj/project.gcl");
+
+        // Open project.gcl — discovers + loads the project (incl.
+        // src/other.gcl) and publishes diagnostics.
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: entry.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "@include(\"src\");\n\nfn foo(_: Foo) {}\n".into(),
+            },
+        })
+        .unwrap();
+        let initial = latest_diags_for(&rx, &entry).expect("entrypoint published");
+        assert!(
+            !initial.iter().any(|d| d.message.contains("Foo")),
+            "`Foo` must resolve while the include is present, got: {initial:?}"
+        );
+
+        // Remove the `@include` line (full-text replace, the LSP's
+        // entrypoint-edit path).
+        b.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: entry.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "fn foo(_: Foo) {}\n".into(),
+            }],
+        })
+        .unwrap();
+        let after = latest_diags_for(&rx, &entry).expect("entrypoint re-published");
+        assert!(
+            after.iter().any(|d| d.message.contains("Foo")),
+            "`Foo` must be unresolved after the include is removed, got: {after:?}"
+        );
+    }
+
+    /// Same scenario as the in-memory test, but against a real on-disk
+    /// project with the production [`FsContext`] — so the real
+    /// `canonicalize` / `is_file` run through the entrypoint-reload gate.
+    /// Rules out an identity-canonicalize mock masking a real-fs path
+    /// mismatch in `is_project_entrypoint`.
+    #[test]
+    fn removing_include_makes_entrypoint_type_unresolved_on_disk() {
+        let tmp = std::env::temp_dir().join(format!(
+            "gca_include_eviction_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(
+            tmp.join("project.gcl"),
+            "@include(\"src\");\n\nfn foo(_: Foo) {}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("src/other.gcl"), "type Foo {}\n").unwrap();
+        // Canonicalize so the URI we build matches the loader's keys
+        // (the loader canonicalizes every path before `path_to_uri`).
+        let root = tmp.canonicalize().unwrap();
+
+        let (mut b, rx) = backend_with(test_fs_ctx(), vec![root.clone()]);
+        let entry = path_to_uri(&root.join("project.gcl"));
+
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: entry.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "@include(\"src\");\n\nfn foo(_: Foo) {}\n".into(),
+            },
+        })
+        .unwrap();
+        let initial = latest_diags_for(&rx, &entry).expect("entrypoint published");
+        assert!(
+            !initial.iter().any(|d| d.message.contains("Foo")),
+            "`Foo` must resolve while the include is present, got: {initial:?}"
+        );
+
+        b.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: entry.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "fn foo(_: Foo) {}\n".into(),
+            }],
+        })
+        .unwrap();
+        let after = latest_diags_for(&rx, &entry).expect("entrypoint re-published");
+        let unresolved = after.iter().any(|d| d.message.contains("Foo"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            unresolved,
+            "`Foo` must be unresolved after the include is removed, got: {after:?}"
+        );
     }
 
     // P32.1
@@ -1667,10 +1902,14 @@ mod tests {
         let (mut b, _rx) = backend();
         let root_a = PathBuf::from("/ws/projA");
         let root_b = PathBuf::from("/ws/projB");
-        b.projects
-            .insert(root_a.clone(), Project::new(root_a.clone(), "projA".into()));
-        b.projects
-            .insert(root_b.clone(), Project::new(root_b.clone(), "projB".into()));
+        b.projects.insert(
+            root_a.clone(),
+            Project::new(root_a.clone(), "projA".into(), test_fs_ctx()),
+        );
+        b.projects.insert(
+            root_b.clone(),
+            Project::new(root_b.clone(), "projB".into(), test_fs_ctx()),
+        );
 
         let a1 = uri("file:///ws/projA/main.gcl");
         let b1 = uri("file:///ws/projB/main.gcl");
@@ -1693,8 +1932,10 @@ mod tests {
     fn did_close_keeps_project_diags_clears_orphan() {
         let (mut b, rx) = backend();
         let root = PathBuf::from("/ws/proj");
-        b.projects
-            .insert(root.clone(), Project::new(root.clone(), "proj".into()));
+        b.projects.insert(
+            root.clone(),
+            Project::new(root.clone(), "proj".into(), test_fs_ctx()),
+        );
         let member = uri("file:///ws/proj/main.gcl");
         b.bind_uri(member.clone(), root.clone());
         let orphan = uri("file:///elsewhere/loose.gcl");
@@ -1971,11 +2212,12 @@ mod tests {
     fn find_owning_project_root_picks_nearest() {
         let (tmp, outer, inner) = fixture_nested_projects("nearest");
         let workspace_roots = vec![outer.clone()];
+        let ctx = FsContext::with_greycat_home(PathBuf::new());
 
         // File in inner dir → inner wins.
         let foo_uri = path_uri(&inner.join("foo.gcl"));
         assert_eq!(
-            find_owning_project_root(&foo_uri, &workspace_roots),
+            find_owning_project_root(&foo_uri, &workspace_roots, &ctx),
             Some(inner.clone())
         );
 
@@ -1983,14 +2225,14 @@ mod tests {
         // not on the walk path).
         let bar_uri = path_uri(&outer.join("bar.gcl"));
         assert_eq!(
-            find_owning_project_root(&bar_uri, &workspace_roots),
+            find_owning_project_root(&bar_uri, &workspace_roots, &ctx),
             Some(outer.clone())
         );
 
         // File outside every workspace folder → no owner.
         let elsewhere_uri = path_uri(&tmp.join("elsewhere.gcl"));
         assert_eq!(
-            find_owning_project_root(&elsewhere_uri, &workspace_roots),
+            find_owning_project_root(&elsewhere_uri, &workspace_roots, &ctx),
             None
         );
 

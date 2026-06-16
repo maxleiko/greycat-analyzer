@@ -122,6 +122,19 @@ pub trait Context {
 
     /// Absolute path to GreyCat's home directory.
     fn greycat_home(&self) -> &Path;
+
+    /// Canonicalize `path` (resolve symlinks, `.` / `..`). The default
+    /// is identity — correct for in-memory contexts whose paths are
+    /// already canonical.
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        Ok(path.to_path_buf())
+    }
+
+    /// `true` iff `path` is a regular file. The default treats
+    /// "readable" as "is a file", which holds for in-memory contexts.
+    fn is_file(&self, path: &Path) -> bool {
+        self.read(path).is_ok()
+    }
 }
 
 /// Default real-filesystem [`Context`]. Holds the resolved GreyCat home so
@@ -165,6 +178,14 @@ impl Context for FsContext {
 
     fn greycat_home(&self) -> &Path {
         &self.greycat_home
+    }
+
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path)
+    }
+
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
     }
 }
 

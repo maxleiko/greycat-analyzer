@@ -474,6 +474,67 @@ pub fn path_to_uri(path: &Path) -> Uri {
         .unwrap_or_else(|_| "file:///invalid".parse().unwrap())
 }
 
+/// Resolve the set of module URIs belonging to the project rooted at
+/// `project_gcl`, by parsing ONLY that file's `@include` / `@library`
+/// pragmas and expanding them to the `.gcl` files they pull in. Read-
+/// only — nothing is loaded into any manager.
+///
+/// Only `project.gcl` can carry these pragmas, so one parse plus a few
+/// directory listings is the entire closure; member modules are never
+/// re-parsed. The entrypoint itself is a member. `@include` dirs and
+/// resolved `@library` dirs contribute every `.gcl` beneath them.
+/// Absolute `@include` paths are skipped (the runtime rejects them) and
+/// an unresolved `@library` contributes nothing.
+#[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
+pub fn resolve_project_modules(project_gcl: &Path, ctx: &dyn Context) -> FxHashSet<Uri> {
+    let mut out: FxHashSet<Uri> = FxHashSet::default();
+    let Ok(text) = ctx.read(project_gcl) else {
+        return out;
+    };
+    let Some(project_dir) = project_gcl.parent() else {
+        return out;
+    };
+    let canon = |p: &Path| ctx.canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    out.insert(path_to_uri(&canon(project_gcl)));
+
+    let tree = greycat_analyzer_syntax::parse(&text);
+    let desc = parse_module_desc(path_to_uri(project_gcl), &text, tree.root_node());
+
+    for inc in &desc.includes {
+        if Path::new(&inc.value).is_absolute() {
+            continue;
+        }
+        // Canonicalize so a relative `../shared` include resolves to a
+        // stable directory identity (real fs follows `..` in `is_dir`;
+        // canonicalizing first keeps the in-memory contexts honest too).
+        let dir = canon(&project_dir.join(&inc.value));
+        if ctx.is_dir(&dir) {
+            for path in ctx.iter_gcl(&dir) {
+                out.insert(path_to_uri(&canon(&path)));
+            }
+        }
+    }
+    for lib in &desc.libraries {
+        let local = library_dir(project_dir, &lib.name);
+        let lib_root = if ctx.is_dir(&local) {
+            local
+        } else if lib.name == "std" {
+            let global = global_std_dir(ctx.greycat_home());
+            if ctx.is_dir(&global) {
+                global
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+        for path in ctx.iter_gcl(&lib_root) {
+            out.insert(path_to_uri(&canon(&path)));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,10 +594,65 @@ mod tests {
         fn greycat_home(&self) -> &Path {
             &self.greycat_home
         }
+
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            // Lexically collapse `.` / `..` so `/ws/bar/../shared`
+            // resolves to `/ws/shared` like the real fs would.
+            let mut out = PathBuf::new();
+            for comp in path.components() {
+                match comp {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => out.push(other),
+                }
+            }
+            Ok(out)
+        }
     }
 
     fn uri(path: &str) -> Uri {
         Uri::from_str(&format!("file://{path}")).unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
+    fn resolve_project_modules_expands_includes() {
+        let ctx = MemContext::default();
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "@include(\"src\");\n");
+        ctx.add_file(PathBuf::from("/proj/src/a.gcl"), "type A {}\n");
+        ctx.add_file(PathBuf::from("/proj/src/b.gcl"), "type B {}\n");
+        ctx.add_file(PathBuf::from("/proj/other/c.gcl"), "type C {}\n");
+        let members = resolve_project_modules(Path::new("/proj/project.gcl"), &ctx);
+        assert!(
+            members.contains(&uri("/proj/project.gcl")),
+            "entrypoint is a member"
+        );
+        assert!(members.contains(&uri("/proj/src/a.gcl")));
+        assert!(members.contains(&uri("/proj/src/b.gcl")));
+        assert!(
+            !members.contains(&uri("/proj/other/c.gcl")),
+            "a non-included dir contributes nothing"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
+    fn resolve_project_modules_follows_parent_relative_include() {
+        // testbed shape: a project that `@include`s a sibling dir via `..`.
+        let ctx = MemContext::default();
+        ctx.add_file(
+            PathBuf::from("/ws/bar/project.gcl"),
+            "@include(\"../shared\");\n",
+        );
+        ctx.add_file(PathBuf::from("/ws/shared/foo.gcl"), "type Foo {}\n");
+        let members = resolve_project_modules(Path::new("/ws/bar/project.gcl"), &ctx);
+        assert!(members.contains(&uri("/ws/bar/project.gcl")));
+        assert!(
+            members.contains(&uri("/ws/shared/foo.gcl")),
+            "`../shared` must resolve to the sibling dir, got: {members:?}"
+        );
     }
 
     #[test]

@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{RecvError, select, unbounded};
-use greycat_analyzer_core::SourceEncoding;
+use greycat_analyzer_core::resolver::{Context, FsContext, try_greycat_home};
+use greycat_analyzer_core::{SourceEncoding, SourceManager};
 use log::{debug, info};
 use lsp_server::*;
 use lsp_types::notification::{
@@ -185,13 +187,20 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
     // stays wired as the fallback).
     let (fs_tx, fs_rx) = unbounded();
     let watcher = crate::watcher::start_watcher(fs_tx.clone());
-    let greycat_home = greycat_analyzer_core::resolver::try_greycat_home().ok();
+    let greycat_home = try_greycat_home().ok();
+
+    // One real-filesystem context, shared by every project's loader and
+    // the Backend's own entrypoint / discovery checks (see `Backend::ctx`).
+    let ctx: Arc<dyn Context> = match FsContext::new() {
+        Ok(c) => Arc::new(c),
+        Err(_) => Arc::new(FsContext::with_greycat_home(PathBuf::new())),
+    };
 
     let mut server = Backend {
         client: conn.sender.clone(),
         projects: Default::default(),
         uri_owner: Default::default(),
-        orphans: greycat_analyzer_core::SourceManager::new(),
+        orphans: SourceManager::with_context(ctx.clone()),
         workspace_roots: Vec::new(),
         lint_libs: false,
         // P15.3 — production fetcher (ureq + 5min TTL cache). Native
@@ -208,6 +217,7 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
         pending_fs_events: Default::default(),
         fs_flush_deadline: None,
         greycat_home,
+        ctx,
     };
 
     server.initialized(&init)?;
@@ -258,7 +268,7 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
                 },
                 Err(RecvError) => return Ok(()),
             },
-            // P34.3 — in-process watcher events. The watcher thread only
+            // In-process watcher events. The watcher thread only
             // forwards raw notify payloads; debounce + classification +
             // dispatch into the shared reload path happen here on the
             // main thread. A disconnected channel (`Err`) can't happen
