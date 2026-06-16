@@ -78,8 +78,7 @@ impl SourceManager {
         self.documents.insert(doc.uri.clone(), RefCell::new(doc));
     }
 
-    /// Convenience: build a `Document` from raw text and add it. Mirrors
-    /// TS `addSimpleSource(uri, content, lib)`.
+    /// Convenience: build a `Document` from raw text and add it.
     pub fn add_simple(
         &mut self,
         uri: Uri,
@@ -142,10 +141,6 @@ impl SourceManager {
     /// Cycle-safe: each canonical filepath is parsed at most once. Returns
     /// the [`LoadReport`] with everything actually parsed in this load,
     /// including which `@library` declarations couldn't be resolved.
-    ///
-    // P1.4 — diagnostics deferred. P2 — project-graph data model.
-    /// This is the recursive-load slice of TS `analyze.ts:resolve_*` —
-    /// trimmed to path resolution + parsing.
     pub fn load_project(&mut self, project_filepath: &Path) -> LoadReport {
         let mut report = LoadReport::default();
         let project_dir = match project_filepath.parent() {
@@ -163,7 +158,7 @@ impl SourceManager {
         // Load the project.gcl itself first.
         if let Some(uri) = self.load_file(project_filepath, "project", &mut visited, &mut report) {
             report.entrypoint_uri = Some(uri.clone());
-            // P40.1 — mirror into the manager so the analyzer's pragma
+            // Mirror into the manager so the analyzer's pragma
             // walker can identify the entrypoint without threading the
             // LoadReport through every call.
             self.entrypoint_uri = Some(uri.clone());
@@ -172,7 +167,7 @@ impl SourceManager {
             self.process_includes(&project_dir, &desc, &mut visited, &mut report);
             self.process_libraries(&project_dir, &desc, &mut visited, &mut report);
         }
-        // P33.1 — always ensure `std` is loaded, regardless of whether
+        // Always ensure `std` is loaded, regardless of whether
         // the project.gcl declared `@library("std", ...)`. This mirrors
         // the GreyCat runtime: local `lib/std` wins, otherwise
         // `$HOME/.greycat/lib/std`, otherwise the runtime falls back to
@@ -183,7 +178,6 @@ impl SourceManager {
         report
     }
 
-    // P33.1
     /// Load the `std` library closure from the local `<project_dir>/lib/std/`
     /// if present, else from the global `<greycat_home>/lib/std/`. Returns
     /// which (if any) source was used. `load_file` is idempotent against
@@ -228,7 +222,7 @@ impl SourceManager {
         report: &mut LoadReport,
     ) {
         for inc in &desc.includes {
-            // P15.x — runtime rejects absolute @include paths; mirror
+            // Runtime rejects absolute @include paths; mirror
             // that here so we don't analyze files that won't actually
             // be loaded at runtime. The `absolute-include` warning is
             // surfaced by `core::diagnostics::pragma_diagnostics`.
@@ -237,7 +231,7 @@ impl SourceManager {
             }
             let dir = project_dir.join(&inc.value);
             if !self.ctx.is_dir(&dir) {
-                // P15.5 — surfaced as a typed `unresolved-include`
+                // Surfaced as a typed `unresolved-include`
                 // diagnostic via `core::diagnostics::pragma_diagnostics`.
                 // Leave the loader silent so consumers don't see it twice.
                 continue;
@@ -292,24 +286,27 @@ impl SourceManager {
         visited: &mut FxHashSet<PathBuf>,
         report: &mut LoadReport,
     ) -> Option<Uri> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical = self
+            .ctx
+            .canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf());
         if !visited.insert(canonical.clone()) {
             return None; // already loaded in this call — cycle-safe
         }
         let uri = path_to_uri(&canonical);
-        // **P19.22** — idempotent across `load_project` calls. If the
+        // Idempotent across `load_project` calls. If the
         // document is already in the manager (because the LSP did_open
         // landed first, or a prior `load_project` populated it), skip
         // the disk read so we don't clobber unsaved in-editor edits.
         // Closed-and-externally-edited files are refreshed via the
         // explicit `did_change_watched_files` path, not here.
-        // **P19.23** — record in `reachable` regardless of whether we
+        // Record in `reachable` regardless of whether we
         // re-read or skipped, so eviction can compute the full closure.
         if self.documents.contains_key(&uri) {
             report.reachable.push(uri.clone());
             return Some(uri);
         }
-        // P14.5: split the read and parse phases so cli `lint --csv`
+        // Split the read and parse phases so cli `lint --csv`
         // can surface them separately. `add_simple` triggers the
         // tree-sitter parse internally; bracketing it captures the
         // parse-only duration.
@@ -334,7 +331,6 @@ impl SourceManager {
         Some(uri)
     }
 
-    // P19.23
     /// Drop every document NOT in `reachable` (and not
     /// currently opened by the editor). Returns the URIs evicted, so
     /// the LSP layer can publish empty diagnostics for them.
@@ -475,16 +471,16 @@ pub fn path_to_uri(path: &Path) -> Uri {
 }
 
 /// Resolve the set of module URIs belonging to the project rooted at
-/// `project_gcl`, by parsing ONLY that file's `@include` / `@library`
-/// pragmas and expanding them to the `.gcl` files they pull in. Read-
-/// only — nothing is loaded into any manager.
+/// `project_gcl`, by parsing that file's `@include` / `@library` pragmas
+/// and expanding them to the `.gcl` files they pull in. Read-only —
+/// nothing is loaded into any manager.
 ///
-/// Only `project.gcl` can carry these pragmas, so one parse plus a few
-/// directory listings is the entire closure; member modules are never
-/// re-parsed. The entrypoint itself is a member. `@include` dirs and
-/// resolved `@library` dirs contribute every `.gcl` beneath them.
-/// Absolute `@include` paths are skipped (the runtime rejects them) and
-/// an unresolved `@library` contributes nothing.
+/// This is the *discovery* definition of project membership: the
+/// entrypoint's own declared closure (member modules aren't re-parsed
+/// for further pragmas). The entrypoint itself is a member; `@include`
+/// dirs and resolved `@library` dirs contribute every `.gcl` beneath
+/// them. Absolute `@include` paths are skipped (the runtime rejects
+/// them) and an unresolved `@library` contributes nothing.
 #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
 pub fn resolve_project_modules(project_gcl: &Path, ctx: &dyn Context) -> FxHashSet<Uri> {
     let mut out: FxHashSet<Uri> = FxHashSet::default();

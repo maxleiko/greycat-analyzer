@@ -6,7 +6,6 @@ use crossbeam_channel::Sender;
 use greycat_analyzer_analysis::project::ProjectAnalysis;
 use greycat_analyzer_core::SourceEncoding;
 use greycat_analyzer_core::module_desc::parse_module_desc;
-use greycat_analyzer_core::path_to_uri;
 use greycat_analyzer_core::registry::RegistryFetcher;
 use greycat_analyzer_core::resolver::{Context, FsContext, global_std_dir};
 use greycat_analyzer_core::{
@@ -16,6 +15,7 @@ use greycat_analyzer_core::{
         orphan_module_diagnostic, parse_diagnostics, pragma_diagnostics,
     },
 };
+use greycat_analyzer_core::{path_to_uri, resolve_project_modules};
 use log::{debug, info, warn};
 use lsp_server::*;
 use lsp_types::{
@@ -910,14 +910,20 @@ impl Backend {
         if self.orphans.get(uri).is_some() {
             return DocOwner::Orphan;
         }
-        let owner = find_owning_project_root(uri, &self.workspace_roots, self.ctx.as_ref());
-        match owner {
-            Some(root) => {
-                if !self.projects.contains_key(&root) {
-                    self.spawn_lazy_project(&root);
+        let owners = find_owning_projects(uri, &self.workspace_roots, self.ctx.as_ref());
+        match owners.first().cloned() {
+            Some(primary) => {
+                // Spawn + bind EVERY owning project. A module included by
+                // two `project.gcl`s ends up bound to both, and the
+                // `multi-project-owner` advisory falls out of the
+                // `OwnerList` length in `publish_for`.
+                for root in &owners {
+                    if !self.projects.contains_key(root) {
+                        self.spawn_lazy_project(root);
+                    }
+                    self.bind_uri(uri.clone(), root.clone());
                 }
-                self.bind_uri(uri.clone(), root.clone());
-                DocOwner::Project(root)
+                DocOwner::Project(primary)
             }
             None => {
                 if self.workspace_roots.is_empty() {
@@ -933,8 +939,7 @@ impl Backend {
                     self.bind_uri(uri.clone(), r.clone());
                     DocOwner::Project(r)
                 } else {
-                    // Inside a workspace but with no project.gcl up-tree
-                    // — true orphan, no analysis.
+                    // No project's closure includes it — true orphan.
                     DocOwner::Orphan
                 }
             }
@@ -1483,11 +1488,8 @@ impl Backend {
                 .get(uri)
                 .map(|o| o.to_vec())
                 .unwrap_or_default();
-            if owners.is_empty()
-                && let Some(root) =
-                    find_owning_project_root(uri, &self.workspace_roots, self.ctx.as_ref())
-            {
-                owners.push(root);
+            if owners.is_empty() {
+                owners = find_owning_projects(uri, &self.workspace_roots, self.ctx.as_ref());
             }
             if owners.is_empty() {
                 debug!("[watch] {:?} on unowned {} -> skip", ev.typ, uri.as_str());
@@ -1577,44 +1579,45 @@ pub(crate) fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     Some(Path::new(stripped).to_path_buf())
 }
 
-// P32.3
-/// Walk up from `uri`'s directory looking for the nearest `project.gcl`,
-/// bounded by the enclosing workspace folder.
+/// Every project root whose `@include` / `@library` closure contains
+/// `uri`, searched across the whole workspace folder(s) — not just
+/// up-tree.
 ///
-/// Returns the directory holding the closest `project.gcl`, or `None`
-/// when the URI is outside every workspace folder or the walk reaches
-/// the workspace folder root without finding one.
-///
-/// The walk *includes* the workspace folder itself — if a project.gcl
-/// sits exactly at the workspace folder root, that wins.
-pub(crate) fn find_owning_project_root(
+/// Ownership is membership in a project's declared module closure
+/// ([`resolve_project_modules`]), so a module pulled in by two sibling
+/// `project.gcl`s (a layout error) is owned by *both*; the caller
+/// surfaces that as `multi-project-owner`. A `uri` no project includes
+/// has no owner and is an orphan. Up-tree proximity is irrelevant — a
+/// sibling `../shared` module is owned exactly when a project includes
+/// it.
+pub(crate) fn find_owning_projects(
     uri: &Uri,
     workspace_roots: &[PathBuf],
     ctx: &dyn Context,
-) -> Option<PathBuf> {
-    let path = uri_to_path(uri)?;
-    let start_dir = path.parent()?.to_path_buf();
-    // Find the workspace folder that contains the URI. Multiple
-    // matches: pick the longest (most specific) one, since nested
-    // workspace folders are valid in LSP.
-    let ws_root = workspace_roots
-        .iter()
-        .filter(|ws| start_dir.starts_with(ws))
-        .max_by_key(|ws| ws.as_os_str().len())?
-        .clone();
-    let mut cur = start_dir;
-    loop {
-        if ctx.is_file(&cur.join("project.gcl")) {
-            return Some(cur);
-        }
-        if cur == ws_root {
-            return None;
-        }
-        match cur.parent() {
-            Some(parent) => cur = parent.to_path_buf(),
-            None => return None,
+) -> Vec<PathBuf> {
+    let Some(path) = uri_to_path(uri) else {
+        return Vec::new();
+    };
+    let target = path_to_uri(&ctx.canonicalize(&path).unwrap_or(path));
+    let mut owners: Vec<PathBuf> = Vec::new();
+    for ws in workspace_roots {
+        for project_gcl in ctx.iter_gcl(ws) {
+            if project_gcl.file_name().and_then(|n| n.to_str()) != Some("project.gcl") {
+                continue;
+            }
+            if !resolve_project_modules(&project_gcl, ctx).contains(&target) {
+                continue;
+            }
+            let Some(dir) = project_gcl.parent() else {
+                continue;
+            };
+            let root = ctx.canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            if !owners.contains(&root) {
+                owners.push(root);
+            }
         }
     }
+    owners
 }
 
 // P34.2
@@ -1773,6 +1776,22 @@ mod tests {
         fn greycat_home(&self) -> &Path {
             &self.greycat_home
         }
+
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            // Lexically collapse `.` / `..` so `../shared` resolves to a
+            // sibling dir like the real fs would.
+            let mut out = PathBuf::new();
+            for comp in path.components() {
+                match comp {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => out.push(other),
+                }
+            }
+            Ok(out)
+        }
     }
 
     /// Drain every pending publish and return the most recent
@@ -1908,6 +1927,52 @@ mod tests {
         assert!(
             b.project_for(&member).is_none(),
             "the de-homed member must no longer be project-owned"
+        );
+    }
+
+    /// End-to-end testbed scenario: two sibling projects both
+    /// `@include("../shared")`. Opening `shared/foo.gcl` binds it to BOTH
+    /// and surfaces the `multi-project-owner` advisory — the layout error
+    /// the membership model is meant to catch.
+    #[test]
+    fn opening_doubly_included_module_reports_multi_owner() {
+        let ctx = MemContext::default();
+        ctx.add_file(
+            PathBuf::from("/ws/bar/project.gcl"),
+            "@include(\"../shared\");\n",
+        );
+        ctx.add_file(
+            PathBuf::from("/ws/foo/project.gcl"),
+            "@include(\"../shared\");\n",
+        );
+        ctx.add_file(PathBuf::from("/ws/shared/foo.gcl"), "type Foo {}\n");
+        let ctx: Arc<dyn Context> = Arc::new(ctx);
+
+        let (mut b, rx) = backend_with(ctx, vec![PathBuf::from("/ws")]);
+        let shared = uri("file:///ws/shared/foo.gcl");
+
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: shared.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "type Foo {}\n".into(),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            b.uri_owner.get(&shared).map(|o| o.len()),
+            Some(2),
+            "shared/foo.gcl must be owned by both projects"
+        );
+        let diags = latest_diags_for(&rx, &shared).expect("shared published");
+        assert!(
+            diags.iter().any(|d| matches!(
+                &d.code,
+                Some(NumberOrString::String(c)) if c == "multi-project-owner"
+            )),
+            "expected a multi-project-owner advisory, got: {diags:?}"
         );
     }
 
@@ -2072,10 +2137,11 @@ mod tests {
     }
 
     // P32.3
-    /// Set up a temp directory with the nested layout
-    /// `outer/project.gcl` + `outer/sub/project.gcl` and return the
-    /// outer / inner roots plus the temp base so the caller can clean
-    /// up.
+    /// Set up a temp directory with nested projects `outer/project.gcl`
+    /// and `outer/sub/project.gcl`, each `@include("src")`-ing a private
+    /// source dir so the test files are genuine closure members (the
+    /// membership model owns only `@include`d modules). Returns the
+    /// outer / inner roots plus the temp base for cleanup.
     fn fixture_nested_projects(slug: &str) -> (PathBuf, PathBuf, PathBuf) {
         let tmp = std::env::temp_dir().join(format!(
             "gca_owner_search_{}_{}_{}",
@@ -2091,17 +2157,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let outer = tmp.join("outer");
         let inner = outer.join("sub");
-        std::fs::create_dir_all(&inner).unwrap();
-        std::fs::write(
-            outer.join("project.gcl"),
-            "fn outer_root(): int { return 0; }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            inner.join("project.gcl"),
-            "fn inner_root(): int { return 0; }\n",
-        )
-        .unwrap();
+        std::fs::create_dir_all(outer.join("src")).unwrap();
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::write(outer.join("project.gcl"), "@include(\"src\");\n").unwrap();
+        std::fs::write(outer.join("src/bar.gcl"), "fn bar(): int { return 0; }\n").unwrap();
+        std::fs::write(inner.join("project.gcl"), "@include(\"src\");\n").unwrap();
+        std::fs::write(inner.join("src/foo.gcl"), "fn foo(): int { return 0; }\n").unwrap();
         (tmp, outer, inner)
     }
 
@@ -2288,39 +2349,55 @@ mod tests {
         assert_eq!(compute_project_tag(&PathBuf::new(), &[]), "single-file");
     }
 
-    // P32.3
-    /// Pure-function test of the parent-walk: nearest `project.gcl`
-    /// wins, walk bounded by the workspace folder, files outside
-    /// every workspace folder return `None`.
+    /// Ownership is closure membership, not directory proximity: an
+    /// `@include`d module is owned; a sibling of `project.gcl` that no
+    /// project includes is an orphan (empty owner list).
     #[test]
-    fn find_owning_project_root_picks_nearest() {
-        let (tmp, outer, inner) = fixture_nested_projects("nearest");
-        let workspace_roots = vec![outer.clone()];
-        let ctx = FsContext::with_greycat_home(PathBuf::new());
-
-        // File in inner dir → inner wins.
-        let foo_uri = path_uri(&inner.join("foo.gcl"));
-        assert_eq!(
-            find_owning_project_root(&foo_uri, &workspace_roots, &ctx),
-            Some(inner.clone())
+    fn find_owning_projects_is_membership_based() {
+        let ctx = MemContext::default();
+        ctx.add_file(
+            PathBuf::from("/ws/proj/project.gcl"),
+            "@include(\"src\");\n",
         );
+        ctx.add_file(PathBuf::from("/ws/proj/src/inc.gcl"), "type Inc {}\n");
+        ctx.add_file(PathBuf::from("/ws/proj/loose.gcl"), "type Loose {}\n");
+        let ws = vec![PathBuf::from("/ws")];
 
-        // File in outer dir (sibling of `sub`) → outer wins (inner is
-        // not on the walk path).
-        let bar_uri = path_uri(&outer.join("bar.gcl"));
         assert_eq!(
-            find_owning_project_root(&bar_uri, &workspace_roots, &ctx),
-            Some(outer.clone())
+            find_owning_projects(&uri("file:///ws/proj/src/inc.gcl"), &ws, &ctx),
+            vec![PathBuf::from("/ws/proj")],
+            "an @included module is owned"
         );
+        assert!(
+            find_owning_projects(&uri("file:///ws/proj/loose.gcl"), &ws, &ctx).is_empty(),
+            "a non-included sibling of project.gcl is an orphan, not owned by proximity"
+        );
+    }
 
-        // File outside every workspace folder → no owner.
-        let elsewhere_uri = path_uri(&tmp.join("elsewhere.gcl"));
+    /// testbed shape: two sibling `project.gcl`s both `@include("../shared")`,
+    /// so `shared/foo.gcl` is owned by BOTH — a layout error the caller
+    /// surfaces as `multi-project-owner`.
+    #[test]
+    fn find_owning_projects_reports_multiple_owners() {
+        let ctx = MemContext::default();
+        ctx.add_file(
+            PathBuf::from("/ws/bar/project.gcl"),
+            "@include(\"../shared\");\n",
+        );
+        ctx.add_file(
+            PathBuf::from("/ws/foo/project.gcl"),
+            "@include(\"../shared\");\n",
+        );
+        ctx.add_file(PathBuf::from("/ws/shared/foo.gcl"), "type Foo {}\n");
+        let ws = vec![PathBuf::from("/ws")];
+
+        let mut owners = find_owning_projects(&uri("file:///ws/shared/foo.gcl"), &ws, &ctx);
+        owners.sort();
         assert_eq!(
-            find_owning_project_root(&elsewhere_uri, &workspace_roots, &ctx),
-            None
+            owners,
+            vec![PathBuf::from("/ws/bar"), PathBuf::from("/ws/foo")],
+            "a module included by two projects is owned by both"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // P32.7
@@ -2401,21 +2478,9 @@ mod tests {
         b.load_workspace(&path_uri(&proj_a));
         b.load_workspace(&path_uri(&proj_b));
 
-        // Add a dummy file to projB so we can later observe that
-        // projB's manager state didn't get clobbered by an unrelated
-        // reload.
-        let b_only = proj_b.join("b_only.gcl");
-        std::fs::write(&b_only, "fn b_only(): int { return 9; }\n").unwrap();
-        let b_only_uri = path_uri(&b_only);
-        b.did_open(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-                uri: b_only_uri.clone(),
-                language_id: "greycat".into(),
-                version: 1,
-                text: "fn b_only(): int { return 9; }\n".into(),
-            },
-        })
-        .unwrap();
+        // projB's entrypoint is a closure member — observe that projB's
+        // manager state survives an unrelated projA reload.
+        let b_entry = path_uri(&proj_b.join("project.gcl"));
 
         // Simulate `greycat install` populating projA/lib/installed.
         let lib_dir = proj_a.join("lib");
@@ -2430,11 +2495,11 @@ mod tests {
         })
         .unwrap();
 
-        // projB still has b_only — its closure wasn't disturbed.
+        // projB still has its entrypoint — its closure wasn't disturbed.
         let proj_b_state = b.projects.get(&proj_b).expect("projB loaded");
         assert!(
-            proj_b_state.manager.get(&b_only_uri).is_some(),
-            "projB must still own b_only after a lib/installed reload of projA"
+            proj_b_state.manager.get(&b_entry).is_some(),
+            "projB must still own its entrypoint after a lib/installed reload of projA"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2462,8 +2527,8 @@ mod tests {
             "inner project must not be loaded eagerly"
         );
 
-        // Open outer/bar.gcl — owner is outer (already loaded).
-        let bar_uri = path_uri(&outer.join("bar.gcl"));
+        // Open outer/src/bar.gcl — a member of outer (already loaded).
+        let bar_uri = path_uri(&outer.join("src/bar.gcl"));
         b.did_open(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: bar_uri.clone(),
@@ -2479,11 +2544,11 @@ mod tests {
         );
         assert!(
             !b.projects.contains_key(&inner),
-            "opening outer/bar.gcl must not spawn inner project"
+            "opening outer/src/bar.gcl must not spawn inner project"
         );
 
-        // Open outer/sub/foo.gcl — owner is inner, must spawn lazily.
-        let foo_uri = path_uri(&inner.join("foo.gcl"));
+        // Open outer/sub/src/foo.gcl — a member of inner, spawned lazily.
+        let foo_uri = path_uri(&inner.join("src/foo.gcl"));
         b.did_open(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: foo_uri.clone(),

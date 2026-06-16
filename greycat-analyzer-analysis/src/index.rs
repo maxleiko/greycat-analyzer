@@ -259,7 +259,6 @@ pub struct ProjectIndex {
     pub modules_ingested: usize,
 }
 
-
 impl ProjectIndex {
     /// Construct a fresh index that reuses an existing
     /// [`SymbolTable`]. Lets `ProjectAnalysis::invalidate` rebuild
