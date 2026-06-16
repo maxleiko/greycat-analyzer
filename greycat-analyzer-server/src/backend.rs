@@ -268,6 +268,13 @@ pub struct Backend {
     /// subsystem stays on the real filesystem — it only runs against a
     /// live `notify` watch, which no in-memory context can drive.
     pub ctx: Arc<dyn Context>,
+    /// Cached workspace `project.gcl` → module-closure index driving
+    /// ownership discovery. `None` when stale: rebuilt on the next
+    /// `owning_projects` call and invalidated whenever a `project.gcl` or
+    /// any `.gcl` file changes (the only events that can move a module
+    /// between projects). `did_open` never invalidates it, so opening a
+    /// burst of files in a stable workspace scans once.
+    pub project_index: Option<ProjectModuleIndex>,
 }
 
 impl Backend {
@@ -284,6 +291,25 @@ impl Backend {
     pub fn project_for_mut(&mut self, uri: &Uri) -> Option<&mut Project> {
         let root = self.uri_owner.get(uri)?.first()?.clone();
         self.projects.get_mut(&root)
+    }
+
+    /// Project roots whose declared closure contains `uri`, served from
+    /// the cached [`Self::project_index`] (built lazily on the first
+    /// call after invalidation). `did_open` of an unbound file hits this,
+    /// so the cache keeps a burst of opens from re-scanning the workspace.
+    fn owning_projects(&mut self, uri: &Uri) -> Vec<PathBuf> {
+        let index = self.project_index.get_or_insert_with(|| {
+            ProjectModuleIndex::scan(&self.workspace_roots, self.ctx.as_ref())
+        });
+        index.owners_of(uri, self.ctx.as_ref())
+    }
+
+    /// Mark the ownership index stale. Called whenever a `project.gcl` or
+    /// any `.gcl` file changes — the only edits that can move a module
+    /// between projects. Cheap: the rebuild is deferred to the next
+    /// `owning_projects` call.
+    fn invalidate_project_index(&mut self) {
+        self.project_index = None;
     }
 
     // P32.6
@@ -910,7 +936,7 @@ impl Backend {
         if self.orphans.get(uri).is_some() {
             return DocOwner::Orphan;
         }
-        let owners = find_owning_projects(uri, &self.workspace_roots, self.ctx.as_ref());
+        let owners = self.owning_projects(uri);
         match owners.first().cloned() {
             Some(primary) => {
                 // Spawn + bind EVERY owning project. A module included by
@@ -1031,6 +1057,9 @@ impl Backend {
         // the synchronous path (no debounce) because closure changes
         // must land before subsequent analyses run.
         if self.is_project_entrypoint(&uri) {
+            // A project.gcl edit can change its @include / @library, so
+            // the ownership index is stale.
+            self.invalidate_project_index();
             self.reload_project_closure(&uri);
             return self.publish_for(&uri);
         }
@@ -1306,6 +1335,8 @@ impl Backend {
         &mut self,
         params: DidChangeWorkspaceFoldersParams,
     ) -> Result<()> {
+        // The set of scanned `project.gcl`s changes with the folder set.
+        self.invalidate_project_index();
         for ws in &params.event.added {
             let Some(path) = uri_to_path(&ws.uri) else {
                 warn!(
@@ -1427,6 +1458,10 @@ impl Backend {
         if changes.is_empty() {
             return Ok(());
         }
+        // Any `.gcl` create / delete / change (incl. a new or removed
+        // project.gcl) can move a module between projects, so the
+        // ownership index is stale. Rebuilt lazily on the next discovery.
+        self.invalidate_project_index();
         // P32.7 — bucket reload triggers per project so a watcher
         // event in projectA never wakes up projectB.
         let mut reload_set: FxHashSet<PathBuf> = FxHashSet::default();
@@ -1489,7 +1524,7 @@ impl Backend {
                 .map(|o| o.to_vec())
                 .unwrap_or_default();
             if owners.is_empty() {
-                owners = find_owning_projects(uri, &self.workspace_roots, self.ctx.as_ref());
+                owners = self.owning_projects(uri);
             }
             if owners.is_empty() {
                 debug!("[watch] {:?} on unowned {} -> skip", ev.typ, uri.as_str());
@@ -1579,45 +1614,72 @@ pub(crate) fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     Some(Path::new(stripped).to_path_buf())
 }
 
-/// Every project root whose `@include` / `@library` closure contains
-/// `uri`, searched across the whole workspace folder(s) — not just
-/// up-tree.
-///
-/// Ownership is membership in a project's declared module closure
-/// ([`resolve_project_modules`]), so a module pulled in by two sibling
-/// `project.gcl`s (a layout error) is owned by *both*; the caller
-/// surfaces that as `multi-project-owner`. A `uri` no project includes
-/// has no owner and is an orphan. Up-tree proximity is irrelevant — a
-/// sibling `../shared` module is owned exactly when a project includes
-/// it.
+/// Project-root → declared module-closure index for a workspace, the
+/// cached input to ownership resolution. Built by [`ProjectModuleIndex::scan`]
+/// and rebuilt when a `project.gcl` or any `.gcl` file changes.
+#[derive(Default)]
+#[repr(transparent)]
+pub(crate) struct ProjectModuleIndex(FxHashMap<PathBuf, FxHashSet<Uri>>);
+
+impl ProjectModuleIndex {
+    /// Scan every workspace folder for `project.gcl` files and resolve
+    /// each one's `@include` / `@library` closure, keyed by canonical
+    /// project root. The expensive bit — a filesystem walk plus a parse
+    /// per `project.gcl` — so callers cache the result.
+    #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
+    pub(crate) fn scan(workspace_roots: &[PathBuf], ctx: &dyn Context) -> Self {
+        let mut index: FxHashMap<PathBuf, FxHashSet<Uri>> = FxHashMap::default();
+        for ws in workspace_roots {
+            for project_gcl in ctx.iter_gcl(ws) {
+                if project_gcl.file_name().and_then(|n| n.to_str()) != Some("project.gcl") {
+                    continue;
+                }
+                let Some(dir) = project_gcl.parent() else {
+                    continue;
+                };
+                let root = ctx.canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                index
+                    .entry(root)
+                    .or_insert_with(|| resolve_project_modules(&project_gcl, ctx));
+            }
+        }
+        Self(index)
+    }
+
+    /// Every project root whose closure contains `uri`.
+    ///
+    /// Ownership is membership in a project's declared module closure, so
+    /// a module pulled in by two sibling `project.gcl`s (a layout error)
+    /// is owned by *both*; the caller surfaces that as
+    /// `multi-project-owner`. A `uri` no project includes has no owner
+    /// and is an orphan. Up-tree proximity is irrelevant — a sibling
+    /// `../shared` module is owned exactly when a project includes it.
+    /// Returned sorted for determinism.
+    pub(crate) fn owners_of(&self, uri: &Uri, ctx: &dyn Context) -> Vec<PathBuf> {
+        let Some(path) = uri_to_path(uri) else {
+            return Vec::new();
+        };
+        let target = path_to_uri(&ctx.canonicalize(&path).unwrap_or(path));
+        let mut owners: Vec<PathBuf> = self
+            .0
+            .iter()
+            .filter(|(_, members)| members.contains(&target))
+            .map(|(root, _)| root.clone())
+            .collect();
+        owners.sort();
+        owners
+    }
+}
+
+/// Uncached convenience: scan + look up in one call. Production code goes
+/// through [`Backend::owning_projects`] (cached); this is for callers
+/// that don't hold a cache (tests).
 pub(crate) fn find_owning_projects(
     uri: &Uri,
     workspace_roots: &[PathBuf],
     ctx: &dyn Context,
 ) -> Vec<PathBuf> {
-    let Some(path) = uri_to_path(uri) else {
-        return Vec::new();
-    };
-    let target = path_to_uri(&ctx.canonicalize(&path).unwrap_or(path));
-    let mut owners: Vec<PathBuf> = Vec::new();
-    for ws in workspace_roots {
-        for project_gcl in ctx.iter_gcl(ws) {
-            if project_gcl.file_name().and_then(|n| n.to_str()) != Some("project.gcl") {
-                continue;
-            }
-            if !resolve_project_modules(&project_gcl, ctx).contains(&target) {
-                continue;
-            }
-            let Some(dir) = project_gcl.parent() else {
-                continue;
-            };
-            let root = ctx.canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            if !owners.contains(&root) {
-                owners.push(root);
-            }
-        }
-    }
-    owners
+    ProjectModuleIndex::scan(workspace_roots, ctx).owners_of(uri, ctx)
 }
 
 // P34.2
@@ -1720,6 +1782,7 @@ mod tests {
                 fs_flush_deadline: None,
                 greycat_home: None,
                 ctx,
+                project_index: None,
             },
             rx,
         )
@@ -2371,6 +2434,57 @@ mod tests {
         assert!(
             find_owning_projects(&uri("file:///ws/proj/loose.gcl"), &ws, &ctx).is_empty(),
             "a non-included sibling of project.gcl is an orphan, not owned by proximity"
+        );
+    }
+
+    /// The ownership index is built lazily on first discovery and
+    /// dropped when a `project.gcl` edit could change membership, so a
+    /// burst of `did_open`s in a stable workspace scans only once.
+    #[test]
+    fn ownership_index_caches_and_invalidates() {
+        let ctx = MemContext::default();
+        ctx.add_file(
+            PathBuf::from("/ws/proj/project.gcl"),
+            "@include(\"src\");\n",
+        );
+        ctx.add_file(PathBuf::from("/ws/proj/src/a.gcl"), "type A {}\n");
+        let ctx: Arc<dyn Context> = Arc::new(ctx);
+        let (mut b, _rx) = backend_with(ctx, vec![PathBuf::from("/ws")]);
+
+        assert!(b.project_index.is_none(), "index starts unbuilt");
+        let owners = b.owning_projects(&uri("file:///ws/proj/src/a.gcl"));
+        assert_eq!(owners, vec![PathBuf::from("/ws/proj")]);
+        assert!(
+            b.project_index.is_some(),
+            "first discovery populates the cache"
+        );
+
+        // Open the entrypoint so the project is loaded, then edit it —
+        // the project.gcl change must invalidate the index.
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri("file:///ws/proj/project.gcl"),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "@include(\"src\");\n".into(),
+            },
+        })
+        .unwrap();
+        b.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri("file:///ws/proj/project.gcl"),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "@include(\"other\");\n".into(),
+            }],
+        })
+        .unwrap();
+        assert!(
+            b.project_index.is_none(),
+            "a project.gcl edit invalidates the index"
         );
     }
 

@@ -218,6 +218,7 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
         fs_flush_deadline: None,
         greycat_home,
         ctx,
+        project_index: None,
     };
 
     server.initialized(&init)?;
