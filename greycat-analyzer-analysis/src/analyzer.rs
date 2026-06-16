@@ -6029,13 +6029,7 @@ impl<'a> Cx<'a> {
                 // GreyCat runtime drops `as` casts entirely — this is
                 // the only safety net, so the wrapper is the single
                 // source of truth for what's allowed.
-                if !crate::project::is_castable_with_index(
-                    self.index,
-                    self.decl_registry,
-                    self.arena,
-                    from_ty,
-                    to_ty,
-                ) {
+                if !crate::project::is_castable_with_index(self.index, self.arena, from_ty, to_ty) {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",

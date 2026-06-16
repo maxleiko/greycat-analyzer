@@ -1514,7 +1514,6 @@ where
 /// net, so generic-arg strictness here matches assignability's.
 pub(crate) fn is_castable_with_index(
     index: &ProjectIndex,
-    _decl_registry: &DeclRegistry,
     arena: &mut TypeArena,
     from: TypeId,
     to: TypeId,
@@ -1559,7 +1558,7 @@ pub(crate) fn is_castable_with_index(
         // would silently undo core's fix.
         TypeKind::Union { alts } => alts
             .into_iter()
-            .any(|alt| is_castable_with_index(index, _decl_registry, arena, alt, to)),
+            .any(|alt| is_castable_with_index(index, arena, alt, to)),
 
         // P-typeof — `as` is dropped at runtime; the analyzer mirrors
         // assignability for cast strictness, so accept the widening
@@ -1569,7 +1568,7 @@ pub(crate) fn is_castable_with_index(
             TypeKind::Type(d) => d == arena.builtins.type_key,
             TypeKind::Union { alts } => alts
                 .into_iter()
-                .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
+                .any(|alt| is_castable_with_index(index, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1622,7 +1621,7 @@ pub(crate) fn is_castable_with_index(
             }
             TypeKind::Union { alts } => alts
                 .into_iter()
-                .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
+                .any(|alt| is_castable_with_index(index, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1691,7 +1690,7 @@ pub(crate) fn is_castable_with_index(
             }
             TypeKind::Union { alts } => alts
                 .into_iter()
-                .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
+                .any(|alt| is_castable_with_index(index, arena, from, alt)),
             TypeKind::Null
             | TypeKind::Any
             | TypeKind::Never
@@ -1711,7 +1710,7 @@ pub(crate) fn is_castable_with_index(
             match to_kind {
                 TypeKind::Union { alts } => alts
                     .into_iter()
-                    .any(|alt| is_castable_with_index(index, _decl_registry, arena, from, alt)),
+                    .any(|alt| is_castable_with_index(index, arena, from, alt)),
                 TypeKind::Null
                 | TypeKind::Any
                 | TypeKind::Never

@@ -63,84 +63,6 @@ pub struct DeclLocation {
     pub ns: Namespace,
 }
 
-/// Cross-module project context: name tables, structure indices, and native-fn signatures shared across module ingestion.
-/// The shared `TypeArena` lives in `ProjectAnalysis` and is threaded through `ingest` so all type allocations land in
-/// one arena. Public lookup helpers (`has_name`, `locate_decl`, `type_members_for`, etc.) keep a `&str` API and
-/// translate to `Symbol` internally.
-#[derive(Debug, Default)]
-pub struct ProjectIndex {
-    /// Project-wide string interner.
-    ///
-    /// Owns canonical storage for every name the analyzer looks up across modules.
-    pub symbols: SymbolTable,
-    /// Set of public top-level declared type/enum names.
-    pub type_names: FxHashSet<Symbol>,
-    /// Set of public top-level declared variable names.
-    pub var_names: FxHashSet<Symbol>,
-    /// Set of public top-level declared function names.
-    pub fn_names: FxHashSet<Symbol>,
-    /// Private-modifier decl locations
-    ///
-    /// Cross-module bare-name resolution skips these, but FQN lookup still reaches them.
-    pub private_locations: FxHashSet<(Uri, Idx<Decl>)>,
-    /// Cross-module decl table: name -> all `(Uri, Idx<Decl>, Namespace)` triples
-    ///
-    /// Collisions kept, disambiguation at use-site.
-    pub decl_locations: FxHashMap<Symbol, Vec<DeclLocation>>,
-    /// `@expose`-renamed -> exposure sites
-    ///
-    /// Lets lints ask "is this name part of the runtime API?".
-    pub exposed: FxHashMap<Symbol, Vec<ExposureSite>>,
-    /// Per-type flag bits from `@iterable` / `@deref` / `@primitive` annotations, keyed by declared type name.
-    pub type_flags: FxHashMap<ItemKey, TypeFlags>,
-    /// Per-module `@permission("name")` pragmas for capability checks.
-    pub module_permissions: FxHashMap<Uri, FxHashSet<Symbol>>,
-    /// Module-name -> URI
-    ///
-    /// Lets the resolver recognize module prefixes in `module::Decl` expressions.
-    pub module_names: FxHashMap<Symbol, Uri>,
-    /// Stem-colliding duplicate modules excluded from the project closure
-    ///
-    /// Overlaid with a `duplicate-module-name` diagnostic.
-    pub duplicate_modules: FxHashMap<Uri, (Symbol, Uri)>,
-    /// Cross-module structure index keyed by `ItemKey`
-    ///
-    /// Maps each type to its home URI and attr/method name -> HIR index.
-    pub type_members: FxHashMap<ItemKey, TypeMembers>,
-    /// Pre-lowered top-level fn signatures keyed by `ItemKey`
-    ///
-    /// `return_ty` is already in the shared arena for call-site substitution.
-    pub fn_signatures: FxHashMap<ItemKey, FnSignature>,
-    /// Enum types pre-registered in the shared arena
-    ///
-    /// Lets the analyzer type `module::Enum::variant` as the correct enum rather than `any`.
-    pub enum_types: FxHashMap<ItemKey, TypeId>,
-    /// Pre-lowered top-level `var` declared types keyed by `ItemKey`
-    ///
-    /// Enables inline typing of cross-module var references at body-walk time.
-    pub var_types: FxHashMap<ItemKey, TypeId>,
-    /// Runtime-only globals (`Infinity`, `NaN`, `-Infinity`) and their declared types
-    ///
-    /// Seeded by `seed_builtin_names`.
-    pub runtime_globals: FxHashMap<Symbol, TypeId>,
-    /// `ItemKey`s of `abstract`-modifier types
-    ///
-    /// Consulted by the sealed-hierarchy narrowing pass.
-    pub is_abstract: FxHashSet<ItemKey>,
-    /// Per-type sorted closure of concrete leaves reachable through `extends`
-    ///
-    /// Built by `populate_subtype_indices`.
-    pub subtype_closure: FxHashMap<ItemKey, Box<[ItemKey]>>,
-    /// Reverse index: closure-set -> abstract ancestor `ItemKey`
-    ///
-    /// Lets `narrow_complement` collapse unions back to the abstract type.
-    pub abstract_by_closure_set: FxHashMap<Box<[ItemKey]>, ItemKey>,
-    /// Total modules ingested
-    ///
-    /// Useful for "did stdlib load?" smoke checks at the LSP boundary.
-    pub modules_ingested: usize,
-}
-
 /// Pre-lowered top-level fn signature; `return_ty` is a `TypeId` in the shared arena and may be
 /// `GenericParam` for generic fns. Consulted by `try_member_call_typing` for cross-module `Ident`
 /// callees and `module::fn` qualified-static shapes.
@@ -260,6 +182,83 @@ pub struct ExposureSite {
     pub local_name: Symbol,
     pub rename: Option<Symbol>,
 }
+
+/// Cross-module project context: name tables, structure indices, and native-fn signatures shared across module ingestion.
+/// The shared `TypeArena` lives in `ProjectAnalysis` and is threaded through `ingest` so all type allocations land in
+/// one arena. Public lookup helpers (`has_name`, `locate_decl`, `type_members_for`, etc.) keep a `&str` API and
+/// translate to `Symbol` internally.
+#[derive(Debug, Default)]
+pub struct ProjectIndex {
+    /// Project-wide string interner.
+    pub symbols: SymbolTable,
+    /// Set of public top-level declared type/enum names.
+    pub type_names: FxHashSet<Symbol>,
+    /// Set of public top-level declared variable names.
+    pub var_names: FxHashSet<Symbol>,
+    /// Set of public top-level declared function names.
+    pub fn_names: FxHashSet<Symbol>,
+    /// Private-modifier decl locations
+    ///
+    /// Cross-module bare-name resolution skips these, but FQN lookup still reaches them.
+    pub private_locations: FxHashSet<(Uri, Idx<Decl>)>,
+    /// Cross-module decl table: name -> all `(Uri, Idx<Decl>, Namespace)` triples
+    ///
+    /// Collisions kept, disambiguation at use-site.
+    pub decl_locations: FxHashMap<Symbol, Vec<DeclLocation>>,
+    /// `@expose`-renamed -> exposure sites
+    ///
+    /// Lets lints ask "is this name part of the runtime API?".
+    pub exposed: FxHashMap<Symbol, Vec<ExposureSite>>,
+    /// Per-type flag bits from `@iterable` / `@deref` / `@primitive` annotations, keyed by declared type name.
+    pub type_flags: FxHashMap<ItemKey, TypeFlags>,
+    /// Per-module `@permission("name")` pragmas for capability checks.
+    pub module_permissions: FxHashMap<Uri, FxHashSet<Symbol>>,
+    /// Module-name -> URI
+    ///
+    /// Lets the resolver recognize module prefixes in `module::Decl` expressions.
+    pub module_names: FxHashMap<Symbol, Uri>,
+    /// Stem-colliding duplicate modules excluded from the project closure
+    ///
+    /// Overlaid with a `duplicate-module-name` diagnostic.
+    pub duplicate_modules: FxHashMap<Uri, (Symbol, Uri)>,
+    /// Cross-module structure index keyed by `ItemKey`
+    ///
+    /// Maps each type to its home URI and attr/method name -> HIR index.
+    pub type_members: FxHashMap<ItemKey, TypeMembers>,
+    /// Pre-lowered top-level fn signatures keyed by `ItemKey`
+    ///
+    /// `return_ty` is already in the shared arena for call-site substitution.
+    pub fn_signatures: FxHashMap<ItemKey, FnSignature>,
+    /// Enum types pre-registered in the shared arena
+    ///
+    /// Lets the analyzer type `module::Enum::variant` as the correct enum rather than `any`.
+    pub enum_types: FxHashMap<ItemKey, TypeId>,
+    /// Pre-lowered top-level `var` declared types keyed by `ItemKey`
+    ///
+    /// Enables inline typing of cross-module var references at body-walk time.
+    pub var_types: FxHashMap<ItemKey, TypeId>,
+    /// Runtime-only globals (`Infinity`, `NaN`, `-Infinity`) and their declared types
+    ///
+    /// Seeded by `seed_builtin_names`.
+    pub runtime_globals: FxHashMap<Symbol, TypeId>,
+    /// `ItemKey`s of `abstract`-modifier types
+    ///
+    /// Consulted by the sealed-hierarchy narrowing pass.
+    pub is_abstract: FxHashSet<ItemKey>,
+    /// Per-type sorted closure of concrete leaves reachable through `extends`
+    ///
+    /// Built by `populate_subtype_indices`.
+    pub subtype_closure: FxHashMap<ItemKey, Box<[ItemKey]>>,
+    /// Reverse index: closure-set -> abstract ancestor `ItemKey`
+    ///
+    /// Lets `narrow_complement` collapse unions back to the abstract type.
+    pub abstract_by_closure_set: FxHashMap<Box<[ItemKey]>, ItemKey>,
+    /// Total modules ingested
+    ///
+    /// Useful for "did stdlib load?" smoke checks at the LSP boundary.
+    pub modules_ingested: usize,
+}
+
 
 impl ProjectIndex {
     /// Construct a fresh index that reuses an existing
