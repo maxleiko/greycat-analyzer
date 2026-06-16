@@ -30,7 +30,7 @@
     "@types/node": "^20",
     "@types/vscode": "^1.75.0",
     "@vscode/vsce": "^3.4.2",
-    "esbuild": "^0.25.5",
+    "esbuild": "^0.28.1",
     "typescript": "^5.8.3"
   },
   "contributes": {
