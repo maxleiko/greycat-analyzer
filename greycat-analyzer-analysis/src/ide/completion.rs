@@ -550,10 +550,9 @@ fn type_matches_expected(
     project: &ProjectAnalysis,
     arena: &mut TypeArena,
     module: &ModuleAnalysis,
-    source: &crate::ide::scope::NameSource,
+    source: &NameSource,
     expected: TypeId,
 ) -> bool {
-    use crate::ide::scope::NameSource;
     let cand = match source {
         NameSource::Local(idx) | NameSource::Param(idx) => {
             module.analysis.def_types.get(idx).copied()
@@ -567,13 +566,7 @@ fn type_matches_expected(
     let Some(cand) = cand else {
         return false;
     };
-    crate::project::is_assignable_to_with_index(
-        &project.index,
-        project.decl_registry(),
-        arena,
-        cand,
-        expected,
-    )
+    project.index.is_assignable_to(arena, cand, expected)
 }
 
 /// `true` when the nearest non-word, non-whitespace char before the

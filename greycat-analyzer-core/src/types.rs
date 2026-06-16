@@ -388,16 +388,22 @@ mod tests {
         let f = cx.arena.builtins.float;
         let s = cx.arena.builtins.string;
         let c = cx.arena.builtins.char_;
-        assert!(cx.arena.is_castable(i, f), "int as float");
-        assert!(cx.arena.is_castable(f, i), "float as int");
-        assert!(cx.arena.is_castable(c, i), "char as int");
+        assert!(cx.arena.is_castable_to(i, f), "int as float");
+        assert!(cx.arena.is_castable_to(f, i), "float as int");
+        assert!(cx.arena.is_castable_to(c, i), "char as int");
         assert!(
-            !cx.arena.is_castable(c, s),
+            !cx.arena.is_castable_to(c, s),
             "char as String is a runtime no-op"
         );
-        assert!(!cx.arena.is_castable(i, c), "int as char is not allowed");
-        assert!(!cx.arena.is_castable(s, i), "String as int is not allowed");
-        assert!(!cx.arena.is_castable(c, f), "char as float is not allowed");
+        assert!(!cx.arena.is_castable_to(i, c), "int as char is not allowed");
+        assert!(
+            !cx.arena.is_castable_to(s, i),
+            "String as int is not allowed"
+        );
+        assert!(
+            !cx.arena.is_castable_to(c, f),
+            "char as float is not allowed"
+        );
     }
 
     #[test]
@@ -415,18 +421,18 @@ mod tests {
         let fq = cx.arena.nullable(f);
         let cq = cx.arena.nullable(c);
         let sq = cx.arena.nullable(s);
-        assert!(cx.arena.is_castable(iq, fq), "int? as float?");
-        assert!(cx.arena.is_castable(i, fq), "int as float?");
-        assert!(cx.arena.is_castable(iq, f), "int? as float");
-        assert!(cx.arena.is_castable(fq, iq), "float? as int?");
-        assert!(cx.arena.is_castable(cq, iq), "char? as int?");
+        assert!(cx.arena.is_castable_to(iq, fq), "int? as float?");
+        assert!(cx.arena.is_castable_to(i, fq), "int as float?");
+        assert!(cx.arena.is_castable_to(iq, f), "int? as float");
+        assert!(cx.arena.is_castable_to(fq, iq), "float? as int?");
+        assert!(cx.arena.is_castable_to(cq, iq), "char? as int?");
         // Non-convertible pairs stay rejected regardless of nullability.
         assert!(
-            !cx.arena.is_castable(iq, cq),
+            !cx.arena.is_castable_to(iq, cq),
             "int? as char? still rejected"
         );
         assert!(
-            !cx.arena.is_castable(sq, iq),
+            !cx.arena.is_castable_to(sq, iq),
             "String? as int? still rejected"
         );
     }

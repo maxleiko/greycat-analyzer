@@ -606,8 +606,7 @@ impl TypeArena {
             },
 
             // Generic args are invariant
-            // (matches the runtime, not the TS checker). The "all-any
-            // wildcard" rule is *target-only* and asymmetric: `Foo<any?,
+            // The "all-any wildcard" rule is *target-only* and asymmetric: `Foo<any?,
             // any?>` as a TARGET accepts any same-decl instantiation
             // (raw-form acceptance), but as a SOURCE does NOT flow into a
             // concrete `Foo<int, T>` — the runtime rejects with
@@ -623,21 +622,29 @@ impl TypeArena {
             // position: `is_assignable_to(any?, int)` returns true via the
             // top-level `Any` source guard, so `Tuple<any?, any?>` would
             // falsely flow into `Tuple<int, AbstractType>`.
-            TypeKind::Generic { tpl: da, args: aa } => match &b.kind {
+            TypeKind::Generic {
+                tpl: a_tpl,
+                args: a_args,
+            } => match &b.kind {
                 TypeKind::Any | TypeKind::Unresolved { .. } => {
                     unreachable!("filtered by top-level guards")
                 }
-                TypeKind::Generic { tpl: db, args: ab } => {
-                    if da == db
-                        && aa.len() == ab.len()
-                        && !ab.is_empty()
-                        && ab
+                TypeKind::Generic {
+                    tpl: b_tpl,
+                    args: b_args,
+                } => {
+                    if a_tpl == b_tpl
+                        && a_args.len() == b_args.len()
+                        && !b_args.is_empty()
+                        && b_args
                             .iter()
                             .all(|y| matches!(self.get(*y).kind, TypeKind::Any))
                     {
                         return true;
                     }
-                    da == db && aa.len() == ab.len() && aa.iter().zip(ab).all(|(x, y)| *x == *y)
+                    a_tpl == b_tpl
+                        && a_args.len() == b_args.len()
+                        && a_args.iter().zip(b_args).all(|(x, y)| *x == *y)
                 }
                 TypeKind::Union { alts } => {
                     alts.iter().any(|alt| self.is_assignable_to(from, *alt))
@@ -758,7 +765,7 @@ impl TypeArena {
     }
 
     /// `true` iff `from` can be casted to `to` via the GreyCat `as` operator.
-    pub fn is_castable(&self, from: TypeId, to: TypeId) -> bool {
+    pub fn is_castable_to(&self, from: TypeId, to: TypeId) -> bool {
         // trivial cast to itself is valid
         if from == to {
             return true;
@@ -784,12 +791,6 @@ impl TypeArena {
             return true;
         }
 
-        // Primitive conversion casts. Runtime-verified 2026-06-15 via
-        // `greycat run` (`type::of(x as T) == T`): only `int <-> float` and
-        // `char as int` genuinely convert. Every other primitive `as` pair
-        // either throws "casting X to Y is not allowed" or no-ops (keeps the
-        // source type) -- both rejected here.
-        //
         // Compared by core kind so nullability on either side is irrelevant:
         // `int? as float?`, `int as float?`, and `int? as float` all reduce
         // to the `int <-> float` core check. `as` is runtime-checked, so a
@@ -842,7 +843,7 @@ impl TypeArena {
             // `var x = lhs.get() ?? rhs.get(); ... x as node<L>`).
             // Assignability uses `.all()` for the same shape because
             // assignment is total — no runtime check stands behind it.
-            TypeKind::Union { alts } => alts.iter().any(|alt| self.is_castable(*alt, to)),
+            TypeKind::Union { alts } => alts.iter().any(|alt| self.is_castable_to(*alt, to)),
 
             // Enum source: castable to `int` (runtime representation) or
             // anything assignable from the same enum.

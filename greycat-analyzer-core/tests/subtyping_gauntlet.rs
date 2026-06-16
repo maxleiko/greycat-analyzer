@@ -287,7 +287,7 @@ fn rt_cast_string_to_int_rejected() {
     let a = arena();
     let s = a.builtins.string;
     let i = a.builtins.int;
-    assert!(!a.is_castable(s, i));
+    assert!(!a.is_castable_to(s, i));
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn rt_cast_char_to_int_allowed() {
     let a = arena();
     let c = a.builtins.char_;
     let i = a.builtins.int;
-    assert!(a.is_castable(c, i));
+    assert!(a.is_castable_to(c, i));
 }
 
 // =============================================================================
@@ -425,7 +425,7 @@ fn rt_cast_nullable_decl_to_non_nullable_decl() {
     let mut a = arena();
     let foo = a.alloc_type(synth_decl("Foo"));
     let foo_q = a.nullable(foo);
-    assert!(a.is_castable(foo_q, foo));
+    assert!(a.is_castable_to(foo_q, foo));
 }
 
 #[test]
@@ -447,7 +447,7 @@ fn rt_cast_nullable_enum_shape_to_non_nullable_enum_shape() {
         nullable: false,
     });
     let enum_q = a.nullable(enum_id);
-    assert!(a.is_castable(enum_q, enum_id));
+    assert!(a.is_castable_to(enum_q, enum_id));
 }
 
 #[test]
@@ -458,5 +458,5 @@ fn rt_cast_non_nullable_decl_to_self_still_works() {
     // must still pass.
     let mut a = arena();
     let foo = a.alloc_type(synth_decl("FooSelf"));
-    assert!(a.is_castable(foo, foo));
+    assert!(a.is_castable_to(foo, foo));
 }

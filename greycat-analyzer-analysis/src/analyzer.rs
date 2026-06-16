@@ -1274,13 +1274,10 @@ impl<'a> Cx<'a> {
             } else {
                 asserted
             };
-            if crate::project::is_assignable_to_with_index(
-                self.index,
-                self.decl_registry,
-                self.arena,
-                alt_non_null,
-                asserted_non_null,
-            ) {
+            if self
+                .index
+                .is_assignable_to(self.arena, alt_non_null, asserted_non_null)
+            {
                 continue;
             }
             survivors.push(*alt);
@@ -1449,13 +1446,8 @@ impl<'a> Cx<'a> {
                         } else {
                             *a_alt
                         };
-                        crate::project::is_assignable_to_with_index(
-                            self.index,
-                            self.decl_registry,
-                            self.arena,
-                            alt_non_null,
-                            a_non_null,
-                        )
+                        self.index
+                            .is_assignable_to(self.arena, alt_non_null, a_non_null)
                     })
                 })
             }
@@ -1665,14 +1657,9 @@ impl<'a> Cx<'a> {
     /// `Sub` assigns to `Sup` whenever `type Sub extends Sup` (and
     /// transitively). Use this for any decidability check on user
     /// types — the bare core relation only knows decl-handle identity.
+    #[inline]
     fn is_assignable(&mut self, from: TypeId, to: TypeId) -> bool {
-        crate::project::is_assignable_to_with_index(
-            self.index,
-            self.decl_registry,
-            self.arena,
-            from,
-            to,
-        )
+        self.index.is_assignable_to(self.arena, from, to)
     }
 
     fn push_narrow(&mut self) {
@@ -6015,7 +6002,7 @@ impl<'a> Cx<'a> {
             Expr::Cast { value, ty, .. } => {
                 let from_ty = self.visit_expr(*value);
                 let to_ty = self.lower_type_ref(*ty);
-                // P12.3: validate the cast against the GreyCat `as`
+                // Validate the cast against the GreyCat `as`
                 // rules. Surfaces invalid casts as a diagnostic; the
                 // resulting expression type is still `to_ty` so
                 // downstream inference doesn't cascade.
@@ -6029,7 +6016,7 @@ impl<'a> Cx<'a> {
                 // GreyCat runtime drops `as` casts entirely — this is
                 // the only safety net, so the wrapper is the single
                 // source of truth for what's allowed.
-                if !crate::project::is_castable_with_index(self.index, self.arena, from_ty, to_ty) {
+                if !self.index.is_castable_to(self.arena, from_ty, to_ty) {
                     let r = self.hir.exprs[expr_id].byte_range();
                     let msg = format!(
                         "cannot cast `{}` to `{}`",
