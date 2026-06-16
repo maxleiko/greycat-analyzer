@@ -1093,90 +1093,107 @@ impl Backend {
     }
 
     fn reload_project_closure_for(&mut self, project_root: &Path) {
-        let Some(project) = self.projects.get_mut(project_root) else {
-            return;
-        };
-        let project_file = project.root.join("project.gcl");
+        // Release the `project` borrow before the closure-membership
+        // moves below — they shuffle `Document`s between `project.manager`
+        // and `self.orphans`, which needs disjoint mutable access.
         let load_start = Instant::now();
-        let report = project.manager.load_project(&project_file);
+        let (report, tag) = {
+            let Some(project) = self.projects.get_mut(project_root) else {
+                return;
+            };
+            let project_file = project.root.join("project.gcl");
+            let report = project.manager.load_project(&project_file);
+            project.std_resolution = report.std_resolution;
+            project.entrypoint_uri = report.entrypoint_uri.clone();
+            (report, project.tag.clone())
+        };
         let load_took = load_start.elapsed();
-        project.std_resolution = report.std_resolution;
-        project.entrypoint_uri = report.entrypoint_uri.clone();
         if report.std_resolution == StdResolution::Missing {
-            warn!(
-                "[{tag}][reload_project] std not found (local or $HOME/.greycat)",
-                tag = project.tag
-            );
+            warn!("[{tag}][reload_project] std not found (local or $HOME/.greycat)");
         }
         for lib in &report.unresolved_libraries {
             warn!(
                 "[{tag}] unresolved @library('{lib}') in {}",
-                project_file.display(),
-                tag = project.tag,
+                project_root.display(),
             );
         }
         for err in &report.errors {
-            warn!("[{tag}][reload_project] {err}", tag = project.tag);
+            warn!("[{tag}][reload_project] {err}");
         }
-        // **P19.23** — evict modules that are no longer in the
-        // project's reachable closure (e.g., the user commented out an
-        // `@library` line). Without this, types the lib exposed would
-        // still resolve and the editor would silently miss the
-        // resulting "unknown type" errors. `evict_unreachable` skips
-        // opened buffers — those stay until `did_close` / explicit
-        // user action.
         #[allow(clippy::mutable_key_type)] // lsp_types::Uri as a HashSet key is fine in practice.
         let reachable: FxHashSet<Uri> = report.reachable.iter().cloned().collect();
-        let evicted = project.manager.evict_unreachable(&reachable);
-        if !evicted.is_empty() {
-            info!(
-                "[{tag}][reload_project] evicted {} unreachable file(s):",
-                evicted.len(),
-                tag = project.tag
-            );
-            for uri in &evicted {
-                info!(
-                    "[{tag}][reload_project]   - {}",
-                    uri.as_str(),
-                    tag = project.tag
-                );
+
+        // Project ownership == membership in the reachable closure. Three
+        // moves keep that invariant after a re-walk; `opened` decides only
+        // whether a de-owned buffer survives as an orphan, never whether
+        // it stays project-analyzed.
+        //
+        // (1) Re-home returning orphans: a reachable URI parked in the
+        //     orphan bucket migrates back, its live buffer winning over
+        //     the disk copy `load_project` just pulled in.
+        let returning: Vec<Uri> = self
+            .orphans
+            .iter()
+            .map(|(u, _)| u.clone())
+            .filter(|u| reachable.contains(u))
+            .collect();
+        for uri in &returning {
+            let doc = self.orphans.remove(uri);
+            if let Some(doc) = doc
+                && let Some(project) = self.projects.get_mut(project_root)
+            {
+                project.manager.add(doc);
             }
         }
-        // Log additions explicitly too — symmetric with eviction so the
-        // user can see project-closure changes in the LSP output.
-        if !report.loaded.is_empty() {
-            info!(
-                "[{tag}][reload_project] loaded {} new file(s):",
-                report.loaded.len(),
-                tag = project.tag
-            );
-            for (uri, _) in &report.loaded {
-                info!(
-                    "[{tag}][reload_project]   + {}",
-                    uri.as_str(),
-                    tag = project.tag
-                );
+        // (2) De-home departing buffers: an OPEN module no longer in the
+        //     closure leaves the analysis set and becomes an orphan, its
+        //     buffer preserved. Non-open unreachable modules are evicted
+        //     outright in step 3.
+        let leaving: Vec<Uri> = match self.projects.get(project_root) {
+            Some(project) => project
+                .manager
+                .iter()
+                .filter(|(u, cell)| !reachable.contains(u) && cell.borrow().opened)
+                .map(|(u, _)| u.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        for uri in &leaving {
+            let doc = self
+                .projects
+                .get_mut(project_root)
+                .and_then(|p| p.manager.remove(uri));
+            if let Some(doc) = doc {
+                self.orphans.add(doc);
             }
+            self.unbind_uri(uri, project_root);
         }
+        // (3) Evict non-open unreachable modules outright.
+        let evicted = match self.projects.get_mut(project_root) {
+            Some(project) => project.manager.evict_unreachable(&reachable),
+            None => Vec::new(),
+        };
+
         let rebuild_start = Instant::now();
-        project.analysis.analyze_staged(&project.manager);
+        if let Some(project) = self.projects.get_mut(project_root) {
+            project.analysis.analyze_staged(&project.manager);
+        }
         let rebuild_took = rebuild_start.elapsed();
         info!(
-            "[{tag}][reload_project] {load_took:?} (parse+load) + {rebuild_took:?} (analyze) — closure: {} reachable, {} added, {} evicted",
+            "[{tag}][reload_project] {load_took:?} (parse+load) + {rebuild_took:?} (analyze) — closure: {} reachable, {} loaded, {} evicted, {} de-homed, {} re-homed",
             report.reachable.len(),
             report.loaded.len(),
             evicted.len(),
-            tag = project.tag,
+            leaving.len(),
+            returning.len(),
         );
-        // Snapshot the report fields we'll need after we drop the
-        // mutable borrow on `self.projects` so we can update
-        // `uri_owner` and publish without overlapping borrows.
+
         let reachable_uris = report.reachable.clone();
         let owner_root = project_root.to_path_buf();
 
-        // Re-index `uri_owner` for everything still reachable, and
-        // drop *this project's* binding for the evicted URIs (other
-        // projects' bindings on the same URI must survive — see P32.6).
+        // Re-index `uri_owner`: drop this project's binding for evicted
+        // URIs (other projects' bindings survive — see P32.6), bind the
+        // reachable closure.
         for uri in &evicted {
             self.unbind_uri(uri, &owner_root);
         }
@@ -1184,19 +1201,22 @@ impl Backend {
             self.bind_uri(uri.clone(), owner_root.clone());
         }
 
-        // Clear diagnostics for evicted URIs so the editor's stale
-        // entries disappear.
+        // Clear diagnostics for evicted URIs so stale editor entries go.
         for uri in &evicted {
             if let Err(e) = self.publish_diagnostics(uri.clone(), Vec::new(), None) {
                 warn!("clear-diagnostics({}) failed: {e}", uri.as_str());
             }
         }
-        // Republish for every newly-loaded module so the editor sees
-        // their diagnostics immediately. Also republish for the rest of
-        // the reachable closure since the rebuild may have changed
-        // diagnostics on files that were already loaded (e.g., the
-        // project entrypoint goes from "all good" to "unknown library"
-        // when an `@library` line is commented out).
+        // Republish de-homed buffers — now orphans, so they pick up the
+        // orphan advisory and shed their stale project diagnostics.
+        for uri in &leaving {
+            if let Err(e) = self.publish_for(uri) {
+                warn!("publish_for({}) failed: {e}", uri.as_str());
+            }
+        }
+        // Republish the reachable closure: the rebuild may have changed
+        // diagnostics on already-loaded files (e.g. a removed `@include`
+        // turns a resolved name into an unknown one).
         for uri in &reachable_uris {
             if let Err(e) = self.publish_for(uri) {
                 warn!("publish_for({}) failed: {e}", uri.as_str());
@@ -1824,6 +1844,70 @@ mod tests {
         assert!(
             after.iter().any(|d| d.message.contains("Foo")),
             "`Foo` must be unresolved after the include is removed, got: {after:?}"
+        );
+    }
+
+    /// The reported bug: with the included module OPEN in a buffer,
+    /// removing the `@include` must still de-own it (move it to the
+    /// orphan bucket) so its type stops resolving in the entrypoint —
+    /// `opened` only preserves the buffer, it doesn't keep the module in
+    /// the project's analysis closure.
+    #[test]
+    fn removing_include_with_open_member_de_homes_it() {
+        let ctx = MemContext::default();
+        ctx.add_file(
+            PathBuf::from("/proj/project.gcl"),
+            "@include(\"src\");\n\nfn foo(_: Foo) {}\n",
+        );
+        ctx.add_file(PathBuf::from("/proj/src/other.gcl"), "type Foo {}\n");
+        let ctx: Arc<dyn Context> = Arc::new(ctx);
+
+        let (mut b, rx) = backend_with(ctx, vec![PathBuf::from("/proj")]);
+        let entry = uri("file:///proj/project.gcl");
+        let member = uri("file:///proj/src/other.gcl");
+
+        let open = |u: &Uri, text: &str| DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: u.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: text.into(),
+            },
+        };
+        b.did_open(open(&entry, "@include(\"src\");\n\nfn foo(_: Foo) {}\n"))
+            .unwrap();
+        // Open the included member so it sits in a live buffer.
+        b.did_open(open(&member, "type Foo {}\n")).unwrap();
+        assert!(
+            b.project_for(&member).is_some(),
+            "the open member starts owned by the project"
+        );
+
+        b.did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: entry.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "fn foo(_: Foo) {}\n".into(),
+            }],
+        })
+        .unwrap();
+
+        let after = latest_diags_for(&rx, &entry).expect("entrypoint re-published");
+        assert!(
+            after.iter().any(|d| d.message.contains("Foo")),
+            "`Foo` must be unresolved once the open member is de-homed, got: {after:?}"
+        );
+        assert!(
+            b.orphans.get(&member).is_some(),
+            "the de-homed member must land in the orphan bucket (buffer preserved)"
+        );
+        assert!(
+            b.project_for(&member).is_none(),
+            "the de-homed member must no longer be project-owned"
         );
     }
 
