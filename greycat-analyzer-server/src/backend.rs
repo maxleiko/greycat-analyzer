@@ -26,7 +26,6 @@ use lsp_types::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
-// P32.6
 /// Per-URI owner list. Most files have exactly one owner; rare
 /// overlap between two projects' closures pushes a second entry
 /// onto the inline tail.
@@ -157,7 +156,6 @@ enum DocOwner {
     Orphan,
 }
 
-// P32.1
 /// LSP server state.
 ///
 /// Storage shape is multi-project: `projects` keyed by project-root
@@ -180,7 +178,6 @@ pub struct Backend {
     /// `multi-project-owner` advisory in [`publish_for`]) the list
     /// grows past one entry.
     pub uri_owner: FxHashMap<Uri, OwnerList>,
-    // P32.5
     /// Documents opened from outside every workspace folder's
     /// `project.gcl` closure. Parsed for syntax diagnostics but not
     /// fed through any project's analysis pipeline. Each gets a
@@ -198,7 +195,6 @@ pub struct Backend {
     /// LSP's `initializationOptions`. Default `false` — most users
     /// don't want warnings about vendored library code.
     pub lint_libs: bool,
-    // P15.3
     /// Registry fetcher for `@library` version completion.
     /// `None` skips the lazy resolution path and surfaces the
     /// placeholder verbatim (the foundational shape used by tests
@@ -312,7 +308,6 @@ impl Backend {
         self.project_index = None;
     }
 
-    // P32.6
     /// Append `root` to `uri`'s owner list. Idempotent: a project
     /// re-binding a URI it already owns is a no-op.
     fn bind_uri(&mut self, uri: Uri, root: PathBuf) {
@@ -322,7 +317,6 @@ impl Backend {
         }
     }
 
-    // P32.9
     /// Comma-separated list of project tags for the given owner
     /// roots. Used to label watcher / multi-owner log lines.
     fn owners_tag_csv(&self, owners: &[PathBuf]) -> String {
@@ -337,7 +331,6 @@ impl Backend {
         }
     }
 
-    // P32.6
     /// Drop `root` from `uri`'s owner list; remove the entry entirely
     /// when no owners remain. Used by reload-time eviction so a file
     /// only leaving project A's closure (while still in B's) ends up
@@ -380,7 +373,7 @@ impl Backend {
         let doc = cell.borrow();
         let version = Some(doc.version);
         let mut fast = parse_diagnostics(doc.root_node(), &doc.text, self.encoding);
-        // P15.5 — pragma resolution diagnostics. Recomputed on every
+        // Pragma resolution diagnostics. Recomputed on every
         // publish so edits to `@include` / `@library` pragmas reflect
         // immediately. Anchored to the owning project's root. Skipped
         // for the implicit empty-root project (P32.1 lazy fallback).
@@ -396,7 +389,7 @@ impl Backend {
                 ));
             }
         }
-        // P32.6 — multi-project-owner advisory.
+        // Multi-project-owner advisory.
         if let Some(owners) = self.uri_owner.get(uri)
             && owners.len() > 1
         {
@@ -406,7 +399,7 @@ impl Backend {
                 self.encoding,
             ));
         }
-        // P33.1 — `missing-std` overlay on the entrypoint when the
+        // `missing-std` overlay on the entrypoint when the
         // resolver couldn't find std.
         if project.std_resolution == StdResolution::Missing
             && project.entrypoint_uri.as_ref() == Some(uri)
@@ -439,7 +432,7 @@ impl Backend {
     /// [`Self::last_analyzer_publish`] / clears any pending trailing
     /// fire so the debounce treats this as a fresh leading edge.
     fn publish_for(&mut self, uri: &Uri) -> Result<()> {
-        // P32.5 — orphans take a separate parse-only path with a
+        // Orphans take a separate parse-only path with a
         // file-spanning "no project" advisory diag. No analyzer state
         // to cache here, but clearing any stale cache entry keeps the
         // maps from leaking across project ↔ orphan transitions.

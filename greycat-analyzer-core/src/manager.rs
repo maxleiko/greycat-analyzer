@@ -237,11 +237,9 @@ impl SourceManager {
                 continue;
             }
             for path in self.ctx.iter_gcl(&dir) {
-                if let Some(uri) = self.load_file(&path, "project", visited, report) {
-                    let nested = self.module_desc_for(&uri);
-                    self.process_includes(project_dir, &nested, visited, report);
-                    self.process_libraries(project_dir, &nested, visited, report);
-                }
+                // we don't want recursion for `@include`/`@library`
+                // those are only allowed in `project.gcl` modules
+                self.load_file(&path, "project", visited, report);
             }
         }
     }
