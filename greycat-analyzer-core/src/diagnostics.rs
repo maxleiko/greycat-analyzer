@@ -430,18 +430,26 @@ fn is_reserved_keyword(text: &str) -> bool {
     RESERVED_KEYWORDS.binary_search(&text).is_ok()
 }
 
+/// Reserved keywords the runtime accepts as a *type* name or reference
+/// (`native type null {}`, `var x: null`, `extends null`). `null` is the
+/// only one: `any` / `type` name types too but aren't reserved words, so
+/// they never reach this check. Every other keyword in type position
+/// (`var x: return`) parse-rejects.
+const TYPE_NAME_KEYWORDS: &[&str] = &["null"];
+
 /// Tree-sitter's `word: $.ident` rule lets keyword text parse as a
 /// plain `ident` whenever the current grammar state has no competing
 /// keyword token reachable — e.g. `fn ex(return: int)` parses with
-/// `return` as a `fn_param.name` ident. The runtime then rejects most
-/// such positions as parse errors. We diagnose them here so the error
-/// surfaces in `parse_diagnostics` instead of as a confusing downstream
-/// resolution failure (or, for the four "declaration-only unreachable"
-/// positions, before the imminent runtime fix lands).
+/// `return` as a `fn_param.name` ident. We diagnose them here so the
+/// problem surfaces in `parse_diagnostics` instead of a confusing
+/// downstream failure.
 ///
-/// The allow-list below matches the positions the runtime genuinely
-/// supports (`type T { return: int; }`, `enum E { return }`,
-/// `t.return`, `n->return`, `E::return`, …).
+/// What's legal depends on the position: a member/field name accepts any
+/// keyword; a type name accepts only [`TYPE_NAME_KEYWORDS`]; everything
+/// else (value binding, fn-decl name, generics, plain expr) accepts none.
+/// `null` / `this` bind without a parse error but are *unreachable* — the
+/// body's `null` / `this` mean the literal / receiver, never the binding —
+/// so they're flagged here to surface the footgun early.
 fn check_ident_keyword(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -471,6 +479,9 @@ fn check_ident_keyword(
             }
         }
     }
+    // Member / field / property / annotation names are pure naming slots
+    // — the runtime accepts any reserved keyword (`type T { return: int }`,
+    // `t.return`, `E::return`, `@private`).
     if matches!(
         (parent_kind, field),
         ("type_attr", Some("name"))
@@ -482,6 +493,16 @@ fn check_ident_keyword(
             | ("static_expr", Some("property"))
             | ("annotation", _)
     ) {
+        return;
+    }
+    // Type-name positions (decl name + type reference) admit only
+    // `null`. Every other position (var / param binding, fn-decl name,
+    // generics, plain expr) admits no keyword.
+    let is_type_name = matches!(
+        (parent_kind, field),
+        ("type_decl", Some("name")) | ("enum_decl", Some("name")) | ("type_ident", Some("name"))
+    );
+    if is_type_name && TYPE_NAME_KEYWORDS.contains(&text) {
         return;
     }
     out.push(Diagnostic {
@@ -1585,6 +1606,44 @@ mod tests {
         assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
     }
 
+    /// `null` is a real builtin type, so it's reachable as a type name /
+    /// reference — `native type null {}` (stdlib) and `var x: null` must
+    /// stay silent even though `null` is a reserved keyword.
+    #[test]
+    fn null_as_type_name_no_diag() {
+        for src in [
+            "native type null {}\n",
+            "fn f() {\n    var x: null;\n}\n",
+            "type T extends null {}\n",
+        ] {
+            let ds = diags(src);
+            assert!(
+                !codes(&ds).contains(&"keyword-as-ident"),
+                "`null` is a type; should be silent in {src:?}, got: {ds:?}"
+            );
+        }
+    }
+
+    /// `null` / `this` bind without a parse error but are unreachable in
+    /// the body (`null` is the literal, `this` the receiver), so they're
+    /// flagged as binding names. The user's footgun: `fn foo(null: String)
+    /// { return null.size(); }` resolves `null` to the type, not the param.
+    #[test]
+    fn unreachable_soft_keyword_bindings_surface() {
+        for src in [
+            "fn foo(null: String): int { return null.size(); }\n",
+            "fn foo(this: int) { println(1); }\n",
+            "fn f() {\n    var null = 1;\n}\n",
+            "fn f() {\n    var this = 1;\n}\n",
+        ] {
+            assert!(
+                codes(&diags(src)).contains(&"keyword-as-ident"),
+                "expected keyword-as-ident in {src:?}, got: {:?}",
+                diags(src)
+            );
+        }
+    }
+
     /// Non-keyword identifiers never trip the check.
     #[test]
     fn non_keyword_ident_no_diag() {
@@ -1592,14 +1651,14 @@ mod tests {
         assert!(!codes(&ds).contains(&"keyword-as-ident"), "got: {ds:?}");
     }
 
-    /// Contextual-only keywords (`sampling`, `limit`, `skip`, `from`,
-    /// `to`, plus `type` / `null` / `this`) are accepted as binding
-    /// names by the runtime — don't false-positive.
+    /// Non-reserved contextual words (`type` is not a reserved keyword;
+    /// `sampling` / `limit` / `skip` / `from` / `to` are for-in clause
+    /// words) parse as ordinary idents and bind fine — don't false-positive.
+    /// (`null` / `this` ARE reserved and unreachable as bindings — see
+    /// `unreachable_soft_keyword_bindings_surface`.)
     #[test]
     fn contextual_keywords_as_param_names_no_diag() {
-        for kw in [
-            "type", "null", "this", "sampling", "limit", "skip", "from", "to",
-        ] {
+        for kw in ["type", "sampling", "limit", "skip", "from", "to"] {
             let src = format!("fn ex({kw}: int) {{ println(1); }}\n");
             let ds = diags(&src);
             assert!(
