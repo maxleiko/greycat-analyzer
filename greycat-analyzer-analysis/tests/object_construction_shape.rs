@@ -25,7 +25,8 @@ macro_rules! std_core_body {
          native type char {}\n\
          native type Array<T> {}\n\
          native type Map<K, V> {}\n\
-         native type node<T> {}\n"
+         native type node<T> {}\n\
+         native type Table<T> {}\n"
     };
 }
 
@@ -82,6 +83,7 @@ fn codes(pa: &ProjectAnalysis, uri: &Uri) -> Vec<&'static str> {
                     | "map-key-type-mismatch"
                     | "map-value-type-mismatch"
                     | "geo-init-arity"
+                    | "table-row-not-array"
             )
         })
         .map(|d| d.code)
@@ -114,6 +116,25 @@ fn positional_init_on_user_type_rejected() {
         msg.contains("named form"),
         "msg should suggest named form: {msg}"
     );
+}
+
+#[test]
+fn table_positional_array_rows_no_diag() {
+    let (uri, pa) =
+        analyze("fn main() { var _ = Table { [\"John\", 42, true], [\"Paul\", 36, false] }; }\n");
+    assert_eq!(codes(&pa, &uri), Vec::<&str>::new());
+}
+
+#[test]
+fn table_empty_init_no_diag() {
+    let (uri, pa) = analyze("fn main() { var _ = Table {}; }\n");
+    assert_eq!(codes(&pa, &uri), Vec::<&str>::new());
+}
+
+#[test]
+fn table_non_array_row_rejected() {
+    let (uri, pa) = analyze("fn main() { var _ = Table { 42, [\"ok\"] }; }\n");
+    assert_eq!(codes(&pa, &uri), vec!["table-row-not-array"]);
 }
 
 #[test]

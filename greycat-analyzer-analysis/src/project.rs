@@ -3050,6 +3050,28 @@ fn collect_object_construction_diags(
             continue;
         }
 
+        // `Table<T>` accepts positional initializers whose elements are
+        // array-literal rows (`Table { ["a", 1], ["b", 2] }`). The runtime
+        // syntax-errors on any non-array row and never type-checks row
+        // elements against `T` (T only drives `set_row` / `get_row`), so the
+        // sole check is "every row is an array literal". Resolved like the v7
+        // tuples below — `None` on no-std projects leaves the branch inert.
+        if Some(head_decl) == index.resolve_type(decl_registry, None, index.symbols.intern("Table"))
+        {
+            for value in obj_expr.fields.iter() {
+                if !matches!(cur_module.hir.exprs[*value], Expr::Array(..)) {
+                    diags.push(SemanticDiagnostic {
+                        severity: Severity::Error,
+                        code: "table-row-not-array",
+                        message: "`Table` positional rows must be array literals".to_string(),
+                        byte_range: cur_module.hir.exprs[*value].byte_range(),
+                        category: DiagCategory::TypeRelation,
+                    });
+                }
+            }
+            continue;
+        }
+
         // v7 fixed-shape tuple natives. Each slot is `Some` only when
         // the loaded stdlib is v7 (slots stay `None` on v8 / no-stdlib
         // projects, so the comparisons all miss and the loop falls
