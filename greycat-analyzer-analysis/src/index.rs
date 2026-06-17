@@ -187,7 +187,7 @@ pub struct ExposureSite {
 /// The shared `TypeArena` lives in `ProjectAnalysis` and is threaded through `ingest` so all type allocations land in
 /// one arena. Public lookup helpers (`has_name`, `locate_decl`, `type_members_for`, etc.) keep a `&str` API and
 /// translate to `Symbol` internally.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ProjectIndex {
     /// Project-wide string interner.
     pub symbols: SymbolTable,
@@ -257,6 +257,8 @@ pub struct ProjectIndex {
     ///
     /// Useful for "did stdlib load?" smoke checks at the LSP boundary.
     pub modules_ingested: usize,
+    /// Cached symbol for `"core"`
+    core_symbol: Symbol,
 }
 
 impl ProjectIndex {
@@ -265,9 +267,29 @@ impl ProjectIndex {
     /// the per-module index without invalidating the `Symbol`s held
     /// elsewhere (notably the per-stage signature cache).
     pub fn new(symbols: SymbolTable, arena: &TypeArena) -> Self {
+        let core_symbol = symbols.intern("core");
         let mut idx = Self {
             symbols,
-            ..Self::default()
+            type_names: FxHashSet::default(),
+            var_names: FxHashSet::default(),
+            fn_names: FxHashSet::default(),
+            private_locations: FxHashSet::default(),
+            decl_locations: FxHashMap::default(),
+            exposed: FxHashMap::default(),
+            type_flags: FxHashMap::default(),
+            module_permissions: FxHashMap::default(),
+            module_names: FxHashMap::default(),
+            duplicate_modules: FxHashMap::default(),
+            type_members: FxHashMap::default(),
+            fn_signatures: FxHashMap::default(),
+            enum_types: FxHashMap::default(),
+            var_types: FxHashMap::default(),
+            runtime_globals: FxHashMap::default(),
+            is_abstract: FxHashSet::default(),
+            subtype_closure: FxHashMap::default(),
+            abstract_by_closure_set: FxHashMap::default(),
+            modules_ingested: 0,
+            core_symbol,
         };
         // Runtime-exposed value-position globals
         for name in ["Infinity", "NaN"] {
@@ -952,18 +974,9 @@ impl ProjectIndex {
         // so members stay empty until std loads -- but the identity is
         // correct). A loaded decl wins above, carrying full member info.
         if Builtins::is_core_type_name(&self.symbols[name]) {
-            let core = self.symbols.intern("core");
-            return Some(ItemKey::new(core, name));
+            return Some(ItemKey::new(self.core_symbol, name));
         }
         None
-    }
-
-    /// The identity `ItemKey` of a core type by name, pinned to the `core`
-    /// module. Unlike [`Self::resolve_type`] this is NOT subject to local-name
-    /// shadowing -- use it to dispatch on well-known stdlib types by identity
-    /// (a user `type t2` is `(project, "t2")`, never this `(core, "t2")`).
-    pub fn core_type_key(&self, name: &str) -> ItemKey {
-        ItemKey::new(self.symbols.intern("core"), self.symbols.intern(name))
     }
 
     /// `Symbol`-keyed location index. Caller must have
@@ -998,7 +1011,7 @@ impl ProjectIndex {
 
     /// Same as [`Self::locate_decl`] but filtered to a single namespace.
     /// Used by the resolver (`record_use` / `bind_qualified_type_leaf`)
-    /// and `resolve_decl_handle` to avoid cross-namespace false
+    /// and `resolve_type` to avoid cross-namespace false
     /// matches (e.g. `type geo` vs `fn geo()`).
     pub fn locate_decl_in_ns(
         &self,

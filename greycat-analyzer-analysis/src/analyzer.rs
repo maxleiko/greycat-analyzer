@@ -728,9 +728,8 @@ struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
     out: &'a mut AnalysisResult,
-    /// URI of the module currently being analyzed. Lets cross-module
-    /// resolution paths (`resolve_decl_handle_from`) prefer same-
-    /// module candidates and reach private decls in their own module.
+    /// URI of the module currently being analyzed. Lets cross-module resolution
+    /// paths prefer same-module candidates and reach private decls in their own module.
     module_uri: &'a Uri,
     /// Symbol for the module currently being analyzed — i.e.
     /// `module_name_from_uri(module_uri)` interned. Lets the body

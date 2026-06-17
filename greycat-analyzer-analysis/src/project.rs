@@ -418,8 +418,8 @@ impl ProjectAnalysis {
     fn reset_state(&mut self) {
         self.modules.clear();
         self.arena = TypeArena::new(&self.index.symbols);
-        let index = std::mem::take(&mut self.index);
-        self.index = ProjectIndex::new(index.symbols, &self.arena);
+        let symbols = std::mem::take(&mut self.index.symbols);
+        self.index = ProjectIndex::new(symbols, &self.arena);
         // Cached `TypeId`s reference the old arena, which
         // we just replaced. Drop the cache so the next
         // `lower_signatures_into` rebuilds against the fresh arena.
@@ -3086,43 +3086,43 @@ fn collect_object_construction_diags(
         type Accepted<'a> = &'a [(TypeId, &'static str)];
         let fixed_tuples: [(ItemKey, usize, Accepted, &str); 7] = [
             (
-                index.core_type_key("t2"),
+                arena.builtins.t2_key,
                 2,
                 &[(arena.builtins.int, "int")],
                 "t2",
             ),
             (
-                index.core_type_key("t2f"),
+                arena.builtins.t2f_key,
                 2,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t2f",
             ),
             (
-                index.core_type_key("t3"),
+                arena.builtins.t3_key,
                 3,
                 &[(arena.builtins.int, "int")],
                 "t3",
             ),
             (
-                index.core_type_key("t3f"),
+                arena.builtins.t3f_key,
                 3,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t3f",
             ),
             (
-                index.core_type_key("t4"),
+                arena.builtins.t4_key,
                 4,
                 &[(arena.builtins.int, "int")],
                 "t4",
             ),
             (
-                index.core_type_key("t4f"),
+                arena.builtins.t4f_key,
                 4,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t4f",
             ),
             (
-                index.core_type_key("str"),
+                arena.builtins.str_key,
                 1,
                 &[(arena.builtins.string, "String")],
                 "str",

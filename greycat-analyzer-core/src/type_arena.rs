@@ -1,20 +1,25 @@
 //! [`TypeArena`] — the append-only interning pool for [`Type`]s — and
-//! [`Builtins`], the canonical [`ItemKey`]s for the native-core well-known
-//! types the subtyping rules reason about.
+//! [`Builtins`], the core-identity registry of pre-built [`TypeId`]s and
+//! [`ItemKey`]s for the native-core well-known types the subtyping rules
+//! reason about.
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::{ItemKey, Symbol, SymbolTable, Type, TypeId, TypeKind};
 
-/// Canonical `ItemKey` per well-known native-core type (declared in
-/// `lib/std/core.gcl`). A primitive `int` is `Type(ItemKey(core, int))`;
-/// a node tag `node<T>` is `Generic { tpl: ItemKey(core, node), .. }`.
+/// Core-identity registry: pre-built `TypeId`s for the primitives, node tags,
+/// and `any`/`null`/`never`, plus the canonical `ItemKey`s for the generic
+/// templates and other core types matched by identity. All pinned to the
+/// `core` module (`lib/std/core.gcl`). A primitive `int` is
+/// `Type(ItemKey(core, int))`; a node tag `node<T>` is
+/// `Generic { tpl: ItemKey(core, node), .. }`.
 ///
-/// Std-free: an `ItemKey` is two interned symbols, so these identities are
-/// valid whether or not the stdlib is loaded.
+/// Std-free: an `ItemKey` is two interned symbols, so these identities hold
+/// whether or not the stdlib is loaded.
 #[derive(Debug, Clone, Copy)]
 pub struct Builtins {
+    // -- Well-known `TypeId`s --
     pub bool_: TypeId,
     pub int: TypeId,
     pub float: TypeId,
@@ -31,30 +36,25 @@ pub struct Builtins {
     pub node_index: TypeId,
     pub node_list: TypeId,
     pub node_geo: TypeId,
-    /// `core::Error` — the type a `catch (e)` parameter always carries.
-    /// Seeded by identity; its members resolve only when `core.gcl` is
-    /// loaded (it is a regular `type`, not an always-available primitive).
     pub error: TypeId,
-    /// The `core::any` / `core::null` decl keys. Source `any` / `null`
-    /// resolve to these decls but lower to the `any` / `null` *variants*
-    /// above, which a nominal `Type(core::X)` can't encode.
+
+    // -- Well-known `ItemKey`s --
     pub any_key: ItemKey,
     pub null_key: ItemKey,
-    /// Stable-core decl identities the analyzer dispatches on by `ItemKey`
-    /// (always seeded, std loaded or not): `Array` / `Map` literal typing,
-    /// `Tuple` desugaring, and the `type` / `field` / `function` sentinels.
-    /// Node-tag identity derives from the `node*` slots above via
-    /// [`TypeArena::is_node_tag`].
     pub array_key: ItemKey,
     pub map_key: ItemKey,
-    /// `core::Table` — the 2D native whose positional init takes array-literal
-    /// rows (`Table { ["a", 1] }`). Identity-anchored so a user-declared
-    /// `type Table` can't be mistaken for it.
     pub table_key: ItemKey,
     pub tuple_key: ItemKey,
     pub type_key: ItemKey,
     pub field_key: ItemKey,
     pub function_key: ItemKey,
+    pub t2_key: ItemKey,
+    pub t2f_key: ItemKey,
+    pub t3_key: ItemKey,
+    pub t3f_key: ItemKey,
+    pub t4_key: ItemKey,
+    pub t4f_key: ItemKey,
+    pub str_key: ItemKey,
 }
 
 impl Builtins {
@@ -172,6 +172,13 @@ impl TypeArena {
         let type_key = ItemKey::new(core, symbols.intern("type"));
         let field_key = ItemKey::new(core, symbols.intern("field"));
         let function_key = ItemKey::new(core, symbols.intern("function"));
+        let t2_key = ItemKey::new(core, symbols.intern("t2"));
+        let t2f_key = ItemKey::new(core, symbols.intern("t2f"));
+        let t3_key = ItemKey::new(core, symbols.intern("t3"));
+        let t3f_key = ItemKey::new(core, symbols.intern("t3f"));
+        let t4_key = ItemKey::new(core, symbols.intern("t4"));
+        let t4f_key = ItemKey::new(core, symbols.intern("t4f"));
+        let str_key = ItemKey::new(core, symbols.intern("str"));
         let mut alloc_type = |name: &str| {
             let id = TypeId(items.len() as u32);
             let ty = Type {
@@ -195,6 +202,13 @@ impl TypeArena {
             type_key,
             field_key,
             function_key,
+            t2_key,
+            t2f_key,
+            t3_key,
+            t3f_key,
+            t4_key,
+            t4f_key,
+            str_key,
             bool_: alloc_type("bool"),
             int: alloc_type("int"),
             float: alloc_type("float"),

@@ -4,7 +4,7 @@
 //!
 //! Before the fix, `lower_type_ref_id` (used by `validate_decl` to
 //! lower the declared return / var-init type at validation time)
-//! lacked the `resolve_decl_handle` step that `lower_type_ref` and
+//! lacked the `resolve_type` step that `lower_type_ref` and
 //! `lower_type_ref_project` already had — so for a foreign decl it
 //! fell through to `arena.named(name)`. Meanwhile the body walker
 //! minted `Type(handle)` for the same source token. The asymmetric
@@ -90,7 +90,7 @@ fn cross_module_generic_arg_matches_declared_type() {
     // Generic instantiation on a foreign type-arg: `Array<Foo>` in
     // module B must agree on the inner `Foo` identity with `Foo`
     // declared in module A. The recursive arg-lowering in
-    // `lower_type_ref_id` shares the same `resolve_decl_handle`
+    // `lower_type_ref_id` shares the same `resolve_type`
     // hole — `Array<Foo>` reduces to `Generic("Array", [Named("Foo")])`
     // on the declared side while the body walker produces
     // `Generic("Array", [Type(handle_Foo)])` for `Array<Foo>{}`.
@@ -235,7 +235,7 @@ fn cross_module_enum_arg_matches_declared_type() {
     // `Array<SearchMode>` where `SearchMode` is a foreign enum.
     // The body walker hits `enum_type_for(name)` and produces
     // `Generic("Array", [Enum{...}])`; the validation side has to
-    // hit the same branch ahead of `resolve_decl_handle`, otherwise
+    // hit the same branch ahead of `resolve_type`, otherwise
     // it mints `Generic("Array", [Type(handle)])` and the outer
     // shapes diverge. Reproduced in the wild on `pro/text_search/`'s
     // hybrid-search tests, which return `Array<SearchMode>`.
