@@ -38,25 +38,6 @@ where
     }
 }
 
-/// Map a borrowed slice `&[T]` to `Vec<U>`. Same dispatch as
-/// [`par_map`] but borrows the input — handy when the caller still
-/// needs the source vec after the parallel pass.
-pub fn par_map_ref<T, U, F>(items: &[T], f: F) -> Vec<U>
-where
-    T: Sync,
-    U: Send,
-    F: Fn(&T) -> U + Sync + Send,
-{
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        items.par_iter().map(f).collect()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        items.iter().map(f).collect()
-    }
-}
-
 /// Run `f` on every element of an owned `Vec<T>`. Returns nothing —
 /// the closure's side effects (per-thread mutation through `&mut`
 /// references it captured) are the whole point. On native this

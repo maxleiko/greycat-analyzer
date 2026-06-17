@@ -47,6 +47,7 @@ use crate::lint::{
 };
 use crate::lower_type_ref::{self, TypeRefLowering};
 use crate::meta_pragmas::{LintPragmas, parse_lint_pragmas};
+use crate::parallel;
 use crate::resolver::Resolutions;
 
 /// Per-document outputs of the analyzer pipeline. Held by
@@ -468,7 +469,7 @@ impl ProjectAnalysis {
 
         // Phase B (parallel on native, serial on wasm): lower each
         // module + parse its directives. No shared mutable state.
-        let mut lowered = crate::parallel::par_map(docs, |m| {
+        let mut lowered = parallel::par_map(docs, |m| {
             let lower_start = Instant::now();
             // Pass the real module name (filename minus `.gcl`) so
             // the HIR carries the module identity that `ingest` keys
@@ -1362,7 +1363,7 @@ impl ProjectAnalysis {
             }
         };
 
-        let pass_a: Vec<PassAOut> = crate::parallel::par_map(hirs, pass_a_run);
+        let pass_a: Vec<PassAOut> = parallel::par_map(hirs, pass_a_run);
 
         // Pass B (serial): body walker mutates `self.arena`.
         for p in pass_a {
@@ -1492,7 +1493,7 @@ impl ProjectAnalysis {
             .iter_mut()
             .filter(|(uri, _)| in_scope(uri))
             .collect();
-        crate::parallel::par_for_each(modules, |(uri, module)| {
+        parallel::par_for_each(modules, |(uri, module)| {
             run_typed_lints_for_module(
                 uri,
                 module,
@@ -3425,14 +3426,6 @@ fn run_typed_lints_for_module(
     if !bypass {
         lint_unused_suppressions(&mut module.directives, &mut module.lints);
     }
-
-    // Final project / module-pragma filter.
-    // The `disabled_rules` / `pragma_disabled_rules` filter
-    // doesn't live in this function. Subsequent passes
-    // (`stage_compute_qualified_refs`) re-emit lints, so the policy
-    // filter has to land in one place after every emission settles —
-    // see [`ProjectAnalysis::apply_rule_policy`], called at the tail
-    // of `analyze_staged` and `invalidate`.
 }
 
 /// Any newly-needed declared-side TypeIds are minted into it

@@ -331,15 +331,13 @@ pub fn analyze_with_index_into(
     let Some(module) = hir.module.as_ref() else {
         return out;
     };
-    let module_sym = index
-        .symbols
-        .intern(crate::index::module_name_from_uri(module_uri).unwrap_or("module"));
+    let module_name = crate::index::module_name_from_uri(module_uri).unwrap_or("module");
     let mut cx = Cx {
         hir,
         res,
         out: &mut out,
         module_uri,
-        module_sym,
+        module_sym: index.symbols.intern(module_name),
         arena,
         index,
         decl_registry,
@@ -3564,8 +3562,6 @@ impl<'a> Cx<'a> {
     }
 
     fn visit_type_decl(&mut self, d: &TypeDecl) {
-        // Type-level generics are visible in attrs + method
-        // signatures.
         let type_name_sym = self.hir.idents[d.name].symbol;
         let type_name = &self.index.symbols[type_name_sym];
         // Inheritance-depth check: the runtime caps `extends` chains

@@ -18,12 +18,7 @@ use serde::Serialize;
 pub struct Project<'a> {
     pub root: &'a str,
     pub modules: Vec<Module<'a>>,
-    /// Deduplicated, project-wide list of generic instantiations
-    /// observed in the type arena (e.g. `Array<core::int>`,
-    /// `Map<core::String, project::Foo>`). Sourced from
-    /// `TypeKind::Generic { decl, args }` entries whose decl resolved
-    /// through `resolve_decl_handle`; unresolved generics are skipped.
-    pub monomorphizations: Vec<Monomorphization<'a>>,
+    pub monomorphizations: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,12 +156,6 @@ pub struct AnnotationView<'a> {
     /// human-readable form (`"foo"`, `42`, `null`,
     /// `DurationUnit::milliseconds`, …).
     pub args: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Monomorphization<'a> {
-    pub display: Cow<'a, str>,
-    pub args: Vec<Cow<'a, str>>,
 }
 
 #[derive(Debug, Serialize)]

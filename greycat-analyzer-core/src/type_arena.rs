@@ -498,6 +498,22 @@ impl TypeArena {
         }
     }
 
+    /// Returns `true` iff the target type is fully instantiated/monomorphized
+    pub fn is_concrete(&self, ty: TypeId) -> bool {
+        match &self.get(ty).kind {
+            TypeKind::GenericParam(_) => false,
+            TypeKind::Generic { args, .. } => args.iter().all(|id| self.is_concrete(*id)),
+            TypeKind::Lambda {
+                params,
+                ret: Some(ret),
+            } => params.iter().all(|id| self.is_concrete(*id)) && self.is_concrete(*ret),
+            TypeKind::Lambda { params, ret: None } => params.iter().all(|id| self.is_concrete(*id)),
+            TypeKind::Union { alts } => alts.iter().all(|id| self.is_concrete(*id)),
+            TypeKind::TypeOf(inner) => self.is_concrete(*inner),
+            _ => true,
+        }
+    }
+
     /// `true` iff a value of `from` is assignable to a slot expecting `to`.
     /// The relation handles primitive widening (int → float), nullability
     /// (T → T?), top/bottom (anything → any, never → anything), and shape

@@ -39,7 +39,7 @@ use crate::utils::AnyError;
 
 use view::{
     AnnotationView, AttrView, EnumFieldView, EnumView, ExtendsLink, FnView, ModifiersView, Module,
-    Monomorphization, ParamView, PragmaView, Project, ResolutionView, TypeView, VarView,
+    ParamView, PragmaView, Project, ResolutionView, TypeView, VarView,
 };
 
 #[derive(clap::Parser)]
@@ -77,7 +77,7 @@ impl HirCmd {
             return Ok(ExitCode::FAILURE);
         }
 
-        let ctx = FsContext::new().unwrap_or_else(|_| FsContext::with_greycat_home(PathBuf::new()));
+        let ctx = FsContext::new()?;
         let mut mgr = SourceManager::with_context(Arc::new(ctx));
         let _report = mgr.load_project(&project_gcl);
         let analysis = ProjectAnalysis::analyze(&mgr);
@@ -87,13 +87,11 @@ impl HirCmd {
         let registry = analysis.decl_registry();
         let index = &analysis.index;
 
-        // Deterministic module order (by URI string) so output is
-        // stable across runs.
+        // Deterministic module order (by URI string) so output is stable across runs.
         let mut ordered: Vec<&Uri> = analysis.iter().map(|(u, _)| u).collect();
         ordered.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
-        // Per-module side buffers — borrows in the view tree point
-        // into these long-lived owned strings.
+        // Per-module side buffers: borrows in the view tree point into these long-lived owned strings.
         let module_uri_strs: Vec<String> = ordered.iter().map(|u| u.as_str().to_string()).collect();
         let module_rel_paths: Vec<String> = ordered
             .iter()
@@ -159,13 +157,7 @@ impl HirCmd {
         let project = Project {
             root: &root_str,
             modules: module_views,
-            monomorphizations: monos
-                .iter()
-                .map(|m| Monomorphization {
-                    display: Cow::Borrowed(m.display.as_str()),
-                    args: m.args.iter().map(|a| Cow::Borrowed(a.as_str())).collect(),
-                })
-                .collect(),
+            monomorphizations: monos,
         };
 
         if self.json {
@@ -809,40 +801,31 @@ fn find_type_id_for_item(arena: &TypeArena, item: ItemKey) -> Option<u32> {
 // Monomorphization collection
 // ---------------------------------------------------------------------------
 
-struct MonoEntry {
-    display: String,
-    args: Vec<String>,
-}
-
 fn collect_monomorphizations(
     arena: &TypeArena,
     registry: &DeclRegistry,
     symbols: &SymbolTable,
     index: &ProjectIndex,
-) -> Vec<MonoEntry> {
+) -> Vec<String> {
     use std::collections::BTreeSet;
     let home = |n: &str| home_lib_for(index, n);
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut out: Vec<MonoEntry> = Vec::new();
-    for (i, ty) in arena.items.iter().enumerate() {
-        if let TypeKind::Generic { tpl, args } = &ty.kind {
+    let mut out: Vec<String> = Vec::new();
+    for (ty, id) in arena
+        .intern
+        .iter()
+        .filter(|(_, id)| arena.is_concrete(**id))
+    {
+        if let TypeKind::Generic { tpl, .. } = &ty.kind {
             let handle = index.resolve_type(registry, None, tpl.name);
             if handle != Some(*tpl) {
                 continue;
             }
-            let id = TypeId::from_raw(i as u32);
-            let display = display_fqn(arena, symbols, id, &home);
+            let display = display_fqn(arena, symbols, *id, &home);
             if !seen.insert(display.clone()) {
                 continue;
             }
-            let arg_strs: Vec<String> = args
-                .iter()
-                .map(|a| display_fqn(arena, symbols, *a, &home))
-                .collect();
-            out.push(MonoEntry {
-                display,
-                args: arg_strs,
-            });
+            out.push(display);
         }
     }
     out
