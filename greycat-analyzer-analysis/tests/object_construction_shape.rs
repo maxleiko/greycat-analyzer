@@ -138,6 +138,18 @@ fn table_non_array_row_rejected() {
 }
 
 #[test]
+fn local_table_shadow_not_treated_as_core_table() {
+    // A user `type Table` is `(project, "Table")`, not the identity-anchored
+    // `core::Table`. Its positional init must fall through to the generic
+    // user-type rule (`positional-object-init`), not the array-row handling.
+    let (uri, pa) = analyze(
+        "type Table { x: int; }\n\
+         fn main() { var _ = Table { 42 }; }\n",
+    );
+    assert_eq!(codes(&pa, &uri), vec!["positional-object-init"]);
+}
+
+#[test]
 fn positional_init_on_map_rejected() {
     let (uri, pa) = analyze("fn main() { var _ = Map { 42 }; }\n");
     let cs = codes(&pa, &uri);

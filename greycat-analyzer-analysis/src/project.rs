@@ -3054,10 +3054,9 @@ fn collect_object_construction_diags(
         // array-literal rows (`Table { ["a", 1], ["b", 2] }`). The runtime
         // syntax-errors on any non-array row and never type-checks row
         // elements against `T` (T only drives `set_row` / `get_row`), so the
-        // sole check is "every row is an array literal". Resolved like the v7
-        // tuples below — `None` on no-std projects leaves the branch inert.
-        if Some(head_decl) == index.resolve_type(decl_registry, None, index.symbols.intern("Table"))
-        {
+        // sole check is "every row is an array literal". Identity-anchored on
+        // `core::Table` so a user-declared `type Table` is not mistaken for it.
+        if head_decl == arena.builtins.table_key {
             for value in obj_expr.fields.iter() {
                 if !matches!(cur_module.hir.exprs[*value], Expr::Array(..)) {
                     diags.push(SemanticDiagnostic {

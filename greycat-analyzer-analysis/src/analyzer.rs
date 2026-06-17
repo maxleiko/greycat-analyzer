@@ -2167,12 +2167,13 @@ impl<'a> Cx<'a> {
         //
         // `out.type_decls` is per-module so it's keyed by the local
         // name `Symbol`; only the cross-module `type_members` map
-        // needs the full `ItemKey`.
-        let local_type_decl = self
-            .out
-            .type_decls
-            .get(&recv_id.name)
-            .copied()
+        // needs the full `ItemKey`. A by-name hit is `recv_id`'s decl only
+        // when `recv_id` is a current-module type — a foreign receiver whose
+        // name collides with a local type (e.g. `core::Error` vs a user
+        // `type Error`) must go through the cross-module chain instead.
+        let local_type_decl = (recv_id.module == self.module_sym)
+            .then(|| self.out.type_decls.get(&recv_id.name).copied())
+            .flatten()
             .and_then(|id| match &self.hir.decls[id] {
                 Decl::Type(td) => Some(td),
                 _ => None,
@@ -3767,16 +3768,9 @@ impl<'a> Cx<'a> {
                 ..
             }) => {
                 self.visit_block(try_block, return_ty);
-                // The catch param is always a non-null `Error` (stdlib
-                // `core::Error`). Falls back to `any?` on no-std projects.
+                // The catch param is always a non-null `core::Error`
                 if let Some(param) = error_param {
-                    let error_sym = self.index.symbols.intern("Error");
-                    let error_ty = self
-                        .index
-                        .resolve_type(self.decl_registry, Some(self.module_uri), error_sym)
-                        .map(|key| self.arena.alloc_type(key))
-                        .unwrap_or_else(|| self.any_nullable());
-                    self.out.def_types.insert(*param, error_ty);
+                    self.out.def_types.insert(*param, self.arena.builtins.error);
                 }
                 self.visit_block(catch_block, return_ty);
             }

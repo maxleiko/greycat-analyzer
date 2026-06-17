@@ -31,6 +31,10 @@ pub struct Builtins {
     pub node_index: TypeId,
     pub node_list: TypeId,
     pub node_geo: TypeId,
+    /// `core::Error` — the type a `catch (e)` parameter always carries.
+    /// Seeded by identity; its members resolve only when `core.gcl` is
+    /// loaded (it is a regular `type`, not an always-available primitive).
+    pub error: TypeId,
     /// The `core::any` / `core::null` decl keys. Source `any` / `null`
     /// resolve to these decls but lower to the `any` / `null` *variants*
     /// above, which a nominal `Type(core::X)` can't encode.
@@ -43,6 +47,10 @@ pub struct Builtins {
     /// [`TypeArena::is_node_tag`].
     pub array_key: ItemKey,
     pub map_key: ItemKey,
+    /// `core::Table` — the 2D native whose positional init takes array-literal
+    /// rows (`Table { ["a", 1] }`). Identity-anchored so a user-declared
+    /// `type Table` can't be mistaken for it.
+    pub table_key: ItemKey,
     pub tuple_key: ItemKey,
     pub type_key: ItemKey,
     pub field_key: ItemKey,
@@ -159,6 +167,7 @@ impl TypeArena {
         let null_key = ItemKey::new(core, symbols.intern("null"));
         let array_key = ItemKey::new(core, symbols.intern("Array"));
         let map_key = ItemKey::new(core, symbols.intern("Map"));
+        let table_key = ItemKey::new(core, symbols.intern("Table"));
         let tuple_key = ItemKey::new(core, symbols.intern("Tuple"));
         let type_key = ItemKey::new(core, symbols.intern("type"));
         let field_key = ItemKey::new(core, symbols.intern("field"));
@@ -181,6 +190,7 @@ impl TypeArena {
             null_key,
             array_key,
             map_key,
+            table_key,
             tuple_key,
             type_key,
             field_key,
@@ -198,6 +208,7 @@ impl TypeArena {
             node_index: alloc_type("nodeIndex"),
             node_list: alloc_type("nodeList"),
             node_geo: alloc_type("nodeGeo"),
+            error: alloc_type("Error"),
         };
         Self {
             items,
