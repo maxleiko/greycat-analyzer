@@ -3762,10 +3762,22 @@ impl<'a> Cx<'a> {
             }
             Stmt::Try(TryStmt {
                 try_block,
+                error_param,
                 catch_block,
                 ..
             }) => {
                 self.visit_block(try_block, return_ty);
+                // The catch param is always a non-null `Error` (stdlib
+                // `core::Error`). Falls back to `any?` on no-std projects.
+                if let Some(param) = error_param {
+                    let error_sym = self.index.symbols.intern("Error");
+                    let error_ty = self
+                        .index
+                        .resolve_type(self.decl_registry, Some(self.module_uri), error_sym)
+                        .map(|key| self.arena.alloc_type(key))
+                        .unwrap_or_else(|| self.any_nullable());
+                    self.out.def_types.insert(*param, error_ty);
+                }
                 self.visit_block(catch_block, return_ty);
             }
             Stmt::At(AtStmt { expr, block, .. }) => {
