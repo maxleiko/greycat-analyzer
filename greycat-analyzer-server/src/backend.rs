@@ -300,6 +300,21 @@ impl Backend {
         index.owners_of(uri, self.ctx.as_ref())
     }
 
+    /// Whether `path` lives under the global `<greycat_home>/lib/std`
+    /// fallback. Uses `ctx.greycat_home()` (the same source the loader
+    /// resolves std against) and canonicalizes the std dir so it lines
+    /// up with the canonical event paths. Empty home (no greycat
+    /// install) matches nothing.
+    fn is_under_global_std(&self, path: &Path) -> bool {
+        let home = self.ctx.greycat_home();
+        if home.as_os_str().is_empty() {
+            return false;
+        }
+        let std_dir = global_std_dir(home);
+        let canonical = self.ctx.canonicalize(&std_dir).unwrap_or(std_dir);
+        path.starts_with(&canonical)
+    }
+
     /// Mark the ownership index stale. Called whenever a `project.gcl` or
     /// any `.gcl` file changes — the only edits that can move a module
     /// between projects. Cheap: the rebuild is deferred to the next
@@ -561,7 +576,11 @@ impl Backend {
         }
         let mut buffered = false;
         for path in event.paths {
-            if is_relevant(&path) {
+            // `is_under_global_std` also passes the std *directory*
+            // itself (not just `.gcl` files) so a reinstall's recreate
+            // — delivered as a folder `Create` because the per-file
+            // create races the recursive watch — still buffers.
+            if is_relevant(&path) || self.is_under_global_std(&path) {
                 self.pending_fs_events.insert(path);
                 buffered = true;
             }
@@ -619,17 +638,25 @@ impl Backend {
     // P34.2
     /// The set of directories the in-process watcher should be watching
     /// right now, derived from current state: every existing workspace
-    /// folder, the global `<greycat_home>/lib/std` (the std fallback,
-    /// which lives outside any workspace folder), and every loaded
-    /// project's local `lib/` subtree. Roots are canonicalized so the
-    /// paths notify reports match the loader's canonical `uri_owner`
-    /// keys, and contained roots are dropped (a project's `lib/` under a
-    /// watched workspace folder is already covered recursively).
+    /// folder, the global `<greycat_home>` root (it holds the `lib/std`
+    /// std fallback, which lives outside any workspace folder), and
+    /// every loaded project's local `lib/` subtree. Roots are
+    /// canonicalized so the paths notify reports match the loader's
+    /// canonical `uri_owner` keys, and contained roots are dropped (a
+    /// project's `lib/` under a watched workspace folder is already
+    /// covered recursively).
     ///
     /// Only existing directories are included: notify errors on a
     /// missing path, and a not-yet-created `lib/` (before the first
     /// `greycat install`) is covered by the enclosing workspace-folder
     /// watch, which sees the directory appear.
+    ///
+    /// The std fallback watches the HOME root, not `<home>/lib/std`
+    /// directly: a `greycat install` / `gcm i` does `rm -rf lib/std`
+    /// (and may wipe `lib`), deleting the watched inode and silently
+    /// dropping a direct watch — the recreated std would then never be
+    /// seen. The home root survives a reinstall (the installer operates
+    /// inside it), so the recreate surfaces under a live watch.
     fn compute_desired_roots(&self) -> FxHashSet<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
         for ws in &self.workspace_roots {
@@ -637,11 +664,10 @@ impl Backend {
                 roots.push(ws.canonicalize().unwrap_or_else(|_| ws.clone()));
             }
         }
-        if let Some(home) = &self.greycat_home {
-            let std_dir = global_std_dir(home);
-            if std_dir.is_dir() {
-                roots.push(std_dir.canonicalize().unwrap_or(std_dir));
-            }
+        if let Some(home) = &self.greycat_home
+            && home.is_dir()
+        {
+            roots.push(home.canonicalize().unwrap_or_else(|_| home.clone()));
         }
         for project in self.projects.values() {
             if project.root.as_os_str().is_empty() {
@@ -1484,6 +1510,27 @@ impl Backend {
                 }
                 continue;
             }
+            // Any event (file OR directory) at-or-under the global
+            // `<greycat_home>/lib/std` fallback. A greycat reinstall
+            // (`greycat install` / `gcm i`) does `rm -rf lib/std` then
+            // recreates it; the recreated entries carry no `uri_owner`
+            // binding and live outside every workspace folder, so the
+            // per-file owner walk below can never re-associate them and
+            // a globally-resolved `std` would stay stuck at `Missing`.
+            // Reloading is also why the directory `Create` event matters
+            // (the recursive watch's per-file create races and is
+            // unreliable on recreate — see `watcher.rs`). Reload every
+            // project resolving std globally or currently missing it;
+            // `reload_project_closure_for` rebuilds the closure +
+            // `uri_owner` from scratch.
+            if self.is_under_global_std(&path) {
+                for (root, project) in &self.projects {
+                    if project.std_resolution != StdResolution::Local {
+                        reload_set.insert(root.clone());
+                    }
+                }
+                continue;
+            }
             if !is_gcl(&path) {
                 continue;
             }
@@ -1799,6 +1846,18 @@ mod tests {
             }
             self.files.lock().unwrap().insert(path, content.to_string());
         }
+
+        /// Drop a single file. Ancestor dirs survive — mirrors `rm` on
+        /// one file inside a directory that keeps existing.
+        fn remove_file(&self, path: &Path) {
+            self.files.lock().unwrap().remove(path);
+        }
+
+        /// Drop a directory from the dir set so `is_dir` reports it
+        /// gone — mirrors `rm -rf <dir>`.
+        fn remove_dir(&self, path: &Path) {
+            self.dirs.lock().unwrap().remove(path);
+        }
     }
 
     impl Context for MemContext {
@@ -2029,6 +2088,197 @@ mod tests {
                 Some(NumberOrString::String(c)) if c == "multi-project-owner"
             )),
             "expected a multi-project-owner advisory, got: {diags:?}"
+        );
+    }
+
+    /// Repro for the `gcm i dev` bug: a project that resolves `std`
+    /// from the GLOBAL `<greycat_home>/lib/std` (no local `@library`)
+    /// must recover after a greycat reinstall removes then recreates
+    /// that directory. The watcher de-owns the std files on delete;
+    /// the recreated files live outside every workspace folder, so the
+    /// CREATE never re-triggers a reload and the project stays poisoned
+    /// at `StdResolution::Missing` — the whole project turns red.
+    #[test]
+    fn global_std_reinstall_recovers() {
+        let home = PathBuf::from("/home/user/.greycat");
+        let std_file = home.join("lib/std/core.gcl");
+        let ctx = Arc::new(MemContext {
+            greycat_home: home.clone(),
+            ..Default::default()
+        });
+        // Project with NO `@library("std", ...)` — relies on global std.
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "fn main() {}\n");
+        ctx.add_file(std_file.clone(), "type Foo {}\n");
+        let backend_ctx: Arc<dyn Context> = ctx.clone();
+
+        let (mut b, rx) = backend_with(backend_ctx, vec![PathBuf::from("/proj")]);
+        let entry = uri("file:///proj/project.gcl");
+        let proj_root = PathBuf::from("/proj");
+        let std_uri = path_to_uri(&std_file);
+        let has_missing_std = |ds: &[Diagnostic]| {
+            ds.iter()
+                .any(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == "missing-std"))
+        };
+
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: entry.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "fn main() {}\n".into(),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            b.projects.get(&proj_root).map(|p| p.std_resolution),
+            Some(StdResolution::Global),
+            "global std must resolve on initial load"
+        );
+        let initial = latest_diags_for(&rx, &entry).unwrap_or_default();
+        assert!(
+            !has_missing_std(&initial),
+            "no missing-std on initial load, got: {initial:?}"
+        );
+        assert!(
+            b.uri_owner.contains_key(&std_uri),
+            "the global std file must be owned by the project"
+        );
+
+        // `gcm i dev` step 1 — uninstall wipes <home>/lib/std entirely.
+        ctx.remove_file(&std_file);
+        ctx.remove_dir(&home.join("lib/std"));
+        b.apply_fs_changes(vec![FileEvent {
+            uri: std_uri.clone(),
+            typ: FileChangeType::DELETED,
+        }])
+        .unwrap();
+        assert_eq!(
+            b.projects.get(&proj_root).map(|p| p.std_resolution),
+            Some(StdResolution::Missing),
+            "std must be Missing mid-reinstall (intermediate-state sanity check)"
+        );
+        let mid = latest_diags_for(&rx, &entry).unwrap_or_default();
+        assert!(
+            has_missing_std(&mid),
+            "missing-std must surface while std is gone, got: {mid:?}"
+        );
+
+        // `gcm i dev` step 2 — reinstall recreates <home>/lib/std.
+        ctx.add_file(std_file.clone(), "type Foo {}\n");
+        b.apply_fs_changes(vec![FileEvent {
+            uri: std_uri.clone(),
+            typ: FileChangeType::CREATED,
+        }])
+        .unwrap();
+
+        assert_eq!(
+            b.projects.get(&proj_root).map(|p| p.std_resolution),
+            Some(StdResolution::Global),
+            "global std must re-resolve after the reinstall recreates it"
+        );
+        let after = latest_diags_for(&rx, &entry).unwrap_or_default();
+        assert!(
+            !has_missing_std(&after),
+            "missing-std must clear after reinstall, got: {after:?}"
+        );
+    }
+
+    /// Same as `global_std_reinstall_recovers`, but recovery is driven
+    /// by a `Create` on the std *directory* rather than the inner
+    /// `.gcl` file. This is the event the recursive watcher actually
+    /// delivers on a real reinstall: the per-file create races the
+    /// freshly-added recursive watch and is dropped, while the folder
+    /// create lands on the surviving home-root watch. The recovery path
+    /// must not be gated on the path being a `.gcl` file.
+    #[test]
+    fn global_std_reinstall_recovers_via_dir_event() {
+        let home = PathBuf::from("/home/user/.greycat");
+        let std_dir = home.join("lib/std");
+        let std_file = std_dir.join("core.gcl");
+        let ctx = Arc::new(MemContext {
+            greycat_home: home.clone(),
+            ..Default::default()
+        });
+        ctx.add_file(PathBuf::from("/proj/project.gcl"), "fn main() {}\n");
+        ctx.add_file(std_file.clone(), "type Foo {}\n");
+        let backend_ctx: Arc<dyn Context> = ctx.clone();
+
+        let (mut b, _rx) = backend_with(backend_ctx, vec![PathBuf::from("/proj")]);
+        let entry = uri("file:///proj/project.gcl");
+        let proj_root = PathBuf::from("/proj");
+
+        b.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: entry.clone(),
+                language_id: "greycat".into(),
+                version: 1,
+                text: "fn main() {}\n".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            b.projects.get(&proj_root).map(|p| p.std_resolution),
+            Some(StdResolution::Global)
+        );
+
+        // Uninstall: wipe <home>/lib/std. The watcher delivers a folder
+        // `Remove` on the std dir.
+        ctx.remove_file(&std_file);
+        ctx.remove_dir(&std_dir);
+        b.apply_fs_changes(vec![FileEvent {
+            uri: path_to_uri(&std_dir),
+            typ: FileChangeType::DELETED,
+        }])
+        .unwrap();
+        assert_eq!(
+            b.projects.get(&proj_root).map(|p| p.std_resolution),
+            Some(StdResolution::Missing),
+            "std must drop to Missing on the folder-remove event"
+        );
+
+        // Reinstall: recreate <home>/lib/std. Only the folder `Create`
+        // is observed (the inner file-create raced and was lost).
+        ctx.add_file(std_file.clone(), "type Foo {}\n");
+        b.apply_fs_changes(vec![FileEvent {
+            uri: path_to_uri(&std_dir),
+            typ: FileChangeType::CREATED,
+        }])
+        .unwrap();
+        assert_eq!(
+            b.projects.get(&proj_root).map(|p| p.std_resolution),
+            Some(StdResolution::Global),
+            "the folder-create event alone must recover global std"
+        );
+    }
+
+    /// `on_fs_event` must buffer a directory event under the global
+    /// `<greycat_home>/lib/std` even though it isn't a `.gcl` file — the
+    /// recreate signal arrives as a folder event and would otherwise be
+    /// dropped by the `is_relevant` pre-filter.
+    #[test]
+    fn on_fs_event_buffers_global_std_dir_event() {
+        let home = PathBuf::from("/home/user/.greycat");
+        let std_dir = home.join("lib/std");
+        let ctx = Arc::new(MemContext {
+            greycat_home: home.clone(),
+            ..Default::default()
+        });
+        ctx.add_file(std_dir.join("core.gcl"), "type Foo {}\n");
+        let backend_ctx: Arc<dyn Context> = ctx.clone();
+        let (mut b, _rx) = backend_with(backend_ctx, vec![PathBuf::from("/proj")]);
+
+        // A bare directory path under lib/std: not `.gcl`, not
+        // `lib/installed`, so `is_relevant` alone would drop it.
+        assert!(!is_relevant(&std_dir));
+        b.on_fs_event(Ok(notify::Event {
+            kind: notify::EventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![std_dir.clone()],
+            attrs: Default::default(),
+        }));
+        assert!(
+            b.pending_fs_events.contains(&std_dir),
+            "a folder event under the global std dir must be buffered"
         );
     }
 
