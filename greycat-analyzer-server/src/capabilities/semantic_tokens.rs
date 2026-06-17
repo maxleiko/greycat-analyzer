@@ -23,6 +23,7 @@ pub const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::NUMBER,
     SemanticTokenType::COMMENT,
     SemanticTokenType::KEYWORD,
+    SemanticTokenType::PROPERTY,
 ];
 
 pub fn semantic_tokens(

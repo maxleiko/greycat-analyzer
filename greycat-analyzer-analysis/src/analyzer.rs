@@ -61,6 +61,12 @@ pub(crate) fn object_field_key_name(
     key: Idx<Expr>,
 ) -> Option<(Symbol, Option<Idx<Ident>>)> {
     match &hir.exprs[key] {
+        Expr::Null { .. } => Some((symbols.intern("null"), None)),
+        Expr::This { .. } => Some((symbols.intern("this"), None)),
+        Expr::Literal(LiteralExpr {
+            kind: LiteralKind::Bool(b),
+            ..
+        }) => Some((symbols.intern(if *b { "true" } else { "false" }), None)),
         Expr::Ident { name, .. } => Some((hir.idents[*name].symbol, Some(*name))),
         // A quoted field name never interpolates; skip template
         // strings (they can't name an attr).

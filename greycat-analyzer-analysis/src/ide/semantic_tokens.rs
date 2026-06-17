@@ -35,6 +35,7 @@ pub const SEMANTIC_TOKEN_TYPES: &[&str] = &[
     "number",
     "comment",
     "keyword",
+    "property",
 ];
 
 const TOK_FN: u32 = 0;
@@ -47,6 +48,7 @@ const TOK_STRING: u32 = 6;
 const TOK_NUMBER: u32 = 7;
 const TOK_COMMENT: u32 = 8;
 const TOK_KEYWORD: u32 = 9;
+const TOK_PROPERTY: u32 = 10;
 
 /// Delta-encoded semantic-token stream, matching the LSP spec's
 /// `data: Vec<u32>` quintuples (delta_line, delta_start, length,
@@ -98,6 +100,16 @@ pub fn semantic_tokens(
                 ty,
             });
         };
+        // An object-field key lowers to whatever `_expr` it's written as: a
+        // bare `ident` (`bar`), or a keyword token (`null` / `this` / `true`
+        // / `false`) when the attr is string-named. These are field names,
+        // not values, so classify them as a property and override the
+        // keyword highlight the bare token would otherwise carry. Mirrors
+        // `highlights.scm`'s `(object_field name: (_) @field)`.
+        if matches!(kind, "ident" | "null" | "true" | "false" | "this") && is_object_field_name(n) {
+            push(&mut events, TOK_PROPERTY);
+            return true;
+        }
         match kind {
             "string_fragment" | "string_escape_sequence" => push(&mut events, TOK_STRING),
             "number_int" | "number_decimal" | "number_scientific" => push(&mut events, TOK_NUMBER),
@@ -184,6 +196,14 @@ pub fn semantic_tokens(
     });
 
     encode_semantic_tokens(events)
+}
+
+/// `true` when `n` is the `name` child of an `object_field` (the field
+/// key), as opposed to its `value` or any other position.
+fn is_object_field_name(n: tree_sitter::Node<'_>) -> bool {
+    n.parent().is_some_and(|p| {
+        p.kind() == "object_field" && p.child_by_field_name("name").map(|c| c.id()) == Some(n.id())
+    })
 }
 
 #[derive(Clone)]
@@ -295,6 +315,34 @@ mod tests {
             .find(|(_, _, _, ty)| *ty == TOK_COMMENT)
             .expect("doc_comment emits a COMMENT token");
         assert_eq!(comment.2, 19, "comment length is 19 UTF-8 bytes");
+    }
+
+    #[test]
+    fn keyword_shaped_object_field_names_classified_as_property_not_keyword() {
+        // `null` / `this` / `true` / `false` are valid string-named attr keys;
+        // in object-field-name position they must read as field names, not the
+        // keyword color the bare token carries elsewhere. `bar` (a plain ident
+        // key) lands on the same property classification.
+        let src = "fn main() {\n    Foo { null: 1, this: 2, true: 3, false: 4, bar: 5 };\n}\n";
+        let tree = parse(src);
+        let tokens = semantic_tokens(src, "project", tree.root_node(), SourceEncoding::UTF8);
+        let events = decode(&tokens);
+        let props = events
+            .iter()
+            .filter(|(l, _, _, ty)| *l == 1 && *ty == TOK_PROPERTY)
+            .count();
+        assert_eq!(
+            props, 5,
+            "5 object-field names classified as property; got {events:?}"
+        );
+        let kws = events
+            .iter()
+            .filter(|(l, _, _, ty)| *l == 1 && *ty == TOK_KEYWORD)
+            .count();
+        assert_eq!(
+            kws, 0,
+            "no keyword tokens on the object literal line; got {events:?}"
+        );
     }
 
     #[test]
