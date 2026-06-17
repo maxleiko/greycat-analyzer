@@ -958,6 +958,14 @@ impl ProjectIndex {
         None
     }
 
+    /// The identity `ItemKey` of a core type by name, pinned to the `core`
+    /// module. Unlike [`Self::resolve_type`] this is NOT subject to local-name
+    /// shadowing -- use it to dispatch on well-known stdlib types by identity
+    /// (a user `type t2` is `(project, "t2")`, never this `(core, "t2")`).
+    pub fn core_type_key(&self, name: &str) -> ItemKey {
+        ItemKey::new(self.symbols.intern("core"), self.symbols.intern(name))
+    }
+
     /// `Symbol`-keyed location index. Caller must have
     /// already interned `name_sym` through `self.symbols`. `ns` is the
     /// namespace of the decl being registered — letting downstream

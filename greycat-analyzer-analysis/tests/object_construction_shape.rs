@@ -150,6 +150,18 @@ fn local_table_shadow_not_treated_as_core_table() {
 }
 
 #[test]
+fn local_tuple_shadow_not_treated_as_core_tuple() {
+    // Even on a v7 stdlib, a user `type t2` is `(project, "t2")`, distinct
+    // from the identity-anchored `core::t2`. Its positional init must fall
+    // through to the generic user-type rule, not the fixed-tuple checks.
+    let (uri, pa) = analyze_v7(
+        "type t2 { a: int; b: int; }\n\
+         fn main() { var _ = t2 { 1, 2 }; }\n",
+    );
+    assert_eq!(codes(&pa, &uri), vec!["positional-object-init"]);
+}
+
+#[test]
 fn positional_init_on_map_rejected() {
     let (uri, pa) = analyze("fn main() { var _ = Map { 42 }; }\n");
     let cs = codes(&pa, &uri);

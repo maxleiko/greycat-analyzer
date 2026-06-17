@@ -3071,45 +3071,58 @@ fn collect_object_construction_diags(
             continue;
         }
 
-        // v7 fixed-shape tuple natives. Each slot is `Some` only when
-        // the loaded stdlib is v7 (slots stay `None` on v8 / no-stdlib
-        // projects, so the comparisons all miss and the loop falls
-        // through to the named-form rule below). Contract per type:
-        // exact positional arity + every element typed as one of
-        // `accepted`. The float variants asymmetrically accept `int`
-        // (runtime coerces `int → float` — verified against
-        // `greycat run` v7.8); the int variants stay strict (runtime
-        // rejects `float → int` even for literals).
-        // Each accepted element is a `(Builtins selector, display name)`
-        // pair: the selector resolves the canonical `Type(core::X)` for
-        // the membership check, the name feeds the diagnostic message.
+        // v7 fixed-shape tuple natives. Identity-anchored on `core::<name>`
+        // (a user `type t2` is a distinct `(project, "t2")` ItemKey and won't
+        // match); on v8 / no-stdlib projects no such type exists so the
+        // comparisons all miss and the loop falls through to the named-form
+        // rule below. Contract per type: exact positional arity + every
+        // element typed as one of `accepted`. The float variants
+        // asymmetrically accept `int` (runtime coerces `int -> float` --
+        // verified against `greycat run` v7.8); the int variants stay strict
+        // (runtime rejects `float -> int` even for literals).
+        // Each accepted element is a `(Builtins selector, display name)` pair:
+        // the selector is the canonical `Type(core::X)` for the membership
+        // check, the name feeds the diagnostic message.
         type Accepted<'a> = &'a [(TypeId, &'static str)];
-        let resolve_tuple =
-            |name: &str| index.resolve_type(decl_registry, None, index.symbols.intern(name));
-        let fixed_tuples: [(Option<ItemKey>, usize, Accepted, &str); 7] = [
-            (resolve_tuple("t2"), 2, &[(arena.builtins.int, "int")], "t2"),
+        let fixed_tuples: [(ItemKey, usize, Accepted, &str); 7] = [
             (
-                resolve_tuple("t2f"),
+                index.core_type_key("t2"),
+                2,
+                &[(arena.builtins.int, "int")],
+                "t2",
+            ),
+            (
+                index.core_type_key("t2f"),
                 2,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t2f",
             ),
-            (resolve_tuple("t3"), 3, &[(arena.builtins.int, "int")], "t3"),
             (
-                resolve_tuple("t3f"),
+                index.core_type_key("t3"),
+                3,
+                &[(arena.builtins.int, "int")],
+                "t3",
+            ),
+            (
+                index.core_type_key("t3f"),
                 3,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t3f",
             ),
-            (resolve_tuple("t4"), 4, &[(arena.builtins.int, "int")], "t4"),
             (
-                resolve_tuple("t4f"),
+                index.core_type_key("t4"),
+                4,
+                &[(arena.builtins.int, "int")],
+                "t4",
+            ),
+            (
+                index.core_type_key("t4f"),
                 4,
                 &[(arena.builtins.float, "float"), (arena.builtins.int, "int")],
                 "t4f",
             ),
             (
-                resolve_tuple("str"),
+                index.core_type_key("str"),
                 1,
                 &[(arena.builtins.string, "String")],
                 "str",
@@ -3117,7 +3130,7 @@ fn collect_object_construction_diags(
         ];
         let mut matched_v7 = false;
         for &(slot, arity, accepted, type_name) in &fixed_tuples {
-            if slot != Some(head_decl) {
+            if slot != head_decl {
                 continue;
             }
             matched_v7 = true;
