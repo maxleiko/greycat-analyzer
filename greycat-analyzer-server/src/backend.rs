@@ -256,6 +256,13 @@ pub struct Backend {
     /// when the home couldn't be resolved (then std lives only under a
     /// project's local `lib/std`, already covered by the project watch).
     pub greycat_home: Option<PathBuf>,
+    /// Canonical `<greycat_home>/lib/std`, resolved once at startup.
+    /// `is_under_global_std` compares against it lexically, so the
+    /// per-event watcher hot path (which fires for every non-`.gcl`
+    /// path) never touches the filesystem. `None` when the home is
+    /// unresolved. Canonicalized so it lines up with the canonical
+    /// paths notify reports under the canonical watch root.
+    pub global_std_dir: Option<PathBuf>,
     /// Filesystem view shared with every [`Project`]'s loader. Real
     /// [`FsContext`] in production; an in-memory mock in tests. Every
     /// path check on the request-dispatch path (entrypoint
@@ -301,18 +308,28 @@ impl Backend {
     }
 
     /// Whether `path` lives under the global `<greycat_home>/lib/std`
-    /// fallback. Uses `ctx.greycat_home()` (the same source the loader
-    /// resolves std against) and canonicalizes the std dir so it lines
-    /// up with the canonical event paths. Empty home (no greycat
-    /// install) matches nothing.
+    /// fallback. A pure lexical check against the pre-resolved
+    /// [`Self::global_std_dir`] — no syscall, so it stays cheap on the
+    /// per-event watcher hot path. Unresolved home matches nothing.
     fn is_under_global_std(&self, path: &Path) -> bool {
-        let home = self.ctx.greycat_home();
+        self.global_std_dir
+            .as_deref()
+            .is_some_and(|d| path.starts_with(d))
+    }
+
+    /// Resolve the canonical `<greycat_home>/lib/std` once. Canonicalizes
+    /// the home (it survives a std reinstall) so the result matches the
+    /// canonical paths notify reports; the `lib/std` join is lexical.
+    /// `None` when the home is unset (no greycat install).
+    pub(crate) fn resolve_global_std_dir(ctx: &dyn Context) -> Option<PathBuf> {
+        let home = ctx.greycat_home();
         if home.as_os_str().is_empty() {
-            return false;
+            return None;
         }
-        let std_dir = global_std_dir(home);
-        let canonical = self.ctx.canonicalize(&std_dir).unwrap_or(std_dir);
-        path.starts_with(&canonical)
+        let base = ctx
+            .canonicalize(home)
+            .unwrap_or_else(|_| home.to_path_buf());
+        Some(global_std_dir(&base))
     }
 
     /// Mark the ownership index stale. Called whenever a `project.gcl` or
@@ -1821,6 +1838,7 @@ mod tests {
                 pending_fs_events: FxHashSet::default(),
                 fs_flush_deadline: None,
                 greycat_home: None,
+                global_std_dir: Backend::resolve_global_std_dir(ctx.as_ref()),
                 ctx,
                 project_index: None,
             },

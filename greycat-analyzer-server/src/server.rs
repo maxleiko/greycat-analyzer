@@ -217,6 +217,7 @@ fn main_loop(conn: Connection, init: InitializeParams, encoding: SourceEncoding)
         pending_fs_events: Default::default(),
         fs_flush_deadline: None,
         greycat_home,
+        global_std_dir: crate::backend::Backend::resolve_global_std_dir(ctx.as_ref()),
         ctx,
         project_index: None,
     };
