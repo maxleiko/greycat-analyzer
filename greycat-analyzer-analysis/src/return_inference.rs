@@ -24,7 +24,7 @@
 use greycat_analyzer_core::{Type, TypeArena, TypeId, TypeKind};
 use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
-use greycat_analyzer_hir::hir::Stmt;
+use greycat_analyzer_hir::hir::{BlockStmt, Stmt};
 
 use crate::analyzer::SemanticAnalysis;
 
@@ -74,7 +74,7 @@ pub fn inferred_return_from_block(
     hir: &Hir,
     analysis: &SemanticAnalysis,
     arena: &TypeArena,
-    body: &greycat_analyzer_hir::hir::BlockStmt,
+    body: &BlockStmt,
 ) -> Option<TypeId> {
     let mut seen: Option<TypeId> = None;
     if collect_returns_in_block(hir, analysis, arena, &body.stmts, &mut seen).is_err() {
@@ -83,10 +83,45 @@ pub fn inferred_return_from_block(
     seen
 }
 
+/// `true` when `ty` is something the user can write in a `type_ident`
+/// slot. The GCL grammar accepts `[typeof] [Mod::]Name[<...>][?]`; any
+/// shape that doesn't fit that template can't be the right-hand side
+/// of an `infer-return-type` hint because the user can't act on it,
+/// and shouldn't surface in a lambda's `ret: Some(T)` slot either
+/// (would render as something un-writable).
+///
+/// Expressible: primitives, named types (`Type(item)`), `Enum`,
+/// `Generic<...>` with expressible args, `TypeOf(inner)` with an
+/// expressible inner, `GenericParam` (the user has the param name in
+/// scope), `Null` (`null` is a valid type keyword), and `Any` (`any`
+/// is too — the lint filters that one as uninformative; lambda body
+/// inference accepts it as a legitimate `any` return).
+///
+/// Not expressible: `Never`, `Unresolved`, `Lambda` (no GCL literal
+/// for function types beyond the `function` primitive — which the
+/// analyzer never picks here because closures type as `Lambda`), and
+/// `Union` (no `T | U` syntax).
+pub fn is_expressible_type_ident(arena: &TypeArena, ty: TypeId) -> bool {
+    let t = arena.get(ty);
+    match &t.kind {
+        TypeKind::Null
+        | TypeKind::Any
+        | TypeKind::Type(_)
+        | TypeKind::Enum { .. }
+        | TypeKind::GenericParam { .. } => true,
+        TypeKind::Generic { args, .. } => args.iter().all(|a| is_expressible_type_ident(arena, *a)),
+        TypeKind::TypeOf(inner) => is_expressible_type_ident(arena, *inner),
+        TypeKind::Never
+        | TypeKind::Unresolved { .. }
+        | TypeKind::Lambda { .. }
+        | TypeKind::Union { .. } => false,
+    }
+}
+
 /// Combine `a` and `b` into the single GCL-expressible type that
 /// covers both, or `None` when no such type exists in the arena. See
 /// [`inferred_return_from_body`] for the rule set.
-pub fn join_return_types(arena: &TypeArena, a: TypeId, b: TypeId) -> Option<TypeId> {
+fn join_return_types(arena: &TypeArena, a: TypeId, b: TypeId) -> Option<TypeId> {
     if a == b {
         return Some(a);
     }
@@ -205,39 +240,4 @@ fn collect_returns_in_block(
         }
     }
     Ok(())
-}
-
-/// `true` when `ty` is something the user can write in a `type_ident`
-/// slot. The GCL grammar accepts `[typeof] [Mod::]Name[<...>][?]`; any
-/// shape that doesn't fit that template can't be the right-hand side
-/// of an `infer-return-type` hint because the user can't act on it,
-/// and shouldn't surface in a lambda's `ret: Some(T)` slot either
-/// (would render as something un-writable).
-///
-/// Expressible: primitives, named types (`Type(item)`), `Enum`,
-/// `Generic<...>` with expressible args, `TypeOf(inner)` with an
-/// expressible inner, `GenericParam` (the user has the param name in
-/// scope), `Null` (`null` is a valid type keyword), and `Any` (`any`
-/// is too — the lint filters that one as uninformative; lambda body
-/// inference accepts it as a legitimate `any` return).
-///
-/// Not expressible: `Never`, `Unresolved`, `Lambda` (no GCL literal
-/// for function types beyond the `function` primitive — which the
-/// analyzer never picks here because closures type as `Lambda`), and
-/// `Union` (no `T | U` syntax).
-pub fn is_expressible_type_ident(arena: &TypeArena, ty: TypeId) -> bool {
-    let t = arena.get(ty);
-    match &t.kind {
-        TypeKind::Null
-        | TypeKind::Any
-        | TypeKind::Type(_)
-        | TypeKind::Enum { .. }
-        | TypeKind::GenericParam { .. } => true,
-        TypeKind::Generic { args, .. } => args.iter().all(|a| is_expressible_type_ident(arena, *a)),
-        TypeKind::TypeOf(inner) => is_expressible_type_ident(arena, *inner),
-        TypeKind::Never
-        | TypeKind::Unresolved { .. }
-        | TypeKind::Lambda { .. }
-        | TypeKind::Union { .. } => false,
-    }
 }
