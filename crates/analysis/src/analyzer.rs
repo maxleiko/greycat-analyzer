@@ -1664,6 +1664,49 @@ impl<'a> Cx<'a> {
         self.index.is_assignable_to(self.arena, from, to)
     }
 
+    /// Least-upper-bound of two reaching branches' effective narrow
+    /// types, for the post-if join when at least one path keeps the
+    /// binding nullable. Keeps the wider type when one subsumes the
+    /// other (subtype relation or a `null` / `T?` companion); falls
+    /// back to the binding's declared type when the two genuinely
+    /// disagree (sibling subtypes), since narrowing below the declared
+    /// type would drop reachable cases. Returns `None` when both paths
+    /// are the dead `Null` shape — nothing to carry.
+    fn join_branch_narrows(
+        &mut self,
+        ident: Idx<Ident>,
+        then_eff: TypeId,
+        else_eff: TypeId,
+        pre: TypeId,
+    ) -> Option<TypeId> {
+        let then_null = matches!(self.arena.get(then_eff).kind, TypeKind::Null);
+        let else_null = matches!(self.arena.get(else_eff).kind, TypeKind::Null);
+        if then_null && else_null {
+            return None;
+        }
+        // One side is the dead `Null` shape: carry the other, made
+        // nullable (the null path keeps the binding maybe-null).
+        if then_null {
+            return Some(self.arena.nullable(else_eff));
+        }
+        if else_null {
+            return Some(self.arena.nullable(then_eff));
+        }
+        // Subtype relation: keep the supertype, which already carries
+        // the wider side's nullability.
+        if self.is_assignable(then_eff, else_eff) {
+            return Some(else_eff);
+        }
+        if self.is_assignable(else_eff, then_eff) {
+            return Some(then_eff);
+        }
+        // Genuine disagreement — the only sound result is the declared
+        // type, kept nullable since this path is reached with a
+        // nullable join.
+        let declared = self.out.def_types.get(&ident).copied().unwrap_or(pre);
+        Some(self.arena.nullable(declared))
+    }
+
     fn push_narrow(&mut self) {
         self.narrows.push(FxHashMap::default());
         self.member_narrows.push(FxHashSet::default());
@@ -4340,16 +4383,12 @@ impl<'a> Cx<'a> {
                     || else_branch_narrows.contains_key(&ident)
                 {
                     // A reaching branch reassigned this binding but the
-                    // join is still nullable, so the non-null lift above
-                    // didn't fire. Write the nullable join anyway: a
-                    // stale pre-if narrow (e.g. an outer guard left it at
-                    // `null`) must not survive the reassignment. The
-                    // carrier is the concrete (non-`Null`) side; skip
-                    // when both paths are the dead `Null` shape.
-                    let then_null_shape = matches!(self.arena.get(then_eff).kind, TypeKind::Null);
-                    let carrier = if then_null_shape { else_eff } else { then_eff };
-                    if !matches!(self.arena.get(carrier).kind, TypeKind::Null) {
-                        let merged = self.arena.nullable(carrier);
+                    // join is still nullable. Join the two reaching
+                    // paths' effective types rather than carrying one:
+                    // an if/else-if chain assigning Dog/Cat/Fish to an
+                    // `Animal?` (no final else) must stay `Animal?`, not
+                    // collapse to the first branch's `Dog?`.
+                    if let Some(merged) = self.join_branch_narrows(ident, then_eff, else_eff, pre) {
                         self.write_narrow(ident, merged);
                     }
                 }
