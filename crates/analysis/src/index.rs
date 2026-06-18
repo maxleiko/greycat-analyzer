@@ -1034,6 +1034,7 @@ impl ProjectIndex {
         self.type_names.contains(&name)
             || self.fn_names.contains(&name)
             || self.var_names.contains(&name)
+            || self.runtime_globals.contains_key(&name)
             || Builtins::is_core_type_name(&self.symbols[name])
     }
 
