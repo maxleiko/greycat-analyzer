@@ -133,14 +133,12 @@ pub fn join_return_types(arena: &TypeArena, a: TypeId, b: TypeId) -> Option<Type
 /// the user wanted a hint they'd write the explicit return).
 ///
 /// Dead branches are skipped: at each block we stop iterating after
-/// the first statement that `stmt_diverges` proves
-/// terminates control flow. That mirrors the `unreachable` lint's
-/// reasoning so a return in a provably-dead branch (e.g. after an
-/// earlier `return` / `throw` in the same block) doesn't pollute the
-/// inferred type. Narrow-dead branches (a then-arm whose condition
-/// the analyzer proves is statically false) aren't covered — the
-/// reachability primitive doesn't track condition-falseness today;
-/// when it does, this walker picks the new signal up for free.
+/// the first statement that `stmt_diverges` proves terminates control
+/// flow. That mirrors the `unreachable` lint's reasoning so a return in
+/// a provably-dead branch (e.g. after an earlier `return` / `throw` in
+/// the same block) doesn't pollute the inferred type. A statically-false
+/// then-arm's returns are still visited, though — the `Stmt::If` arm
+/// descends into `then_branch` unconditionally, not via `stmt_diverges`.
 fn collect_return_types(
     hir: &Hir,
     analysis: &SemanticAnalysis,
