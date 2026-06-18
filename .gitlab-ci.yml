@@ -1,0 +1,101 @@
+variables:
+  GIT_STRATEGY: clone
+  GIT_DEPTH: "0"
+  # tree-sitter-greycat is a git submodule and the syntax crate's build.rs
+  # reads node-types.json from it -- without this every cargo build fails.
+  GIT_SUBMODULE_STRATEGY: recursive
+  CARGO_TERM_COLOR: always
+  # The distributable CLI binary (one workspace member, not the whole tree).
+  CARGO_PKG: greycat-analyzer
+  CARGO_BIN: greycat-analyzer
+
+stages:
+  - build
+  - publish
+
+before_script:
+  # greycat owns the version: MAJOR.MINOR from the VERSION file, patch + branch
+  # suffix (e.g. 0.1.0-dev) computed from git. greycat is on the runner host;
+  # the build toolchain is only in the devcontainer image, so we stamp the
+  # version here and pass it into the container via -e. GREYCAT_ANALYZER_VERSION
+  # is read at compile time by the CLI's clap `version` (falls back to Cargo.toml
+  # when unset), so the binary reports the same string as `greycat -v`.
+  - export PROJECT_VERSION_MAJOR_MINOR=$(cat VERSION)
+  - export PROJECT_VERSION=$(greycat build-version)
+  - export PROJECT_VERSION_FULL=$(greycat build-version-full)
+  - export GREYCAT_ANALYZER_VERSION="${PROJECT_VERSION}"
+  - echo "${CARGO_BIN} ${PROJECT_VERSION} (${PROJECT_VERSION_FULL})"
+
+# Reuse the prebuilt greycat devcontainer image (Rust + clang/lld + llvm-mingw +
+# greycat). The reference is read from the "image" field of
+# .devcontainer/devcontainer.json and pulled only when not already cached.
+.docker_build:
+  script: &docker_build_script
+    - export GREYCAT_DEV_IMAGE=$(grep -o '"image"[[:space:]]*:[[:space:]]*"[^"]*"' ${CI_PROJECT_DIR}/.devcontainer/devcontainer.json | sed -E 's/.*"image"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+    - docker image inspect "${GREYCAT_DEV_IMAGE}" >/dev/null 2>&1 || docker pull "${GREYCAT_DEV_IMAGE}"
+
+# macOS has no devcontainer (the image is Linux-only and carries no macOS SDK),
+# so it builds natively on the mac runner -- same split as the C pipeline.
+macos:
+  stage: build
+  tags: [ macos_native ]
+  script:
+    - rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    - cargo build --release --locked -p ${CARGO_PKG} --target aarch64-apple-darwin
+    - cargo build --release --locked -p ${CARGO_PKG} --target x86_64-apple-darwin
+    - mkdir -p dist/arm64-apple dist/x64-apple
+    - cp target/aarch64-apple-darwin/release/${CARGO_BIN} dist/arm64-apple/
+    - cp target/x86_64-apple-darwin/release/${CARGO_BIN} dist/x64-apple/
+  artifacts:
+    paths:
+      - dist
+
+x64-linux:
+  stage: build
+  tags: [ linux ]
+  script:
+    - *docker_build_script
+    # x86_64-unknown-linux-gnu is the image's default rust target on an x64 host.
+    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} --target x86_64-unknown-linux-gnu
+    - mkdir -p dist/x64-linux
+    - cp target/x86_64-unknown-linux-gnu/release/${CARGO_BIN} dist/x64-linux/
+  artifacts:
+    paths:
+      - dist
+
+arm64-linux:
+  stage: build
+  tags: [ linux_arm64 ]
+  script:
+    - *docker_build_script
+    # aarch64-unknown-linux-gnu is the image's default rust target on an arm64 host.
+    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} --target aarch64-unknown-linux-gnu
+    - mkdir -p dist/arm64-linux
+    - cp target/aarch64-unknown-linux-gnu/release/${CARGO_BIN} dist/arm64-linux/
+  artifacts:
+    paths:
+      - dist
+
+# Windows is cross-compiled from the Linux container via the image's llvm-mingw
+# (ucrt) toolchain -- the same machine/tag the C pipeline uses for x64-windows.
+# FIXME(verify): the rust target triple for llvm-mingw ucrt is gnullvm, not the
+# classic gnu (gcc/msvcrt). Confirm `x86_64-pc-windows-gnullvm` links against the
+# image's /opt/toolchains/ucrt-mingw before relying on this in a release.
+windows:
+  stage: build
+  tags: [ mingw ]
+  script:
+    - *docker_build_script
+    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} bash -c 'export PATH="/opt/toolchains/ucrt-mingw/bin:$PATH" && rustup target add x86_64-pc-windows-gnullvm && cargo build --release --locked -p '"${CARGO_PKG}"' --target x86_64-pc-windows-gnullvm'
+    - mkdir -p dist/x64-windows
+    - cp target/x86_64-pc-windows-gnullvm/release/${CARGO_BIN}.exe dist/x64-windows/
+  artifacts:
+    paths:
+      - dist
+
+publish:
+  stage: publish
+  when: manual
+  tags: [ linux ]
+  script:
+    - echo "TODO PUBLISH to get.greycat.io"

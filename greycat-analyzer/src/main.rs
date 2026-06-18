@@ -8,8 +8,15 @@ use cmd::*;
 
 use crate::utils::AnyError;
 
+// CI stamps the greycat-style branch-qualified version (e.g. `0.1.0-dev`) via
+// this env at build time; plain `cargo build` falls back to Cargo.toml.
+const VERSION: &str = match option_env!("GREYCAT_ANALYZER_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[clap(name = "greycat-analyzer", version)]
+#[clap(name = "greycat-analyzer", version = VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
