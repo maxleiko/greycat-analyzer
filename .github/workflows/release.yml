@@ -58,6 +58,8 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Use HTTPS for hub.datathings.com submodules
+        run: git config --global url."https://hub.datathings.com/".insteadOf "git@hub.datathings.com:"
       - uses: actions/checkout@v5
         with:
           submodules: recursive

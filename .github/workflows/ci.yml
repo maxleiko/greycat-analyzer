@@ -10,6 +10,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Use HTTPS for hub.datathings.com submodules
+        run: git config --global url."https://hub.datathings.com/".insteadOf "git@hub.datathings.com:"
       - uses: actions/checkout@v5
         with:
           submodules: recursive
@@ -40,6 +42,8 @@ jobs:
   fmt-check:
     runs-on: ubuntu-latest
     steps:
+      - name: Use HTTPS for hub.datathings.com submodules
+        run: git config --global url."https://hub.datathings.com/".insteadOf "git@hub.datathings.com:"
       - uses: actions/checkout@v5
         with:
           submodules: recursive
