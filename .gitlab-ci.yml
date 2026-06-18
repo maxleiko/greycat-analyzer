@@ -21,10 +21,26 @@ before_script:
   # is read at compile time by the CLI's clap `version` (falls back to Cargo.toml
   # when unset), so the binary reports the same string as `greycat -v`.
   - export PROJECT_VERSION_MAJOR_MINOR=$(cat VERSION)
-  - export PROJECT_VERSION=$(greycat build-version)
-  - export PROJECT_VERSION_FULL=$(greycat build-version-full)
-  - export GREYCAT_ANALYZER_VERSION="${PROJECT_VERSION}"
-  - echo "${CARGO_BIN} ${PROJECT_VERSION} (${PROJECT_VERSION_FULL})"
+  - export PROJECT_VERSION=$(greycat build-version-full)
+  - export PROJECT_VERSION_SIMPLE=$(greycat build-version)
+  - export GREYCAT_ANALYZER_VERSION="${PROJECT_VERSION_SIMPLE}"
+  - echo "${CARGO_BIN} ${PROJECT_VERSION_SIMPLE} (${PROJECT_VERSION})"
+  # gc_package <greycat-target> <built-binary-path>: stage the binary as
+  # bin/<name> (exact zip layout: bin/greycat-analyzer, executable) and zip it
+  # to the get.greycat.io package path that scripts/publish.sh uploads from.
+  - |
+    gc_package() {
+      local target="$1" src="$2" name
+      name=$(basename "$src")
+      rm -rf bin && mkdir -p bin
+      cp "$src" "bin/${name}"
+      chmod +x "bin/${name}"
+      local dest="dist/${CI_COMMIT_REF_NAME}/${PROJECT_VERSION_MAJOR_MINOR}/${target}"
+      mkdir -p "$dest"
+      rm -f "${dest}/${PROJECT_VERSION_SIMPLE}.zip"
+      zip -r "${dest}/${PROJECT_VERSION_SIMPLE}.zip" bin
+      rm -rf bin
+    }
 
 # Reuse the prebuilt greycat devcontainer image (Rust + clang/lld + llvm-mingw +
 # greycat). The reference is read from the "image" field of
@@ -43,9 +59,8 @@ macos:
     - rustup target add aarch64-apple-darwin x86_64-apple-darwin
     - cargo build --release --locked -p ${CARGO_PKG} --target aarch64-apple-darwin
     - cargo build --release --locked -p ${CARGO_PKG} --target x86_64-apple-darwin
-    - mkdir -p dist/arm64-apple dist/x64-apple
-    - cp target/aarch64-apple-darwin/release/${CARGO_BIN} dist/arm64-apple/
-    - cp target/x86_64-apple-darwin/release/${CARGO_BIN} dist/x64-apple/
+    - gc_package arm64-apple target/aarch64-apple-darwin/release/${CARGO_BIN}
+    - gc_package x64-apple target/x86_64-apple-darwin/release/${CARGO_BIN}
   artifacts:
     paths:
       - dist
@@ -57,8 +72,7 @@ x64-linux:
     - *docker_build_script
     # x86_64-unknown-linux-gnu is the image's default rust target on an x64 host.
     - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} --target x86_64-unknown-linux-gnu
-    - mkdir -p dist/x64-linux
-    - cp target/x86_64-unknown-linux-gnu/release/${CARGO_BIN} dist/x64-linux/
+    - gc_package x64-linux target/x86_64-unknown-linux-gnu/release/${CARGO_BIN}
   artifacts:
     paths:
       - dist
@@ -70,8 +84,7 @@ arm64-linux:
     - *docker_build_script
     # aarch64-unknown-linux-gnu is the image's default rust target on an arm64 host.
     - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} --target aarch64-unknown-linux-gnu
-    - mkdir -p dist/arm64-linux
-    - cp target/aarch64-unknown-linux-gnu/release/${CARGO_BIN} dist/arm64-linux/
+    - gc_package arm64-linux target/aarch64-unknown-linux-gnu/release/${CARGO_BIN}
   artifacts:
     paths:
       - dist
@@ -87,15 +100,16 @@ windows:
   script:
     - *docker_build_script
     - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} bash -c 'export PATH="/opt/toolchains/ucrt-mingw/bin:$PATH" && rustup target add x86_64-pc-windows-gnullvm && cargo build --release --locked -p '"${CARGO_PKG}"' --target x86_64-pc-windows-gnullvm'
-    - mkdir -p dist/x64-windows
-    - cp target/x86_64-pc-windows-gnullvm/release/${CARGO_BIN}.exe dist/x64-windows/
+    - gc_package x64-windows target/x86_64-pc-windows-gnullvm/release/${CARGO_BIN}.exe
   artifacts:
     paths:
       - dist
 
+# Uploads every dist/**/*.zip to get.greycat.io (package "lang") and bumps the
+# branch's latest pointer. Receives the build stage's dist artifacts by default.
 publish:
   stage: publish
   when: manual
   tags: [ linux ]
   script:
-    - echo "TODO PUBLISH to get.greycat.io"
+    - ./scripts/publish.sh

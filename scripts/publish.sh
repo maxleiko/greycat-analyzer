@@ -1,44 +1,14 @@
-#!/usr/bin/env bash
-# P10.1 — crates.io publish driver.
-#
-# Publishes every crate in dependency order. Run with `--dry-run`
-# first; this script does NOT pass `--dry-run` automatically because
-# real publishing is destructive and irreversible.
-#
-# Pre-flight (do these before running):
-#   1. `cargo login <token>` is configured.
-#   2. The submodule `tree-sitter-greycat` is published as a
-#      crate (or its parser.c vendored into greycat-analyzer-syntax)
-#      — `greycat-analyzer-syntax` currently uses a path dep to it
-#      and won't publish without that.
-#   3. The CI gauntlet (build / clippy / test) is green.
-#   4. The repo is on a clean tag (e.g. `v0.1.0`) — Cargo's package
-#      registry rejects re-publishing the same `version`.
-set -euo pipefail
+#!/bin/bash
+sha256_hash=$(echo -n "$GET_GC_CI_PASS" | openssl dgst -sha256 | cut -d ' ' -f2)
+base64url_token=$(echo -n "root:$sha256_hash" | base64 -w 0 )
+token=$(curl -s -d "[\"${base64url_token}\", false]" -X POST https://get.greycat.io/runtime::User::login | tr -d '"')
+package="lang"
 
-ORDER=(
-  greycat-analyzer-syntax
-  greycat-analyzer-core
-  greycat-analyzer-hir
-  greycat-analyzer-fmt
-  greycat-analyzer-analysis
-  greycat-analyzer-server
-  greycat-analyzer-wasm
-  greycat-analyzer
-)
+cd dist || exit
 
-DRY="${1:-}"
-
-for crate in "${ORDER[@]}"; do
-  echo "=== publishing $crate ==="
-  if [[ "$DRY" == "--dry-run" ]]; then
-    cargo publish --dry-run -p "$crate"
-  else
-    cargo publish -p "$crate"
-  fi
-  # Wait for the crates.io registry to settle so the next crate's
-  # dep on this one resolves.
-  if [[ "$DRY" != "--dry-run" ]]; then
-    sleep 30
-  fi
+find . -type f -name '*.zip' -print0 | while IFS= read -r -d '' file; do
+    short_file=$(echo "$file" | sed 's/^.//'| sed 's/^.//')
+    curl -s -X PUT -H "Authorization: $token" -T $file https://get.greycat.io/files/$package/$short_file
 done
+
+curl -s -X PUT -H "Authorization: $token" -d "${PROJECT_VERSION_MAJOR_MINOR}/${PROJECT_VERSION_SIMPLE}" -H "Content-Type: text/plain" "https://get.greycat.io/files/$package/${CI_COMMIT_REF_NAME}/latest"
