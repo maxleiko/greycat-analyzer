@@ -14,6 +14,9 @@ variables:
   # The distributable CLI binary (one workspace member, not the whole tree).
   CARGO_PKG: greycat-analyzer
   CARGO_BIN: greycat-analyzer
+  # The FFI cdylib (`name = "greycat_lang"`) shipped alongside the CLI as
+  # lib/lang/libgreycat_lang.{so,dylib,dll} in the same zip.
+  CARGO_FFI_PKG: greycat-analyzer-ffi
 
 stages:
   - build
@@ -31,21 +34,30 @@ before_script:
   - export PROJECT_VERSION_SIMPLE=$(greycat build-version)
   - export GREYCAT_ANALYZER_VERSION="${PROJECT_VERSION_SIMPLE}"
   - echo "${CARGO_BIN} ${PROJECT_VERSION_SIMPLE} (${PROJECT_VERSION})"
-  # gc_package <greycat-target> <built-binary-path>: stage the binary as
-  # bin/<name> (exact zip layout: bin/greycat-analyzer, executable) and zip it
-  # to the get.greycat.io package path that scripts/publish.sh uploads from.
+  # gc_package <greycat-target> <built-binary-path> [<built-ffi-lib-path>]:
+  # stage the binary as bin/<name> and, when given, the FFI cdylib as
+  # lib/lang/<libname> (exact zip layout: bin/greycat-analyzer +
+  # lib/lang/libgreycat_lang.so), then zip both to the get.greycat.io package
+  # path that scripts/publish.sh uploads from. Stages into a scratch dir so it
+  # never clobbers the repo-root lib/ (gitignored stdlib) on the runner.
   - |
     gc_package() {
-      local target="$1" src="$2" name
-      name=$(basename "$src")
-      rm -rf bin && mkdir -p bin
-      cp "$src" "bin/${name}"
-      chmod +x "bin/${name}"
-      local dest="dist/${CI_COMMIT_REF_NAME}/${PROJECT_VERSION_MAJOR_MINOR}/${target}"
+      local target="$1" src="$2" lib="$3"
+      local stage; stage=$(mktemp -d)
+      mkdir -p "${stage}/bin"
+      cp "$src" "${stage}/bin/$(basename "$src")"
+      chmod +x "${stage}/bin/$(basename "$src")"
+      local contents="bin"
+      if [ -n "$lib" ]; then
+        mkdir -p "${stage}/lib/lang"
+        cp "$lib" "${stage}/lib/lang/$(basename "$lib")"
+        contents="bin lib"
+      fi
+      local dest="${CI_PROJECT_DIR}/dist/${CI_COMMIT_REF_NAME}/${PROJECT_VERSION_MAJOR_MINOR}/${target}"
       mkdir -p "$dest"
       rm -f "${dest}/${PROJECT_VERSION_SIMPLE}.zip"
-      zip -r "${dest}/${PROJECT_VERSION_SIMPLE}.zip" bin
-      rm -rf bin
+      ( cd "$stage" && zip -r "${dest}/${PROJECT_VERSION_SIMPLE}.zip" $contents )
+      rm -rf "$stage"
     }
 
 # Reuse the prebuilt greycat devcontainer image (Rust + clang/lld + llvm-mingw +
@@ -63,10 +75,10 @@ macos:
   tags: [ macos_native ]
   script:
     - rustup target add aarch64-apple-darwin x86_64-apple-darwin
-    - cargo build --release --locked -p ${CARGO_PKG} --target aarch64-apple-darwin
-    - cargo build --release --locked -p ${CARGO_PKG} --target x86_64-apple-darwin
-    - gc_package arm64-apple target/aarch64-apple-darwin/release/${CARGO_BIN}
-    - gc_package x64-apple target/x86_64-apple-darwin/release/${CARGO_BIN}
+    - cargo build --release --locked -p ${CARGO_PKG} -p ${CARGO_FFI_PKG} --target aarch64-apple-darwin
+    - cargo build --release --locked -p ${CARGO_PKG} -p ${CARGO_FFI_PKG} --target x86_64-apple-darwin
+    - gc_package arm64-apple target/aarch64-apple-darwin/release/${CARGO_BIN} target/aarch64-apple-darwin/release/libgreycat_lang.dylib
+    - gc_package x64-apple target/x86_64-apple-darwin/release/${CARGO_BIN} target/x86_64-apple-darwin/release/libgreycat_lang.dylib
   artifacts:
     paths:
       - dist
@@ -77,8 +89,8 @@ x64-linux:
   script:
     - *docker_build_script
     # x86_64-unknown-linux-gnu is the image's default rust target on an x64 host.
-    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} --target x86_64-unknown-linux-gnu
-    - gc_package x64-linux target/x86_64-unknown-linux-gnu/release/${CARGO_BIN}
+    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} -p ${CARGO_FFI_PKG} --target x86_64-unknown-linux-gnu
+    - gc_package x64-linux target/x86_64-unknown-linux-gnu/release/${CARGO_BIN} target/x86_64-unknown-linux-gnu/release/libgreycat_lang.so
   artifacts:
     paths:
       - dist
@@ -89,8 +101,8 @@ arm64-linux:
   script:
     - *docker_build_script
     # aarch64-unknown-linux-gnu is the image's default rust target on an arm64 host.
-    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} --target aarch64-unknown-linux-gnu
-    - gc_package arm64-linux target/aarch64-unknown-linux-gnu/release/${CARGO_BIN}
+    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} cargo build --release --locked -p ${CARGO_PKG} -p ${CARGO_FFI_PKG} --target aarch64-unknown-linux-gnu
+    - gc_package arm64-linux target/aarch64-unknown-linux-gnu/release/${CARGO_BIN} target/aarch64-unknown-linux-gnu/release/libgreycat_lang.so
   artifacts:
     paths:
       - dist
@@ -105,8 +117,8 @@ windows:
   tags: [ mingw ]
   script:
     - *docker_build_script
-    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} bash -c 'export PATH="/opt/toolchains/ucrt-mingw/bin:$PATH" && rustup target add x86_64-pc-windows-gnullvm && cargo build --release --locked -p '"${CARGO_PKG}"' --target x86_64-pc-windows-gnullvm'
-    - gc_package x64-windows target/x86_64-pc-windows-gnullvm/release/${CARGO_BIN}.exe
+    - docker run --rm -v "${CI_PROJECT_DIR}:/project:z" -e GREYCAT_ANALYZER_VERSION="${GREYCAT_ANALYZER_VERSION}" ${GREYCAT_DEV_IMAGE} bash -c 'export PATH="/opt/toolchains/ucrt-mingw/bin:$PATH" && rustup target add x86_64-pc-windows-gnullvm && cargo build --release --locked -p '"${CARGO_PKG}"' -p '"${CARGO_FFI_PKG}"' --target x86_64-pc-windows-gnullvm'
+    - gc_package x64-windows target/x86_64-pc-windows-gnullvm/release/${CARGO_BIN}.exe target/x86_64-pc-windows-gnullvm/release/greycat_lang.dll
   artifacts:
     paths:
       - dist

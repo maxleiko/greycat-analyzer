@@ -7,7 +7,7 @@
 # Two consumer modes:
 #
 #   --out-dir packages/analyzer-wasm           # @greycat/analyzer-wasm npm pkg
-#   --out-dir greycat-analyzer-wasm/pkg \      # playground (debug dumpers)
+#   --out-dir crates/wasm/pkg \                # playground (debug dumpers)
 #       --features playground
 #
 # Emits `--target web`. The produced JS module exports an async
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WASM_CRATE="$REPO_ROOT/greycat-analyzer-wasm"
+WASM_CRATE="$REPO_ROOT/crates/wasm"
 
 EMSDK_ROOT="${EMSDK:-${EMSDK_ROOT:-$HOME/app/emsdk}}"
 SYSROOT="$EMSDK_ROOT/upstream/emscripten/cache/sysroot"

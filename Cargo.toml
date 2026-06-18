@@ -1,14 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
-  "greycat-analyzer",
-  "greycat-analyzer-analysis",
-  "greycat-analyzer-core",
-  "greycat-analyzer-fmt",
-  "greycat-analyzer-hir",
-  "greycat-analyzer-server",
-  "greycat-analyzer-syntax",
-  "greycat-analyzer-wasm",
+  "crates/cli",
+  "crates/analysis",
+  "crates/core",
+  "crates/ffi",
+  "crates/fmt",
+  "crates/hir",
+  "crates/server",
+  "crates/syntax",
+  "crates/wasm",
 ]
 exclude = ["editors/zed"]
 
@@ -28,14 +29,14 @@ categories = ["development-tools", "compilers", "parsing"]
 # tree consistently — Cargo.lock resolves once, not once-per-crate.
 [workspace.dependencies]
 # Internal crates — kept as path-deps with versions so the workspace
-# is publishable to crates.io once the path-dep / version dance is set
-# up (see `scripts/publish.sh`).
-greycat-analyzer-analysis = { path = "greycat-analyzer-analysis", version = "0.1.0" }
-greycat-analyzer-core = { path = "greycat-analyzer-core", version = "0.1.0" }
-greycat-analyzer-fmt = { path = "greycat-analyzer-fmt", version = "0.1.0" }
-greycat-analyzer-hir = { path = "greycat-analyzer-hir", version = "0.1.0" }
-greycat-analyzer-server = { path = "greycat-analyzer-server", version = "0.1.0" }
-greycat-analyzer-syntax = { path = "greycat-analyzer-syntax", version = "0.1.0" }
+# is publishable to crates.io
+greycat-analyzer = { path = "crates/cli", version = "0.1.0" }
+greycat-analyzer-analysis = { path = "crates/analysis", version = "0.1.0" }
+greycat-analyzer-core = { path = "crates/core", version = "0.1.0" }
+greycat-analyzer-fmt = { path = "crates/fmt", version = "0.1.0" }
+greycat-analyzer-hir = { path = "crates/hir", version = "0.1.0" }
+greycat-analyzer-server = { path = "crates/server", version = "0.1.0" }
+greycat-analyzer-syntax = { path = "crates/syntax", version = "0.1.0" }
 tree-sitter-greycat = { path = "tree-sitter-greycat" }
 
 # Third-party. Features chosen here are the union of what crates

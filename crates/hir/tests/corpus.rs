@@ -17,7 +17,8 @@ use greycat_analyzer_syntax::parse;
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("hir crate has a parent")
+        .and_then(|p| p.parent())
+        .expect("hir crate lives under crates/")
         .to_path_buf()
 }
 

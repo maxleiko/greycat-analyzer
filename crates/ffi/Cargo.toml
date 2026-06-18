@@ -1,0 +1,19 @@
+[package]
+name = "greycat-analyzer-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# `name = "greycat_lang"` is what makes Cargo emit `libgreycat_lang.so`.
+# Anticipates the planned `greycat-analyzer` -> `greycat-lang` rename.
+[lib]
+name = "greycat_lang"
+crate-type = ["cdylib"]
+
+[dependencies]
+greycat-analyzer.workspace = true

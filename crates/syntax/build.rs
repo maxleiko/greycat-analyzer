@@ -132,7 +132,8 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let json_path = manifest_dir
         .parent()
-        .expect("syntax crate has a parent dir")
+        .and_then(|p| p.parent())
+        .expect("syntax crate lives under crates/ at the workspace root")
         .join("tree-sitter-greycat/src/node-types.json");
 
     println!("cargo:rerun-if-changed={}", json_path.display());

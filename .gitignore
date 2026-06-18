@@ -11,7 +11,7 @@
 /bin
 
 # wasm-pack output (rebuilt via `playground/scripts/build-wasm.sh`)
-/greycat-analyzer-wasm/pkg
+/crates/wasm/pkg
 
 # Build artifacts inside the playground (vite scaffold's own .gitignore
 # covers node_modules + dist; this catches any global slipups).

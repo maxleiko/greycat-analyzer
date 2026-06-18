@@ -14,7 +14,7 @@ pub struct Cst {
 }
 
 impl Cst {
-    pub fn run(self) -> Result<(), AnyError> {
+    pub fn run(self) -> Result<i32, AnyError> {
         env_logger::init();
         // When omitted, default to `./project.gcl`; a directory argument
         // resolves to its `project.gcl` (mirrors `lint` / `fmt`).
@@ -36,7 +36,7 @@ impl Cst {
             write_compact(tree.root_node(), src, &mut out);
         }
         println!("{out}");
-        Ok(())
+        Ok(0)
     }
 }
 

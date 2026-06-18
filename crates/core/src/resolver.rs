@@ -307,6 +307,7 @@ mod tests {
     fn fs_context_iter_gcl_finds_corpus() {
         let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
+            .and_then(|p| p.parent())
             .unwrap()
             .join("tests/corpus");
         let ctx = FsContext::with_greycat_home(PathBuf::from("/nonexistent"));

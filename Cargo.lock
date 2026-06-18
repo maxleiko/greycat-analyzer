@@ -410,6 +410,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "greycat-analyzer-ffi"
+version = "0.1.22"
+dependencies = [
+ "greycat-analyzer",
+]
+
+[[package]]
 name = "greycat-analyzer-fmt"
 version = "0.1.22"
 dependencies = [

@@ -16,6 +16,7 @@ use greycat_analyzer_syntax::parse;
 fn enumerate_unsupported_kinds() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
+        .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf();
     let stdlib = workspace.join("lib/std");

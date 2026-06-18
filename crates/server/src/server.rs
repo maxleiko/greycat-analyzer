@@ -30,9 +30,18 @@ pub fn start_server() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
 
     let r = Arc::clone(&running);
-    ctrlc::set_handler(move || {
+    // Best-effort: when dlopen'd into a host that already owns SIGINT, a
+    // duplicate handler isn't fatal — fall back to stdin-close shutdown.
+    if let Err(err) = ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-    })?;
+    }) {
+        match err {
+            ctrlc::Error::MultipleHandlers => {
+                debug!("SIGINT handler already installed by host; relying on stdin close");
+            }
+            other => return Err(other.into()),
+        }
+    }
 
     let (conn, io_threads) = Connection::stdio();
 

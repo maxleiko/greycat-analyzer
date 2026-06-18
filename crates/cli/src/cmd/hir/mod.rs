@@ -18,7 +18,6 @@ use std::borrow::Cow;
 use std::cell::Ref;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::Arc;
 
 use greycat_analyzer_analysis::analyzer::SemanticAnalysis;
@@ -57,7 +56,7 @@ pub struct HirCmd {
 }
 
 impl HirCmd {
-    pub fn run(self) -> Result<ExitCode, AnyError> {
+    pub fn run(self) -> Result<i32, AnyError> {
         env_logger::init();
         // When omitted, default to the current working directory — its
         // `project.gcl` becomes the entrypoint (mirrors `lint` / `fmt`).
@@ -74,7 +73,7 @@ impl HirCmd {
                 project_gcl.display(),
                 canonical.display(),
             );
-            return Ok(ExitCode::FAILURE);
+            return Ok(1);
         }
 
         let ctx = FsContext::new()?;
@@ -166,7 +165,7 @@ impl HirCmd {
         } else {
             println!("{project:#?}");
         }
-        Ok(ExitCode::SUCCESS)
+        Ok(0)
     }
 }
 

@@ -27,7 +27,8 @@ use greycat_analyzer_syntax::tree_sitter;
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("syntax crate has a parent dir")
+        .and_then(|p| p.parent())
+        .expect("syntax crate lives under crates/")
         .to_path_buf()
 }
 

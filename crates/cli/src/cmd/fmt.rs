@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::Arc;
 
 use greycat_analyzer_core::{SourceManager, resolver::FsContext};
@@ -51,7 +50,7 @@ pub enum FmtMode {
 }
 
 impl Fmt {
-    pub fn run(self) -> Result<ExitCode, AnyError> {
+    pub fn run(self) -> Result<i32, AnyError> {
         env_logger::init();
 
         // Project-shaped discovery: optional positional accepting a
@@ -71,7 +70,7 @@ impl Fmt {
                     "error: no project.gcl found in {}; pass a .gcl entrypoint or a directory containing project.gcl",
                     project_filepath.display(),
                 );
-                return Ok(ExitCode::FAILURE);
+                return Ok(1);
             }
         }
 
@@ -82,7 +81,7 @@ impl Fmt {
             let source = std::fs::read_to_string(&project_filepath)?;
             let formatted = greycat_analyzer_fmt::format(&source);
             print!("{formatted}");
-            return Ok(ExitCode::SUCCESS);
+            return Ok(0);
         }
 
         // Load the project closure for write / check / diff modes.
@@ -132,11 +131,7 @@ impl Fmt {
                     std::fs::write(&e.path, &e.formatted)?;
                 }
                 println!("{} file(s) formatted", drift.len());
-                Ok(if any_skipped {
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
-                })
+                Ok(if any_skipped { 1 } else { 0 })
             }
             FmtMode::Check => {
                 for e in &drift {
@@ -144,9 +139,9 @@ impl Fmt {
                 }
                 println!("{} file(s) would be reformatted", drift.len());
                 Ok(if drift.is_empty() && !any_skipped {
-                    ExitCode::SUCCESS
+                    0
                 } else {
-                    ExitCode::FAILURE
+                    1
                 })
             }
             FmtMode::Diff => {
@@ -155,9 +150,9 @@ impl Fmt {
                     print_unified_diff(&e.path, &e.source, &e.formatted, color);
                 }
                 Ok(if drift.is_empty() && !any_skipped {
-                    ExitCode::SUCCESS
+                    0
                 } else {
-                    ExitCode::FAILURE
+                    1
                 })
             }
         }

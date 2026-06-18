@@ -14,9 +14,9 @@ pub struct LangServer {
 }
 
 impl LangServer {
-    pub fn run(self) -> Result<(), AnyError> {
+    pub fn run(self) -> Result<i32, AnyError> {
         env_logger::init();
         start_server()?;
-        Ok(())
+        Ok(0)
     }
 }

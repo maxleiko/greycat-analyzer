@@ -1,7 +1,6 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    process::ExitCode,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -142,7 +141,7 @@ impl OutputFormat {
 }
 
 impl Lint {
-    pub fn run(self) -> Result<ExitCode, AnyError> {
+    pub fn run(self) -> Result<i32, AnyError> {
         env_logger::init();
 
         // Force miette's color decision when the user explicitly
@@ -184,7 +183,7 @@ impl Lint {
             }
             println!();
             println!("`*` = advisory rule, off by default (enable via `--on=<rule>`).");
-            return Ok(ExitCode::SUCCESS);
+            return Ok(0);
         }
 
         // Build the `--off` set up-front and warn (fail-soft) on
@@ -206,7 +205,7 @@ impl Lint {
                     "error: unknown lint rule `{name}` in --off \
                      (see --list-rules for the available set)"
                 );
-                std::process::exit(1);
+                return Ok(2);
             }
         }
         let disabled: std::collections::HashSet<String> = self.off.iter().cloned().collect();
@@ -219,7 +218,7 @@ impl Lint {
                     "error: unknown lint rule `{name}` in --on \
                      (see --list-rules for the available set)"
                 );
-                std::process::exit(1);
+                return Ok(2);
             }
         }
 
@@ -243,7 +242,7 @@ impl Lint {
                     "error: no project.gcl found in {}; pass a .gcl entrypoint or a directory containing project.gcl",
                     project_filepath.display(),
                 );
-                return Ok(ExitCode::FAILURE);
+                return Ok(1);
             }
         }
 
@@ -641,11 +640,7 @@ impl Lint {
         // style nudges) — they must not flip CI red. Only errors and
         // warnings count toward the failure exit code.
         let blocking = count_blocking(&entries);
-        Ok(if blocking == 0 {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        })
+        Ok(if blocking == 0 { 0 } else { 1 })
     }
 }
 

@@ -13,6 +13,7 @@ use std::path::PathBuf;
 fn formatter_parity_against_corpus() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
+        .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf();
     let fixtures = workspace.join("tests/corpus/parser_fixtures");
@@ -53,6 +54,7 @@ fn formatter_parity_against_corpus() {
 fn formatter_idempotent_on_corpus() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
+        .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf();
     let fixtures = workspace.join("tests/corpus/parser_fixtures");

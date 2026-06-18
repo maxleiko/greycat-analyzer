@@ -11,21 +11,21 @@ Pre-built binaries — each snippet pulls the latest release. Pick your platform
 **Linux x86_64 (glibc 2.39+)**
 
 ```sh
-curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-gnu.zip -o /tmp/gca.zip
+curl -fsSL https://github.com/maxleiko/crates/cli/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-gnu.zip -o /tmp/gca.zip
 unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
 ```
 
 **Linux x86_64 (musl, fully static)**
 
 ```sh
-curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-musl.zip -o /tmp/gca.zip
+curl -fsSL https://github.com/maxleiko/crates/cli/releases/latest/download/greycat-analyzer-x86_64-unknown-linux-musl.zip -o /tmp/gca.zip
 unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
 ```
 
 **macOS (Apple Silicon)**
 
 ```sh
-curl -fsSL https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-aarch64-apple-darwin.zip -o /tmp/gca.zip
+curl -fsSL https://github.com/maxleiko/crates/cli/releases/latest/download/greycat-analyzer-aarch64-apple-darwin.zip -o /tmp/gca.zip
 unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
 ```
 
@@ -34,11 +34,11 @@ unzip -o /tmp/gca.zip -d ~/.local/bin/ && chmod +x ~/.local/bin/greycat-analyzer
 ```powershell
 $dest = "$env:LOCALAPPDATA\Programs\greycat-analyzer"
 New-Item -ItemType Directory -Force $dest | Out-Null
-Invoke-WebRequest "https://github.com/maxleiko/greycat-analyzer/releases/latest/download/greycat-analyzer-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\gca.zip"
+Invoke-WebRequest "https://github.com/maxleiko/crates/cli/releases/latest/download/greycat-analyzer-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\gca.zip"
 Expand-Archive "$env:TEMP\gca.zip" -DestinationPath $dest -Force
 ```
 
-Confirm: `greycat-analyzer --version`. Make sure `~/.local/bin` (Unix) or `$env:LOCALAPPDATA\Programs\greycat-analyzer` (Windows) is on your `PATH`. All [GitHub releases](https://github.com/maxleiko/greycat-analyzer/releases) carry the same artifacts if you want to pin a specific version.
+Confirm: `greycat-analyzer --version`. Make sure `~/.local/bin` (Unix) or `$env:LOCALAPPDATA\Programs\greycat-analyzer` (Windows) is on your `PATH`. All [GitHub releases](https://github.com/maxleiko/crates/cli/releases) carry the same artifacts if you want to pin a specific version.
 
 ### From source
 
@@ -116,7 +116,7 @@ A single session can host multiple GreyCat projects: each workspace folder with 
 
 ## Editors
 
-- **VS Code** — install [editors/code/](editors/code/) (or grab the `.vsix` from the [releases page](https://github.com/maxleiko/greycat-analyzer/releases)). Activates on `.gcl`.
+- **VS Code** — install [editors/code/](editors/code/) (or grab the `.vsix` from the [releases page](https://github.com/maxleiko/crates/cli/releases)). Activates on `.gcl`.
 - **Zed** — install the [GreyCat extension](https://zed.dev/extensions/greycat) from Zed's extension registry. ([GitHub](https://github.com/maxleiko/zed-greycat-extension))
 - **Any LSP client** — point it at `greycat-analyzer server`.
 
@@ -152,7 +152,7 @@ git submodule update --init --recursive
 ```sh
 cargo build --workspace
 cargo test  --workspace
-cargo install --path greycat-analyzer --debug
+cargo install --path crates/cli --debug
 ```
 
 Per-commit verification loop:
@@ -170,14 +170,14 @@ CI enforces all four on every push.
 
 | Crate | Purpose |
 |---|---|
-| [greycat-analyzer-syntax](greycat-analyzer-syntax/) | Tree-sitter wrapper. Parsing via [tree-sitter-greycat](tree-sitter-greycat/) (submodule). |
-| [greycat-analyzer-core](greycat-analyzer-core/) | `Document`, `SourceManager`, project graph, type arena, subtyping. |
-| [greycat-analyzer-hir](greycat-analyzer-hir/) | Arena-backed HIR + CST→HIR lowering. |
-| [greycat-analyzer-analysis](greycat-analyzer-analysis/) | Resolver, type analyzer, lint rules, capability services (`ide/`). |
-| [greycat-analyzer-fmt](greycat-analyzer-fmt/) | Formatter. |
-| [greycat-analyzer-server](greycat-analyzer-server/) | LSP server. |
-| [greycat-analyzer-wasm](greycat-analyzer-wasm/) | WASM bindings for the playground. |
-| [greycat-analyzer](greycat-analyzer/) | The CLI binary. |
+| [greycat-analyzer-syntax](crates/syntax/) | Tree-sitter wrapper. Parsing via [tree-sitter-greycat](tree-sitter-greycat/) (submodule). |
+| [greycat-analyzer-core](crates/core/) | `Document`, `SourceManager`, project graph, type arena, subtyping. |
+| [greycat-analyzer-hir](crates/hir/) | Arena-backed HIR + CST→HIR lowering. |
+| [greycat-analyzer-analysis](crates/analysis/) | Resolver, type analyzer, lint rules, capability services (`ide/`). |
+| [greycat-analyzer-fmt](crates/fmt/) | Formatter. |
+| [greycat-analyzer-server](crates/server/) | LSP server. |
+| [greycat-analyzer-wasm](crates/wasm/) | WASM bindings for the playground. |
+| [greycat-analyzer](crates/cli/) | The CLI binary. |
 
 Dependency direction: `syntax → core → hir → analysis → {fmt, server, cli, wasm}`.
 
