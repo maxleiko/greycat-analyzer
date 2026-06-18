@@ -6,8 +6,9 @@ variables:
   # is excluded from the workspace, so CI fetches only this one submodule.
   GIT_SUBMODULE_STRATEGY: recursive
   GIT_SUBMODULE_PATHS: tree-sitter-greycat
-  # .gitmodules pins github over SSH (git@github.com:) for local push; the runner
-  # has no github SSH key, so rewrite to anonymous HTTPS (the repos are public).
+  # .gitmodules pins the submodules over SSH (git@hub.datathings.com:) for local
+  # dev; the runner has no SSH key, so force the rewrite to HTTPS + CI job token,
+  # which authenticates because the submodules live on this same GitLab instance.
   GIT_SUBMODULE_FORCE_HTTPS: "true"
   CARGO_TERM_COLOR: always
   # The distributable CLI binary (one workspace member, not the whole tree).
