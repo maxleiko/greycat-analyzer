@@ -173,7 +173,7 @@ impl SemanticDiagnostic {
 }
 
 /// A non-exhaustive enum-eq if-chain detected in pass 2. Recorded into
-/// [`AnalysisResult`] rather than emitted directly so the lint pipeline
+/// [`SemanticAnalysis`] rather than emitted directly so the lint pipeline
 /// can surface it as a real, suppressible `non-exhaustive` rule via
 /// [`crate::lint::lint_non_exhaustive_with_directives`]. Mirrors the
 /// existing record-then-emit pattern used by `exhaustive_enum_chains`.
@@ -193,10 +193,9 @@ pub struct NonExhaustiveFinding {
 
 /// Output of semantic analysis for a single module.
 ///
-/// The backing [`TypeArena`] is owned by
-/// [`crate::project::ProjectAnalysis`].
+/// The backing [`TypeArena`] is owned by [`crate::project::ProjectAnalysis`].
 #[derive(Debug, Default)]
-pub struct AnalysisResult {
+pub struct SemanticAnalysis {
     pub registry: TypeRegistry,
     /// Inferred type for analyzed expressions.
     pub expr_types: FxHashMap<Idx<Expr>, TypeId>,
@@ -278,7 +277,7 @@ pub struct ObjectFieldBinding {
     pub attr: Idx<TypeAttr>,
 }
 
-impl AnalysisResult {
+impl SemanticAnalysis {
     pub fn type_of(&self, expr: Idx<Expr>) -> Option<TypeId> {
         self.expr_types.get(&expr).copied()
     }
@@ -330,8 +329,8 @@ pub fn analyze_with_index_into(
     decl_registry: &DeclRegistry,
     module_uri: &Uri,
     arena: &mut TypeArena,
-) -> AnalysisResult {
-    let mut out = AnalysisResult::default();
+) -> SemanticAnalysis {
+    let mut out = SemanticAnalysis::default();
     register_module_types(hir, arena, &mut out, index, decl_registry, module_uri);
 
     let Some(module) = hir.module.as_ref() else {
@@ -566,13 +565,13 @@ pub fn analyze_with_index_into(
 /// `type Foo {}` becomes a Named("Foo") TypeId; later phases can
 /// elaborate the type's attribute list separately.
 ///
-/// Also populates [`AnalysisResult::type_decls`] (name → HIR
+/// Also populates [`SemanticAnalysis::type_decls`] (name → HIR
 /// `TypeDecl` index) so  member resolution can navigate from a
 /// receiver's `TypeId` back to the declaring node.
 fn register_module_types(
     hir: &Hir,
     arena: &mut TypeArena,
-    out: &mut AnalysisResult,
+    out: &mut SemanticAnalysis,
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
     module_uri: &Uri,
@@ -733,7 +732,7 @@ struct EnumChain {
 struct Cx<'a> {
     hir: &'a Hir,
     res: &'a Resolutions,
-    out: &'a mut AnalysisResult,
+    out: &'a mut SemanticAnalysis,
     /// URI of the module currently being analyzed. Lets cross-module resolution
     /// paths prefer same-module candidates and reach private decls in their own module.
     module_uri: &'a Uri,
@@ -1585,7 +1584,7 @@ impl<'a> Cx<'a> {
         self.out.expr_types.insert(expr, ty);
     }
     /// Push a fully-formed [`LintDiagnostic`] into
-    /// [`AnalysisResult::surfaced_lints`]. The project-level typed-lint
+    /// [`SemanticAnalysis::surfaced_lints`]. The project-level typed-lint
     /// runner pipes the buffer through `emit_typed`, so a
     /// `// gcl-lint-off <rule>` directive at the right scope will
     /// silence the emit just like any pure-HIR rule.
@@ -6262,7 +6261,7 @@ mod tests {
         res: &Resolutions,
         arena: &mut TypeArena,
         index: &ProjectIndex,
-    ) -> (DeclRegistry, AnalysisResult) {
+    ) -> (DeclRegistry, SemanticAnalysis) {
         use std::str::FromStr;
         let module_uri = Uri::from_str("file:///module.gcl").unwrap();
         // Standalone equivalent of `ProjectIndex::ingest`'s decl
@@ -6284,7 +6283,7 @@ mod tests {
         (decl_registry, out)
     }
 
-    fn analyze_src(src: &str) -> (TypeArena, AnalysisResult) {
+    fn analyze_src(src: &str) -> (TypeArena, SemanticAnalysis) {
         let tree = parse(src);
         let symbols = SymbolTable::new();
         let hir = lower_module(src, &symbols, "mod", "project", tree.root_node());
@@ -6296,7 +6295,7 @@ mod tests {
     }
 
     /// Drop-in helper for tests that don't need to inspect the arena.
-    fn analyze_src_only(src: &str) -> AnalysisResult {
+    fn analyze_src_only(src: &str) -> SemanticAnalysis {
         analyze_src(src).1
     }
 

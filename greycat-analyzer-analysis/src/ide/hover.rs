@@ -22,7 +22,7 @@ use greycat_analyzer_hir::{DeclRegistry, Hir};
 use greycat_analyzer_syntax::cst::{ancestors, node_at_offset};
 use greycat_analyzer_syntax::tree_sitter;
 
-use crate::analyzer::{AnalysisResult, MemberDef};
+use crate::analyzer::{MemberDef, SemanticAnalysis};
 use crate::conv::position_to_byte;
 use crate::ide::render::{
     RenderCtx, decl_doc, decl_modifier_annotations, module_label_for_uri, push_annotations,
@@ -222,7 +222,7 @@ fn ident_hover_markdown(
     hir: &Hir,
     symbols: &SymbolTable,
     resolutions: &Resolutions,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     decl_registry: &DeclRegistry,
     ident_idx: Idx<Ident>,
@@ -547,7 +547,7 @@ fn render_decl_hover_markdown(
 /// the receiver's type didn't settle.
 fn receiver_ty_for_property(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     property: Idx<Ident>,
 ) -> Option<TypeId> {
     let receiver_id = hir.exprs.iter().find_map(|(_, e)| match e {
@@ -564,7 +564,7 @@ fn receiver_ty_for_property(
 fn local_binder_hover(
     hir: &Hir,
     project: &ProjectAnalysis,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     ident_idx: Idx<Ident>,
 ) -> Option<String> {
     let (name, has_var_keyword) = local_binder_for(hir, ident_idx)?;

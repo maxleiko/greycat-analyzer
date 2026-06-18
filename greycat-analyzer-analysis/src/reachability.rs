@@ -5,9 +5,9 @@
 //! every path through it reaches a `return` / `throw` / `break` /
 //! `continue`, or recursively a divergent inner statement.
 //!
-//! A structural HIR walker that folds in two `AnalysisResult` facts
+//! A structural HIR walker that folds in two `SemanticAnalysis` facts
 //! (`decidable_conditions`, `exhaustive_enum_chains`); pass an empty
-//! `AnalysisResult` for the purely-structural view. The dead-code lint
+//! `SemanticAnalysis` for the purely-structural view. The dead-code lint
 //! ([`crate::lint`]'s `unreachable` rule) and the `missing-return`
 //! check both consume this primitive.
 //!
@@ -29,7 +29,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::hir::{AtStmt, BlockStmt, Expr, IfStmt, LiteralKind, Stmt, TryStmt};
 
-use crate::analyzer::AnalysisResult;
+use crate::analyzer::SemanticAnalysis;
 
 /// `true` iff control flow cannot fall through past `stmt_id`. The HIR
 /// structural walker (loops, try/catch, break-targeting) plus two facts
@@ -40,8 +40,8 @@ use crate::analyzer::AnalysisResult;
 /// narrowed to `Poly` diverges despite having no `else`. And an
 /// exhaustive enum-eq if-chain (`exhaustive_enum_chains`) diverges when
 /// every arm body diverges, even without a trailing `else`. Pass an
-/// empty `AnalysisResult` for the purely-structural view.
-pub fn stmt_diverges(hir: &Hir, analysis: &AnalysisResult, stmt_id: Idx<Stmt>) -> bool {
+/// empty `SemanticAnalysis` for the purely-structural view.
+pub fn stmt_diverges(hir: &Hir, analysis: &SemanticAnalysis, stmt_id: Idx<Stmt>) -> bool {
     match &hir.stmts[stmt_id] {
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::Block(b) => block_diverges_impl(hir, analysis, b),
@@ -84,14 +84,19 @@ pub fn stmt_diverges(hir: &Hir, analysis: &AnalysisResult, stmt_id: Idx<Stmt>) -
 /// block is unreachable. HIR-only convenience used by the unit tests.
 #[cfg(test)]
 fn block_diverges(hir: &Hir, block: &BlockStmt) -> bool {
-    block_diverges_impl(hir, &AnalysisResult::default(), block)
+    block_diverges_impl(hir, &SemanticAnalysis::default(), block)
 }
 
-fn block_diverges_impl(hir: &Hir, analysis: &AnalysisResult, block: &BlockStmt) -> bool {
+fn block_diverges_impl(hir: &Hir, analysis: &SemanticAnalysis, block: &BlockStmt) -> bool {
     block.stmts.iter().any(|s| stmt_diverges(hir, analysis, *s))
 }
 
-fn if_diverges_impl(hir: &Hir, analysis: &AnalysisResult, stmt_id: Idx<Stmt>, i: &IfStmt) -> bool {
+fn if_diverges_impl(
+    hir: &Hir,
+    analysis: &SemanticAnalysis,
+    stmt_id: Idx<Stmt>,
+    i: &IfStmt,
+) -> bool {
     // A statically-decidable condition collapses the `if` to its one
     // live path: always-true → only the then-branch runs; always-false
     // → only the else (or fall-through) runs.
@@ -184,7 +189,7 @@ fn stmt_breaks_current_loop(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
 /// diverge would suppress the post-chain dead-code signal in the
 /// canonical "Some/None arms both return; else { } is dead;
 /// post-chain code is dead" shape.
-fn every_arm_diverges(hir: &Hir, analysis: &AnalysisResult, head_id: Idx<Stmt>) -> bool {
+fn every_arm_diverges(hir: &Hir, analysis: &SemanticAnalysis, head_id: Idx<Stmt>) -> bool {
     let mut cur = head_id;
     loop {
         match &hir.stmts[cur] {
@@ -277,7 +282,7 @@ mod tests {
     /// sibling — i.e. the first statement that is *unreachable* under
     /// normal control flow. `None` when every statement is reachable.
     fn first_dead_index(hir: &Hir, block: &BlockStmt) -> Option<usize> {
-        let analysis = AnalysisResult::default();
+        let analysis = SemanticAnalysis::default();
         for (i, s) in block.stmts.iter().enumerate() {
             if stmt_diverges(hir, &analysis, *s) {
                 // Everything after `i` is unreachable. The divergent
@@ -492,7 +497,11 @@ mod tests {
         assert!(stmt_diverges(&m.hir, &m.analysis, head_id));
         // With an empty analysis the walker can't know about enum
         // exhaustiveness (no else arm), so it returns false.
-        assert!(!stmt_diverges(&m.hir, &AnalysisResult::default(), head_id));
+        assert!(!stmt_diverges(
+            &m.hir,
+            &SemanticAnalysis::default(),
+            head_id
+        ));
     }
 
     #[test]

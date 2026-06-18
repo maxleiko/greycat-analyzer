@@ -68,7 +68,7 @@ pub fn goto_definition(
     }
 
     // The property side of `a.b` / `a->b` isn't in `Resolutions`
-    // — bindings live in `AnalysisResult::member_uses`. Run the
+    // — bindings live in `SemanticAnalysis::member_uses`. Run the
     // analyzer to consult it before giving up.
     let m = project.module(uri)?;
     let member = m.analysis.member_lookup(target)?;

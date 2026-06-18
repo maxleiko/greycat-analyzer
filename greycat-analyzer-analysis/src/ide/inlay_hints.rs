@@ -15,7 +15,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::hir::{BlockStmt, Decl, Stmt};
 
-use crate::analyzer::AnalysisResult;
+use crate::analyzer::SemanticAnalysis;
 use crate::conv::position_to_byte;
 use crate::ide::types::{Position, Range};
 use crate::project::{ModuleAnalysis, ProjectAnalysis};
@@ -165,7 +165,7 @@ fn params_close_paren_end(text: &str, after_name: usize) -> Option<usize> {
     None
 }
 
-fn inferred_fn_return(hir: &Hir, analysis: &AnalysisResult, body: Idx<Stmt>) -> Option<TypeId> {
+fn inferred_fn_return(hir: &Hir, analysis: &SemanticAnalysis, body: Idx<Stmt>) -> Option<TypeId> {
     let block = match &hir.stmts[body] {
         Stmt::Block(b) => b,
         _ => return None,
@@ -568,7 +568,7 @@ fn push_type_hint(
 #[allow(clippy::too_many_arguments)]
 fn emit_var_hints_block(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     render_ty: &dyn Fn(TypeId) -> String,
     block: &BlockStmt,
     want: (usize, usize),
@@ -584,7 +584,7 @@ fn emit_var_hints_block(
 #[allow(clippy::too_many_arguments)]
 fn emit_var_hints(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     render_ty: &dyn Fn(TypeId) -> String,
     stmt_id: Idx<Stmt>,
     want: (usize, usize),

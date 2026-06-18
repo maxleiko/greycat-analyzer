@@ -2340,7 +2340,7 @@ fn trim_trailing_trivia(bytes: &[u8], end: usize) -> usize {
 fn lookup_name_type_at(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &crate::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::SemanticAnalysis,
     cursor_byte: usize,
     name: &str,
 ) -> Option<TypeId> {
@@ -2398,7 +2398,7 @@ fn lookup_name_type_at(
 fn lookup_name_type_in_fn(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &crate::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::SemanticAnalysis,
     cursor_byte: usize,
     fnd: &greycat_analyzer_hir::hir::FnDecl,
     name: &str,
@@ -2418,7 +2418,7 @@ fn lookup_name_type_in_fn(
 fn lookup_name_type_in_block(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &crate::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::SemanticAnalysis,
     cursor_byte: usize,
     block: &greycat_analyzer_hir::hir::BlockStmt,
     name: &str,
@@ -2448,7 +2448,7 @@ fn lookup_name_type_in_block(
 fn lookup_name_type_in_stmt(
     hir: &greycat_analyzer_hir::Hir,
     symbols: &SymbolTable,
-    analysis: &crate::analyzer::AnalysisResult,
+    analysis: &crate::analyzer::SemanticAnalysis,
     cursor_byte: usize,
     stmt_id: greycat_analyzer_hir::arena::Idx<greycat_analyzer_hir::hir::Stmt>,
     name: &str,

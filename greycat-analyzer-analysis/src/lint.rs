@@ -33,7 +33,7 @@ use greycat_analyzer_hir::hir::{
 };
 use greycat_analyzer_hir::{DeclRegistry, Hir};
 
-use crate::analyzer::AnalysisResult;
+use crate::analyzer::SemanticAnalysis;
 use crate::directives::Directives;
 use crate::index::ProjectIndex;
 use crate::resolver::{Definition, Resolutions};
@@ -713,7 +713,7 @@ pub(super) fn visit_for_locals(
 /// name-keyed allowlist needed.
 ///
 /// This is a *typed* lint: it depends on the per-module
-/// [`AnalysisResult`] (for `expr_types`) and the project-wide
+/// [`SemanticAnalysis`] (for `expr_types`) and the project-wide
 /// [`ProjectIndex`] (for `@deref` type flags), so it doesn't run as part
 /// of [`run_lints`]. The project pipeline drives it after the
 /// cross-module type fixups have settled — see
@@ -726,7 +726,7 @@ pub(super) fn visit_for_locals(
 ///   shapes the lint hasn't been formally taught.
 pub fn lint_arrow_on_non_deref(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
@@ -740,7 +740,7 @@ pub fn lint_arrow_on_non_deref(
 #[allow(clippy::too_many_arguments)]
 pub fn lint_arrow_on_non_deref_with_directives(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
@@ -763,7 +763,7 @@ pub fn lint_arrow_on_non_deref_with_directives(
 #[allow(clippy::too_many_arguments)]
 fn lint_arrow_on_non_deref_inner(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
     decl_registry: &DeclRegistry,
@@ -814,7 +814,7 @@ fn lint_arrow_on_non_deref_inner(
 
 /// Emit-via-directives helper for the typed-lint free functions. They
 /// don't go through [`LintCx`] because they take a richer set of
-/// arguments (TypeArena, ProjectIndex, AnalysisResult) and have nothing
+/// arguments (TypeArena, ProjectIndex, SemanticAnalysis) and have nothing
 /// useful to do with `LintCx::hir`/`res`'s simpler signature. Same
 /// auto-tag behavior as [`LintCx::emit`].
 fn emit_typed(
@@ -897,7 +897,7 @@ fn receiver_head_name(
 /// `return e;` with a settled, informative type gets a HINT.
 pub fn lint_inferred_return_type(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
@@ -909,7 +909,7 @@ pub fn lint_inferred_return_type(
 #[allow(clippy::too_many_arguments)]
 pub fn lint_inferred_return_type_with_directives(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
@@ -929,7 +929,7 @@ pub fn lint_inferred_return_type_with_directives(
 
 fn lint_inferred_return_type_inner(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
     out: &mut Vec<LintDiagnostic>,
@@ -975,7 +975,7 @@ fn lint_inferred_return_type_inner(
 #[allow(clippy::too_many_arguments)]
 fn check_fn_inferred_return(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     index: &ProjectIndex,
     fnd: &FnDecl,
@@ -1093,7 +1093,7 @@ pub fn chain_has_upstream_nullsafe(hir: &Hir, expr_id: Idx<Expr>) -> bool {
 pub fn lint_nullability(
     hir: &Hir,
     symbols: &SymbolTable,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
 ) {
@@ -1104,7 +1104,7 @@ pub fn lint_nullability(
 pub fn lint_nullability_with_directives(
     hir: &Hir,
     symbols: &SymbolTable,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut Directives,
@@ -1124,7 +1124,7 @@ pub fn lint_nullability_with_directives(
 fn lint_nullability_inner(
     hir: &Hir,
     symbols: &SymbolTable,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut Directives>,
@@ -1399,14 +1399,14 @@ fn display_receiver(hir: &Hir, symbols: &SymbolTable, expr_id: Idx<Expr>) -> Str
 // outer-island dominance on top so a dead inner block doesn't
 // double-flag.
 
-pub fn lint_unreachable(hir: &Hir, analysis: &AnalysisResult, out: &mut Vec<LintDiagnostic>) {
+pub fn lint_unreachable(hir: &Hir, analysis: &SemanticAnalysis, out: &mut Vec<LintDiagnostic>) {
     lint_unreachable_inner(hir, analysis, out, None, false);
 }
 
 /// Directive-aware variant.
 pub fn lint_unreachable_with_directives(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut Directives,
     bypass_suppressions: bool,
@@ -1416,7 +1416,7 @@ pub fn lint_unreachable_with_directives(
 
 fn lint_unreachable_inner(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     out: &mut Vec<LintDiagnostic>,
     mut directives: Option<&mut Directives>,
     bypass_suppressions: bool,
@@ -1474,13 +1474,13 @@ fn lint_unreachable_inner(
 
 /// Emit a `non-exhaustive` lint for every enum-eq chain the analyzer
 /// flagged in pass 2. The analyzer records the findings into
-/// [`AnalysisResult::non_exhaustive_findings`] so this rule can ride
+/// [`SemanticAnalysis::non_exhaustive_findings`] so this rule can ride
 /// the standard lint pipeline (`emit_typed` honors `// gcl-lint-off…`
 /// directives, `unused-suppression` checks against actual emissions,
 /// quickfixes dispatch by `code`).
 pub fn lint_non_exhaustive_with_directives(
     symbols: &SymbolTable,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut Directives,
     bypass_suppressions: bool,
@@ -1512,7 +1512,7 @@ pub fn lint_non_exhaustive_with_directives(
 }
 
 /// Pipe every `LintDiagnostic` the typed analyzer pre-built into
-/// [`AnalysisResult::surfaced_lints`] through `emit_typed`, so
+/// [`SemanticAnalysis::surfaced_lints`] through `emit_typed`, so
 /// `// gcl-lint-off <rule>` directives can suppress them uniformly
 /// with every other rule.
 ///
@@ -1521,7 +1521,7 @@ pub fn lint_non_exhaustive_with_directives(
 /// is needed here. The set of rule codes the analyzer can surface is
 /// declared in [`SURFACED_RULES`].
 pub fn lint_surfaced_with_directives(
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     out: &mut Vec<LintDiagnostic>,
     directives: &mut Directives,
     bypass_suppressions: bool,
@@ -1537,7 +1537,7 @@ pub fn lint_surfaced_with_directives(
 }
 
 /// Rule codes the typed analyzer can surface through
-/// [`AnalysisResult::surfaced_lints`]. The typed-lint runner's
+/// [`SemanticAnalysis::surfaced_lints`]. The typed-lint runner's
 /// `retain` filter uses this slice to drop stale entries before
 /// re-piping, so incremental edits in the LSP don't accumulate dupes.
 ///
@@ -1547,7 +1547,7 @@ pub const SURFACED_RULES: &[&str] = &["decidable-condition"];
 
 fn collect_dead_in_fn(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     fnd: &FnDecl,
     out: &mut Vec<std::ops::Range<usize>>,
 ) {
@@ -1567,7 +1567,7 @@ fn collect_dead_in_fn(
 /// exhaustive enum chains.
 fn collect_dead_in_block(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     block: &greycat_analyzer_hir::hir::BlockStmt,
     out: &mut Vec<std::ops::Range<usize>>,
 ) {
@@ -1605,7 +1605,7 @@ fn collect_dead_in_block(
 
 fn collect_dead_in_stmt(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     stmt_id: Idx<Stmt>,
     out: &mut Vec<std::ops::Range<usize>>,
 ) {

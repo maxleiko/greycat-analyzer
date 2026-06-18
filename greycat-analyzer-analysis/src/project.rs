@@ -34,7 +34,9 @@ use greycat_analyzer_core::{
 use greycat_analyzer_hir::hir::{BlockStmt, Decl, Expr, Ident, Stmt, TypeRef};
 use greycat_analyzer_hir::{DeclRegistry, Hir, lower_module};
 
-use crate::analyzer::{AnalysisResult, DiagCategory, SemanticDiagnostic, analyze_with_index_into};
+use crate::analyzer::{
+    DiagCategory, SemanticAnalysis, SemanticDiagnostic, analyze_with_index_into,
+};
 use crate::directives::{Directives, parse_directives};
 use crate::display::{ProjectTypeDisplay, display_type, display_type_for_module};
 use crate::index::{FnSignature, ProjectIndex, module_name_from_uri};
@@ -57,7 +59,7 @@ use crate::resolver::Resolutions;
 pub struct ModuleAnalysis {
     pub hir: Hir,
     pub resolutions: Resolutions,
-    pub analysis: AnalysisResult,
+    pub analysis: SemanticAnalysis,
     pub lints: Vec<LintDiagnostic>,
     /// Library this module belongs to — copied from
     /// [`greycat_analyzer_core::Document::lib`] at construction.
@@ -107,7 +109,7 @@ impl ModuleTimings {
 /// instead of lingering.
 ///
 /// The [`TypeArena`] now lives on the
-/// project (not per [`AnalysisResult`]). Every module's analyzer mints
+/// project (not per [`SemanticAnalysis`]). Every module's analyzer mints
 /// into the same arena so cross-module `TypeId`s are directly
 /// comparable — no `mint_type_shape`/`read_type_shape` translation
 /// needed. Callers that previously wrote `module.analysis.types`
@@ -3506,7 +3508,7 @@ fn validate_module_type_relations(
     #[allow(clippy::too_many_arguments)]
     fn validate_decl(
         hir: &Hir,
-        analysis: &AnalysisResult,
+        analysis: &SemanticAnalysis,
         cur_uri: &Uri,
         index: &ProjectIndex,
         decl_registry: &DeclRegistry,
@@ -3670,7 +3672,7 @@ fn validate_module_type_relations(
     #[allow(clippy::too_many_arguments)]
     fn validate_block(
         hir: &Hir,
-        analysis: &AnalysisResult,
+        analysis: &SemanticAnalysis,
         cur_uri: &Uri,
         index: &ProjectIndex,
         decl_registry: &DeclRegistry,
@@ -3699,7 +3701,7 @@ fn validate_module_type_relations(
     #[allow(clippy::too_many_arguments)]
     fn validate_stmt(
         hir: &Hir,
-        analysis: &AnalysisResult,
+        analysis: &SemanticAnalysis,
         cur_uri: &Uri,
         index: &ProjectIndex,
         decl_registry: &DeclRegistry,
@@ -4033,7 +4035,7 @@ fn validate_module_type_relations(
 
     #[allow(clippy::too_many_arguments)]
     fn check_assign(
-        analysis: &AnalysisResult,
+        analysis: &SemanticAnalysis,
         index: &ProjectIndex,
         decl_registry: &DeclRegistry,
         arena: &mut TypeArena,
@@ -4065,7 +4067,7 @@ fn validate_module_type_relations(
 
     #[allow(clippy::too_many_arguments)]
     fn check_bool(
-        analysis: &AnalysisResult,
+        analysis: &SemanticAnalysis,
         arena: &TypeArena,
         index: &ProjectIndex,
         decl_registry: &DeclRegistry,

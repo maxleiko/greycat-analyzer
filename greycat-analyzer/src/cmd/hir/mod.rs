@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use greycat_analyzer_analysis::analyzer::AnalysisResult;
+use greycat_analyzer_analysis::analyzer::SemanticAnalysis;
 use greycat_analyzer_analysis::display_fqn;
 use greycat_analyzer_analysis::index::ProjectIndex;
 use greycat_analyzer_analysis::project::{ModuleAnalysis, ProjectAnalysis};
@@ -362,7 +362,7 @@ fn build_module_buffers(
 fn record_fn_signature(
     buf: &mut ModuleFqnBuffers,
     hir: &HirArenas,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     symbols: &SymbolTable,
     index: &ProjectIndex,

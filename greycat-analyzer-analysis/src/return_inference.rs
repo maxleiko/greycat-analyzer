@@ -26,7 +26,7 @@ use greycat_analyzer_hir::Hir;
 use greycat_analyzer_hir::arena::Idx;
 use greycat_analyzer_hir::hir::Stmt;
 
-use crate::analyzer::AnalysisResult;
+use crate::analyzer::SemanticAnalysis;
 
 /// Walk the fn / lambda body recursively, collect the settled type of
 /// every `return e;`, and return the joined single type — or `None`
@@ -53,7 +53,7 @@ use crate::analyzer::AnalysisResult;
 /// `TypeOf` return) when the branches happen to share an id.
 pub fn inferred_return_from_body(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     body: Idx<Stmt>,
 ) -> Option<TypeId> {
@@ -72,7 +72,7 @@ pub fn inferred_return_from_body(
 /// temporary `Stmt::Block` allocation.
 pub fn inferred_return_from_block(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     body: &greycat_analyzer_hir::hir::BlockStmt,
 ) -> Option<TypeId> {
@@ -143,7 +143,7 @@ pub fn join_return_types(arena: &TypeArena, a: TypeId, b: TypeId) -> Option<Type
 /// when it does, this walker picks the new signal up for free.
 fn collect_return_types(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     stmt_id: Idx<Stmt>,
     seen: &mut Option<TypeId>,
@@ -195,7 +195,7 @@ fn collect_return_types(
 /// returns). The cutoff is "siblings AFTER a divergent one".
 fn collect_returns_in_block(
     hir: &Hir,
-    analysis: &AnalysisResult,
+    analysis: &SemanticAnalysis,
     arena: &TypeArena,
     stmts: &[Idx<Stmt>],
     seen: &mut Option<TypeId>,
