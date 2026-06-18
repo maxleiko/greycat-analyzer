@@ -1,9 +1,14 @@
 variables:
   GIT_STRATEGY: clone
   GIT_DEPTH: "0"
-  # tree-sitter-greycat is a git submodule and the syntax crate's build.rs
-  # reads node-types.json from it -- without this every cargo build fails.
+  # tree-sitter-greycat is a git submodule whose node-types.json the syntax
+  # crate's build.rs reads -- without it every cargo build fails. editors/zed
+  # is excluded from the workspace, so CI fetches only this one submodule.
   GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_PATHS: tree-sitter-greycat
+  # .gitmodules pins github over SSH (git@github.com:) for local push; the runner
+  # has no github SSH key, so rewrite to anonymous HTTPS (the repos are public).
+  GIT_SUBMODULE_FORCE_HTTPS: "true"
   CARGO_TERM_COLOR: always
   # The distributable CLI binary (one workspace member, not the whole tree).
   CARGO_PKG: greycat-analyzer
