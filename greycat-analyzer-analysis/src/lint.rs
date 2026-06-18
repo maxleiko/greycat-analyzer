@@ -1576,7 +1576,7 @@ fn collect_dead_in_block(
     let mut dead_start_idx: Option<usize> = None;
     for (i, s) in block.stmts.iter().enumerate() {
         if dead_start_idx.is_none()
-            && crate::reachability::stmt_diverges_with_analysis(hir, analysis, *s)
+            && crate::reachability::stmt_diverges(hir, analysis, *s)
             && i + 1 < block.stmts.len()
         {
             dead_start_idx = Some(i + 1);

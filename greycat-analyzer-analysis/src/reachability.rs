@@ -5,9 +5,11 @@
 //! every path through it reaches a `return` / `throw` / `break` /
 //! `continue`, or recursively a divergent inner statement.
 //!
-//! Pure-HIR walker, no typing / resolver dependency. The dead-code lint
-//! ([`crate::lint`]'s `unreachable` rule) consumes this primitive
-//! to flag statements that follow a divergent sibling.
+//! A structural HIR walker that folds in two `AnalysisResult` facts
+//! (`decidable_conditions`, `exhaustive_enum_chains`); pass an empty
+//! `AnalysisResult` for the purely-structural view. The dead-code lint
+//! ([`crate::lint`]'s `unreachable` rule) and the `missing-return`
+//! check both consume this primitive.
 //!
 //! **Conservative on loops, with one exception.** Loops with a
 //! non-literal condition stay non-divergent: we don't const-fold, so we
@@ -29,21 +31,31 @@ use greycat_analyzer_hir::hir::{AtStmt, BlockStmt, Expr, IfStmt, LiteralKind, St
 
 use crate::analyzer::AnalysisResult;
 
-/// `true` iff control flow cannot fall through past `stmt_id`. See the
-/// module docs for the conservative-on-loops / conservative-on-calls
-/// caveats.
-pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
+/// `true` iff control flow cannot fall through past `stmt_id`. The HIR
+/// structural walker (loops, try/catch, break-targeting) plus two facts
+/// it can't see on its own, folded in recursively at every nesting
+/// depth. An `if` whose condition the analyzer proved statically
+/// `true` / `false` (`decidable_conditions`) collapses to its one live
+/// branch — so `if (s is Poly) { return ...; }` where `s` is already
+/// narrowed to `Poly` diverges despite having no `else`. And an
+/// exhaustive enum-eq if-chain (`exhaustive_enum_chains`) diverges when
+/// every arm body diverges, even without a trailing `else`. Pass an
+/// empty `AnalysisResult` for the purely-structural view.
+pub fn stmt_diverges(hir: &Hir, analysis: &AnalysisResult, stmt_id: Idx<Stmt>) -> bool {
     match &hir.stmts[stmt_id] {
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
-        Stmt::Block(b) => block_diverges(hir, b),
-        Stmt::If(i) => if_diverges(hir, i),
-        Stmt::Try(t) => try_diverges(hir, t),
+        Stmt::Block(b) => block_diverges_impl(hir, analysis, b),
+        Stmt::If(i) => if_diverges_impl(hir, analysis, stmt_id, i),
+        Stmt::Try(t) => {
+            block_diverges_impl(hir, analysis, &t.try_block)
+                && block_diverges_impl(hir, analysis, &t.catch_block)
+        }
         // `@<expr> { … }` — the block runs at most once and the
         // expression's side effects don't change reachability of
         // anything after the at-stmt. Treat as divergent iff the inner
         // block diverges (the at-stmt itself is otherwise straight-
         // through).
-        Stmt::At(a) => block_diverges(hir, &a.block),
+        Stmt::At(a) => block_diverges_impl(hir, analysis, &a.block),
         // Narrow infinite-loop rule: a `while (true)` or a C-style
         // `for (var i = ...; true; ...)` with a literal-`true` condition
         // and no `break` targeting it can never fall through. Any other
@@ -67,53 +79,46 @@ pub fn stmt_diverges(hir: &Hir, stmt_id: Idx<Stmt>) -> bool {
     }
 }
 
-/// Analyzer-aware divergence: same as [`stmt_diverges`]
-/// but also treats an exhaustive enum-eq if-chain (recorded in
-/// `analysis.exhaustive_enum_chains`) as divergent when every arm body
-/// diverges. Without this, the canonical `if (x == E::A) { return …; }
-/// else if (x == E::B) { return …; }` shape would not flag the
-/// post-chain `var _` as dead — the HIR-only walker can't tell that
-/// the chain semantically covers every branch.
-pub fn stmt_diverges_with_analysis(
-    hir: &Hir,
-    analysis: &AnalysisResult,
-    stmt_id: Idx<Stmt>,
-) -> bool {
-    if stmt_diverges(hir, stmt_id) {
-        return true;
+/// `true` iff some statement in `block` diverges. Equivalent to "this
+/// block has a guaranteed exit point" — the next statement after the
+/// block is unreachable. HIR-only convenience used by the unit tests.
+#[cfg(test)]
+fn block_diverges(hir: &Hir, block: &BlockStmt) -> bool {
+    block_diverges_impl(hir, &AnalysisResult::default(), block)
+}
+
+fn block_diverges_impl(hir: &Hir, analysis: &AnalysisResult, block: &BlockStmt) -> bool {
+    block.stmts.iter().any(|s| stmt_diverges(hir, analysis, *s))
+}
+
+fn if_diverges_impl(hir: &Hir, analysis: &AnalysisResult, stmt_id: Idx<Stmt>, i: &IfStmt) -> bool {
+    // A statically-decidable condition collapses the `if` to its one
+    // live path: always-true → only the then-branch runs; always-false
+    // → only the else (or fall-through) runs.
+    match analysis.decidable_conditions.get(&stmt_id) {
+        Some(true) => return block_diverges_impl(hir, analysis, &i.then_branch),
+        Some(false) => {
+            return i
+                .else_branch
+                .is_some_and(|eb| stmt_diverges(hir, analysis, eb));
+        }
+        None => {}
     }
-    // The HIR walker said "doesn't diverge". The only extra signal we
-    // know about is "this if is the head of an exhaustive chain whose
-    // every arm body diverges". Check that.
-    if let Stmt::If(_) = &hir.stmts[stmt_id]
-        && analysis.exhaustive_enum_chains.contains(&stmt_id)
+    // Exhaustive enum-eq chain with no else: every value is covered, so
+    // the chain diverges when every arm body diverges.
+    if analysis.exhaustive_enum_chains.contains(&stmt_id)
         && every_arm_diverges(hir, analysis, stmt_id)
     {
         return true;
     }
-    false
-}
-
-/// `true` iff some statement in `block` diverges. Equivalent to "this
-/// block has a guaranteed exit point" — the next statement after the
-/// block is unreachable.
-fn block_diverges(hir: &Hir, block: &BlockStmt) -> bool {
-    block.stmts.iter().any(|s| stmt_diverges(hir, *s))
-}
-
-fn if_diverges(hir: &Hir, i: &IfStmt) -> bool {
-    if !block_diverges(hir, &i.then_branch) {
+    if !block_diverges_impl(hir, analysis, &i.then_branch) {
         return false;
     }
     let Some(else_id) = i.else_branch else {
         // No else → fall-through path exists when condition is false.
         return false;
     };
-    stmt_diverges(hir, else_id)
-}
-
-fn try_diverges(hir: &Hir, t: &TryStmt) -> bool {
-    block_diverges(hir, &t.try_block) && block_diverges(hir, &t.catch_block)
+    stmt_diverges(hir, analysis, else_id)
 }
 
 /// `true` iff `expr_id` is the literal `true`.
@@ -188,7 +193,7 @@ fn every_arm_diverges(hir: &Hir, analysis: &AnalysisResult, head_id: Idx<Stmt>) 
                 else_branch,
                 ..
             }) => {
-                if !block_diverges(hir, then_branch) {
+                if !block_diverges_impl(hir, analysis, then_branch) {
                     return false;
                 }
                 let Some(eb) = else_branch else {
@@ -208,7 +213,7 @@ fn every_arm_diverges(hir: &Hir, analysis: &AnalysisResult, head_id: Idx<Stmt>) 
             _ => {
                 // Anything else in the else-branch slot (e.g. a single
                 // statement) — fall back to the divergence primitive.
-                return stmt_diverges_with_analysis(hir, analysis, cur);
+                return stmt_diverges(hir, analysis, cur);
             }
         }
     }
@@ -272,8 +277,9 @@ mod tests {
     /// sibling — i.e. the first statement that is *unreachable* under
     /// normal control flow. `None` when every statement is reachable.
     fn first_dead_index(hir: &Hir, block: &BlockStmt) -> Option<usize> {
+        let analysis = AnalysisResult::default();
         for (i, s) in block.stmts.iter().enumerate() {
-            if stmt_diverges(hir, *s) {
+            if stmt_diverges(hir, &analysis, *s) {
                 // Everything after `i` is unreachable. The divergent
                 // statement itself is reachable — `i + 1` is the first
                 // dead index.
@@ -474,19 +480,19 @@ mod tests {
     }
 
     #[test]
-    fn stmt_diverges_with_analysis_promotes_exhaustive_chain() {
+    fn analysis_promotes_exhaustive_chain() {
         let (uri, pa) = project_analyze(
             "enum E { A, B }\nfn f(x: E): int { if (x == E::A) { return 1; } else if (x == E::B) { return 2; } return 0; }\n",
         );
         let m = pa.module(&uri).unwrap();
         let body = fn_body(&m.hir, pa.symbols(), "f");
-        // The exhaustive chain is at index 0; every arm returns; so
-        // `stmt_diverges_with_analysis` should call it divergent.
+        // The exhaustive chain is at index 0; every arm returns; so with
+        // the analysis facts it should be divergent.
         let head_id = body.stmts[0];
-        assert!(stmt_diverges_with_analysis(&m.hir, &m.analysis, head_id,));
-        // Plain `stmt_diverges` doesn't know about enum exhaustiveness
-        // (no else arm), so it returns false.
-        assert!(!stmt_diverges(&m.hir, head_id));
+        assert!(stmt_diverges(&m.hir, &m.analysis, head_id));
+        // With an empty analysis the walker can't know about enum
+        // exhaustiveness (no else arm), so it returns false.
+        assert!(!stmt_diverges(&m.hir, &AnalysisResult::default(), head_id));
     }
 
     #[test]

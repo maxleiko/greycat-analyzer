@@ -26,7 +26,7 @@
 //!    toggles emit `unused-suppression`.
 //! 6. [`reachability`] — pure-HIR divergence analysis +
 //!    analyzer-aware exhaustive-chain promotion. The `unreachable`
-//!    lint rule consumes [`reachability::stmt_diverges_with_analysis`]
+//!    lint rule consumes [`reachability::stmt_diverges`]
 //!    and [`reachability::dead_else_range_for_exhaustive_chain`] to
 //!    flag dead islands; the LSP layer translates the lint's
 //!    [`lint::DiagTag::Unnecessary`] into `DiagnosticTag::UNNECESSARY`

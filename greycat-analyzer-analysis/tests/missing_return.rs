@@ -228,6 +228,82 @@ fn cond(x: bool): int {
 }
 
 #[test]
+fn subtype_exhaustive_is_chain_is_ok() {
+    // `Shape` is abstract with exactly two concrete subtypes. After the
+    // `Rect` arm returns, `s` narrows to `Poly`, so `s is Poly` is
+    // statically true and its return covers the only remaining value —
+    // the end of the body is unreachable.
+    let src = "\
+abstract type Shape {}
+type Rect extends Shape {}
+type Poly extends Shape {}
+fn shapeName(s: Shape): String {
+    if (s is Rect) {
+        return \"Rect\";
+    }
+    if (s is Poly) {
+        return \"Poly\";
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    assert_eq!(
+        missing_return_count(&pa, &uri),
+        0,
+        "the decidably-true final `is`-guard returns, covering every subtype",
+    );
+}
+
+#[test]
+fn exhaustive_enum_chain_sole_body_is_ok() {
+    // An exhaustive enum-eq if-chain as the whole body covers every
+    // value; the end of the body is unreachable even with no trailing
+    // `else` / `return`.
+    let src = "\
+enum E { A, B }
+fn f(x: E): int {
+    if (x == E::A) {
+        return 1;
+    } else if (x == E::B) {
+        return 2;
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    assert_eq!(
+        missing_return_count(&pa, &uri),
+        0,
+        "every enum value is covered, so the body never falls through",
+    );
+}
+
+#[test]
+fn decidably_true_guard_with_non_returning_body_is_flagged() {
+    // Guard against over-suppression: the final `is`-guard is statically
+    // true, but its then-branch does NOT diverge, so control still falls
+    // off the end of the body.
+    let src = "\
+abstract type Shape {}
+type Rect extends Shape {}
+type Poly extends Shape {}
+fn shapeName(s: Shape): String {
+    if (s is Rect) {
+        return \"Rect\";
+    }
+    if (s is Poly) {
+        var _ = 1;
+    }
+}
+";
+    let (uri, pa) = analyze(src);
+    assert_eq!(
+        missing_return_count(&pa, &uri),
+        1,
+        "a decidably-true guard whose body doesn't return still falls through",
+    );
+}
+
+#[test]
 fn non_nullable_method_with_reachable_end_is_flagged() {
     let src = "\
 type Box {

@@ -133,7 +133,7 @@ pub fn join_return_types(arena: &TypeArena, a: TypeId, b: TypeId) -> Option<Type
 /// the user wanted a hint they'd write the explicit return).
 ///
 /// Dead branches are skipped: at each block we stop iterating after
-/// the first statement that `stmt_diverges_with_analysis` proves
+/// the first statement that `stmt_diverges` proves
 /// terminates control flow. That mirrors the `unreachable` lint's
 /// reasoning so a return in a provably-dead branch (e.g. after an
 /// earlier `return` / `throw` in the same block) doesn't pollute the
@@ -202,7 +202,7 @@ fn collect_returns_in_block(
 ) -> Result<(), ()> {
     for s in stmts {
         collect_return_types(hir, analysis, arena, *s, seen)?;
-        if crate::reachability::stmt_diverges_with_analysis(hir, analysis, *s) {
+        if crate::reachability::stmt_diverges(hir, analysis, *s) {
             break;
         }
     }

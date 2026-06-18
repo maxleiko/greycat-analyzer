@@ -3565,9 +3565,7 @@ fn validate_module_type_relations(
                     if let (Some(ret_ty), Some(ret_tref)) = (return_ty, fnd.return_type) {
                         let null_ty = arena.null();
                         if !index.is_assignable_to(arena, null_ty, ret_ty)
-                            && !crate::reachability::stmt_diverges_with_analysis(
-                                hir, analysis, body,
-                            )
+                            && !crate::reachability::stmt_diverges(hir, analysis, body)
                         {
                             diags.push(SemanticDiagnostic {
                                 severity: Severity::Error,
